@@ -255,6 +255,1144 @@ def test_runtime_evidence_receipt_reconciliation_supersedes_recorded_state() -> 
     }
 
 
+def test_runtime_evidence_projects_safe_workspace_mutation_and_finalization() -> None:
+    async def scenario():
+        store = InMemorySessionStore()
+        await _create_session(store, "workspace-root")
+        common = {
+            "window_id": "window-1",
+            "workspace_id": "workspace-1",
+            "tool_call_id": "call-1",
+            "tool_round_id": "round-1",
+        }
+        await store.append_events(
+            "workspace-root",
+            [
+                Event(
+                    id="workspace-before",
+                    type=EventType.WORKSPACE_REVISION_OBSERVED,
+                    session_id="workspace-root",
+                    payload={
+                        **common,
+                        "phase": "before",
+                        "status": "supported",
+                        "revision": "revision-before",
+                        "branch": "secret-feature-branch",
+                        "path_scope": "complete",
+                        "paths": [{"path": "secret-plan.txt", "kind": "file"}],
+                        "total_paths": 1,
+                        "detail_code": None,
+                    },
+                ),
+                Event(
+                    id="workspace-after",
+                    type=EventType.WORKSPACE_REVISION_OBSERVED,
+                    session_id="workspace-root",
+                    payload={
+                        **common,
+                        "phase": "after",
+                        "status": "supported",
+                        "revision": "revision-after",
+                        "branch": "secret-feature-branch",
+                        "path_scope": "changed",
+                        "paths": [{"path": "secret-plan.txt", "kind": "file"}],
+                        "total_paths": 1,
+                        "detail_code": None,
+                    },
+                ),
+                Event(
+                    id="workspace-delta",
+                    type=EventType.WORKSPACE_MUTATION_RECORDED,
+                    session_id="workspace-root",
+                    payload={
+                        **common,
+                        "status": "changed",
+                        "before_revision": "revision-before",
+                        "after_revision": "revision-after",
+                        "paths": [{"path": "secret-plan.txt", "change": "modified"}],
+                        "total_paths": 1,
+                        "head_changed": False,
+                        "branch_changed": False,
+                        "detail_code": None,
+                        "attribution": {
+                            "confidence": "exclusive_tool",
+                            "writer_isolation": "exclusive",
+                            "overlap_detected": False,
+                            "direct_reconciliation": "consistent",
+                            "detail_code": "exclusive_writer_isolation_verified",
+                        },
+                        "writer_isolation": {
+                            "before": {
+                                "status": "exclusive",
+                                "mechanism": "secret-lease-mechanism",
+                                "generation": "secret-generation",
+                            },
+                            "after": {
+                                "status": "exclusive",
+                                "mechanism": "secret-lease-mechanism",
+                                "generation": "secret-generation",
+                            },
+                        },
+                        "direct_mutations": {
+                            "operations": [{"path": "secret-plan.txt", "method": "write_bytes"}]
+                        },
+                        "manifest_artifact_id": "artifact-delta",
+                        "manifest_artifact_sha256": "a" * 64,
+                        "manifest_artifact_size_bytes": 123,
+                    },
+                ),
+                Event(
+                    id="workspace-terminal",
+                    type=EventType.WORKSPACE_OBSERVATION_FINALIZED,
+                    session_id="workspace-root",
+                    payload={
+                        **common,
+                        "status": "complete",
+                        "detail_code": None,
+                        "mutation_event_id": "workspace-delta",
+                        "referenced_artifact_count": 1,
+                        "failed_artifact_count": 0,
+                    },
+                ),
+                Event(
+                    id="workspace-finalized",
+                    type=EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
+                    session_id="workspace-root",
+                    payload={
+                        "final_revision": {
+                            "workspace_id": "workspace-1",
+                            "observer": "GitRepositoryBinding",
+                            "status": "supported",
+                            "revision": "revision-final",
+                            "head_revision": "head-secret",
+                            "branch": "secret-feature-branch",
+                            "path_scope": "changed",
+                            "total_paths": 2,
+                            "detail_code": None,
+                            "finalization_delta": {
+                                "attribution_confidence": ("unattributed_finalization_change"),
+                                "status": "changed",
+                                "before_revision": "revision-after",
+                                "after_revision": "revision-final",
+                                "paths": [{"path_sha256": "b" * 64, "change": "added"}],
+                                "retained_paths": 1,
+                                "total_paths": 1,
+                                "truncated": False,
+                                "head_changed": True,
+                                "branch_changed": False,
+                                "detail_code": None,
+                            },
+                        }
+                    },
+                ),
+            ],
+        )
+        return await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(
+                root_session_id="workspace-root",
+                max_sessions=10,
+                max_events=20,
+            ),
+        )
+
+    report = asyncio.run(scenario())
+    session = report.sessions[0]
+
+    assert report.schema_version == 3
+    assert len(session.workspace_mutations) == 1
+    mutation = session.workspace_mutations[0]
+    assert mutation.window_id == "window-1"
+    assert mutation.before is not None and mutation.before.revision == "revision-before"
+    assert mutation.after is not None and mutation.after.revision == "revision-after"
+    assert mutation.delta is not None
+    assert mutation.delta.status == "changed"
+    assert mutation.delta.total_paths == 1
+    assert mutation.attribution is not None
+    assert mutation.attribution.confidence == "exclusive_tool"
+    assert mutation.terminal is not None and mutation.terminal.status == "complete"
+    assert mutation.artifacts[0].artifact_id == "artifact-delta"
+    assert [ref.event_id for ref in mutation.source_refs] == [
+        "workspace-before",
+        "workspace-after",
+        "workspace-delta",
+        "workspace-terminal",
+    ]
+    assert session.workspace_finalization is not None
+    assert session.workspace_finalization.revision == "revision-final"
+    assert session.workspace_finalization.delta is not None
+    assert session.workspace_finalization.delta.attribution_confidence == (
+        "unattributed_finalization_change"
+    )
+    assert session.workspace_finalization.source_refs[0].event_id == "workspace-finalized"
+
+    serialized = report.model_dump_json()
+    for secret in (
+        "secret-plan.txt",
+        "secret-feature-branch",
+        "head-secret",
+        "secret-lease-mechanism",
+        "secret-generation",
+    ):
+        assert secret not in serialized
+
+
+def test_runtime_evidence_warns_and_omits_conflicting_workspace_evidence() -> None:
+    async def scenario():
+        store = InMemorySessionStore()
+        await _create_session(store, "workspace-conflict")
+        common = {
+            "window_id": "window-conflict",
+            "workspace_id": "workspace-1",
+            "tool_call_id": "call-1",
+            "tool_round_id": "round-1",
+            "phase": "before",
+            "status": "supported",
+            "path_scope": "complete",
+            "paths": [],
+            "total_paths": 0,
+            "detail_code": None,
+        }
+        await store.append_events(
+            "workspace-conflict",
+            [
+                Event(
+                    id="before-one",
+                    type=EventType.WORKSPACE_REVISION_OBSERVED,
+                    session_id="workspace-conflict",
+                    payload={**common, "revision": "revision-one"},
+                ),
+                Event(
+                    id="before-two",
+                    type=EventType.WORKSPACE_REVISION_OBSERVED,
+                    session_id="workspace-conflict",
+                    payload={**common, "revision": "revision-two"},
+                ),
+                Event(
+                    id="bad-workspace-delta",
+                    type=EventType.WORKSPACE_MUTATION_RECORDED,
+                    session_id="workspace-conflict",
+                    payload={
+                        "window_id": "window-bad",
+                        "workspace_id": "workspace-1",
+                        "tool_call_id": "call-2",
+                        "status": "changed",
+                        "before_revision": "before",
+                        "after_revision": "after",
+                        "total_paths": -1,
+                        "head_changed": False,
+                        "branch_changed": False,
+                    },
+                ),
+                Event(
+                    id="final-revision-one",
+                    type=EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
+                    session_id="workspace-conflict",
+                    payload={
+                        "final_revision": {
+                            "workspace_id": "workspace-1",
+                            "status": "supported",
+                            "revision": "final-one",
+                            "path_scope": "complete",
+                            "total_paths": 0,
+                            "detail_code": None,
+                        }
+                    },
+                ),
+                Event(
+                    id="final-revision-two",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id="workspace-conflict",
+                    payload={
+                        "final_revision": {
+                            "workspace_id": "workspace-1",
+                            "status": "supported",
+                            "revision": "final-two",
+                            "path_scope": "complete",
+                            "total_paths": 0,
+                            "detail_code": None,
+                        }
+                    },
+                ),
+            ],
+        )
+        return await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(
+                root_session_id="workspace-conflict",
+                max_sessions=10,
+                max_events=20,
+            ),
+        )
+
+    report = asyncio.run(scenario())
+
+    assert report.sessions[0].workspace_mutations == ()
+    assert report.sessions[0].workspace_finalization is None
+    assert RuntimeEvidenceWarningCode.MALFORMED_WORKSPACE_EVIDENCE in {
+        warning.code for warning in report.warnings
+    }
+
+
+def test_runtime_evidence_workspace_duplicate_replay_converges() -> None:
+    async def scenario():
+        store = InMemorySessionStore()
+        await _create_session(store, "workspace-replay")
+        common = {
+            "window_id": "window-replay",
+            "workspace_id": "workspace-1",
+            "tool_call_id": "call-1",
+            "tool_round_id": "round-1",
+        }
+        before = {
+            **common,
+            "phase": "before",
+            "status": "unsupported",
+            "revision": None,
+            "path_scope": "complete",
+            "paths": [],
+            "total_paths": 0,
+            "detail_code": "revision_observation_unsupported",
+        }
+        final_revision = {
+            "workspace_id": "workspace-1",
+            "status": "unsupported",
+            "revision": None,
+            "path_scope": "complete",
+            "total_paths": 0,
+            "detail_code": "revision_observation_unsupported",
+            "finalization_delta": {
+                "attribution_confidence": "unattributed_finalization_change",
+                "status": "incomplete",
+                "before_revision": None,
+                "after_revision": None,
+                "total_paths": 0,
+                "head_changed": False,
+                "branch_changed": False,
+                "detail_code": "finalization_baseline_unavailable",
+            },
+        }
+        await store.append_events(
+            "workspace-replay",
+            [
+                Event(
+                    id="before-original",
+                    type=EventType.WORKSPACE_REVISION_OBSERVED,
+                    session_id="workspace-replay",
+                    payload=before,
+                ),
+                Event(
+                    id="before-replayed",
+                    type=EventType.WORKSPACE_REVISION_OBSERVED,
+                    session_id="workspace-replay",
+                    payload=before,
+                ),
+                Event(
+                    id="terminal-recovered",
+                    type=EventType.WORKSPACE_OBSERVATION_FINALIZED,
+                    session_id="workspace-replay",
+                    payload={
+                        **common,
+                        "status": "incomplete",
+                        "detail_code": "workspace_revision_evidence_incomplete",
+                    },
+                ),
+                Event(
+                    id="finalize-completed",
+                    type=EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
+                    session_id="workspace-replay",
+                    payload={"final_revision": final_revision},
+                ),
+                Event(
+                    id="session-completed",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id="workspace-replay",
+                    payload={"final_revision": final_revision},
+                ),
+            ],
+        )
+        return await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(
+                root_session_id="workspace-replay",
+                max_sessions=10,
+                max_events=20,
+            ),
+        )
+
+    report = asyncio.run(scenario())
+    session = report.sessions[0]
+
+    assert [ref.event_id for ref in session.workspace_mutations[0].source_refs] == [
+        "before-original",
+        "before-replayed",
+        "terminal-recovered",
+    ]
+    assert session.workspace_finalization is not None
+    assert [ref.event_id for ref in session.workspace_finalization.source_refs] == [
+        "finalize-completed",
+        "session-completed",
+    ]
+    assert RuntimeEvidenceWarningCode.MALFORMED_WORKSPACE_EVIDENCE not in {
+        warning.code for warning in report.warnings
+    }
+
+
+def test_runtime_evidence_keeps_recovered_workspace_terminal_evidence_distinct() -> None:
+    async def scenario():
+        store = InMemorySessionStore()
+        await _create_session(store, "workspace-recovered")
+        await store.append_event(
+            "workspace-recovered",
+            Event(
+                id="recovered-terminal",
+                type=EventType.WORKSPACE_OBSERVATION_FINALIZED,
+                session_id="workspace-recovered",
+                payload={
+                    "window_id": "window-recovered",
+                    "workspace_id": "workspace-1",
+                    "tool_call_id": "call-1",
+                    "tool_round_id": "round-1",
+                    "status": "ambiguous",
+                    "detail_code": "worker_lost_before_tool_outcome_was_durable",
+                    "attribution": {
+                        "confidence": "concurrent_ambiguity",
+                        "writer_isolation": "unknown",
+                        "overlap_detected": False,
+                        "direct_reconciliation": "not_observed",
+                        "detail_code": "workspace_attribution_recovery_incomplete",
+                    },
+                    "revision_before_artifact_id": "artifact-before",
+                    "revision_before_artifact_sha256": "c" * 64,
+                    "revision_before_artifact_size_bytes": 17,
+                    "revision_before_artifact_state": "missing",
+                },
+            ),
+        )
+        return await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(
+                root_session_id="workspace-recovered",
+                max_sessions=10,
+                max_events=20,
+            ),
+        )
+
+    report = asyncio.run(scenario())
+    recovered = report.sessions[0].workspace_mutations[0]
+
+    assert recovered.before is None
+    assert recovered.after is None
+    assert recovered.delta is None
+    assert recovered.terminal is not None and recovered.terminal.status == "ambiguous"
+    assert recovered.attribution is not None
+    assert recovered.attribution.confidence == "concurrent_ambiguity"
+    assert recovered.artifacts[0].state == "missing"
+
+
+def test_runtime_evidence_recovery_supersedes_a_referenced_artifact_state() -> None:
+    async def scenario():
+        store = InMemorySessionStore()
+        await _create_session(store, "workspace-artifact-recovery")
+        common = {
+            "window_id": "window-recovery",
+            "workspace_id": "workspace-1",
+            "tool_call_id": "call-1",
+        }
+        await store.append_events(
+            "workspace-artifact-recovery",
+            [
+                Event(
+                    id="before-referenced",
+                    type=EventType.WORKSPACE_REVISION_OBSERVED,
+                    session_id="workspace-artifact-recovery",
+                    payload={
+                        **common,
+                        "phase": "before",
+                        "status": "supported",
+                        "revision": "revision-before",
+                        "path_scope": "complete",
+                        "total_paths": 1,
+                        "detail_code": None,
+                        "manifest_artifact_id": "artifact-before",
+                        "manifest_artifact_sha256": "d" * 64,
+                        "manifest_artifact_size_bytes": 18,
+                    },
+                ),
+                Event(
+                    id="terminal-missing",
+                    type=EventType.WORKSPACE_OBSERVATION_FINALIZED,
+                    session_id="workspace-artifact-recovery",
+                    payload={
+                        **common,
+                        "status": "incomplete",
+                        "detail_code": "referenced_workspace_artifact_missing",
+                        "revision_before_artifact_id": "artifact-before",
+                        "revision_before_artifact_sha256": "d" * 64,
+                        "revision_before_artifact_size_bytes": 18,
+                        "revision_before_artifact_state": "missing",
+                    },
+                ),
+            ],
+        )
+        return await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(
+                root_session_id="workspace-artifact-recovery",
+                max_sessions=10,
+                max_events=20,
+            ),
+        )
+
+    report = asyncio.run(scenario())
+    mutation = report.sessions[0].workspace_mutations[0]
+
+    assert mutation.artifacts[0].state == "missing"
+    assert RuntimeEvidenceWarningCode.MALFORMED_WORKSPACE_EVIDENCE not in {
+        warning.code for warning in report.warnings
+    }
+
+
+def test_runtime_evidence_keeps_workspace_delta_degradation_states_distinct() -> None:
+    async def scenario():
+        store = InMemorySessionStore()
+        await _create_session(store, "workspace-states")
+        events = []
+        details = {
+            "unsupported": "observation_not_complete",
+            "truncated": "workspace_evidence_quarantined",
+            "failed": "revision_comparison_failed",
+            "incomplete": "observation_not_complete",
+        }
+        for status in ("no_change", "unsupported", "truncated", "failed", "incomplete"):
+            complete = status == "no_change"
+            events.append(
+                Event(
+                    id=f"delta-{status}",
+                    type=EventType.WORKSPACE_MUTATION_RECORDED,
+                    session_id="workspace-states",
+                    payload={
+                        "window_id": f"window-{status}",
+                        "workspace_id": "workspace-1",
+                        "tool_call_id": f"call-{status}",
+                        "status": status,
+                        "before_revision": "same" if complete else None,
+                        "after_revision": "same" if complete else None,
+                        "total_paths": 0,
+                        "head_changed": False,
+                        "branch_changed": False,
+                        "detail_code": details.get(status),
+                    },
+                )
+            )
+        await store.append_events("workspace-states", events)
+        return await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(
+                root_session_id="workspace-states",
+                max_sessions=10,
+                max_events=20,
+            ),
+        )
+
+    report = asyncio.run(scenario())
+
+    assert tuple(
+        mutation.delta.status
+        for mutation in report.sessions[0].workspace_mutations
+        if mutation.delta is not None
+    ) == ("no_change", "unsupported", "truncated", "failed", "incomplete")
+
+
+def test_runtime_evidence_accepts_current_workspace_producer_detail_codes() -> None:
+    async def scenario():
+        store = InMemorySessionStore()
+        await _create_session(store, "workspace-producer-details")
+        await store.append_events(
+            "workspace-producer-details",
+            [
+                Event(
+                    id="file-limit-before",
+                    type=EventType.WORKSPACE_REVISION_OBSERVED,
+                    session_id="workspace-producer-details",
+                    payload={
+                        "window_id": "window-file-limit",
+                        "workspace_id": "workspace-1",
+                        "tool_call_id": "call-file-limit",
+                        "phase": "before",
+                        "status": "truncated",
+                        "revision": None,
+                        "path_scope": "complete",
+                        "total_paths": 1,
+                        "detail_code": "file_byte_limit_exceeded",
+                    },
+                ),
+                Event(
+                    id="file-limit-terminal",
+                    type=EventType.WORKSPACE_OBSERVATION_FINALIZED,
+                    session_id="workspace-producer-details",
+                    payload={
+                        "window_id": "window-file-limit",
+                        "workspace_id": "workspace-1",
+                        "tool_call_id": "call-file-limit",
+                        "status": "incomplete",
+                        "detail_code": "workspace_revision_evidence_incomplete",
+                    },
+                ),
+                Event(
+                    id="artifact-write-delta",
+                    type=EventType.WORKSPACE_MUTATION_RECORDED,
+                    session_id="workspace-producer-details",
+                    payload={
+                        "window_id": "window-artifact-write",
+                        "workspace_id": "workspace-1",
+                        "tool_call_id": "call-artifact-write",
+                        "status": "truncated",
+                        "before_revision": None,
+                        "after_revision": None,
+                        "total_paths": 0,
+                        "head_changed": False,
+                        "branch_changed": False,
+                        "detail_code": "manifest_artifact_write_failed",
+                    },
+                ),
+                Event(
+                    id="artifact-write-terminal",
+                    type=EventType.WORKSPACE_OBSERVATION_FINALIZED,
+                    session_id="workspace-producer-details",
+                    payload={
+                        "window_id": "window-artifact-write",
+                        "workspace_id": "workspace-1",
+                        "tool_call_id": "call-artifact-write",
+                        "status": "incomplete",
+                        "detail_code": "workspace_revision_evidence_incomplete",
+                    },
+                ),
+            ],
+        )
+        return await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(
+                root_session_id="workspace-producer-details",
+                max_sessions=10,
+                max_events=20,
+            ),
+        )
+
+    report = asyncio.run(scenario())
+    first, second = report.sessions[0].workspace_mutations
+
+    assert first.before is not None
+    assert first.before.detail_code == "file_byte_limit_exceeded"
+    assert second.delta is not None
+    assert second.delta.detail_code == "manifest_artifact_write_failed"
+    assert RuntimeEvidenceWarningCode.MALFORMED_WORKSPACE_EVIDENCE not in {
+        warning.code for warning in report.warnings
+    }
+
+
+@pytest.mark.parametrize(
+    ("delta_before", "delta_after"),
+    [
+        ("different-before", "observed-after"),
+        ("observed-before", "different-after"),
+    ],
+)
+def test_runtime_evidence_rejects_contradictory_workspace_revision_chain(
+    delta_before: str,
+    delta_after: str,
+) -> None:
+    async def scenario():
+        store = InMemorySessionStore()
+        await _create_session(store, "workspace-chain-conflict")
+        common = {
+            "window_id": "window-conflict",
+            "workspace_id": "workspace-1",
+            "tool_call_id": "call-1",
+        }
+        await store.append_events(
+            "workspace-chain-conflict",
+            [
+                Event(
+                    id="chain-before",
+                    type=EventType.WORKSPACE_REVISION_OBSERVED,
+                    session_id="workspace-chain-conflict",
+                    payload={
+                        **common,
+                        "phase": "before",
+                        "status": "supported",
+                        "revision": "observed-before",
+                        "path_scope": "complete",
+                        "total_paths": 0,
+                        "detail_code": None,
+                    },
+                ),
+                Event(
+                    id="chain-after",
+                    type=EventType.WORKSPACE_REVISION_OBSERVED,
+                    session_id="workspace-chain-conflict",
+                    payload={
+                        **common,
+                        "phase": "after",
+                        "status": "supported",
+                        "revision": "observed-after",
+                        "path_scope": "complete",
+                        "total_paths": 0,
+                        "detail_code": None,
+                    },
+                ),
+                Event(
+                    id="chain-delta",
+                    type=EventType.WORKSPACE_MUTATION_RECORDED,
+                    session_id="workspace-chain-conflict",
+                    payload={
+                        **common,
+                        "status": "changed",
+                        "before_revision": delta_before,
+                        "after_revision": delta_after,
+                        "total_paths": 1,
+                        "head_changed": False,
+                        "branch_changed": False,
+                        "detail_code": None,
+                    },
+                ),
+                Event(
+                    id="chain-terminal",
+                    type=EventType.WORKSPACE_OBSERVATION_FINALIZED,
+                    session_id="workspace-chain-conflict",
+                    payload={**common, "status": "complete", "detail_code": None},
+                ),
+            ],
+        )
+        return await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(
+                root_session_id="workspace-chain-conflict",
+                max_sessions=10,
+                max_events=20,
+            ),
+        )
+
+    report = asyncio.run(scenario())
+
+    assert report.sessions[0].workspace_mutations == ()
+    assert RuntimeEvidenceWarningCode.MALFORMED_WORKSPACE_EVIDENCE in {
+        warning.code for warning in report.warnings
+    }
+
+
+def test_runtime_evidence_rejects_complete_terminal_for_incomplete_delta() -> None:
+    async def scenario():
+        store = InMemorySessionStore()
+        await _create_session(store, "workspace-terminal-conflict")
+        common = {
+            "window_id": "window-terminal-conflict",
+            "workspace_id": "workspace-1",
+            "tool_call_id": "call-1",
+        }
+        await store.append_events(
+            "workspace-terminal-conflict",
+            [
+                Event(
+                    id="incomplete-delta",
+                    type=EventType.WORKSPACE_MUTATION_RECORDED,
+                    session_id="workspace-terminal-conflict",
+                    payload={
+                        **common,
+                        "status": "incomplete",
+                        "before_revision": None,
+                        "after_revision": None,
+                        "total_paths": 0,
+                        "head_changed": False,
+                        "branch_changed": False,
+                        "detail_code": "observation_not_complete",
+                    },
+                ),
+                Event(
+                    id="false-complete-terminal",
+                    type=EventType.WORKSPACE_OBSERVATION_FINALIZED,
+                    session_id="workspace-terminal-conflict",
+                    payload={**common, "status": "complete", "detail_code": None},
+                ),
+            ],
+        )
+        return await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(
+                root_session_id="workspace-terminal-conflict",
+                max_sessions=10,
+                max_events=20,
+            ),
+        )
+
+    report = asyncio.run(scenario())
+
+    assert report.sessions[0].workspace_mutations == ()
+    assert RuntimeEvidenceWarningCode.MALFORMED_WORKSPACE_EVIDENCE in {
+        warning.code for warning in report.warnings
+    }
+
+
+@pytest.mark.parametrize(
+    ("delta_after", "attribution_confidence"),
+    [
+        ("different-final", "unattributed_finalization_change"),
+        ("final-observation", "exclusive_tool"),
+    ],
+)
+def test_runtime_evidence_rejects_incoherent_workspace_finalization_delta(
+    delta_after: str,
+    attribution_confidence: str,
+) -> None:
+    async def scenario():
+        store = InMemorySessionStore()
+        await _create_session(store, "workspace-finalization-conflict")
+        await store.append_event(
+            "workspace-finalization-conflict",
+            Event(
+                id="incoherent-finalization",
+                type=EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
+                session_id="workspace-finalization-conflict",
+                payload={
+                    "binding_generation_id": "generation-1",
+                    "final_revision": {
+                        "workspace_id": "workspace-1",
+                        "status": "supported",
+                        "revision": "final-observation",
+                        "path_scope": "complete",
+                        "total_paths": 0,
+                        "detail_code": None,
+                        "finalization_delta": {
+                            "attribution_confidence": attribution_confidence,
+                            "status": "changed",
+                            "before_revision": "before",
+                            "after_revision": delta_after,
+                            "total_paths": 1,
+                            "head_changed": False,
+                            "branch_changed": False,
+                            "detail_code": None,
+                        },
+                    },
+                },
+            ),
+        )
+        return await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(
+                root_session_id="workspace-finalization-conflict",
+                max_sessions=10,
+                max_events=20,
+            ),
+        )
+
+    report = asyncio.run(scenario())
+
+    assert report.sessions[0].workspace_finalization is None
+    assert RuntimeEvidenceWarningCode.MALFORMED_WORKSPACE_EVIDENCE in {
+        warning.code for warning in report.warnings
+    }
+
+
+def test_runtime_evidence_selects_latest_workspace_binding_generation() -> None:
+    async def scenario():
+        store = InMemorySessionStore()
+        await _create_session(store, "workspace-resumed-finalization")
+
+        def final_revision(revision: str) -> dict[str, object]:
+            return {
+                "workspace_id": "workspace-1",
+                "status": "supported",
+                "revision": revision,
+                "path_scope": "complete",
+                "total_paths": 0,
+                "detail_code": None,
+            }
+
+        await store.append_events(
+            "workspace-resumed-finalization",
+            [
+                Event(
+                    id="generation-1-finalized",
+                    type=EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
+                    session_id="workspace-resumed-finalization",
+                    payload={
+                        "binding_generation_id": "generation-1",
+                        "final_revision": final_revision("revision-1"),
+                    },
+                ),
+                Event(
+                    id="generation-2-finalized",
+                    type=EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
+                    session_id="workspace-resumed-finalization",
+                    payload={
+                        "binding_generation_id": "generation-2",
+                        "final_revision": final_revision("revision-2"),
+                    },
+                ),
+                Event(
+                    id="generation-1-replayed",
+                    type=EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
+                    session_id="workspace-resumed-finalization",
+                    payload={
+                        "binding_generation_id": "generation-1",
+                        "final_revision": final_revision("revision-1"),
+                    },
+                ),
+                Event(
+                    id="generation-2-session-terminal",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id="workspace-resumed-finalization",
+                    payload={"final_revision": final_revision("revision-2")},
+                ),
+            ],
+        )
+        return await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(
+                root_session_id="workspace-resumed-finalization",
+                max_sessions=10,
+                max_events=20,
+            ),
+        )
+
+    report = asyncio.run(scenario())
+    finalization = report.sessions[0].workspace_finalization
+
+    assert finalization is not None
+    assert finalization.binding_generation_id == "generation-2"
+    assert finalization.revision == "revision-2"
+    assert [ref.event_id for ref in finalization.source_refs] == [
+        "generation-2-finalized",
+        "generation-2-session-terminal",
+    ]
+    assert RuntimeEvidenceWarningCode.MALFORMED_WORKSPACE_EVIDENCE not in {
+        warning.code for warning in report.warnings
+    }
+
+
+def test_runtime_evidence_retains_workspace_terminal_recovery_epochs() -> None:
+    async def scenario():
+        store = InMemorySessionStore()
+        await _create_session(store, "workspace-terminal-epochs")
+        events = []
+        for window_id, recovery_run_epoch in (("direct", 1), ("recovered", 2)):
+            common = {
+                "window_id": f"window-{window_id}",
+                "workspace_id": "workspace-1",
+                "tool_call_id": f"call-{window_id}",
+            }
+            events.extend(
+                [
+                    Event(
+                        id=f"{window_id}-delta",
+                        type=EventType.WORKSPACE_MUTATION_RECORDED,
+                        session_id="workspace-terminal-epochs",
+                        payload={
+                            **common,
+                            "status": "changed",
+                            "before_revision": f"{window_id}-before",
+                            "after_revision": f"{window_id}-after",
+                            "total_paths": 1,
+                            "head_changed": False,
+                            "branch_changed": False,
+                            "detail_code": None,
+                        },
+                    ),
+                    Event(
+                        id=f"{window_id}-terminal",
+                        type=EventType.WORKSPACE_OBSERVATION_FINALIZED,
+                        session_id="workspace-terminal-epochs",
+                        payload={
+                            **common,
+                            "session_run_epoch": 1,
+                            "recovery_run_epoch": recovery_run_epoch,
+                            "binding_generation_id": "generation-1",
+                            "status": "complete",
+                            "detail_code": None,
+                        },
+                    ),
+                ]
+            )
+        await store.append_events("workspace-terminal-epochs", events)
+        return await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(
+                root_session_id="workspace-terminal-epochs",
+                max_sessions=10,
+                max_events=20,
+            ),
+        )
+
+    report = asyncio.run(scenario())
+    direct, recovered = report.sessions[0].workspace_mutations
+
+    assert direct.terminal is not None
+    assert direct.terminal.session_run_epoch == direct.terminal.recovery_run_epoch == 1
+    assert direct.terminal.binding_generation_id == "generation-1"
+    assert recovered.terminal is not None
+    assert recovered.terminal.session_run_epoch == 1
+    assert recovered.terminal.recovery_run_epoch == 2
+    assert recovered.terminal.binding_generation_id == "generation-1"
+
+
+def test_runtime_evidence_warns_for_malformed_workspace_shapes_without_crashing() -> None:
+    async def scenario():
+        store = InMemorySessionStore()
+        await _create_session(store, "workspace-malformed")
+        await store.append_events(
+            "workspace-malformed",
+            [
+                Event(
+                    id="invalid-enum",
+                    type=EventType.WORKSPACE_REVISION_OBSERVED,
+                    session_id="workspace-malformed",
+                    payload={
+                        "window_id": "enum-window",
+                        "workspace_id": "workspace-1",
+                        "tool_call_id": "call-1",
+                        "phase": "middle",
+                        "status": "supported",
+                        "revision": "revision",
+                        "path_scope": "complete",
+                        "total_paths": 0,
+                    },
+                ),
+                Event(
+                    id="invalid-digest",
+                    type=EventType.WORKSPACE_MUTATION_RECORDED,
+                    session_id="workspace-malformed",
+                    payload={
+                        "window_id": "digest-window",
+                        "workspace_id": "workspace-1",
+                        "tool_call_id": "call-2",
+                        "status": "changed",
+                        "before_revision": "before",
+                        "after_revision": "after",
+                        "total_paths": 1,
+                        "head_changed": False,
+                        "branch_changed": False,
+                        "manifest_artifact_id": "artifact-1",
+                        "manifest_artifact_sha256": "not-a-digest",
+                        "manifest_artifact_size_bytes": 10,
+                    },
+                ),
+                Event(
+                    id="invalid-identifier",
+                    type=EventType.WORKSPACE_OBSERVATION_FINALIZED,
+                    session_id="workspace-malformed",
+                    payload={
+                        "window_id": " ",
+                        "workspace_id": "workspace-1",
+                        "tool_call_id": "call-3",
+                        "status": "failed",
+                        "detail_code": "receipt_publication_failed",
+                    },
+                ),
+                Event(
+                    id="invalid-count",
+                    type=EventType.WORKSPACE_MUTATION_RECORDED,
+                    session_id="workspace-malformed",
+                    payload={
+                        "window_id": "count-window",
+                        "workspace_id": "workspace-1",
+                        "tool_call_id": "call-4",
+                        "status": "changed",
+                        "before_revision": "before",
+                        "after_revision": "after",
+                        "total_paths": -1,
+                        "head_changed": False,
+                        "branch_changed": False,
+                    },
+                ),
+                Event(
+                    id="invalid-finalization",
+                    type=EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
+                    session_id="workspace-malformed",
+                    payload={
+                        "final_revision": {
+                            "workspace_id": "workspace-1",
+                            "status": "mystery",
+                            "revision": None,
+                            "path_scope": "complete",
+                            "total_paths": 0,
+                        }
+                    },
+                ),
+            ],
+        )
+        return await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(
+                root_session_id="workspace-malformed",
+                max_sessions=10,
+                max_events=20,
+            ),
+        )
+
+    report = asyncio.run(scenario())
+    session = report.sessions[0]
+    malformed = [
+        warning
+        for warning in report.warnings
+        if warning.code is RuntimeEvidenceWarningCode.MALFORMED_WORKSPACE_EVIDENCE
+    ]
+
+    assert session.workspace_mutations == ()
+    assert session.workspace_finalization is None
+    assert {warning.event_id for warning in malformed} == {
+        "invalid-enum",
+        "invalid-digest",
+        "invalid-identifier",
+        "invalid-count",
+        "invalid-finalization",
+    }
+
+
+def test_runtime_evidence_workspace_projection_matches_memory_and_sqlite(tmp_path: Path) -> None:
+    async def build(store: SessionStore):
+        await _create_session(store, "workspace-parity")
+        await store.append_event(
+            "workspace-parity",
+            Event(
+                id="parity-delta",
+                type=EventType.WORKSPACE_MUTATION_RECORDED,
+                session_id="workspace-parity",
+                payload={
+                    "window_id": "window-parity",
+                    "workspace_id": "workspace-1",
+                    "tool_call_id": "call-1",
+                    "status": "no_change",
+                    "before_revision": "same",
+                    "after_revision": "same",
+                    "total_paths": 0,
+                    "head_changed": False,
+                    "branch_changed": False,
+                    "detail_code": None,
+                },
+            ),
+        )
+        return await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(
+                root_session_id="workspace-parity",
+                max_sessions=10,
+                max_events=20,
+            ),
+        )
+
+    async def scenario():
+        memory = InMemorySessionStore()
+        sqlite = SQLiteSessionStore(tmp_path / "workspace-parity.sqlite")
+        memory_report = await build(memory)
+        sqlite_report = await build(sqlite)
+        await sqlite.close()
+        return memory_report, sqlite_report
+
+    memory_report, sqlite_report = asyncio.run(scenario())
+
+    assert memory_report.model_dump(mode="json") == sqlite_report.model_dump(mode="json")
+
+
 def test_runtime_evidence_projects_bounded_lineage_attempts_and_safe_totals() -> None:
     async def scenario():
         store = InMemorySessionStore()
@@ -327,7 +1465,7 @@ def test_runtime_evidence_projects_bounded_lineage_attempts_and_safe_totals() ->
 
     report = asyncio.run(scenario())
 
-    assert report.schema_version == 2
+    assert report.schema_version == 3
     assert report.scope.descendant_session_ids == ("root", "child")
     assert [session.session_id for session in report.sessions] == ["root", "child"]
     assert report.sessions[1].parent_session_id == "root"
@@ -1307,7 +2445,7 @@ async def _minimal_golden_report(
     )
 
 
-def test_runtime_evidence_sqlite_restart_and_v2_golden_are_exact(tmp_path: Path) -> None:
+def test_runtime_evidence_sqlite_restart_and_v3_golden_are_exact(tmp_path: Path) -> None:
     async def scenario():
         database = tmp_path / "runtime-evidence.sqlite"
         first_store = SQLiteSessionStore(database)
@@ -1323,7 +2461,7 @@ def test_runtime_evidence_sqlite_restart_and_v2_golden_are_exact(tmp_path: Path)
 
     first, second = asyncio.run(scenario())
     assert first == second
-    golden_path = Path(__file__).parents[1] / "fixtures" / "runtime_evidence_v2.json"
+    golden_path = Path(__file__).parents[1] / "fixtures" / "runtime_evidence_v3.json"
     assert first.model_dump(mode="json") == json.loads(golden_path.read_text())
 
 

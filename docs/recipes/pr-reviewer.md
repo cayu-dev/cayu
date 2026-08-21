@@ -229,6 +229,42 @@ needs exact inspection, the agent should use `read_file` against the workspace.
 `session.failed` event, so branch on `EventType.SESSION_FAILED` and read the answer
 with `final_output_text(transcript)` rather than expecting an exception.
 
+## 7. Read workspace evidence without exposing the checkout
+
+After the run reaches a terminal event, use the canonical bounded evidence read model
+to confirm what happened in the Git-backed review workspace:
+
+```python
+from cayu import RuntimeEvidenceRequest, runtime_evidence
+
+evidence = await runtime_evidence(
+    app,
+    RuntimeEvidenceRequest(
+        root_session_id=request.session_id,
+        max_sessions=1,
+        max_events=2_000,
+    ),
+)
+review = evidence.sessions[0]
+for mutation in review.workspace_mutations:
+    print(
+        mutation.tool_call_id,
+        mutation.delta.status if mutation.delta else "delta unavailable",
+        mutation.attribution.confidence if mutation.attribution else "unattributed",
+        mutation.terminal.status if mutation.terminal else "not finalized",
+    )
+
+if review.workspace_finalization is not None:
+    print(review.workspace_finalization.status, review.workspace_finalization.revision)
+```
+
+The schema-v3 summaries expose revision identities, statuses, counts, attribution,
+artifact references, and source-event references. They deliberately omit checkout
+paths, branch names, file contents, direct operation payloads, tool arguments/results,
+and credentials, so this is the appropriate default for logs and review bookkeeping.
+Use an explicitly authorized, bounded event/artifact read only when an operator needs
+the exact private detail behind a retained source reference.
+
 ## Going to production
 
 - **Durability:** back the app with `PostgresSessionStore` / `PostgresTaskStore`

@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import ROUND_HALF_EVEN, Context, Decimal, localcontext
 from enum import IntEnum, StrEnum
 from heapq import heappop, heappush
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import (
     BaseModel,
@@ -43,8 +43,12 @@ from cayu.runtime.sessions import (
 from cayu.runtime.tasks import TaskTopologyQuery
 from cayu.runtime.tool_policy import taint_labels_from_metadata
 from cayu.runtime.usage import AggregateCount, UsageMetrics, usage_metrics_from_event_payload
+from cayu.runtime.workspace_observation_recovery import (
+    WORKSPACE_OBSERVATION_TERMINAL_CONTROLS,
+    workspace_observation_terminal_from_delta_status,
+)
 
-RUNTIME_EVIDENCE_SCHEMA_VERSION = 2
+RUNTIME_EVIDENCE_SCHEMA_VERSION = 3
 
 _HARD_MAX_SESSIONS = 500
 _HARD_MAX_EVENTS = 100_000
@@ -72,6 +76,80 @@ _MODEL_CONFIG = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=Tru
 _ToolCallStatus = Literal["started", "completed", "failed", "blocked"]
 _ApprovalDecision = Literal["pending", "approved", "denied", "expired", "blocked"]
 _PolicyDecision = Literal["allow", "deny", "require_approval", "ambiguous"]
+
+_WORKSPACE_REVISION_DETAIL_CODES = frozenset(
+    {
+        "final_revision_observer_failed",
+        "final_revision_observer_capacity_exhausted",
+        "final_revision_observer_limit_exceeded",
+        "final_revision_secret_scope_unavailable",
+        "final_revision_observer_timeout",
+        "file_byte_limit_exceeded",
+        "manifest_artifact_reference_invalid",
+        "manifest_artifact_store_inside_workspace",
+        "manifest_artifact_store_unavailable",
+        "manifest_artifact_write_failed",
+        "manifest_artifact_write_unsettled",
+        "manifest_byte_limit_exceeded",
+        "manifest_redaction_failed",
+        "path_byte_limit_exceeded",
+        "path_count_limit_exceeded",
+        "revision_observation_unsupported",
+        "revision_observer_capacity_exhausted",
+        "revision_observer_failed",
+        "revision_observer_limit_exceeded",
+        "revision_observer_timeout",
+        "total_file_byte_limit_exceeded",
+        "unsafe_workspace_path",
+        "workspace_file_read_failed",
+        "workspace_evidence_quarantined",
+        "workspace_list_failed",
+    }
+)
+_WORKSPACE_DELTA_DETAIL_CODES = _WORKSPACE_REVISION_DETAIL_CODES | frozenset(
+    {
+        "finalization_baseline_evidence_incomplete",
+        "finalization_baseline_unavailable",
+        "finalization_delta_secret_scope_unavailable",
+        "manifest_artifact_reference_invalid",
+        "manifest_artifact_store_inside_workspace",
+        "manifest_artifact_store_unavailable",
+        "manifest_artifact_write_unsettled",
+        "manifest_redaction_failed",
+        "observation_not_complete",
+        "observation_path_scope_mismatch",
+        "publication_storage_exhausted",
+        "revision_comparison_failed",
+        "workspace_evidence_quarantined",
+    }
+)
+_WORKSPACE_ATTRIBUTION_DETAIL_CODES = frozenset(
+    {
+        "direct_and_observed_workspace_evidence_conflict",
+        "exclusive_writer_isolation_unproven",
+        "exclusive_writer_isolation_verified",
+        "overlapping_workspace_mutation_windows",
+        "workspace_attribution_recovery_incomplete",
+        "workspace_evidence_quarantined",
+        "workspace_resource_identity_unavailable",
+    }
+)
+_WORKSPACE_TERMINAL_DETAIL_CODES = frozenset(
+    {
+        "durable_tool_outcome_evidence_missing",
+        "mutation_settlement_unproven",
+        "receipt_publication_failed",
+        "receipt_publication_interrupted",
+        "referenced_workspace_artifact_missing",
+        "worker_lost_before_tool_outcome_was_durable",
+        "worker_lost_before_workspace_observation_completed",
+        "workspace_artifact_verification_failed",
+        "workspace_delta_evidence_conflict",
+        "workspace_delta_evidence_missing",
+        "workspace_revision_comparison_failed",
+        "workspace_revision_evidence_incomplete",
+    }
+)
 
 
 class _OperationPrecedence(IntEnum):
@@ -138,6 +216,7 @@ class RuntimeEvidenceWarningCode(StrEnum):
     MALFORMED_POLICY_DECISION = "malformed_policy_decision"
     MALFORMED_TAINT_LABELS = "malformed_taint_labels"
     MALFORMED_EXECUTION_PROFILE = "malformed_execution_profile"
+    MALFORMED_WORKSPACE_EVIDENCE = "malformed_workspace_evidence"
     ORIGIN_EVIDENCE_UNAVAILABLE = "origin_evidence_unavailable"
     TASK_EVIDENCE_UNAVAILABLE = "task_evidence_unavailable"
     TASK_EVIDENCE_PARTIAL = "task_evidence_partial"
@@ -557,6 +636,307 @@ class RuntimeEvidenceRecoverySummary(BaseModel):
     source_refs: tuple[RuntimeEvidenceSourceRef, ...] = ()
 
 
+class RuntimeEvidenceWorkspaceArtifact(BaseModel):
+    """Content-free workspace evidence artifact reference."""
+
+    model_config = _MODEL_CONFIG
+
+    kind: Literal["revision-before", "revision-after", "revision-delta"]
+    artifact_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
+    sha256: str = Field(min_length=64, max_length=64)
+    size_bytes: StrictInt = Field(ge=1, le=16 * 1024 * 1024)
+    state: Literal["intent", "published", "referenced", "failed", "orphaned", "missing"]
+
+    @field_validator("artifact_id")
+    @classmethod
+    def validate_artifact_id(cls, value: str) -> str:
+        return require_clean_nonblank(value, "artifact_id")
+
+    @field_validator("sha256")
+    @classmethod
+    def validate_sha256(cls, value: str) -> str:
+        if any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("sha256 must be a lowercase SHA-256 digest.")
+        return value
+
+
+class RuntimeEvidenceWorkspaceRevision(BaseModel):
+    """Path-free summary of one workspace revision observation."""
+
+    model_config = _MODEL_CONFIG
+
+    phase: Literal["before", "after"]
+    status: Literal["supported", "unsupported", "failed", "incomplete", "truncated"]
+    revision: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
+    path_scope: Literal["complete", "changed"]
+    total_paths: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    detail_code: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
+    source_ref: RuntimeEvidenceSourceRef
+
+    @field_validator("revision")
+    @classmethod
+    def validate_optional_revision(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, "revision")
+
+    @field_validator("detail_code")
+    @classmethod
+    def validate_detail_code(cls, value: str | None) -> str | None:
+        if value is not None and value not in _WORKSPACE_REVISION_DETAIL_CODES:
+            raise ValueError("detail_code is not a fixed workspace revision value.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_revision_shape(self) -> RuntimeEvidenceWorkspaceRevision:
+        if (self.status == "supported") != (self.revision is not None):
+            raise ValueError("Only supported workspace observations may carry a revision.")
+        return self
+
+
+class RuntimeEvidenceWorkspaceDelta(BaseModel):
+    """Path-free summary of one workspace revision delta."""
+
+    model_config = _MODEL_CONFIG
+
+    status: Literal["changed", "no_change", "unsupported", "failed", "incomplete", "truncated"]
+    before_revision: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
+    after_revision: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
+    total_paths: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    head_changed: StrictBool
+    branch_changed: StrictBool
+    detail_code: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
+    attribution_confidence: (
+        Literal[
+            "exclusive_tool",
+            "concurrent_ambiguity",
+            "external_or_unknown",
+            "unattributed_finalization_change",
+        ]
+        | None
+    ) = None
+    source_ref: RuntimeEvidenceSourceRef
+
+    @field_validator("before_revision", "after_revision")
+    @classmethod
+    def validate_optional_revision(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("detail_code")
+    @classmethod
+    def validate_detail_code(cls, value: str | None) -> str | None:
+        if value is not None and value not in _WORKSPACE_DELTA_DETAIL_CODES:
+            raise ValueError("detail_code is not a fixed workspace delta value.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_delta_shape(self) -> RuntimeEvidenceWorkspaceDelta:
+        complete = self.status in {"changed", "no_change"}
+        has_revisions = self.before_revision is not None and self.after_revision is not None
+        if complete and not has_revisions:
+            raise ValueError("Complete workspace deltas require both revisions.")
+        if self.status == "no_change" and (
+            self.before_revision != self.after_revision
+            or self.total_paths != 0
+            or self.head_changed
+            or self.branch_changed
+        ):
+            raise ValueError("A no-change workspace delta cannot contain change evidence.")
+        return self
+
+
+class RuntimeEvidenceWorkspaceAttribution(BaseModel):
+    """Safe classification of responsibility for one workspace mutation."""
+
+    model_config = _MODEL_CONFIG
+
+    confidence: Literal[
+        "exclusive_tool",
+        "concurrent_ambiguity",
+        "external_or_unknown",
+        "unattributed_finalization_change",
+    ]
+    writer_isolation: Literal["exclusive", "shared", "unknown"]
+    overlap_detected: StrictBool
+    direct_reconciliation: Literal[
+        "not_observed",
+        "consistent",
+        "incomplete",
+        "contradictory",
+        "truncated",
+    ]
+    detail_code: str = Field(max_length=_MAX_IDENTITY_CHARS)
+
+    @field_validator("detail_code")
+    @classmethod
+    def validate_detail_code(cls, value: str) -> str:
+        value = require_clean_nonblank(value, "detail_code")
+        if value not in _WORKSPACE_ATTRIBUTION_DETAIL_CODES:
+            raise ValueError("detail_code is not a fixed workspace attribution value.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_attribution_shape(self) -> RuntimeEvidenceWorkspaceAttribution:
+        if self.confidence == "exclusive_tool" and (
+            self.writer_isolation != "exclusive"
+            or self.overlap_detected
+            or self.direct_reconciliation == "contradictory"
+        ):
+            raise ValueError("Exclusive workspace attribution requires exclusive evidence.")
+        if (
+            self.confidence == "unattributed_finalization_change"
+            and self.writer_isolation == "exclusive"
+        ):
+            raise ValueError("Finalization-only change cannot claim exclusive isolation.")
+        return self
+
+
+class RuntimeEvidenceWorkspaceTerminal(BaseModel):
+    """Final durable state of one workspace-observation window."""
+
+    model_config = _MODEL_CONFIG
+
+    status: Literal["complete", "incomplete", "ambiguous", "failed"]
+    detail_code: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
+    session_run_epoch: StrictInt | None = Field(default=None, ge=1)
+    recovery_run_epoch: StrictInt | None = Field(default=None, ge=1)
+    binding_generation_id: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
+    source_ref: RuntimeEvidenceSourceRef
+
+    @field_validator("binding_generation_id")
+    @classmethod
+    def validate_optional_identity(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, "binding_generation_id")
+
+    @field_validator("detail_code")
+    @classmethod
+    def validate_detail_code(cls, value: str | None) -> str | None:
+        if value is not None and value not in _WORKSPACE_TERMINAL_DETAIL_CODES:
+            raise ValueError("detail_code is not a fixed workspace terminal value.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_terminal_shape(self) -> RuntimeEvidenceWorkspaceTerminal:
+        if (self.status, self.detail_code) not in WORKSPACE_OBSERVATION_TERMINAL_CONTROLS:
+            raise ValueError("Workspace terminal status and detail code are inconsistent.")
+        if (self.session_run_epoch is None) != (self.recovery_run_epoch is None):
+            raise ValueError("Workspace terminal run epochs must be retained together.")
+        if (
+            self.session_run_epoch is not None
+            and self.recovery_run_epoch is not None
+            and self.recovery_run_epoch < self.session_run_epoch
+        ):
+            raise ValueError("Workspace terminal recovery cannot precede its source run.")
+        return self
+
+
+class RuntimeEvidenceWorkspaceMutation(BaseModel):
+    """Correlated, content-free evidence for one workspace mutation window."""
+
+    model_config = _MODEL_CONFIG
+
+    window_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
+    workspace_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
+    tool_call_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
+    tool_round_id: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
+    before: RuntimeEvidenceWorkspaceRevision | None = None
+    after: RuntimeEvidenceWorkspaceRevision | None = None
+    delta: RuntimeEvidenceWorkspaceDelta | None = None
+    attribution: RuntimeEvidenceWorkspaceAttribution | None = None
+    terminal: RuntimeEvidenceWorkspaceTerminal | None = None
+    artifacts: tuple[RuntimeEvidenceWorkspaceArtifact, ...] = ()
+    source_refs: tuple[RuntimeEvidenceSourceRef, ...] = ()
+
+    @field_validator("window_id", "workspace_id", "tool_call_id", "tool_round_id")
+    @classmethod
+    def validate_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_correlated_evidence(self) -> RuntimeEvidenceWorkspaceMutation:
+        if self.delta is not None:
+            if self.before is not None and self.before.revision != self.delta.before_revision:
+                raise ValueError("Workspace before revision contradicts the retained delta.")
+            if self.after is not None and self.after.revision != self.delta.after_revision:
+                raise ValueError("Workspace after revision contradicts the retained delta.")
+        if (
+            self.terminal is not None
+            and self.terminal.status == "complete"
+            and (self.delta is None or self.delta.status not in {"changed", "no_change"})
+        ):
+            raise ValueError("Complete workspace terminal evidence requires a complete delta.")
+        if (
+            self.delta is not None
+            and self.terminal is not None
+            and self.terminal.session_run_epoch is not None
+            and self.terminal.recovery_run_epoch == self.terminal.session_run_epoch
+        ):
+            expected_status, expected_detail = workspace_observation_terminal_from_delta_status(
+                self.delta.status,
+                detail_code=self.delta.detail_code,
+            )
+            if (self.terminal.status, self.terminal.detail_code) != (
+                expected_status.value,
+                expected_detail,
+            ):
+                raise ValueError("Workspace terminal evidence contradicts its direct-run delta.")
+        return self
+
+
+class RuntimeEvidenceWorkspaceFinalization(BaseModel):
+    """Last safely observable workspace state at environment finalization."""
+
+    model_config = _MODEL_CONFIG
+
+    workspace_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
+    binding_generation_id: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
+    status: Literal["supported", "unsupported", "failed", "incomplete", "truncated"]
+    revision: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
+    path_scope: Literal["complete", "changed"]
+    total_paths: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    detail_code: str | None = Field(default=None, max_length=_MAX_IDENTITY_CHARS)
+    delta: RuntimeEvidenceWorkspaceDelta | None = None
+    source_refs: tuple[RuntimeEvidenceSourceRef, ...] = ()
+
+    @field_validator("workspace_id", "binding_generation_id")
+    @classmethod
+    def validate_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("revision")
+    @classmethod
+    def validate_optional_revision(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, "revision")
+
+    @field_validator("detail_code")
+    @classmethod
+    def validate_detail_code(cls, value: str | None) -> str | None:
+        if value is not None and value not in _WORKSPACE_REVISION_DETAIL_CODES:
+            raise ValueError("detail_code is not a fixed workspace finalization value.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_final_revision_shape(self) -> RuntimeEvidenceWorkspaceFinalization:
+        if (self.status == "supported") != (self.revision is not None):
+            raise ValueError("Only supported workspace finalization may carry a revision.")
+        if self.delta is not None:
+            if self.delta.after_revision != self.revision:
+                raise ValueError("Finalization delta must end at the retained final revision.")
+            if self.delta.attribution_confidence != "unattributed_finalization_change":
+                raise ValueError("Finalization delta cannot claim tool attribution.")
+        return self
+
+
 class RuntimeEvidenceSession(BaseModel):
     """Stable, safe evidence projection for one durable session."""
 
@@ -582,6 +962,8 @@ class RuntimeEvidenceSession(BaseModel):
     policy_decisions: tuple[RuntimeEvidencePolicyDecision, ...] = ()
     recovery: RuntimeEvidenceRecoverySummary
     receipts: tuple[RuntimeEvidenceReceipt, ...] = ()
+    workspace_mutations: tuple[RuntimeEvidenceWorkspaceMutation, ...] = ()
+    workspace_finalization: RuntimeEvidenceWorkspaceFinalization | None = None
     totals: RuntimeEvidenceTotals
 
 
@@ -614,7 +996,7 @@ class RuntimeEvidenceReport(BaseModel):
 
     model_config = _MODEL_CONFIG
 
-    schema_version: Literal[2] = RUNTIME_EVIDENCE_SCHEMA_VERSION
+    schema_version: Literal[3] = RUNTIME_EVIDENCE_SCHEMA_VERSION
     root_session_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
     scope: RuntimeEvidenceScope
     sessions: tuple[RuntimeEvidenceSession, ...] = Field(max_length=_HARD_MAX_SESSIONS)
@@ -691,6 +1073,31 @@ class _CompactionRecord:
     compaction_id: str
     status: Literal["started", "completed", "failed"] = "started"
     source_refs: list[RuntimeEvidenceSourceRef] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class _WorkspaceMutationRecord:
+    window_id: str
+    workspace_id: str
+    tool_call_id: str
+    tool_round_id: str | None
+    before: RuntimeEvidenceWorkspaceRevision | None = None
+    after: RuntimeEvidenceWorkspaceRevision | None = None
+    delta: RuntimeEvidenceWorkspaceDelta | None = None
+    attribution: RuntimeEvidenceWorkspaceAttribution | None = None
+    terminal: RuntimeEvidenceWorkspaceTerminal | None = None
+    artifacts: dict[str, RuntimeEvidenceWorkspaceArtifact] = field(default_factory=dict)
+    terminal_artifact_kinds: set[str] = field(default_factory=set)
+    source_refs: list[RuntimeEvidenceSourceRef] = field(default_factory=list)
+    last_record: EventRecord | None = None
+    conflicted: bool = False
+
+
+@dataclass(slots=True)
+class _WorkspaceFinalizationRecord:
+    candidate: RuntimeEvidenceWorkspaceFinalization
+    generation_sequence: int
+    conflicted: bool = False
 
 
 async def runtime_evidence(
@@ -1160,6 +1567,16 @@ def _project_session(
     approvals = _project_approvals(session.id, records, capture.warnings)
     policy_decisions = _project_policy_decisions(session.id, records, capture.warnings)
     receipts = _project_receipts(session.id, records, capture.warnings)
+    workspace_mutations = _project_workspace_mutations(
+        session.id,
+        records,
+        capture.warnings,
+    )
+    workspace_finalization = _project_workspace_finalization(
+        session.id,
+        records,
+        capture.warnings,
+    )
     last_cursor = (
         None
         if not records
@@ -1230,7 +1647,634 @@ def _project_session(
             source_refs=recovery_refs,
         ),
         receipts=receipts,
+        workspace_mutations=workspace_mutations,
+        workspace_finalization=workspace_finalization,
         totals=totals,
+    )
+
+
+def _project_workspace_mutations(
+    session_id: str,
+    records: tuple[EventRecord, ...],
+    warnings: list[RuntimeEvidenceWarning],
+) -> tuple[RuntimeEvidenceWorkspaceMutation, ...]:
+    allowed_types = {
+        EventType.WORKSPACE_REVISION_OBSERVED,
+        EventType.WORKSPACE_MUTATION_RECORDED,
+        EventType.WORKSPACE_OBSERVATION_FINALIZED,
+    }
+    by_window: dict[str, _WorkspaceMutationRecord] = {}
+    order: list[str] = []
+    for record in records:
+        if record.event.type not in allowed_types:
+            continue
+        payload = record.event.payload
+        try:
+            window_id = _workspace_required_text(payload, "window_id")
+            workspace_id = _workspace_required_text(payload, "workspace_id")
+            tool_call_id = _workspace_required_text(payload, "tool_call_id")
+            tool_round_id = _workspace_optional_text(payload, "tool_round_id")
+        except (TypeError, ValueError):
+            _warn_malformed_workspace(session_id, record, warnings)
+            continue
+
+        mutation = by_window.get(window_id)
+        if mutation is None:
+            mutation = _WorkspaceMutationRecord(
+                window_id=window_id,
+                workspace_id=workspace_id,
+                tool_call_id=tool_call_id,
+                tool_round_id=tool_round_id,
+            )
+            by_window[window_id] = mutation
+            order.append(window_id)
+        elif (
+            mutation.workspace_id != workspace_id
+            or mutation.tool_call_id != tool_call_id
+            or (
+                mutation.tool_round_id is not None
+                and tool_round_id is not None
+                and mutation.tool_round_id != tool_round_id
+            )
+        ):
+            mutation.conflicted = True
+            _warn_malformed_workspace(session_id, record, warnings)
+            continue
+        elif mutation.tool_round_id is None:
+            mutation.tool_round_id = tool_round_id
+
+        source_ref = _source_ref(record)
+        try:
+            artifacts: tuple[RuntimeEvidenceWorkspaceArtifact, ...]
+            if record.event.type is EventType.WORKSPACE_REVISION_OBSERVED:
+                revision = _workspace_revision_from_record(record)
+                phase = revision.phase
+                previous = mutation.before if phase == "before" else mutation.after
+                if previous is not None and not _same_workspace_fact(previous, revision):
+                    raise ValueError("Workspace revision phase conflicts with prior evidence.")
+                if previous is None:
+                    if phase == "before":
+                        mutation.before = revision
+                    else:
+                        mutation.after = revision
+                artifacts = _workspace_manifest_artifacts(
+                    payload,
+                    kind=f"revision-{phase}",
+                )
+            elif record.event.type is EventType.WORKSPACE_MUTATION_RECORDED:
+                delta = _workspace_delta_from_payload(payload, source_ref=source_ref)
+                if mutation.delta is not None and not _same_workspace_fact(mutation.delta, delta):
+                    raise ValueError("Workspace delta conflicts with prior evidence.")
+                if mutation.delta is None:
+                    mutation.delta = delta
+                attribution = _workspace_attribution_from_payload(payload)
+                if attribution is not None:
+                    if mutation.attribution is not None and mutation.attribution != attribution:
+                        raise ValueError("Workspace attribution conflicts with prior evidence.")
+                    mutation.attribution = attribution
+                artifacts = _workspace_manifest_artifacts(
+                    payload,
+                    kind="revision-delta",
+                )
+            else:
+                terminal = _workspace_terminal_from_record(record)
+                if mutation.terminal is not None and not _same_workspace_fact(
+                    mutation.terminal, terminal
+                ):
+                    raise ValueError("Workspace terminal state conflicts with prior evidence.")
+                if mutation.terminal is None:
+                    mutation.terminal = terminal
+                attribution = _workspace_attribution_from_payload(payload)
+                if attribution is not None:
+                    if mutation.attribution is not None and mutation.attribution != attribution:
+                        raise ValueError("Workspace attribution conflicts with prior evidence.")
+                    mutation.attribution = attribution
+                artifacts = _workspace_terminal_artifacts(payload)
+            for artifact in artifacts:
+                previous_artifact = mutation.artifacts.get(artifact.kind)
+                terminal_artifact = record.event.type is EventType.WORKSPACE_OBSERVATION_FINALIZED
+                if previous_artifact is not None:
+                    if not _same_workspace_fact(
+                        previous_artifact,
+                        artifact,
+                        excluded={"state"},
+                    ):
+                        raise ValueError("Workspace artifact conflicts with prior evidence.")
+                    if (
+                        terminal_artifact
+                        and artifact.kind in mutation.terminal_artifact_kinds
+                        and previous_artifact != artifact
+                    ):
+                        raise ValueError("Workspace terminal artifact state conflicts.")
+                mutation.artifacts[artifact.kind] = artifact
+                if terminal_artifact:
+                    mutation.terminal_artifact_kinds.add(artifact.kind)
+        except (TypeError, ValueError):
+            mutation.conflicted = True
+            _warn_malformed_workspace(session_id, record, warnings)
+            continue
+        mutation.source_refs.append(source_ref)
+        mutation.last_record = record
+
+    projected: list[RuntimeEvidenceWorkspaceMutation] = []
+    for window_id in order:
+        mutation = by_window[window_id]
+        if mutation.conflicted or not mutation.source_refs:
+            continue
+        try:
+            candidate = RuntimeEvidenceWorkspaceMutation(
+                window_id=mutation.window_id,
+                workspace_id=mutation.workspace_id,
+                tool_call_id=mutation.tool_call_id,
+                tool_round_id=mutation.tool_round_id,
+                before=mutation.before,
+                after=mutation.after,
+                delta=mutation.delta,
+                attribution=mutation.attribution,
+                terminal=mutation.terminal,
+                artifacts=tuple(
+                    mutation.artifacts[kind]
+                    for kind in ("revision-before", "revision-after", "revision-delta")
+                    if kind in mutation.artifacts
+                ),
+                source_refs=tuple(mutation.source_refs),
+            )
+        except (TypeError, ValueError):
+            if mutation.last_record is not None:
+                _warn_malformed_workspace(session_id, mutation.last_record, warnings)
+            continue
+        projected.append(candidate)
+    return tuple(projected)
+
+
+def _project_workspace_finalization(
+    session_id: str,
+    records: tuple[EventRecord, ...],
+    warnings: list[RuntimeEvidenceWarning],
+) -> RuntimeEvidenceWorkspaceFinalization | None:
+    finalization_types = {
+        EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
+        EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
+        EventType.SESSION_COMPLETED,
+        EventType.SESSION_FAILED,
+        EventType.SESSION_INTERRUPTED,
+    }
+    by_generation: dict[str | None, _WorkspaceFinalizationRecord] = {}
+    generation_sequences: dict[str, int] = {}
+    current_generation_id: str | None = None
+    current_generation_sequence = 0
+    for record in records:
+        payload = record.event.payload
+        record_generation_id: str | None = None
+        if record.event.type in {
+            EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED,
+            EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
+            EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
+        }:
+            try:
+                generation_id = _workspace_optional_text(payload, "binding_generation_id")
+            except (TypeError, ValueError):
+                if payload.get("final_revision") is not None:
+                    _warn_malformed_workspace(session_id, record, warnings)
+                continue
+            if generation_id is not None:
+                record_generation_id = generation_id
+                generation_sequence = generation_sequences.setdefault(
+                    generation_id,
+                    record.sequence,
+                )
+                if generation_sequence > current_generation_sequence:
+                    current_generation_id = generation_id
+                    current_generation_sequence = generation_sequence
+        if record.event.type not in finalization_types:
+            continue
+        raw_final = payload.get("final_revision")
+        if raw_final is None:
+            continue
+        try:
+            if type(raw_final) is not dict:
+                raise TypeError("final_revision must be an object.")
+            final_payload = cast("dict[str, object]", raw_final)
+            source_ref = _source_ref(record)
+            status = _workspace_enum(
+                final_payload,
+                "status",
+                {"supported", "unsupported", "failed", "incomplete", "truncated"},
+            )
+            raw_delta = final_payload.get("finalization_delta")
+            if raw_delta is not None and type(raw_delta) is not dict:
+                raise TypeError("finalization_delta must be an object.")
+            delta = (
+                None
+                if raw_delta is None
+                else _workspace_delta_from_payload(
+                    cast("dict[str, object]", raw_delta),
+                    source_ref=source_ref,
+                    include_attribution_confidence=True,
+                )
+            )
+            candidate = RuntimeEvidenceWorkspaceFinalization.model_validate(
+                {
+                    "workspace_id": _workspace_required_text(final_payload, "workspace_id"),
+                    "binding_generation_id": record_generation_id,
+                    "status": status,
+                    "revision": _workspace_optional_text(final_payload, "revision"),
+                    "path_scope": _workspace_enum(
+                        final_payload,
+                        "path_scope",
+                        {"complete", "changed"},
+                    ),
+                    "total_paths": _workspace_required_nonnegative_int(
+                        final_payload,
+                        "total_paths",
+                    ),
+                    "detail_code": _workspace_optional_detail_code(
+                        final_payload,
+                        _WORKSPACE_REVISION_DETAIL_CODES,
+                    ),
+                    "delta": delta,
+                    "source_refs": (source_ref,),
+                }
+            )
+        except (TypeError, ValueError):
+            _warn_malformed_workspace(session_id, record, warnings)
+            continue
+        effective_generation_id = record_generation_id
+        if effective_generation_id is None:
+            matching_generations = tuple(
+                (
+                    generation_id,
+                    generation,
+                )
+                for generation_id, generation in by_generation.items()
+                if generation_id is not None
+                and _same_workspace_fact(
+                    generation.candidate,
+                    candidate,
+                    excluded={
+                        "binding_generation_id",
+                        "source_ref",
+                        "source_refs",
+                    },
+                )
+            )
+            if matching_generations:
+                effective_generation_id = max(
+                    matching_generations,
+                    key=lambda item: item[1].generation_sequence,
+                )[0]
+            else:
+                effective_generation_id = current_generation_id
+            if effective_generation_id is not None:
+                candidate = candidate.model_copy(
+                    update={"binding_generation_id": effective_generation_id}
+                )
+        generation = by_generation.get(effective_generation_id)
+        if generation is None:
+            by_generation[effective_generation_id] = _WorkspaceFinalizationRecord(
+                candidate=candidate,
+                generation_sequence=(
+                    record.sequence
+                    if effective_generation_id is None
+                    else generation_sequences.get(effective_generation_id, record.sequence)
+                ),
+            )
+        elif not _same_workspace_fact(
+            generation.candidate,
+            candidate,
+            excluded={"source_ref", "source_refs"},
+        ):
+            generation.conflicted = True
+            _warn_malformed_workspace(session_id, record, warnings)
+        else:
+            generation.candidate = generation.candidate.model_copy(
+                update={"source_refs": (*generation.candidate.source_refs, source_ref)}
+            )
+    valid = tuple(record for record in by_generation.values() if not record.conflicted)
+    if not valid:
+        return None
+    return max(valid, key=lambda record: record.generation_sequence).candidate
+
+
+def _workspace_revision_from_record(
+    record: EventRecord,
+) -> RuntimeEvidenceWorkspaceRevision:
+    payload = record.event.payload
+    return RuntimeEvidenceWorkspaceRevision.model_validate(
+        {
+            "phase": _workspace_enum(payload, "phase", {"before", "after"}),
+            "status": _workspace_enum(
+                payload,
+                "status",
+                {"supported", "unsupported", "failed", "incomplete", "truncated"},
+            ),
+            "revision": _workspace_optional_text(payload, "revision"),
+            "path_scope": _workspace_enum(payload, "path_scope", {"complete", "changed"}),
+            "total_paths": _workspace_required_nonnegative_int(payload, "total_paths"),
+            "detail_code": _workspace_optional_detail_code(
+                payload,
+                _WORKSPACE_REVISION_DETAIL_CODES,
+            ),
+            "source_ref": _source_ref(record),
+        }
+    )
+
+
+def _workspace_delta_from_payload(
+    payload: dict[str, object],
+    *,
+    source_ref: RuntimeEvidenceSourceRef,
+    include_attribution_confidence: bool = False,
+) -> RuntimeEvidenceWorkspaceDelta:
+    confidence = None
+    if include_attribution_confidence:
+        confidence = _workspace_enum(
+            payload,
+            "attribution_confidence",
+            {
+                "exclusive_tool",
+                "concurrent_ambiguity",
+                "external_or_unknown",
+                "unattributed_finalization_change",
+            },
+        )
+    return RuntimeEvidenceWorkspaceDelta.model_validate(
+        {
+            "status": _workspace_enum(
+                payload,
+                "status",
+                {"changed", "no_change", "unsupported", "failed", "incomplete", "truncated"},
+            ),
+            "before_revision": _workspace_optional_text(payload, "before_revision"),
+            "after_revision": _workspace_optional_text(payload, "after_revision"),
+            "total_paths": _workspace_required_nonnegative_int(payload, "total_paths"),
+            "head_changed": _workspace_required_bool(payload, "head_changed"),
+            "branch_changed": _workspace_required_bool(payload, "branch_changed"),
+            "detail_code": _workspace_optional_detail_code(
+                payload,
+                _WORKSPACE_DELTA_DETAIL_CODES,
+            ),
+            "attribution_confidence": confidence,
+            "source_ref": source_ref,
+        }
+    )
+
+
+def _workspace_attribution_from_payload(
+    payload: dict[str, object],
+) -> RuntimeEvidenceWorkspaceAttribution | None:
+    raw = payload.get("attribution")
+    if raw is None:
+        return None
+    if type(raw) is not dict:
+        raise TypeError("attribution must be an object.")
+    attribution = cast("dict[str, object]", raw)
+    return RuntimeEvidenceWorkspaceAttribution.model_validate(
+        {
+            "confidence": _workspace_enum(
+                attribution,
+                "confidence",
+                {
+                    "exclusive_tool",
+                    "concurrent_ambiguity",
+                    "external_or_unknown",
+                    "unattributed_finalization_change",
+                },
+            ),
+            "writer_isolation": _workspace_enum(
+                attribution,
+                "writer_isolation",
+                {"exclusive", "shared", "unknown"},
+            ),
+            "overlap_detected": _workspace_required_bool(
+                attribution,
+                "overlap_detected",
+            ),
+            "direct_reconciliation": _workspace_enum(
+                attribution,
+                "direct_reconciliation",
+                {"not_observed", "consistent", "incomplete", "contradictory", "truncated"},
+            ),
+            "detail_code": _workspace_required_detail_code(
+                attribution,
+                _WORKSPACE_ATTRIBUTION_DETAIL_CODES,
+            ),
+        }
+    )
+
+
+def _workspace_terminal_from_record(
+    record: EventRecord,
+) -> RuntimeEvidenceWorkspaceTerminal:
+    payload = record.event.payload
+    return RuntimeEvidenceWorkspaceTerminal.model_validate(
+        {
+            "status": _workspace_enum(
+                payload,
+                "status",
+                {"complete", "incomplete", "ambiguous", "failed"},
+            ),
+            "detail_code": _workspace_optional_detail_code(
+                payload,
+                _WORKSPACE_TERMINAL_DETAIL_CODES,
+            ),
+            "session_run_epoch": _workspace_optional_positive_int(
+                payload,
+                "session_run_epoch",
+            ),
+            "recovery_run_epoch": _workspace_optional_positive_int(
+                payload,
+                "recovery_run_epoch",
+            ),
+            "binding_generation_id": _workspace_optional_text(
+                payload,
+                "binding_generation_id",
+            ),
+            "source_ref": _source_ref(record),
+        }
+    )
+
+
+def _workspace_manifest_artifacts(
+    payload: dict[str, object],
+    *,
+    kind: str,
+) -> tuple[RuntimeEvidenceWorkspaceArtifact, ...]:
+    field_names = {
+        "artifact_id": "manifest_artifact_id",
+        "sha256": "manifest_artifact_sha256",
+        "size_bytes": "manifest_artifact_size_bytes",
+    }
+    if not any(payload.get(field_name) is not None for field_name in field_names.values()):
+        return ()
+    return (
+        RuntimeEvidenceWorkspaceArtifact.model_validate(
+            {
+                "kind": kind,
+                "artifact_id": _workspace_required_text(payload, field_names["artifact_id"]),
+                "sha256": _workspace_required_text(payload, field_names["sha256"]),
+                "size_bytes": _workspace_required_positive_int(
+                    payload,
+                    field_names["size_bytes"],
+                ),
+                "state": "referenced",
+            }
+        ),
+    )
+
+
+def _workspace_terminal_artifacts(
+    payload: dict[str, object],
+) -> tuple[RuntimeEvidenceWorkspaceArtifact, ...]:
+    projected: list[RuntimeEvidenceWorkspaceArtifact] = []
+    for field_prefix, kind in (
+        ("revision_before", "revision-before"),
+        ("revision_after", "revision-after"),
+        ("revision_delta", "revision-delta"),
+    ):
+        names = {
+            "artifact_id": f"{field_prefix}_artifact_id",
+            "sha256": f"{field_prefix}_artifact_sha256",
+            "size_bytes": f"{field_prefix}_artifact_size_bytes",
+            "state": f"{field_prefix}_artifact_state",
+        }
+        if not any(payload.get(field_name) is not None for field_name in names.values()):
+            continue
+        projected.append(
+            RuntimeEvidenceWorkspaceArtifact.model_validate(
+                {
+                    "kind": kind,
+                    "artifact_id": _workspace_required_text(payload, names["artifact_id"]),
+                    "sha256": _workspace_required_text(payload, names["sha256"]),
+                    "size_bytes": _workspace_required_positive_int(
+                        payload,
+                        names["size_bytes"],
+                    ),
+                    "state": _workspace_enum(
+                        payload,
+                        names["state"],
+                        {"intent", "published", "referenced", "failed", "orphaned", "missing"},
+                    ),
+                }
+            )
+        )
+    return tuple(projected)
+
+
+def _workspace_required_text(payload: Mapping[str, object], field_name: str) -> str:
+    value = _optional_text(payload.get(field_name))
+    if value is None:
+        raise ValueError(f"{field_name} must be bounded nonblank text.")
+    return value
+
+
+def _workspace_optional_text(payload: Mapping[str, object], field_name: str) -> str | None:
+    raw = payload.get(field_name)
+    if raw is None:
+        return None
+    value = _optional_text(raw)
+    if value is None:
+        raise ValueError(f"{field_name} must be bounded nonblank text or null.")
+    return value
+
+
+def _workspace_optional_detail_code(
+    payload: Mapping[str, object],
+    allowed: frozenset[str],
+) -> str | None:
+    raw = payload.get("detail_code")
+    if raw is None:
+        return None
+    if type(raw) is not str or raw not in allowed:
+        raise ValueError("detail_code is not a fixed workspace evidence value.")
+    return raw
+
+
+def _workspace_required_detail_code(
+    payload: Mapping[str, object],
+    allowed: frozenset[str],
+) -> str:
+    value = _workspace_optional_detail_code(payload, allowed)
+    if value is None:
+        raise ValueError("detail_code is required for workspace attribution.")
+    return value
+
+
+def _workspace_enum(
+    payload: Mapping[str, object],
+    field_name: str,
+    allowed: set[str],
+) -> str:
+    value = payload.get(field_name)
+    if type(value) is not str or value not in allowed:
+        raise ValueError(f"{field_name} is not a recognized workspace evidence value.")
+    return value
+
+
+def _workspace_required_nonnegative_int(payload: Mapping[str, object], field_name: str) -> int:
+    value = _nonnegative_int(payload.get(field_name))
+    if value is None:
+        raise ValueError(f"{field_name} must be a bounded nonnegative integer.")
+    return value
+
+
+def _workspace_required_positive_int(payload: Mapping[str, object], field_name: str) -> int:
+    value = _positive_int(payload.get(field_name))
+    if value is None:
+        raise ValueError(f"{field_name} must be a bounded positive integer.")
+    return value
+
+
+def _workspace_optional_positive_int(
+    payload: Mapping[str, object],
+    field_name: str,
+) -> int | None:
+    if payload.get(field_name) is None:
+        return None
+    return _workspace_required_positive_int(payload, field_name)
+
+
+def _workspace_required_bool(payload: Mapping[str, object], field_name: str) -> bool:
+    value = payload.get(field_name)
+    if type(value) is not bool:
+        raise ValueError(f"{field_name} must be a boolean.")
+    return value
+
+
+def _same_workspace_fact(
+    left: BaseModel,
+    right: BaseModel,
+    *,
+    excluded: set[str] | None = None,
+) -> bool:
+    excluded_fields = {"source_ref"} if excluded is None else excluded
+
+    def normalized(value: object) -> object:
+        if isinstance(value, BaseModel):
+            return normalized(value.model_dump())
+        if type(value) is dict:
+            return {
+                key: normalized(item) for key, item in value.items() if key not in excluded_fields
+            }
+        if isinstance(value, list | tuple):
+            return tuple(normalized(item) for item in value)
+        return value
+
+    return normalized(left) == normalized(right)
+
+
+def _warn_malformed_workspace(
+    session_id: str,
+    record: EventRecord,
+    warnings: list[RuntimeEvidenceWarning],
+) -> None:
+    warnings.append(
+        RuntimeEvidenceWarning(
+            code=RuntimeEvidenceWarningCode.MALFORMED_WORKSPACE_EVIDENCE,
+            session_id=session_id,
+            event_id=record.event.id,
+            sequence=record.sequence,
+        )
     )
 
 

@@ -1,0 +1,413 @@
+{
+  "schema_version": 3,
+  "root_session_id": "golden-root",
+  "scope": {
+    "root_session_id": "golden-root",
+    "causal_budget_id": "budget-1",
+    "descendant_session_ids": [
+      "golden-root"
+    ],
+    "causal_budget_session_ids": null
+  },
+  "sessions": [
+    {
+      "session_id": "golden-root",
+      "parent_session_id": null,
+      "agent_name": "agent-golden-root",
+      "task_ids": [],
+      "causal_budget_id": "budget-1",
+      "provider_name": "provider",
+      "model": "model",
+      "status": "pending",
+      "last_event_cursor": {
+        "event_id": "golden-model-completed",
+        "sequence": 3
+      },
+      "origin_refs": [],
+      "checkpoints": [],
+      "compactions": [],
+      "compaction_count": "0",
+      "attempts": [
+        {
+          "attempt_id": "golden-attempt",
+          "model_step_id": "golden-step",
+          "operation": "agent_step",
+          "attempt_ordinal": 1,
+          "provider_name": "provider",
+          "requested_model": "model",
+          "model": "model",
+          "status": "completed",
+          "usage_status": "reported",
+          "usage": {
+            "input_tokens": "2",
+            "output_tokens": "1",
+            "total_tokens": "3",
+            "reasoning_output_tokens": "0",
+            "cache": {
+              "read_tokens": "0",
+              "write_tokens": "0",
+              "write_5m_tokens": "0",
+              "write_1h_tokens": "0",
+              "write_unknown_ttl_tokens": "0",
+              "cached_input_tokens": "0",
+              "uncached_input_tokens": "2"
+            }
+          },
+          "cost": {
+            "status": "not_requested",
+            "currency": null,
+            "total_cost": null,
+            "pricing_provider_name": null,
+            "pricing_model": null
+          },
+          "source_refs": [
+            {
+              "event_id": "golden-model-started",
+              "sequence": 2
+            },
+            {
+              "event_id": "golden-model-completed",
+              "sequence": 3
+            }
+          ]
+        }
+      ],
+      "tool_calls": [],
+      "approvals": [],
+      "effective_taint_labels": [],
+      "policy_decisions": [],
+      "recovery": {
+        "interruption_count": "0",
+        "resume_count": "0",
+        "manual_recovery_required_count": "0",
+        "manual_reconciliation_count": "0",
+        "source_refs": []
+      },
+      "receipts": [],
+      "workspace_mutations": [],
+      "workspace_finalization": null,
+      "totals": {
+        "session_count": "1",
+        "model_step_count": "1",
+        "attempt_count": "1",
+        "first_attempt_count": "1",
+        "provider_retry_attempt_count": "0",
+        "structured_output_repair_attempt_count": "0",
+        "tool_call_count": "0",
+        "missing_usage_attempt_count": "0",
+        "usage": {
+          "input_tokens": "2",
+          "output_tokens": "1",
+          "total_tokens": "3",
+          "reasoning_output_tokens": "0",
+          "cache": {
+            "read_tokens": "0",
+            "write_tokens": "0",
+            "write_5m_tokens": "0",
+            "write_1h_tokens": "0",
+            "write_unknown_ttl_tokens": "0",
+            "cached_input_tokens": "0",
+            "uncached_input_tokens": "2"
+          }
+        },
+        "first_attempt_usage": {
+          "input_tokens": "2",
+          "output_tokens": "1",
+          "total_tokens": "3",
+          "reasoning_output_tokens": "0",
+          "cache": {
+            "read_tokens": "0",
+            "write_tokens": "0",
+            "write_5m_tokens": "0",
+            "write_1h_tokens": "0",
+            "write_unknown_ttl_tokens": "0",
+            "cached_input_tokens": "0",
+            "uncached_input_tokens": "2"
+          }
+        },
+        "provider_retry_usage": {
+          "input_tokens": "0",
+          "output_tokens": "0",
+          "total_tokens": "0",
+          "reasoning_output_tokens": "0",
+          "cache": {
+            "read_tokens": "0",
+            "write_tokens": "0",
+            "write_5m_tokens": "0",
+            "write_1h_tokens": "0",
+            "write_unknown_ttl_tokens": "0",
+            "cached_input_tokens": "0",
+            "uncached_input_tokens": "0"
+          }
+        },
+        "structured_output_repair_usage": {
+          "input_tokens": "0",
+          "output_tokens": "0",
+          "total_tokens": "0",
+          "reasoning_output_tokens": "0",
+          "cache": {
+            "read_tokens": "0",
+            "write_tokens": "0",
+            "write_5m_tokens": "0",
+            "write_1h_tokens": "0",
+            "write_unknown_ttl_tokens": "0",
+            "cached_input_tokens": "0",
+            "uncached_input_tokens": "0"
+          }
+        },
+        "compaction_usage": {
+          "input_tokens": "0",
+          "output_tokens": "0",
+          "total_tokens": "0",
+          "reasoning_output_tokens": "0",
+          "cache": {
+            "read_tokens": "0",
+            "write_tokens": "0",
+            "write_5m_tokens": "0",
+            "write_1h_tokens": "0",
+            "write_unknown_ttl_tokens": "0",
+            "cached_input_tokens": "0",
+            "uncached_input_tokens": "0"
+          }
+        },
+        "evaluation_usage": {
+          "input_tokens": "0",
+          "output_tokens": "0",
+          "total_tokens": "0",
+          "reasoning_output_tokens": "0",
+          "cache": {
+            "read_tokens": "0",
+            "write_tokens": "0",
+            "write_5m_tokens": "0",
+            "write_1h_tokens": "0",
+            "write_unknown_ttl_tokens": "0",
+            "cached_input_tokens": "0",
+            "uncached_input_tokens": "0"
+          }
+        },
+        "repair_usage": {
+          "input_tokens": "0",
+          "output_tokens": "0",
+          "total_tokens": "0",
+          "reasoning_output_tokens": "0",
+          "cache": {
+            "read_tokens": "0",
+            "write_tokens": "0",
+            "write_5m_tokens": "0",
+            "write_1h_tokens": "0",
+            "write_unknown_ttl_tokens": "0",
+            "cached_input_tokens": "0",
+            "uncached_input_tokens": "0"
+          }
+        },
+        "comparison_control_usage": {
+          "input_tokens": "0",
+          "output_tokens": "0",
+          "total_tokens": "0",
+          "reasoning_output_tokens": "0",
+          "cache": {
+            "read_tokens": "0",
+            "write_tokens": "0",
+            "write_5m_tokens": "0",
+            "write_1h_tokens": "0",
+            "write_unknown_ttl_tokens": "0",
+            "cached_input_tokens": "0",
+            "uncached_input_tokens": "0"
+          }
+        },
+        "operations": [
+          {
+            "operation": "agent_step",
+            "attempt_count": "1",
+            "usage": {
+              "input_tokens": "2",
+              "output_tokens": "1",
+              "total_tokens": "3",
+              "reasoning_output_tokens": "0",
+              "cache": {
+                "read_tokens": "0",
+                "write_tokens": "0",
+                "write_5m_tokens": "0",
+                "write_1h_tokens": "0",
+                "write_unknown_ttl_tokens": "0",
+                "cached_input_tokens": "0",
+                "uncached_input_tokens": "2"
+              }
+            }
+          }
+        ],
+        "priced_costs": [],
+        "priced_attempt_count": "0",
+        "unpriced_attempt_count": "0"
+      }
+    }
+  ],
+  "tasks": [],
+  "lineage_totals": {
+    "session_count": "1",
+    "model_step_count": "1",
+    "attempt_count": "1",
+    "first_attempt_count": "1",
+    "provider_retry_attempt_count": "0",
+    "structured_output_repair_attempt_count": "0",
+    "tool_call_count": "0",
+    "missing_usage_attempt_count": "0",
+    "usage": {
+      "input_tokens": "2",
+      "output_tokens": "1",
+      "total_tokens": "3",
+      "reasoning_output_tokens": "0",
+      "cache": {
+        "read_tokens": "0",
+        "write_tokens": "0",
+        "write_5m_tokens": "0",
+        "write_1h_tokens": "0",
+        "write_unknown_ttl_tokens": "0",
+        "cached_input_tokens": "0",
+        "uncached_input_tokens": "2"
+      }
+    },
+    "first_attempt_usage": {
+      "input_tokens": "2",
+      "output_tokens": "1",
+      "total_tokens": "3",
+      "reasoning_output_tokens": "0",
+      "cache": {
+        "read_tokens": "0",
+        "write_tokens": "0",
+        "write_5m_tokens": "0",
+        "write_1h_tokens": "0",
+        "write_unknown_ttl_tokens": "0",
+        "cached_input_tokens": "0",
+        "uncached_input_tokens": "2"
+      }
+    },
+    "provider_retry_usage": {
+      "input_tokens": "0",
+      "output_tokens": "0",
+      "total_tokens": "0",
+      "reasoning_output_tokens": "0",
+      "cache": {
+        "read_tokens": "0",
+        "write_tokens": "0",
+        "write_5m_tokens": "0",
+        "write_1h_tokens": "0",
+        "write_unknown_ttl_tokens": "0",
+        "cached_input_tokens": "0",
+        "uncached_input_tokens": "0"
+      }
+    },
+    "structured_output_repair_usage": {
+      "input_tokens": "0",
+      "output_tokens": "0",
+      "total_tokens": "0",
+      "reasoning_output_tokens": "0",
+      "cache": {
+        "read_tokens": "0",
+        "write_tokens": "0",
+        "write_5m_tokens": "0",
+        "write_1h_tokens": "0",
+        "write_unknown_ttl_tokens": "0",
+        "cached_input_tokens": "0",
+        "uncached_input_tokens": "0"
+      }
+    },
+    "compaction_usage": {
+      "input_tokens": "0",
+      "output_tokens": "0",
+      "total_tokens": "0",
+      "reasoning_output_tokens": "0",
+      "cache": {
+        "read_tokens": "0",
+        "write_tokens": "0",
+        "write_5m_tokens": "0",
+        "write_1h_tokens": "0",
+        "write_unknown_ttl_tokens": "0",
+        "cached_input_tokens": "0",
+        "uncached_input_tokens": "0"
+      }
+    },
+    "evaluation_usage": {
+      "input_tokens": "0",
+      "output_tokens": "0",
+      "total_tokens": "0",
+      "reasoning_output_tokens": "0",
+      "cache": {
+        "read_tokens": "0",
+        "write_tokens": "0",
+        "write_5m_tokens": "0",
+        "write_1h_tokens": "0",
+        "write_unknown_ttl_tokens": "0",
+        "cached_input_tokens": "0",
+        "uncached_input_tokens": "0"
+      }
+    },
+    "repair_usage": {
+      "input_tokens": "0",
+      "output_tokens": "0",
+      "total_tokens": "0",
+      "reasoning_output_tokens": "0",
+      "cache": {
+        "read_tokens": "0",
+        "write_tokens": "0",
+        "write_5m_tokens": "0",
+        "write_1h_tokens": "0",
+        "write_unknown_ttl_tokens": "0",
+        "cached_input_tokens": "0",
+        "uncached_input_tokens": "0"
+      }
+    },
+    "comparison_control_usage": {
+      "input_tokens": "0",
+      "output_tokens": "0",
+      "total_tokens": "0",
+      "reasoning_output_tokens": "0",
+      "cache": {
+        "read_tokens": "0",
+        "write_tokens": "0",
+        "write_5m_tokens": "0",
+        "write_1h_tokens": "0",
+        "write_unknown_ttl_tokens": "0",
+        "cached_input_tokens": "0",
+        "uncached_input_tokens": "0"
+      }
+    },
+    "operations": [
+      {
+        "operation": "agent_step",
+        "attempt_count": "1",
+        "usage": {
+          "input_tokens": "2",
+          "output_tokens": "1",
+          "total_tokens": "3",
+          "reasoning_output_tokens": "0",
+          "cache": {
+            "read_tokens": "0",
+            "write_tokens": "0",
+            "write_5m_tokens": "0",
+            "write_1h_tokens": "0",
+            "write_unknown_ttl_tokens": "0",
+            "cached_input_tokens": "0",
+            "uncached_input_tokens": "2"
+          }
+        }
+      }
+    ],
+    "priced_costs": [],
+    "priced_attempt_count": "0",
+    "unpriced_attempt_count": "0"
+  },
+  "branch_totals": [],
+  "causal_budget_totals": null,
+  "whole_workflow_totals": null,
+  "pricing_catalog_version": null,
+  "pricing_catalog_generated_at": null,
+  "warnings": [
+    {
+      "code": "task_evidence_unavailable",
+      "session_id": "golden-root",
+      "event_id": null,
+      "sequence": null
+    }
+  ]
+}

@@ -3889,9 +3889,10 @@ report = await runtime_evidence(
 ```
 
 `RuntimeEvidenceReport.schema_version` is
-`RUNTIME_EVIDENCE_SCHEMA_VERSION == 2`. Version 2 adds the optional governing
-execution-profile fingerprint to each model attempt. Sessions are ordered parent before
-child, then by durable creation time and session id. The scope records the exact
+`RUNTIME_EVIDENCE_SCHEMA_VERSION == 3`. Version 2 added the optional governing
+execution-profile fingerprint to each model attempt. Version 3 adds safe workspace
+mutation-window and finalization summaries. Sessions are ordered parent before child,
+then by durable creation time and session id. The scope records the exact
 descendant ids and, when requested, causal-budget ids. Session records retain
 only structural identity, terminal state, last durable event cursor, origin
 event references, payload-free task links, checkpoint event identities,
@@ -3903,6 +3904,28 @@ from trusted terminal tool events that record a completed manual
 reconciliation; arbitrary custom-event payload fields cannot increment either
 count. Every event-derived item carries its stable source event id and sequence.
 Task and session ids are themselves the owning durable-record identities.
+
+Workspace mutation summaries correlate before/after revision observations,
+revision deltas, attribution, terminal outcomes, and artifact references by
+`window_id`. They retain the aliased workspace and tool-call identities, optional
+tool-round identity, observation/delta statuses, revision identities, path counts,
+HEAD/branch-change booleans, fixed detail codes, attribution classifications,
+artifact id/digest/size/state, and exact source-event references. Recovered terminal
+evidence retains its source and recovery run epochs, so a successfully recovered
+terminal remains distinguishable from a direct terminal even when both are
+`complete`. Finalization summaries retain the authoritative binding generation, final
+revision, and optional `unattributed_finalization_change` delta. Repeated facts
+converge within one binding generation; after a resumed session creates a later
+generation, the latest valid finalization is authoritative. Contradictory identities,
+revision endpoints, terminal/delta states, or same-generation facts and malformed
+enums, counts, digests, or identifiers produce
+`malformed_workspace_evidence` and omit the unsafe merged fact.
+`RuntimeEvidenceSession.workspace_mutations` contains
+`RuntimeEvidenceWorkspaceMutation` values composed from
+`RuntimeEvidenceWorkspaceRevision`, `RuntimeEvidenceWorkspaceDelta`,
+`RuntimeEvidenceWorkspaceAttribution`, `RuntimeEvidenceWorkspaceTerminal`, and
+`RuntimeEvidenceWorkspaceArtifact`. `workspace_finalization` is an optional
+`RuntimeEvidenceWorkspaceFinalization`.
 
 Attempts preserve their logical model-step and attempt ids, ordinal, terminal
 state, provider/model identity, usage availability, typed operation, source
@@ -3945,7 +3968,13 @@ approval reasons, receipt bodies, credentials, arbitrary metadata, task titles
 or descriptions, or compaction summaries. Custom checkpoint names collapse to
 the non-secret `custom` kind while retaining the checkpoint event id. Receipt
 extraction inspects only the documented receipt-identity locations and discards
-the surrounding result body.
+the surrounding result body. Workspace summaries likewise exclude paths, branch
+names, HEAD identities, artifact bodies, direct mutation operations, writer
+mechanisms, and unrestricted observation payloads. A separately authorized caller
+that needs exact detail follows a retained source reference through a bounded
+`SessionStore.query_events(...)` read and may fetch an explicitly referenced artifact
+through its owning `ArtifactStore.read_bytes(...)` with a byte limit. That privileged
+read is outside `runtime_evidence`; the report never performs it implicitly.
 
 Missing roots, unsupported bounded reads, parent contradictions, cycles, and
 session/event/causal-budget exhaustion raise `RuntimeEvidenceError` with a
