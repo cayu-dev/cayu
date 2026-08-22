@@ -36,22 +36,25 @@ baseline did not use one.
 
 ## Cross-source recall baseline
 
-`recall-corpus-v1.json` and `recall-baseline-results-v1.json` exercise the
-bounded `RecallEngine` across canonical knowledge and explicitly selected
-transcripts. Run the checked in-memory/SQLite matrix with:
+`recall-corpus-v2.json` and `recall-baseline-results-v2.json` exercise the
+bounded `RecallEngine` and calibrated automatic-recall admission across canonical
+knowledge and explicitly selected transcripts. Run the checked in-memory/SQLite
+matrix with:
 
 ```bash
 PYTHONPATH=src python scripts/run_recall_baseline.py
 ```
 
 The corpus covers knowledge-only and transcript-only matches, duplicate
-provenance, current revision selection, authorization isolation, Spanish and
-Russian text, and short follow-ups resolved from bounded recent context. It
-checks recall, false results, stale knowledge, authorization leaks, exact
-locators, false completeness, candidate/byte overhead, and backend identity
-parity. Built-in stores in this corpus do not provide semantic embeddings, so
-the semantic lane is deliberately recorded as partial instead of pretending
-that empty results are complete.
+cross-source content, current revision selection, authorization isolation,
+malicious recalled text, Spanish and Russian text, and short follow-ups resolved
+from bounded recent context. It checks recall and exact locators alongside
+injected/offer/silent precision, false/stale/unauthorized injection, source
+diversity, deterministic clipping, serialized contribution overhead, admission
+latency, required-source failure, incomplete coverage, and backend identity
+parity. Built-in stores in this corpus do not provide semantic embeddings, so the
+semantic lane is deliberately recorded as partial instead of pretending that
+empty results are complete.
 
 `--corpus` accepts the same bounded public/private origin contract and
 `--output` retains a report. Keep private production-shaped corpora and reports

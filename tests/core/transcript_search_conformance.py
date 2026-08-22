@@ -90,6 +90,28 @@ async def assert_transcript_search_conformance(store: SessionStore) -> None:
     assert second.next_cursor is None
     assert second.matched_records_examined == 2
 
+    bounded_history = await store.search_transcript(
+        TranscriptSearchQuery(
+            text="Atlas",
+            session_ids=("recall-alpha",),
+            before_transcript_indexes={"recall-alpha": 1},
+        )
+    )
+    assert [hit.transcript_index for hit in bounded_history.hits] == [0]
+    assert bounded_history.matched_records_examined == 1
+    assert bounded_history.truncated is False
+
+    empty_history = await store.search_transcript(
+        TranscriptSearchQuery(
+            text="Atlas",
+            session_ids=("recall-alpha",),
+            before_transcript_indexes={"recall-alpha": 0},
+        )
+    )
+    assert empty_history.hits == ()
+    assert empty_history.matched_records_examined == 0
+    assert empty_history.truncated is False
+
     thinking_only = await store.search_transcript(
         TranscriptSearchQuery(text="secret reasoning", session_ids=("recall-alpha",))
     )

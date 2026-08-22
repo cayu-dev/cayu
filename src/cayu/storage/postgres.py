@@ -19637,12 +19637,21 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         query = copy_transcript_search_query(query)
         cursor = decode_transcript_search_cursor(query)
         query_document = transcript_search_query_document(query.text)
+        before_filter = "".join(
+            " AND (transcript.session_id <> %s OR transcript.session_order <= %s)"
+            for _ in query.before_transcript_indexes
+        )
+        before_params = [
+            value
+            for session_id, before_index in query.before_transcript_indexes.items()
+            for value in (session_id, before_index)
+        ]
         fetch_limit = query.max_records_scanned + 1
 
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
             await cur.execute(
-                """
+                f"""
                 WITH search_query AS (
                     SELECT to_tsquery('simple'::regconfig, %s) AS value
                 )
@@ -19657,6 +19666,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 WHERE transcript.session_id = ANY(%s)
                   AND transcript.message ->> 'role' IN ('user', 'assistant')
                   AND transcript.message ->> 'role' = ANY(%s)
+                  {before_filter}
                   AND to_tsvector(
                         'simple'::regconfig,
                         transcript.transcript_search_document
@@ -19667,6 +19677,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     _postgres_transcript_search_expression(query),
                     list(query.session_ids),
                     [str(role) for role in query.roles],
+                    *before_params,
                     fetch_limit,
                 ],
             )

@@ -1,0 +1,2396 @@
+{
+  "corpus_revision": "public-cross-source-admission-v2",
+  "results": [
+    {
+      "backend": "memory",
+      "cases": [
+        {
+          "admission_latency_ms": 1.166959,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "knowledge-only",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2626,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 657,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "knowledge_chunk:deployment-port:r1:0:1"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 2.560792,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2380,
+          "selected_identities": [
+            "knowledge_chunk:deployment-port:r1:0:1"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.157292,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "transcript-only",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2849,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 713,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "transcript_message:ops-session:0:b6ce92b0b9efff01c57e5b2b6ae15906401823c4e7eae854978b652436b4c306"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 2.739334,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2603,
+          "selected_identities": [
+            "transcript_message:ops-session:0:b6ce92b0b9efff01c57e5b2b6ae15906401823c4e7eae854978b652436b4c306"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.848416,
+          "admission_truncated": true,
+          "authorization_leak_count": 0,
+          "candidate_count": 2,
+          "case_id": "duplicate-provenance",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 3886,
+          "correct_injected_count": 1,
+          "correct_offered_count": 1,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 972,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "knowledge_chunk:refund-owner:r1:0:1"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 3.240166,
+          "locator_correct_count": 2,
+          "locator_evaluated_count": 2,
+          "offered_identities": [
+            "transcript_message:support-session:0:a03a2d0e7c7349b84878c3a2ed6cfa5ffd7801ad135196cabf66a7cb6e87be05"
+          ],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 3529,
+          "selected_identities": [
+            "knowledge_chunk:refund-owner:r1:0:1",
+            "transcript_message:support-session:0:a03a2d0e7c7349b84878c3a2ed6cfa5ffd7801ad135196cabf66a7cb6e87be05"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.813292,
+          "admission_truncated": true,
+          "authorization_leak_count": 0,
+          "candidate_count": 2,
+          "case_id": "current-knowledge-and-historical-transcript",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 3879,
+          "correct_injected_count": 1,
+          "correct_offered_count": 1,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 970,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "knowledge_chunk:release-date:r2:0:2"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 3.195417,
+          "locator_correct_count": 2,
+          "locator_evaluated_count": 2,
+          "offered_identities": [
+            "transcript_message:release-history:0:215d99ad812a8c47b51092442230a707bd330e282040e5c40bcd607678c9268e"
+          ],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 3531,
+          "selected_identities": [
+            "knowledge_chunk:release-date:r2:0:2",
+            "transcript_message:release-history:0:215d99ad812a8c47b51092442230a707bd330e282040e5c40bcd607678c9268e"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 2.137834,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 2,
+          "case_id": "authorization-isolation",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 3894,
+          "correct_injected_count": 2,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 974,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "knowledge_chunk:authorized-boundary:r1:0:1",
+            "transcript_message:authorized-session:0:5dbe513381cee6dad9456b34dca87a6d262cbc76f2ea4e54f3eeff1d3de6794e"
+          ],
+          "injected_source_diversity": 2,
+          "language": "en",
+          "latency_ms": 3.258916,
+          "locator_correct_count": 2,
+          "locator_evaluated_count": 2,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 3574,
+          "selected_identities": [
+            "knowledge_chunk:authorized-boundary:r1:0:1",
+            "transcript_message:authorized-session:0:5dbe513381cee6dad9456b34dca87a6d262cbc76f2ea4e54f3eeff1d3de6794e"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.080958,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "spanish-knowledge",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2644,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 661,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "knowledge_chunk:spanish-deployment:r1:0:1"
+          ],
+          "injected_source_diversity": 1,
+          "language": "es",
+          "latency_ms": 2.284708,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2398,
+          "selected_identities": [
+            "knowledge_chunk:spanish-deployment:r1:0:1"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.133541,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "russian-transcript",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2897,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 725,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "transcript_message:russian-session:0:921a11e70570119976f3fcf4de67c97517bbd9773d927b8ec111daa5bb8c37ef"
+          ],
+          "injected_source_diversity": 1,
+          "language": "ru",
+          "latency_ms": 2.44075,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2651,
+          "selected_identities": [
+            "transcript_message:russian-session:0:921a11e70570119976f3fcf4de67c97517bbd9773d927b8ec111daa5bb8c37ef"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.069875,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "short-followup-why",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2626,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 657,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "knowledge_chunk:deployment-port:r1:0:1"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 2.251833,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2380,
+          "selected_identities": [
+            "knowledge_chunk:deployment-port:r1:0:1"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.161042,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "short-followup-action",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2845,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 712,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "transcript_message:ops-session:0:b6ce92b0b9efff01c57e5b2b6ae15906401823c4e7eae854978b652436b4c306"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 2.688083,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2599,
+          "selected_identities": [
+            "transcript_message:ops-session:0:b6ce92b0b9efff01c57e5b2b6ae15906401823c4e7eae854978b652436b4c306"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.136042,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "token-boundary-normalization",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2861,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 716,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "transcript_message:token-boundary-session:1:c0d3140619aeb566ba5c6cadd9501cf39e6cf7036ed85d1979e6dcf1fe3039db"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 2.422375,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2615,
+          "selected_identities": [
+            "transcript_message:token-boundary-session:1:c0d3140619aeb566ba5c6cadd9501cf39e6cf7036ed85d1979e6dcf1fe3039db"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.134458,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "unicode-casefold-parity",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2859,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 715,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "transcript_message:unicode-fold-session:0:99c0e33b267103c30a0436810fe4d31f458de985ead9ebd9589de8ff05254ac9"
+          ],
+          "injected_source_diversity": 1,
+          "language": "de",
+          "latency_ms": 2.451625,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2613,
+          "selected_identities": [
+            "transcript_message:unicode-fold-session:0:99c0e33b267103c30a0436810fe4d31f458de985ead9ebd9589de8ff05254ac9"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.453041,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "relevance-before-identity",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [
+            "transcript.lexical"
+          ],
+          "contribution_bytes": 3370,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 843,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "transcript_message:z-ranking-session:0:cbd7eb8b118e4b9fef59275ea993248d754ec16c5b6a35cde16699c5995400cb"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 3.024375,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2904,
+          "selected_identities": [
+            "transcript_message:z-ranking-session:0:cbd7eb8b118e4b9fef59275ea993248d754ec16c5b6a35cde16699c5995400cb"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.077917,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "scan-overflow-fails-closed",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2641,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 661,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "knowledge_chunk:scan-fallback:r1:0:1"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 3.096083,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 2,
+          "recall_at_k": 1.0,
+          "result_bytes": 2416,
+          "selected_identities": [
+            "knowledge_chunk:scan-fallback:r1:0:1"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": "scan_limit"
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "partial"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.121792,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "byte-truncation-without-false-continuation",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2834,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 709,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "transcript_message:byte-bound-session:0:bd5ec4358313ea077dcc799f008356e59bdb19b382f588db3c8bed3747dbd271"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 2.465542,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2616,
+          "selected_identities": [
+            "transcript_message:byte-bound-session:0:bd5ec4358313ea077dcc799f008356e59bdb19b382f588db3c8bed3747dbd271"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 2.1155,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 3,
+          "case_id": "admission-threshold-ladder",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 4194,
+          "correct_injected_count": 1,
+          "correct_offered_count": 1,
+          "correct_silent_count": 1,
+          "estimated_contribution_tokens": 1049,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "transcript_message:admission-ladder-session:2:cd868777687b2d1e6a8d8fc9fca59880e45d4b5fe7264eb81372a09e0ac577fb"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 4.661709,
+          "locator_correct_count": 3,
+          "locator_evaluated_count": 3,
+          "offered_identities": [
+            "transcript_message:admission-ladder-session:1:0ba631cca9f0661a39d205fe6953c2fa071cb434f7472acd9e4c470819952910"
+          ],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 5003,
+          "selected_identities": [
+            "transcript_message:admission-ladder-session:2:cd868777687b2d1e6a8d8fc9fca59880e45d4b5fe7264eb81372a09e0ac577fb",
+            "transcript_message:admission-ladder-session:1:0ba631cca9f0661a39d205fe6953c2fa071cb434f7472acd9e4c470819952910",
+            "transcript_message:admission-ladder-session:0:fad8b0bd8cac0400cc16ebd58e64560a4554889e954b1cb25cfd1b9eca8ab79f"
+          ],
+          "silent_identities": [
+            "transcript_message:admission-ladder-session:0:fad8b0bd8cac0400cc16ebd58e64560a4554889e954b1cb25cfd1b9eca8ab79f"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.077666,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "malicious-recalled-text",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2704,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 676,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "knowledge_chunk:malicious-memory-text:r1:0:1"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 2.271084,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2458,
+          "selected_identities": [
+            "knowledge_chunk:malicious-memory-text:r1:0:1"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        }
+      ],
+      "configuration": {
+        "admission_policy_by_case": {
+          "admission-threshold-ladder": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "authorization-isolation": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "byte-truncation-without-false-continuation": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "current-knowledge-and-historical-transcript": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 1,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "duplicate-provenance": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "knowledge-only": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "malicious-recalled-text": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "relevance-before-identity": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "russian-transcript": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "scan-overflow-fails-closed": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "short-followup-action": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "short-followup-why": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "spanish-knowledge": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "token-boundary-normalization": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "transcript-only": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "unicode-casefold-parity": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          }
+        },
+        "channel_weights": {
+          "knowledge.lexical": 1,
+          "knowledge.semantic": 1,
+          "transcript.lexical": 1
+        },
+        "cutoffs_by_case": {
+          "admission-threshold-ladder": 3,
+          "authorization-isolation": 5,
+          "byte-truncation-without-false-continuation": 1,
+          "current-knowledge-and-historical-transcript": 5,
+          "duplicate-provenance": 5,
+          "knowledge-only": 5,
+          "malicious-recalled-text": 5,
+          "relevance-before-identity": 1,
+          "russian-transcript": 5,
+          "scan-overflow-fails-closed": 5,
+          "short-followup-action": 5,
+          "short-followup-why": 5,
+          "spanish-knowledge": 5,
+          "token-boundary-normalization": 2,
+          "transcript-only": 5,
+          "unicode-casefold-parity": 5
+        },
+        "engine_version": "cayu.recall.v1",
+        "fusion_configuration_version": "public-recall-admission-baseline-v2",
+        "fusion_strategy_version": "cayu.wrrf.v1",
+        "source_set": [
+          "knowledge",
+          "transcript"
+        ],
+        "token_estimator": "ceil(utf8_json_bytes/4)",
+        "transcript_budgets_by_case": {
+          "admission-threshold-ladder": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "authorization-isolation": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "byte-truncation-without-false-continuation": {
+            "max_bytes": 4,
+            "max_records_scanned": 10000
+          },
+          "current-knowledge-and-historical-transcript": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "duplicate-provenance": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "knowledge-only": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "malicious-recalled-text": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "relevance-before-identity": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "russian-transcript": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "scan-overflow-fails-closed": {
+            "max_bytes": 64000,
+            "max_records_scanned": 1
+          },
+          "short-followup-action": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "short-followup-why": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "spanish-knowledge": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "token-boundary-normalization": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "transcript-only": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "unicode-casefold-parity": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          }
+        }
+      },
+      "corpus_origin": "hermetic_public",
+      "corpus_revision": "public-cross-source-admission-v2",
+      "metrics": {
+        "admission_latency_p50_ms": 1.136042,
+        "admission_latency_p95_ms": 2.137834,
+        "admission_truncated_case_count": 2,
+        "authorization_leak_rate": 0.0,
+        "case_count": 16,
+        "contribution_bytes": 49609,
+        "estimated_contribution_tokens": 12403,
+        "estimated_result_tokens": 11568,
+        "false_complete_rate": 0.0,
+        "false_injection_rate": 0.0,
+        "false_result_rate": 0.0,
+        "injected_precision": 1.0,
+        "latency_p50_ms": 2.560792,
+        "latency_p95_ms": 4.661709,
+        "locator_correctness": 1.0,
+        "mean_candidate_count": 1.3125,
+        "mean_injected_source_diversity": 1.0625,
+        "offer_precision": 1.0,
+        "partial_source_count": 17,
+        "recall_at_k": 1.0,
+        "required_source_failure_closed": true,
+        "result_bytes": 46270,
+        "silent_precision": 1.0,
+        "stale_injection_rate": 0.0,
+        "stale_knowledge_rate": 0.0,
+        "total_candidate_count": 21,
+        "truncated_case_count": 16,
+        "unauthorized_injection_rate": 0.0
+      },
+      "schema_version": "cayu.recall_baseline_result.v2"
+    },
+    {
+      "backend": "sqlite",
+      "cases": [
+        {
+          "admission_latency_ms": 1.123834,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "knowledge-only",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2645,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 662,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "knowledge_chunk:deployment-port:r1:0:1"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 3.12975,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2399,
+          "selected_identities": [
+            "knowledge_chunk:deployment-port:r1:0:1"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.152583,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "transcript-only",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2849,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 713,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "transcript_message:ops-session:0:b6ce92b0b9efff01c57e5b2b6ae15906401823c4e7eae854978b652436b4c306"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 3.084333,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2603,
+          "selected_identities": [
+            "transcript_message:ops-session:0:b6ce92b0b9efff01c57e5b2b6ae15906401823c4e7eae854978b652436b4c306"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.858958,
+          "admission_truncated": true,
+          "authorization_leak_count": 0,
+          "candidate_count": 2,
+          "case_id": "duplicate-provenance",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 3906,
+          "correct_injected_count": 1,
+          "correct_offered_count": 1,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 977,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "knowledge_chunk:refund-owner:r1:0:1"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 3.717084,
+          "locator_correct_count": 2,
+          "locator_evaluated_count": 2,
+          "offered_identities": [
+            "transcript_message:support-session:0:a03a2d0e7c7349b84878c3a2ed6cfa5ffd7801ad135196cabf66a7cb6e87be05"
+          ],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 3549,
+          "selected_identities": [
+            "knowledge_chunk:refund-owner:r1:0:1",
+            "transcript_message:support-session:0:a03a2d0e7c7349b84878c3a2ed6cfa5ffd7801ad135196cabf66a7cb6e87be05"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.908292,
+          "admission_truncated": true,
+          "authorization_leak_count": 0,
+          "candidate_count": 2,
+          "case_id": "current-knowledge-and-historical-transcript",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 3899,
+          "correct_injected_count": 1,
+          "correct_offered_count": 1,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 975,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "knowledge_chunk:release-date:r2:0:2"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 3.73225,
+          "locator_correct_count": 2,
+          "locator_evaluated_count": 2,
+          "offered_identities": [
+            "transcript_message:release-history:0:215d99ad812a8c47b51092442230a707bd330e282040e5c40bcd607678c9268e"
+          ],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 3551,
+          "selected_identities": [
+            "knowledge_chunk:release-date:r2:0:2",
+            "transcript_message:release-history:0:215d99ad812a8c47b51092442230a707bd330e282040e5c40bcd607678c9268e"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 2.133458,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 2,
+          "case_id": "authorization-isolation",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 3913,
+          "correct_injected_count": 2,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 979,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "knowledge_chunk:authorized-boundary:r1:0:1",
+            "transcript_message:authorized-session:0:5dbe513381cee6dad9456b34dca87a6d262cbc76f2ea4e54f3eeff1d3de6794e"
+          ],
+          "injected_source_diversity": 2,
+          "language": "en",
+          "latency_ms": 4.427459,
+          "locator_correct_count": 2,
+          "locator_evaluated_count": 2,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 3593,
+          "selected_identities": [
+            "knowledge_chunk:authorized-boundary:r1:0:1",
+            "transcript_message:authorized-session:0:5dbe513381cee6dad9456b34dca87a6d262cbc76f2ea4e54f3eeff1d3de6794e"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.115584,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "spanish-knowledge",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2664,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 666,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "knowledge_chunk:spanish-deployment:r1:0:1"
+          ],
+          "injected_source_diversity": 1,
+          "language": "es",
+          "latency_ms": 2.678292,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2418,
+          "selected_identities": [
+            "knowledge_chunk:spanish-deployment:r1:0:1"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.171333,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "russian-transcript",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2897,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 725,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "transcript_message:russian-session:0:921a11e70570119976f3fcf4de67c97517bbd9773d927b8ec111daa5bb8c37ef"
+          ],
+          "injected_source_diversity": 1,
+          "language": "ru",
+          "latency_ms": 3.104042,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2651,
+          "selected_identities": [
+            "transcript_message:russian-session:0:921a11e70570119976f3fcf4de67c97517bbd9773d927b8ec111daa5bb8c37ef"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.074083,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "short-followup-why",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2645,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 662,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "knowledge_chunk:deployment-port:r1:0:1"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 2.777667,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2399,
+          "selected_identities": [
+            "knowledge_chunk:deployment-port:r1:0:1"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.134709,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "short-followup-action",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2845,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 712,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "transcript_message:ops-session:0:b6ce92b0b9efff01c57e5b2b6ae15906401823c4e7eae854978b652436b4c306"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 3.095667,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2599,
+          "selected_identities": [
+            "transcript_message:ops-session:0:b6ce92b0b9efff01c57e5b2b6ae15906401823c4e7eae854978b652436b4c306"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.157959,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "token-boundary-normalization",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2861,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 716,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "transcript_message:token-boundary-session:1:c0d3140619aeb566ba5c6cadd9501cf39e6cf7036ed85d1979e6dcf1fe3039db"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 2.901334,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2615,
+          "selected_identities": [
+            "transcript_message:token-boundary-session:1:c0d3140619aeb566ba5c6cadd9501cf39e6cf7036ed85d1979e6dcf1fe3039db"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.16925,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "unicode-casefold-parity",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2859,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 715,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "transcript_message:unicode-fold-session:0:99c0e33b267103c30a0436810fe4d31f458de985ead9ebd9589de8ff05254ac9"
+          ],
+          "injected_source_diversity": 1,
+          "language": "de",
+          "latency_ms": 2.966542,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2613,
+          "selected_identities": [
+            "transcript_message:unicode-fold-session:0:99c0e33b267103c30a0436810fe4d31f458de985ead9ebd9589de8ff05254ac9"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.252875,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "relevance-before-identity",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [
+            "transcript.lexical"
+          ],
+          "contribution_bytes": 3370,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 843,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "transcript_message:z-ranking-session:0:cbd7eb8b118e4b9fef59275ea993248d754ec16c5b6a35cde16699c5995400cb"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 3.928667,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2904,
+          "selected_identities": [
+            "transcript_message:z-ranking-session:0:cbd7eb8b118e4b9fef59275ea993248d754ec16c5b6a35cde16699c5995400cb"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.311334,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "scan-overflow-fails-closed",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2661,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 666,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "knowledge_chunk:scan-fallback:r1:0:1"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 2.887708,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 2,
+          "recall_at_k": 1.0,
+          "result_bytes": 2436,
+          "selected_identities": [
+            "knowledge_chunk:scan-fallback:r1:0:1"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": "scan_limit"
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "partial"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.133208,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "byte-truncation-without-false-continuation",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2834,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 709,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "transcript_message:byte-bound-session:0:bd5ec4358313ea077dcc799f008356e59bdb19b382f588db3c8bed3747dbd271"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 2.921375,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2616,
+          "selected_identities": [
+            "transcript_message:byte-bound-session:0:bd5ec4358313ea077dcc799f008356e59bdb19b382f588db3c8bed3747dbd271"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.944292,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 3,
+          "case_id": "admission-threshold-ladder",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 4194,
+          "correct_injected_count": 1,
+          "correct_offered_count": 1,
+          "correct_silent_count": 1,
+          "estimated_contribution_tokens": 1049,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "transcript_message:admission-ladder-session:2:cd868777687b2d1e6a8d8fc9fca59880e45d4b5fe7264eb81372a09e0ac577fb"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 4.675292,
+          "locator_correct_count": 3,
+          "locator_evaluated_count": 3,
+          "offered_identities": [
+            "transcript_message:admission-ladder-session:1:0ba631cca9f0661a39d205fe6953c2fa071cb434f7472acd9e4c470819952910"
+          ],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 5003,
+          "selected_identities": [
+            "transcript_message:admission-ladder-session:2:cd868777687b2d1e6a8d8fc9fca59880e45d4b5fe7264eb81372a09e0ac577fb",
+            "transcript_message:admission-ladder-session:1:0ba631cca9f0661a39d205fe6953c2fa071cb434f7472acd9e4c470819952910",
+            "transcript_message:admission-ladder-session:0:fad8b0bd8cac0400cc16ebd58e64560a4554889e954b1cb25cfd1b9eca8ab79f"
+          ],
+          "silent_identities": [
+            "transcript_message:admission-ladder-session:0:fad8b0bd8cac0400cc16ebd58e64560a4554889e954b1cb25cfd1b9eca8ab79f"
+          ],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        },
+        {
+          "admission_latency_ms": 1.116833,
+          "admission_truncated": false,
+          "authorization_leak_count": 0,
+          "candidate_count": 1,
+          "case_id": "malicious-recalled-text",
+          "channel_index_versions": {
+            "knowledge.lexical": "cayu.knowledge.lexical.v1",
+            "knowledge.semantic": "unsupported",
+            "transcript.lexical": "cayu.transcript.text.v1+cayu.transcript.tokenizer.v1+unicode-15.0.0"
+          },
+          "continuation_channels": [],
+          "contribution_bytes": 2724,
+          "correct_injected_count": 1,
+          "correct_offered_count": 0,
+          "correct_silent_count": 0,
+          "estimated_contribution_tokens": 681,
+          "false_complete": false,
+          "false_injection_count": 0,
+          "false_result_count": 0,
+          "injected_identities": [
+            "knowledge_chunk:malicious-memory-text:r1:0:1"
+          ],
+          "injected_source_diversity": 1,
+          "language": "en",
+          "latency_ms": 2.672042,
+          "locator_correct_count": 1,
+          "locator_evaluated_count": 1,
+          "offered_identities": [],
+          "partial_source_count": 1,
+          "recall_at_k": 1.0,
+          "result_bytes": 2478,
+          "selected_identities": [
+            "knowledge_chunk:malicious-memory-text:r1:0:1"
+          ],
+          "silent_identities": [],
+          "source_failure_codes": {
+            "knowledge": "semantic_unsupported",
+            "transcript": null
+          },
+          "source_statuses": {
+            "knowledge": "partial",
+            "transcript": "complete"
+          },
+          "stale_injection_count": 0,
+          "stale_knowledge_count": 0,
+          "truncated": true,
+          "unauthorized_injection_count": 0
+        }
+      ],
+      "configuration": {
+        "admission_policy_by_case": {
+          "admission-threshold-ladder": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "authorization-isolation": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "byte-truncation-without-false-continuation": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "current-knowledge-and-historical-transcript": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 1,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "duplicate-provenance": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "knowledge-only": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "malicious-recalled-text": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "relevance-before-identity": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "russian-transcript": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "scan-overflow-fails-closed": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "short-followup-action": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "short-followup-why": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "spanish-knowledge": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "token-boundary-normalization": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "transcript-only": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          },
+          "unicode-casefold-parity": {
+            "calibration_version": "public-recall-admission-v1",
+            "fusion_configuration_version": "public-recall-admission-baseline-v2",
+            "fusion_strategy_version": "cayu.wrrf.v1",
+            "max_candidate_text_bytes": 32000,
+            "max_evaluated_candidates": 30,
+            "max_focus_bytes": 96000,
+            "max_injected_items": 5,
+            "max_offer_bytes": 48000,
+            "max_offered_items": 10,
+            "max_total_bytes": 192000,
+            "minimum_inject_score": 0.0162,
+            "minimum_offer_score": 0.016,
+            "mode": "offer_and_strong_matches",
+            "policy_version": "cayu.automatic_recall_policy.v1"
+          }
+        },
+        "channel_weights": {
+          "knowledge.lexical": 1,
+          "knowledge.semantic": 1,
+          "transcript.lexical": 1
+        },
+        "cutoffs_by_case": {
+          "admission-threshold-ladder": 3,
+          "authorization-isolation": 5,
+          "byte-truncation-without-false-continuation": 1,
+          "current-knowledge-and-historical-transcript": 5,
+          "duplicate-provenance": 5,
+          "knowledge-only": 5,
+          "malicious-recalled-text": 5,
+          "relevance-before-identity": 1,
+          "russian-transcript": 5,
+          "scan-overflow-fails-closed": 5,
+          "short-followup-action": 5,
+          "short-followup-why": 5,
+          "spanish-knowledge": 5,
+          "token-boundary-normalization": 2,
+          "transcript-only": 5,
+          "unicode-casefold-parity": 5
+        },
+        "engine_version": "cayu.recall.v1",
+        "fusion_configuration_version": "public-recall-admission-baseline-v2",
+        "fusion_strategy_version": "cayu.wrrf.v1",
+        "source_set": [
+          "knowledge",
+          "transcript"
+        ],
+        "token_estimator": "ceil(utf8_json_bytes/4)",
+        "transcript_budgets_by_case": {
+          "admission-threshold-ladder": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "authorization-isolation": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "byte-truncation-without-false-continuation": {
+            "max_bytes": 4,
+            "max_records_scanned": 10000
+          },
+          "current-knowledge-and-historical-transcript": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "duplicate-provenance": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "knowledge-only": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "malicious-recalled-text": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "relevance-before-identity": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "russian-transcript": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "scan-overflow-fails-closed": {
+            "max_bytes": 64000,
+            "max_records_scanned": 1
+          },
+          "short-followup-action": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "short-followup-why": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "spanish-knowledge": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "token-boundary-normalization": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "transcript-only": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          },
+          "unicode-casefold-parity": {
+            "max_bytes": 64000,
+            "max_records_scanned": 10000
+          }
+        }
+      },
+      "corpus_origin": "hermetic_public",
+      "corpus_revision": "public-cross-source-admission-v2",
+      "metrics": {
+        "admission_latency_p50_ms": 1.157959,
+        "admission_latency_p95_ms": 2.133458,
+        "admission_truncated_case_count": 2,
+        "authorization_leak_rate": 0.0,
+        "case_count": 16,
+        "contribution_bytes": 49766,
+        "estimated_contribution_tokens": 12442,
+        "estimated_result_tokens": 11607,
+        "false_complete_rate": 0.0,
+        "false_injection_rate": 0.0,
+        "false_result_rate": 0.0,
+        "injected_precision": 1.0,
+        "latency_p50_ms": 3.084333,
+        "latency_p95_ms": 4.675292,
+        "locator_correctness": 1.0,
+        "mean_candidate_count": 1.3125,
+        "mean_injected_source_diversity": 1.0625,
+        "offer_precision": 1.0,
+        "partial_source_count": 17,
+        "recall_at_k": 1.0,
+        "required_source_failure_closed": true,
+        "result_bytes": 46427,
+        "silent_precision": 1.0,
+        "stale_injection_rate": 0.0,
+        "stale_knowledge_rate": 0.0,
+        "total_candidate_count": 21,
+        "truncated_case_count": 16,
+        "unauthorized_injection_rate": 0.0
+      },
+      "schema_version": "cayu.recall_baseline_result.v2"
+    }
+  ],
+  "schema_version": "cayu.recall_baseline_matrix.v2"
+}

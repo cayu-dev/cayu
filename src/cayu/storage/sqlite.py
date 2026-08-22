@@ -9282,6 +9282,15 @@ class SQLiteSessionStore(SessionStore):
         roles = tuple(str(role) for role in query.roles)
         role_placeholders = ", ".join("?" for _ in roles)
         session_placeholders = ", ".join("?" for _ in query.session_ids)
+        before_filter = "".join(
+            " AND (transcript.session_id <> ? OR transcript.session_order <= ?)"
+            for _ in query.before_transcript_indexes
+        )
+        before_params = [
+            value
+            for session_id, before_index in query.before_transcript_indexes.items()
+            for value in (session_id, before_index)
+        ]
         query_document = transcript_search_query_document(query.text)
         fetch_limit = query.max_records_scanned + 1
 
@@ -9300,12 +9309,14 @@ class SQLiteSessionStore(SessionStore):
                 WHERE cayu_transcript_messages_fts MATCH ?
                   AND transcript.session_id IN ({session_placeholders})
                   AND transcript.role IN ({role_placeholders})
+                  {before_filter}
                 LIMIT ?
                 """,
                 [
                     _sqlite_transcript_search_expression(query),
                     *query.session_ids,
                     *roles,
+                    *before_params,
                     fetch_limit,
                 ],
             ).fetchall()

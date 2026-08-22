@@ -17,12 +17,12 @@ from cayu.storage import InMemoryKnowledgeStore, SQLiteKnowledgeStore, SQLiteSes
 
 def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run Cayu's hermetic bounded cross-source recall baseline."
+        description="Run Cayu's hermetic bounded recall and admission baseline."
     )
     parser.add_argument(
         "--corpus",
         type=Path,
-        default=Path("benchmarks/memory/recall-corpus-v1.json"),
+        default=Path("benchmarks/memory/recall-corpus-v2.json"),
         help="Public hermetic or private external corpus JSON.",
     )
     parser.add_argument(
@@ -56,7 +56,7 @@ async def _run(corpus_path: Path) -> dict:
             await sqlite_sessions.close()
             await sqlite_knowledge.close()
     return {
-        "schema_version": "cayu.recall_baseline_matrix.v1",
+        "schema_version": "cayu.recall_baseline_matrix.v2",
         "corpus_revision": corpus.corpus_revision,
         "results": [
             memory_result.model_dump(mode="json"),

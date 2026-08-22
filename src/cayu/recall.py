@@ -21,6 +21,7 @@ from pydantic import (
 )
 
 from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
     FrozenJsonDict,
     canonical_durable_json_bytes,
     copy_durable_json_object,
@@ -115,6 +116,7 @@ class RecallSituation(BaseModel):
     knowledge_access_scope: KnowledgeAccessScope | None = None
     knowledge_namespace: str = DEFAULT_KNOWLEDGE_NAMESPACE
     transcript_session_ids: tuple[str, ...] = ()
+    transcript_before_indexes: Mapping[str, int] = Field(default_factory=dict)
     continuations: Mapping[str, str] = Field(default_factory=dict)
     current_time: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -193,6 +195,35 @@ class RecallSituation(BaseModel):
         )
         object.__setattr__(value, "allowed_statuses", tuple(value.allowed_statuses))
         return value
+
+    @field_validator("transcript_before_indexes", mode="before")
+    @classmethod
+    def copy_transcript_before_indexes(cls, value) -> dict[str, int]:
+        copied = copy_durable_json_object(value, "transcript_before_indexes")
+        result: dict[str, int] = {}
+        for session_id, index in copied.items():
+            session_id = require_clean_nonblank(session_id, "transcript_before_indexes key")
+            if type(index) is not int or not 0 <= index <= MAX_DURABLE_JSON_INTEGER:
+                raise ValueError(
+                    "`transcript_before_indexes` values must be non-negative durable integers."
+                )
+            result[session_id] = index
+        return {session_id: result[session_id] for session_id in sorted(result)}
+
+    @field_validator("transcript_before_indexes")
+    @classmethod
+    def freeze_transcript_before_indexes(
+        cls,
+        value: Mapping[str, int],
+    ) -> Mapping[str, int]:
+        return FrozenJsonDict(value)
+
+    @field_serializer("transcript_before_indexes")
+    def serialize_transcript_before_indexes(
+        self,
+        value: Mapping[str, int],
+    ) -> dict[str, int]:
+        return dict(value)
 
     @field_serializer("knowledge_access_scope")
     def serialize_access_scope(
@@ -283,6 +314,14 @@ class RecallSituation(BaseModel):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("`current_time` must be timezone-aware.")
         return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_transcript_before_index_scope(self) -> RecallSituation:
+        if not set(self.transcript_before_indexes).issubset(self.transcript_session_ids):
+            raise ValueError(
+                "`transcript_before_indexes` keys must belong to transcript_session_ids."
+            )
+        return self
 
     def retrieval_text(self) -> str:
         """Resolve short follow-ups from bounded caller-supplied current context."""
@@ -1457,11 +1496,9 @@ class TranscriptRecallSource(RecallSource):
         max_bytes: int = 64_000,
         max_records_scanned: int = 10_000,
     ) -> None:
-        if not isinstance(store, SessionStore):
-            raise TypeError("store must be a SessionStore.")
+        if not self.supports_store(store):
+            raise TypeError("store must provide enabled transcript search.")
         super().__init__(required=required, candidate_limit=candidate_limit)
-        if not store.supports_transcript_search:
-            raise ValueError("SessionStore does not advertise transcript search support.")
         if (
             type(max_bytes) is not int
             or not TRANSCRIPT_SEARCH_MIN_MAX_BYTES <= max_bytes <= TRANSCRIPT_SEARCH_MAX_BYTES
@@ -1481,6 +1518,14 @@ class TranscriptRecallSource(RecallSource):
         self._max_bytes = max_bytes
         self._max_records_scanned = max_records_scanned
 
+    @staticmethod
+    def supports_store(store: object) -> bool:
+        """Return whether a store exposes the bounded transcript-search contract."""
+
+        supports_search = getattr(store, "supports_transcript_search", None)
+        search = getattr(store, "search_transcript", None)
+        return supports_search is True and callable(search)
+
     async def retrieve(self, situation: RecallSituation) -> RecallSourceResult:
         if not situation.transcript_session_ids:
             return RecallSourceResult(
@@ -1499,6 +1544,7 @@ class TranscriptRecallSource(RecallSource):
             TranscriptSearchQuery(
                 text=situation.retrieval_text(),
                 session_ids=situation.transcript_session_ids,
+                before_transcript_indexes=situation.transcript_before_indexes,
                 limit=self.candidate_limit,
                 max_bytes=self._max_bytes,
                 max_records_scanned=self._max_records_scanned,

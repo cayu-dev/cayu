@@ -1,7 +1,8 @@
-"""Credential-free bounded recall across canonical knowledge and transcripts.
+"""Credential-free bounded recall and calibrated admission across memory sources.
 
-Recall returns retrieval evidence. It does not inject candidates into a model
-request; an application-owned context policy must make that separate decision.
+Recall produces retrieval evidence; admission separately chooses bounded memory
+focus, reference-only offers, and silent candidates. Runtime applications use
+``AutomaticRecallContextPolicy`` to freeze this decision for one interaction.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from cayu import (
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
     TRANSCRIPT_LEXICAL_CHANNEL,
+    WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
     InMemoryKnowledgeStore,
     KnowledgeAccessScope,
     KnowledgeEntry,
@@ -22,6 +24,7 @@ from cayu import (
     WeightedReciprocalRankFusionConfig,
 )
 from cayu.core.messages import Message, MessageRole
+from cayu.memory import AutomaticRecallContributor, AutomaticRecallPolicy
 from cayu.runtime import InMemorySessionStore, RunRequest, SessionIdentity
 
 
@@ -64,7 +67,17 @@ async def main() -> None:
             fused_head_limit=5,
         ),
     )
-    result = await engine.recall(
+    contributor = AutomaticRecallContributor(
+        engine,
+        AutomaticRecallPolicy(
+            calibration_version="example-calibration-v1",
+            fusion_strategy_version=WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
+            fusion_configuration_version="example-v1",
+            minimum_inject_score=0.0162,
+            minimum_offer_score=0.016,
+        ),
+    )
+    contribution = await contributor.contribute(
         RecallSituation(
             query="Which deployment port should we use?",
             knowledge_access_scope=scope,
@@ -73,10 +86,15 @@ async def main() -> None:
         )
     )
 
-    for candidate in result.candidates:
-        record = candidate.record
-        print(record.identity.record_type, record.text, dict(record.locator))
-    print("source coverage:", [(item.source, item.status) for item in result.sources])
+    print("memory focus:")
+    for item in () if contribution.focus is None else contribution.focus.items:
+        record = item.candidate.record
+        print(" ", record.identity.record_type, record.text, dict(record.locator))
+    print("reference offers:")
+    for item in () if contribution.offer is None else contribution.offer.items:
+        print(" ", item.identity.record_type, dict(item.locator), item.reason)
+    print("silent candidates:", contribution.diagnostics.silent_count)
+    print("source coverage:", [(item.source, item.status) for item in contribution.sources])
 
 
 if __name__ == "__main__":

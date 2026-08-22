@@ -37,6 +37,7 @@ from pydantic import (
     SecretStr,
     StrictBool,
     StrictInt,
+    field_serializer,
     field_validator,
     model_validator,
 )
@@ -44,6 +45,7 @@ from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs 
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
+    FrozenJsonDict,
     JsonUtf8SizeCounter,
     canonical_durable_json_bytes,
     compact_json_utf8_size,
@@ -6631,6 +6633,7 @@ class TranscriptSearchQuery(BaseModel):
         MessageRole.USER,
         MessageRole.ASSISTANT,
     )
+    before_transcript_indexes: Mapping[str, int] = Field(default_factory=dict)
     limit: int = TRANSCRIPT_SEARCH_DEFAULT_LIMIT
     max_bytes: int = TRANSCRIPT_SEARCH_DEFAULT_MAX_BYTES
     max_records_scanned: int = TRANSCRIPT_SEARCH_DEFAULT_SCAN_LIMIT
@@ -6690,6 +6693,43 @@ class TranscriptSearchQuery(BaseModel):
         if MessageRole.SYSTEM in roles or MessageRole.TOOL in roles:
             raise ValueError("Transcript recall indexes only user and assistant narrative text.")
         return tuple(sorted(roles, key=str))
+
+    @field_validator("before_transcript_indexes", mode="before")
+    @classmethod
+    def validate_before_transcript_indexes(cls, value) -> dict[str, int]:
+        copied = copy_durable_json_object(value, "before_transcript_indexes")
+        result: dict[str, int] = {}
+        for session_id, index in copied.items():
+            session_id = require_clean_nonblank(session_id, "before_transcript_indexes key")
+            if type(index) is not int or not 0 <= index <= MAX_DURABLE_JSON_INTEGER:
+                raise ValueError(
+                    "`before_transcript_indexes` values must be non-negative durable integers."
+                )
+            result[session_id] = index
+        return {session_id: result[session_id] for session_id in sorted(result)}
+
+    @field_validator("before_transcript_indexes")
+    @classmethod
+    def freeze_before_transcript_indexes(
+        cls,
+        value: Mapping[str, int],
+    ) -> Mapping[str, int]:
+        return FrozenJsonDict(value)
+
+    @field_serializer("before_transcript_indexes")
+    def serialize_before_transcript_indexes(
+        self,
+        value: Mapping[str, int],
+    ) -> dict[str, int]:
+        return dict(value)
+
+    @model_validator(mode="after")
+    def validate_before_index_scope(self) -> TranscriptSearchQuery:
+        if not set(self.before_transcript_indexes).issubset(self.session_ids):
+            raise ValueError(
+                "`before_transcript_indexes` keys must belong to the selected session scope."
+            )
+        return self
 
     @field_validator("limit", "max_bytes", "max_records_scanned", mode="before")
     @classmethod
@@ -13419,7 +13459,14 @@ class InMemorySessionStore(SessionStore):
                             continue
                         source_index = len(posting_sources)
                         posting_sources.append((session_id, indexes))
-                        position = len(indexes) - 1
+                        before_index = query.before_transcript_indexes.get(session_id)
+                        position = (
+                            len(indexes) - 1
+                            if before_index is None
+                            else bisect_left(indexes, before_index) - 1
+                        )
+                        if position < 0:
+                            continue
                         heapq.heappush(
                             posting_heap,
                             (session_id, -indexes[position], source_index, position),
@@ -20100,6 +20147,7 @@ def transcript_search_query_fingerprint(query: TranscriptSearchQuery) -> str:
         "text": query.text,
         "session_ids": list(query.session_ids),
         "roles": [str(role) for role in query.roles],
+        "before_transcript_indexes": dict(query.before_transcript_indexes),
     }
     return sha256(canonical_durable_json_bytes(material, "transcript search query")).hexdigest()
 
@@ -20225,6 +20273,7 @@ def copy_transcript_search_query(
         text=query.text,
         session_ids=tuple(query.session_ids),
         roles=tuple(query.roles),
+        before_transcript_indexes=dict(query.before_transcript_indexes),
         limit=query.limit,
         max_bytes=query.max_bytes,
         max_records_scanned=query.max_records_scanned,

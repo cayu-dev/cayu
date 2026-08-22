@@ -139,6 +139,7 @@ def _situation(**updates) -> RecallSituation:
 def test_recall_situation_is_bounded_defensive_and_resolves_short_followups() -> None:
     recent = ["We selected project Atlas."]
     continuations = {"transcript.lexical": "cursor"}
+    before_indexes = {"session-a": 3}
     access_scope = KnowledgeAccessScope.for_namespace(
         "project:cayu",
         required_labels={"project": "cayu"},
@@ -149,23 +150,28 @@ def test_recall_situation_is_bounded_defensive_and_resolves_short_followups() ->
         work_context="Release investigation",
         knowledge_access_scope=access_scope,
         transcript_session_ids=("session-b", "session-a"),
+        transcript_before_indexes=before_indexes,
         continuations=continuations,
         current_time=_NOW,
     )
     recent[0] = "mutated"
     continuations["transcript.lexical"] = "mutated"
+    before_indexes["session-a"] = 99
     access_scope.allowed_namespaces.append("project:other")
     access_scope.required_labels["project"] = "other"
 
     assert situation.recent_conversation == ("We selected project Atlas.",)
     assert situation.transcript_session_ids == ("session-a", "session-b")
     assert situation.continuations == {"transcript.lexical": "cursor"}
+    assert situation.transcript_before_indexes == {"session-a": 3}
     assert situation.knowledge_access_scope is not None
     assert situation.knowledge_access_scope.allowed_namespaces == ("project:cayu",)
     assert situation.knowledge_access_scope.required_labels == {"project": "cayu"}
     assert situation.retrieval_text() == ("Release investigation\nWe selected project Atlas.\nWhy?")
     with pytest.raises(TypeError):
         situation.continuations["new"] = "cursor"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        situation.transcript_before_indexes["session-a"] = 4  # type: ignore[index]
     with pytest.raises(AttributeError):
         situation.knowledge_access_scope.allowed_namespaces.append("project:other")
     with pytest.raises(TypeError, match="cannot be mutated"):
@@ -176,6 +182,18 @@ def test_recall_situation_is_bounded_defensive_and_resolves_short_followups() ->
         RecallSituation(query="bounded", transcript_session_ids=repeat("session"))
     with pytest.raises(ValueError, match="more than 100"):
         TranscriptSearchQuery(text="bounded", session_ids=repeat("session"))
+    with pytest.raises(ValueError, match="selected session scope"):
+        TranscriptSearchQuery(
+            text="bounded",
+            session_ids=("session-a",),
+            before_transcript_indexes={"session-b": 1},
+        )
+    with pytest.raises(ValueError, match="belong to transcript_session_ids"):
+        RecallSituation(
+            query="bounded",
+            transcript_session_ids=("session-a",),
+            transcript_before_indexes={"session-b": 1},
+        )
     with pytest.raises(ValueError, match="at most .* UTF-8 bytes"):
         TranscriptSearchQuery(
             text="bounded",
