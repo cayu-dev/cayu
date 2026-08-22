@@ -5,12 +5,6 @@ import subprocess
 import tomllib
 from pathlib import Path
 
-from cayu.runtime.context import (
-    _KNOWLEDGE_CANDIDATES_CLOSE_TAG,
-    _KNOWLEDGE_CANDIDATES_FORMAT_VERSION,
-    _KNOWLEDGE_CANDIDATES_OPEN_TAG,
-)
-
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _INTERNAL_MARKDOWN_REFERENCE_PATTERNS = (
     re.compile(r"https://github\.com/cayu-dev/cayu/(?:issues|pull)/[0-9]+", re.I),
@@ -38,65 +32,49 @@ def _heading_section(path: Path, *, heading: str) -> str:
     return " ".join(section.split())
 
 
-def test_knowledge_injection_runtime_contract_pins_candidate_manifest() -> None:
+def test_automatic_recall_runtime_contract_pins_interaction_scoped_focus() -> None:
     section = _section(
         _REPO_ROOT / "docs" / "runtime-contracts.md",
-        start="Apps can also use `KnowledgeInjectionPolicy`",
+        start="Apps can use `AutomaticRecallContextPolicy`",
         end="This slice does not add graph retrieval",
     )
 
-    assert "synthetic user context" not in section
     for required in (
-        "latest eligible user message",
+        "`RecallEngine` retrieves and fuses",
+        "`AutomaticRecallPolicy` maps",
+        "`MemoryFocus`, `RecallOffer`, and `AutomaticRecallContribution`",
+        "exact fusion strategy/configuration and calibration versions",
+        "required unavailable source fails closed",
+        "optional source failure",
+        "exclusive transcript-index cutoff",
+        "anchoring user message cannot recall itself",
+        "`off`, `offer`, `strong_matches`, and `offer_and_strong_matches`",
+        "content-hash deduplicated",
+        "record-type diverse",
+        "complete contribution sizes all have explicit bounds",
+        "`AutomaticRecallContextPolicy` owns the automatic-memory frame",
+        "latest real user message",
         "never falls back to an earlier turn",
-        "structured-output repair or before-stop continuation",
-        "same atomic write that appends them to the transcript",
-        "a later real user message is not suppressed",
-        "`query_max_chars`",
-        "`max_hits`",
-        "`max_bytes`",
-        "capped at 128 KiB",
+        "structured-output repair and before-stop continuation",
+        "never mutated",
+        '`<cayu_automatic_memory version="1">`',
+        "exact candidate identity, revision, representation, content hash, locator",
+        "No hidden tool is registered",
         "first text part",
-        "before invoking the wrapped context policy",
-        "provider token counting, compaction",
-        "discarded rather than being attached to a different message",
-        "original user text and file parts remain separate and unchanged",
-        f"`cayu.knowledge_candidates.v{_KNOWLEDGE_CANDIDATES_FORMAT_VERSION}`",
-        f"`{_KNOWLEDGE_CANDIDATES_OPEN_TAG}`",
-        f"`{_KNOWLEDGE_CANDIDATES_CLOSE_TAG}`",
-        "valid JSON",
-        "entry ids, exact positive revisions, kinds, source metadata, and bounded excerpts",
-        "ordinary `read_knowledge` tool",
-        "does not fabricate assistant tool calls or tool-result messages",
-        "strict provider tool-history validation",
-        "any knowledge kind",
-        "no kind-specific loader",
-        "runtime-authored context",
-        "durable transcript",
-        "frozen once per user turn",
-        "runtime checkpoint",
-        "`knowledge_injection`",
-        "tool-result follow-ups, retries, cache-prefix construction",
-        "provider-managed reasoning state",
-        "does not mutate the frozen candidates",
-        "Zero-hit searches and `fail_open=True` failures are also frozen",
-        "absence of an active knowledge store",
-        "retroactively injecting into a user message",
-        "prunes its checkpoint frame",
-        "prompt-cache prefix stable",
-        "retains every indistinguishable anchor",
-        "rehydrated even when a later context build has no active knowledge store",
-        "`max_checkpoint_bytes` default is 1 MiB",
-        "configured up to 16 MiB",
-        "fails closed before provider dispatch",
-        "`knowledge.search.started`",
-        "`knowledge.search.completed`",
-        "`knowledge.search.failed`",
-        "`knowledge.injected`",
-        "candidate count, byte count, format version, truncation state",
-        "does not emit a second search or injection event",
-        "fail closed by default",
-        "`fail_open=True`",
+        "original transcript without receiving recalled content",
+        "prevents a compactor or custom selector from paraphrasing memory",
+        "content-free frozen state prevents another recall",
+        "frame is never attached to another message",
+        "never appended to the durable user transcript",
+        "`automatic_recall` checkpoint root",
+        "same frozen contribution is reused",
+        "Empty and silent outcomes are frozen",
+        "`max_projection_bytes`",
+        "`memory.recall.started`",
+        "`memory.recall.completed`",
+        "`memory.recall.failed`",
+        "`memory.recall.admitted`",
+        "first-class execution-profile component",
     ):
         assert required in section
 

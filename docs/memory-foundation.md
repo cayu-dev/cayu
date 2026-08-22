@@ -2,7 +2,8 @@
 
 This document records Cayu's v5.1 long-term-memory foundations, immutable
 knowledge revisions, and the bounded cross-source recall layer built on them.
-Context composition, curation, and automatic governance remain separate layers.
+Context composition, curation, admission, and exposure evidence remain separate
+layers; the first automatic recall-admission boundary is now implemented.
 
 ## Knowledge and memory are different layers
 
@@ -87,13 +88,20 @@ promptly. Because Python cannot stop an already-running SQLite worker thread
 safely, the physical read remains fenced behind its connection lock until it
 settles; later reads and shutdown cannot reuse that connection in the meantime.
 
-Recall is retrieval only. It does not decide that a candidate should enter a
-model request, does not inspect the model's existing context, and does not
-position material around lost-in-the-middle regions. Those are future/context
-composition decisions owned by a `ContextPolicy` (and eventually exposure
-evidence), after authorization-safe recall has produced candidates. The
-credential-free [cross-source example](../examples/cross_source_recall.py)
-shows the boundary explicitly.
+Recall is retrieval only. `AutomaticRecallPolicy` is a separate calibrated
+admission primitive that classifies the fused head as strong memory focus,
+reference-only offers, or silent candidates under explicit count and byte
+bounds. `AutomaticRecallContextPolicy` runs that boundary once for a real user
+interaction, freezes the redacted provider-neutral contribution through retries,
+tool rounds, repair, compaction, and recovery, and expires it at the next real
+user message. It never mutates the durable transcript.
+
+This first context manager does not claim semantic awareness of everything
+already stated in the provider-visible context and does not reposition material
+around a guessed lost-in-the-middle region. Those remain future composition and
+exposure-evidence decisions. The credential-free
+[cross-source example](../examples/cross_source_recall.py) shows retrieval and
+admission as explicit separate steps.
 
 ## Storage-enforced access
 

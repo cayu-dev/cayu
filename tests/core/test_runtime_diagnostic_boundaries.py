@@ -9,7 +9,13 @@ from tests.core._workload_secret_support import FakeProvider
 
 from cayu import (
     EXECUTION_PROFILE_FINGERPRINT_FIELD,
+    KNOWLEDGE_LEXICAL_CHANNEL,
+    KNOWLEDGE_SEMANTIC_CHANNEL,
+    WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
     AgentSpec,
+    AutomaticRecallContextPolicy,
+    AutomaticRecallPolicy,
+    AutomaticRecallSourceConfig,
     BoundWorkspace,
     CayuApp,
     DurableValueError,
@@ -23,7 +29,6 @@ from cayu import (
     InMemorySessionStore,
     InMemoryTaskStore,
     KnowledgeAccessScope,
-    KnowledgeInjectionPolicy,
     Message,
     ModelStreamEvent,
     RunRequest,
@@ -39,6 +44,7 @@ from cayu import (
     ToolEffect,
     ToolResult,
     ToolSpec,
+    WeightedReciprocalRankFusionConfig,
     WorkspaceBinding,
 )
 from cayu._exception_groups import (
@@ -77,6 +83,33 @@ from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 async def _collect(app: CayuApp, request: RunRequest) -> list[Event]:
     return [event async for event in app.run(request)]
+
+
+def _optional_knowledge_recall_policy() -> AutomaticRecallContextPolicy:
+    configuration_version = "diagnostic-boundary-automatic-recall-v1"
+    return AutomaticRecallContextPolicy(
+        admission_policy=AutomaticRecallPolicy(
+            calibration_version="diagnostic-boundary-calibration-v1",
+            fusion_strategy_version=WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
+            fusion_configuration_version=configuration_version,
+            minimum_inject_score=0.01,
+            minimum_offer_score=0.005,
+        ),
+        fusion_config=WeightedReciprocalRankFusionConfig(
+            configuration_version=configuration_version,
+            channel_weights={
+                KNOWLEDGE_LEXICAL_CHANNEL: 1.0,
+                KNOWLEDGE_SEMANTIC_CHANNEL: 1.0,
+            },
+            max_candidates_per_channel=20,
+            fused_head_limit=20,
+        ),
+        sources=AutomaticRecallSourceConfig(
+            include_transcript=False,
+            transcript_required=False,
+            knowledge_required=False,
+        ),
+    )
 
 
 class _RecordingEnvironmentFactory(EnvironmentFactory):
@@ -497,7 +530,7 @@ def test_binding_cleanup_status_corruption_fails_closed_without_erasing_state() 
     }
 
 
-def test_knowledge_failure_redacts_secret_crossing_diagnostic_boundary() -> None:
+def test_automatic_recall_source_failure_does_not_cross_diagnostic_boundary() -> None:
     secret = "knowledge-boundary-secret-canary"
     prefix = "d" * (MAX_DIAGNOSTIC_UTF8_BYTES - len(secret.encode("utf-8")) // 2)
 
@@ -526,7 +559,7 @@ def test_knowledge_failure_redacts_secret_crossing_diagnostic_boundary() -> None
     )
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
-        context_policy=KnowledgeInjectionPolicy(fail_open=True),
+        context_policy=_optional_knowledge_recall_policy(),
     )
 
     events = asyncio.run(
@@ -540,13 +573,20 @@ def test_knowledge_failure_redacts_secret_crossing_diagnostic_boundary() -> None
         )
     )
 
-    failed_event = next(
-        event for event in events if event.type == EventType.KNOWLEDGE_SEARCH_FAILED
+    completed_event = next(
+        event for event in events if event.type == EventType.AUTOMATIC_RECALL_COMPLETED
     )
-    rendered = str(failed_event.payload)
+    rendered = str(completed_event.payload)
     assert secret not in rendered
     assert secret[: len(secret) // 2] not in rendered
-    assert len(failed_event.payload["error"].encode("utf-8")) <= MAX_DIAGNOSTIC_UTF8_BYTES
+    assert completed_event.payload["source_statuses"] == [
+        {
+            "source": "knowledge",
+            "required": False,
+            "status": "unavailable",
+            "failure_code": "failed",
+        }
+    ]
     assert len(provider.requests) == 1
 
 
@@ -1353,7 +1393,7 @@ def test_terminal_hook_nonportable_failure_is_recorded_without_rewriting_session
         ("knowledge failure\ud800with invalid text", "unicode_surrogate"),
     ],
 )
-def test_fail_open_knowledge_search_publishes_portable_failure_and_calls_provider(
+def test_optional_automatic_recall_source_failure_is_portable_and_calls_provider(
     rejected_text: str,
     error_code: str,
 ) -> None:
@@ -1382,7 +1422,7 @@ def test_fail_open_knowledge_search_publishes_portable_failure_and_calls_provide
     )
     app.register_agent(
         AgentSpec(name="assistant", model="scripted-model"),
-        context_policy=KnowledgeInjectionPolicy(fail_open=True),
+        context_policy=_optional_knowledge_recall_policy(),
     )
 
     events = asyncio.run(
@@ -1400,10 +1440,18 @@ def test_fail_open_knowledge_search_publishes_portable_failure_and_calls_provide
     assert session is not None
     assert session.status is SessionStatus.COMPLETED
     assert len(provider.requests) == 1
-    failed = next(event for event in events if event.type == EventType.KNOWLEDGE_SEARCH_FAILED)
-    assert failed.payload["error"] == ("Knowledge search failed with a non-portable diagnostic.")
-    assert failed.payload["error_type"] == "RuntimeError"
-    assert failed.payload["durable_value_error_code"] == error_code
-    assert failed.payload["durable_value_error_path"] == "$"
+    completed = next(
+        event for event in events if event.type == EventType.AUTOMATIC_RECALL_COMPLETED
+    )
+    assert completed.payload["source_statuses"] == [
+        {
+            "source": "knowledge",
+            "required": False,
+            "status": "unavailable",
+            "failure_code": "failed",
+        }
+    ]
+    assert rejected_text not in str(completed.payload)
+    assert error_code not in str(completed.payload)
     assert EventType.MODEL_STARTED in [event.type for event in events]
     assert EventType.SESSION_FAILED not in [event.type for event in events]

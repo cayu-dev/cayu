@@ -481,11 +481,9 @@ def resolve_execution_profile_identity(
         context_selection_application_versioned=(
             context_components.selection_application_versioned
         ),
-        knowledge_injection=context_components.knowledge,
-        knowledge_injection_process_local=context_components.knowledge_process_local,
-        knowledge_injection_application_versioned=(
-            context_components.knowledge_application_versioned
-        ),
+        automatic_recall=context_components.recall,
+        automatic_recall_process_local=context_components.recall_process_local,
+        automatic_recall_application_versioned=(context_components.recall_application_versioned),
         context_compaction=context_components.compaction,
         context_compaction_process_local=context_components.compaction_process_local,
         context_compaction_application_versioned=(
@@ -642,7 +640,7 @@ def prepare_execution_profile_continuation(
             candidate,
             snapshot.profile.component(ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION),
         )
-        if snapshot.profile.schema_version >= 3 and not invocation_semantics_available:
+        if snapshot.profile.schema_version >= 4 and not invocation_semantics_available:
             for component_class in (
                 ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY,
                 ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY,
@@ -900,13 +898,13 @@ def _cayu_policy_material(policy: object) -> dict[str, Any] | None:
 @dataclass(frozen=True)
 class _ContextComponentMaterials:
     selection: dict[str, Any]
-    knowledge: dict[str, Any]
+    recall: dict[str, Any]
     compaction: dict[str, Any]
     selection_process_local: bool = False
-    knowledge_process_local: bool = False
+    recall_process_local: bool = False
     compaction_process_local: bool = False
     selection_application_versioned: bool = False
-    knowledge_application_versioned: bool = False
+    recall_application_versioned: bool = False
     compaction_application_versioned: bool = False
 
 
@@ -930,7 +928,7 @@ def _context_component_materials(
     if overflow_policy is None:
         overflow = _ContextComponentMaterials(
             selection={"kind": "none", "version": 1},
-            knowledge={"kind": "none", "version": 1},
+            recall={"kind": "none", "version": 1},
             compaction={"kind": "none", "version": 1},
         )
     else:
@@ -945,22 +943,20 @@ def _context_component_materials(
         )
     return _ContextComponentMaterials(
         selection={"primary": primary.selection, "overflow": overflow.selection},
-        knowledge={"primary": primary.knowledge, "overflow": overflow.knowledge},
+        recall={"primary": primary.recall, "overflow": overflow.recall},
         compaction={"primary": primary.compaction, "overflow": overflow.compaction},
         selection_process_local=(
             primary.selection_process_local or overflow.selection_process_local
         ),
-        knowledge_process_local=(
-            primary.knowledge_process_local or overflow.knowledge_process_local
-        ),
+        recall_process_local=(primary.recall_process_local or overflow.recall_process_local),
         compaction_process_local=(
             primary.compaction_process_local or overflow.compaction_process_local
         ),
         selection_application_versioned=(
             primary.selection_application_versioned or overflow.selection_application_versioned
         ),
-        knowledge_application_versioned=(
-            primary.knowledge_application_versioned or overflow.knowledge_application_versioned
+        recall_application_versioned=(
+            primary.recall_application_versioned or overflow.recall_application_versioned
         ),
         compaction_application_versioned=(
             primary.compaction_application_versioned or overflow.compaction_application_versioned
@@ -989,10 +985,10 @@ def _project_context_policy(
         material = {"behavior": entry}
         return _ContextComponentMaterials(
             selection=material,
-            knowledge=material,
+            recall=material,
             compaction=material,
             selection_application_versioned=True,
-            knowledge_application_versioned=True,
+            recall_application_versioned=True,
             compaction_application_versioned=True,
         )
 
@@ -1012,27 +1008,27 @@ def _project_context_policy(
         material = {"behavior": entry}
         return _ContextComponentMaterials(
             selection=material,
-            knowledge=material,
+            recall=material,
             compaction=material,
             selection_process_local=True,
-            knowledge_process_local=True,
+            recall_process_local=True,
             compaction_process_local=True,
         )
 
     selection_material = dict(projected.selection)
-    knowledge_material = dict(projected.knowledge)
+    recall_material = dict(projected.recall)
     compaction_material = dict(projected.compaction)
     if projected.selection_process_local:
         selection_material["process_scope"] = _process_scope_identity(process_identity)
         selection_material["slot"] = f"{slot}:selection"
-    if projected.knowledge_process_local:
-        knowledge_material["process_scope"] = _process_scope_identity(process_identity)
-        knowledge_material["slot"] = f"{slot}:knowledge"
+    if projected.recall_process_local:
+        recall_material["process_scope"] = _process_scope_identity(process_identity)
+        recall_material["slot"] = f"{slot}:recall"
     if projected.compaction_process_local:
         compaction_material["process_scope"] = _process_scope_identity(process_identity)
         compaction_material["slot"] = f"{slot}:compaction"
     safe_selection = _secret_safe_cayu_owned_material(selection_material, redactor=redactor)
-    safe_knowledge = _secret_safe_cayu_owned_material(knowledge_material, redactor=redactor)
+    safe_recall = _secret_safe_cayu_owned_material(recall_material, redactor=redactor)
     safe_compaction = _secret_safe_cayu_owned_material(compaction_material, redactor=redactor)
     private_selection = _process_local_private_material(
         selection_material,
@@ -1040,11 +1036,11 @@ def _project_context_policy(
         process_identity=process_identity,
         slot=f"{slot}:selection",
     )
-    private_knowledge = _process_local_private_material(
-        knowledge_material,
+    private_recall = _process_local_private_material(
+        recall_material,
         value=policy,
         process_identity=process_identity,
-        slot=f"{slot}:knowledge",
+        slot=f"{slot}:recall",
     )
     private_compaction = _process_local_private_material(
         compaction_material,
@@ -1054,13 +1050,13 @@ def _project_context_policy(
     )
     return _ContextComponentMaterials(
         selection=(private_selection if safe_selection is None else safe_selection),
-        knowledge=(private_knowledge if safe_knowledge is None else safe_knowledge),
+        recall=(private_recall if safe_recall is None else safe_recall),
         compaction=(private_compaction if safe_compaction is None else safe_compaction),
         selection_process_local=(projected.selection_process_local or safe_selection is None),
-        knowledge_process_local=(projected.knowledge_process_local or safe_knowledge is None),
+        recall_process_local=(projected.recall_process_local or safe_recall is None),
         compaction_process_local=(projected.compaction_process_local or safe_compaction is None),
         selection_application_versioned=projected.selection_application_versioned,
-        knowledge_application_versioned=projected.knowledge_application_versioned,
+        recall_application_versioned=projected.recall_application_versioned,
         compaction_application_versioned=projected.compaction_application_versioned,
     )
 
@@ -1075,12 +1071,12 @@ def _cayu_context_policy_material(
         _DEFAULT_CHECKPOINT_COMPACTION_SUMMARY_PREFIX,
         CheckpointCompactionContextPolicy,
         DefaultContextPolicy,
-        KnowledgeInjectionPolicy,
         MessageWindowContextPolicy,
         RecentTurnsContextPolicy,
         TranscriptDigestCompactor,
         UsageTriggeredContextPolicy,
     )
+    from cayu.runtime.memory_context import AutomaticRecallContextPolicy
 
     declared_identity = behavior_identities.get(id(policy))
     if declared_identity is not None:
@@ -1092,10 +1088,10 @@ def _cayu_context_policy_material(
         }
         return _ContextComponentMaterials(
             selection=material,
-            knowledge=material,
+            recall=material,
             compaction=material,
             selection_application_versioned=True,
-            knowledge_application_versioned=True,
+            recall_application_versioned=True,
             compaction_application_versioned=True,
         )
 
@@ -1106,7 +1102,7 @@ def _cayu_context_policy_material(
                 "version": 1,
                 "max_attachment_results": policy.max_attachment_results,
             },
-            knowledge={"kind": "none", "version": 1},
+            recall={"kind": "none", "version": 1},
             compaction={"kind": "none", "version": 1},
         )
     if type(policy) is MessageWindowContextPolicy:
@@ -1118,7 +1114,7 @@ def _cayu_context_policy_material(
                 "preserve_system": policy.preserve_system,
                 "max_attachment_results": policy.max_attachment_results,
             },
-            knowledge={"kind": "none", "version": 1},
+            recall={"kind": "none", "version": 1},
             compaction={"kind": "none", "version": 1},
         )
     if type(policy) is RecentTurnsContextPolicy:
@@ -1130,10 +1126,10 @@ def _cayu_context_policy_material(
                 "preserve_system": policy.preserve_system,
                 "max_attachment_results": policy.max_attachment_results,
             },
-            knowledge={"kind": "none", "version": 1},
+            recall={"kind": "none", "version": 1},
             compaction={"kind": "none", "version": 1},
         )
-    if type(policy) is KnowledgeInjectionPolicy:
+    if type(policy) is AutomaticRecallContextPolicy:
         base = _cayu_context_policy_material(
             policy.base_policy,
             behavior_identities=behavior_identities,
@@ -1141,74 +1137,15 @@ def _cayu_context_policy_material(
         )
         if base is None:
             return None
-        has_private_filters = any(
-            (
-                policy.namespace != "default",
-                policy.labels is not None,
-                policy.kinds is not None,
-                policy.visibilities is not None,
-                bool(policy.aspects),
-                bool(policy.impact_targets),
-                policy.source_type is not None,
-                policy.source_id is not None,
-                policy.prefix != "Relevant knowledge retrieved for this request:",
-            )
-        )
-        knowledge = (
-            {
-                "kind": "process_local_private_configuration",
-                "component": _qualified_type_name(policy),
-                "configuration_hmac_sha256": _process_local_configuration_commitment(
-                    {
-                        "enabled": policy.enabled,
-                        "namespace": policy.namespace,
-                        "labels": policy.labels,
-                        "kinds": policy.kinds,
-                        "visibilities": (
-                            None
-                            if policy.visibilities is None
-                            else [item.value for item in policy.visibilities]
-                        ),
-                        "aspects": policy.aspects,
-                        "impact_targets": policy.impact_targets,
-                        "source_type": policy.source_type,
-                        "source_id": policy.source_id,
-                        "mode": policy.mode.value,
-                        "include_expired": policy.include_expired,
-                        "max_hits": policy.max_hits,
-                        "max_bytes": policy.max_bytes,
-                        "max_checkpoint_bytes": policy.max_checkpoint_bytes,
-                        "query_max_chars": policy.query_max_chars,
-                        "prefix": policy.prefix,
-                        "fail_open": policy.fail_open,
-                    },
-                    process_identity=process_identity,
-                    field_name="knowledge_injection_private_configuration",
-                ),
-            }
-            if has_private_filters
-            else {
-                "kind": "knowledge_injection",
-                "version": 1,
-                "enabled": policy.enabled,
-                "mode": policy.mode.value,
-                "include_expired": policy.include_expired,
-                "max_hits": policy.max_hits,
-                "max_bytes": policy.max_bytes,
-                "max_checkpoint_bytes": policy.max_checkpoint_bytes,
-                "query_max_chars": policy.query_max_chars,
-                "fail_open": policy.fail_open,
-            }
-        )
         return _ContextComponentMaterials(
             selection=base.selection,
-            knowledge=knowledge,
+            recall={"base": base.recall, "automatic": policy.configuration_material()},
             compaction=base.compaction,
             selection_process_local=base.selection_process_local,
-            knowledge_process_local=(has_private_filters or base.knowledge_process_local),
+            recall_process_local=base.recall_process_local,
             compaction_process_local=base.compaction_process_local,
             selection_application_versioned=base.selection_application_versioned,
-            knowledge_application_versioned=base.knowledge_application_versioned,
+            recall_application_versioned=base.recall_application_versioned,
             compaction_application_versioned=base.compaction_application_versioned,
         )
     if type(policy) is UsageTriggeredContextPolicy:
@@ -1240,22 +1177,20 @@ def _cayu_context_policy_material(
         }
         return _ContextComponentMaterials(
             selection=selection,
-            knowledge={"base": base.knowledge, "triggered": triggered.knowledge},
+            recall={"base": base.recall, "triggered": triggered.recall},
             compaction={"base": base.compaction, "triggered": triggered.compaction},
             selection_process_local=(
                 base.selection_process_local or triggered.selection_process_local
             ),
-            knowledge_process_local=(
-                base.knowledge_process_local or triggered.knowledge_process_local
-            ),
+            recall_process_local=(base.recall_process_local or triggered.recall_process_local),
             compaction_process_local=(
                 base.compaction_process_local or triggered.compaction_process_local
             ),
             selection_application_versioned=(
                 base.selection_application_versioned or triggered.selection_application_versioned
             ),
-            knowledge_application_versioned=(
-                base.knowledge_application_versioned or triggered.knowledge_application_versioned
+            recall_application_versioned=(
+                base.recall_application_versioned or triggered.recall_application_versioned
             ),
             compaction_application_versioned=(
                 base.compaction_application_versioned or triggered.compaction_application_versioned
@@ -1322,7 +1257,7 @@ def _cayu_context_policy_material(
         }
         return _ContextComponentMaterials(
             selection=selection,
-            knowledge={"kind": "none", "version": 1},
+            recall={"kind": "none", "version": 1},
             compaction=compaction,
             selection_process_local=private_summary_prefix,
             compaction_process_local=compaction_process_local,

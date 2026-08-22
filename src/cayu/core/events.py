@@ -146,10 +146,10 @@ class EventType(StrEnum):
     CONTEXT_OVERFLOW_RECOVERING = "context.overflow.recovering"
     CONTEXT_OVERFLOW_FAILED = "context.overflow.failed"
 
-    KNOWLEDGE_SEARCH_STARTED = "knowledge.search.started"
-    KNOWLEDGE_SEARCH_COMPLETED = "knowledge.search.completed"
-    KNOWLEDGE_SEARCH_FAILED = "knowledge.search.failed"
-    KNOWLEDGE_INJECTED = "knowledge.injected"
+    AUTOMATIC_RECALL_STARTED = "memory.recall.started"
+    AUTOMATIC_RECALL_COMPLETED = "memory.recall.completed"
+    AUTOMATIC_RECALL_FAILED = "memory.recall.failed"
+    AUTOMATIC_RECALL_ADMITTED = "memory.recall.admitted"
 
     ENVIRONMENT_BINDING_STARTED = "environment.binding.started"
     ENVIRONMENT_BINDING_COMPLETED = "environment.binding.completed"

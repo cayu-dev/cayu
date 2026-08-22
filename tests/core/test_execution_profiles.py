@@ -17,7 +17,12 @@ import cayu.runtime._execution_profile_admission as execution_profile_admission
 import cayu.runtime._session_engine as session_engine_module
 from cayu import (
     EXECUTION_PROFILE_METADATA_KEY,
+    WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
     AgentSpec,
+    AutomaticRecallContextPolicy,
+    AutomaticRecallMode,
+    AutomaticRecallPolicy,
+    AutomaticRecallSourceConfig,
     BeforeStopContext,
     BeforeStopDecision,
     BrowserSessionTool,
@@ -60,8 +65,10 @@ from cayu import (
     ExecutionProfilePolicyError,
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
+    InMemoryKnowledgeStore,
     InMemorySessionStore,
-    KnowledgeInjectionPolicy,
+    KnowledgeAccessScope,
+    KnowledgeEntry,
     LocalRunner,
     LoopPolicy,
     Message,
@@ -107,6 +114,7 @@ from cayu import (
     TranscriptDigestCompactor,
     UsageTriggeredContextPolicy,
     WebFetchTool,
+    WeightedReciprocalRankFusionConfig,
     estimate_session_cost,
     runtime_evidence,
 )
@@ -1119,15 +1127,52 @@ def _model_semantics_profile(
     )
 
 
-def test_schema_v3_covers_model_decision_semantics_without_raw_material() -> None:
-    context_policy = KnowledgeInjectionPolicy(
-        base_policy=CheckpointCompactionContextPolicy(
+def _automatic_recall_context(
+    base_policy=None,
+    *,
+    namespace: str = "default",
+    max_injected_items: int = 3,
+    knowledge_candidate_limit: int = 20,
+    mode: AutomaticRecallMode = AutomaticRecallMode.OFF,
+) -> AutomaticRecallContextPolicy:
+    configuration_version = "execution-profile-automatic-recall-v1"
+    return AutomaticRecallContextPolicy(
+        base_policy,
+        admission_policy=AutomaticRecallPolicy(
+            calibration_version="execution-profile-calibration-v1",
+            fusion_strategy_version=WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
+            fusion_configuration_version=configuration_version,
+            mode=mode,
+            minimum_inject_score=0.01,
+            minimum_offer_score=0.005,
+            max_injected_items=max_injected_items,
+        ),
+        fusion_config=WeightedReciprocalRankFusionConfig(
+            configuration_version=configuration_version,
+            channel_weights={
+                "knowledge.lexical": 1.0,
+                "knowledge.semantic": 1.0,
+            },
+            max_candidates_per_channel=20,
+            fused_head_limit=20,
+        ),
+        sources=AutomaticRecallSourceConfig(
+            include_transcript=False,
+            transcript_required=False,
+            knowledge_namespace=namespace,
+            knowledge_candidate_limit=knowledge_candidate_limit,
+        ),
+    )
+
+
+def test_schema_v4_covers_model_decision_semantics_without_raw_material() -> None:
+    context_policy = _automatic_recall_context(
+        CheckpointCompactionContextPolicy(
             compactor=TranscriptDigestCompactor(max_summary_chars=4096),
             max_user_turns=3,
             compact_after_messages=8,
         ),
-        max_hits=3,
-        max_bytes=4096,
+        max_injected_items=3,
     )
     profile = _model_semantics_profile(
         context_policy=context_policy,
@@ -1148,7 +1193,7 @@ def test_schema_v3_covers_model_decision_semantics_without_raw_material() -> Non
         retry_policy=RetryPolicy(max_attempts=2),
     )
 
-    assert profile.schema_version == 3
+    assert profile.schema_version == 4
     assert {component.component_class for component in profile.components} == set(
         ExecutionProfileComponentClass
     )
@@ -1173,8 +1218,8 @@ def test_nested_compactor_identity_is_copied_at_agent_registration() -> None:
             )
 
     compactor = DeclaredCompactor("1")
-    policy = KnowledgeInjectionPolicy(
-        base_policy=CheckpointCompactionContextPolicy(
+    policy = _automatic_recall_context(
+        CheckpointCompactionContextPolicy(
             compactor=compactor,
             max_user_turns=2,
         )
@@ -1313,7 +1358,7 @@ def test_usage_triggered_policy_preserves_nested_application_identity_strength()
 
     for component_class in (
         ExecutionProfileComponentClass.CONTEXT_SELECTION,
-        ExecutionProfileComponentClass.KNOWLEDGE_INJECTION,
+        ExecutionProfileComponentClass.AUTOMATIC_RECALL,
         ExecutionProfileComponentClass.CONTEXT_COMPACTION,
     ):
         assert (
@@ -1353,22 +1398,35 @@ def _registered_context_profile(app: CayuApp) -> ExecutionProfileIdentity:
     )
 
 
-def test_private_knowledge_configuration_mutation_changes_process_local_profile() -> None:
+def test_private_automatic_recall_configuration_is_secret_safe_and_distinct() -> None:
     first_private_namespace = "private-knowledge-namespace-a"
     second_private_namespace = "private-knowledge-namespace-b"
-    policy = KnowledgeInjectionPolicy(namespace=first_private_namespace, enabled=False)
-    app = CayuApp(enable_logging=False)
-    app.register_provider(_completed_provider(), default=True)
-    app.register_agent(
-        AgentSpec(name="assistant", model="fake-model"),
-        context_policy=policy,
-    )
+    process_identity = "fixed-automatic-recall-profile-process-key"
 
-    first = _registered_context_profile(app)
-    policy.namespace = second_private_namespace
-    second = _registered_context_profile(app)
+    def profile(namespace: str) -> ExecutionProfileIdentity:
+        app = CayuApp(
+            secret_redactor=SecretRedactor([first_private_namespace, second_private_namespace]),
+            enable_logging=False,
+        )
+        app.register_provider(_completed_provider(), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=_automatic_recall_context(namespace=namespace),
+        )
+        return session_engine_module._execution_profile_identity(
+            registered_agent=app._agents["assistant"],
+            provider_name="fake",
+            registered_provider=app._providers["fake"],
+            model="fake-model",
+            durable_system_prompt=None,
+            redactor=app._secret_redactor,
+            process_identity=process_identity,
+        )
 
-    component_class = ExecutionProfileComponentClass.KNOWLEDGE_INJECTION
+    first = profile(first_private_namespace)
+    second = profile(second_private_namespace)
+
+    component_class = ExecutionProfileComponentClass.AUTOMATIC_RECALL
     first_component = first.component(component_class)
     second_component = second.component(component_class)
     serialized = json.dumps(
@@ -1380,7 +1438,7 @@ def test_private_knowledge_configuration_mutation_changes_process_local_profile(
     assert first_component != second_component
     assert first_private_namespace not in serialized
     assert second_private_namespace not in serialized
-    assert app._execution_profile_process_identity not in serialized
+    assert process_identity not in serialized
 
 
 @pytest.mark.parametrize("compactor_kind", ["model", "prompt_cache"])
@@ -1939,22 +1997,26 @@ def test_custom_provider_cache_policy_change_rejects_resume_before_dispatch() ->
 def test_runtime_owned_private_context_commitments_survive_secret_collision() -> None:
     process_identity = "fixed-private-context-profile-process-key"
     policies = [
-        KnowledgeInjectionPolicy(namespace=namespace, enabled=False)
+        _automatic_recall_context(namespace=namespace)
         for namespace in ("private-namespace-alpha", "private-namespace-beta")
     ]
     commitment_secrets = []
-    for policy in policies:
-        projected = execution_profile_admission._cayu_context_policy_material(
+    namespaces = ["private-namespace-alpha", "private-namespace-beta"]
+    for policy, namespace in zip(policies, namespaces, strict=True):
+        projected = execution_profile_admission._project_context_policy(
             policy,
+            identity=None,
             behavior_identities={id(policy): None, id(policy.base_policy): None},
+            runtime_version="1",
             process_identity=process_identity,
+            slot="context-policy",
+            redactor=SecretRedactor(namespace),
         )
-        assert projected is not None
-        commitment = projected.knowledge["configuration_hmac_sha256"]
+        commitment = projected.recall["configuration_hmac_sha256"]
         assert type(commitment) is str
         commitment_secrets.append(commitment)
     app = CayuApp(
-        secret_redactor=SecretRedactor(commitment_secrets),
+        secret_redactor=SecretRedactor([*namespaces, *commitment_secrets]),
         enable_logging=False,
     )
     app.register_provider(_completed_provider(), default=True)
@@ -1973,7 +2035,7 @@ def test_runtime_owned_private_context_commitments_survive_secret_collision() ->
             durable_system_prompt=None,
             redactor=app._secret_redactor,
             process_identity=process_identity,
-        ).component(ExecutionProfileComponentClass.KNOWLEDGE_INJECTION)
+        ).component(ExecutionProfileComponentClass.AUTOMATIC_RECALL)
         for name in ("first", "second")
     ]
     serialized = json.dumps(
@@ -1990,13 +2052,13 @@ def test_runtime_owned_private_context_commitments_survive_secret_collision() ->
 
 def test_each_model_semantics_component_changes_independently() -> None:
     baseline = _model_semantics_profile(
-        context_policy=KnowledgeInjectionPolicy(
+        context_policy=_automatic_recall_context(
             base_policy=CheckpointCompactionContextPolicy(
                 compactor=TranscriptDigestCompactor(max_summary_chars=4096),
                 max_user_turns=3,
                 compact_after_messages=8,
             ),
-            max_hits=3,
+            max_injected_items=3,
         ),
         provider_options={"fake": {"temperature": 0.25}},
         budget_policy=BudgetPolicy(limits=(_profile_budget_limit(scope="app"),)),
@@ -2017,13 +2079,13 @@ def test_each_model_semantics_component_changes_independently() -> None:
             max_steps=7,
         ),
         ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY: _model_semantics_profile(
-            context_policy=KnowledgeInjectionPolicy(
+            context_policy=_automatic_recall_context(
                 base_policy=CheckpointCompactionContextPolicy(
                     compactor=TranscriptDigestCompactor(max_summary_chars=4096),
                     max_user_turns=3,
                     compact_after_messages=8,
                 ),
-                max_hits=3,
+                max_injected_items=3,
             ),
             provider_options={"fake": {"temperature": 0.5}},
             budget_policy=BudgetPolicy(limits=(_profile_budget_limit(scope="app"),)),
@@ -2032,13 +2094,13 @@ def test_each_model_semantics_component_changes_independently() -> None:
             max_steps=7,
         ),
         ExecutionProfileComponentClass.PROVIDER_ADAPTER: _model_semantics_profile(
-            context_policy=KnowledgeInjectionPolicy(
+            context_policy=_automatic_recall_context(
                 base_policy=CheckpointCompactionContextPolicy(
                     compactor=TranscriptDigestCompactor(max_summary_chars=4096),
                     max_user_turns=3,
                     compact_after_messages=8,
                 ),
-                max_hits=3,
+                max_injected_items=3,
             ),
             provider=VersionedScriptedProvider("2"),
             provider_options={"fake": {"temperature": 0.25}},
@@ -2047,14 +2109,14 @@ def test_each_model_semantics_component_changes_independently() -> None:
             structured_output=StructuredOutputSpec(json_schema={"type": "object"}, strategy="tool"),
             max_steps=7,
         ),
-        ExecutionProfileComponentClass.KNOWLEDGE_INJECTION: _model_semantics_profile(
-            context_policy=KnowledgeInjectionPolicy(
+        ExecutionProfileComponentClass.AUTOMATIC_RECALL: _model_semantics_profile(
+            context_policy=_automatic_recall_context(
                 base_policy=CheckpointCompactionContextPolicy(
                     compactor=TranscriptDigestCompactor(max_summary_chars=4096),
                     max_user_turns=3,
                     compact_after_messages=8,
                 ),
-                max_hits=4,
+                max_injected_items=4,
             ),
             provider_options={"fake": {"temperature": 0.25}},
             budget_policy=BudgetPolicy(limits=(_profile_budget_limit(scope="app"),)),
@@ -2063,13 +2125,13 @@ def test_each_model_semantics_component_changes_independently() -> None:
             max_steps=7,
         ),
         ExecutionProfileComponentClass.CONTEXT_COMPACTION: _model_semantics_profile(
-            context_policy=KnowledgeInjectionPolicy(
+            context_policy=_automatic_recall_context(
                 base_policy=CheckpointCompactionContextPolicy(
                     compactor=TranscriptDigestCompactor(max_summary_chars=5000),
                     max_user_turns=3,
                     compact_after_messages=8,
                 ),
-                max_hits=3,
+                max_injected_items=3,
             ),
             provider_options={"fake": {"temperature": 0.25}},
             budget_policy=BudgetPolicy(limits=(_profile_budget_limit(scope="app"),)),
@@ -2078,13 +2140,13 @@ def test_each_model_semantics_component_changes_independently() -> None:
             max_steps=7,
         ),
         ExecutionProfileComponentClass.APPLICATION_BUDGET_POLICY: _model_semantics_profile(
-            context_policy=KnowledgeInjectionPolicy(
+            context_policy=_automatic_recall_context(
                 base_policy=CheckpointCompactionContextPolicy(
                     compactor=TranscriptDigestCompactor(max_summary_chars=4096),
                     max_user_turns=3,
                     compact_after_messages=8,
                 ),
-                max_hits=3,
+                max_injected_items=3,
             ),
             provider_options={"fake": {"temperature": 0.25}},
             budget_policy=BudgetPolicy(limits=(_profile_budget_limit(maximum="11", scope="app"),)),
@@ -2093,13 +2155,13 @@ def test_each_model_semantics_component_changes_independently() -> None:
             max_steps=7,
         ),
         ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY: _model_semantics_profile(
-            context_policy=KnowledgeInjectionPolicy(
+            context_policy=_automatic_recall_context(
                 base_policy=CheckpointCompactionContextPolicy(
                     compactor=TranscriptDigestCompactor(max_summary_chars=4096),
                     max_user_turns=3,
                     compact_after_messages=8,
                 ),
-                max_hits=3,
+                max_injected_items=3,
             ),
             provider_options={"fake": {"temperature": 0.25}},
             budget_policy=BudgetPolicy(limits=(_profile_budget_limit(scope="app"),)),
@@ -2108,13 +2170,13 @@ def test_each_model_semantics_component_changes_independently() -> None:
             max_steps=7,
         ),
         ExecutionProfileComponentClass.STRUCTURED_OUTPUT: _model_semantics_profile(
-            context_policy=KnowledgeInjectionPolicy(
+            context_policy=_automatic_recall_context(
                 base_policy=CheckpointCompactionContextPolicy(
                     compactor=TranscriptDigestCompactor(max_summary_chars=4096),
                     max_user_turns=3,
                     compact_after_messages=8,
                 ),
-                max_hits=3,
+                max_injected_items=3,
             ),
             provider_options={"fake": {"temperature": 0.25}},
             budget_policy=BudgetPolicy(limits=(_profile_budget_limit(scope="app"),)),
@@ -2123,13 +2185,13 @@ def test_each_model_semantics_component_changes_independently() -> None:
             max_steps=7,
         ),
         ExecutionProfileComponentClass.FINALIZATION: _model_semantics_profile(
-            context_policy=KnowledgeInjectionPolicy(
+            context_policy=_automatic_recall_context(
                 base_policy=CheckpointCompactionContextPolicy(
                     compactor=TranscriptDigestCompactor(max_summary_chars=4096),
                     max_user_turns=3,
                     compact_after_messages=8,
                 ),
-                max_hits=3,
+                max_injected_items=3,
             ),
             provider_options={"fake": {"temperature": 0.25}},
             budget_policy=BudgetPolicy(limits=(_profile_budget_limit(scope="app"),)),
@@ -5651,6 +5713,120 @@ def test_context_profile_drift_rejects_before_dispatch_and_explicit_adoption_can
     asyncio.run(exercise())
 
 
+def test_automatic_recall_profile_adoption_readmits_instead_of_bricking_session() -> None:
+    async def exercise() -> None:
+        store = InMemorySessionStore()
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = InMemoryKnowledgeStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="automatic-recall-profile-adoption",
+                namespace="project:cayu",
+                text="Atlas release evidence says Friday.",
+            )
+        )
+        environment = Environment(
+            EnvironmentSpec(
+                name="local",
+                execution_profile_identity=_test_behavior_identity(
+                    "automatic-recall-profile-adoption-environment"
+                ),
+            ),
+            knowledge_store=knowledge,
+        )
+        original_policy = _automatic_recall_context(
+            namespace="project:cayu",
+            max_injected_items=3,
+            mode=AutomaticRecallMode.STRONG_MATCHES,
+        )
+        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app.register_provider(_completed_provider(), default=True)
+        original_app.register_environment(environment, default=True)
+        original_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=original_policy,
+        )
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="automatic-recall-profile-adoption",
+                    messages=[Message.text("user", "When is Atlas released?")],
+                )
+            )
+        )
+        original_checkpoint = await store.load_checkpoint("automatic-recall-profile-adoption")
+        assert original_checkpoint is not None
+        original_policy_sha256 = original_checkpoint["automatic_recall"]["policy_sha256"]
+        original_configuration_sha256 = original_checkpoint["automatic_recall"][
+            "configuration_sha256"
+        ]
+
+        changed_policy = _automatic_recall_context(
+            namespace="project:cayu",
+            max_injected_items=3,
+            knowledge_candidate_limit=10,
+            mode=AutomaticRecallMode.STRONG_MATCHES,
+        )
+        profile_policy = RecordingExecutionProfilePolicy(
+            ExecutionProfilePolicyResult(
+                action=ExecutionProfilePolicyAction.ADOPT,
+                reason="Reviewed automatic-recall policy migration.",
+                authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+            )
+        )
+        adopted_provider = _completed_provider()
+        adopted_app = CayuApp(
+            session_store=store,
+            execution_profile_policy=profile_policy,
+            enable_logging=False,
+        )
+        adopted_app.register_provider(adopted_provider, default=True)
+        adopted_app.register_environment(environment, default=True)
+        adopted_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=changed_policy,
+        )
+
+        events = await _collect(
+            adopted_app.resume(
+                ResumeRequest(
+                    session_id="automatic-recall-profile-adoption",
+                    messages=[Message.text("user", "Confirm the Atlas release day.")],
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key="adopt-automatic-recall-policy-v1",
+                        reason="Adopt the reviewed automatic-recall policy.",
+                        requested_by=ResolutionActor(
+                            subject="maintainer",
+                            source=ResolutionActorSource.REQUEST,
+                        ),
+                    ),
+                )
+            )
+        )
+
+        decision = next(
+            event for event in events if event.type is EventType.SESSION_EXECUTION_PROFILE_DECIDED
+        )
+        assert decision.payload["decision"] == ExecutionProfileDecisionKind.ADOPTED
+        assert decision.payload["changed_component_classes"] == ["automatic_recall"]
+        assert len(adopted_provider.requests) == 1
+        adopted_checkpoint = await store.load_checkpoint("automatic-recall-profile-adoption")
+        assert adopted_checkpoint is not None
+        adopted_policy_sha256 = adopted_checkpoint["automatic_recall"]["policy_sha256"]
+        adopted_configuration_sha256 = adopted_checkpoint["automatic_recall"][
+            "configuration_sha256"
+        ]
+        assert adopted_policy_sha256 == original_policy_sha256
+        assert adopted_policy_sha256 == changed_policy.admission_policy.fingerprint()
+        assert adopted_configuration_sha256 != original_configuration_sha256
+        assert adopted_configuration_sha256 == changed_policy.configuration_fingerprint()
+        assert [event.type for event in events].count(EventType.AUTOMATIC_RECALL_STARTED) == 1
+        assert [event.type for event in events].count(EventType.AUTOMATIC_RECALL_ADMITTED) == 1
+
+    asyncio.run(exercise())
+
+
 def test_live_context_policy_mutation_between_model_steps_rejects_before_redispatch() -> None:
     class MutateContextPolicyTool(Tool):
         def __init__(self, policy: MessageWindowContextPolicy) -> None:
@@ -5786,7 +5962,7 @@ def test_live_provider_mutation_from_hook_rejects_before_redispatch(
     ("change_kind", "expected_component"),
     [
         ("provider_options", ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY),
-        ("knowledge", ExecutionProfileComponentClass.KNOWLEDGE_INJECTION),
+        ("automatic_recall", ExecutionProfileComponentClass.AUTOMATIC_RECALL),
         ("compaction", ExecutionProfileComponentClass.CONTEXT_COMPACTION),
         ("application_budget", ExecutionProfileComponentClass.APPLICATION_BUDGET_POLICY),
         ("invocation_budget", ExecutionProfileComponentClass.INVOCATION_BUDGET_POLICY),
@@ -5818,8 +5994,8 @@ def test_model_semantics_drift_rejects_before_replacement_provider_dispatch(
             )
             if change_kind == "compaction"
             else (
-                KnowledgeInjectionPolicy(enabled=False, max_hits=3)
-                if change_kind == "knowledge"
+                _automatic_recall_context(max_injected_items=3)
+                if change_kind == "automatic_recall"
                 else None
             )
         )
@@ -5876,8 +6052,8 @@ def test_model_semantics_drift_rejects_before_replacement_provider_dispatch(
             )
             if change_kind == "compaction"
             else (
-                KnowledgeInjectionPolicy(enabled=False, max_hits=4)
-                if change_kind == "knowledge"
+                _automatic_recall_context(max_injected_items=4)
+                if change_kind == "automatic_recall"
                 else None
             )
         )

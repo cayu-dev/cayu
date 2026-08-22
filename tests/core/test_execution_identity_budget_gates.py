@@ -39,7 +39,7 @@ from cayu.runtime import (
 )
 from cayu.runtime.context import (
     ContextBuildResult,
-    ContextKnowledgeTelemetry,
+    ContextRecallTelemetry,
     ContextRequest,
     RuntimeManagedContextPolicy,
 )
@@ -264,7 +264,7 @@ def test_runtime_replaces_all_provider_supplied_execution_identity(
         assert field_name not in terminal.payload
 
 
-def test_runtime_replaces_all_custom_knowledge_telemetry_identity() -> None:
+def test_runtime_replaces_all_custom_recall_telemetry_identity() -> None:
     forged_identity = {
         "model_step_id": f"mstep_{'a' * 32}",
         "model_attempt_id": f"matt_{'b' * 32}",
@@ -283,9 +283,9 @@ def test_runtime_replaces_all_custom_knowledge_telemetry_identity() -> None:
             del checkpoint
             return ContextBuildResult(
                 messages=request.messages,
-                knowledge_telemetry=[
-                    ContextKnowledgeTelemetry(
-                        event_type=EventType.KNOWLEDGE_SEARCH_STARTED,
+                recall_telemetry=[
+                    ContextRecallTelemetry(
+                        event_type=EventType.AUTOMATIC_RECALL_STARTED,
                         payload=forged_identity,
                     )
                 ],
@@ -303,13 +303,13 @@ def test_runtime_replaces_all_custom_knowledge_telemetry_identity() -> None:
             app,
             RunRequest(
                 agent_name="assistant",
-                session_id="sess_custom_knowledge_identity",
+                session_id="sess_custom_recall_identity",
                 messages=[Message.text("user", "answer")],
             ),
         )
     )
 
-    telemetry = next(event for event in events if event.type == EventType.KNOWLEDGE_SEARCH_STARTED)
+    telemetry = next(event for event in events if event.type == EventType.AUTOMATIC_RECALL_STARTED)
     assert telemetry.payload["model_step_id"] != forged_identity["model_step_id"]
     for field_name in (
         "model_attempt_id",

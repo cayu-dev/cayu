@@ -5634,11 +5634,11 @@ def _snapshot_context_behavior_execution_profile_identities(
 
     from cayu.runtime.context import (
         CheckpointCompactionContextPolicy,
-        KnowledgeInjectionPolicy,
         ModelCompactor,
         PromptCacheCompactor,
         UsageTriggeredContextPolicy,
     )
+    from cayu.runtime.memory_context import AutomaticRecallContextPolicy
 
     snapshots: dict[int, ExecutionProfileBehaviorIdentity | None] = {}
 
@@ -5651,7 +5651,7 @@ def _snapshot_context_behavior_execution_profile_identities(
             redactor=redactor,
             field_name=f"{field_name}.execution_profile_identity",
         )
-        if type(policy) is KnowledgeInjectionPolicy:
+        if type(policy) is AutomaticRecallContextPolicy:
             visit(policy.base_policy, field_name=f"{field_name}.base_policy")
             return
         if type(policy) is UsageTriggeredContextPolicy:

@@ -27,10 +27,20 @@ import cayu.runtime._session_engine as session_engine_module
 import cayu.runtime.fork_groups as fork_group_module
 import cayu.runtime.sessions as sessions_module
 from cayu import (
+    KNOWLEDGE_LEXICAL_CHANNEL,
+    KNOWLEDGE_SEMANTIC_CHANNEL,
+    WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
+    AutomaticRecallContextPolicy,
+    AutomaticRecallPolicy,
+    AutomaticRecallSourceConfig,
+    InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
+    KnowledgeEntry,
     SessionWorkspaceBranchStore,
     SQLiteSessionStore,
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
+    WeightedReciprocalRankFusionConfig,
 )
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -48,6 +58,7 @@ from cayu.core import (
     HostedToolCallPart,
     Message,
     MessageRole,
+    TextPart,
     ToolCallPart,
     ToolResultPart,
     WebSearchAction,
@@ -1052,6 +1063,42 @@ class _ChangingApprovalPolicy(ToolPolicy):
             decision=decision,
             reason=f"stateful policy returned {decision.value}",
         )
+
+
+class _AutomaticRecallRecoveryKnowledgeStore(InMemoryKnowledgeStore):
+    def __init__(self) -> None:
+        super().__init__(access_scope=KnowledgeAccessScope.privileged())
+        self.search_count = 0
+
+    async def search(self, query, *, access_scope=None):
+        self.search_count += 1
+        return await super().search(query, access_scope=access_scope)
+
+
+def _automatic_recall_recovery_policy() -> AutomaticRecallContextPolicy:
+    configuration_version = "session-store-recovery-automatic-recall-v1"
+    return AutomaticRecallContextPolicy(
+        admission_policy=AutomaticRecallPolicy(
+            calibration_version="session-store-recovery-calibration-v1",
+            fusion_strategy_version=WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
+            fusion_configuration_version=configuration_version,
+            minimum_inject_score=0.01,
+            minimum_offer_score=0.005,
+        ),
+        fusion_config=WeightedReciprocalRankFusionConfig(
+            configuration_version=configuration_version,
+            channel_weights={
+                KNOWLEDGE_LEXICAL_CHANNEL: 1.0,
+                KNOWLEDGE_SEMANTIC_CHANNEL: 1.0,
+            },
+            max_candidates_per_channel=20,
+            fused_head_limit=20,
+        ),
+        sources=AutomaticRecallSourceConfig(
+            include_transcript=False,
+            transcript_required=False,
+        ),
+    )
 
 
 class _CeilingConformanceTool(Tool):
@@ -2626,6 +2673,123 @@ async def _reopen_store(case, store: SessionStore) -> SessionStore:
         postgres_dsn,
         public_authority_alias_codec=public_authority_alias_codec,
     )
+
+
+def test_session_store_conformance_recovers_one_frozen_automatic_recall_frame(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        knowledge = _AutomaticRecallRecoveryKnowledgeStore()
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="automatic-recall-recovery",
+                text="Atlas recovery evidence says Friday.",
+            )
+        )
+        policy_calls: list[ToolPolicyDecision] = []
+        tool_calls: list[dict[str, Any]] = []
+        session_id = f"automatic-recall-recovery-{session_store_case[0]}"
+        try:
+            first_provider = _ApprovalRecoveryProvider()
+            first_app = CayuApp(session_store=store, enable_logging=False)
+            first_app.register_provider(first_provider, default=True)
+            first_app.register_environment(
+                Environment(
+                    _approval_recovery_environment_spec(),
+                    knowledge_store=knowledge,
+                ),
+                default=True,
+            )
+            first_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[_ApprovalRecoveryTool(tool_calls)],
+                tool_policy=_ChangingApprovalPolicy(policy_calls),
+                context_policy=_automatic_recall_recovery_policy(),
+            )
+            first_events = [
+                event
+                async for event in first_app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "When is Atlas released?")],
+                    )
+                )
+            ]
+            requested = next(
+                event
+                for event in first_events
+                if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
+            )
+            approval = await _pending_approval_for_public_event(store, requested)
+            first_manifest = next(
+                part.text
+                for message in first_provider.requests[0].messages
+                if message.role is MessageRole.USER
+                for part in message.content
+                if type(part) is TextPart
+                and part.text.startswith('<cayu_automatic_memory version="1">')
+            )
+            assert knowledge.search_count == 1
+            assert [event.type for event in first_events].count(
+                EventType.AUTOMATIC_RECALL_ADMITTED
+            ) == 1
+
+            store = await _reopen_store(session_store_case, store)
+            recovery_provider = _ApprovalRecoveryProvider(complete_without_tools=True)
+            recovery_app = CayuApp(session_store=store, enable_logging=False)
+            recovery_app.register_provider(recovery_provider, default=True)
+            recovery_app.register_environment(
+                Environment(
+                    _approval_recovery_environment_spec(),
+                    knowledge_store=knowledge,
+                ),
+                default=True,
+            )
+            recovery_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[_ApprovalRecoveryTool(tool_calls)],
+                tool_policy=_ChangingApprovalPolicy(policy_calls),
+                context_policy=_automatic_recall_recovery_policy(),
+            )
+            recovered_events = [
+                event
+                async for event in recovery_app.resolve_tool_approval(
+                    ToolApprovalRequest(
+                        session_id=session_id,
+                        approval_id=approval.approval_id,
+                        tool_round_id=approval.tool_round_id,
+                        tool_call_id=approval.tool_call_id,
+                        decision=ToolApprovalDecision.APPROVE,
+                    )
+                )
+            ]
+            recovered_manifest = next(
+                part.text
+                for message in recovery_provider.requests[0].messages
+                if message.role is MessageRole.USER
+                for part in message.content
+                if type(part) is TextPart
+                and part.text.startswith('<cayu_automatic_memory version="1">')
+            )
+
+            assert recovered_manifest == first_manifest
+            assert knowledge.search_count == 1
+            assert EventType.AUTOMATIC_RECALL_STARTED not in [
+                event.type for event in recovered_events
+            ]
+            assert EventType.AUTOMATIC_RECALL_ADMITTED not in [
+                event.type for event in recovered_events
+            ]
+            assert tool_calls == [{"value": "must remain gated"}]
+            session = await store.load(session_id)
+            assert session is not None
+            assert session.status is SessionStatus.COMPLETED
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
 
 
 def test_session_store_conformance_repairs_terminal_evidence_durably(

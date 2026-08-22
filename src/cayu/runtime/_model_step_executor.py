@@ -190,10 +190,10 @@ from cayu.runtime.context import (
     ContextBuildError,
     ContextCompactionTelemetry,
     ContextCompactor,
-    ContextKnowledgeTelemetry,
     ContextPolicy,
     ContextPressureEstimate,
     ContextPressureOverhead,
+    ContextRecallTelemetry,
     ContextRequest,
     ContextUsageState,
     RuntimeManagedContextPolicy,
@@ -202,7 +202,7 @@ from cayu.runtime.context import (
     _AutomaticCompactionRunner,
     _compaction_completion_publisher_scope,
     _compaction_model_attempt_identity_scope,
-    _context_knowledge_search_telemetry_publisher_scope,
+    _context_recall_telemetry_publisher_scope,
     _context_secret_redactor_scope,
     _ContextCountAuthorityError,
     _defer_billing_identity_cancellation_scope,
@@ -6576,10 +6576,10 @@ class ModelStepRun:
         compaction_completion_events: dict[str, Event] = {}
         compaction_identity_ledger = _CompactionExecutionIdentityLedger(model_step_identity)
 
-        async def publish_knowledge_search_telemetry(
-            telemetry: ContextKnowledgeTelemetry,
+        async def publish_recall_telemetry(
+            telemetry: ContextRecallTelemetry,
         ) -> None:
-            event = _context_knowledge_telemetry_event(
+            event = _context_recall_telemetry_event(
                 telemetry=telemetry,
                 session=self._session,
                 registered_agent=self._registered_agent,
@@ -6638,7 +6638,7 @@ class ModelStepRun:
                 checkpoint_update,
                 checkpoint_event_payload,
                 context_compaction_telemetry,
-                context_knowledge_telemetry,
+                context_recall_telemetry,
             ) = await _build_context(
                 context_policy=self._registered_agent.context_policy,
                 session_store=self._executor._session_store,
@@ -6672,7 +6672,7 @@ class ModelStepRun:
                 ),
                 secret_redactor=self._executor._secret_redactor,
                 run_compaction=run_automatic_compaction,
-                publish_knowledge_search_telemetry=publish_knowledge_search_telemetry,
+                publish_recall_telemetry=publish_recall_telemetry,
             )
         except ContextBuildError as exc:
             (
@@ -6746,7 +6746,7 @@ class ModelStepRun:
             checkpoint_update=checkpoint_update,
             checkpoint_event_payload=checkpoint_event_payload,
             compaction_telemetry=context_compaction_telemetry,
-            knowledge_telemetry=context_knowledge_telemetry,
+            recall_telemetry=context_recall_telemetry,
             published_compaction_attempt_ids=published_compaction_attempt_ids,
             compaction_completion_events=compaction_completion_events,
             compaction_start_event=(
@@ -7459,10 +7459,10 @@ class ModelStepRun:
         compaction_identity_ledger = _CompactionExecutionIdentityLedger(model_step_identity)
         latest_model_attempt_identity: ModelAttemptIdentity | None = None
 
-        async def publish_knowledge_search_telemetry(
-            telemetry: ContextKnowledgeTelemetry,
+        async def publish_recall_telemetry(
+            telemetry: ContextRecallTelemetry,
         ) -> None:
-            event = _context_knowledge_telemetry_event(
+            event = _context_recall_telemetry_event(
                 telemetry=telemetry,
                 session=self._session,
                 registered_agent=self._registered_agent,
@@ -7604,7 +7604,7 @@ class ModelStepRun:
                 checkpoint_update,
                 checkpoint_event_payload,
                 compaction_telemetry,
-                knowledge_telemetry,
+                recall_telemetry,
             ) = await _build_context(
                 context_policy=overflow_policy,
                 session_store=self._executor._session_store,
@@ -7638,7 +7638,7 @@ class ModelStepRun:
                 ),
                 secret_redactor=self._executor._secret_redactor,
                 run_compaction=run_automatic_compaction,
-                publish_knowledge_search_telemetry=publish_knowledge_search_telemetry,
+                publish_recall_telemetry=publish_recall_telemetry,
                 force_bounded_compaction=True,
             )
         except ContextBuildError as exc:
@@ -7746,7 +7746,7 @@ class ModelStepRun:
             checkpoint_update=checkpoint_update,
             checkpoint_event_payload=checkpoint_event_payload,
             compaction_telemetry=compaction_telemetry,
-            knowledge_telemetry=knowledge_telemetry,
+            recall_telemetry=recall_telemetry,
             published_compaction_attempt_ids=published_compaction_attempt_ids,
             compaction_completion_events=compaction_completion_events,
             compaction_start_event=(
@@ -8347,7 +8347,7 @@ class ModelStepRun:
         model_step_identity: ModelStepIdentity,
         compaction_identity_ledger: _CompactionExecutionIdentityLedger,
         compaction_telemetry: list[ContextCompactionTelemetry],
-        knowledge_telemetry: list[ContextKnowledgeTelemetry],
+        recall_telemetry: list[ContextRecallTelemetry],
         checkpoint_update: dict[str, Any] | None,
         checkpoint_event_payload: dict[str, Any] | None,
         published_compaction_attempt_ids: set[str],
@@ -8386,7 +8386,7 @@ class ModelStepRun:
                 reconciled_start_events.append(compaction_start_event.model_copy(deep=True))
 
         prepared_events = [
-            _context_knowledge_telemetry_event(
+            _context_recall_telemetry_event(
                 telemetry=telemetry,
                 session=self._session,
                 registered_agent=self._registered_agent,
@@ -8394,8 +8394,8 @@ class ModelStepRun:
                 model_step_identity=model_step_identity,
                 execution_profile=self._execution_profile,
             )
-            for telemetry in knowledge_telemetry
-            if telemetry.event_type != EventType.KNOWLEDGE_INJECTED
+            for telemetry in recall_telemetry
+            if telemetry.event_type != EventType.AUTOMATIC_RECALL_ADMITTED
         ]
         for telemetry in compaction_telemetry:
             if (
@@ -8451,7 +8451,7 @@ class ModelStepRun:
                     )
             prepared_events.append(event.model_copy(deep=True))
         prepared_events.extend(
-            _context_knowledge_telemetry_event(
+            _context_recall_telemetry_event(
                 telemetry=telemetry,
                 session=self._session,
                 registered_agent=self._registered_agent,
@@ -8459,8 +8459,8 @@ class ModelStepRun:
                 model_step_identity=model_step_identity,
                 execution_profile=self._execution_profile,
             )
-            for telemetry in knowledge_telemetry
-            if telemetry.event_type == EventType.KNOWLEDGE_INJECTED
+            for telemetry in recall_telemetry
+            if telemetry.event_type == EventType.AUTOMATIC_RECALL_ADMITTED
         )
 
         async def persist() -> tuple[list[Event], BaseException | None]:
@@ -8597,7 +8597,7 @@ class ModelStepRun:
             model_step_identity=model_step_identity,
             compaction_identity_ledger=compaction_identity_ledger,
             compaction_telemetry=list(error.compaction_telemetry),
-            knowledge_telemetry=list(error.knowledge_telemetry),
+            recall_telemetry=list(error.recall_telemetry),
             checkpoint_update=error.checkpoint,
             checkpoint_event_payload=error.checkpoint_event_payload,
             published_compaction_attempt_ids=published_compaction_attempt_ids,
@@ -8779,7 +8779,7 @@ class ModelStepRun:
         checkpoint_update: dict[str, Any] | None,
         checkpoint_event_payload: dict[str, Any] | None,
         compaction_telemetry: list[ContextCompactionTelemetry],
-        knowledge_telemetry: list[ContextKnowledgeTelemetry],
+        recall_telemetry: list[ContextRecallTelemetry],
         published_compaction_attempt_ids: set[str],
         compaction_completion_events: dict[str, Event],
         compaction_start_event: Event | None,
@@ -8789,7 +8789,7 @@ class ModelStepRun:
             model_step_identity=model_step_identity,
             compaction_identity_ledger=compaction_identity_ledger,
             compaction_telemetry=compaction_telemetry,
-            knowledge_telemetry=knowledge_telemetry,
+            recall_telemetry=recall_telemetry,
             checkpoint_update=checkpoint_update,
             checkpoint_event_payload=checkpoint_event_payload,
             published_compaction_attempt_ids=published_compaction_attempt_ids,
@@ -9542,15 +9542,14 @@ async def _build_context(
     build_cache_prefix_request: Callable[[list[Message]], Awaitable[ModelRequest]] | None,
     secret_redactor: SecretRedactor,
     run_compaction: _AutomaticCompactionRunner | None = None,
-    publish_knowledge_search_telemetry: Callable[[ContextKnowledgeTelemetry], Awaitable[None]]
-    | None = None,
+    publish_recall_telemetry: Callable[[ContextRecallTelemetry], Awaitable[None]] | None = None,
     force_bounded_compaction: bool = False,
 ) -> tuple[
     list[Message],
     dict[str, Any] | None,
     dict[str, Any] | None,
     list[ContextCompactionTelemetry],
-    list[ContextKnowledgeTelemetry],
+    list[ContextRecallTelemetry],
 ]:
     context_usage = await _context_usage_state_for_session(
         session_store=session_store,
@@ -9569,6 +9568,7 @@ async def _build_context(
         messages=[message.model_copy(deep=True) for message in messages],
         step=step,
         environment_name=environment_name,
+        session_store=session_store,
         knowledge_store=knowledge_store,
         knowledge_access_scope=knowledge_access_scope,
         metadata=copy_json_value(request_metadata, "metadata"),
@@ -9583,9 +9583,7 @@ async def _build_context(
         try:
             with (
                 _context_secret_redactor_scope(secret_redactor),
-                _context_knowledge_search_telemetry_publisher_scope(
-                    publish_knowledge_search_telemetry
-                ),
+                _context_recall_telemetry_publisher_scope(publish_recall_telemetry),
                 _defer_billing_identity_cancellation_scope(),
                 _automatic_compaction_runner_scope(run_compaction),
             ):
@@ -9608,7 +9606,7 @@ async def _build_context(
             safe_checkpoint,
             safe_checkpoint_event_payload,
             [telemetry.model_copy(deep=True) for telemetry in result.compaction_telemetry],
-            [telemetry.model_copy(deep=True) for telemetry in result.knowledge_telemetry],
+            [telemetry.model_copy(deep=True) for telemetry in result.recall_telemetry],
         )
 
     with _context_secret_redactor_scope(secret_redactor):
@@ -9726,17 +9724,17 @@ def _context_compaction_telemetry_event(
     return event_with_execution_profile_authority(event, execution_profile)
 
 
-def _context_knowledge_telemetry_event(
+def _context_recall_telemetry_event(
     *,
-    telemetry: ContextKnowledgeTelemetry,
+    telemetry: ContextRecallTelemetry,
     session: Session,
     registered_agent: runtime_records.RegisteredAgentState,
     environment_name: str | None,
     model_step_identity: ModelStepIdentity,
     execution_profile: ExecutionProfileIdentity | None = None,
 ) -> Event:
-    if type(telemetry) is not ContextKnowledgeTelemetry:
-        raise TypeError("Context knowledge telemetry must be ContextKnowledgeTelemetry instances.")
+    if type(telemetry) is not ContextRecallTelemetry:
+        raise TypeError("Context recall telemetry must be ContextRecallTelemetry instances.")
     payload = copy_json_value(telemetry.payload, "payload")
     strip_runtime_owned_execution_identity(payload)
     payload.update(copy_model_step_identity(model_step_identity).payload())

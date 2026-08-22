@@ -266,6 +266,7 @@ from cayu.runtime.budgets import (
     request_budget_limits_for_session,
 )
 from cayu.runtime.checkpoints import (
+    AUTOMATIC_RECALL_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
@@ -7822,7 +7823,7 @@ class SessionEngine:
         profile_candidate = current_compaction_profile_candidate()
         governed_registration_components = (
             ExecutionProfileComponentClass.CONTEXT_SELECTION,
-            ExecutionProfileComponentClass.KNOWLEDGE_INJECTION,
+            ExecutionProfileComponentClass.AUTOMATIC_RECALL,
             ExecutionProfileComponentClass.CONTEXT_COMPACTION,
             ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT,
         )
@@ -13364,6 +13365,10 @@ class SessionEngine:
                     model_completion_publication.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
                     None,
                 )
+                # Automatic recall is scoped to one source-session interaction.
+                # A child inherits the authoritative transcript, but must derive
+                # its own frame from its next real user interaction.
+                fork_checkpoint.pop(AUTOMATIC_RECALL_CHECKPOINT_KEY, None)
             if not session_request_boundary.fork_checkpoint_is_secret_free(
                 fork_checkpoint,
                 redactor=self._secret_redactor,
@@ -14899,7 +14904,7 @@ class SessionEngine:
 
             live_model_semantic_components = (
                 ExecutionProfileComponentClass.CONTEXT_SELECTION,
-                ExecutionProfileComponentClass.KNOWLEDGE_INJECTION,
+                ExecutionProfileComponentClass.AUTOMATIC_RECALL,
                 ExecutionProfileComponentClass.CONTEXT_COMPACTION,
                 ExecutionProfileComponentClass.PROVIDER_ADAPTER,
                 ExecutionProfileComponentClass.PROVIDER_REQUEST_POLICY,

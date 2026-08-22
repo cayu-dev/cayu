@@ -33,7 +33,7 @@ from cayu.runtime.approvals import (
 )
 from cayu.runtime.checkpoints import ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
 
-EXECUTION_PROFILE_SCHEMA_VERSION = 3
+EXECUTION_PROFILE_SCHEMA_VERSION = 4
 _EXECUTION_PROFILE_RECORD_SCHEMA_VERSION = 1
 _ACTIVE_INVOCATION_EXECUTION_PROFILE_SCHEMA_VERSION = 1
 EXECUTION_PROFILE_METADATA_KEY = "cayu:execution_profile"
@@ -59,7 +59,7 @@ class ExecutionProfileComponentClass(StrEnum):
     EXECUTION_ENVIRONMENT = "execution_environment"
     EFFECT_AUTHORITY = "effect_authority"
     CONTEXT_SELECTION = "context_selection"
-    KNOWLEDGE_INJECTION = "knowledge_injection"
+    AUTOMATIC_RECALL = "automatic_recall"
     CONTEXT_COMPACTION = "context_compaction"
     LIVE_STATE_PROJECTION = "live_state_projection"
     PROVIDER_ADAPTER = "provider_adapter"
@@ -90,11 +90,11 @@ _SCHEMA_V2_COMPONENT_CLASSES = frozenset(
         ExecutionProfileComponentClass.EFFECT_AUTHORITY,
     }
 )
-_SCHEMA_V3_COMPONENT_CLASSES = frozenset(
+_SCHEMA_V4_COMPONENT_CLASSES = frozenset(
     {
         *_SCHEMA_V2_COMPONENT_CLASSES,
         ExecutionProfileComponentClass.CONTEXT_SELECTION,
-        ExecutionProfileComponentClass.KNOWLEDGE_INJECTION,
+        ExecutionProfileComponentClass.AUTOMATIC_RECALL,
         ExecutionProfileComponentClass.CONTEXT_COMPACTION,
         ExecutionProfileComponentClass.LIVE_STATE_PROJECTION,
         ExecutionProfileComponentClass.PROVIDER_ADAPTER,
@@ -108,7 +108,7 @@ _SCHEMA_V3_COMPONENT_CLASSES = frozenset(
 _SCHEMA_COMPONENT_CLASSES = {
     1: _SCHEMA_V1_COMPONENT_CLASSES,
     2: _SCHEMA_V2_COMPONENT_CLASSES,
-    3: _SCHEMA_V3_COMPONENT_CLASSES,
+    4: _SCHEMA_V4_COMPONENT_CLASSES,
 }
 
 
@@ -132,7 +132,7 @@ _AUTHORITY_COMPONENT_CLASSES = frozenset(
         ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT,
         ExecutionProfileComponentClass.EFFECT_AUTHORITY,
         ExecutionProfileComponentClass.CONTEXT_SELECTION,
-        ExecutionProfileComponentClass.KNOWLEDGE_INJECTION,
+        ExecutionProfileComponentClass.AUTOMATIC_RECALL,
         ExecutionProfileComponentClass.CONTEXT_COMPACTION,
         ExecutionProfileComponentClass.LIVE_STATE_PROJECTION,
         ExecutionProfileComponentClass.PROVIDER_ADAPTER,
@@ -534,7 +534,7 @@ class ExecutionProfileIdentity(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    schema_version: Literal[1, 2, 3] = EXECUTION_PROFILE_SCHEMA_VERSION
+    schema_version: Literal[1, 2, 4] = EXECUTION_PROFILE_SCHEMA_VERSION
     fingerprint: str
     components: tuple[ExecutionProfileComponentIdentity, ...]
 
@@ -797,9 +797,9 @@ def build_execution_profile_identity(
     context_selection: Mapping[str, Any] | None = None,
     context_selection_process_local: bool = False,
     context_selection_application_versioned: bool = False,
-    knowledge_injection: Mapping[str, Any] | None = None,
-    knowledge_injection_process_local: bool = False,
-    knowledge_injection_application_versioned: bool = False,
+    automatic_recall: Mapping[str, Any] | None = None,
+    automatic_recall_process_local: bool = False,
+    automatic_recall_application_versioned: bool = False,
     context_compaction: Mapping[str, Any] | None = None,
     context_compaction_process_local: bool = False,
     context_compaction_application_versioned: bool = False,
@@ -939,12 +939,12 @@ def build_execution_profile_identity(
             else context_selection,
         ),
         _available_component(
-            ExecutionProfileComponentClass.KNOWLEDGE_INJECTION,
+            ExecutionProfileComponentClass.AUTOMATIC_RECALL,
             _aggregate_identity_strength(
-                process_local=knowledge_injection_process_local,
-                application_versioned=knowledge_injection_application_versioned,
+                process_local=automatic_recall_process_local,
+                application_versioned=automatic_recall_application_versioned,
             ),
-            {"kind": "none", "version": 1} if knowledge_injection is None else knowledge_injection,
+            {"kind": "none", "version": 1} if automatic_recall is None else automatic_recall,
         ),
         _available_component(
             ExecutionProfileComponentClass.CONTEXT_COMPACTION,

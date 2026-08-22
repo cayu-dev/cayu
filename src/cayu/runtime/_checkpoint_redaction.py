@@ -6,6 +6,7 @@ from cayu._validation import copy_json_value
 from cayu.runtime._web_access_results import persisted_web_access_control_paths
 from cayu.runtime.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
+    AUTOMATIC_RECALL_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
 )
 from cayu.runtime.structured_output import json_schema_contains_secret
@@ -69,6 +70,8 @@ _DURABLE_STRUCTURE_STRING_FIELDS = frozenset(
 _DURABLE_ENUM_STRING_FIELDS = frozenset(
     {
         "assistant_message_state",
+        "channel",
+        "channels",
         "decision",
         "policy_decision",
         "policy_evidence",
@@ -81,7 +84,12 @@ _DURABLE_ENUM_STRING_FIELDS = frozenset(
         "strategy",
         "type",
         "hooks_state",
+        "failure_code",
+        "mode",
+        "notice",
         "phase",
+        "record_type",
+        "selection_reason",
         "before_state",
         "after_state",
         "delta_state",
@@ -90,14 +98,23 @@ _DURABLE_ENUM_STRING_FIELDS = frozenset(
 )
 _DURABLE_SHA256_STRING_FIELDS = frozenset(
     {
+        "contribution_sha256",
+        "configuration_sha256",
+        "content_hash",
+        "manifest_sha256",
+        "policy_sha256",
+        "projection_sha256",
         "resolution_request_digest",
+        "situation_sha256",
         "user_message_sha256",
+        "user_text_sha256",
         "fingerprint",
         "execution_profile_fingerprint",
         "exposure_fingerprint",
         "sha256",
         "mutation_event_digest",
         "tool_outcome_event_digest",
+        "ticket",
     }
 )
 _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_STRING_FIELDS) | {
@@ -117,6 +134,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "arguments",
     "artifacts",
     "anchor_transcript_index",
+    AUTOMATIC_RECALL_CHECKPOINT_KEY,
     "as_of",
     "backoff_multiplier",
     "batch",
@@ -158,8 +176,8 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "key",
     "kind",
     "label",
-    "knowledge_injection",
     "runtime_authored_user_message",
+    "runtime_authored_anchors",
     "limits",
     "match",
     "match_prefixes",
@@ -199,6 +217,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "provenance",
     "provider_name",
     "profile",
+    "projected_bytes",
     "records",
     "question",
     "quarantined_assistant_message",
@@ -229,6 +248,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "source_id",
     "source_type",
     "source_uri",
+    "sources",
     "standard",
     "structured_output",
     "structured_output_attempt",
@@ -289,6 +309,28 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "updated_at",
     "valid",
     "excerpt",
+    "channel",
+    "channels",
+    "coverage_truncated",
+    "focus",
+    "failure_code",
+    "fused_rank",
+    "identity",
+    "index_version",
+    "items",
+    "locator_json",
+    "matches",
+    "mode",
+    "notice",
+    "offer",
+    "omitted_item_count",
+    "projection",
+    "record_id",
+    "representation",
+    "required",
+    "revision",
+    "selection_reason",
+    "text_complete",
 }
 _DURABLE_SUBAGENT_ROOTS = frozenset(
     {"durable_subagent_submission_seeds", "durable_subagent_submissions"}
@@ -388,13 +430,13 @@ _DURABLE_ROOT_STRUCTURE_KEYS = frozenset(
     {
         ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         CHECKPOINT_SCHEMA_VERSION_KEY,
+        AUTOMATIC_RECALL_CHECKPOINT_KEY,
         "context_compaction",
         "durable_subagent_submission_seeds",
         "durable_subagent_submissions",
         "environment_factory_allocation_owner",
         "environment_factory_reconnect",
         "incomplete_session_recovery_claim",
-        "knowledge_injection",
         "runtime_authored_user_message",
         "pending_interruption_cascade",
         "pending_session_interrupt",

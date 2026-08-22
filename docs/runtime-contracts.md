@@ -379,7 +379,7 @@ context after a provider overflow. `CheckpointCompactionContextPolicy` carries
 that signal into `CompactionRequest.force_bounded_compaction`; cache-aware
 compactors must not reconstruct the request that already overflowed.
 
-`UsageTriggeredContextPolicy` packages actual and estimated pressure triggers. Below threshold it delegates to a base policy. Once the previous call's input/total tokens meet an exact threshold, or once `trigger_estimated_context_tokens` is met, later context builds delegate to a triggered policy such as a smaller `RecentTurnsContextPolicy` or `MessageWindowContextPolicy`. The estimated trigger is computed after the base policy has produced model-facing context, so it includes knowledge injected by that base policy, trimming performed by that base policy, known tool schemas, structured-output tool/schema wiring, provider-visible request options, tool-call arguments, tool-result text, thinking/provider-state parts, and conservative file-attachment size estimates from attachment references. Provider adapters expose `ModelContextPressureProfile` hints for local calibration of image attachment floors, document/PDF attachment floors, document byte density, and tool-schema payload density; runtime estimators consume those hints without branching on provider names. Tool-result structured data and artifact reference metadata are not counted as prompt text unless a provider-facing adapter actually sends them. The trigger compares `estimated_context_window_tokens`, which is `estimated_context_input_tokens + reserved_output_tokens`, so applications can reserve generation/reasoning headroom before the hard provider context limit. This estimate uses `method="observed_plus_estimated_delta_with_overhead"` when it can anchor on previous actual provider input usage and `method="local_full_request_estimate"` when it must estimate the whole model-facing request locally. Anchored estimates do not add stable request overhead twice: `model.completed` records component-only overhead counts, and the next estimate adds only the current overhead delta if tools, structured output, or provider-visible options changed. Both remain local and conservative; providers can still count differently. The trigger is sticky by default and stored under the `usage_triggered_context` session checkpoint key so a lower-usage compact/windowed call does not immediately return the session to the base policy. Set `sticky=False` only for explicit last-call-only routing.
+`UsageTriggeredContextPolicy` packages actual and estimated pressure triggers. Below threshold it delegates to a base policy. Once the previous call's input/total tokens meet an exact threshold, or once `trigger_estimated_context_tokens` is met, later context builds delegate to a triggered policy such as a smaller `RecentTurnsContextPolicy` or `MessageWindowContextPolicy`. The estimated trigger is computed after the base policy has produced model-facing context, so it includes any automatic-memory contribution produced by that base policy, trimming performed by that base policy, known tool schemas, structured-output tool/schema wiring, provider-visible request options, tool-call arguments, tool-result text, thinking/provider-state parts, and conservative file-attachment size estimates from attachment references. Provider adapters expose `ModelContextPressureProfile` hints for local calibration of image attachment floors, document/PDF attachment floors, document byte density, and tool-schema payload density; runtime estimators consume those hints without branching on provider names. Tool-result structured data and artifact reference metadata are not counted as prompt text unless a provider-facing adapter actually sends them. The trigger compares `estimated_context_window_tokens`, which is `estimated_context_input_tokens + reserved_output_tokens`, so applications can reserve generation/reasoning headroom before the hard provider context limit. This estimate uses `method="observed_plus_estimated_delta_with_overhead"` when it can anchor on previous actual provider input usage and `method="local_full_request_estimate"` when it must estimate the whole model-facing request locally. Anchored estimates do not add stable request overhead twice: `model.completed` records component-only overhead counts, and the next estimate adds only the current overhead delta if tools, structured output, or provider-visible options changed. Both remain local and conservative; providers can still count differently. The trigger is sticky by default and stored under the `usage_triggered_context` session checkpoint key so a lower-usage compact/windowed call does not immediately return the session to the base policy. Set `sticky=False` only for explicit last-call-only routing.
 
 Estimated triggers speculatively evaluate `base_policy` before deciding whether to switch to `triggered_policy`. For that reason, `base_policy` must be side-effect-free in estimated-trigger mode. Runtime-managed base policies are rejected because they can perform compaction, emit checkpoint payloads, or call a compactor model during context construction. Put compaction or other managed behavior in `triggered_policy`, or use exact post-call thresholds such as `min_input_tokens` when the base policy must be runtime-managed.
 
@@ -387,7 +387,7 @@ Estimated triggers can optionally verify with the active provider's `count_input
 
 Context output must preserve complete tool rounds: assistant tool calls must be followed by matching tool results, and tool results cannot appear without their preceding assistant tool calls. Policies that trim recent history should use `trim_context_turns(...)` for user-turn based history or `trim_context_messages(...)` for message-count based history instead of slicing blindly. Both helpers preserve leading system messages by default.
 
-Built-in policies include `RecentTurnsContextPolicy`, `MessageWindowContextPolicy`, `UsageTriggeredContextPolicy`, `CheckpointCompactionContextPolicy`, and `KnowledgeInjectionPolicy`. Recent-turn and message-window policies are pure projections over the current transcript. Built-in policies keep only the latest file-attachment tool result provider-resolvable by default; older attachment references are replaced with text/structured summaries using `strip_old_file_attachments(...)` so providers do not receive the same file bytes on every later request. The same helper keeps user-prompt `FilePart`s provider-resolvable only on the current attach turn — once a file's turn has been answered and a newer user turn begins, its bytes are projected to a short text note (see "Files in prompts" under ArtifactStore). Checkpoint-backed compaction is runtime-managed: it summarizes older messages through a `ContextCompactor`, stores summary state in the session checkpoint under `context_compaction`, emits `context.compaction.started`, `context.compaction.completed` or `context.compaction.failed`, emits `session.checkpointed` after successful checkpoint writes, and sends leading system messages, compacted user-context summary, and recent complete turns to the provider. It does not delete or rewrite transcript messages.
+Built-in policies include `RecentTurnsContextPolicy`, `MessageWindowContextPolicy`, `UsageTriggeredContextPolicy`, `CheckpointCompactionContextPolicy`, and `AutomaticRecallContextPolicy`. Recent-turn and message-window policies are pure projections over the current transcript. Built-in policies keep only the latest file-attachment tool result provider-resolvable by default; older attachment references are replaced with text/structured summaries using `strip_old_file_attachments(...)` so providers do not receive the same file bytes on every later request. The same helper keeps user-prompt `FilePart`s provider-resolvable only on the current attach turn — once a file's turn has been answered and a newer user turn begins, its bytes are projected to a short text note (see "Files in prompts" under ArtifactStore). Checkpoint-backed compaction is runtime-managed: it summarizes older messages through a `ContextCompactor`, stores summary state in the session checkpoint under `context_compaction`, emits `context.compaction.started`, `context.compaction.completed` or `context.compaction.failed`, emits `session.checkpointed` after successful checkpoint writes, and sends leading system messages, compacted user-context summary, and recent complete turns to the provider. It does not delete or rewrite transcript messages.
 
 Compaction checkpoints store the summary and `compacted_transcript_cursor`, the provider-neutral transcript position covered by that summary. A compactor may advance this cursor only across a contiguous source prefix represented in the returned summary; omitted history remains eligible for a later compaction and is included verbatim between the synthetic summary and recent turns in every model-facing projection. Coverage boundaries may not split an assistant tool call from its matching tool result. A custom provider-backed prompt must cover at least one source message. When recompacting an existing checkpoint, every positive-coverage `CompactionResult` must set `represented_existing_summary_sha256` to the lowercase SHA-256 digest of the exact UTF-8 `CompactionRequest.existing_summary` it represents. A zero-coverage result instead must return that existing summary byte-for-byte unchanged. These checks prevent a valid old cursor from outliving the summary that represents its source range. A result may report zero coverage only as validated `progress_exhausted` state for the current compactor configuration; an ordinary zero-coverage success is rejected so it cannot trigger recurring paid work without cursor progress. Version-1 compaction checkpoints predate explicit source coverage and are invalidated on read; the next eligible compaction rebuilds them from the authoritative transcript as version 2. The model-facing summary is injected as synthetic user context, not as a system instruction, and is not appended to the durable transcript. The authoritative transcript remains immutable and complete, while the checkpoint controls only the model-facing projection. Compaction lifecycle events report requested and represented source ranges, coverage mode, source chunk count/mode, bounded-input state, and failure state through allowlisted scalar fields; they do not include summary, transcript, attachment, provider-state, or instruction content.
 
@@ -1566,11 +1566,15 @@ continuation cannot reinterpret the call against a wider request.
 
 ## Execution profiles
 
-Every fresh `CayuApp.run(...)` freezes a versioned `ExecutionProfileIdentity` in runtime-owned session metadata in the same transaction that creates the running session. The immutable `baseline` is that creation profile; the `expected` profile is the identity a later invocation must match. The invocation snapshot is the candidate profile resolved once by a particular public run or resume before admission and then held fixed for that invocation. The profile is a sorted set of typed component identities covering the runtime, provider/model target and adapter, durable system projection, context selection, knowledge injection, compaction, provider request controls, application and invocation budgets, structured output, finalization, direct tool declarations, tool implementations, tool-view grants, registered execution policies, invocation policies, ordered hooks, environment and runner semantics, and effect authority. The system component fingerprints the fully rendered system message, including statically resolvable workspace instructions, that is subsequently persisted in the authoritative transcript. If factory materialization would change that projection after the profile is frozen, setup fails closed before model or tool work.
+Every fresh `CayuApp.run(...)` freezes a versioned `ExecutionProfileIdentity` in runtime-owned session metadata in the same transaction that creates the running session. The immutable `baseline` is that creation profile; the `expected` profile is the identity a later invocation must match. The invocation snapshot is the candidate profile resolved once by a particular public run or resume before admission and then held fixed for that invocation. The profile is a sorted set of typed component identities covering the runtime, provider/model target and adapter, durable system projection, context selection, automatic recall, compaction, provider request controls, application and invocation budgets, structured output, finalization, direct tool declarations, tool implementations, tool-view grants, registered execution policies, invocation policies, ordered hooks, environment and runner semantics, and effect authority. The system component fingerprints the fully rendered system message, including statically resolvable workspace instructions, that is subsequently persisted in the authoritative transcript. If factory materialization would change that projection after the profile is frozen, setup fails closed before model or tool work.
 
 Each component states its identity strength and availability. `application_versioned` is an application declaration, `structural` covers canonical material Cayu can inspect safely, `process_local` explicitly means that custom behavior is comparable only for the lifetime of one `CayuApp` registration, and `unavailable` means that no deterministic proof exists. A process-local component includes an app-instance-scoped opaque nonce, so retries through the same frozen registration can proceed. An opaque request-scoped loop policy additionally includes an app-local identity for the exact live policy object; reconstructing another instance of the same class therefore changes invocation authority, while reusing the exact object in the same app remains comparable. Constructing another app—even in the same operating-system process—deliberately produces a mismatch. This prevents a same-class replacement with changed opaque configuration from being mistaken for exact reuse. It is never presented as reproducible evidence. Cayu-owned built-ins use a runtime-versioned identity plus bounded behavior-affecting configuration where Cayu knows that contract. Durable profile records contain only SHA-256 fingerprints and classifications: raw prompts, tool names, descriptions, schemas, implementation objects, policy configuration, secrets, and credentials are not stored in the record.
 
-The schema-v3 component contract and its default comparison behavior are:
+The schema-v4 component contract and its default comparison behavior are:
+
+Schema v4 is an intentional breaking replacement for the prerelease schema-v3
+knowledge-injection identity. Schema-v3 profile records are rejected rather
+than translated, and no compatibility component is retained.
 
 | Component | Fingerprinted contract | Default on change |
 | --- | --- | --- |
@@ -1586,7 +1590,7 @@ The schema-v3 component contract and its default comparison behavior are:
 | `execution_environment` | Environment/factory/runner identities, binding shape, workspace/runner presence, and execution requirements | Reject as authority-changing; missing custom environment, factory, or runner identity is `process_local`. |
 | `effect_authority` | Tool effects, argument publication, workspace mutation, credential mode, egress and real-secret reach, and runner availability | Reject as authority-changing. |
 | `context_selection` | Primary and overflow context-policy selection semantics and bounded built-in controls | Reject as authority-changing; opaque custom policies are `process_local` unless application-versioned. |
-| `knowledge_injection` | Whether and how retrieved knowledge can enter model context, excluding private filters and content | Reject as authority-changing; private or opaque configuration is `process_local`. |
+| `automatic_recall` | Source membership, fusion calibration, admission policy, and bounds governing automatic memory focus | Reject as authority-changing; private or opaque configuration is `process_local`. |
 | `context_compaction` | Automatic and explicit compactor behavior, including provider/model selection for built-in model compactors | Reject as authority-changing; opaque custom compactors are `process_local` unless application-versioned. |
 | `live_state_projection` | Configured live-state inputs that can enter model context | Reject as authority-changing. The current absence is represented explicitly as `none`, never inferred from an omitted component. |
 | `provider_adapter` | The selected provider adapter's bounded built-in behavior or application-declared identity | Reject as authority-changing; custom adapters without an identity are `process_local`. |
@@ -1742,7 +1746,7 @@ When the policy's eligible-count condition is satisfied, Cayu creates the evalua
 
 `fail-group` fails closed when any branch is failed, interrupted, invalid, oversized, budget-exhausted, or gate-rejected, preserving all sibling sessions and evidence. `evaluate-viable` preserves every successful sibling and every terminal predecessor while creating at most the declared number of replacements at the declared parallelism. Failure to reach the minimum viable count, replacement or causal-budget exhaustion, invalid evaluator output, missing authority, or malformed evidence fails closed without any disposition or selection. Evaluator failure likewise preserves the complete attempt graph. Extension and planner failures are projected through bounded, secret-redacted diagnostics before entering branch results or the durable group record. `ForkGroupResult` distinguishes terminal attempt outcome, deterministic eligibility, evaluator disposition, and replacement lineage; none of those constitutes application-owned promotion, merge, publication, breeding, or deletion. Task-backed/distributed execution, workspace promotion, and remote copy-on-write branches remain separate capabilities.
 
-`ForkSessionRequest` creates a new session branch from an existing `completed`, `failed`, or `interrupted` session without mutating the source. Every child receives one immutable execution-profile baseline. Omitting `execution_profile_selection`, or selecting `INHERIT_PARENT`, copies the parent's effective durable authority exactly, including an explicitly unavailable component: an invocation-bound profile is authoritative while that exact parent invocation remains represented in its checkpoint; otherwise the parent's current expected session profile is authoritative. This selection does not rewrite the parent's immutable creation baseline or its current expected profile. An inherited-prompt partial fork must retain every durable source system message so the copied transcript and inherited baseline cannot diverge. Selecting `CURRENT_CHILD` instead resolves the complete schema-v3 child profile from the current registered agent, provider, environment, policies, hooks, budgets, context controls, tools, model, and prompt body; it requires `ExecutionProfileAdoptionIntent` and an attributable application-policy authorization before any child, transcript, checkpoint, or event mutation. That review is required even when the candidate profile is structurally equal because `CURRENT_CHILD` explicitly chooses current application authority instead of inheriting the parent's frozen authority. The selected child agent may target a different registered provider; every provider change projects the complete portable transcript and calls the target provider's portability preflight even when the model name is unchanged. The provider change and authorization decision are stored atomically with the fork relationship. Agent, model, or environment overrides and `ForkSystemPromptPolicy.CURRENT_AGENT` require this explicit current-child selection. A rejected, malformed, authority-widening, unavailable, or nonportable current-child selection leaves the parent unchanged and creates neither a runnable child nor partial decision evidence. When the caller omits `session_id`, Cayu derives one opaque parent-and-request-scoped child identity from the prepared request so retries and concurrent submissions converge on the same exact fork across key rotation and process restart.
+`ForkSessionRequest` creates a new session branch from an existing `completed`, `failed`, or `interrupted` session without mutating the source. Every child receives one immutable execution-profile baseline. Omitting `execution_profile_selection`, or selecting `INHERIT_PARENT`, copies the parent's effective durable authority exactly, including an explicitly unavailable component: an invocation-bound profile is authoritative while that exact parent invocation remains represented in its checkpoint; otherwise the parent's current expected session profile is authoritative. This selection does not rewrite the parent's immutable creation baseline or its current expected profile. An inherited-prompt partial fork must retain every durable source system message so the copied transcript and inherited baseline cannot diverge. Selecting `CURRENT_CHILD` instead resolves the complete schema-v4 child profile from the current registered agent, provider, environment, policies, hooks, budgets, context controls, tools, model, and prompt body; it requires `ExecutionProfileAdoptionIntent` and an attributable application-policy authorization before any child, transcript, checkpoint, or event mutation. That review is required even when the candidate profile is structurally equal because `CURRENT_CHILD` explicitly chooses current application authority instead of inheriting the parent's frozen authority. The selected child agent may target a different registered provider; every provider change projects the complete portable transcript and calls the target provider's portability preflight even when the model name is unchanged. The provider change and authorization decision are stored atomically with the fork relationship. Agent, model, or environment overrides and `ForkSystemPromptPolicy.CURRENT_AGENT` require this explicit current-child selection. A rejected, malformed, authority-widening, unavailable, or nonportable current-child selection leaves the parent unchanged and creates neither a runnable child nor partial decision evidence. When the caller omits `session_id`, Cayu derives one opaque parent-and-request-scoped child identity from the prepared request so retries and concurrent submissions converge on the same exact fork across key rotation and process restart.
 
 The store atomically persists the child baseline, immutable parent/child profile relationship, accepted decision actor/policy/reason when applicable, and ordered decision-then-`session.forked` evidence. Exact retry, lost-acknowledgement reconciliation, and concurrent delivery use the caller-selected or runtime-derived child ID plus a digest of the complete pre-redaction fork request and converge on that one relationship across in-memory, SQLite, and PostgreSQL stores. When secret-bearing requests are admitted, the digest is derived through the configured durable authority keyring: distinct raw values that share a redacted representation still conflict, while retained authority keys keep exact replay valid during key rotation. A conflicting request or incomplete evidence fails closed. SQLite pruning retains those content-bound fork events while the relationship exists, so exact replay does not depend on otherwise-prunable history. Deleting a terminal parent may clear the surviving child's live parent foreign key, but the immutable relationship retains the original source identity and remains authoritative for the child's creation profile. Child run, resume, approval continuation, and recovery consult the child's own baseline. A later child-profile adoption changes only the child's expected profile and retains its immutable fork baseline; it never changes the parent baseline or retroactively changes which parent invocation authority the fork selected, and exact replay continues to validate against the creation target rather than the child's mutable current provider/model fields.
 
@@ -7732,102 +7736,146 @@ with only `query`, then use returned hit metadata to refine later searches. Apps
 that rely on non-default namespaces or strict project/user labels should make
 that scope part of the registered agent/tool configuration or instructions.
 
-Apps can also use `KnowledgeInjectionPolicy` when knowledge should be recalled
-automatically before a model call instead of only through explicit tools. The
-policy may wrap another context policy, but nesting one
-`KnowledgeInjectionPolicy` inside another is rejected because one policy owns
-the session's frozen retrieval state; use its filters to define one retrieval
-surface. The
-policy identifies the transcript's latest eligible user message, rehydrates any
-previously frozen manifests, and searches the active environment's
-`knowledge_store` when that latest message is new and has non-blank text. It
-never falls back to an earlier turn. Runtime-authored user-role messages used for
-structured-output repair or before-stop continuation are marked by exact message
-digest in the same atomic write that appends them to the transcript, so recovery
-does not mistake them for user input and a later real user message is not
-suppressed. They do not start a new search. The query honors `query_max_chars`,
-namespace, labels, kinds,
-visibilities, aspects, impact targets, source type/id, search mode, expiry
-handling, `max_hits`, and `max_bytes`; injection `max_bytes` is capped at 128 KiB.
+Apps can use `AutomaticRecallContextPolicy` to turn multi-source recall into a
+bounded, interaction-scoped memory contribution before a model call. Recall and
+admission are separate: `RecallEngine` retrieves and fuses independently ranked
+knowledge and transcript channels, while `AutomaticRecallPolicy` maps the
+calibrated fused head into strong matches, model-visible offers, or silent
+omissions. `MemoryFocus`, `RecallOffer`, and `AutomaticRecallContribution` are
+immutable provider-neutral values, so applications and evals can inspect the
+decision without parsing model-facing prompt text. The admission policy names
+the exact fusion strategy/configuration and calibration versions; construction
+fails if those identities do not agree.
 
-When the search returns hits, the policy prepends a bounded candidate manifest as
-the first text part of the latest user message before invoking the wrapped
-context policy. Token-pressure decisions, provider token counting, compaction,
-and prompt-cache-prefix construction therefore see the same augmented message
-that can reach the provider. If the wrapped policy removes the anchor, the
-manifest and its checkpoint frame are discarded rather than being attached to a
-different message with identical content. The
-original user text and file parts remain separate and unchanged after that part.
-The manifest uses the versioned `cayu.knowledge_candidates.v2` format: valid JSON
-enclosed by `<cayu_knowledge_candidates>` / `</cayu_knowledge_candidates>` markers.
-It contains entry ids, exact positive revisions, kinds, source metadata, and bounded excerpts, plus an
-explicit notice that the candidates are runtime-retrieved, potentially incomplete
-or untrusted reference data rather than the user's words or instructions. Marker
-characters inside retrieved values are JSON-escaped so retrieved content cannot
-forge the outer envelope. The configurable `prefix` is included when the byte
-bound permits it. If all hit fields cannot fit, Cayu omits optional metadata,
-clips only an excerpt at a character boundary, or omits later candidates; the
-envelope remains valid JSON and records `truncated: true` instead of cutting
-through JSON or a trust marker.
+The source set is explicit in `AutomaticRecallSourceConfig`. Knowledge and
+transcript recall can be enabled independently and each source declares whether
+it is required. A required unavailable source fails closed before provider
+dispatch. An optional source failure produces bounded `unavailable` diagnostics
+and allows the remaining channels to contribute; provider or store exception
+text is never copied into those diagnostics. The transcript source searches only
+the configured session ids and applies an exact exclusive transcript-index
+cutoff, so the anchoring user message cannot recall itself.
 
-The candidate manifest is a discovery surface, not fabricated model history. An
-agent may use the ordinary `read_knowledge` tool, when the app registered it, to
-load the complete bounded content for any knowledge kind. Kinds such as `skill`,
-`procedure`, or an app-defined future kind are metadata; there is no kind-specific
-loader. Automatic injection does not register a hidden tool and does not fabricate
-assistant tool calls or tool-result messages, so the request remains compatible
-with strict provider tool-history validation. The augmented message is
-runtime-authored context: it is sent in model-facing context but is not appended
-to the user-authored durable transcript.
+The four admission modes are `off`, `offer`, `strong_matches`, and
+`offer_and_strong_matches`. Strong matches must meet `minimum_inject_score` and
+may enter `MemoryFocus`; plausible lower-scoring matches may enter a
+`RecallOffer` for explicit model inspection; everything else remains silent.
+Selection is deterministic, content-hash deduplicated, and record-type diverse
+before remaining capacity is filled. Candidate count, candidate text, focus,
+offer, and complete contribution sizes all have explicit bounds. Clipping keeps
+valid complete typed values and truthful omission diagnostics rather than
+cutting serialized JSON.
 
-Retrieval is frozen once per user turn. Cayu stores the bounded, secret-redacted
-candidate payload and its user-message anchor in typed runtime checkpoint state
-under `knowledge_injection`; fixed envelope text is reconstructed
-deterministically rather than stored as an opaque serialized string. Cayu never
-stores raw search hits there. Every later model
-step for that turn — including tool-result follow-ups, retries, cache-prefix
-construction, and recovery from provider-managed reasoning state — reuses the
-exact same manifest before the wrapped policy runs. Knowledge returned by a real
-tool call remains ordinary tool-result context and does not mutate the frozen
-candidates. New or changed knowledge becomes eligible on the next user turn.
-Zero-hit searches and `fail_open=True` failures are also frozen, so one tool
-round cannot repeatedly query a failing store. The absence of an active
-knowledge store is frozen as well, preventing a later environment rebind from
-retroactively injecting into a user message that the provider has already seen.
-When trimming or compaction
-removes an anchored user message from model-facing context, Cayu prunes its
-checkpoint frame. This keeps the provider-visible history and prompt-cache
-prefix stable without mislabeling runtime retrieval as user-authored data. When
-multiple transcript anchors have identical complete projected messages, Cayu
-retains every indistinguishable anchor instead of guessing which occurrence a
-custom context policy kept. Frozen frames are rehydrated even when a later
-context build has no active knowledge store, because new search capability and
-existing provider history are separate concerns.
+A typical knowledge-plus-transcript policy is configured explicitly:
 
-The frozen history also has an aggregate serialized checkpoint bound. The
-`max_checkpoint_bytes` default is 1 MiB and may be configured up to 16 MiB; it
-must be at least `max_bytes`. Cayu applies the wrapped policy and prunes removed
-anchors before checking this total. If the surviving frames still exceed the
-bound, context construction fails closed before provider dispatch instead of
-silently evicting a manifest and destabilizing previously visible history. Long
-uncompacted sessions should use a bounded or checkpoint-compacting wrapped policy
-or deliberately raise this explicit limit.
+```python
+from cayu import (
+    AutomaticRecallContextPolicy,
+    AutomaticRecallPolicy,
+    AutomaticRecallSourceConfig,
+    KNOWLEDGE_LEXICAL_CHANNEL,
+    KNOWLEDGE_SEMANTIC_CHANNEL,
+    TRANSCRIPT_LEXICAL_CHANNEL,
+    WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
+    WeightedReciprocalRankFusionConfig,
+)
 
-`knowledge.search.started` records that a search was attempted and its safe
-query/filter bounds; `knowledge.search.completed` records hit counts and search
-truncation, including zero-hit searches; and `knowledge.search.failed` records
-the lookup failure. Search telemetry becomes durable as retrieval runs, before
-any wrapped-policy operation it causally precedes, such as compaction.
-`knowledge.injected` is emitted after the wrapped projection accepts the anchored
-message and remains atomic with the resulting checkpoint update. It proves the
-candidate manifest was added to the model-facing projection for a new user turn
-and records its hit count, candidate count, byte count, format version,
-truncation state, projection location, and source metadata without copying
-retrieved text into the event. It does not prove that a later provider request
-completed. Reusing a frozen frame does not emit a second search or injection
-event. Search failures fail closed by default; configure
-`fail_open=True` to emit the failure, freeze that outcome for the turn, and
-continue without a candidate manifest.
+fusion_version = "app-recall-v1"
+policy = AutomaticRecallContextPolicy(
+    admission_policy=AutomaticRecallPolicy(
+        calibration_version="app-recall-calibration-v1",
+        fusion_strategy_version=WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
+        fusion_configuration_version=fusion_version,
+        minimum_inject_score=0.025,
+        minimum_offer_score=0.012,
+    ),
+    fusion_config=WeightedReciprocalRankFusionConfig(
+        configuration_version=fusion_version,
+        channel_weights={
+            KNOWLEDGE_LEXICAL_CHANNEL: 1.0,
+            KNOWLEDGE_SEMANTIC_CHANNEL: 1.0,
+            TRANSCRIPT_LEXICAL_CHANNEL: 0.8,
+        },
+        max_candidates_per_channel=20,
+        fused_head_limit=30,
+    ),
+    sources=AutomaticRecallSourceConfig(
+        knowledge_namespace="project:cayu",
+        knowledge_required=True,
+        transcript_required=False,
+    ),
+)
+```
+
+One `AutomaticRecallContextPolicy` owns the automatic-memory frame; nesting it
+directly or through `UsageTriggeredContextPolicy` is rejected. It identifies the
+latest real user message with non-blank text and never falls back to an earlier
+turn. A new file-only user interaction expires the preceding frame without
+running text recall. Runtime-authored user-role messages for structured-output repair and
+before-stop continuation carry exact runtime markers and do not start another
+recall. The situation includes the current query, bounded preceding
+conversation, explicit knowledge scope/namespace, and transcript cutoff. The
+input transcript and its messages are copied defensively and never mutated.
+
+For a new real user interaction, recall runs once and the redacted contribution
+is rendered as valid deterministic JSON inside
+`<cayu_automatic_memory version="1">` markers. Retrieved values are untrusted
+reference data, not user instructions; marker characters in values are escaped
+so recalled text cannot close or forge the envelope. Focus items retain their
+exact candidate identity, revision, representation, content hash, locator,
+fused rank, score, and matched-channel provenance. Offers retain exact locators
+for application-registered read/search tools. No hidden tool is registered and
+no assistant tool call or tool-result history is fabricated.
+
+The wrapped context policy projects the original transcript without receiving
+recalled content as input. This prevents a compactor or custom selector from
+paraphrasing memory into a different message where provenance could no longer be
+proved. After projection, Cayu requires one unambiguous surviving anchor and
+prepends the exact manifest as its separate first text part. If trimming or
+compaction removes the anchor, changes its user text, or makes that text
+ambiguous, the model-facing contribution is suppressed. A content-free frozen
+state prevents another recall
+during the same interaction; the frame is never attached to another message.
+The final context-pressure estimate, provider count, overflow handling, and
+prompt-cache construction all operate on the contribution that may reach the
+provider. The projection is runtime-authored and is never appended to the
+durable user transcript.
+
+The frozen redacted provider-neutral contribution projection and its session id,
+anchor digest/index, admission-policy and complete automatic-recall configuration
+fingerprints, situation and contribution/projection/manifest digests, byte count,
+and runtime-authored anchors are stored under the versioned
+`automatic_recall` checkpoint root. The delimited manifest is reconstructed
+deterministically from that typed JSON projection rather than stored as opaque
+prompt text. The
+same frozen contribution is reused across tool rounds, retries, structured-output
+repair, before-stop continuation, compaction, and process recovery. Empty and
+silent outcomes are frozen too, preventing repeated retrieval during one
+interaction. An execution-profile-authorized change to admission, fusion,
+source, engine, or projection-bound configuration expires a well-formed old
+frame and re-admits the current interaction under the complete new identity; a
+malformed or internally inconsistent frame still fails closed without recalling.
+The next real user message creates a new frame and can observe new knowledge. The
+complete redacted projection must fit `max_projection_bytes`; otherwise context
+construction fails before dispatch.
+
+Forks inherit authoritative transcript history but never the source interaction's
+`automatic_recall` checkpoint root. The child derives a new frame from its next
+real user interaction under the child's session identity.
+
+Only the versioned `automatic_recall` root is recognized. The removed
+`knowledge_injection` checkpoint shape is neither read nor translated; sessions
+created against that prerelease contract must be recreated.
+
+`memory.recall.started`, `memory.recall.completed`, and
+`memory.recall.failed` describe the bounded operation without query or candidate
+text. A successful completion records source status, counts, truncation, and
+duration. `memory.recall.admitted` records the accepted frame and remains ordered
+with its checkpoint outcome after the wrapped projection retains the anchor.
+Reusing a frozen frame emits no duplicate recall or admission lifecycle. The
+automatic-recall configuration is also a first-class execution-profile
+component, so source, fusion, calibration, admission, or bound drift is rejected
+before changed behavior can run under an old session profile.
 
 This slice does not add graph retrieval, remote source connectors, background
 remembering workers, or agent-led mutation of existing knowledge. Those layers

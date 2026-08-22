@@ -2901,22 +2901,23 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     policies[EventType.CONTEXT_OVERFLOW_RECOVERING] = overflow_policy
     policies[EventType.CONTEXT_OVERFLOW_FAILED] = overflow_policy
 
-    knowledge_policy = _observed_policy(
-        "anchor_transcript_index candidate_count durable_value_error_code "
-        "durable_value_error_path error error_type execution_profile_fingerprint format hit_count injected_bytes "
-        "manifest_truncated model_step_id policy projection query query_chars sources "
-        "total_hits_known truncated",
+    automatic_recall_policy = _observed_policy(
+        "admission_truncated anchor_transcript_index configuration_sha256 contribution_sha256 duration_seconds "
+        "error_type evaluated_candidate_count execution_profile_fingerprint focused_item_count "
+        "manifest_sha256 model_step_id offered_item_count policy_sha256 projected_bytes "
+        "recall_candidate_count recall_truncated silent_item_count situation_sha256 source_names "
+        "source_statuses",
         authority_keys={"execution_profile_fingerprint"},
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
-        untrusted_container_keys={"sources"},
+        untrusted_container_keys={"source_names", "source_statuses"},
     )
     for event_type in (
-        EventType.KNOWLEDGE_SEARCH_STARTED,
-        EventType.KNOWLEDGE_SEARCH_COMPLETED,
-        EventType.KNOWLEDGE_SEARCH_FAILED,
-        EventType.KNOWLEDGE_INJECTED,
+        EventType.AUTOMATIC_RECALL_STARTED,
+        EventType.AUTOMATIC_RECALL_COMPLETED,
+        EventType.AUTOMATIC_RECALL_FAILED,
+        EventType.AUTOMATIC_RECALL_ADMITTED,
     ):
-        policies[event_type] = knowledge_policy
+        policies[event_type] = automatic_recall_policy
 
     binding_policy = _observed_policy(
         "binding_cleanup binding_generation_id binding_type bound_metadata bound_path bound_snapshot "
