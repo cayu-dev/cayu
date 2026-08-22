@@ -137,7 +137,8 @@ the supplied paths, and do not perform project discovery.
 
 `EvalCorpusDocument` is Cayu's bounded, JSON-portable definition format for
 reusable eval suites and cases. A document describes exactly one trusted
-`target_key`. It contains only user-role text input, bounded trial settings,
+`target_key`. A runnable case contains only user-role text input; a captured-only
+case uses `input: null`. Documents also contain bounded trial settings,
 diagnostic source/pricing identities, an explicit evidence policy, and a closed
 set of structural assertion specifications. It cannot contain a `CayuApp`,
 provider/model/environment selection, import path, callback, raw session ID, or
@@ -169,15 +170,17 @@ cases reference suites by `suite_id`, so cases from independent corpus fragments
 can be merged without rewriting suite membership. Case, suite, evidence-policy,
 and corpus revisions change whenever their covered content changes;
 `assertion_spec_revision(...)` provides the same identity for one assertion.
-Every suite must contain at least one case so every accepted suite has a valid
-execution and publication shape.
+Every suite must contain at least one case. A fresh-execution suite cannot mix
+runnable and captured-only cases; captured-only suites remain valid definition
+and publication shapes but are rejected by fresh-run admission until runnable
+input is authored.
 
 `eval_corpus_to_json(...)`, `eval_corpus_from_json(...)`, and
 `load_eval_corpus(...)` enforce schema version 1 and Cayu's durable-JSON rules,
 including duplicate-key, non-finite-number, integer-range, Unicode, and nesting
 validation. Input is rejected before an unbounded read or decode. The hard
 document limit is 8 MiB, with at most 64 suites, 1,000 cases, 64 assertions per
-case, 16 messages per case, 65,536 characters per message, 262,144 input
+case, 0 to 16 messages per case, 65,536 characters per message, 262,144 input
 characters per case, 100 sequential trials, and a 3,600-second per-trial timeout.
 Each suite may expand to at most 10,000 published assertion results across its
 cases and trials, matching the boundary of the one-suite execution result. A
@@ -731,39 +734,47 @@ Preview evidence, warnings, app internals, runtime configuration, and session
 identity are not corpus fields. The same valid candidate produces byte-identical
 output across processes.
 
-### Dashboard promotion workflow
+### Click-to-evaluate captured sessions
 
-An authenticated Cayu server can expose this same promotion contract directly
-on completed and failed session pages. Configure
-`EvaluationPromotionConfig(target_key=..., source_agent_name=...,
-application_release_id=...)` on `ServerConfig`; the feature and both API routes
-are absent when that policy is not configured.
+On an authenticated server with a generated or explicitly registered eval
+target, every coherently retained completed or failed session exposes
+**Evaluate**. No per-session Python configuration is required. The server maps
+the session's root agent to one unambiguous target, reconstructs bounded terminal
+evidence, and returns a side-effect-free preview. Preview never calls a provider,
+tool, environment, hook, or application workload and never writes a corpus or
+result.
 
-**Promote to eval** first rebuilds the candidate from the current bounded durable
-snapshot. The sheet exposes its diagnostic source and evidence, then lets the
-operator edit the suite identity and trial settings, case identity and input,
-and every schema-v1 portable assertion. **Preview score** sends the complete
-authority-free draft back to the server. The server reapplies application
-redaction, restores all server-owned provenance and evidence, revalidates the
-current session, verifies that the draft satisfies the complete portable-corpus
-contract, and scores through `score_promotion_candidate(...)`. A cost assertion
-without a configured pricing profile, or with a currency absent from that
-profile, is rejected during preview instead of producing an unusable export.
+The review sheet shows retained status, output, tool, step, usage, and cost
+evidence. Assertion quick-adds begin from those observed facts; operators can
+edit suite/case identity and any portable non-judge assertion before rescoring.
+The initial root assertion always expects `completed`, so a captured failure is
+saved as a regression to fix rather than silently approved as correct behavior.
+Every edit makes the displayed score stale and disables save/export until the
+server has reconstructed the current session and scored the exact edited
+candidate again. A changed session, release, manifest, evidence policy, pricing
+profile, target mapping, or redaction result returns a conflict and requires a
+new preview.
 
-Editing any field makes the displayed score stale and disables export until the
-new draft is previewed. **Export eval JSON** submits that exact canonical
-candidate; the server reconstructs and rescores it again before returning the
-deterministic corpus download. A racing session, app-manifest change, pricing
-change, or stale candidate returns a conflict and requires a fresh preview. The
-adapter stores no draft or corpus and does not run providers, tools,
-environments, hooks, or the exported eval.
+**Save evaluation** atomically persists two immutable documents: a one-case
+expectation corpus and its captured score result. That corpus deliberately uses
+`input: null`; Cayu does not invent a prompt, flatten a resumed conversation, or
+pretend that historical execution authority is replayable. The saved result is
+valid and useful for review, baselining, release comparison, and future scenario
+authoring even when runnable corpus-v1 conversion is unavailable. **Export eval
+JSON** returns the same deterministic captured-only corpus without writing.
 
-When the authenticated server also exposes a writable Evals surface, **Save to
-Evals** sends the same exact previewed candidate through the export boundary and
-imports the resulting portable corpus. The browser does not construct a second
-corpus shape or retain a server-side draft. Equal content resolves to the same
-immutable revision; import incompatibility or a stale promotion remains visible
-and cannot silently fall back to a download-only workflow.
+Runnable conversion remains an independent capability. Simple fresh invocations
+may also satisfy `build_promotion_candidate(...)`; multi-turn, resumed,
+approval-driven, file/structured-input, and structured-output sessions normally
+need an authored runnable input or scenario. Fresh-run admission rejects a
+captured-only case with that precise explanation. This is an honest boundary of
+reconstructing execution, not a reason to block captured scoring or persistence.
+
+Saved results appear in the target-scoped **Evals → Results** catalog alongside
+fresh results. Selecting a result exposes its immutable public-safe score and
+corpus identity. **Approve baseline** performs an actor-attributed, idempotent
+compare-and-swap update; the request cannot supply or spoof its actor. Concurrent
+baseline changes fail instead of silently overwriting another operator's choice.
 
 ### Durable eval catalog and run state
 
@@ -772,7 +783,7 @@ must survive beyond the promotion request. `SQLiteEvalStore` is restart-durable
 for one embedded database; `PostgresEvalStore` supports shared multi-worker
 claims; `InMemoryEvalStore` is intentionally process-local and is suitable for
 tests and transient SDK workflows only. SQLite and PostgreSQL require storage
-schema revision 47. Corpus saves, run admission, and result publication require
+schema revision 48. Corpus saves, run admission, and result publication require
 the active application's complete JSON redaction boundary. A configured workload
 secret or redaction failure rejects before any write; the store never retains
 the redaction function or secret registry.

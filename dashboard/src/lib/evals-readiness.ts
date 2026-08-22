@@ -16,17 +16,15 @@ export const EVALS_READINESS_OPERATIONS = [
 
 const REASON_TEXT: Record<EvalsReadinessReasonCode, string> = {
   evaluation_promotion_not_configured:
-    "Captured-session evaluation is not assembled in this deployment; automatic assembly is planned.",
+    "The optional runnable-session conversion adapter is not configured in this deployment.",
   terminal_evidence_not_supported:
     "The session store cannot provide the terminal evidence required for captured evaluation.",
   session_lineage_not_supported:
     "The session store cannot provide the session lineage required for captured evaluation.",
-  eval_store_not_configured:
-    "Durable Evals storage is not assembled in this deployment; automatic assembly is planned.",
-  eval_target_not_configured:
-    "No approved fresh-execution target is assembled in this deployment; automatic discovery is planned.",
+  eval_store_not_configured: "Durable Evals storage is not available in this deployment.",
+  eval_target_not_configured: "No server-owned eval target is available in this deployment.",
   captured_result_persistence_not_available:
-    "Saving captured results is planned for a future Cayu release.",
+    "The configured eval store cannot persist captured results.",
   scenario_v2_not_available:
     "Multi-stage production scenarios are planned for a future Cayu release.",
 }
@@ -34,10 +32,7 @@ const REASON_TEXT: Record<EvalsReadinessReasonCode, string> = {
 export function evalsReadinessStateLabel(readiness: EvalsOperationReadiness): string {
   if (readiness.state === "ready") return "Ready"
   if (readiness.state === "gated") return "Not ready"
-  if (
-    readiness.reason_code === "captured_result_persistence_not_available" ||
-    readiness.reason_code === "scenario_v2_not_available"
-  ) {
+  if (readiness.reason_code === "scenario_v2_not_available") {
     return "Planned"
   }
   return "Unavailable"

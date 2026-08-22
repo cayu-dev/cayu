@@ -109,7 +109,7 @@ def test_postgres_eval_store_shared_conformance(postgres_dsn) -> None:
     asyncio.run(exercise())
 
 
-def test_postgres_eval_store_creates_revision_forty_seven_schema(postgres_dsn) -> None:
+def test_postgres_eval_store_creates_revision_forty_eight_schema(postgres_dsn) -> None:
     async def exercise() -> None:
         import psycopg
 
@@ -128,9 +128,31 @@ def test_postgres_eval_store_creates_revision_forty_seven_schema(postgres_dsn) -
             conn.cursor() as cur,
         ):
             await cur.execute(
-                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 47"
+                "SELECT revision, kind, compatible_from FROM cayu_schema_migrations "
+                "WHERE revision IN (47, 48) ORDER BY revision"
             )
-            assert await cur.fetchone() == ("breaking", 47)
+            assert await cur.fetchall() == [
+                (47, "breaking", 47),
+                (48, "breaking", 48),
+            ]
+            await cur.execute(
+                """
+                SELECT pg_get_constraintdef(constraint_record.oid)
+                FROM pg_catalog.pg_constraint AS constraint_record
+                JOIN pg_catalog.pg_class AS table_record
+                  ON table_record.oid = constraint_record.conrelid
+                JOIN pg_catalog.pg_namespace AS namespace
+                  ON namespace.oid = table_record.relnamespace
+                WHERE namespace.nspname = current_schema()
+                  AND table_record.relname = 'cayu_eval_cases'
+                  AND constraint_record.conname = 'cayu_eval_cases_message_count_check'
+                """
+            )
+            constraint = await cur.fetchone()
+            assert constraint is not None
+            normalized_constraint = "".join(constraint[0].lower().split())
+            assert "message_count>=0" in normalized_constraint
+            assert "message_count<=16" in normalized_constraint
             await cur.execute(
                 "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() "
                 "AND (indexname LIKE 'idx_cayu_eval_runs_target_%' "
@@ -186,6 +208,72 @@ def test_postgres_eval_store_creates_revision_forty_seven_schema(postgres_dsn) -
                 ("cayu_eval_runs", "run_id", "C"),
                 ("cayu_eval_suites", "suite_id", "C"),
             ]
+
+    asyncio.run(exercise())
+
+
+def test_postgres_revision_forty_eight_preserves_cases_and_admits_zero_messages(
+    postgres_dsn,
+) -> None:
+    async def exercise() -> None:
+        import psycopg
+
+        from cayu.storage.evals_postgres import PostgresEvalStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _drop_eval_tables(postgres_dsn)
+        corpus = _corpus(trials=1)
+        initialized = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            await _save_corpus(initialized, corpus)
+        finally:
+            await initialized.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                "ALTER TABLE cayu_eval_cases DROP CONSTRAINT cayu_eval_cases_message_count_check"
+            )
+            await cur.execute(
+                "ALTER TABLE cayu_eval_cases ADD CONSTRAINT "
+                "cayu_eval_cases_message_count_check "
+                "CHECK (message_count >= 1 AND message_count <= 16)"
+            )
+            await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 48")
+
+        migrated = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            assert await migrated.load_corpus(corpus.revision) == corpus
+        finally:
+            await migrated.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                "SELECT message_count FROM cayu_eval_cases "
+                "WHERE corpus_revision = %s AND case_id = %s",
+                (corpus.revision, corpus.cases[0].id),
+            )
+            assert await cur.fetchone() == (len(corpus.cases[0].input.messages),)
+            await cur.execute(
+                """
+                INSERT INTO cayu_eval_cases (
+                    corpus_revision, case_id, case_revision, suite_id, name,
+                    description, message_count, assertion_count
+                ) VALUES (%s, %s, %s, %s, %s, NULL, 0, 1)
+                """,
+                (
+                    corpus.revision,
+                    "captured-contract-check",
+                    "sha256:" + "f" * 64,
+                    corpus.suites[0].id,
+                    "Captured contract check",
+                ),
+            )
 
     asyncio.run(exercise())
 
@@ -299,7 +387,7 @@ def test_postgres_revision_forty_seven_indexes_existing_fresh_results(postgres_d
             await cur.execute("DROP TABLE cayu_eval_baseline_mutations")
             await cur.execute("DROP TABLE cayu_eval_baselines")
             await cur.execute("DROP TABLE cayu_eval_result_records")
-            await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 47")
+            await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 47")
             await conn.commit()
 
         migrated = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)

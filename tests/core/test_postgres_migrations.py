@@ -251,7 +251,7 @@ def test_revision_forty_six_migrates_empty_transcript_database(
             await cur.execute("SELECT to_regclass('idx_cayu_transcript_messages_narrative_fts')")
             assert await cur.fetchone() == ("idx_cayu_transcript_messages_narrative_fts",)
             await cur.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
-            assert await cur.fetchone() == (47,)
+            assert await cur.fetchone() == (48,)
             await cur.execute(
                 "SELECT singleton, tokenizer_version FROM cayu_transcript_search_configuration"
             )

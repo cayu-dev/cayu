@@ -239,10 +239,13 @@ def test_application_anatomy_guide_tracks_shipped_process_roles() -> None:
 def test_release_notes_preserve_storage_revision_chronology() -> None:
     release_notes = _REPO_ROOT / "docs" / "release-notes.md"
     v0_3_0 = _heading_section(release_notes, heading="v0.3.0")
+    unreleased = _heading_section(release_notes, heading="Unreleased")
     v0_2_1 = _heading_section(release_notes, heading="v0.2.1")
     v0_2_0 = _heading_section(release_notes, heading="v0.2.0")
 
     assert "advances from revision 29 to revision 34" in v0_2_0
+    assert "Storage revision 48 is a breaking boundary" in unreleased
+    assert "confirm revision 48 before starting current workers" in unreleased
     assert "confirm revision 34 with no pending migrations" in v0_2_0
     assert "revision 39" not in v0_2_0
 

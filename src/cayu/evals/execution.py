@@ -579,6 +579,10 @@ def _compile_prepared_corpus_suite(
     case_specs = tuple(
         case for case in validated_corpus.cases if case.suite_id == validated_suite_id
     )
+    if any(case.input is None for case in case_specs):
+        raise ValueError(
+            "Captured-only eval cases cannot execute until runnable input is authored."
+        )
     if len(case_specs) > validated_target.limits.max_cases:
         raise ValueError("Eval corpus suite exceeds the trusted target case limit.")
     if suite_spec.trial_request.trials > validated_target.limits.max_trials:
@@ -611,11 +615,14 @@ def _compile_prepared_corpus_suite(
     compiled_input_chars = 0
     compiled_cases: list[EvalCase] = []
     for case_spec, assertion_count in zip(case_specs, assertion_counts, strict=True):
+        case_input = case_spec.input
+        if case_input is None:  # Narrowed by the suite-level admission check above.
+            raise RuntimeError("Captured-only eval input passed fresh-execution admission.")
         corpus_messages = tuple(
-            Message.text(MessageRole.USER, message.text) for message in case_spec.input.messages
+            Message.text(MessageRole.USER, message.text) for message in case_input.messages
         )
         total_input_chars = bootstrap_chars + sum(
-            len(message.text) for message in case_spec.input.messages
+            len(message.text) for message in case_input.messages
         )
         if total_input_chars > validated_target.limits.max_total_input_chars:
             raise ValueError(
@@ -693,6 +700,11 @@ def _validate_corpus_target_compatibility(
             raise ValueError("Eval corpus pricing profile does not match the trusted CorpusTarget.")
         trusted_pricing_identity = pricing_profile_identity(context.target.price_book)
     for suite in context.corpus.suites:
+        suite_cases = tuple(case for case in context.corpus.cases if case.suite_id == suite.id)
+        if all(case.input is None for case in suite_cases):
+            continue
+        if any(case.input is None for case in suite_cases):
+            raise ValueError("An eval suite cannot mix captured-only and runnable cases.")
         _compile_prepared_corpus_suite(
             context,
             suite.id,

@@ -28,25 +28,28 @@ import {
 import { Textarea } from "@/components/ui/textarea"
 import {
   ApiClientError,
-  type EvaluationPromotionCandidateDraft,
-  type EvaluationPromotionPreview,
-  exportEvaluationPromotion,
-  importEvalCorpus,
-  previewEvaluationPromotion,
+  type CapturedEvaluationCandidateDraft as EvaluationPromotionCandidateDraft,
+  type CapturedEvaluationPreview as EvaluationPromotionPreview,
+  exportCapturedEvaluation as exportEvaluationPromotion,
+  fetchEvalResultDetail,
+  previewCapturedEvaluation as previewEvaluationPromotion,
+  saveCapturedEvaluation,
+  selectEvalBaseline,
 } from "@/lib/api"
-import { dashboardCapabilityUnavailableText } from "@/lib/dashboard-capabilities"
-import { preflightEvalCorpusFile, shortEvalIdentity } from "@/lib/evals-dashboard"
+import { shortEvalIdentity } from "@/lib/evals-dashboard"
+import { evalsReadinessReasonText } from "@/lib/evals-readiness"
 import {
+  createCapturedEvaluationAssertion,
   createPromotionAssertion,
   PROMOTION_ASSERTION_KINDS,
   PROMOTION_ASSERTION_LABELS,
   type PromotionAssertion,
   type PromotionAssertionKind,
-  previewMatchesDraft,
-  promotionDraftFromCandidate,
-  validatePromotionDraft,
+  capturedEvaluationPreviewMatchesDraft as previewMatchesDraft,
+  capturedEvaluationDraftFromCandidate as promotionDraftFromCandidate,
+  validateCapturedEvaluationDraft as validatePromotionDraft,
 } from "@/lib/evaluation-promotion"
-import { useDashboardCapability } from "./server-contract"
+import { useServerContract } from "./server-contract"
 
 const SELECT_CLASS =
   "h-8 w-full rounded-lg border border-input bg-background px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
@@ -60,20 +63,9 @@ export function EvaluationPromotionAction({
   sessionId: string
   status: string
 }) {
-  const readCapability = useDashboardCapability({
-    kind: "surface",
-    surface: "evaluation_promotion",
-  })
-  const mutateCapability = useDashboardCapability({
-    kind: "surface",
-    surface: "evaluation_promotion",
-    operation: "mutate",
-  })
-  const evalsMutateCapability = useDashboardCapability({
-    kind: "surface",
-    surface: "evals",
-    operation: "mutate",
-  })
+  const readiness = useServerContract().capabilities.evals_readiness
+  const capturedReadiness = readiness.captured_evaluation
+  const persistenceReadiness = readiness.captured_result_persistence
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
   const [preview, setPreview] = useState<EvaluationPromotionPreview | null>(null)
@@ -82,6 +74,10 @@ export function EvaluationPromotionAction({
   const [exporting, setExporting] = useState(false)
   const [saving, setSaving] = useState(false)
   const [savedRevision, setSavedRevision] = useState<string | null>(null)
+  const [savedCorpusRevision, setSavedCorpusRevision] = useState<string | null>(null)
+  const [savedTargetKey, setSavedTargetKey] = useState<string | null>(null)
+  const [baselineGeneration, setBaselineGeneration] = useState<number | null>(null)
+  const [baselining, setBaselining] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const previewRequestRef = useRef<{ generation: number; controller: AbortController } | null>(null)
   const exportControllerRef = useRef<AbortController | null>(null)
@@ -144,7 +140,11 @@ export function EvaluationPromotionAction({
     setPreviewing(false)
     setExporting(false)
     setSaving(false)
+    setBaselining(false)
     setSavedRevision(null)
+    setSavedCorpusRevision(null)
+    setSavedTargetKey(null)
+    setBaselineGeneration(null)
     setOpen(true)
     void loadPreview()
   }
@@ -156,6 +156,7 @@ export function EvaluationPromotionAction({
       setPreviewing(false)
       setExporting(false)
       setSaving(false)
+      setBaselining(false)
     }
   }
 
@@ -174,8 +175,8 @@ export function EvaluationPromotionAction({
     draft !== null &&
     validation?.ok === true &&
     previewMatchesDraft(preview, draft)
-  const mutationUnavailable = dashboardCapabilityUnavailableText(mutateCapability)
-  const evalsMutationUnavailable = dashboardCapabilityUnavailableText(evalsMutateCapability)
+  const persistenceUnavailable =
+    persistenceReadiness.state === "ready" ? null : evalsReadinessReasonText(persistenceReadiness)
 
   const exportPreviewedCandidate = (signal: AbortSignal) => {
     if (!previewIsCurrent || preview === null) return null
@@ -224,19 +225,27 @@ export function EvaluationPromotionAction({
     setSaving(true)
     setSavedRevision(null)
     setError(null)
-    let exportCompleted = false
     try {
-      const exported = await exportPreviewedCandidate(controller.signal)
-      if (exported === null || controller.signal.aborted) return
-      exportCompleted = true
-      await preflightEvalCorpusFile(exported.blob)
-      const imported = await importEvalCorpus(exported.blob, controller.signal)
+      const saved = await saveCapturedEvaluation(
+        sessionId,
+        {
+          candidate: preview.candidate,
+          expected_candidate_revision: preview.candidate.revision,
+        },
+        controller.signal,
+      )
       if (controller.signal.aborted) return
-      setSavedRevision(imported.revision)
-      await queryClient.invalidateQueries({ queryKey: ["evals", "corpora"] })
+      setSavedRevision(saved.record.revision)
+      setSavedCorpusRevision(saved.record.corpus_revision)
+      setSavedTargetKey(saved.record.target.target_key)
+      setBaselineGeneration(null)
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["evals", "results"] }),
+        queryClient.invalidateQueries({ queryKey: ["evals", "corpora"] }),
+      ])
     } catch (saveError) {
       if (controller.signal.aborted) return
-      if (!exportCompleted && isPromotionConflict(saveError)) {
+      if (isPromotionConflict(saveError)) {
         setPreview(null)
         setDraft(null)
       }
@@ -249,25 +258,49 @@ export function EvaluationPromotionAction({
     }
   }
 
-  if (!readCapability.enabled || !ELIGIBLE_STATUSES.has(status)) return null
+  const approveBaseline = async () => {
+    if (savedRevision === null) return
+    setBaselining(true)
+    setError(null)
+    try {
+      const current = await fetchEvalResultDetail(savedRevision)
+      if (current.baseline?.result_revision === savedRevision) {
+        setBaselineGeneration(current.baseline.generation)
+        return
+      }
+      const selected = await selectEvalBaseline(savedRevision, {
+        result_revision: savedRevision,
+        expected_generation: current.baseline?.generation ?? 0,
+        operation_id: randomOperationId(),
+      })
+      setBaselineGeneration(selected.baseline.generation)
+      await queryClient.invalidateQueries({ queryKey: ["evals", "results"] })
+    } catch (baselineError) {
+      setError(promotionErrorMessage(baselineError))
+    } finally {
+      setBaselining(false)
+    }
+  }
+
+  if (capturedReadiness.state !== "ready" || !ELIGIBLE_STATUSES.has(status)) return null
 
   return (
     <>
-      <Button size="sm" variant="outline" data-testid="promote-to-eval" onClick={openPromotion}>
+      <Button size="sm" variant="outline" data-testid="evaluate-session" onClick={openPromotion}>
         <FlaskConical className="h-4 w-4" />
-        Promote to eval
+        Evaluate
       </Button>
       <Sheet open={open} onOpenChange={changeOpen}>
         <SheetContent
           className="w-full! gap-0 sm:max-w-4xl!"
           data-testid="promotion-sheet"
-          aria-busy={previewing || exporting || saving}
+          aria-busy={previewing || exporting || saving || baselining}
         >
           <SheetHeader className="border-b border-border pr-12">
-            <SheetTitle>Promote captured run to an eval</SheetTitle>
+            <SheetTitle>Evaluate captured session</SheetTitle>
             <SheetDescription>
-              Edit a portable candidate, score it against this run, then save or export the exact
-              previewed version.
+              Review retained evidence, define expectations, then save or export the exact previewed
+              evaluation. No application workload runs here.
             </SheetDescription>
           </SheetHeader>
 
@@ -280,7 +313,7 @@ export function EvaluationPromotionAction({
             ) : draft === null ? (
               <div className="flex min-h-56 flex-col items-center justify-center gap-3 text-center">
                 <p className="max-w-md text-sm text-muted-foreground">
-                  The promotion candidate could not be loaded. No eval has been exported.
+                  The captured evidence could not be loaded. No evaluation has been saved.
                 </p>
                 <Button variant="outline" onClick={() => void loadPreview()} disabled={previewing}>
                   <RotateCcw /> Retry preview
@@ -291,10 +324,16 @@ export function EvaluationPromotionAction({
                 {preview && (
                   <PromotionEvidenceSummary preview={preview} current={previewIsCurrent} />
                 )}
-                <fieldset className="contents" disabled={previewing || exporting || saving}>
+                <fieldset
+                  className="contents"
+                  disabled={previewing || exporting || saving || baselining}
+                >
                   <PromotionIdentityEditor draft={draft} editDraft={editDraft} />
-                  <PromotionInputEditor draft={draft} editDraft={editDraft} />
-                  <PromotionAssertionsEditor draft={draft} editDraft={editDraft} />
+                  <PromotionAssertionsEditor
+                    draft={draft}
+                    evidence={preview?.candidate.evidence}
+                    editDraft={editDraft}
+                  />
                 </fieldset>
                 {preview && <PromotionScore preview={preview} current={previewIsCurrent} />}
               </div>
@@ -314,22 +353,43 @@ export function EvaluationPromotionAction({
                 className="mt-4 rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3 text-sm text-emerald-700 dark:text-emerald-300"
                 role="status"
               >
-                Saved corpus {shortEvalIdentity(savedRevision)} to Evals.{" "}
+                Saved result {shortEvalIdentity(savedRevision)} to Evals.{" "}
                 <Link
                   to="/evals"
-                  search={{ tab: "catalog", corpus: savedRevision }}
+                  search={{
+                    tab: "results",
+                    result: savedRevision,
+                    corpus: savedCorpusRevision ?? undefined,
+                    target: savedTargetKey ?? undefined,
+                  }}
                   className="font-medium underline"
                   onClick={() => changeOpen(false)}
                 >
                   Open Evals
                 </Link>
+                {baselineGeneration === null ? (
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    className="ml-2"
+                    disabled={baselining}
+                    onClick={() => void approveBaseline()}
+                  >
+                    {baselining ? <LoaderCircle className="animate-spin" /> : <CheckCircle2 />}
+                    {baselining ? "Approving..." : "Approve baseline"}
+                  </Button>
+                ) : (
+                  <span className="ml-2 font-medium">Baseline approved</span>
+                )}
               </div>
             )}
           </div>
 
           <SheetFooter className="border-t border-border bg-background sm:flex-row sm:items-center sm:justify-end">
-            {mutationUnavailable && (
-              <span className="mr-auto text-xs text-muted-foreground">{mutationUnavailable}</span>
+            {persistenceUnavailable && (
+              <span className="mr-auto text-xs text-muted-foreground">
+                {persistenceUnavailable}
+              </span>
             )}
             <Button variant="ghost" onClick={() => changeOpen(false)}>
               Cancel
@@ -347,9 +407,7 @@ export function EvaluationPromotionAction({
             </Button>
             <Button
               data-testid="promotion-export"
-              disabled={
-                !previewIsCurrent || !mutateCapability.enabled || previewing || exporting || saving
-              }
+              disabled={!previewIsCurrent || previewing || exporting || saving || baselining}
               onClick={() => void exportCandidate()}
             >
               {exporting ? <LoaderCircle className="animate-spin" /> : <Download />}
@@ -359,17 +417,17 @@ export function EvaluationPromotionAction({
               data-testid="promotion-save"
               disabled={
                 !previewIsCurrent ||
-                !mutateCapability.enabled ||
-                !evalsMutateCapability.enabled ||
+                persistenceReadiness.state !== "ready" ||
                 previewing ||
                 exporting ||
-                saving
+                saving ||
+                baselining
               }
-              title={evalsMutationUnavailable ?? undefined}
+              title={persistenceUnavailable ?? undefined}
               onClick={() => void saveCandidate()}
             >
               {saving ? <LoaderCircle className="animate-spin" /> : <Save />}
-              {saving ? "Saving..." : "Save to Evals"}
+              {saving ? "Saving..." : "Save evaluation"}
             </Button>
           </SheetFooter>
         </SheetContent>
@@ -422,6 +480,11 @@ function PromotionEvidenceSummary({
           {candidate.warnings.map(promotionWarning).join(" ")}
         </div>
       )}
+      <div className="mx-3 mt-3 rounded-lg border border-border bg-muted/20 p-2.5 text-xs text-muted-foreground">
+        {preview.runnable_conversion.available
+          ? "This captured session can also be converted into runnable input for a fresh evaluation."
+          : `Captured scoring and saving are available. Fresh execution needs authored runnable input${preview.runnable_conversion.reason_code ? ` (${preview.runnable_conversion.reason_code.replaceAll("_", " ")})` : ""}.`}
+      </div>
     </Card>
   )
 }
@@ -470,32 +533,6 @@ function PromotionIdentityEditor({ draft, editDraft }: PromotionEditorProps) {
             }
           />
         </PromotionField>
-        <PromotionField label="Trials" id="promotion-trials">
-          <Input
-            id="promotion-trials"
-            type="number"
-            min={1}
-            max={100}
-            value={draft.suite.trial_request.trials ?? 1}
-            onChange={(event) =>
-              editDraft((next) => (next.suite.trial_request.trials = Number(event.target.value)))
-            }
-          />
-        </PromotionField>
-        <PromotionField label="Timeout seconds" id="promotion-timeout">
-          <Input
-            id="promotion-timeout"
-            type="number"
-            min={1}
-            max={3600}
-            value={draft.suite.trial_request.timeout_seconds ?? 300}
-            onChange={(event) =>
-              editDraft(
-                (next) => (next.suite.trial_request.timeout_seconds = Number(event.target.value)),
-              )
-            }
-          />
-        </PromotionField>
         <PromotionField label="Case ID" id="promotion-case-id">
           <Input
             id="promotion-case-id"
@@ -524,66 +561,21 @@ function PromotionIdentityEditor({ draft, editDraft }: PromotionEditorProps) {
   )
 }
 
-function PromotionInputEditor({ draft, editDraft }: PromotionEditorProps) {
-  return (
-    <Card size="sm">
-      <CardHeader className="grid-cols-[1fr_auto]">
-        <div>
-          <CardTitle>Eval input</CardTitle>
-          <p className="mt-1 text-xs text-muted-foreground">
-            Portable user messages captured before the run began.
-          </p>
-        </div>
-        <Button
-          size="xs"
-          variant="outline"
-          disabled={draft.case.input.messages.length >= 16}
-          onClick={() =>
-            editDraft((next) => next.case.input.messages.push({ role: "user", text: "" }))
-          }
-        >
-          <Plus /> Add message
-        </Button>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        {draft.case.input.messages.map((message, index) => (
-          // biome-ignore lint/suspicious/noArrayIndexKey: portable input messages have no identity field.
-          <div key={index} className="rounded-lg border border-border p-3">
-            <div className="mb-2 flex items-center justify-between">
-              <span className="text-xs font-medium">User message {index + 1}</span>
-              <Button
-                size="icon-xs"
-                variant="ghost"
-                aria-label={`Remove user message ${index + 1}`}
-                disabled={draft.case.input.messages.length === 1}
-                onClick={() => editDraft((next) => next.case.input.messages.splice(index, 1))}
-              >
-                <Trash2 />
-              </Button>
-            </div>
-            <Textarea
-              aria-label={`User message ${index + 1}`}
-              className="min-h-24 font-mono"
-              value={message.text}
-              onChange={(event) => {
-                const text = event.target.value
-                editDraft((next) => {
-                  const target = next.case.input.messages[index]
-                  if (target !== undefined) target.text = text
-                })
-              }}
-            />
-          </div>
-        ))}
-      </CardContent>
-    </Card>
-  )
-}
-
-function PromotionAssertionsEditor({ draft, editDraft }: PromotionEditorProps) {
+function PromotionAssertionsEditor({
+  draft,
+  evidence,
+  editDraft,
+}: PromotionEditorProps & {
+  evidence: EvaluationPromotionPreview["candidate"]["evidence"] | undefined
+}) {
+  const [quickKind, setQuickKind] = useState<PromotionAssertionKind>("root_status")
   const addAssertion = () =>
     editDraft((next) => {
-      next.case.assertions.push(createPromotionAssertion("root_status", next.case.assertions))
+      next.case.assertions.push(
+        evidence
+          ? createCapturedEvaluationAssertion(quickKind, next.case.assertions, evidence)
+          : createPromotionAssertion(quickKind, next.case.assertions),
+      )
     })
   return (
     <Card size="sm">
@@ -594,14 +586,28 @@ function PromotionAssertionsEditor({ draft, editDraft }: PromotionEditorProps) {
             Assertions are rescored against the captured run before export.
           </p>
         </div>
-        <Button
-          size="xs"
-          variant="outline"
-          disabled={draft.case.assertions.length >= 64}
-          onClick={addAssertion}
-        >
-          <Plus /> Add assertion
-        </Button>
+        <div className="flex items-center gap-2">
+          <select
+            className={SELECT_CLASS}
+            value={quickKind}
+            aria-label="Assertion quick-add type"
+            onChange={(event) => setQuickKind(event.target.value as PromotionAssertionKind)}
+          >
+            {PROMOTION_ASSERTION_KINDS.map((kind) => (
+              <option key={kind} value={kind}>
+                {PROMOTION_ASSERTION_LABELS[kind]}
+              </option>
+            ))}
+          </select>
+          <Button
+            size="xs"
+            variant="outline"
+            disabled={draft.case.assertions.length >= 64}
+            onClick={addAssertion}
+          >
+            <Plus /> Add observed
+          </Button>
+        </div>
       </CardHeader>
       <CardContent className="space-y-3">
         {draft.case.assertions.map((assertion, index) => (
@@ -611,6 +617,7 @@ function PromotionAssertionsEditor({ draft, editDraft }: PromotionEditorProps) {
             assertion={assertion}
             index={index}
             assertions={draft.case.assertions}
+            evidence={evidence}
             update={(updated) =>
               editDraft((next) => {
                 next.case.assertions[index] = updated
@@ -628,20 +635,22 @@ function AssertionEditor({
   assertion,
   index,
   assertions,
+  evidence,
   update,
   remove,
 }: {
   assertion: PromotionAssertion
   index: number
   assertions: PromotionAssertion[]
+  evidence: EvaluationPromotionPreview["candidate"]["evidence"] | undefined
   update: (assertion: PromotionAssertion) => void
   remove: () => void
 }) {
   const replaceKind = (kind: PromotionAssertionKind) => {
-    const replacement = createPromotionAssertion(
-      kind,
-      assertions.filter((_, candidateIndex) => candidateIndex !== index),
-    )
+    const remaining = assertions.filter((_, candidateIndex) => candidateIndex !== index)
+    const replacement = evidence
+      ? createCapturedEvaluationAssertion(kind, remaining, evidence)
+      : createPromotionAssertion(kind, remaining)
     replacement.id = assertion.id
     replacement.description = assertion.description ?? null
     update(replacement)
@@ -1050,7 +1059,6 @@ type PromotionEditorProps = {
 }
 
 function promotionWarning(warning: string): string {
-  if (warning === "input_redacted") return "Sensitive input was redacted before promotion."
   if (warning === "source_run_failed")
     return "The source run failed; review its expectations carefully."
   return warning
@@ -1061,7 +1069,7 @@ function promotionErrorMessage(error: unknown): string {
     const message = (error.detail as Record<string, unknown>).message
     if (typeof message === "string" && message.trim()) return message
   }
-  return error instanceof Error ? error.message : "The eval promotion request failed."
+  return error instanceof Error ? error.message : "The captured evaluation request failed."
 }
 
 function isPromotionConflict(error: unknown): boolean {
@@ -1078,4 +1086,10 @@ function downloadBlob(blob: Blob, filename: string): void {
   anchor.click()
   anchor.remove()
   window.setTimeout(() => URL.revokeObjectURL(url), 0)
+}
+
+function randomOperationId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32))
+  const digest = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")
+  return `sha256:${digest}`
 }

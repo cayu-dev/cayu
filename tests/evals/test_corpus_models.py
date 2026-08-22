@@ -208,6 +208,27 @@ def test_every_portable_assertion_kind_round_trips_through_a_case():
     )
 
 
+def test_case_input_is_required_but_may_be_explicitly_null():
+    runnable = _case()
+    captured = EvalCaseSpec.create(
+        id=runnable.id,
+        suite_id=runnable.suite_id,
+        name=runnable.name,
+        description=runnable.description,
+        source=runnable.source,
+        input=None,
+        assertions=runnable.assertions,
+    )
+
+    document = captured.model_dump(mode="json")
+    assert document["input"] is None
+    assert EvalCaseSpec.model_validate(document) == captured
+
+    del document["input"]
+    with pytest.raises(ValidationError, match="Field required"):
+        EvalCaseSpec.model_validate(document)
+
+
 def test_portable_model_judge_spec_round_trips_as_bounded_authority_free_data():
     spec = _model_judge_assertion()
 

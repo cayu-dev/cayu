@@ -18,12 +18,21 @@ import type {
   ApproveKnowledgeApiKnowledgeEntryIdApprovePostResponse,
   ArtifactReadResponse,
   ArtifactsResponse,
+  CapturedEvaluationDraft,
+  CapturedEvaluationExportRequest,
+  CapturedEvaluationPreviewResponse,
+  CapturedEvaluationSaveRequest,
+  CapturedEvaluationSaveResponse,
   EnvironmentsResponse,
+  EvalBaselineSelectionRequest,
+  EvalBaselineSelectionResponse,
   EvalCaseCatalogPage,
   EvalComparisonResponse,
   EvalCorpusCatalogEntry,
   EvalCorpusCatalogPage,
   EvalCorpusDocument,
+  EvalResultDetailResponse,
+  EvalResultPage,
   EvalResultResponse,
   EvalRunPage,
   EvalRunRecord,
@@ -53,6 +62,7 @@ import type {
   ListArtifactsApiArtifactsGetData,
   ListEvalCasesApiEvalsCorporaCorpusRevisionSuitesSuiteIdCasesGetData,
   ListEvalCorporaApiEvalsCorporaGetData,
+  ListEvalResultsApiEvalsResultsGetData,
   ListEvalRunsApiEvalsRunsGetData,
   ListEvalSuitesApiEvalsCorporaCorpusRevisionSuitesGetData,
   ListPendingActionsApiPendingActionsGetData,
@@ -172,6 +182,15 @@ export type SessionInterrupt = InterruptSessionBody
 export type EvaluationPromotionPreview = EvaluationPromotionPreviewResponse
 export type EvaluationPromotionCandidateDraft = EvaluationPromotionDraft
 export type EvaluationPromotionExport = EvaluationPromotionExportRequest
+export type CapturedEvaluationPreview = CapturedEvaluationPreviewResponse
+export type CapturedEvaluationCandidateDraft = CapturedEvaluationDraft
+export type CapturedEvaluationExport = CapturedEvaluationExportRequest
+export type CapturedEvaluationSave = CapturedEvaluationSaveRequest
+export type CapturedEvaluationSaved = CapturedEvaluationSaveResponse
+export type EvalBaselineSelection = EvalBaselineSelectionRequest
+export type EvalBaselineSelected = EvalBaselineSelectionResponse
+export type EvalResultDetail = EvalResultDetailResponse
+export type EvalResultsPage = EvalResultPage
 export type EvalCorpus = EvalCorpusDocument
 export type EvalCorpusEntry = EvalCorpusCatalogEntry
 export type EvalCorporaPage = EvalCorpusCatalogPage
@@ -192,6 +211,7 @@ export type EvalCasesQuery = NonNullable<
   ListEvalCasesApiEvalsCorporaCorpusRevisionSuitesSuiteIdCasesGetData["query"]
 >
 export type EvalRunsQuery = NonNullable<ListEvalRunsApiEvalsRunsGetData["query"]>
+export type EvalResultsQuery = NonNullable<ListEvalResultsApiEvalsResultsGetData["query"]>
 
 export type DownloadedFile = {
   blob: Blob
@@ -431,6 +451,74 @@ export async function exportEvaluationPromotion(
     blob: await response.blob(),
     filename: evaluationPromotionFilename(response.headers.get("content-disposition")),
   }
+}
+
+export async function previewCapturedEvaluation(
+  sessionId: string,
+  draft?: CapturedEvaluationCandidateDraft,
+  signal?: AbortSignal,
+): Promise<CapturedEvaluationPreview> {
+  return requestJson<CapturedEvaluationPreview>(
+    `/evals/sessions/${encodeURIComponent(sessionId)}/evaluation/preview`,
+    {
+      method: "POST",
+      body: JSON.stringify({ draft: draft ?? null }),
+      signal,
+    },
+  )
+}
+
+export async function saveCapturedEvaluation(
+  sessionId: string,
+  body: CapturedEvaluationSave,
+  signal?: AbortSignal,
+): Promise<CapturedEvaluationSaved> {
+  return requestJson<CapturedEvaluationSaved>(
+    `/evals/sessions/${encodeURIComponent(sessionId)}/evaluation/save`,
+    { method: "POST", body: JSON.stringify(body), signal },
+  )
+}
+
+export async function exportCapturedEvaluation(
+  sessionId: string,
+  body: CapturedEvaluationExport,
+  signal?: AbortSignal,
+): Promise<DownloadedFile> {
+  const response = await requestResponse(
+    `/evals/sessions/${encodeURIComponent(sessionId)}/evaluation/export`,
+    { method: "POST", body: JSON.stringify(body), signal },
+  )
+  return {
+    blob: await response.blob(),
+    filename: evaluationPromotionFilename(response.headers.get("content-disposition")),
+  }
+}
+
+export async function fetchEvalResults(
+  query: EvalResultsQuery,
+  signal?: AbortSignal,
+): Promise<EvalResultsPage> {
+  return requestJson<EvalResultsPage>(`/evals/results${queryString(query)}`, { signal })
+}
+
+export async function fetchEvalResultDetail(
+  resultRevision: string,
+  signal?: AbortSignal,
+): Promise<EvalResultDetail> {
+  return requestJson<EvalResultDetail>(`/evals/results/${encodeURIComponent(resultRevision)}`, {
+    signal,
+  })
+}
+
+export async function selectEvalBaseline(
+  resultRevision: string,
+  body: EvalBaselineSelection,
+  signal?: AbortSignal,
+): Promise<EvalBaselineSelected> {
+  return requestJson<EvalBaselineSelected>(
+    `/evals/results/${encodeURIComponent(resultRevision)}/baseline`,
+    { method: "POST", body: JSON.stringify(body), signal },
+  )
 }
 
 export async function fetchEvalCorpora(

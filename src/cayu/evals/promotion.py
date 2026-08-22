@@ -68,6 +68,8 @@ PROMOTABLE_RUN_INPUT_SCHEMA_VERSION = 1
 PROMOTION_SOURCE_SCHEMA_VERSION = 1
 PROMOTION_CANDIDATE_SCHEMA_VERSION = 1
 PROMOTION_CANDIDATE_MAX_BYTES = 16 << 20
+CAPTURED_EVALUATION_CANDIDATE_SCHEMA_VERSION = 1
+CAPTURED_EVALUATION_CANDIDATE_MAX_BYTES = 16 << 20
 CAPTURED_RUN_SCORE_SCHEMA_VERSION = 1
 CAPTURED_RUN_SCORE_MAX_BYTES = 2 << 20
 
@@ -361,6 +363,224 @@ class PromotionCandidateV1(_SchemaV1PortableModel):
         )
 
 
+class CapturedEvaluationWarningCode(StrEnum):
+    """Stable non-blocking facts about one captured evaluation."""
+
+    SOURCE_RUN_FAILED = "source_run_failed"
+
+
+class CapturedEvaluationSourceV1(_SchemaV1PortableModel):
+    """Public-safe provenance for evaluation without replay authority."""
+
+    schema_version: Literal[1] = 1
+    source_agent_name: StrictStr
+    application_release_id: StrictStr
+    app_manifest_schema_version: StrictStr
+    app_manifest_fingerprint: StrictStr
+    evidence_revision: StrictStr
+    evidence_policy_revision: StrictStr
+    pricing_profile_fingerprint: StrictStr | None = None
+    source_label: StrictStr | None = None
+
+    @field_validator("source_agent_name", "application_release_id")
+    @classmethod
+    def validate_source_identity(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=256,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("app_manifest_schema_version")
+    @classmethod
+    def validate_manifest_schema_version(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=32,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("source_label")
+    @classmethod
+    def validate_source_label(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=256,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("app_manifest_fingerprint")
+    @classmethod
+    def validate_manifest_fingerprint(cls, value: str, info) -> str:
+        return _sha256_hex(value, info.field_name)
+
+    @field_validator(
+        "evidence_revision",
+        "evidence_policy_revision",
+        "pricing_profile_fingerprint",
+    )
+    @classmethod
+    def validate_content_revision(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _sha256_revision(value, info.field_name)
+
+    def case_source(self) -> EvaluationSourceIdentityV1:
+        return EvaluationSourceIdentityV1(
+            application_release_id=self.application_release_id,
+            app_manifest_schema_version=self.app_manifest_schema_version,
+            app_manifest_fingerprint=self.app_manifest_fingerprint,
+            evidence_revision=self.evidence_revision,
+        )
+
+
+class CapturedEvaluationCandidateV1(_SchemaV1PortableModel):
+    """Editable assertion contract bound to coherent captured evidence only."""
+
+    schema_version: Literal[1] = CAPTURED_EVALUATION_CANDIDATE_SCHEMA_VERSION
+    revision: StrictStr
+    target_key: StrictStr
+    source: CapturedEvaluationSourceV1
+    evidence_policy: EvaluationEvidencePolicySpec
+    pricing_profile: PricingProfileIdentityV1 | None = None
+    evidence: AssertionEvidenceView
+    suite: EvalSuiteSpec
+    case: EvalCaseSpec
+    warnings: tuple[CapturedEvaluationWarningCode, ...] = Field(max_length=1)
+
+    @field_validator("target_key")
+    @classmethod
+    def validate_target_key(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("revision")
+    @classmethod
+    def validate_revision_shape(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("warnings", mode="before")
+    @classmethod
+    def validate_warnings_are_ordered(cls, value: object, info) -> object:
+        return _ordered_sequence_input(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> CapturedEvaluationCandidateV1:
+        if self.source.evidence_revision != self.evidence.revision:
+            raise ValueError("Captured source and evidence revisions do not match.")
+        if self.source.evidence_policy_revision != self.evidence_policy.revision:
+            raise ValueError("Captured source and evidence-policy revisions do not match.")
+        if self.evidence.policy_revision != self.evidence_policy.revision:
+            raise ValueError("Captured evidence and evidence-policy revisions do not match.")
+        expected_pricing_fingerprint = (
+            None if self.pricing_profile is None else self.pricing_profile.fingerprint
+        )
+        if self.source.pricing_profile_fingerprint != expected_pricing_fingerprint:
+            raise ValueError("Captured source and pricing-profile identities do not match.")
+        if self.evidence.pricing_profile_fingerprint not in {
+            None,
+            expected_pricing_fingerprint,
+        }:
+            raise ValueError("Captured evidence uses a different pricing profile.")
+        if self.case.source != self.source.case_source():
+            raise ValueError("Captured case source does not match candidate provenance.")
+        if self.case.suite_id != self.suite.id:
+            raise ValueError("Captured case must reference the candidate suite.")
+        if self.case.input is not None:
+            raise ValueError("A captured-only evaluation candidate cannot carry runnable input.")
+        expected_warnings = (
+            (CapturedEvaluationWarningCode.SOURCE_RUN_FAILED,)
+            if self.evidence.root_status == SessionStatus.FAILED.value
+            else ()
+        )
+        if self.warnings != expected_warnings:
+            raise ValueError("Captured evaluation warnings do not match source facts.")
+        if not json_utf8_size_within_limit(
+            self,
+            CAPTURED_EVALUATION_CANDIDATE_MAX_BYTES,
+        ):
+            raise ValueError(
+                "Captured evaluation candidate exceeds "
+                f"{CAPTURED_EVALUATION_CANDIDATE_MAX_BYTES} canonical JSON bytes."
+            )
+        expected = _content_revision(self.model_dump(mode="json"), "captured candidate")
+        if self.revision != expected:
+            raise ValueError("Captured evaluation candidate revision does not match its content.")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        target_key: str,
+        source: CapturedEvaluationSourceV1,
+        evidence_policy: EvaluationEvidencePolicySpec,
+        evidence: AssertionEvidenceView,
+        suite: EvalSuiteSpec,
+        case: EvalCaseSpec,
+        pricing_profile: PricingProfileIdentityV1 | None = None,
+    ) -> CapturedEvaluationCandidateV1:
+        validated_target_key = _portable_id(target_key, "target_key")
+        validated_source = _validate_exact_model(
+            source,
+            CapturedEvaluationSourceV1,
+            "source",
+        )
+        validated_policy = _validate_exact_model(
+            evidence_policy,
+            EvaluationEvidencePolicySpec,
+            "evidence_policy",
+        )
+        validated_evidence = _validate_exact_model(evidence, AssertionEvidenceView, "evidence")
+        validated_suite = _validate_exact_model(suite, EvalSuiteSpec, "suite")
+        validated_case = _validate_exact_model(case, EvalCaseSpec, "case")
+        validated_pricing = (
+            None
+            if pricing_profile is None
+            else _validate_exact_model(
+                pricing_profile,
+                PricingProfileIdentityV1,
+                "pricing_profile",
+            )
+        )
+        warnings = (
+            (CapturedEvaluationWarningCode.SOURCE_RUN_FAILED,)
+            if validated_evidence.root_status == SessionStatus.FAILED.value
+            else ()
+        )
+        document = {
+            "schema_version": CAPTURED_EVALUATION_CANDIDATE_SCHEMA_VERSION,
+            "target_key": validated_target_key,
+            "source": validated_source.model_dump(mode="json"),
+            "evidence_policy": validated_policy.model_dump(mode="json"),
+            "pricing_profile": (
+                None if validated_pricing is None else validated_pricing.model_dump(mode="json")
+            ),
+            "evidence": validated_evidence.model_dump(mode="json"),
+            "suite": validated_suite.model_dump(mode="json"),
+            "case": validated_case.model_dump(mode="json"),
+            "warnings": [warning.value for warning in warnings],
+        }
+        return cls(
+            revision=_content_revision(document, "captured candidate"),
+            target_key=validated_target_key,
+            source=validated_source,
+            evidence_policy=validated_policy,
+            pricing_profile=validated_pricing,
+            evidence=validated_evidence,
+            suite=validated_suite,
+            case=validated_case,
+            warnings=warnings,
+        )
+
+
 class CapturedRunScoreV1(_SchemaV1PortableModel):
     """Bounded public score for an edited candidate against its captured evidence."""
 
@@ -430,15 +650,24 @@ class CapturedRunScoreV1(_SchemaV1PortableModel):
     def create(
         cls,
         *,
-        candidate: PromotionCandidateV1,
+        candidate: PromotionCandidateV1 | CapturedEvaluationCandidateV1,
         evidence: AssertionEvidenceView,
         assertions: Sequence[PublishedAssertionResult],
     ) -> CapturedRunScoreV1:
-        validated_candidate = _validate_exact_model(
-            candidate,
-            PromotionCandidateV1,
-            "candidate",
-        )
+        if type(candidate) is PromotionCandidateV1:
+            validated_candidate: PromotionCandidateV1 | CapturedEvaluationCandidateV1 = (
+                _validate_exact_model(candidate, PromotionCandidateV1, "candidate")
+            )
+        elif type(candidate) is CapturedEvaluationCandidateV1:
+            validated_candidate = _validate_exact_model(
+                candidate,
+                CapturedEvaluationCandidateV1,
+                "candidate",
+            )
+        else:
+            raise TypeError(
+                "candidate must be an exact PromotionCandidateV1 or CapturedEvaluationCandidateV1."
+            )
         validated_evidence = _validate_exact_model(evidence, AssertionEvidenceView, "evidence")
         ordered_assertion_input = _ordered_sequence_argument(assertions, "assertions")
         validated_assertions = tuple(
@@ -923,6 +1152,275 @@ def _default_case_id(
         canonical_durable_json_bytes(identity, "promotion case identity")
     ).hexdigest()
     return f"case-{digest}"
+
+
+def _default_captured_case_id(
+    target_key: str,
+    source: EvaluationSourceIdentityV1,
+) -> str:
+    identity = {
+        "target_key": target_key,
+        "source": source.model_dump(mode="json"),
+    }
+    digest = hashlib.sha256(
+        canonical_durable_json_bytes(identity, "captured evaluation case identity")
+    ).hexdigest()
+    return f"case-{digest}"
+
+
+def build_captured_evaluation_candidate(
+    app: CayuApp,
+    trajectory: Trajectory,
+    *,
+    target_key: str,
+    source_agent_name: str,
+    application_release_id: str,
+    evidence_policy: EvaluationEvidencePolicySpec,
+    pricing: PriceBook | None = None,
+    source_label: str | None = None,
+    project_root: str | Path | None = None,
+) -> CapturedEvaluationCandidateV1:
+    """Build a deterministic assertion contract without requiring replay input."""
+
+    if not isinstance(app, CayuApp):
+        raise TypeError("app must be a CayuApp.")
+    validated_trajectory = _validated_trajectory_for_promotion(trajectory)
+    session = validated_trajectory.session
+    if session is None or session.status not in {SessionStatus.COMPLETED, SessionStatus.FAILED}:
+        raise _promotion_error(SessionPromotionErrorCode.ROOT_STATUS_UNSUPPORTED)
+    _validate_eligible_tree(validated_trajectory)
+    validated_target_key = _safe_portable_id(app, target_key, "target_key")
+    safe_source_agent_name = _safe_candidate_text(
+        app,
+        source_agent_name,
+        "source_agent_name",
+        max_chars=256,
+    )
+    if session.agent_name != safe_source_agent_name:
+        raise _promotion_error(SessionPromotionErrorCode.SOURCE_AGENT_MISMATCH)
+    safe_release_id = _safe_candidate_text(
+        app,
+        application_release_id,
+        "application_release_id",
+        max_chars=256,
+    )
+    safe_source_label = (
+        None
+        if source_label is None
+        else _safe_candidate_text(
+            app,
+            source_label,
+            "source_label",
+            max_chars=256,
+        )
+    )
+    validated_policy = _validate_exact_model(
+        evidence_policy,
+        EvaluationEvidencePolicySpec,
+        "evidence_policy",
+    )
+    evidence = project_assertion_evidence_view(
+        app,
+        validated_trajectory,
+        evidence_policy=validated_policy,
+    )
+    manifest = app.describe(project_root=project_root)
+    pricing_profile = _safe_pricing_profile_identity(
+        app,
+        None if pricing is None else pricing_profile_identity(pricing),
+    )
+    source = CapturedEvaluationSourceV1(
+        source_agent_name=safe_source_agent_name,
+        application_release_id=safe_release_id,
+        app_manifest_schema_version=manifest.schema_version,
+        app_manifest_fingerprint=manifest.fingerprint,
+        evidence_revision=evidence.revision,
+        evidence_policy_revision=validated_policy.revision,
+        pricing_profile_fingerprint=(
+            None if pricing_profile is None else pricing_profile.fingerprint
+        ),
+        source_label=safe_source_label,
+    )
+    suite_id = _safe_portable_id(
+        app,
+        _default_suite_id(validated_target_key),
+        "suite.id",
+    )
+    suite = EvalSuiteSpec.create(
+        id=suite_id,
+        name=_safe_candidate_text(
+            app,
+            f"{validated_target_key} regressions",
+            "suite.name",
+            max_chars=256,
+        ),
+        description="Regression expectations evaluated from bounded Cayu evidence.",
+    )
+    case_id = _default_captured_case_id(validated_target_key, source.case_source())
+    case = EvalCaseSpec.create(
+        id=case_id,
+        suite_id=suite.id,
+        name=(
+            safe_source_label
+            if safe_source_label is not None
+            else f"Captured evaluation {case_id.removeprefix('case-')[:12]}"
+        ),
+        description="Historical evaluation derived from public-safe captured evidence.",
+        source=source.case_source(),
+        input=None,
+        assertions=(
+            RootStatusAssertionSpec(
+                id="root-status",
+                description="The root session should complete successfully.",
+                expected=SessionStatus.COMPLETED.value,
+            ),
+        ),
+    )
+    return CapturedEvaluationCandidateV1.create(
+        target_key=validated_target_key,
+        source=source,
+        evidence_policy=validated_policy,
+        pricing_profile=pricing_profile,
+        evidence=evidence,
+        suite=suite,
+        case=case,
+    )
+
+
+def score_captured_evaluation_candidate(
+    app: CayuApp,
+    trajectory: Trajectory,
+    candidate: CapturedEvaluationCandidateV1,
+    *,
+    target_key: str,
+    source_agent_name: str,
+    application_release_id: str,
+    pricing: PriceBook | None = None,
+    project_root: str | Path | None = None,
+) -> CapturedRunScoreV1:
+    """Score reviewed assertions solely against the retained evidence snapshot."""
+
+    if not isinstance(app, CayuApp):
+        raise TypeError("app must be a CayuApp.")
+    validated_trajectory = _validated_trajectory_for_promotion(trajectory)
+    _validate_eligible_tree(validated_trajectory)
+    validated_candidate = _validate_exact_model(
+        candidate,
+        CapturedEvaluationCandidateV1,
+        "candidate",
+    )
+    validated_target_key = _safe_portable_id(app, target_key, "target_key")
+    if validated_candidate.target_key != validated_target_key:
+        raise ValueError("Captured candidate target does not match the configured target.")
+    safe_source_agent_name = _safe_candidate_text(
+        app,
+        source_agent_name,
+        "source_agent_name",
+        max_chars=256,
+    )
+    session = validated_trajectory.session
+    if (
+        session is None
+        or session.status not in {SessionStatus.COMPLETED, SessionStatus.FAILED}
+        or session.agent_name != safe_source_agent_name
+        or validated_candidate.source.source_agent_name != safe_source_agent_name
+    ):
+        raise ValueError("Captured candidate source agent no longer matches the session.")
+    safe_release_id = _safe_candidate_text(
+        app,
+        application_release_id,
+        "application_release_id",
+        max_chars=256,
+    )
+    if validated_candidate.source.application_release_id != safe_release_id:
+        raise ValueError("Captured candidate release does not match the configured release.")
+    manifest = app.describe(project_root=project_root)
+    if (
+        validated_candidate.source.app_manifest_schema_version != manifest.schema_version
+        or validated_candidate.source.app_manifest_fingerprint != manifest.fingerprint
+    ):
+        raise ValueError("Captured candidate app manifest no longer matches the application.")
+    baseline_evidence = project_assertion_evidence_view(
+        app,
+        validated_trajectory,
+        evidence_policy=validated_candidate.evidence_policy,
+    )
+    if baseline_evidence != validated_candidate.evidence:
+        raise ValueError("Captured candidate evidence changed; build a new candidate.")
+
+    if pricing is None:
+        validated_pricing = None
+    else:
+        pricing_identity = _safe_pricing_profile_identity(
+            app,
+            pricing_profile_identity(pricing),
+        )
+        if validated_candidate.pricing_profile != pricing_identity:
+            raise ValueError("Captured candidate pricing profile no longer matches.")
+        validated_pricing = pricing
+    cost_currencies = tuple(
+        sorted(
+            {
+                assertion.currency
+                for assertion in validated_candidate.case.assertions
+                if type(assertion) is MaxEstimatedCostAssertionSpec
+            }
+        )
+    )
+    scored_evidence = (
+        baseline_evidence
+        if not cost_currencies
+        else project_assertion_evidence_view(
+            app,
+            validated_trajectory,
+            evidence_policy=validated_candidate.evidence_policy,
+            pricing=validated_pricing,
+            cost_currencies=cost_currencies,
+        )
+    )
+    internal_results = evaluate_assertion_specs(
+        validated_candidate.case.assertions,
+        scored_evidence,
+    )
+    published_results = tuple(
+        _published_assertion(spec, result)
+        for spec, result in zip(
+            validated_candidate.case.assertions,
+            internal_results,
+            strict=True,
+        )
+    )
+    return CapturedRunScoreV1.create(
+        candidate=validated_candidate,
+        evidence=scored_evidence,
+        assertions=published_results,
+    )
+
+
+def corpus_from_captured_evaluation_candidate(
+    candidate: CapturedEvaluationCandidateV1,
+) -> EvalCorpusDocument:
+    """Build the immutable captured-only corpus represented by a candidate."""
+
+    validated = _validate_exact_model(
+        candidate,
+        CapturedEvaluationCandidateV1,
+        "candidate",
+    )
+    return EvalCorpusDocument.create(
+        target_key=validated.target_key,
+        evidence_policy=validated.evidence_policy,
+        pricing_profile=validated.pricing_profile,
+        suites=(validated.suite,),
+        cases=(validated.case,),
+    )
+
+
+def export_captured_evaluation_corpus(
+    candidate: CapturedEvaluationCandidateV1,
+) -> bytes:
+    corpus = corpus_from_captured_evaluation_candidate(candidate)
+    return eval_corpus_to_json(corpus).encode("utf-8")
 
 
 def build_promotion_candidate(

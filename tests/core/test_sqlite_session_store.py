@@ -2728,8 +2728,8 @@ def test_sqlite_revision_forty_six_migrates_empty_transcript_database(tmp_path) 
     finally:
         connection.close()
 
-    assert revision == (47,)
-    assert version == (47,)
+    assert revision == (48,)
+    assert version == (48,)
     assert transcript_column == ("TEXT", 1)
     assert fts is not None
     assert tokenizer_configuration == (1, TRANSCRIPT_SEARCH_TOKENIZER_VERSION)
@@ -2897,6 +2897,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (45, 45),
         (46, 46),
         (47, 47),
+        (48, 48),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

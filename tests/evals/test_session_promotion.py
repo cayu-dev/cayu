@@ -44,12 +44,15 @@ from cayu import (
     TextPart,
     ToolResultPart,
     Trajectory,
+    build_captured_evaluation_candidate,
     build_promotion_candidate,
+    corpus_from_captured_evaluation_candidate,
     corpus_from_promotion_candidate,
     eval_corpus_from_json,
     export_promotion_corpus,
     file_attachment,
     promotable_run_input,
+    score_captured_evaluation_candidate,
     score_promotion_candidate,
     scripted_structured_output,
     session_usage_summary,
@@ -1233,6 +1236,56 @@ def test_runtime_attested_structured_output_is_ineligible_without_event_guessing
         trajectory,
         SessionPromotionErrorCode.STRUCTURED_OUTPUT_UNSUPPORTED,
     )
+
+    policy = EvaluationEvidencePolicySpec.standard()
+    candidate = build_captured_evaluation_candidate(
+        app,
+        trajectory,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="structured-release",
+        evidence_policy=policy,
+    )
+    assert candidate.case.input is None
+    score = score_captured_evaluation_candidate(
+        app,
+        trajectory,
+        candidate,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="structured-release",
+    )
+    assert score.status == "passed"
+    corpus = corpus_from_captured_evaluation_candidate(candidate)
+    assert corpus.cases[0].input is None
+
+
+def test_captured_failed_session_defaults_to_a_regression_to_fix():
+    async def scenario():
+        return await _run_trajectory(InMemorySessionStore(), fail=True)
+
+    app, trajectory = asyncio.run(scenario())
+    candidate = build_captured_evaluation_candidate(
+        app,
+        trajectory,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="failed-release",
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+    )
+    assertion = candidate.case.assertions[0]
+    assert isinstance(assertion, RootStatusAssertionSpec)
+    assert assertion.expected == SessionStatus.COMPLETED
+    assert candidate.warnings == ("source_run_failed",)
+    score = score_captured_evaluation_candidate(
+        app,
+        trajectory,
+        candidate,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="failed-release",
+    )
+    assert score.status == "failed"
 
 
 def test_promotion_redacts_input_before_returning_a_public_model():

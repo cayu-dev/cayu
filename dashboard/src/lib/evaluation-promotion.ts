@@ -1,10 +1,14 @@
 import type {
+  CapturedEvaluationCandidateV1,
+  CapturedEvaluationDraft,
+  CapturedEvaluationPreviewResponse,
   EvaluationPromotionDraft,
   EvaluationPromotionPreviewResponse,
   PromotionCandidateV1,
 } from "./generated/server-api"
 
 export type PromotionAssertion = EvaluationPromotionDraft["case"]["assertions"][number]
+export type CapturedEvaluationAssertion = CapturedEvaluationDraft["case"]["assertions"][number]
 // Promotion drafts are candidate-authored. Model judges require target-owned
 // execution authority and therefore cannot be created or selected here.
 export type PromotionAssertionKind = Exclude<NonNullable<PromotionAssertion["kind"]>, "model_judge">
@@ -45,11 +49,17 @@ export const PROMOTION_ASSERTION_LABELS: Record<PromotionAssertionKind, string> 
 export type PromotionDraftValidation =
   | { ok: true; draft: EvaluationPromotionDraft }
   | { ok: false; error: string }
+export type CapturedEvaluationDraftValidation =
+  | { ok: true; draft: CapturedEvaluationDraft }
+  | { ok: false; error: string }
 
 export function promotionDraftFromCandidate(
   candidate: PromotionCandidateV1,
   baselineRevision: string,
 ): EvaluationPromotionDraft {
+  if (candidate.case.input == null) {
+    throw new Error("A runnable promotion candidate must contain eval input.")
+  }
   return structuredClone({
     expected_baseline_revision: baselineRevision,
     suite: {
@@ -67,6 +77,69 @@ export function promotionDraftFromCandidate(
       assertions: candidate.case.assertions,
     },
   })
+}
+
+export function capturedEvaluationDraftFromCandidate(
+  candidate: CapturedEvaluationCandidateV1,
+  baselineRevision: string,
+): CapturedEvaluationDraft {
+  return structuredClone({
+    expected_baseline_revision: baselineRevision,
+    suite: {
+      id: candidate.suite.id,
+      name: candidate.suite.name,
+      description: candidate.suite.description ?? null,
+    },
+    case: {
+      id: candidate.case.id,
+      suite_id: candidate.case.suite_id,
+      name: candidate.case.name,
+      description: candidate.case.description ?? null,
+      assertions: candidate.case.assertions,
+    },
+  })
+}
+
+export function capturedEvaluationPreviewMatchesDraft(
+  preview: CapturedEvaluationPreviewResponse,
+  draft: CapturedEvaluationDraft,
+): boolean {
+  return (
+    JSON.stringify(
+      capturedEvaluationDraftFromCandidate(preview.candidate, preview.baseline_revision),
+    ) === JSON.stringify(draft)
+  )
+}
+
+export function validateCapturedEvaluationDraft(
+  draft: CapturedEvaluationDraft,
+): CapturedEvaluationDraftValidation {
+  try {
+    validateCapturedDraft(draft)
+    return { ok: true, draft }
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : "The captured evaluation is invalid.",
+    }
+  }
+}
+
+function validateCapturedDraft(draft: CapturedEvaluationDraft): void {
+  if (!SHA256_REVISION_PATTERN.test(draft.expected_baseline_revision)) {
+    throw new Error("Reload the captured preview before editing this evaluation.")
+  }
+  requirePortableId(draft.suite.id, "Suite ID")
+  requireBoundedCleanText(draft.suite.name, "Suite name", 256)
+  requireOptionalCleanText(draft.suite.description, "Suite description", 2_048)
+  requirePortableId(draft.case.id, "Case ID")
+  requirePortableId(draft.case.suite_id, "Case suite ID")
+  if (draft.case.suite_id !== draft.suite.id) {
+    throw new Error("Case suite ID must match the edited suite ID.")
+  }
+  requireBoundedCleanText(draft.case.name, "Case name", 256)
+  requireOptionalCleanText(draft.case.description, "Case description", 2_048)
+  validateAssertions(draft.case.assertions)
 }
 
 export function previewMatchesDraft(
@@ -130,7 +203,10 @@ function validateDraft(draft: EvaluationPromotionDraft): void {
     throw new Error("Eval input cannot exceed 262,144 total characters.")
   }
 
-  const assertions = draft.case.assertions
+  validateAssertions(draft.case.assertions)
+}
+
+function validateAssertions(assertions: readonly PromotionAssertion[]): void {
   if (assertions.length < 1 || assertions.length > 64) {
     throw new Error("An eval case must contain between 1 and 64 assertions.")
   }
@@ -235,6 +311,68 @@ export function createPromotionAssertion(
     case "max_estimated_cost":
       return { id, kind, maximum: "1", currency: "USD" }
   }
+}
+
+export function createCapturedEvaluationAssertion(
+  kind: PromotionAssertionKind,
+  existing: readonly PromotionAssertion[],
+  evidence: CapturedEvaluationCandidateV1["evidence"],
+): PromotionAssertion {
+  const assertion = createPromotionAssertion(kind, existing)
+  switch (assertion.kind) {
+    case "root_status":
+      return evidence.root_status === "failed" ? { ...assertion, expected: "failed" } : assertion
+    case "child_status": {
+      const expected = evidence.child_statuses.find(
+        (status): status is "completed" | "failed" => status === "completed" || status === "failed",
+      )
+      if (expected === undefined) return assertion
+      const count = evidence.child_statuses.filter((status) => status === expected).length
+      return { ...assertion, expected, min_count: count, max_count: count }
+    }
+    case "final_output_equals":
+    case "final_output_contains":
+      return evidence.final_output_state === "complete"
+        ? { ...assertion, expected: evidence.final_output }
+        : assertion
+    case "tool_called": {
+      const toolName = evidence.started_tool_names[0]
+      if (toolName === undefined) return assertion
+      const count = evidence.started_tool_names.filter((name) => name === toolName).length
+      return { ...assertion, tool_name: toolName, min_count: count, max_count: count }
+    }
+    case "tools_called_in_order":
+      return { ...assertion, tool_names: [...evidence.requested_tool_names] }
+    case "max_tool_calls":
+      return evidence.tool_calls_started == null
+        ? assertion
+        : { ...assertion, maximum: evidence.tool_calls_started }
+    case "max_model_steps":
+      return evidence.model_steps == null
+        ? assertion
+        : { ...assertion, maximum: evidence.model_steps }
+    case "usage_recorded": {
+      const totalTokens = safeEvidenceInteger(evidence.total_tokens)
+      return totalTokens == null ? assertion : { ...assertion, min_total_tokens: totalTokens }
+    }
+    case "max_total_tokens": {
+      const totalTokens = safeEvidenceInteger(evidence.total_tokens)
+      return totalTokens == null ? assertion : { ...assertion, maximum: totalTokens }
+    }
+    case "max_estimated_cost": {
+      const cost = evidence.costs[0]
+      return cost == null
+        ? assertion
+        : { ...assertion, maximum: cost.total_cost, currency: cost.currency }
+    }
+  }
+  throw new Error(`Unsupported captured assertion kind: ${String(kind)}`)
+}
+
+function safeEvidenceInteger(value: string | null | undefined): number | null {
+  if (value == null || !/^(0|[1-9]\d*)$/.test(value)) return null
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) ? parsed : null
 }
 
 function nextAssertionId(

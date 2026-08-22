@@ -2,6 +2,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { useNavigate, useSearch } from "@tanstack/react-router"
 import {
   Ban,
+  CheckCircle2,
   Database,
   Download,
   FileJson,
@@ -48,17 +49,21 @@ import {
   type EvalComparison,
   type EvalCorpusEntry,
   type EvalResult,
+  type EvalResultDetail,
   type EvalRun,
   type EvalStatus,
   type EvalTarget,
   fetchEvalCases,
   fetchEvalCorpora,
   fetchEvalResult,
+  fetchEvalResultDetail,
+  fetchEvalResults,
   fetchEvalRun,
   fetchEvalRuns,
   fetchEvalSuites,
   fetchEvalTargets,
   importEvalCorpus,
+  selectEvalBaseline,
 } from "@/lib/api"
 import { dashboardConfig } from "@/lib/config"
 import { dashboardCapabilityUnavailableText } from "@/lib/dashboard-capabilities"
@@ -96,6 +101,7 @@ export function EvalsPage() {
   const queryClient = useQueryClient()
   const readiness = useServerContract().capabilities.evals_readiness
   const catalogReady = readiness.catalog_read.state === "ready"
+  const resultsReady = readiness.captured_result_persistence.state === "ready"
   const targets = useQuery({
     queryKey: ["evals", "targets"],
     queryFn: ({ signal }) => fetchEvalTargets(signal),
@@ -115,6 +121,7 @@ export function EvalsPage() {
   const mutationUnavailable = dashboardCapabilityUnavailableText(mutateCapability)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const catalogTabRef = useRef<HTMLButtonElement>(null)
+  const resultsTabRef = useRef<HTMLButtonElement>(null)
   const runsTabRef = useRef<HTMLButtonElement>(null)
   const actionControllerRef = useRef<AbortController | null>(null)
   const [pendingAction, setPendingAction] = useState<string | null>(null)
@@ -187,42 +194,91 @@ export function EvalsPage() {
         "corpus",
         "suite",
         "run",
+        "result",
         "baseline",
         "status",
         "corpora_cursor",
         "suites_cursor",
         "cases_cursor",
         "runs_cursor",
+        "results_cursor",
       ),
       target: targetKey,
     }))
   const showCatalog = () =>
     updateSearch((current) => ({
-      ...evalsSearchWithout(current, "run", "baseline", "runs_cursor", "status"),
+      ...evalsSearchWithout(
+        current,
+        "run",
+        "result",
+        "baseline",
+        "runs_cursor",
+        "results_cursor",
+        "status",
+      ),
       tab: "catalog",
+    }))
+  const showResults = () =>
+    updateSearch((current) => ({
+      ...evalsSearchWithout(
+        current,
+        "suite",
+        "run",
+        "baseline",
+        "suites_cursor",
+        "cases_cursor",
+        "corpora_cursor",
+        "runs_cursor",
+        "status",
+      ),
+      tab: "results",
     }))
   const showRuns = () =>
     updateSearch((current) => ({
-      ...evalsSearchWithout(current, "suite", "suites_cursor", "cases_cursor", "corpora_cursor"),
+      ...evalsSearchWithout(
+        current,
+        "suite",
+        "result",
+        "suites_cursor",
+        "cases_cursor",
+        "corpora_cursor",
+        "results_cursor",
+      ),
       tab: "runs",
     }))
   const moveTabFocus = (event: KeyboardEvent<HTMLDivElement>) => {
-    const focusedTab = document.activeElement === runsTabRef.current ? "runs" : "catalog"
+    const focusedTab =
+      document.activeElement === runsTabRef.current
+        ? "runs"
+        : document.activeElement === resultsTabRef.current
+          ? "results"
+          : "catalog"
     const nextTab =
       event.key === "Home"
         ? "catalog"
         : event.key === "End"
           ? "runs"
-          : event.key === "ArrowLeft" || event.key === "ArrowRight"
-            ? focusedTab === "catalog"
-              ? "runs"
-              : "catalog"
-            : null
+          : event.key === "ArrowLeft"
+            ? focusedTab === "runs"
+              ? "results"
+              : focusedTab === "results"
+                ? "catalog"
+                : "runs"
+            : event.key === "ArrowRight"
+              ? focusedTab === "catalog"
+                ? "results"
+                : focusedTab === "results"
+                  ? "runs"
+                  : "catalog"
+              : null
     if (nextTab === null) return
     event.preventDefault()
     if (nextTab === "catalog") {
       catalogTabRef.current?.focus()
       void showCatalog()
+    } else if (nextTab === "results") {
+      resultsTabRef.current?.focus()
+      void showResults()
     } else {
       runsTabRef.current?.focus()
       void showRuns()
@@ -305,6 +361,19 @@ export function EvalsPage() {
           <Database /> Catalog
         </Button>
         <Button
+          ref={resultsTabRef}
+          id="evals-tab-results"
+          role="tab"
+          aria-controls="evals-panel-results"
+          aria-selected={activeTab === "results"}
+          tabIndex={activeTab === "results" ? 0 : -1}
+          variant="ghost"
+          className="rounded-b-none"
+          onClick={() => void showResults()}
+        >
+          <CheckCircle2 /> Results
+        </Button>
+        <Button
           ref={runsTabRef}
           id="evals-tab-runs"
           role="tab"
@@ -369,6 +438,36 @@ export function EvalsPage() {
                 runAction={runAction}
                 mutateEnabled={mutateCapability.enabled}
               />
+            )}
+          </div>
+          <div
+            id="evals-panel-results"
+            role="tabpanel"
+            aria-labelledby="evals-tab-results"
+            hidden={activeTab !== "results"}
+          >
+            {activeTab === "results" && resultsReady && (
+              <ResultsView
+                search={search}
+                targetKey={selectedTargetKey}
+                updateSearch={updateSearch}
+                pendingAction={pendingAction}
+                runAction={runAction}
+                mutateEnabled={mutateCapability.enabled}
+              />
+            )}
+            {activeTab === "results" && !resultsReady && (
+              <StateMessage
+                className="rounded-lg border border-border bg-muted/30 py-12"
+                role="status"
+              >
+                <div className="font-medium text-foreground">
+                  The evaluation result catalog is unavailable
+                </div>
+                <div className="mt-1">
+                  {evalsReadinessReasonText(readiness.captured_result_persistence)}
+                </div>
+              </StateMessage>
             )}
           </div>
           <div
@@ -876,6 +975,264 @@ function CatalogView({
           </>
         )}
       </div>
+    </div>
+  )
+}
+
+function ResultsView({
+  search,
+  targetKey,
+  updateSearch,
+  pendingAction,
+  runAction,
+  mutateEnabled,
+}: {
+  search: EvalsSearch
+  targetKey: string
+  updateSearch: UpdateEvalsSearch
+  pendingAction: string | null
+  runAction: (
+    name: string,
+    action: (signal: AbortSignal) => Promise<string | undefined>,
+  ) => Promise<void>
+  mutateEnabled: boolean
+}) {
+  const queryClient = useQueryClient()
+  const results = useQuery({
+    queryKey: ["evals", "results", targetKey, search.results_cursor],
+    queryFn: ({ signal }) =>
+      fetchEvalResults(
+        { target_key: targetKey, limit: PAGE_LIMIT, cursor: search.results_cursor },
+        signal,
+      ),
+  })
+  const detail = useQuery({
+    queryKey: ["evals", "result-detail", targetKey, search.result],
+    queryFn: ({ signal }) => fetchEvalResultDetail(search.result ?? "", signal),
+    enabled: search.result !== undefined,
+  })
+
+  const approveBaseline = (selected: EvalResultDetail) => {
+    if (pendingAction !== null || !mutateEnabled) return
+    const revision = selected.record.revision
+    void runAction(`baseline:${revision}`, async (signal) => {
+      await selectEvalBaseline(
+        revision,
+        {
+          result_revision: revision,
+          expected_generation: selected.baseline?.generation ?? 0,
+          operation_id: randomEvalOperationId(),
+        },
+        signal,
+      )
+      if (signal.aborted) return
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["evals", "result-detail", targetKey, revision],
+        }),
+        queryClient.invalidateQueries({ queryKey: ["evals", "results"] }),
+      ])
+      return `Approved result ${shortEvalIdentity(revision)} as the suite baseline.`
+    })
+  }
+
+  return (
+    <div className="grid min-w-0 gap-6 xl:grid-cols-[minmax(24rem,0.95fr)_minmax(0,1.3fr)]">
+      <DataCard
+        title="Evaluation results"
+        description={`${formatCount(results.data?.items.length)} immutable results on this page${search.results_cursor ? " · later page" : " · first page"}`}
+        actions={
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            disabled={results.isFetching}
+            onClick={() => void results.refetch()}
+          >
+            <RotateCcw className={results.isFetching ? "animate-spin" : undefined} /> Refresh
+          </Button>
+        }
+      >
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Result</TableHead>
+              <TableHead>Origin</TableHead>
+              <TableHead>Outcome</TableHead>
+              <TableHead>Created</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {results.data?.items.map((result) => (
+              <TableRow
+                key={result.revision}
+                data-state={search.result === result.revision ? "selected" : undefined}
+              >
+                <TableCell>
+                  <button
+                    type="button"
+                    className="max-w-44 truncate text-left font-mono text-xs text-primary hover:underline"
+                    title={result.revision}
+                    onClick={() =>
+                      updateSearch((current) => ({
+                        ...current,
+                        tab: "results",
+                        result: result.revision,
+                        corpus: result.corpus_revision,
+                      }))
+                    }
+                  >
+                    {shortEvalIdentity(result.revision)}
+                  </button>
+                  <div className="mt-1 max-w-44 truncate text-xs text-muted-foreground">
+                    {result.suite_id}
+                  </div>
+                </TableCell>
+                <TableCell>
+                  <Badge variant="outline">
+                    {result.origin === "captured_session" ? "Captured" : "Fresh"}
+                  </Badge>
+                  <div className="mt-1 max-w-40 truncate text-xs text-muted-foreground">
+                    {result.target.application_release_id}
+                  </div>
+                </TableCell>
+                <TableCell>
+                  <OutcomeBadge outcome={result.status} />
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    {formatScore(result.score)}
+                  </div>
+                </TableCell>
+                <TableCell>{formatDateTime(result.created_at)}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+        {results.isLoading ? (
+          <LoadingState label="Loading evaluation results..." />
+        ) : results.isError ? (
+          <QueryError
+            message="Could not load the evaluation result catalog."
+            retry={() => void results.refetch()}
+          />
+        ) : results.data?.items.length === 0 ? (
+          <StateMessage>
+            No results yet. Open a completed session and choose Evaluate to capture one.
+          </StateMessage>
+        ) : null}
+        <PageControls
+          scope="evaluation results"
+          cursor={search.results_cursor}
+          nextCursor={results.data?.next_cursor}
+          fetching={results.isFetching}
+          first={() =>
+            updateSearch((current) => evalsSearchWithout(current, "results_cursor", "result"))
+          }
+          next={(cursor) =>
+            updateSearch((current) => ({
+              ...evalsSearchWithout(current, "result"),
+              tab: "results",
+              results_cursor: cursor,
+            }))
+          }
+        />
+      </DataCard>
+
+      {!search.result ? (
+        <StateMessage className="rounded-lg border border-border bg-muted/30 py-16">
+          Select an immutable result to inspect its score and baseline status.
+        </StateMessage>
+      ) : detail.isLoading ? (
+        <LoadingState label="Loading evaluation result..." />
+      ) : detail.isError ? (
+        <DataCard title="Result unavailable">
+          <QueryError
+            message="Could not load the selected evaluation result."
+            retry={() => void detail.refetch()}
+          />
+        </DataCard>
+      ) : detail.data && detail.data.record.target.target_key !== targetKey ? (
+        <StateMessage className="rounded-lg border border-border bg-muted/30 py-16">
+          The selected result does not belong to this eval target.
+        </StateMessage>
+      ) : detail.data ? (
+        <CapturedResultInspector
+          detail={detail.data}
+          approving={pendingAction === `baseline:${detail.data.record.revision}`}
+          canMutate={mutateEnabled}
+          approve={() => approveBaseline(detail.data)}
+          openCorpus={() =>
+            updateSearch((current) => ({
+              ...evalsSearchWithout(current, "result", "results_cursor"),
+              tab: "catalog",
+              target: detail.data.record.target.target_key,
+              corpus: detail.data.record.corpus_revision,
+            }))
+          }
+        />
+      ) : null}
+    </div>
+  )
+}
+
+function CapturedResultInspector({
+  detail,
+  approving,
+  canMutate,
+  approve,
+  openCorpus,
+}: {
+  detail: EvalResultDetail
+  approving: boolean
+  canMutate: boolean
+  approve: () => void
+  openCorpus: () => void
+}) {
+  const selectedAsBaseline = detail.baseline?.result_revision === detail.record.revision
+  return (
+    <div className="min-w-0 space-y-6">
+      <DataCard
+        title={
+          <span className="flex items-center gap-2">
+            Result {shortEvalIdentity(detail.record.revision)}
+            <OutcomeBadge outcome={detail.record.status} />
+            {selectedAsBaseline && <Badge variant="secondary">Baseline</Badge>}
+          </span>
+        }
+        description={`${detail.record.origin === "captured_session" ? "Captured session" : "Fresh execution"} · release ${detail.record.target.application_release_id}`}
+        actions={
+          <>
+            <Button type="button" size="sm" variant="outline" onClick={openCorpus}>
+              <Database /> Open corpus
+            </Button>
+            {!selectedAsBaseline && (
+              <Button type="button" size="sm" disabled={!canMutate || approving} onClick={approve}>
+                {approving ? <LoaderCircle className="animate-spin" /> : <CheckCircle2 />}
+                {approving ? "Approving..." : "Approve baseline"}
+              </Button>
+            )}
+          </>
+        }
+      >
+        <div className="grid gap-4 p-4 text-sm sm:grid-cols-2 lg:grid-cols-4">
+          <RunFact label="Score" value={formatScore(detail.record.score)} />
+          <RunFact label="Suite" value={detail.record.suite_id} />
+          <RunFact label="Corpus" value={shortEvalIdentity(detail.record.corpus_revision)} />
+          <RunFact label="Created" value={formatDateTime(detail.record.created_at)} />
+        </div>
+        {detail.baseline && (
+          <div className="border-t border-border px-4 py-3 text-xs text-muted-foreground">
+            Baseline generation {formatCount(detail.baseline.generation)} · selected by{" "}
+            {detail.baseline.updated_by} · {formatDateTime(detail.baseline.updated_at)}
+          </div>
+        )}
+      </DataCard>
+      <DataCard
+        title="Immutable score evidence"
+        description="Public-safe result content persisted with the corpus revision."
+        contentClassName="p-4"
+      >
+        <PayloadViewer value={detail.result} maxHeight="max-h-[36rem]" />
+      </DataCard>
     </div>
   )
 }
@@ -1785,4 +2142,10 @@ function downloadBlob(blob: Blob, filename: string): void {
   anchor.click()
   anchor.remove()
   window.setTimeout(() => URL.revokeObjectURL(url), 0)
+}
+
+function randomEvalOperationId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32))
+  const digest = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")
+  return `sha256:${digest}`
 }

@@ -2172,6 +2172,36 @@ _MIGRATION_STEPS: dict[int, str] = {
                 target_key, corpus_revision, suite_id, resulting_generation
             );
     """,
+    48: """
+        ALTER TABLE cayu_eval_cases RENAME TO cayu_eval_cases_revision_47;
+        DROP INDEX idx_cayu_eval_cases_suite;
+        CREATE TABLE cayu_eval_cases (
+            corpus_revision TEXT NOT NULL,
+            case_id TEXT COLLATE BINARY NOT NULL,
+            case_revision TEXT NOT NULL,
+            suite_id TEXT COLLATE BINARY NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            message_count INTEGER NOT NULL
+                CHECK (message_count >= 0 AND message_count <= 16),
+            assertion_count INTEGER NOT NULL
+                CHECK (assertion_count >= 1 AND assertion_count <= 64),
+            PRIMARY KEY (corpus_revision, case_id),
+            FOREIGN KEY (corpus_revision, suite_id)
+                REFERENCES cayu_eval_suites(corpus_revision, suite_id) ON DELETE CASCADE
+        );
+        INSERT INTO cayu_eval_cases (
+            corpus_revision, case_id, case_revision, suite_id, name,
+            description, message_count, assertion_count
+        )
+        SELECT
+            corpus_revision, case_id, case_revision, suite_id, name,
+            description, message_count, assertion_count
+        FROM cayu_eval_cases_revision_47;
+        DROP TABLE cayu_eval_cases_revision_47;
+        CREATE INDEX idx_cayu_eval_cases_suite
+            ON cayu_eval_cases(corpus_revision, suite_id, case_id ASC);
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -3297,6 +3327,8 @@ def reconcile_schema(
         _validate_revision_46_transcript_search_schema(connection)
     if app_min_supported >= 47:
         _validate_eval_result_baseline_schema(connection)
+    if app_min_supported >= 48:
+        _validate_captured_eval_case_schema(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -4418,6 +4450,19 @@ def _validate_eval_result_baseline_schema(connection: sqlite3.Connection) -> Non
             )
 
 
+def _validate_captured_eval_case_schema(connection: sqlite3.Connection) -> None:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cayu_eval_cases'"
+    ).fetchone()
+    normalized = "" if row is None or row[0] is None else "".join(str(row[0]).lower().split())
+    if "check(message_count>=0andmessage_count<=16)" not in normalized:
+        raise RuntimeError(
+            "SQLite schema object 'cayu_eval_cases.message_count' conflicts with Cayu's "
+            "revision-48 captured-evaluation contract. Run `cayu storage migrate` or "
+            "restore the database from a known-good backup."
+        )
+
+
 def initialize_schema(connection: sqlite3.Connection) -> None:
     reconcile_schema(connection, schema.SchemaMode.CREATE)
 
@@ -4697,6 +4742,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_revision_46_transcript_search_schema(connection)
         if rev.revision == 47:
             _validate_eval_result_baseline_schema(connection)
+        if rev.revision == 48:
+            _validate_captured_eval_case_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

@@ -4238,7 +4238,11 @@ version 15 adds the bounded retry-series projection to task list/detail response
 Its cumulative and remaining token counters use the same lossless decimal-string
 representation as aggregate counters. Server contract version 16 adds exact
 hosted-tool usage counters and hosted web-search pricing evidence to usage and
-cost projections. Clients generated against contract version 1 through 15 must
+cost projections. Server contract version 17 adds automatic project-owned Evals
+storage and target discovery. Server contract version 18 adds captured-session
+preview/save/export, the target-scoped immutable result catalog, actor-attributed
+baseline selection, and explicit captured-result store readiness. Clients
+generated against contract version 1 through 17 must
 regenerate from the current OpenAPI document.
 Version 1 and 2 clients must also treat all aggregate
 counter fields as strings. Independently hosted dashboards must not render

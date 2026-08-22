@@ -538,7 +538,7 @@ class EvalCaseCatalogEntry(_EvalStoreModel):
     suite_id: StrictStr
     name: StrictStr
     description: StrictStr | None = None
-    message_count: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_MESSAGES_PER_CASE)
+    message_count: StrictInt = Field(ge=0, le=EVAL_CORPUS_MAX_MESSAGES_PER_CASE)
     assertion_count: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE)
 
     @field_validator("corpus_revision", "revision")
@@ -903,6 +903,70 @@ class EvalResultRecord(_EvalStoreModel):
         return self
 
 
+class EvalResultQuery(_EvalStoreModel):
+    """Bounded target-scoped immutable result catalog query."""
+
+    target_key: StrictStr
+    origin: EvalResultOrigin | None = None
+    cursor: StrictStr | None = None
+    limit: StrictInt = Field(
+        default=EVAL_STORE_DEFAULT_PAGE_SIZE,
+        ge=1,
+        le=EVAL_STORE_MAX_PAGE_SIZE,
+    )
+    max_result_bytes: StrictInt = Field(
+        default=EVAL_STORE_DEFAULT_PAGE_BYTES,
+        ge=1_024,
+        le=EVAL_STORE_MAX_PAGE_BYTES,
+    )
+
+    @field_validator("target_key")
+    @classmethod
+    def validate_target_key(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("cursor")
+    @classmethod
+    def validate_cursor(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_cursor(value, info.field_name)
+
+
+class EvalResultPage(_EvalStoreModel):
+    items: tuple[EvalResultRecord, ...] = Field(max_length=EVAL_STORE_MAX_PAGE_SIZE)
+    next_cursor: StrictStr | None = None
+    has_more: StrictBool = False
+
+    @model_validator(mode="after")
+    def validate_page(self) -> EvalResultPage:
+        _validate_page_boundary(self.items, self.next_cursor, self.has_more)
+        if len({item.revision for item in self.items}) != len(self.items):
+            raise ValueError("Eval result page contains duplicate revisions.")
+        expected = list(self.items)
+        expected.sort(key=lambda item: item.revision)
+        expected.sort(key=lambda item: item.created_at, reverse=True)
+        if list(self.items) != expected:
+            raise ValueError("Eval result page is not in keyset order.")
+        if self.has_more:
+            assert self.next_cursor is not None
+            timestamp, revision, target_key, origin = _decode_cursor(
+                self.next_cursor,
+                "results",
+                ("created_at", "revision", "target_key", "origin"),
+            )
+            if (timestamp, revision) != (
+                self.items[-1].created_at.isoformat(),
+                self.items[-1].revision,
+            ):
+                raise ValueError("Eval result cursor does not follow its last item.")
+            if any(item.target.target_key != target_key for item in self.items):
+                raise ValueError("Eval result cursor target filter does not match its items.")
+            if origin and any(str(item.origin) != origin for item in self.items):
+                raise ValueError("Eval result cursor origin filter does not match its items.")
+        return self
+
+
 class EvalBaselineKey(_EvalStoreModel):
     """Stable scope of one explicit baseline pointer."""
 
@@ -941,7 +1005,7 @@ class EvalBaselineUpdate(_EvalStoreModel):
         return _bounded_durable_text(
             value,
             info.field_name,
-            max_chars=256,
+            max_chars=512,
             nonblank=True,
             clean=True,
         )
@@ -1142,6 +1206,40 @@ def _run_cursor(record: EvalRunRecord, query: EvalRunQuery) -> str:
     )
 
 
+def _result_cursor(record: EvalResultRecord, query: EvalResultQuery) -> str:
+    return _encode_cursor(
+        "results",
+        {
+            "created_at": record.created_at.isoformat(),
+            "revision": record.revision,
+            "target_key": query.target_key,
+            "origin": "" if query.origin is None else str(query.origin),
+        },
+    )
+
+
+def decode_result_cursor(
+    cursor: str,
+    target_key: str,
+    origin: EvalResultOrigin | None,
+) -> tuple[datetime, str]:
+    timestamp, revision, cursor_target_key, cursor_origin = _decode_cursor(
+        cursor,
+        "results",
+        ("created_at", "revision", "target_key", "origin"),
+    )
+    if cursor_target_key != target_key or cursor_origin != ("" if origin is None else str(origin)):
+        raise ValueError("Eval-store result cursor does not match this query.")
+    try:
+        created_at = datetime.fromisoformat(timestamp)
+    except ValueError as exc:
+        raise ValueError("Invalid eval-store result cursor timestamp.") from exc
+    return _aware_utc(created_at, "cursor created_at"), _sha256_revision(
+        revision,
+        "cursor revision",
+    )
+
+
 def decode_run_cursor(
     cursor: str,
     target_key: str | None,
@@ -1228,7 +1326,7 @@ def case_catalog_entries(corpus: EvalCorpusDocument) -> tuple[EvalCaseCatalogEnt
             suite_id=case.suite_id,
             name=case.name,
             description=case.description,
-            message_count=len(case.input.messages),
+            message_count=0 if case.input is None else len(case.input.messages),
             assertion_count=len(case.assertions),
         )
         for case in validated.cases
@@ -1274,6 +1372,10 @@ def validate_run_request_for_corpus(
         raise EvalRunAdmissionConflict(f"Eval suite not found: {request.suite_id}")
     if request.suite_revision != suite.revision:
         raise EvalRunAdmissionConflict("Eval run suite revision does not match its corpus.")
+    if any(case.suite_id == request.suite_id and case.input is None for case in corpus.cases):
+        raise EvalRunAdmissionConflict(
+            "Captured-only eval cases cannot run until runnable input is authored."
+        )
 
 
 def validate_result_for_run(
@@ -1542,6 +1644,12 @@ class EvalStore(ABC):
 
         del revision
         raise NotImplementedError("Origin-aware eval result reads are not supported.")
+
+    async def list_results(self, query: EvalResultQuery) -> EvalResultPage:
+        """List target-scoped immutable result metadata in keyset order."""
+
+        del query
+        raise NotImplementedError("Origin-aware eval result catalogs are not supported.")
 
     async def set_baseline(
         self,
@@ -2158,6 +2266,32 @@ class InMemoryEvalStore(EvalStore):
             state = self._results.get(revision)
             return None if state is None else state.record.model_copy(deep=True)
 
+    async def list_results(self, query: EvalResultQuery) -> EvalResultPage:
+        query = _exact_model(query, EvalResultQuery, "query")
+        boundary = (
+            decode_result_cursor(query.cursor, query.target_key, query.origin)
+            if query.cursor is not None
+            else None
+        )
+        async with self._lock:
+            records = [
+                state.record.model_copy(deep=True)
+                for state in self._results.values()
+                if state.record.target.target_key == query.target_key
+                and (query.origin is None or state.record.origin is query.origin)
+            ]
+            records.sort(key=lambda item: item.revision)
+            records.sort(key=lambda item: item.created_at, reverse=True)
+            if boundary is not None:
+                created_at, revision = boundary
+                records = [
+                    item
+                    for item in records
+                    if item.created_at < created_at
+                    or (item.created_at == created_at and item.revision > revision)
+                ]
+            return _bounded_result_page(records, query)
+
     async def set_baseline(
         self,
         update: EvalBaselineUpdate,
@@ -2431,6 +2565,19 @@ def _bounded_run_page(items: list[EvalRunRecord], query: EvalRunQuery) -> EvalRu
     return EvalRunPage(items=retained, next_cursor=next_cursor, has_more=has_more)
 
 
+def _bounded_result_page(
+    items: list[EvalResultRecord],
+    query: EvalResultQuery,
+) -> EvalResultPage:
+    retained, next_cursor, has_more = _bounded_page(
+        items,
+        limit=query.limit,
+        max_bytes=query.max_result_bytes,
+        cursor=lambda item: _result_cursor(item, query),
+    )
+    return EvalResultPage(items=retained, next_cursor=next_cursor, has_more=has_more)
+
+
 __all__ = [
     "EVAL_STORE_DEFAULT_PAGE_BYTES",
     "EVAL_STORE_DEFAULT_PAGE_SIZE",
@@ -2448,6 +2595,8 @@ __all__ = [
     "EvalCorpusCatalogEntry",
     "EvalCorpusCatalogPage",
     "EvalCorpusConflict",
+    "EvalResultPage",
+    "EvalResultQuery",
     "EvalRunAdmissionConflict",
     "EvalRunClaim",
     "EvalRunClaimLost",

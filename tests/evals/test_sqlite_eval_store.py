@@ -95,7 +95,7 @@ def test_sqlite_eval_store_shared_conformance(tmp_path) -> None:
     asyncio.run(exercise())
 
 
-def test_sqlite_eval_store_creates_revision_forty_seven_schema(tmp_path) -> None:
+def test_sqlite_eval_store_creates_revision_forty_eight_schema(tmp_path) -> None:
     path = tmp_path / "evals.db"
 
     async def initialize() -> None:
@@ -105,8 +105,12 @@ def test_sqlite_eval_store_creates_revision_forty_seven_schema(tmp_path) -> None
     asyncio.run(initialize())
     connection = sqlite3.connect(path)
     try:
-        revision = connection.execute(
-            "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 47"
+        revisions = connection.execute(
+            "SELECT revision, kind, compatible_from FROM cayu_schema_migrations "
+            "WHERE revision IN (47, 48) ORDER BY revision"
+        ).fetchall()
+        case_table = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cayu_eval_cases'"
         ).fetchone()
         tables = {
             row[0]
@@ -125,7 +129,10 @@ def test_sqlite_eval_store_creates_revision_forty_seven_schema(tmp_path) -> None
         }
     finally:
         connection.close()
-    assert revision == ("breaking", 47)
+    assert revisions == [(47, "breaking", 47), (48, "breaking", 48)]
+    assert case_table is not None
+    normalized_case_table = "".join(case_table[0].lower().split())
+    assert "check(message_count>=0andmessage_count<=16)" in normalized_case_table
     assert tables == {
         "cayu_eval_baseline_mutations",
         "cayu_eval_baselines",
@@ -143,6 +150,87 @@ def test_sqlite_eval_store_creates_revision_forty_seven_schema(tmp_path) -> None
         "idx_cayu_eval_runs_target_catalog",
         "idx_cayu_eval_runs_target_status_claim",
     }
+
+
+def test_sqlite_revision_forty_eight_preserves_cases_and_admits_zero_messages(
+    tmp_path,
+) -> None:
+    path = tmp_path / "evals.db"
+    corpus = _corpus(trials=1)
+
+    async def initialize_revision_forty_eight() -> None:
+        store = SQLiteEvalStore(path)
+        try:
+            await _save_corpus(store, corpus)
+        finally:
+            await store.close()
+
+    asyncio.run(initialize_revision_forty_eight())
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            ALTER TABLE cayu_eval_cases RENAME TO cayu_eval_cases_revision_48;
+            DROP INDEX idx_cayu_eval_cases_suite;
+            CREATE TABLE cayu_eval_cases (
+                corpus_revision TEXT NOT NULL,
+                case_id TEXT COLLATE BINARY NOT NULL,
+                case_revision TEXT NOT NULL,
+                suite_id TEXT COLLATE BINARY NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                message_count INTEGER NOT NULL
+                    CHECK (message_count >= 1 AND message_count <= 16),
+                assertion_count INTEGER NOT NULL
+                    CHECK (assertion_count >= 1 AND assertion_count <= 64),
+                PRIMARY KEY (corpus_revision, case_id),
+                FOREIGN KEY (corpus_revision, suite_id)
+                    REFERENCES cayu_eval_suites(corpus_revision, suite_id) ON DELETE CASCADE
+            );
+            INSERT INTO cayu_eval_cases
+            SELECT * FROM cayu_eval_cases_revision_48;
+            DROP TABLE cayu_eval_cases_revision_48;
+            CREATE INDEX idx_cayu_eval_cases_suite
+                ON cayu_eval_cases(corpus_revision, suite_id, case_id ASC);
+            DELETE FROM cayu_schema_migrations WHERE revision = 48;
+            PRAGMA user_version = 47;
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    async def migrate() -> None:
+        store = SQLiteEvalStore(path, schema_mode=SchemaMode.MIGRATE)
+        try:
+            assert await store.load_corpus(corpus.revision) == corpus
+        finally:
+            await store.close()
+
+    asyncio.run(migrate())
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute(
+            "SELECT message_count FROM cayu_eval_cases WHERE corpus_revision = ? AND case_id = ?",
+            (corpus.revision, corpus.cases[0].id),
+        ).fetchone() == (len(corpus.cases[0].input.messages),)
+        connection.execute(
+            """
+            INSERT INTO cayu_eval_cases (
+                corpus_revision, case_id, case_revision, suite_id, name,
+                description, message_count, assertion_count
+            ) VALUES (?, ?, ?, ?, ?, NULL, 0, 1)
+            """,
+            (
+                corpus.revision,
+                "captured-contract-check",
+                "sha256:" + "f" * 64,
+                corpus.suites[0].id,
+                "Captured contract check",
+            ),
+        )
+    finally:
+        connection.close()
 
 
 def test_sqlite_eval_store_is_restart_durable_and_idempotent(tmp_path) -> None:
@@ -235,7 +323,8 @@ def test_sqlite_revision_forty_seven_indexes_existing_fresh_results(tmp_path) ->
             DROP TABLE cayu_eval_baseline_mutations;
             DROP TABLE cayu_eval_baselines;
             DROP TABLE cayu_eval_result_records;
-            DELETE FROM cayu_schema_migrations WHERE revision = 47;
+            DELETE FROM cayu_schema_migrations WHERE revision >= 47;
+            PRAGMA user_version = 46;
             """
         )
         connection.commit()

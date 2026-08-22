@@ -1161,8 +1161,10 @@ async def _run_browser_contract(
             "manual_mutation_reobservation",
             "sessions_list",
             "session_detail",
-            "evaluation_promotion",
-            "eval_catalog_save_and_download",
+            "captured_evaluation_preview_and_assertion_authoring",
+            "captured_result_save_and_baseline",
+            "eval_result_catalog_navigation",
+            "eval_catalog_import_and_download",
             "eval_durable_launch_and_cancellation",
             "eval_result_inspection_and_reports",
             "eval_compatible_comparison",
@@ -1301,7 +1303,7 @@ async def _exercise_dashboard(
     await expect(include_thinking).to_be_checked()
     await expect(thinking_payload).to_be_visible()
     await _exercise_existing_session_mutations(page, base_url, provider)
-    await _exercise_evaluation_promotion(
+    await _exercise_captured_evaluation(
         page,
         base_url,
         provider,
@@ -1316,7 +1318,7 @@ async def _exercise_dashboard(
     )
 
 
-async def _exercise_evaluation_promotion(
+async def _exercise_captured_evaluation(
     page: Page,
     base_url: str,
     provider: DashboardContractProvider,
@@ -1326,15 +1328,15 @@ async def _exercise_evaluation_promotion(
         f"{base_url}/cayu/sessions/{WORKFLOW_ACTIVE_SESSION_ID}",
         wait_until="networkidle",
     )
-    await expect(page.get_by_test_id("promote-to-eval")).to_have_count(0)
+    await expect(page.get_by_test_id("evaluate-session")).to_have_count(0)
 
     await page.goto(
         f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}",
         wait_until="networkidle",
     )
-    promote = page.get_by_test_id("promote-to-eval")
-    await expect(promote).to_be_visible()
-    await promote.focus()
+    evaluate = page.get_by_test_id("evaluate-session")
+    await expect(evaluate).to_be_visible()
+    await evaluate.focus()
     await page.keyboard.press("Enter")
 
     sheet = page.get_by_test_id("promotion-sheet")
@@ -1348,6 +1350,8 @@ async def _exercise_evaluation_promotion(
     await expect(export).to_be_enabled()
     case_name = sheet.get_by_label("Case name", exact=True)
     await case_name.fill("Captured dashboard regression")
+    await sheet.get_by_label("Assertion quick-add type").select_option("final_output_contains")
+    await sheet.get_by_role("button", name="Add observed", exact=True).click()
     await expect(export).to_be_disabled()
     await expect(
         sheet.get_by_text("Edit detected. Preview again before export.", exact=True)
@@ -1364,40 +1368,77 @@ async def _exercise_evaluation_promotion(
     download = await download_info.value
     require_equal(
         download.suggested_filename,
-        "dashboard.regressions.eval.json",
-        "promotion export must retain the server-owned portable target filename",
+        "dashboard.regressions-captured.eval.json",
+        "captured export must retain the server-owned portable target filename",
     )
     download_path = await download.path()
     require(download_path is not None, "promotion export must produce a browser download")
-    corpus = json.loads(Path(download_path).read_text(encoding="utf-8"))
+    captured_corpus = json.loads(Path(download_path).read_text(encoding="utf-8"))
     require_equal(
-        corpus["target_key"],
+        captured_corpus["target_key"],
         "dashboard.regressions",
-        "promotion export must retain the configured target key",
+        "captured export must retain the configured target key",
     )
     require_equal(
-        corpus["cases"][0]["name"],
+        captured_corpus["cases"][0]["name"],
         "Captured dashboard regression",
-        "promotion export must contain the exact rescored case edit",
+        "captured export must contain the exact rescored case edit",
+    )
+    require_equal(
+        captured_corpus["cases"][0]["input"],
+        None,
+        "captured export must not invent runnable session input",
     )
     require(
-        PROMOTION_SESSION_ID not in json.dumps(corpus, sort_keys=True),
-        "promotion export must not disclose its source session identity",
+        PROMOTION_SESSION_ID not in json.dumps(captured_corpus, sort_keys=True),
+        "captured export must not disclose its source session identity",
     )
 
     save = sheet.get_by_test_id("promotion-save")
     await expect(save).to_be_enabled()
     await save.click()
-    await expect(sheet.get_by_text(re.compile(r"Saved corpus .* to Evals\."))).to_be_visible()
+    await expect(sheet.get_by_text(re.compile(r"Saved result .* to Evals\."))).to_be_visible()
+    await sheet.get_by_role("button", name="Approve baseline", exact=True).click()
+    await expect(sheet.get_by_text("Baseline approved", exact=True)).to_be_visible()
     await sheet.get_by_role("link", name="Open Evals").click()
 
     await expect(page).to_have_url(re.compile(r"/cayu/evals\?"))
     await expect(page.get_by_role("heading", name="Evals")).to_be_visible()
     await expect(page.locator("#evals-panel-catalog")).to_have_count(1)
+    await expect(page.locator("#evals-panel-results")).to_have_count(1)
     await expect(page.locator("#evals-panel-runs")).to_have_count(1)
+    await expect(page.get_by_role("tab", name="Results", exact=True)).to_have_attribute(
+        "aria-selected", "true"
+    )
+    await expect(page.get_by_text("Immutable score evidence", exact=True)).to_be_visible()
+    await expect(page.get_by_text("Baseline", exact=True)).to_be_visible()
+    await page.get_by_role("button", name="Open corpus", exact=True).click()
+
+    runnable_preview_response = await page.request.post(
+        f"{base_url}/api/evals/promotion/sessions/{PROMOTION_SESSION_ID}/preview",
+        data={},
+    )
+    require_equal(
+        runnable_preview_response.status,
+        200,
+        "the compatibility promotion endpoint must still build a runnable corpus candidate",
+    )
+    runnable_candidate = (await runnable_preview_response.json())["candidate"]
+    runnable_export_response = await page.request.post(
+        f"{base_url}/api/evals/promotion/sessions/{PROMOTION_SESSION_ID}/export",
+        data={
+            "expected_candidate_revision": runnable_candidate["revision"],
+            "candidate": runnable_candidate,
+        },
+    )
+    require_equal(
+        runnable_export_response.status,
+        200,
+        "the compatibility promotion endpoint must export its runnable corpus",
+    )
+    corpus = await runnable_export_response.json()
     suite_name = corpus["suites"][0]["name"]
     suite_id = corpus["suites"][0]["id"]
-    await expect(page.get_by_role("button", name=suite_name, exact=True)).to_be_visible()
 
     await page.get_by_test_id("eval-import-file").set_input_files(
         {
@@ -1444,7 +1485,7 @@ async def _exercise_evaluation_promotion(
         catalog_tab = page.get_by_role("tab", name="Catalog", exact=True)
         await runs_tab.focus()
         if tab_keyboard_contract_checked:
-            await page.keyboard.press("ArrowLeft")
+            await page.keyboard.press("Home")
             await expect(catalog_tab).to_have_attribute("aria-selected", "true")
             await expect(page.get_by_role("button", name=suite_name, exact=True)).to_be_visible()
             await page.wait_for_load_state("networkidle")
@@ -1548,7 +1589,7 @@ async def _exercise_evaluation_promotion(
     await expect(page.get_by_text("These runs are comparable.", exact=True)).to_be_visible()
     await expect(page.get_by_text("No compatible-result regressions.", exact=True)).to_be_visible()
     await _exercise_local_eval_acceptance(
-        corpus_path=Path(download_path),
+        corpus=corpus,
         dashboard_result_path=Path(json_result_path),
     )
 
@@ -1636,7 +1677,7 @@ async def _exercise_evaluation_promotion(
 
 async def _exercise_local_eval_acceptance(
     *,
-    corpus_path: Path,
+    corpus: dict[str, object],
     dashboard_result_path: Path,
 ) -> None:
     """Prove that dashboard exports are the exact local reporting and CI inputs."""
@@ -1665,6 +1706,8 @@ async def _exercise_local_eval_acceptance(
 
     with tempfile.TemporaryDirectory(prefix="cayu-evals-local-acceptance-") as temporary:
         output_root = Path(temporary)
+        corpus_path = output_root / "dashboard-runnable.eval.json"
+        corpus_path.write_text(json.dumps(corpus, sort_keys=True), encoding="utf-8")
         inspection_path = output_root / "corpus-inspection.json"
         local_result_path = output_root / "local-result.json"
         local_report_path = output_root / "local-report.html"

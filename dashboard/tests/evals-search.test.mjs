@@ -20,6 +20,8 @@ test("eval search accepts only bounded known values", () => {
       baseline: "eval-0",
       status: "completed",
       corpora_cursor: "next-corpus",
+      result: CORPUS_REVISION,
+      results_cursor: "next-result",
       unknown: "ignored",
     }),
     {
@@ -31,6 +33,8 @@ test("eval search accepts only bounded known values", () => {
       baseline: "eval-0",
       status: "completed",
       corpora_cursor: "next-corpus",
+      result: CORPUS_REVISION,
+      results_cursor: "next-result",
     },
   )
 })
@@ -84,4 +88,22 @@ test("eval search dependencies can be reset without mutating the current locatio
     corpus: "corpus-1",
   })
   assert.equal(current.suite, "suite-1")
+})
+
+test("eval result links retain only bounded result catalog state", () => {
+  assert.deepEqual(
+    validateEvalsSearch({
+      tab: "results",
+      target: "eval.target",
+      result: CORPUS_REVISION,
+      results_cursor: "next-result-page",
+    }),
+    {
+      tab: "results",
+      target: "eval.target",
+      result: CORPUS_REVISION,
+      results_cursor: "next-result-page",
+    },
+  )
+  assert.deepEqual(validateEvalsSearch({ result: "sha256:short", results_cursor: "+" }), {})
 })

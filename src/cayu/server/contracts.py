@@ -38,11 +38,21 @@ from cayu.evals.execution import (
 )
 from cayu.evals.execution_comparison import CorpusExecutionComparison
 from cayu.evals.promotion import (
+    CAPTURED_EVALUATION_CANDIDATE_MAX_BYTES,
     PROMOTION_CANDIDATE_MAX_BYTES,
+    CapturedEvaluationCandidateV1,
     CapturedRunScoreV1,
     PromotionCandidateV1,
 )
-from cayu.evals.store import EVAL_STORE_MAX_CLAIM_TARGETS, EvalRunRecord, EvalRunStatus
+from cayu.evals.results import CapturedEvaluationResultV1
+from cayu.evals.store import (
+    EVAL_STORE_MAX_CLAIM_TARGETS,
+    EvalBaselineMutationRecord,
+    EvalBaselineRecord,
+    EvalResultRecord,
+    EvalRunRecord,
+    EvalRunStatus,
+)
 from cayu.runtime.aggregates import (
     AggregateAccuracy,
     AggregateCount,
@@ -118,6 +128,7 @@ MAX_CONTROL_PLANE_METADATA_NESTING = 32
 MAX_CONTROL_PLANE_PROMPT_BYTES = 64 * 1024
 MAX_CONTROL_PLANE_REQUEST_BYTES = 1024 * 1024
 MAX_EVALUATION_PROMOTION_REQUEST_BYTES = PROMOTION_CANDIDATE_MAX_BYTES + (64 * 1024)
+MAX_CAPTURED_EVALUATION_REQUEST_BYTES = CAPTURED_EVALUATION_CANDIDATE_MAX_BYTES + (64 * 1024)
 MAX_EVALS_REQUEST_BYTES = EVAL_CORPUS_MAX_BYTES + (64 * 1024)
 MAX_EXECUTION_TOPOLOGY_EDGES = 1500
 MAX_EVAL_TARGETS = EVAL_STORE_MAX_CLAIM_TARGETS
@@ -1138,6 +1149,110 @@ EVALUATION_PROMOTION_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
     404: {"description": "The requested source session does not exist."},
     409: {"description": "The source is ineligible, changed, or no longer matches the preview."},
     413: {"description": "The encoded promotion request or bounded evidence exceeds its limit."},
+}
+
+
+class CapturedEvaluationSuiteDraft(ApiBaseModel):
+    """Operator-editable suite identity for one captured evaluation."""
+
+    id: PromotionPortableId
+    name: StrictStr = Field(min_length=1, max_length=256)
+    description: StrictStr | None = Field(default=None, min_length=1, max_length=2_048)
+
+
+class CapturedEvaluationCaseDraft(ApiBaseModel):
+    """Operator-editable expectation set without runnable input."""
+
+    id: PromotionPortableId
+    suite_id: PromotionPortableId
+    name: StrictStr = Field(min_length=1, max_length=256)
+    description: StrictStr | None = Field(default=None, min_length=1, max_length=2_048)
+    assertions: tuple[AssertionSpec, ...] = Field(
+        min_length=1,
+        max_length=EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
+    )
+
+
+class CapturedEvaluationDraft(ApiBaseModel):
+    """Editable fields bound to one server-owned captured-evidence baseline."""
+
+    expected_baseline_revision: EvalRevision
+    suite: CapturedEvaluationSuiteDraft
+    case: CapturedEvaluationCaseDraft
+
+
+class CapturedEvaluationPreviewRequest(ApiBaseModel):
+    draft: CapturedEvaluationDraft | None = None
+
+
+class CapturedEvaluationConversion(ApiBaseModel):
+    """Independent corpus-v1 conversion availability for this source session."""
+
+    available: StrictBool
+    reason_code: StrictStr | None = Field(default=None, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> CapturedEvaluationConversion:
+        if self.available == (self.reason_code is not None):
+            raise ValueError("Runnable conversion availability contradicts its reason code.")
+        return self
+
+
+class CapturedEvaluationPreviewResponse(ApiBaseModel):
+    baseline_revision: EvalRevision
+    candidate: CapturedEvaluationCandidateV1
+    captured_score: CapturedRunScoreV1
+    runnable_conversion: CapturedEvaluationConversion
+
+
+class CapturedEvaluationSaveRequest(ApiBaseModel):
+    expected_candidate_revision: EvalRevision
+    candidate: CapturedEvaluationCandidateV1
+
+    @field_validator("candidate", mode="before")
+    @classmethod
+    def validate_json_candidate(cls, value: object) -> CapturedEvaluationCandidateV1 | object:
+        if type(value) is CapturedEvaluationCandidateV1:
+            return value
+        if isinstance(value, Mapping):
+            return CapturedEvaluationCandidateV1.model_validate_json(
+                json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            )
+        return value
+
+
+class CapturedEvaluationSaveResponse(ApiBaseModel):
+    record: EvalResultRecord
+    result: CapturedEvaluationResultV1
+
+
+class CapturedEvaluationExportRequest(CapturedEvaluationSaveRequest):
+    pass
+
+
+class EvalBaselineSelectionRequest(ApiBaseModel):
+    result_revision: EvalRevision
+    expected_generation: StrictInt = Field(ge=0, le=9_223_372_036_854_775_807)
+    operation_id: EvalRevision
+
+
+class EvalBaselineSelectionResponse(ApiBaseModel):
+    baseline: EvalBaselineRecord
+    mutation: EvalBaselineMutationRecord
+
+
+class EvalResultDetailResponse(ApiBaseModel):
+    record: EvalResultRecord
+    result: CapturedEvaluationResultV1 | CorpusExecutionResult
+    baseline: EvalBaselineRecord | None = None
+
+
+CAPTURED_EVALUATION_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
+    400: {"description": "The edited captured evaluation is invalid or unsafe."},
+    404: {"description": "The requested session or evaluation resource does not exist."},
+    409: {"description": "The captured evidence or compare-and-swap baseline changed."},
+    413: {"description": "The bounded captured evidence or result exceeds its byte limit."},
+    422: {"description": "The request is invalid or contains unsafe public data."},
 }
 
 

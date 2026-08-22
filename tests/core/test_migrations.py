@@ -125,6 +125,22 @@ def test_revision_forty_seven_adds_origin_aware_eval_results_and_baselines() -> 
         )
 
 
+def test_revision_forty_eight_adds_explicit_captured_only_eval_cases() -> None:
+    state = m.SchemaState(revision=48, compatible_from=48)
+
+    # A revision-47 EvalStore requires at least one input message and therefore
+    # cannot safely interpret the zero-message marker for a captured-only case.
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 48"):
+        m.validate(state, app_latest=47, app_min_supported=47)
+    m.validate(state, app_latest=48, app_min_supported=48)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 48"):
+        m.validate(
+            m.SchemaState(revision=47, compatible_from=47),
+            app_latest=48,
+            app_min_supported=48,
+        )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

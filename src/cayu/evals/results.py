@@ -123,7 +123,8 @@ class CapturedEvaluationResultV1(_SchemaV1PortableModel):
 
     The document deliberately contains no session id, store handle, application
     object, credential, or historical execution authority. Its corpus revision
-    supplies the separately persisted expectation and input contract.
+    supplies the separately persisted expectation contract; captured-only
+    corpora deliberately contain no runnable input.
     """
 
     schema_version: Literal[1] = CAPTURED_EVALUATION_RESULT_SCHEMA_VERSION

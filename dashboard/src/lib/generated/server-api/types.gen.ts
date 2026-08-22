@@ -2250,6 +2250,254 @@ export type CapabilityOperation = {
 };
 
 /**
+ * CapturedEvaluationCandidateV1
+ *
+ * Editable assertion contract bound to coherent captured evidence only.
+ */
+export type CapturedEvaluationCandidateV1 = {
+    case: EvalCaseSpec;
+    evidence: AssertionEvidenceView;
+    evidence_policy: EvaluationEvidencePolicySpec;
+    pricing_profile?: PricingProfileIdentityV1 | null;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    source: CapturedEvaluationSourceV1;
+    suite: EvalSuiteSpec;
+    /**
+     * Target Key
+     */
+    target_key: string;
+    /**
+     * Warnings
+     */
+    warnings: Array<CapturedEvaluationWarningCode>;
+};
+
+/**
+ * CapturedEvaluationCaseDraft
+ *
+ * Operator-editable expectation set without runnable input.
+ */
+export type CapturedEvaluationCaseDraft = {
+    /**
+     * Assertions
+     */
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Suite Id
+     */
+    suite_id: string;
+};
+
+/**
+ * CapturedEvaluationConversion
+ *
+ * Independent corpus-v1 conversion availability for this source session.
+ */
+export type CapturedEvaluationConversion = {
+    /**
+     * Available
+     */
+    available: boolean;
+    /**
+     * Reason Code
+     */
+    reason_code?: string | null;
+};
+
+/**
+ * CapturedEvaluationDraft
+ *
+ * Editable fields bound to one server-owned captured-evidence baseline.
+ */
+export type CapturedEvaluationDraft = {
+    case: CapturedEvaluationCaseDraft;
+    /**
+     * Expected Baseline Revision
+     */
+    expected_baseline_revision: string;
+    suite: CapturedEvaluationSuiteDraft;
+};
+
+/**
+ * CapturedEvaluationExportRequest
+ */
+export type CapturedEvaluationExportRequest = {
+    candidate: CapturedEvaluationCandidateV1;
+    /**
+     * Expected Candidate Revision
+     */
+    expected_candidate_revision: string;
+};
+
+/**
+ * CapturedEvaluationPreviewRequest
+ */
+export type CapturedEvaluationPreviewRequest = {
+    draft?: CapturedEvaluationDraft | null;
+};
+
+/**
+ * CapturedEvaluationPreviewResponse
+ */
+export type CapturedEvaluationPreviewResponse = {
+    /**
+     * Baseline Revision
+     */
+    baseline_revision: string;
+    candidate: CapturedEvaluationCandidateV1;
+    captured_score: CapturedRunScoreV1;
+    runnable_conversion: CapturedEvaluationConversion;
+};
+
+/**
+ * CapturedEvaluationResultV1
+ *
+ * Immutable public result scored only from retained session evidence.
+ *
+ * The document deliberately contains no session id, store handle, application
+ * object, credential, or historical execution authority. Its corpus revision
+ * supplies the separately persisted expectation contract; captured-only
+ * corpora deliberately contain no runnable input.
+ */
+export type CapturedEvaluationResultV1 = {
+    /**
+     * Corpus Revision
+     */
+    corpus_revision: string;
+    /**
+     * Origin
+     */
+    origin?: 'captured_session';
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    score: CapturedRunScoreV1;
+    /**
+     * Suite Id
+     */
+    suite_id: string;
+    /**
+     * Suite Revision
+     */
+    suite_revision: string;
+    target: EvalResultTargetIdentityV1;
+};
+
+/**
+ * CapturedEvaluationSaveRequest
+ */
+export type CapturedEvaluationSaveRequest = {
+    candidate: CapturedEvaluationCandidateV1;
+    /**
+     * Expected Candidate Revision
+     */
+    expected_candidate_revision: string;
+};
+
+/**
+ * CapturedEvaluationSaveResponse
+ */
+export type CapturedEvaluationSaveResponse = {
+    record: EvalResultRecord;
+    result: CapturedEvaluationResultV1;
+};
+
+/**
+ * CapturedEvaluationSourceV1
+ *
+ * Public-safe provenance for evaluation without replay authority.
+ */
+export type CapturedEvaluationSourceV1 = {
+    /**
+     * App Manifest Fingerprint
+     */
+    app_manifest_fingerprint: string;
+    /**
+     * App Manifest Schema Version
+     */
+    app_manifest_schema_version: string;
+    /**
+     * Application Release Id
+     */
+    application_release_id: string;
+    /**
+     * Evidence Policy Revision
+     */
+    evidence_policy_revision: string;
+    /**
+     * Evidence Revision
+     */
+    evidence_revision: string;
+    /**
+     * Pricing Profile Fingerprint
+     */
+    pricing_profile_fingerprint?: string | null;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Source Agent Name
+     */
+    source_agent_name: string;
+    /**
+     * Source Label
+     */
+    source_label?: string | null;
+};
+
+/**
+ * CapturedEvaluationSuiteDraft
+ *
+ * Operator-editable suite identity for one captured evaluation.
+ */
+export type CapturedEvaluationSuiteDraft = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Name
+     */
+    name: string;
+};
+
+/**
+ * CapturedEvaluationWarningCode
+ *
+ * Stable non-blocking facts about one captured evaluation.
+ */
+export type CapturedEvaluationWarningCode = 'source_run_failed';
+
+/**
  * CapturedRunScoreV1
  *
  * Bounded public score for an edited candidate against its captured evidence.
@@ -3012,6 +3260,114 @@ export type EnvironmentsResponse = {
 };
 
 /**
+ * EvalBaselineKey
+ *
+ * Stable scope of one explicit baseline pointer.
+ */
+export type EvalBaselineKey = {
+    /**
+     * Corpus Revision
+     */
+    corpus_revision: string;
+    /**
+     * Suite Id
+     */
+    suite_id: string;
+    /**
+     * Target Key
+     */
+    target_key: string;
+};
+
+/**
+ * EvalBaselineMutationRecord
+ *
+ * Immutable audit fact for one committed baseline transition.
+ */
+export type EvalBaselineMutationRecord = {
+    /**
+     * Actor Id
+     */
+    actor_id: string;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Expected Generation
+     */
+    expected_generation: number;
+    key: EvalBaselineKey;
+    /**
+     * Operation Id
+     */
+    operation_id: string;
+    /**
+     * Previous Result Revision
+     */
+    previous_result_revision?: string | null;
+    /**
+     * Resulting Generation
+     */
+    resulting_generation: number;
+    /**
+     * Selected Result Revision
+     */
+    selected_result_revision: string;
+};
+
+/**
+ * EvalBaselineRecord
+ *
+ * Current mutable pointer to an immutable eval result.
+ */
+export type EvalBaselineRecord = {
+    /**
+     * Generation
+     */
+    generation: number;
+    key: EvalBaselineKey;
+    /**
+     * Result Revision
+     */
+    result_revision: string;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+    /**
+     * Updated By
+     */
+    updated_by: string;
+};
+
+/**
+ * EvalBaselineSelectionRequest
+ */
+export type EvalBaselineSelectionRequest = {
+    /**
+     * Expected Generation
+     */
+    expected_generation: number;
+    /**
+     * Operation Id
+     */
+    operation_id: string;
+    /**
+     * Result Revision
+     */
+    result_revision: string;
+};
+
+/**
+ * EvalBaselineSelectionResponse
+ */
+export type EvalBaselineSelectionResponse = {
+    baseline: EvalBaselineRecord;
+    mutation: EvalBaselineMutationRecord;
+};
+
+/**
  * EvalCaseCatalogEntry
  */
 export type EvalCaseCatalogEntry = {
@@ -3070,7 +3426,12 @@ export type EvalCaseCatalogPage = {
 /**
  * EvalCaseSpec
  *
- * One portable request and deterministic expectation set.
+ * One deterministic expectation set with optional fresh-run input.
+ *
+ * Captured-session evaluations intentionally set ``input`` to ``None`` when
+ * the retained evidence cannot be represented as one corpus-v1 invocation.
+ * Such cases remain portable historical evaluation contracts, but execution
+ * rejects them until a runnable input or scenario is authored.
  */
 export type EvalCaseSpec = {
     /**
@@ -3085,7 +3446,7 @@ export type EvalCaseSpec = {
      * Id
      */
     id: string;
-    input: RunInputSpec;
+    input: RunInputSpec | null;
     /**
      * Name
      */
@@ -3205,11 +3566,118 @@ export type EvalCorpusDocument = {
 };
 
 /**
+ * EvalResultDetailResponse
+ */
+export type EvalResultDetailResponse = {
+    baseline?: EvalBaselineRecord | null;
+    record: EvalResultRecord;
+    /**
+     * Result
+     */
+    result: CapturedEvaluationResultV1 | CorpusExecutionResult;
+};
+
+/**
+ * EvalResultOrigin
+ *
+ * How one immutable published result was produced.
+ */
+export type EvalResultOrigin = 'captured_session' | 'fresh_execution';
+
+/**
+ * EvalResultPage
+ */
+export type EvalResultPage = {
+    /**
+     * Has More
+     */
+    has_more?: boolean;
+    /**
+     * Items
+     */
+    items: Array<EvalResultRecord>;
+    /**
+     * Next Cursor
+     */
+    next_cursor?: string | null;
+};
+
+/**
+ * EvalResultRecord
+ *
+ * Bounded catalog metadata for one immutable captured or fresh result.
+ */
+export type EvalResultRecord = {
+    /**
+     * Corpus Revision
+     */
+    corpus_revision: string;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Document Bytes
+     */
+    document_bytes: number;
+    origin: EvalResultOrigin;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Score
+     */
+    score?: number | null;
+    /**
+     * Status
+     */
+    status: 'passed' | 'failed' | 'unavailable' | 'error';
+    /**
+     * Suite Id
+     */
+    suite_id: string;
+    /**
+     * Suite Revision
+     */
+    suite_revision: string;
+    target: EvalResultTargetIdentityV1;
+};
+
+/**
  * EvalResultResponse
  */
 export type EvalResultResponse = {
     result: CorpusExecutionResult;
     run: EvalRunRecord;
+};
+
+/**
+ * EvalResultTargetIdentityV1
+ *
+ * Comparable public target identity without executable application authority.
+ */
+export type EvalResultTargetIdentityV1 = {
+    /**
+     * App Manifest Fingerprint
+     */
+    app_manifest_fingerprint: string;
+    /**
+     * App Manifest Schema Version
+     */
+    app_manifest_schema_version: string;
+    /**
+     * Application Release Id
+     */
+    application_release_id: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Target Key
+     */
+    target_key: string;
 };
 
 /**
@@ -8484,6 +8952,154 @@ export type PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewP
 
 export type PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostResponse = PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostResponses[keyof PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostResponses];
 
+export type ListEvalResultsApiEvalsResultsGetData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Target Key
+         */
+        target_key: string;
+        /**
+         * Cursor
+         */
+        cursor?: string | null;
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * Max Result Bytes
+         */
+        max_result_bytes?: number;
+        /**
+         * Origin
+         */
+        origin?: EvalResultOrigin | null;
+    };
+    url: '/api/evals/results';
+};
+
+export type ListEvalResultsApiEvalsResultsGetErrors = {
+    /**
+     * The edited captured evaluation is invalid or unsafe.
+     */
+    400: unknown;
+    /**
+     * The requested session or evaluation resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The captured evidence or compare-and-swap baseline changed.
+     */
+    409: unknown;
+    /**
+     * The bounded captured evidence or result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type ListEvalResultsApiEvalsResultsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalResultPage;
+};
+
+export type ListEvalResultsApiEvalsResultsGetResponse = ListEvalResultsApiEvalsResultsGetResponses[keyof ListEvalResultsApiEvalsResultsGetResponses];
+
+export type GetEvalResultApiEvalsResultsResultRevisionGetData = {
+    body?: never;
+    path: {
+        /**
+         * Result Revision
+         */
+        result_revision: string;
+    };
+    query?: never;
+    url: '/api/evals/results/{result_revision}';
+};
+
+export type GetEvalResultApiEvalsResultsResultRevisionGetErrors = {
+    /**
+     * The edited captured evaluation is invalid or unsafe.
+     */
+    400: unknown;
+    /**
+     * The requested session or evaluation resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The captured evidence or compare-and-swap baseline changed.
+     */
+    409: unknown;
+    /**
+     * The bounded captured evidence or result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type GetEvalResultApiEvalsResultsResultRevisionGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalResultDetailResponse;
+};
+
+export type GetEvalResultApiEvalsResultsResultRevisionGetResponse = GetEvalResultApiEvalsResultsResultRevisionGetResponses[keyof GetEvalResultApiEvalsResultsResultRevisionGetResponses];
+
+export type SelectEvalBaselineApiEvalsResultsResultRevisionBaselinePostData = {
+    body: EvalBaselineSelectionRequest;
+    path: {
+        /**
+         * Result Revision
+         */
+        result_revision: string;
+    };
+    query?: never;
+    url: '/api/evals/results/{result_revision}/baseline';
+};
+
+export type SelectEvalBaselineApiEvalsResultsResultRevisionBaselinePostErrors = {
+    /**
+     * The edited captured evaluation is invalid or unsafe.
+     */
+    400: unknown;
+    /**
+     * The requested session or evaluation resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The captured evidence or compare-and-swap baseline changed.
+     */
+    409: unknown;
+    /**
+     * The bounded captured evidence or result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type SelectEvalBaselineApiEvalsResultsResultRevisionBaselinePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalBaselineSelectionResponse;
+};
+
+export type SelectEvalBaselineApiEvalsResultsResultRevisionBaselinePostResponse = SelectEvalBaselineApiEvalsResultsResultRevisionBaselinePostResponses[keyof SelectEvalBaselineApiEvalsResultsResultRevisionBaselinePostResponses];
+
 export type ListEvalRunsApiEvalsRunsGetData = {
     body?: never;
     path?: never;
@@ -8826,6 +9442,136 @@ export type GetEvalResultApiEvalsRunsRunIdResultGetResponses = {
 };
 
 export type GetEvalResultApiEvalsRunsRunIdResultGetResponse = GetEvalResultApiEvalsRunsRunIdResultGetResponses[keyof GetEvalResultApiEvalsRunsRunIdResultGetResponses];
+
+export type ExportCapturedEvaluationApiEvalsSessionsSessionIdEvaluationExportPostData = {
+    body: CapturedEvaluationExportRequest;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: never;
+    url: '/api/evals/sessions/{session_id}/evaluation/export';
+};
+
+export type ExportCapturedEvaluationApiEvalsSessionsSessionIdEvaluationExportPostErrors = {
+    /**
+     * The edited captured evaluation is invalid or unsafe.
+     */
+    400: unknown;
+    /**
+     * The requested session or evaluation resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The captured evidence or compare-and-swap baseline changed.
+     */
+    409: unknown;
+    /**
+     * The bounded captured evidence or result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type ExportCapturedEvaluationApiEvalsSessionsSessionIdEvaluationExportPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type PreviewCapturedEvaluationApiEvalsSessionsSessionIdEvaluationPreviewPostData = {
+    body: CapturedEvaluationPreviewRequest;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: never;
+    url: '/api/evals/sessions/{session_id}/evaluation/preview';
+};
+
+export type PreviewCapturedEvaluationApiEvalsSessionsSessionIdEvaluationPreviewPostErrors = {
+    /**
+     * The edited captured evaluation is invalid or unsafe.
+     */
+    400: unknown;
+    /**
+     * The requested session or evaluation resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The captured evidence or compare-and-swap baseline changed.
+     */
+    409: unknown;
+    /**
+     * The bounded captured evidence or result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type PreviewCapturedEvaluationApiEvalsSessionsSessionIdEvaluationPreviewPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: CapturedEvaluationPreviewResponse;
+};
+
+export type PreviewCapturedEvaluationApiEvalsSessionsSessionIdEvaluationPreviewPostResponse = PreviewCapturedEvaluationApiEvalsSessionsSessionIdEvaluationPreviewPostResponses[keyof PreviewCapturedEvaluationApiEvalsSessionsSessionIdEvaluationPreviewPostResponses];
+
+export type SaveCapturedEvaluationApiEvalsSessionsSessionIdEvaluationSavePostData = {
+    body: CapturedEvaluationSaveRequest;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: never;
+    url: '/api/evals/sessions/{session_id}/evaluation/save';
+};
+
+export type SaveCapturedEvaluationApiEvalsSessionsSessionIdEvaluationSavePostErrors = {
+    /**
+     * The edited captured evaluation is invalid or unsafe.
+     */
+    400: unknown;
+    /**
+     * The requested session or evaluation resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The captured evidence or compare-and-swap baseline changed.
+     */
+    409: unknown;
+    /**
+     * The bounded captured evidence or result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type SaveCapturedEvaluationApiEvalsSessionsSessionIdEvaluationSavePostResponses = {
+    /**
+     * Successful Response
+     */
+    201: CapturedEvaluationSaveResponse;
+};
+
+export type SaveCapturedEvaluationApiEvalsSessionsSessionIdEvaluationSavePostResponse = SaveCapturedEvaluationApiEvalsSessionsSessionIdEvaluationSavePostResponses[keyof SaveCapturedEvaluationApiEvalsSessionsSessionIdEvaluationSavePostResponses];
 
 export type ListEvalTargetsApiEvalsTargetsGetData = {
     body?: never;

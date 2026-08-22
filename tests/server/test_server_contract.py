@@ -251,7 +251,7 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
     assert body["capabilities"]["evals_readiness"] == {
         "captured_evaluation": {
             "state": "gated",
-            "reason_code": "evaluation_promotion_not_configured",
+            "reason_code": "eval_target_not_configured",
         },
         "catalog_read": {"state": "gated", "reason_code": "eval_store_not_configured"},
         "catalog_write": {"state": "gated", "reason_code": "eval_store_not_configured"},
@@ -407,7 +407,7 @@ def test_system_diagnostics_reports_bounded_protected_runtime_state(tmp_path) ->
         "dashboard_enabled": True,
         "docs_enabled": False,
     }
-    assert body["versions"]["server_contract"] == "17"
+    assert body["versions"]["server_contract"] == "18"
     assert body["versions"]["cayu"] == body["capabilities"]["cayu_version"]
     assert body["capabilities"]["actor"] == {
         "subject": "operator-a",

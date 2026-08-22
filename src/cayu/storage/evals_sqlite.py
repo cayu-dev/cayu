@@ -40,6 +40,8 @@ from cayu.evals.store import (
     EvalCorpusCatalogPage,
     EvalCorpusConflict,
     EvalResultConflict,
+    EvalResultPage,
+    EvalResultQuery,
     EvalResultRecord,
     EvalRunAdmissionConflict,
     EvalRunClaim,
@@ -62,6 +64,7 @@ from cayu.evals.store import (
     EvalSuiteCatalogQuery,
     _bounded_case_page,
     _bounded_corpus_page,
+    _bounded_result_page,
     _bounded_run_page,
     _bounded_suite_page,
     _claim_target_keys,
@@ -78,6 +81,7 @@ from cayu.evals.store import (
     _validate_baseline_result,
     decode_case_cursor,
     decode_corpus_cursor,
+    decode_result_cursor,
     decode_run_cursor,
     decode_suite_cursor,
     eval_result_record,
@@ -88,7 +92,7 @@ from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage.sqlite import _run_off_thread_with_connection_ownership
 
-_SQLITE_EVAL_MIN_REQUIRED_REVISION = 47
+_SQLITE_EVAL_MIN_REQUIRED_REVISION = 48
 
 _RUN_COLUMNS = """
     run_id,
@@ -1175,6 +1179,41 @@ class SQLiteEvalStore(EvalStore):
                 (revision,),
             ).fetchone()
             return None if row is None else _result_record_from_row(row)
+
+        return await self._run(operation)
+
+    async def list_results(self, query: EvalResultQuery) -> EvalResultPage:
+        query = _exact_model(query, EvalResultQuery, "query")
+        boundary = (
+            decode_result_cursor(query.cursor, query.target_key, query.origin)
+            if query.cursor is not None
+            else None
+        )
+
+        def operation(connection: sqlite3.Connection) -> EvalResultPage:
+            clauses = ["target_key = ?"]
+            params: list[object] = [query.target_key]
+            if query.origin is not None:
+                clauses.append("origin = ?")
+                params.append(query.origin.value)
+            if boundary is not None:
+                clauses.append("(created_at < ? OR (created_at = ? AND revision > ?))")
+                timestamp = _format_datetime(boundary[0])
+                params.extend((timestamp, timestamp, boundary[1]))
+            rows = connection.execute(
+                f"""
+                SELECT {_RESULT_RECORD_COLUMNS}
+                FROM cayu_eval_result_records
+                WHERE {" AND ".join(clauses)}
+                ORDER BY created_at DESC, revision ASC
+                LIMIT ?
+                """,
+                (*params, query.limit + 1),
+            ).fetchall()
+            return _bounded_result_page(
+                [_result_record_from_row(row) for row in rows],
+                query,
+            )
 
         return await self._run(operation)
 

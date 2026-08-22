@@ -42,7 +42,14 @@ test("Evals readiness copy distinguishes ready, deployment-gated, and planned op
       state: "gated",
       reason_code: "eval_store_not_configured",
     }),
-    "Durable Evals storage is not assembled in this deployment; automatic assembly is planned.",
+    "Durable Evals storage is not available in this deployment.",
+  )
+  assert.equal(
+    evalsReadinessStateLabel({
+      state: "unsupported",
+      reason_code: "captured_result_persistence_not_available",
+    }),
+    "Unavailable",
   )
   assert.equal(
     evalsReadinessReasonText({

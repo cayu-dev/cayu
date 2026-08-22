@@ -1980,6 +1980,12 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "ON cayu_eval_baseline_mutations("
         "target_key, corpus_revision, suite_id, resulting_generation)",
     ),
+    48: (
+        "ALTER TABLE cayu_eval_cases DROP CONSTRAINT IF EXISTS cayu_eval_cases_message_count_check",
+        "ALTER TABLE cayu_eval_cases ADD CONSTRAINT "
+        "cayu_eval_cases_message_count_check "
+        "CHECK (message_count >= 0 AND message_count <= 16)",
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -3312,6 +3318,8 @@ class _PostgresStoreBase:
                             await self._validate_transcript_search_document_column(cur)
                         if self._min_required_revision >= 47:
                             await self._validate_eval_result_baseline_schema(cur)
+                        if self._min_required_revision >= 48:
+                            await self._validate_captured_eval_case_schema(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -3476,6 +3484,8 @@ class _PostgresStoreBase:
             await self._validate_transcript_search_document_column(cur)
         if self._min_required_revision >= 47:
             await self._validate_eval_result_baseline_schema(cur)
+        if self._min_required_revision >= 48:
+            await self._validate_captured_eval_case_schema(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -3558,6 +3568,8 @@ class _PostgresStoreBase:
             await self._validate_transcript_search_document_column(cur)
         if revision.revision == 47:
             await self._validate_eval_result_baseline_schema(cur)
+        if revision.revision == 48:
+            await self._validate_captured_eval_case_schema(cur)
 
     async def _validate_transcript_search_document_column(self, cur: Any) -> None:
         await cur.execute(
@@ -4720,6 +4732,29 @@ class _PostgresStoreBase:
             for index_name, (unique, columns) in expected_indexes.items()
         ):
             self._raise_eval_result_baseline_schema_error("eval result indexes")
+
+    async def _validate_captured_eval_case_schema(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT pg_get_constraintdef(constraint_record.oid)
+            FROM pg_catalog.pg_constraint AS constraint_record
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = constraint_record.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = 'cayu_eval_cases'
+              AND constraint_record.conname = 'cayu_eval_cases_message_count_check'
+            """
+        )
+        row = await cur.fetchone()
+        definition = "" if row is None else "".join(str(row[0]).lower().split())
+        if "message_count>=0" not in definition or "message_count<=16" not in definition:
+            raise RuntimeError(
+                "Postgres schema object 'cayu_eval_cases.message_count' conflicts with "
+                "Cayu's revision-48 captured-evaluation contract. Run `cayu storage "
+                "migrate` or restore the database from a known-good backup."
+            )
 
     @staticmethod
     def _raise_eval_result_baseline_schema_error(name: str) -> NoReturn:

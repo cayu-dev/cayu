@@ -37,6 +37,8 @@ from cayu.evals.store import (
     EvalCorpusCatalogPage,
     EvalCorpusConflict,
     EvalResultConflict,
+    EvalResultPage,
+    EvalResultQuery,
     EvalResultRecord,
     EvalRunAdmissionConflict,
     EvalRunClaim,
@@ -59,6 +61,7 @@ from cayu.evals.store import (
     EvalSuiteCatalogQuery,
     _bounded_case_page,
     _bounded_corpus_page,
+    _bounded_result_page,
     _bounded_run_page,
     _bounded_suite_page,
     _claim_target_keys,
@@ -75,6 +78,7 @@ from cayu.evals.store import (
     _validate_baseline_result,
     decode_case_cursor,
     decode_corpus_cursor,
+    decode_result_cursor,
     decode_run_cursor,
     decode_suite_cursor,
     eval_result_record,
@@ -83,7 +87,7 @@ from cayu.evals.store import (
 )
 from cayu.storage.postgres import _PostgresStoreBase
 
-_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 47
+_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 48
 
 _RUN_COLUMNS = """
     run_id,
@@ -1108,6 +1112,39 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
             )
             row = await cur.fetchone()
             return None if row is None else _result_record_from_row(row)
+
+    async def list_results(self, query: EvalResultQuery) -> EvalResultPage:
+        query = _exact_model(query, EvalResultQuery, "query")
+        boundary = (
+            decode_result_cursor(query.cursor, query.target_key, query.origin)
+            if query.cursor is not None
+            else None
+        )
+        clauses = ["target_key = %s"]
+        params: list[object] = [query.target_key]
+        if query.origin is not None:
+            clauses.append("origin = %s")
+            params.append(query.origin.value)
+        if boundary is not None:
+            clauses.append("(created_at < %s OR (created_at = %s AND revision > %s))")
+            params.extend((boundary[0], boundary[0], boundary[1]))
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    f"""
+                    SELECT {_RESULT_RECORD_COLUMNS}
+                    FROM cayu_eval_result_records
+                    WHERE {" AND ".join(clauses)}
+                    ORDER BY created_at DESC, revision ASC
+                    LIMIT %s
+                    """,
+                ),
+                (*params, query.limit + 1),
+            )
+            rows = await cur.fetchall()
+        return _bounded_result_page([_result_record_from_row(row) for row in rows], query)
 
     async def set_baseline(
         self,

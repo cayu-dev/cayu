@@ -2,11 +2,15 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import {
+  capturedEvaluationDraftFromCandidate,
+  capturedEvaluationPreviewMatchesDraft,
+  createCapturedEvaluationAssertion,
   createPromotionAssertion,
   PROMOTION_ASSERTION_KINDS,
   parsePromotionInteger,
   previewMatchesDraft,
   promotionDraftFromCandidate,
+  validateCapturedEvaluationDraft,
   validatePromotionDraft,
 } from "../src/lib/evaluation-promotion.ts"
 
@@ -36,6 +40,40 @@ function candidate() {
 
 function draftFromCandidate(source = candidate()) {
   return promotionDraftFromCandidate(source, source.revision)
+}
+
+function capturedCandidate() {
+  const source = candidate()
+  source.case.input = null
+  source.evidence = {
+    revision: `sha256:${"2".repeat(64)}`,
+    policy_revision: `sha256:${"3".repeat(64)}`,
+    pricing_profile_fingerprint: null,
+    root_evidence_available: true,
+    root_status: "failed",
+    child_evidence_state: "complete",
+    child_statuses: ["completed", "completed"],
+    final_output_state: "complete",
+    final_output: "Observed answer",
+    tool_evidence_state: "complete",
+    requested_tool_names: ["search", "read"],
+    started_tool_names: ["search"],
+    tool_calls_started: 2,
+    model_step_evidence_state: "complete",
+    model_steps: 3,
+    usage_evidence_state: "complete",
+    total_tokens: "42",
+    costs: [
+      {
+        currency: "USD",
+        total_cost: "0.25",
+        model_steps: 3,
+        priced_model_steps: 3,
+        unpriced_model_steps: 0,
+      },
+    ],
+  }
+  return source
 }
 
 test("candidate projection owns a complete authority-free editable draft", () => {
@@ -77,6 +115,51 @@ test("all portable assertion kinds get valid deterministic editor defaults", () 
   const draft = draftFromCandidate()
   draft.case.assertions = assertions
   assert.deepEqual(validatePromotionDraft(draft), { ok: true, draft })
+})
+
+test("captured drafts omit replay input and quick-add assertions use observed facts", () => {
+  const source = capturedCandidate()
+  const draft = capturedEvaluationDraftFromCandidate(source, source.revision)
+  assert.equal("input" in draft.case, false)
+  assert.deepEqual(validateCapturedEvaluationDraft(draft), { ok: true, draft })
+  assert.equal(
+    capturedEvaluationPreviewMatchesDraft(
+      { baseline_revision: source.revision, candidate: source },
+      draft,
+    ),
+    true,
+  )
+
+  const assertions = []
+  for (const kind of PROMOTION_ASSERTION_KINDS) {
+    assertions.push(createCapturedEvaluationAssertion(kind, assertions, source.evidence))
+  }
+  assert.deepEqual(
+    assertions.find((item) => item.kind === "root_status"),
+    {
+      id: "root_status",
+      kind: "root_status",
+      expected: "failed",
+    },
+  )
+  assert.equal(
+    assertions.find((item) => item.kind === "final_output_equals").expected,
+    "Observed answer",
+  )
+  assert.deepEqual(assertions.find((item) => item.kind === "tools_called_in_order").tool_names, [
+    "search",
+    "read",
+  ])
+  assert.equal(assertions.find((item) => item.kind === "max_total_tokens").maximum, 42)
+  assert.deepEqual(
+    assertions.find((item) => item.kind === "max_estimated_cost"),
+    {
+      id: "max_estimated_cost",
+      kind: "max_estimated_cost",
+      maximum: "0.25",
+      currency: "USD",
+    },
+  )
 })
 
 test("draft validation rejects nonportable placement, duplicate assertions, and lossy counters", () => {

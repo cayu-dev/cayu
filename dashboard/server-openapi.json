@@ -4475,6 +4475,503 @@
         "title": "CapabilityOperation",
         "type": "object"
       },
+      "CapturedEvaluationCandidateV1": {
+        "additionalProperties": false,
+        "description": "Editable assertion contract bound to coherent captured evidence only.",
+        "properties": {
+          "case": {
+            "$ref": "#/components/schemas/EvalCaseSpec"
+          },
+          "evidence": {
+            "$ref": "#/components/schemas/AssertionEvidenceView"
+          },
+          "evidence_policy": {
+            "$ref": "#/components/schemas/EvaluationEvidencePolicySpec"
+          },
+          "pricing_profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PricingProfileIdentityV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "source": {
+            "$ref": "#/components/schemas/CapturedEvaluationSourceV1"
+          },
+          "suite": {
+            "$ref": "#/components/schemas/EvalSuiteSpec"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          },
+          "warnings": {
+            "items": {
+              "$ref": "#/components/schemas/CapturedEvaluationWarningCode"
+            },
+            "maxItems": 1,
+            "title": "Warnings",
+            "type": "array"
+          }
+        },
+        "required": [
+          "revision",
+          "target_key",
+          "source",
+          "evidence_policy",
+          "evidence",
+          "suite",
+          "case",
+          "warnings"
+        ],
+        "title": "CapturedEvaluationCandidateV1",
+        "type": "object"
+      },
+      "CapturedEvaluationCaseDraft": {
+        "additionalProperties": false,
+        "description": "Operator-editable expectation set without runnable input.",
+        "properties": {
+          "assertions": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "child_status": "#/components/schemas/ChildStatusAssertionSpec",
+                  "final_output_contains": "#/components/schemas/FinalOutputContainsAssertionSpec",
+                  "final_output_equals": "#/components/schemas/FinalOutputEqualsAssertionSpec",
+                  "max_estimated_cost": "#/components/schemas/MaxEstimatedCostAssertionSpec",
+                  "max_model_steps": "#/components/schemas/MaxModelStepsAssertionSpec",
+                  "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
+                  "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
+                  "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
+                  "root_status": "#/components/schemas/RootStatusAssertionSpec",
+                  "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
+                  "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
+                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/RootStatusAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ChildStatusAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/FinalOutputEqualsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/FinalOutputContainsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolCalledAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxModelStepsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/UsageRecordedAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxTotalTokensAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxEstimatedCostAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ModelJudgeAssertionSpec"
+                }
+              ]
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "title": "Assertions",
+            "type": "array"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "suite_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+            "title": "Suite Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "suite_id",
+          "name",
+          "assertions"
+        ],
+        "title": "CapturedEvaluationCaseDraft",
+        "type": "object"
+      },
+      "CapturedEvaluationConversion": {
+        "additionalProperties": false,
+        "description": "Independent corpus-v1 conversion availability for this source session.",
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "reason_code": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason Code"
+          }
+        },
+        "required": [
+          "available"
+        ],
+        "title": "CapturedEvaluationConversion",
+        "type": "object"
+      },
+      "CapturedEvaluationDraft": {
+        "additionalProperties": false,
+        "description": "Editable fields bound to one server-owned captured-evidence baseline.",
+        "properties": {
+          "case": {
+            "$ref": "#/components/schemas/CapturedEvaluationCaseDraft"
+          },
+          "expected_baseline_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Expected Baseline Revision",
+            "type": "string"
+          },
+          "suite": {
+            "$ref": "#/components/schemas/CapturedEvaluationSuiteDraft"
+          }
+        },
+        "required": [
+          "expected_baseline_revision",
+          "suite",
+          "case"
+        ],
+        "title": "CapturedEvaluationDraft",
+        "type": "object"
+      },
+      "CapturedEvaluationExportRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate": {
+            "$ref": "#/components/schemas/CapturedEvaluationCandidateV1"
+          },
+          "expected_candidate_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Expected Candidate Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_candidate_revision",
+          "candidate"
+        ],
+        "title": "CapturedEvaluationExportRequest",
+        "type": "object"
+      },
+      "CapturedEvaluationPreviewRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "draft": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CapturedEvaluationDraft"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "title": "CapturedEvaluationPreviewRequest",
+        "type": "object"
+      },
+      "CapturedEvaluationPreviewResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "baseline_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Baseline Revision",
+            "type": "string"
+          },
+          "candidate": {
+            "$ref": "#/components/schemas/CapturedEvaluationCandidateV1"
+          },
+          "captured_score": {
+            "$ref": "#/components/schemas/CapturedRunScoreV1"
+          },
+          "runnable_conversion": {
+            "$ref": "#/components/schemas/CapturedEvaluationConversion"
+          }
+        },
+        "required": [
+          "baseline_revision",
+          "candidate",
+          "captured_score",
+          "runnable_conversion"
+        ],
+        "title": "CapturedEvaluationPreviewResponse",
+        "type": "object"
+      },
+      "CapturedEvaluationResultV1": {
+        "additionalProperties": false,
+        "description": "Immutable public result scored only from retained session evidence.\n\nThe document deliberately contains no session id, store handle, application\nobject, credential, or historical execution authority. Its corpus revision\nsupplies the separately persisted expectation contract; captured-only\ncorpora deliberately contain no runnable input.",
+        "properties": {
+          "corpus_revision": {
+            "title": "Corpus Revision",
+            "type": "string"
+          },
+          "origin": {
+            "const": "captured_session",
+            "default": "captured_session",
+            "title": "Origin",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "score": {
+            "$ref": "#/components/schemas/CapturedRunScoreV1"
+          },
+          "suite_id": {
+            "title": "Suite Id",
+            "type": "string"
+          },
+          "suite_revision": {
+            "title": "Suite Revision",
+            "type": "string"
+          },
+          "target": {
+            "$ref": "#/components/schemas/EvalResultTargetIdentityV1"
+          }
+        },
+        "required": [
+          "revision",
+          "target",
+          "corpus_revision",
+          "suite_id",
+          "suite_revision",
+          "score"
+        ],
+        "title": "CapturedEvaluationResultV1",
+        "type": "object"
+      },
+      "CapturedEvaluationSaveRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate": {
+            "$ref": "#/components/schemas/CapturedEvaluationCandidateV1"
+          },
+          "expected_candidate_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Expected Candidate Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_candidate_revision",
+          "candidate"
+        ],
+        "title": "CapturedEvaluationSaveRequest",
+        "type": "object"
+      },
+      "CapturedEvaluationSaveResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "record": {
+            "$ref": "#/components/schemas/EvalResultRecord"
+          },
+          "result": {
+            "$ref": "#/components/schemas/CapturedEvaluationResultV1"
+          }
+        },
+        "required": [
+          "record",
+          "result"
+        ],
+        "title": "CapturedEvaluationSaveResponse",
+        "type": "object"
+      },
+      "CapturedEvaluationSourceV1": {
+        "additionalProperties": false,
+        "description": "Public-safe provenance for evaluation without replay authority.",
+        "properties": {
+          "app_manifest_fingerprint": {
+            "title": "App Manifest Fingerprint",
+            "type": "string"
+          },
+          "app_manifest_schema_version": {
+            "title": "App Manifest Schema Version",
+            "type": "string"
+          },
+          "application_release_id": {
+            "title": "Application Release Id",
+            "type": "string"
+          },
+          "evidence_policy_revision": {
+            "title": "Evidence Policy Revision",
+            "type": "string"
+          },
+          "evidence_revision": {
+            "title": "Evidence Revision",
+            "type": "string"
+          },
+          "pricing_profile_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Profile Fingerprint"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "source_agent_name": {
+            "title": "Source Agent Name",
+            "type": "string"
+          },
+          "source_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Label"
+          }
+        },
+        "required": [
+          "source_agent_name",
+          "application_release_id",
+          "app_manifest_schema_version",
+          "app_manifest_fingerprint",
+          "evidence_revision",
+          "evidence_policy_revision"
+        ],
+        "title": "CapturedEvaluationSourceV1",
+        "type": "object"
+      },
+      "CapturedEvaluationSuiteDraft": {
+        "additionalProperties": false,
+        "description": "Operator-editable suite identity for one captured evaluation.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "CapturedEvaluationSuiteDraft",
+        "type": "object"
+      },
+      "CapturedEvaluationWarningCode": {
+        "description": "Stable non-blocking facts about one captured evaluation.",
+        "enum": [
+          "source_run_failed"
+        ],
+        "title": "CapturedEvaluationWarningCode",
+        "type": "string"
+      },
       "CapturedRunScoreV1": {
         "additionalProperties": false,
         "description": "Bounded public score for an edited candidate against its captured evidence.",
@@ -5997,6 +6494,177 @@
         "title": "EnvironmentsResponse",
         "type": "object"
       },
+      "EvalBaselineKey": {
+        "additionalProperties": false,
+        "description": "Stable scope of one explicit baseline pointer.",
+        "properties": {
+          "corpus_revision": {
+            "title": "Corpus Revision",
+            "type": "string"
+          },
+          "suite_id": {
+            "title": "Suite Id",
+            "type": "string"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_key",
+          "corpus_revision",
+          "suite_id"
+        ],
+        "title": "EvalBaselineKey",
+        "type": "object"
+      },
+      "EvalBaselineMutationRecord": {
+        "additionalProperties": false,
+        "description": "Immutable audit fact for one committed baseline transition.",
+        "properties": {
+          "actor_id": {
+            "title": "Actor Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "expected_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Expected Generation",
+            "type": "integer"
+          },
+          "key": {
+            "$ref": "#/components/schemas/EvalBaselineKey"
+          },
+          "operation_id": {
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "previous_result_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Result Revision"
+          },
+          "resulting_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Resulting Generation",
+            "type": "integer"
+          },
+          "selected_result_revision": {
+            "title": "Selected Result Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "key",
+          "expected_generation",
+          "selected_result_revision",
+          "resulting_generation",
+          "actor_id",
+          "created_at"
+        ],
+        "title": "EvalBaselineMutationRecord",
+        "type": "object"
+      },
+      "EvalBaselineRecord": {
+        "additionalProperties": false,
+        "description": "Current mutable pointer to an immutable eval result.",
+        "properties": {
+          "generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "key": {
+            "$ref": "#/components/schemas/EvalBaselineKey"
+          },
+          "result_revision": {
+            "title": "Result Revision",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "updated_by": {
+            "title": "Updated By",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "result_revision",
+          "generation",
+          "updated_by",
+          "updated_at"
+        ],
+        "title": "EvalBaselineRecord",
+        "type": "object"
+      },
+      "EvalBaselineSelectionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_generation": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Expected Generation",
+            "type": "integer"
+          },
+          "operation_id": {
+            "maxLength": 71,
+            "minLength": 71,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "result_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Result Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result_revision",
+          "expected_generation",
+          "operation_id"
+        ],
+        "title": "EvalBaselineSelectionRequest",
+        "type": "object"
+      },
+      "EvalBaselineSelectionResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "baseline": {
+            "$ref": "#/components/schemas/EvalBaselineRecord"
+          },
+          "mutation": {
+            "$ref": "#/components/schemas/EvalBaselineMutationRecord"
+          }
+        },
+        "required": [
+          "baseline",
+          "mutation"
+        ],
+        "title": "EvalBaselineSelectionResponse",
+        "type": "object"
+      },
       "EvalCaseCatalogEntry": {
         "additionalProperties": false,
         "properties": {
@@ -6027,7 +6695,7 @@
           },
           "message_count": {
             "maximum": 16.0,
-            "minimum": 1.0,
+            "minimum": 0.0,
             "title": "Message Count",
             "type": "integer"
           },
@@ -6092,7 +6760,7 @@
       },
       "EvalCaseSpec": {
         "additionalProperties": false,
-        "description": "One portable request and deterministic expectation set.",
+        "description": "One deterministic expectation set with optional fresh-run input.\n\nCaptured-session evaluations intentionally set ``input`` to ``None`` when\nthe retained evidence cannot be represented as one corpus-v1 invocation.\nSuch cases remain portable historical evaluation contracts, but execution\nrejects them until a runnable input or scenario is authored.",
         "properties": {
           "assertions": {
             "items": {
@@ -6173,7 +6841,14 @@
             "type": "string"
           },
           "input": {
-            "$ref": "#/components/schemas/RunInputSpec"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunInputSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "name": {
             "title": "Name",
@@ -6394,6 +7069,159 @@
         "title": "EvalCorpusDocument",
         "type": "object"
       },
+      "EvalResultDetailResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "baseline": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalBaselineRecord"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "record": {
+            "$ref": "#/components/schemas/EvalResultRecord"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CapturedEvaluationResultV1"
+              },
+              {
+                "$ref": "#/components/schemas/CorpusExecutionResult"
+              }
+            ],
+            "title": "Result"
+          }
+        },
+        "required": [
+          "record",
+          "result"
+        ],
+        "title": "EvalResultDetailResponse",
+        "type": "object"
+      },
+      "EvalResultOrigin": {
+        "description": "How one immutable published result was produced.",
+        "enum": [
+          "captured_session",
+          "fresh_execution"
+        ],
+        "title": "EvalResultOrigin",
+        "type": "string"
+      },
+      "EvalResultPage": {
+        "additionalProperties": false,
+        "properties": {
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/EvalResultRecord"
+            },
+            "maxItems": 200,
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "EvalResultPage",
+        "type": "object"
+      },
+      "EvalResultRecord": {
+        "additionalProperties": false,
+        "description": "Bounded catalog metadata for one immutable captured or fresh result.",
+        "properties": {
+          "corpus_revision": {
+            "title": "Corpus Revision",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "document_bytes": {
+            "maximum": 41943040.0,
+            "minimum": 1.0,
+            "title": "Document Bytes",
+            "type": "integer"
+          },
+          "origin": {
+            "$ref": "#/components/schemas/EvalResultOrigin"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
+          "status": {
+            "enum": [
+              "passed",
+              "failed",
+              "unavailable",
+              "error"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "suite_id": {
+            "title": "Suite Id",
+            "type": "string"
+          },
+          "suite_revision": {
+            "title": "Suite Revision",
+            "type": "string"
+          },
+          "target": {
+            "$ref": "#/components/schemas/EvalResultTargetIdentityV1"
+          }
+        },
+        "required": [
+          "revision",
+          "origin",
+          "target",
+          "corpus_revision",
+          "suite_id",
+          "suite_revision",
+          "status",
+          "document_bytes",
+          "created_at"
+        ],
+        "title": "EvalResultRecord",
+        "type": "object"
+      },
       "EvalResultResponse": {
         "additionalProperties": false,
         "properties": {
@@ -6409,6 +7237,42 @@
           "result"
         ],
         "title": "EvalResultResponse",
+        "type": "object"
+      },
+      "EvalResultTargetIdentityV1": {
+        "additionalProperties": false,
+        "description": "Comparable public target identity without executable application authority.",
+        "properties": {
+          "app_manifest_fingerprint": {
+            "title": "App Manifest Fingerprint",
+            "type": "string"
+          },
+          "app_manifest_schema_version": {
+            "title": "App Manifest Schema Version",
+            "type": "string"
+          },
+          "application_release_id": {
+            "title": "Application Release Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_key",
+          "application_release_id",
+          "app_manifest_schema_version",
+          "app_manifest_fingerprint"
+        ],
+        "title": "EvalResultTargetIdentityV1",
         "type": "object"
       },
       "EvalRunFailureCode": {
@@ -11031,7 +11895,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "17",
+            "default": "18",
             "title": "Contract Version",
             "type": "string"
           },
@@ -14707,7 +15571,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "17",
+            "default": "18",
             "title": "Contract Version",
             "type": "string"
           }
@@ -16075,6 +16939,206 @@
         "summary": "Preview Evaluation Promotion"
       }
     },
+    "/api/evals/results": {
+      "get": {
+        "operationId": "list_eval_results_api_evals_results_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "target_key",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "title": "Target Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_result_bytes",
+            "required": false,
+            "schema": {
+              "default": 1048576,
+              "maximum": 8388608,
+              "minimum": 1024,
+              "title": "Max Result Bytes",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "origin",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/EvalResultOrigin"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Origin"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalResultPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The edited captured evaluation is invalid or unsafe."
+          },
+          "404": {
+            "description": "The requested session or evaluation resource does not exist."
+          },
+          "409": {
+            "description": "The captured evidence or compare-and-swap baseline changed."
+          },
+          "413": {
+            "description": "The bounded captured evidence or result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "List Eval Results"
+      }
+    },
+    "/api/evals/results/{result_revision}": {
+      "get": {
+        "operationId": "get_eval_result_api_evals_results__result_revision__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "result_revision",
+            "required": true,
+            "schema": {
+              "title": "Result Revision",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalResultDetailResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The edited captured evaluation is invalid or unsafe."
+          },
+          "404": {
+            "description": "The requested session or evaluation resource does not exist."
+          },
+          "409": {
+            "description": "The captured evidence or compare-and-swap baseline changed."
+          },
+          "413": {
+            "description": "The bounded captured evidence or result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Get Eval Result"
+      }
+    },
+    "/api/evals/results/{result_revision}/baseline": {
+      "post": {
+        "operationId": "select_eval_baseline_api_evals_results__result_revision__baseline_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "result_revision",
+            "required": true,
+            "schema": {
+              "title": "Result Revision",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalBaselineSelectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalBaselineSelectionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The edited captured evaluation is invalid or unsafe."
+          },
+          "404": {
+            "description": "The requested session or evaluation resource does not exist."
+          },
+          "409": {
+            "description": "The captured evidence or compare-and-swap baseline changed."
+          },
+          "413": {
+            "description": "The bounded captured evidence or result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Select Eval Baseline"
+      }
+    },
     "/api/evals/runs": {
       "get": {
         "operationId": "list_eval_runs_api_evals_runs_get",
@@ -16488,6 +17552,161 @@
           }
         },
         "summary": "Get Eval Result"
+      }
+    },
+    "/api/evals/sessions/{session_id}/evaluation/export": {
+      "post": {
+        "operationId": "export_captured_evaluation_api_evals_sessions__session_id__evaluation_export_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CapturedEvaluationExportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The edited captured evaluation is invalid or unsafe."
+          },
+          "404": {
+            "description": "The requested session or evaluation resource does not exist."
+          },
+          "409": {
+            "description": "The captured evidence or compare-and-swap baseline changed."
+          },
+          "413": {
+            "description": "The bounded captured evidence or result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Export Captured Evaluation"
+      }
+    },
+    "/api/evals/sessions/{session_id}/evaluation/preview": {
+      "post": {
+        "operationId": "preview_captured_evaluation_api_evals_sessions__session_id__evaluation_preview_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CapturedEvaluationPreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapturedEvaluationPreviewResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The edited captured evaluation is invalid or unsafe."
+          },
+          "404": {
+            "description": "The requested session or evaluation resource does not exist."
+          },
+          "409": {
+            "description": "The captured evidence or compare-and-swap baseline changed."
+          },
+          "413": {
+            "description": "The bounded captured evidence or result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Preview Captured Evaluation"
+      }
+    },
+    "/api/evals/sessions/{session_id}/evaluation/save": {
+      "post": {
+        "operationId": "save_captured_evaluation_api_evals_sessions__session_id__evaluation_save_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CapturedEvaluationSaveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapturedEvaluationSaveResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The edited captured evaluation is invalid or unsafe."
+          },
+          "404": {
+            "description": "The requested session or evaluation resource does not exist."
+          },
+          "409": {
+            "description": "The captured evidence or compare-and-swap baseline changed."
+          },
+          "413": {
+            "description": "The bounded captured evidence or result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Save Captured Evaluation"
       }
     },
     "/api/evals/targets": {

@@ -100,8 +100,8 @@ def test_serve_uses_the_maintained_service_factory_for_explicit_local_developmen
         "reason_code": None,
     }
     assert readiness["captured_result_persistence"] == {
-        "state": "unsupported",
-        "reason_code": "captured_result_persistence_not_available",
+        "state": "ready",
+        "reason_code": None,
     }
     output = capsys.readouterr().out
     assert "Cayu product service: http://127.0.0.1:8123/api/operations" in output

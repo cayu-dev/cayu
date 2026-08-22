@@ -518,14 +518,14 @@ def test_evals_api_imports_executes_compares_and_exports_deterministically(tmp_p
             }
             assert capabilities["evals_readiness"] == {
                 "captured_evaluation": {
-                    "state": "gated",
-                    "reason_code": "evaluation_promotion_not_configured",
+                    "state": "ready",
+                    "reason_code": None,
                 },
                 "catalog_read": {"state": "ready", "reason_code": None},
                 "catalog_write": {"state": "ready", "reason_code": None},
                 "captured_result_persistence": {
-                    "state": "unsupported",
-                    "reason_code": "captured_result_persistence_not_available",
+                    "state": "ready",
+                    "reason_code": None,
                 },
                 "scenario_conversion": {
                     "state": "unsupported",

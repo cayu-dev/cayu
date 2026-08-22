@@ -274,6 +274,11 @@ REVISIONS: tuple[Revision, ...] = (
     # the index atomically; pre-47 EvalStore workers would publish unindexed
     # results, so mixed-version writers are unsafe.
     Revision(revision=47, kind=RevisionKind.BREAKING, compatible_from=47),
+    # Captured-only eval cases deliberately carry no runnable input. Their
+    # catalog rows therefore record zero messages, while corpus-v1 fresh cases
+    # retain the existing one-to-sixteen bound. Older EvalStore writers cannot
+    # publish this representation, so mixed-version writers are unsafe.
+    Revision(revision=48, kind=RevisionKind.BREAKING, compatible_from=48),
 )
 
 #: The revision an empty database is initialized to.

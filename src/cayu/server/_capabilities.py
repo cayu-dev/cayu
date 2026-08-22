@@ -38,6 +38,7 @@ class ControlPlaneCapabilitySnapshot:
     eval_store_configured: bool
     eval_target_configured: bool
     eval_project_identity_configured: bool
+    eval_captured_results_supported: bool
 
     @property
     def evaluation_promotion_supported(self) -> bool:
@@ -145,6 +146,7 @@ def inspect_control_plane_capabilities(
     eval_store_configured: bool | None = None,
     eval_target_configured: bool | None = None,
     eval_project_identity_configured: bool | None = None,
+    eval_captured_results_supported: bool = False,
 ) -> ControlPlaneCapabilitySnapshot:
     """Capture fixed capability inputs once, without probing external services."""
 
@@ -173,6 +175,7 @@ def inspect_control_plane_capabilities(
         ("eval_store_configured", eval_store_configured),
         ("eval_target_configured", eval_target_configured),
         ("eval_project_identity_configured", eval_project_identity_configured),
+        ("eval_captured_results_supported", eval_captured_results_supported),
     ):
         if type(value) is not bool:
             raise TypeError(f"{field_name} must be a bool.")
@@ -197,6 +200,7 @@ def inspect_control_plane_capabilities(
         eval_store_configured=eval_store_configured,
         eval_target_configured=eval_target_configured,
         eval_project_identity_configured=eval_project_identity_configured,
+        eval_captured_results_supported=eval_captured_results_supported,
     )
 
 
@@ -259,10 +263,13 @@ def _evaluation_promotion_surface(
 
 
 def _evals_readiness(snapshot: ControlPlaneCapabilitySnapshot) -> EvalsReadiness:
-    if not snapshot.evaluation_promotion_configured:
+    # Captured evaluation routes resolve the session's agent through the
+    # published eval-target registry.  The older runnable-promotion config has
+    # its own capability surface and must not make this workflow look ready.
+    if not snapshot.eval_target_configured:
         captured_evaluation = EvalsOperationReadiness(
             state="gated",
-            reason_code="evaluation_promotion_not_configured",
+            reason_code="eval_target_not_configured",
         )
     elif not snapshot.terminal_session_evidence_supported:
         captured_evaluation = EvalsOperationReadiness(
@@ -308,17 +315,22 @@ def _evals_readiness(snapshot: ControlPlaneCapabilitySnapshot) -> EvalsReadiness
             ),
         )
 
-    if store_ready and identity_ready:
-        captured_result_persistence = EvalsOperationReadiness(
-            state="unsupported",
-            reason_code="captured_result_persistence_not_available",
-        )
-    else:
+    if not store_ready or not target_ready or not identity_ready:
         captured_result_persistence = EvalsOperationReadiness(
             state="gated",
             reason_code=(
                 "eval_store_not_configured" if not store_ready else "eval_target_not_configured"
             ),
+        )
+    elif snapshot.eval_captured_results_supported:
+        captured_result_persistence = EvalsOperationReadiness(
+            state="ready",
+            reason_code=None,
+        )
+    else:
+        captured_result_persistence = EvalsOperationReadiness(
+            state="unsupported",
+            reason_code="captured_result_persistence_not_available",
         )
 
     return EvalsReadiness(

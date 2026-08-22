@@ -32,6 +32,7 @@ from cayu.evals.store import (
     EvalBaselineUpdate,
     EvalCaseCatalogQuery,
     EvalCatalogQuery,
+    EvalResultQuery,
     EvalRunClaimLost,
     EvalRunFailureCode,
     EvalRunQuery,
@@ -589,6 +590,39 @@ async def assert_captured_eval_store_conformance(
     assert fresh_record.origin is EvalResultOrigin.FRESH_EXECUTION
     assert await store.load_result_by_revision(result.revision) == result
 
+    first_result_page = await store.list_results(
+        EvalResultQuery(target_key=corpus.target_key, limit=1)
+    )
+    assert len(first_result_page.items) == 1
+    assert first_result_page.next_cursor is not None
+    second_result_page = await store.list_results(
+        EvalResultQuery(
+            target_key=corpus.target_key,
+            limit=1,
+            cursor=first_result_page.next_cursor,
+        )
+    )
+    assert len(second_result_page.items) == 1
+    assert {
+        first_result_page.items[0].revision,
+        second_result_page.items[0].revision,
+    } == {captured.revision, result.revision}
+    captured_page = await store.list_results(
+        EvalResultQuery(
+            target_key=corpus.target_key,
+            origin=EvalResultOrigin.CAPTURED_SESSION,
+        )
+    )
+    assert [item.revision for item in captured_page.items] == [captured.revision]
+    with pytest.raises(ValueError, match="cursor does not match this query"):
+        await store.list_results(
+            EvalResultQuery(
+                target_key=corpus.target_key,
+                origin=EvalResultOrigin.CAPTURED_SESSION,
+                cursor=first_result_page.next_cursor,
+            )
+        )
+
     key = EvalBaselineKey(
         target_key=corpus.target_key,
         corpus_revision=corpus.revision,
@@ -684,4 +718,35 @@ async def assert_captured_eval_store_conformance(
             ),
             redact_json=_NO_SECRETS.redact_json,
         )
+
+    captured_case = EvalCaseSpec.create(
+        id=corpus.cases[0].id,
+        suite_id=corpus.cases[0].suite_id,
+        name=corpus.cases[0].name,
+        description=corpus.cases[0].description,
+        source=corpus.cases[0].source,
+        input=None,
+        assertions=corpus.cases[0].assertions,
+    )
+    captured_only_corpus = EvalCorpusDocument.create(
+        target_key=corpus.target_key,
+        evidence_policy=corpus.evidence_policy,
+        pricing_profile=corpus.pricing_profile,
+        suites=corpus.suites,
+        cases=(captured_case,),
+    )
+    captured_only_result = captured_result_for_corpus(captured_only_corpus, result)
+    captured_only_record = await store.save_captured_result(
+        captured_only_corpus,
+        captured_only_result,
+        redact_json=_NO_SECRETS.redact_json,
+    )
+    assert captured_only_record.corpus_revision == captured_only_corpus.revision
+    captured_cases = await store.list_cases(
+        EvalCaseCatalogQuery(
+            corpus_revision=captured_only_corpus.revision,
+            suite_id=captured_only_corpus.suites[0].id,
+        )
+    )
+    assert captured_cases.items[0].message_count == 0
     return captured, key, final_mutation

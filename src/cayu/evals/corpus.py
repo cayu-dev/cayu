@@ -881,7 +881,13 @@ class EvalSuiteSpec(_PortableModel):
 
 
 class EvalCaseSpec(_PortableModel):
-    """One portable request and deterministic expectation set."""
+    """One deterministic expectation set with optional fresh-run input.
+
+    Captured-session evaluations intentionally set ``input`` to ``None`` when
+    the retained evidence cannot be represented as one corpus-v1 invocation.
+    Such cases remain portable historical evaluation contracts, but execution
+    rejects them until a runnable input or scenario is authored.
+    """
 
     id: StrictStr
     revision: StrictStr
@@ -889,7 +895,10 @@ class EvalCaseSpec(_PortableModel):
     name: StrictStr
     description: StrictStr | None = None
     source: EvaluationSourceIdentityV1
-    input: RunInputSpec
+    # The field is required even when its value is null.  Requiring an explicit
+    # null keeps captured-only cases intentional and prevents a malformed
+    # runnable corpus that merely omitted ``input`` from being accepted.
+    input: RunInputSpec | None
     assertions: tuple[AssertionSpec, ...] = Field(
         min_length=1,
         max_length=EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
@@ -955,16 +964,18 @@ class EvalCaseSpec(_PortableModel):
         suite_id: str,
         name: str,
         source: EvaluationSourceIdentityV1,
-        input: RunInputSpec,
+        input: RunInputSpec | None,
         assertions: Sequence[AssertionSpec],
         description: str | None = None,
     ) -> EvalCaseSpec:
         if type(source) is not EvaluationSourceIdentityV1:
             raise TypeError("source must be an exact EvaluationSourceIdentityV1.")
-        if type(input) is not RunInputSpec:
-            raise TypeError("input must be an exact RunInputSpec.")
+        if input is not None and type(input) is not RunInputSpec:
+            raise TypeError("input must be an exact RunInputSpec or None.")
         validated_source = EvaluationSourceIdentityV1.model_validate(_model_python_input(source))
-        validated_input = RunInputSpec.model_validate(_model_python_input(input))
+        validated_input = (
+            None if input is None else RunInputSpec.model_validate(_model_python_input(input))
+        )
         ordered_assertions = _ordered_sequence_argument(assertions, "assertions")
         validated_assertions = tuple(_validated_assertion_spec(item) for item in ordered_assertions)
         document: dict[str, Any] = {
@@ -973,7 +984,7 @@ class EvalCaseSpec(_PortableModel):
             "name": name,
             "description": description,
             "source": validated_source.model_dump(mode="json"),
-            "input": validated_input.model_dump(mode="json"),
+            "input": (None if validated_input is None else validated_input.model_dump(mode="json")),
             "assertions": [assertion.model_dump(mode="json") for assertion in validated_assertions],
         }
         return cls(revision=_content_revision(document, "eval case spec"), **document)

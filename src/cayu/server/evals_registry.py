@@ -177,6 +177,27 @@ class EvalTargetRegistry:
 
         return self._registrations.get(target_key)
 
+    def registration_for_agent(
+        self,
+        agent_name: str,
+    ) -> EvalTargetRegistration | None:
+        """Resolve the unambiguous published target for one session agent."""
+
+        agent_name = _target_identity_component(agent_name, "agent_name")
+        matches = tuple(
+            registration
+            for registration in self._registrations.values()
+            if registration.catalog_entry.agent_name == agent_name
+        )
+        if len(matches) == 1:
+            return matches[0]
+        defaults = tuple(
+            registration
+            for registration in matches
+            if registration.catalog_entry.profile_id == DEFAULT_EVAL_PROFILE_ID
+        )
+        return defaults[0] if len(defaults) == 1 else None
+
 
 @dataclass(frozen=True, slots=True, repr=False)
 class ResolvedEvalsRuntime:

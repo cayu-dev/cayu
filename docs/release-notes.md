@@ -111,6 +111,22 @@ intent; the default policy rejects the drift before work. Pre-change serialized
 adoption requests have a different fingerprint and must be resubmitted under
 the new contract. No storage migration is required.
 
+### Captured sessions become durable evaluations from the Control Plane
+
+Completed and failed retained sessions now expose an **Evaluate** workflow that
+previews public-safe evidence, creates assertions from observed facts, scores
+without rerunning the application, and atomically saves an immutable captured
+result with its expectation corpus. The Evals Results catalog exposes captured
+and fresh results together, with actor-attributed compare-and-swap baseline
+approval. Captured-only corpora contain no invented replay input and fresh-run
+admission explains that runnable input or a scenario must be authored first.
+
+Storage revision 48 is a breaking boundary that permits the case catalog to
+represent captured-only cases with zero runnable messages. Stop revision-47
+workers, back up each SQLite or PostgreSQL store, run `cayu storage migrate`,
+and confirm revision 48 before starting current workers. Mixed revision-47 and
+revision-48 workers are unsupported.
+
 ### OpenAI Responses background work survives worker loss
 
 `OpenAIProvider(background=True)` now starts stored, streamed Responses API

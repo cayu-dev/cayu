@@ -138,7 +138,7 @@ def test_dashboard_eject_materializes_version_matched_editable_project(
 
     manifest = json.loads((destination / "cayu-dashboard-source.json").read_text(encoding="utf-8"))
     assert manifest["cayu_version"] == _version()
-    assert manifest["server_contract_version"] == "17"
+    assert manifest["server_contract_version"] == "18"
     assert manifest["source_digest"].startswith("sha256:")
     package = json.loads((destination / "package.json").read_text(encoding="utf-8"))
     assert "build:package" not in package["scripts"]
@@ -153,7 +153,7 @@ def test_dashboard_eject_materializes_version_matched_editable_project(
     output = capsys.readouterr().out
     assert f"installed Cayu version: {_version()}" in output
     assert f"dashboard source version: {_version()}" in output
-    assert "dashboard server contract: v17" in output
+    assert "dashboard server contract: v18" in output
     assert f"Project directory: {destination}" in output
     assert f"cd {destination}" not in output
     assert "npm ci" in output

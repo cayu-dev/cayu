@@ -10,8 +10,13 @@ const {
   fetchEvalCases,
   fetchEvalCorpora,
   fetchEvalRuns,
+  fetchEvalResultDetail,
+  fetchEvalResults,
   fetchEvalTargets,
   importEvalCorpus,
+  previewCapturedEvaluation,
+  saveCapturedEvaluation,
+  selectEvalBaseline,
 } = await import("../src/lib/api.ts")
 const { preflightEvalCorpusFile } = await import("../src/lib/evals-dashboard.ts")
 
@@ -164,4 +169,59 @@ test("eval corpus imports preserve the selected file bytes for strict server val
   assert.equal(requestHeaders.get("content-type"), "application/json")
   assert.equal(requestBody, corpus)
   assert.deepEqual(new Uint8Array(await requestBody.arrayBuffer()), raw)
+})
+
+test("captured evaluation adapters preserve revisions, target scope, and baseline CAS", async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  const revision = `sha256:${"a".repeat(64)}`
+  const controller = new AbortController()
+  globalThis.fetch = async (input, init) => {
+    calls.push({ input: String(input), init })
+    return new Response(JSON.stringify({ items: [], record: {}, baseline: {}, mutation: {} }), {
+      status: String(input).endsWith("/save") ? 201 : 200,
+      headers: { "content-type": "application/json" },
+    })
+  }
+  const candidate = { revision }
+  try {
+    await previewCapturedEvaluation("session/one", undefined, controller.signal)
+    await saveCapturedEvaluation(
+      "session/one",
+      { candidate, expected_candidate_revision: revision },
+      controller.signal,
+    )
+    await fetchEvalResults(
+      { target_key: "eval.target", origin: "captured_session", cursor: "next", limit: 10 },
+      controller.signal,
+    )
+    await fetchEvalResultDetail(revision, controller.signal)
+    await selectEvalBaseline(
+      revision,
+      { result_revision: revision, expected_generation: 2, operation_id: revision },
+      controller.signal,
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.equal(calls[0].input, "/api/evals/sessions/session%2Fone/evaluation/preview")
+  assert.deepEqual(JSON.parse(calls[0].init.body), { draft: null })
+  assert.equal(calls[1].input, "/api/evals/sessions/session%2Fone/evaluation/save")
+  assert.deepEqual(JSON.parse(calls[1].init.body), {
+    candidate,
+    expected_candidate_revision: revision,
+  })
+  assert.equal(
+    calls[2].input,
+    "/api/evals/results?target_key=eval.target&origin=captured_session&cursor=next&limit=10",
+  )
+  assert.equal(calls[3].input, `/api/evals/results/${encodeURIComponent(revision)}`)
+  assert.equal(calls[4].input, `/api/evals/results/${encodeURIComponent(revision)}/baseline`)
+  assert.deepEqual(JSON.parse(calls[4].init.body), {
+    result_revision: revision,
+    expected_generation: 2,
+    operation_id: revision,
+  })
+  assert.equal(calls[4].init.signal, controller.signal)
 })

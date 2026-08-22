@@ -214,8 +214,8 @@ def test_promotion_capability_and_routes_require_authentication() -> None:
         "mutate": {"enabled": True, "unavailable_reason": None},
     }
     assert capabilities["evals_readiness"]["captured_evaluation"] == {
-        "state": "ready",
-        "reason_code": None,
+        "state": "gated",
+        "reason_code": "eval_target_not_configured",
     }
     assert capabilities["evals_readiness"]["catalog_read"] == {
         "state": "gated",
@@ -224,15 +224,11 @@ def test_promotion_capability_and_routes_require_authentication() -> None:
 
 
 @pytest.mark.parametrize(
-    ("store_type", "reason_code"),
-    [
-        (_NoTerminalEvidenceSessionStore, "terminal_evidence_not_supported"),
-        (_NoSessionLineageStore, "session_lineage_not_supported"),
-    ],
+    "store_type",
+    [_NoTerminalEvidenceSessionStore, _NoSessionLineageStore],
 )
-def test_captured_evaluation_readiness_identifies_the_missing_store_capability(
+def test_runnable_promotion_does_not_claim_captured_evaluation_readiness(
     store_type: type[InMemorySessionStore],
-    reason_code: str,
 ) -> None:
     app = CayuApp(session_store=store_type(), enable_logging=False)
     app.register_provider(_PromotionProvider(), default=True)
@@ -246,8 +242,8 @@ def test_captured_evaluation_readiness_identifies_the_missing_store_capability(
         "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
     }
     assert capabilities["evals_readiness"]["captured_evaluation"] == {
-        "state": "unsupported",
-        "reason_code": reason_code,
+        "state": "gated",
+        "reason_code": "eval_target_not_configured",
     }
 
 

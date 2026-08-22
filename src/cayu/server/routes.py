@@ -78,12 +78,23 @@ from cayu.evals.execution_reporting import (
 )
 from cayu.evals.models import Trajectory
 from cayu.evals.promotion import (
+    CapturedEvaluationCandidateV1,
+    CapturedRunScoreV1,
     PromotionCandidateV1,
     SessionPromotionError,
+    build_captured_evaluation_candidate,
     build_promotion_candidate,
+    corpus_from_captured_evaluation_candidate,
     corpus_from_promotion_candidate,
+    export_captured_evaluation_corpus,
     export_promotion_corpus,
+    score_captured_evaluation_candidate,
     score_promotion_candidate,
+)
+from cayu.evals.results import (
+    CapturedEvaluationResultV1,
+    EvalResultOrigin,
+    EvalResultTargetIdentityV1,
 )
 from cayu.evals.store import (
     EVAL_STORE_DEFAULT_PAGE_BYTES,
@@ -92,12 +103,18 @@ from cayu.evals.store import (
     EVAL_STORE_MAX_IDENTIFIER_CHARS,
     EVAL_STORE_MAX_PAGE_BYTES,
     EVAL_STORE_MAX_PAGE_SIZE,
+    EvalBaselineConflict,
+    EvalBaselineKey,
+    EvalBaselineUpdate,
     EvalCaseCatalogPage,
     EvalCaseCatalogQuery,
     EvalCatalogQuery,
     EvalCorpusCatalogEntry,
     EvalCorpusCatalogPage,
     EvalCorpusConflict,
+    EvalResultConflict,
+    EvalResultPage,
+    EvalResultQuery,
     EvalRunAdmissionConflict,
     EvalRunPage,
     EvalRunQuery,
@@ -252,9 +269,11 @@ from cayu.server.contracts import (
     ARTIFACT_CONTENT_ENDPOINT_RESPONSES,
     ARTIFACT_ENDPOINT_ERROR_RESPONSES,
     BOUNDED_STREAMING_ENDPOINT_RESPONSES,
+    CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
     CAUSAL_BUDGET_SUMMARY_ENDPOINT_RESPONSES,
     EVALS_ENDPOINT_RESPONSES,
     EVALUATION_PROMOTION_ENDPOINT_RESPONSES,
+    MAX_CAPTURED_EVALUATION_REQUEST_BYTES,
     MAX_CONTROL_PLANE_METADATA_BYTES,
     MAX_CONTROL_PLANE_METADATA_MEMBERS,
     MAX_CONTROL_PLANE_METADATA_NESTING,
@@ -281,11 +300,21 @@ from cayu.server.contracts import (
     ApiTaskListItem,
     ArtifactReadResponse,
     ArtifactsResponse,
+    CapturedEvaluationConversion,
+    CapturedEvaluationDraft,
+    CapturedEvaluationExportRequest,
+    CapturedEvaluationPreviewRequest,
+    CapturedEvaluationPreviewResponse,
+    CapturedEvaluationSaveRequest,
+    CapturedEvaluationSaveResponse,
     CausalBudgetSummaryResponse,
     ClientGenerationContract,
     EnvironmentsResponse,
+    EvalBaselineSelectionRequest,
+    EvalBaselineSelectionResponse,
     EvalComparisonRequest,
     EvalComparisonResponse,
+    EvalResultDetailResponse,
     EvalResultResponse,
     EvalRunCreateRequest,
     EvalTargetCatalogResponse,
@@ -315,6 +344,7 @@ from cayu.server.contracts import (
     UsageRollupResponse,
 )
 from cayu.server.evals_registry import (
+    EvalTargetRegistration,
     generated_eval_target_registry,
     resolved_evals_runtime,
 )
@@ -671,11 +701,20 @@ class _BoundedControlPlaneRequestRoute(_BoundedPrivateJsonBodyRoute):
 
 
 class _BoundedEvaluationPromotionRoute(_BoundedPrivateJsonBodyRoute):
-    """Bound complete canonical candidates before JSON parsing or validation."""
+    """Bound runnable-promotion candidates before JSON parsing or validation."""
 
     max_request_bytes = MAX_EVALUATION_PROMOTION_REQUEST_BYTES
     invalid_request_detail = "Invalid evaluation promotion request."
     oversized_request_detail = "Evaluation promotion request exceeds the server byte limit."
+    reject_duplicate_json_keys = True
+
+
+class _BoundedCapturedEvaluationRoute(_BoundedPrivateJsonBodyRoute):
+    """Bound captured-evaluation candidates before JSON parsing or validation."""
+
+    max_request_bytes = MAX_CAPTURED_EVALUATION_REQUEST_BYTES
+    invalid_request_detail = "Invalid captured evaluation request."
+    oversized_request_detail = "Captured evaluation request exceeds the server byte limit."
     reject_duplicate_json_keys = True
 
 
@@ -3577,6 +3616,7 @@ def create_router(
     router = APIRouter(prefix=api_prefix, lifespan=evals_lifespan)
     bounded_control_plane_router = APIRouter(route_class=_BoundedControlPlaneRequestRoute)
     bounded_evaluation_promotion_router = APIRouter(route_class=_BoundedEvaluationPromotionRoute)
+    bounded_captured_evaluation_router = APIRouter(route_class=_BoundedCapturedEvaluationRoute)
     bounded_evals_router = APIRouter(
         route_class=(_BoundedEvalsRoute if auth is None else _bounded_evals_route_class(auth))
     )
@@ -3600,6 +3640,9 @@ def create_router(
         eval_project_identity_configured=(
             (eval_runtime is not None and evals is not None)
             or (_project_context is not None and _project_context.project_id is not None)
+        ),
+        eval_captured_results_supported=(
+            eval_runtime is not None and eval_runtime.store.captured_results
         ),
     )
     if dashboard_access_authenticated is None and dashboard_configured:
@@ -4176,6 +4219,461 @@ def create_router(
         async def list_eval_targets() -> EvalTargetCatalogResponse:
             return eval_registry.catalog()
 
+        captured_eval_store = None if eval_runtime is None else eval_runtime.store
+
+        async def _load_captured_evaluation_baseline(
+            public_session_id: str,
+        ) -> tuple[Trajectory, EvalTargetRegistration, CapturedEvaluationCandidateV1]:
+            private_session_id = await _resolve_public_session_id(public_session_id)
+            try:
+                trajectory = await trajectory_from_session(cayu_app, private_session_id)
+            except SessionTrajectoryError as exc:
+                _raise_promotion_trajectory_error(exc)
+            session = trajectory.session
+            if session is None:
+                raise HTTPException(status_code=409, detail="Captured session evidence is absent.")
+            registration = eval_registry.registration_for_agent(session.agent_name)
+            if registration is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The session agent has no unambiguous published eval target.",
+                )
+            target = registration.target
+            try:
+                candidate = build_captured_evaluation_candidate(
+                    cayu_app,
+                    trajectory,
+                    target_key=target.key,
+                    source_agent_name=target.request_base.agent_name,
+                    application_release_id=target.application_release_id,
+                    evidence_policy=target.evidence_policy,
+                    pricing=target.price_book,
+                    project_root=registration.manifest_project_root,
+                )
+            except SessionPromotionError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_promotion_error_detail(
+                        "source_ineligible",
+                        str(exc),
+                        reason=exc.code.value,
+                    ),
+                ) from exc
+            return trajectory, registration, candidate
+
+        def _captured_candidate_from_draft(
+            baseline: CapturedEvaluationCandidateV1,
+            draft: CapturedEvaluationDraft,
+        ) -> CapturedEvaluationCandidateV1:
+            if draft.expected_baseline_revision != baseline.revision:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_promotion_error_detail(
+                        "preview_stale",
+                        "The captured evidence changed; preview the session again.",
+                    ),
+                )
+            _require_safe_promotion_document(
+                draft.model_dump(mode="json"),
+                code="draft_rejected",
+                failure_subject="The edited captured evaluation",
+            )
+            try:
+                suite = EvalSuiteSpec.create(
+                    id=draft.suite.id,
+                    name=draft.suite.name,
+                    description=draft.suite.description,
+                )
+                case = EvalCaseSpec.create(
+                    id=draft.case.id,
+                    suite_id=draft.case.suite_id,
+                    name=draft.case.name,
+                    description=draft.case.description,
+                    source=baseline.source.case_source(),
+                    input=None,
+                    assertions=draft.case.assertions,
+                )
+                candidate = CapturedEvaluationCandidateV1.create(
+                    target_key=baseline.target_key,
+                    source=baseline.source,
+                    evidence_policy=baseline.evidence_policy,
+                    pricing_profile=baseline.pricing_profile,
+                    evidence=baseline.evidence,
+                    suite=suite,
+                    case=case,
+                )
+                corpus_from_captured_evaluation_candidate(candidate)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=_promotion_error_detail(
+                        "draft_rejected",
+                        "The edited captured evaluation violates its portable contract.",
+                    ),
+                ) from exc
+            return candidate
+
+        def _captured_server_fields_match(
+            candidate: CapturedEvaluationCandidateV1,
+            baseline: CapturedEvaluationCandidateV1,
+        ) -> bool:
+            return (
+                candidate.target_key == baseline.target_key
+                and candidate.source == baseline.source
+                and candidate.evidence_policy == baseline.evidence_policy
+                and candidate.pricing_profile == baseline.pricing_profile
+                and candidate.evidence == baseline.evidence
+                and candidate.warnings == baseline.warnings
+            )
+
+        def _runnable_conversion(
+            trajectory: Trajectory,
+            registration: EvalTargetRegistration,
+        ) -> CapturedEvaluationConversion:
+            target = registration.target
+            try:
+                build_promotion_candidate(
+                    cayu_app,
+                    trajectory,
+                    target_key=target.key,
+                    source_agent_name=target.request_base.agent_name,
+                    application_release_id=target.application_release_id,
+                    evidence_policy=target.evidence_policy,
+                    pricing=target.price_book,
+                    project_root=registration.manifest_project_root,
+                )
+            except SessionPromotionError as exc:
+                return CapturedEvaluationConversion(
+                    available=False,
+                    reason_code=exc.code.value,
+                )
+            except (TypeError, ValueError):
+                return CapturedEvaluationConversion(
+                    available=False,
+                    reason_code="conversion_contract_unavailable",
+                )
+            return CapturedEvaluationConversion(available=True)
+
+        async def _require_current_captured_candidate(
+            session_id: str,
+            candidate: CapturedEvaluationCandidateV1,
+            expected_revision: str,
+        ) -> tuple[Trajectory, EvalTargetRegistration, CapturedEvaluationCandidateV1]:
+            if expected_revision != candidate.revision:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_promotion_error_detail(
+                        "preview_stale",
+                        "The evaluation changed after preview; preview it again.",
+                    ),
+                )
+            _require_safe_promotion_document(
+                candidate.model_dump(mode="json"),
+                code="candidate_rejected",
+                failure_subject="The captured evaluation",
+            )
+            trajectory, registration, baseline = await _load_captured_evaluation_baseline(
+                session_id
+            )
+            if not _captured_server_fields_match(candidate, baseline):
+                raise HTTPException(
+                    status_code=409,
+                    detail=_promotion_error_detail(
+                        "preview_stale",
+                        "The captured evidence or target identity changed.",
+                    ),
+                )
+            return trajectory, registration, baseline
+
+        def _score_current_captured_candidate(
+            trajectory: Trajectory,
+            registration: EvalTargetRegistration,
+            candidate: CapturedEvaluationCandidateV1,
+        ) -> CapturedRunScoreV1:
+            """Revalidate one current candidate through the side-effect-free scorer."""
+
+            target = registration.target
+            try:
+                return score_captured_evaluation_candidate(
+                    cayu_app,
+                    trajectory,
+                    candidate,
+                    target_key=target.key,
+                    source_agent_name=target.request_base.agent_name,
+                    application_release_id=target.application_release_id,
+                    pricing=target.price_book,
+                    project_root=registration.manifest_project_root,
+                )
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=_promotion_error_detail(
+                        "candidate_rejected",
+                        "The captured evaluation cannot be scored from its retained evidence.",
+                    ),
+                ) from exc
+
+        @bounded_captured_evaluation_router.post(
+            "/evals/sessions/{session_id}/evaluation/preview",
+            response_model=CapturedEvaluationPreviewResponse,
+            responses=CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def preview_captured_evaluation(
+            session_id: str,
+            body: CapturedEvaluationPreviewRequest,
+        ) -> CapturedEvaluationPreviewResponse:
+            trajectory, registration, baseline = await _load_captured_evaluation_baseline(
+                session_id
+            )
+            candidate = (
+                baseline
+                if body.draft is None
+                else _captured_candidate_from_draft(baseline, body.draft)
+            )
+            captured_score = _score_current_captured_candidate(
+                trajectory,
+                registration,
+                candidate,
+            )
+            return CapturedEvaluationPreviewResponse(
+                baseline_revision=baseline.revision,
+                candidate=candidate,
+                captured_score=captured_score,
+                runnable_conversion=_runnable_conversion(trajectory, registration),
+            )
+
+        @bounded_captured_evaluation_router.post(
+            "/evals/sessions/{session_id}/evaluation/save",
+            response_model=CapturedEvaluationSaveResponse,
+            status_code=201,
+            responses=CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def save_captured_evaluation(
+            session_id: str,
+            body: CapturedEvaluationSaveRequest,
+        ) -> CapturedEvaluationSaveResponse:
+            if captured_eval_store is None or not captured_eval_store.captured_results:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Durable captured-result persistence is not available.",
+                )
+            trajectory, registration, _ = await _require_current_captured_candidate(
+                session_id,
+                body.candidate,
+                body.expected_candidate_revision,
+            )
+            try:
+                score = _score_current_captured_candidate(
+                    trajectory,
+                    registration,
+                    body.candidate,
+                )
+                corpus = corpus_from_captured_evaluation_candidate(body.candidate)
+                result = CapturedEvaluationResultV1.create(
+                    corpus=corpus,
+                    target=EvalResultTargetIdentityV1(
+                        target_key=body.candidate.target_key,
+                        application_release_id=body.candidate.source.application_release_id,
+                        app_manifest_schema_version=(
+                            body.candidate.source.app_manifest_schema_version
+                        ),
+                        app_manifest_fingerprint=(body.candidate.source.app_manifest_fingerprint),
+                    ),
+                    score=score,
+                )
+                record = await captured_eval_store.save_captured_result(
+                    corpus,
+                    result,
+                    redact_json=cayu_app.redact_json,
+                )
+            except (EvalCorpusConflict, EvalResultConflict) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The immutable captured evaluation conflicts with stored content.",
+                ) from exc
+            except EvalStorePublicationRejected as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="The captured evaluation contains unsafe public data.",
+                ) from exc
+            except EvalStoreResultTooLarge as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail="The captured evaluation exceeds the server byte limit.",
+                ) from exc
+            return CapturedEvaluationSaveResponse(record=record, result=result)
+
+        @bounded_captured_evaluation_router.post(
+            "/evals/sessions/{session_id}/evaluation/export",
+            response_class=Response,
+            responses=CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def export_captured_evaluation(
+            session_id: str,
+            body: CapturedEvaluationExportRequest,
+        ) -> Response:
+            trajectory, registration, _ = await _require_current_captured_candidate(
+                session_id,
+                body.candidate,
+                body.expected_candidate_revision,
+            )
+            _score_current_captured_candidate(
+                trajectory,
+                registration,
+                body.candidate,
+            )
+            content = export_captured_evaluation_corpus(body.candidate)
+            return Response(
+                content=content,
+                media_type="application/json",
+                headers={
+                    "Content-Disposition": (
+                        f'attachment; filename="{body.candidate.target_key}-captured.eval.json"'
+                    )
+                },
+            )
+
+        @bounded_captured_evaluation_router.get(
+            "/evals/results",
+            response_model=EvalResultPage,
+            responses=CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def list_eval_results(
+            target_key: Annotated[str, Query(max_length=EVAL_STORE_MAX_IDENTIFIER_CHARS)],
+            cursor: Annotated[str | None, Query(max_length=EVAL_STORE_MAX_CURSOR_BYTES)] = None,
+            limit: Annotated[int, Query(ge=1, le=EVAL_STORE_MAX_PAGE_SIZE)] = (
+                EVAL_STORE_DEFAULT_PAGE_SIZE
+            ),
+            max_result_bytes: Annotated[
+                int,
+                Query(ge=1_024, le=EVAL_STORE_MAX_PAGE_BYTES),
+            ] = EVAL_STORE_DEFAULT_PAGE_BYTES,
+            origin: Annotated[EvalResultOrigin | None, Query()] = None,
+        ) -> EvalResultPage:
+            if captured_eval_store is None or not captured_eval_store.captured_results:
+                raise HTTPException(status_code=409, detail="Eval result catalog is unavailable.")
+            if eval_registry.get(target_key) is None:
+                raise HTTPException(status_code=404, detail="Eval target not found.")
+            try:
+                return await captured_eval_store.list_results(
+                    EvalResultQuery(
+                        target_key=target_key,
+                        origin=origin,
+                        cursor=cursor,
+                        limit=limit,
+                        max_result_bytes=max_result_bytes,
+                    )
+                )
+            except NotImplementedError as exc:
+                raise HTTPException(
+                    status_code=409, detail="Eval result catalog is unavailable."
+                ) from exc
+            except EvalStoreResultTooLarge as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Eval result catalog exceeds the requested byte limit.",
+                ) from exc
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=422, detail="Invalid Evals query.") from exc
+
+        @bounded_captured_evaluation_router.get(
+            "/evals/results/{result_revision}",
+            response_model=EvalResultDetailResponse,
+            responses=CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def get_eval_result(result_revision: str) -> EvalResultDetailResponse:
+            if captured_eval_store is None or not captured_eval_store.captured_results:
+                raise HTTPException(status_code=409, detail="Eval result catalog is unavailable.")
+            try:
+                record = await captured_eval_store.load_result_record(result_revision)
+                result = await captured_eval_store.load_result_by_revision(result_revision)
+            except NotImplementedError as exc:
+                raise HTTPException(
+                    status_code=409, detail="Eval result catalog is unavailable."
+                ) from exc
+            except EvalStoreResultTooLarge as exc:
+                raise HTTPException(status_code=413, detail="Eval result is too large.") from exc
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422, detail="Invalid eval result revision."
+                ) from exc
+            if (
+                record is None
+                or result is None
+                or eval_registry.get(record.target.target_key) is None
+            ):
+                raise HTTPException(status_code=404, detail="Eval result not found.")
+            key = EvalBaselineKey(
+                target_key=record.target.target_key,
+                corpus_revision=record.corpus_revision,
+                suite_id=record.suite_id,
+            )
+            baseline = await captured_eval_store.load_baseline(key)
+            return EvalResultDetailResponse(record=record, result=result, baseline=baseline)
+
+        @bounded_captured_evaluation_router.post(
+            "/evals/results/{result_revision}/baseline",
+            response_model=EvalBaselineSelectionResponse,
+            responses=CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
+        )
+        async def select_eval_baseline(
+            result_revision: str,
+            body: EvalBaselineSelectionRequest,
+            auth_context: AuthContext | None = optional_auth_context,
+        ) -> EvalBaselineSelectionResponse:
+            if captured_eval_store is None or not captured_eval_store.captured_results:
+                raise HTTPException(status_code=409, detail="Eval baselines are unavailable.")
+            if body.result_revision != result_revision:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Result revision path and request body do not match.",
+                )
+            try:
+                record = await captured_eval_store.load_result_record(result_revision)
+            except (NotImplementedError, TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422, detail="Invalid eval result revision."
+                ) from exc
+            if record is None or eval_registry.get(record.target.target_key) is None:
+                raise HTTPException(status_code=404, detail="Eval result not found.")
+            actor_id = (
+                "cayu:trusted-local-development" if auth_context is None else auth_context.subject
+            )
+            key = EvalBaselineKey(
+                target_key=record.target.target_key,
+                corpus_revision=record.corpus_revision,
+                suite_id=record.suite_id,
+            )
+            try:
+                mutation = await captured_eval_store.set_baseline(
+                    EvalBaselineUpdate(
+                        key=key,
+                        result_revision=result_revision,
+                        expected_generation=body.expected_generation,
+                        operation_id=body.operation_id,
+                        actor_id=actor_id,
+                    ),
+                    redact_json=cayu_app.redact_json,
+                )
+            except EvalBaselineConflict as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except EvalStorePublicationRejected as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="The authenticated baseline actor cannot cross the public boundary.",
+                ) from exc
+            except (KeyError, TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="Invalid baseline selection.") from exc
+            baseline = await captured_eval_store.load_baseline(key)
+            if baseline is None:
+                raise RuntimeError("Committed eval baseline is unavailable.")
+            return EvalBaselineSelectionResponse(baseline=baseline, mutation=mutation)
+
     if eval_runtime is not None:
         eval_store = eval_runtime.store
         active_eval_registry = eval_runtime.registry
@@ -4469,6 +4967,14 @@ def create_router(
             )
             corpus = await _load_eval_corpus(body.corpus_revision)
             eval_target = _eval_target(corpus.target_key)
+            if any(case.suite_id == body.suite_id and case.input is None for case in corpus.cases):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "This captured evaluation has no runnable input. Author runnable "
+                        "input or a scenario before launching fresh work."
+                    ),
+                )
             try:
                 idempotency_key = require_clean_nonblank(
                     idempotency_key,
@@ -7635,5 +8141,6 @@ def create_router(
 
     router.include_router(bounded_control_plane_router)
     router.include_router(bounded_evaluation_promotion_router)
+    router.include_router(bounded_captured_evaluation_router)
     router.include_router(bounded_evals_router)
     return router
