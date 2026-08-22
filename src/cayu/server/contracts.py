@@ -28,6 +28,8 @@ from cayu.core.events import EVENT_ID_MAX_CHARS
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_BYTES,
+    EVAL_CORPUS_MAX_TIMEOUT_SECONDS,
+    EVAL_CORPUS_MAX_TRIALS,
     AssertionSpec,
     RunInputSpec,
     TrialRequestSpec,
@@ -50,6 +52,7 @@ from cayu.evals.store import (
     EvalBaselineMutationRecord,
     EvalBaselineRecord,
     EvalResultRecord,
+    EvalRunCostBudget,
     EvalRunRecord,
     EvalRunStatus,
 )
@@ -86,6 +89,7 @@ from cayu.runtime.sessions import (
     SessionAggregateFilter,
     SessionOperationalSnapshot,
 )
+from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.tasks import (
     TASK_TOPOLOGY_DEFAULT_BRANCH_LIMIT,
     TASK_TOPOLOGY_MAX_BRANCH_LIMIT,
@@ -964,6 +968,12 @@ class EvalTargetCatalogEntry(ApiBaseModel):
         max_length=MAX_EVAL_TARGET_COMPONENT_CHARS,
     )
     app_manifest_fingerprint: EvalSha256Hex
+    max_trials: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
+    max_concurrency: StrictInt = Field(ge=1, le=CORPUS_EXECUTION_MAX_CONCURRENCY)
+    max_timeout_seconds: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TIMEOUT_SECONDS)
+    max_steps: StrictInt = Field(ge=1, le=256)
+    cost_budget_available: StrictBool
+    cost_budget_currencies: tuple[StrictStr, ...] = Field(max_length=32)
 
     @field_validator(
         "project_id",
@@ -978,6 +988,32 @@ class EvalTargetCatalogEntry(ApiBaseModel):
         if value != value.strip():
             raise ValueError(f"{info.field_name} must not have surrounding whitespace.")
         return require_unicode_scalar_text(value, info.field_name)
+
+    @field_validator("cost_budget_currencies")
+    @classmethod
+    def validate_cost_budget_currencies(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        validated = tuple(
+            require_unicode_scalar_text(currency, "cost_budget_currencies").upper()
+            for currency in value
+        )
+        if any(
+            not currency
+            or len(currency) > 16
+            or any(
+                character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for character in currency
+            )
+            for currency in validated
+        ):
+            raise ValueError("Cost-budget currencies must use portable uppercase identifiers.")
+        if validated != tuple(sorted(set(validated))):
+            raise ValueError("Cost-budget currencies must be unique and sorted.")
+        return validated
+
+    @model_validator(mode="after")
+    def validate_cost_budget_availability(self) -> EvalTargetCatalogEntry:
+        if self.cost_budget_available != bool(self.cost_budget_currencies):
+            raise ValueError("Cost-budget availability contradicts its compatible currencies.")
+        return self
 
     @model_validator(mode="after")
     def validate_source(self) -> EvalTargetCatalogEntry:
@@ -1013,6 +1049,20 @@ class EvalRunCreateRequest(ApiBaseModel):
     corpus_revision: EvalRevision
     suite_id: PromotionPortableId
     max_concurrency: StrictInt = Field(default=1, ge=1, le=CORPUS_EXECUTION_MAX_CONCURRENCY)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    limits: RunLimits | None = None
+    cost_budget: EvalRunCostBudget | None = None
+
+    @field_validator("limits", mode="before")
+    @classmethod
+    def require_run_scoped_limits(cls, value: object) -> object:
+        if isinstance(value, RunLimits) and value.scope != "run":
+            raise ValueError("Eval execution limits must use run scope.")
+        if isinstance(value, Mapping):
+            scope = cast("Mapping[str, object]", value).get("scope", "run")
+            if scope != "run":
+                raise ValueError("Eval execution limits must use run scope.")
+        return value
 
 
 class EvalComparisonRequest(ApiBaseModel):
@@ -1224,6 +1274,26 @@ class CapturedEvaluationSaveRequest(ApiBaseModel):
 class CapturedEvaluationSaveResponse(ApiBaseModel):
     record: EvalResultRecord
     result: CapturedEvaluationResultV1
+
+
+class CapturedEvaluationLaunchRequest(CapturedEvaluationSaveRequest):
+    """Reviewed captured contract plus bounded fresh-execution settings."""
+
+    trial_request: TrialRequestSpec = Field(default_factory=TrialRequestSpec)
+    max_concurrency: StrictInt = Field(default=1, ge=1, le=CORPUS_EXECUTION_MAX_CONCURRENCY)
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    limits: RunLimits | None = None
+    cost_budget: EvalRunCostBudget | None = None
+
+    @field_validator("limits", mode="before")
+    @classmethod
+    def require_run_scoped_limits(cls, value: object) -> object:
+        return EvalRunCreateRequest.require_run_scoped_limits(value)
+
+
+class CapturedEvaluationLaunchResponse(ApiBaseModel):
+    captured: CapturedEvaluationSaveResponse
+    run: EvalRunRecord
 
 
 class CapturedEvaluationExportRequest(CapturedEvaluationSaveRequest):

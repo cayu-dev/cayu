@@ -10,7 +10,7 @@ pytest.importorskip("fastapi")
 pytest.importorskip("sse_starlette")
 
 from fastapi.testclient import TestClient
-from tests.evals.test_corpus_execution import _corpus, _provider, _target
+from tests.evals.test_corpus_execution import _corpus, _price_book, _provider, _target
 from tests.server.test_server_evals import _AUTH_HEADERS, _authenticate
 
 from cayu import AgentSpec
@@ -75,7 +75,7 @@ def test_project_context_generates_multi_agent_targets_and_keeps_all_work_target
         app,
         config=ServerConfig.protected(
             _authenticate,
-            dashboard=DashboardConfig(enabled=False),
+            dashboard=DashboardConfig(runtime_config={"priceBook": _price_book()}),
         ),
         project_context=context,
     )
@@ -86,6 +86,12 @@ def test_project_context_generates_multi_agent_targets_and_keeps_all_work_target
         assert [item["agent_name"] for item in target_catalog["items"]] == ["agent", "beta"]
         assert {item["profile_id"] for item in target_catalog["items"]} == {"default"}
         assert {item["source"] for item in target_catalog["items"]} == {"generated"}
+        assert {item["max_trials"] for item in target_catalog["items"]} == {1}
+        assert {item["max_concurrency"] for item in target_catalog["items"]} == {1}
+        assert {item["cost_budget_available"] for item in target_catalog["items"]} == {True}
+        assert {tuple(item["cost_budget_currencies"]) for item in target_catalog["items"]} == {
+            ("USD",)
+        }
         assert {item["app_manifest_fingerprint"] for item in target_catalog["items"]} == {
             rooted_manifest.fingerprint
         }
@@ -293,6 +299,12 @@ def test_explicit_v1_configuration_publishes_one_compatible_target(tmp_path) -> 
                     "source": "explicit",
                     "application_release_id": target.application_release_id,
                     "app_manifest_fingerprint": body["items"][0]["app_manifest_fingerprint"],
+                    "max_trials": target.limits.max_trials,
+                    "max_concurrency": target.limits.max_concurrency,
+                    "max_timeout_seconds": target.limits.max_timeout_seconds,
+                    "max_steps": target.request_base.max_steps,
+                    "cost_budget_available": target.price_book is not None,
+                    "cost_budget_currencies": [],
                 }
             ]
     finally:

@@ -1,4 +1,4 @@
-import { useQueryClient } from "@tanstack/react-query"
+import { useQuery, useQueryClient } from "@tanstack/react-query"
 import { Link } from "@tanstack/react-router"
 import {
   AlertTriangle,
@@ -6,6 +6,7 @@ import {
   Download,
   FlaskConical,
   LoaderCircle,
+  Play,
   Plus,
   RotateCcw,
   Save,
@@ -28,15 +29,26 @@ import {
 import { Textarea } from "@/components/ui/textarea"
 import {
   ApiClientError,
+  type CapturedEvaluationLaunch,
+  type CapturedEvaluationLaunched,
+  type EvalTarget,
   type CapturedEvaluationCandidateDraft as EvaluationPromotionCandidateDraft,
   type CapturedEvaluationPreview as EvaluationPromotionPreview,
   exportCapturedEvaluation as exportEvaluationPromotion,
   fetchEvalResultDetail,
+  fetchEvalTargets,
+  launchCapturedEvaluation,
   previewCapturedEvaluation as previewEvaluationPromotion,
   saveCapturedEvaluation,
   selectEvalBaseline,
 } from "@/lib/api"
-import { shortEvalIdentity } from "@/lib/evals-dashboard"
+import { dashboardConfig } from "@/lib/config"
+import {
+  capturedEvalLaunchRequestIdentity,
+  EvalLaunchIdempotencyRegistry,
+  evalLaunchFailureIsDefinitive,
+  shortEvalIdentity,
+} from "@/lib/evals-dashboard"
 import { evalsReadinessReasonText } from "@/lib/evals-readiness"
 import {
   createCapturedEvaluationAssertion,
@@ -55,6 +67,31 @@ const SELECT_CLASS =
   "h-8 w-full rounded-lg border border-input bg-background px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
 const LABEL_CLASS = "mb-1 block text-xs font-medium text-muted-foreground"
 const ELIGIBLE_STATUSES = new Set(["completed", "failed"])
+const MAX_SAFE_RUNTIME_LIMIT = Number.MAX_SAFE_INTEGER
+
+type FreshExecutionDraft = {
+  trials: string
+  maxConcurrency: string
+  timeoutSeconds: string
+  maxSteps: string
+  maxTotalTokens: string
+  maxToolCalls: string
+  maxElapsedSeconds: string
+  maxEstimatedCost: string
+  currency: string
+}
+
+const DEFAULT_FRESH_EXECUTION: FreshExecutionDraft = Object.freeze({
+  trials: "1",
+  maxConcurrency: "1",
+  timeoutSeconds: "300",
+  maxSteps: "",
+  maxTotalTokens: "",
+  maxToolCalls: "",
+  maxElapsedSeconds: "",
+  maxEstimatedCost: "",
+  currency: "USD",
+})
 
 export function EvaluationPromotionAction({
   sessionId,
@@ -66,6 +103,7 @@ export function EvaluationPromotionAction({
   const readiness = useServerContract().capabilities.evals_readiness
   const capturedReadiness = readiness.captured_evaluation
   const persistenceReadiness = readiness.captured_result_persistence
+  const freshReadiness = readiness.fresh_launch
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
   const [preview, setPreview] = useState<EvaluationPromotionPreview | null>(null)
@@ -73,15 +111,27 @@ export function EvaluationPromotionAction({
   const [previewing, setPreviewing] = useState(false)
   const [exporting, setExporting] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [launching, setLaunching] = useState(false)
+  const [freshExecution, setFreshExecution] = useState<FreshExecutionDraft>({
+    ...DEFAULT_FRESH_EXECUTION,
+  })
   const [savedRevision, setSavedRevision] = useState<string | null>(null)
   const [savedCorpusRevision, setSavedCorpusRevision] = useState<string | null>(null)
   const [savedTargetKey, setSavedTargetKey] = useState<string | null>(null)
+  const [launchedRunId, setLaunchedRunId] = useState<string | null>(null)
   const [baselineGeneration, setBaselineGeneration] = useState<number | null>(null)
   const [baselining, setBaselining] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const previewRequestRef = useRef<{ generation: number; controller: AbortController } | null>(null)
   const exportControllerRef = useRef<AbortController | null>(null)
   const generationRef = useRef(0)
+  const launchRegistryRef = useRef<EvalLaunchIdempotencyRegistry | null>(null)
+  const targets = useQuery({
+    queryKey: ["evals", "targets"],
+    queryFn: ({ signal }) => fetchEvalTargets(signal),
+    enabled: open && freshReadiness.state === "ready",
+    staleTime: Number.POSITIVE_INFINITY,
+  })
 
   const cancelRequests = useCallback(() => {
     generationRef.current += 1
@@ -109,6 +159,7 @@ export function EvaluationPromotionAction({
       previewRequestRef.current = { generation, controller }
       setPreviewing(true)
       setSavedRevision(null)
+      setLaunchedRunId(null)
       setError(null)
       try {
         const response = await previewEvaluationPromotion(sessionId, nextDraft, controller.signal)
@@ -140,10 +191,13 @@ export function EvaluationPromotionAction({
     setPreviewing(false)
     setExporting(false)
     setSaving(false)
+    setLaunching(false)
+    setFreshExecution({ ...DEFAULT_FRESH_EXECUTION })
     setBaselining(false)
     setSavedRevision(null)
     setSavedCorpusRevision(null)
     setSavedTargetKey(null)
+    setLaunchedRunId(null)
     setBaselineGeneration(null)
     setOpen(true)
     void loadPreview()
@@ -156,6 +210,7 @@ export function EvaluationPromotionAction({
       setPreviewing(false)
       setExporting(false)
       setSaving(false)
+      setLaunching(false)
       setBaselining(false)
     }
   }
@@ -166,6 +221,7 @@ export function EvaluationPromotionAction({
     edit(next)
     setDraft(next)
     setSavedRevision(null)
+    setLaunchedRunId(null)
     setError(null)
   }
 
@@ -177,6 +233,35 @@ export function EvaluationPromotionAction({
     previewMatchesDraft(preview, draft)
   const persistenceUnavailable =
     persistenceReadiness.state === "ready" ? null : evalsReadinessReasonText(persistenceReadiness)
+  const freshExecutionUnavailable =
+    freshReadiness.state === "ready" ? null : evalsReadinessReasonText(freshReadiness)
+  const selectedTarget = targets.data?.items.find(
+    (target) => target.target_key === preview?.candidate.target_key,
+  )
+  const freshLaunch = useMemo(
+    () => validateFreshExecution(freshExecution, selectedTarget),
+    [freshExecution, selectedTarget],
+  )
+
+  useEffect(() => {
+    if (selectedTarget === undefined) return
+    setFreshExecution((current) => {
+      const timeout = Number(current.timeoutSeconds)
+      const timeoutSeconds =
+        !Number.isInteger(timeout) || timeout <= selectedTarget.max_timeout_seconds
+          ? current.timeoutSeconds
+          : String(selectedTarget.max_timeout_seconds)
+      const currency = selectedTarget.cost_budget_currencies.includes(current.currency)
+        ? current.currency
+        : selectedTarget.cost_budget_currencies.includes("USD")
+          ? "USD"
+          : (selectedTarget.cost_budget_currencies[0] ?? current.currency)
+      if (timeoutSeconds === current.timeoutSeconds && currency === current.currency) {
+        return current
+      }
+      return { ...current, timeoutSeconds, currency }
+    })
+  }, [selectedTarget])
 
   const exportPreviewedCandidate = (signal: AbortSignal) => {
     if (!previewIsCurrent || preview === null) return null
@@ -224,6 +309,7 @@ export function EvaluationPromotionAction({
     exportControllerRef.current = controller
     setSaving(true)
     setSavedRevision(null)
+    setLaunchedRunId(null)
     setError(null)
     try {
       const saved = await saveCapturedEvaluation(
@@ -254,6 +340,84 @@ export function EvaluationPromotionAction({
       if (exportControllerRef.current === controller) {
         exportControllerRef.current = null
         setSaving(false)
+      }
+    }
+  }
+
+  const launchFreshTrial = async () => {
+    if (
+      !previewIsCurrent ||
+      preview === null ||
+      !preview.runnable_conversion.available ||
+      freshReadiness.state !== "ready" ||
+      !freshLaunch.ok
+    ) {
+      return
+    }
+    exportControllerRef.current?.abort()
+    const controller = new AbortController()
+    exportControllerRef.current = controller
+    const request: CapturedEvaluationLaunch = {
+      candidate: preview.candidate,
+      expected_candidate_revision: preview.candidate.revision,
+      ...freshLaunch.request,
+    }
+    const requestIdentity = capturedEvalLaunchRequestIdentity(
+      sessionId,
+      preview.candidate.revision,
+      freshLaunch.request,
+    )
+    setLaunching(true)
+    setSavedRevision(null)
+    setLaunchedRunId(null)
+    setError(null)
+    try {
+      const registry =
+        launchRegistryRef.current ??
+        new EvalLaunchIdempotencyRegistry(window.sessionStorage, dashboardConfig.apiBaseUrl)
+      launchRegistryRef.current = registry
+      const idempotencyKey = registry.keyFor(requestIdentity)
+      let launched: CapturedEvaluationLaunched
+      try {
+        launched = await launchCapturedEvaluation(
+          sessionId,
+          request,
+          idempotencyKey,
+          controller.signal,
+        )
+      } catch (launchError) {
+        if (
+          launchError instanceof ApiClientError &&
+          evalLaunchFailureIsDefinitive(launchError.status)
+        ) {
+          registry.resolve(requestIdentity)
+        }
+        throw launchError
+      }
+      registry.resolve(requestIdentity)
+      if (controller.signal.aborted) return
+      setSavedRevision(launched.captured.record.revision)
+      setSavedCorpusRevision(launched.run.spec.corpus_revision)
+      setSavedTargetKey(launched.run.spec.target_key)
+      setLaunchedRunId(launched.run.spec.run_id)
+      setBaselineGeneration(null)
+      queryClient.setQueryData(["evals", "run", launched.run.spec.run_id], launched.run)
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["evals", "results"] }),
+        queryClient.invalidateQueries({ queryKey: ["evals", "corpora"] }),
+        queryClient.invalidateQueries({ queryKey: ["evals", "runs"] }),
+      ])
+    } catch (launchError) {
+      if (controller.signal.aborted) return
+      if (isPromotionConflict(launchError)) {
+        setPreview(null)
+        setDraft(null)
+      }
+      setError(promotionErrorMessage(launchError))
+    } finally {
+      if (exportControllerRef.current === controller) {
+        exportControllerRef.current = null
+        setLaunching(false)
       }
     }
   }
@@ -294,13 +458,14 @@ export function EvaluationPromotionAction({
         <SheetContent
           className="w-full! gap-0 sm:max-w-4xl!"
           data-testid="promotion-sheet"
-          aria-busy={previewing || exporting || saving || baselining}
+          aria-busy={previewing || exporting || saving || launching || baselining}
         >
           <SheetHeader className="border-b border-border pr-12">
             <SheetTitle>Evaluate captured session</SheetTitle>
             <SheetDescription>
               Review retained evidence, define expectations, then save or export the exact previewed
-              evaluation. No application workload runs here.
+              evaluation. Preview is evidence-only; Run fresh trial explicitly starts new
+              application work.
             </SheetDescription>
           </SheetHeader>
 
@@ -326,7 +491,7 @@ export function EvaluationPromotionAction({
                 )}
                 <fieldset
                   className="contents"
-                  disabled={previewing || exporting || saving || baselining}
+                  disabled={previewing || exporting || saving || launching || baselining}
                 >
                   <PromotionIdentityEditor draft={draft} editDraft={editDraft} />
                   <PromotionAssertionsEditor
@@ -334,6 +499,16 @@ export function EvaluationPromotionAction({
                     evidence={preview?.candidate.evidence}
                     editDraft={editDraft}
                   />
+                  {preview?.runnable_conversion.available && (
+                    <FreshExecutionEditor
+                      target={selectedTarget}
+                      loadingTarget={targets.isLoading}
+                      draft={freshExecution}
+                      validation={freshLaunch}
+                      unavailable={freshExecutionUnavailable}
+                      edit={setFreshExecution}
+                    />
+                  )}
                 </fieldset>
                 {preview && <PromotionScore preview={preview} current={previewIsCurrent} />}
               </div>
@@ -353,19 +528,22 @@ export function EvaluationPromotionAction({
                 className="mt-4 rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3 text-sm text-emerald-700 dark:text-emerald-300"
                 role="status"
               >
-                Saved result {shortEvalIdentity(savedRevision)} to Evals.{" "}
+                {launchedRunId === null
+                  ? `Saved result ${shortEvalIdentity(savedRevision)} to Evals. `
+                  : `Started fresh eval run ${shortEvalIdentity(launchedRunId)}. `}
                 <Link
                   to="/evals"
                   search={{
-                    tab: "results",
-                    result: savedRevision,
+                    tab: launchedRunId === null ? "results" : "runs",
+                    result: launchedRunId === null ? savedRevision : undefined,
+                    run: launchedRunId ?? undefined,
                     corpus: savedCorpusRevision ?? undefined,
                     target: savedTargetKey ?? undefined,
                   }}
                   className="font-medium underline"
                   onClick={() => changeOpen(false)}
                 >
-                  Open Evals
+                  {launchedRunId === null ? "Open Evals" : "Open run"}
                 </Link>
                 {baselineGeneration === null ? (
                   <Button
@@ -398,7 +576,12 @@ export function EvaluationPromotionAction({
               variant="outline"
               data-testid="promotion-preview"
               disabled={
-                draft === null || previewing || exporting || saving || validation?.ok !== true
+                draft === null ||
+                previewing ||
+                exporting ||
+                saving ||
+                launching ||
+                validation?.ok !== true
               }
               onClick={() => draft && void loadPreview(draft)}
             >
@@ -407,7 +590,9 @@ export function EvaluationPromotionAction({
             </Button>
             <Button
               data-testid="promotion-export"
-              disabled={!previewIsCurrent || previewing || exporting || saving || baselining}
+              disabled={
+                !previewIsCurrent || previewing || exporting || saving || launching || baselining
+              }
               onClick={() => void exportCandidate()}
             >
               {exporting ? <LoaderCircle className="animate-spin" /> : <Download />}
@@ -421,6 +606,7 @@ export function EvaluationPromotionAction({
                 previewing ||
                 exporting ||
                 saving ||
+                launching ||
                 baselining
               }
               title={persistenceUnavailable ?? undefined}
@@ -428,6 +614,26 @@ export function EvaluationPromotionAction({
             >
               {saving ? <LoaderCircle className="animate-spin" /> : <Save />}
               {saving ? "Saving..." : "Save evaluation"}
+            </Button>
+            <Button
+              data-testid="promotion-launch"
+              disabled={
+                !previewIsCurrent ||
+                preview?.runnable_conversion.available !== true ||
+                persistenceReadiness.state !== "ready" ||
+                freshReadiness.state !== "ready" ||
+                !freshLaunch.ok ||
+                previewing ||
+                exporting ||
+                saving ||
+                launching ||
+                baselining
+              }
+              title={freshExecutionUnavailable ?? persistenceUnavailable ?? undefined}
+              onClick={() => void launchFreshTrial()}
+            >
+              {launching ? <LoaderCircle className="animate-spin" /> : <Play />}
+              {launching ? "Starting..." : "Run fresh trial"}
             </Button>
           </SheetFooter>
         </SheetContent>
@@ -496,6 +702,266 @@ function EvidenceFact({ label, value }: { label: string; value: string }) {
       <div className="mt-0.5 truncate font-medium text-foreground">{value}</div>
     </div>
   )
+}
+
+type FreshLaunchRequest = Omit<
+  CapturedEvaluationLaunch,
+  "candidate" | "expected_candidate_revision"
+>
+type FreshLaunchValidation =
+  | { ok: true; request: FreshLaunchRequest }
+  | { ok: false; error: string }
+
+function FreshExecutionEditor({
+  target,
+  loadingTarget,
+  draft,
+  validation,
+  unavailable,
+  edit,
+}: {
+  target: EvalTarget | undefined
+  loadingTarget: boolean
+  draft: FreshExecutionDraft
+  validation: FreshLaunchValidation
+  unavailable: string | null
+  edit: (next: FreshExecutionDraft) => void
+}) {
+  const update = (field: keyof FreshExecutionDraft, value: string) =>
+    edit({ ...draft, [field]: value })
+  const targetSummary = target
+    ? `${target.label} · up to ${target.max_trials} trial${target.max_trials === 1 ? "" : "s"}, concurrency ${target.max_concurrency}`
+    : loadingTarget
+      ? "Loading server-owned execution limits..."
+      : "Server-owned execution limits are unavailable."
+
+  return (
+    <Card size="sm" data-testid="promotion-fresh-execution">
+      <CardHeader>
+        <CardTitle>Fresh execution</CardTitle>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Starts new application work with the target&apos;s existing tools, environment, approvals,
+          and operator policy. {targetSummary}
+        </p>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <FreshExecutionField
+            label="Trials"
+            id="promotion-trials"
+            value={draft.trials}
+            maximum={target?.max_trials}
+            onChange={(value) => update("trials", value)}
+          />
+          <FreshExecutionField
+            label="Parallel trials"
+            id="promotion-concurrency"
+            value={draft.maxConcurrency}
+            maximum={target?.max_concurrency}
+            onChange={(value) => update("maxConcurrency", value)}
+          />
+          <FreshExecutionField
+            label="Trial timeout (seconds)"
+            id="promotion-timeout"
+            value={draft.timeoutSeconds}
+            maximum={target?.max_timeout_seconds}
+            onChange={(value) => update("timeoutSeconds", value)}
+          />
+          <FreshExecutionField
+            label="Max model steps per trial"
+            id="promotion-max-steps"
+            value={draft.maxSteps}
+            maximum={target?.max_steps}
+            optional
+            onChange={(value) => update("maxSteps", value)}
+          />
+          <FreshExecutionField
+            label="Max total tokens per trial"
+            id="promotion-max-total-tokens"
+            value={draft.maxTotalTokens}
+            optional
+            onChange={(value) => update("maxTotalTokens", value)}
+          />
+          <FreshExecutionField
+            label="Max tool calls per trial"
+            id="promotion-max-tool-calls"
+            value={draft.maxToolCalls}
+            optional
+            onChange={(value) => update("maxToolCalls", value)}
+          />
+          <FreshExecutionField
+            label="Max run time per trial (seconds)"
+            id="promotion-max-elapsed"
+            value={draft.maxElapsedSeconds}
+            optional
+            onChange={(value) => update("maxElapsedSeconds", value)}
+          />
+          <PromotionField label="Max estimated cost per trial" id="promotion-max-cost">
+            <div className="grid grid-cols-[minmax(0,1fr)_5rem] gap-2">
+              <Input
+                id="promotion-max-cost"
+                inputMode="decimal"
+                placeholder={target?.cost_budget_available ? "Optional" : "No pricing"}
+                value={draft.maxEstimatedCost}
+                disabled={target?.cost_budget_available !== true}
+                onChange={(event) => update("maxEstimatedCost", event.target.value)}
+              />
+              <select
+                aria-label="Cost budget currency"
+                className={SELECT_CLASS}
+                value={draft.currency}
+                disabled={target?.cost_budget_available !== true}
+                onChange={(event) => update("currency", event.target.value.toUpperCase())}
+              >
+                {(target?.cost_budget_currencies ?? []).map((currency) => (
+                  <option key={currency} value={currency}>
+                    {currency}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </PromotionField>
+        </div>
+        {(unavailable || !validation.ok) && (
+          <div className="text-xs text-amber-700 dark:text-amber-300">
+            {unavailable ?? (!validation.ok ? validation.error : null)}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function FreshExecutionField({
+  label,
+  id,
+  value,
+  maximum,
+  optional = false,
+  onChange,
+}: {
+  label: string
+  id: string
+  value: string
+  maximum?: number
+  optional?: boolean
+  onChange: (value: string) => void
+}) {
+  return (
+    <PromotionField label={label} id={id}>
+      <Input
+        id={id}
+        type="number"
+        inputMode="numeric"
+        min={1}
+        max={maximum}
+        step={1}
+        placeholder={optional ? "Inherit target" : undefined}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+      />
+    </PromotionField>
+  )
+}
+
+function validateFreshExecution(
+  draft: FreshExecutionDraft,
+  target: EvalTarget | undefined,
+): FreshLaunchValidation {
+  if (target === undefined) {
+    return { ok: false, error: "Execution target details have not loaded." }
+  }
+  try {
+    const trials = freshExecutionInteger(draft.trials, "Trials", target.max_trials)
+    const maxConcurrency = freshExecutionInteger(
+      draft.maxConcurrency,
+      "Parallel trials",
+      target.max_concurrency,
+    )
+    const timeoutSeconds = freshExecutionInteger(
+      draft.timeoutSeconds,
+      "Trial timeout",
+      target.max_timeout_seconds,
+    )
+    const maxSteps = optionalFreshExecutionInteger(
+      draft.maxSteps,
+      "Max model steps per trial",
+      target.max_steps,
+    )
+    const maxTotalTokens = optionalFreshExecutionInteger(
+      draft.maxTotalTokens,
+      "Max total tokens per trial",
+      MAX_SAFE_RUNTIME_LIMIT,
+    )
+    const maxToolCalls = optionalFreshExecutionInteger(
+      draft.maxToolCalls,
+      "Max tool calls per trial",
+      MAX_SAFE_RUNTIME_LIMIT,
+    )
+    const maxElapsedSeconds = optionalFreshExecutionInteger(
+      draft.maxElapsedSeconds,
+      "Max run time per trial",
+      MAX_SAFE_RUNTIME_LIMIT,
+    )
+    const limits =
+      maxTotalTokens === undefined && maxToolCalls === undefined && maxElapsedSeconds === undefined
+        ? undefined
+        : {
+            scope: "run" as const,
+            max_total_tokens: maxTotalTokens,
+            max_tool_calls: maxToolCalls,
+            max_elapsed_seconds: maxElapsedSeconds,
+          }
+    const cost = draft.maxEstimatedCost.trim()
+    let costBudget: FreshLaunchRequest["cost_budget"]
+    if (cost !== "") {
+      if (!target.cost_budget_available) {
+        throw new Error("This target has no server-owned pricing for a cost budget.")
+      }
+      if (!/^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(cost) || Number(cost) <= 0) {
+        throw new Error("Max estimated cost per trial must be a positive decimal.")
+      }
+      const currency = draft.currency.trim().toUpperCase()
+      if (!target.cost_budget_currencies.includes(currency)) {
+        throw new Error("Cost currency is not compatible with this target's current pricing.")
+      }
+      costBudget = { max_estimated_cost: cost, currency }
+    }
+    return {
+      ok: true,
+      request: {
+        trial_request: { trials, timeout_seconds: timeoutSeconds },
+        max_concurrency: maxConcurrency,
+        max_steps: maxSteps,
+        limits,
+        cost_budget: costBudget,
+      },
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : "Fresh execution settings are invalid.",
+    }
+  }
+}
+
+function freshExecutionInteger(source: string, label: string, maximum: number): number {
+  if (!/^[1-9]\d*$/.test(source)) {
+    throw new Error(`${label} must be a positive whole number.`)
+  }
+  const value = Number(source)
+  if (!Number.isSafeInteger(value) || value > maximum) {
+    throw new Error(`${label} must be from 1 to ${maximum}.`)
+  }
+  return value
+}
+
+function optionalFreshExecutionInteger(
+  source: string,
+  label: string,
+  maximum: number,
+): number | undefined {
+  return source === "" ? undefined : freshExecutionInteger(source, label, maximum)
 }
 
 function PromotionIdentityEditor({ draft, editDraft }: PromotionEditorProps) {

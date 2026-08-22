@@ -32,6 +32,7 @@ from cayu.evals.corpus import (
     PricingProfileIdentityV1,
     RootStatusAssertionSpec,
     RunInputSpec,
+    TrialRequestSpec,
     _bounded_durable_text,
     _content_revision,
     _model_python_input,
@@ -1413,6 +1414,85 @@ def corpus_from_captured_evaluation_candidate(
         pricing_profile=validated.pricing_profile,
         suites=(validated.suite,),
         cases=(validated.case,),
+    )
+
+
+def runnable_promotion_candidate(
+    captured: CapturedEvaluationCandidateV1,
+    runnable_baseline: PromotionCandidateV1,
+    *,
+    trial_request: TrialRequestSpec | None = None,
+) -> PromotionCandidateV1:
+    """Transfer a reviewed captured contract onto server-reconstructed safe input.
+
+    The operator-authored suite, case, and assertions remain unchanged. Only the
+    server-owned replay source and its attested input come from the current
+    runnable baseline; this prevents a browser from manufacturing executable
+    session input or changing provenance.
+    """
+
+    validated_captured = _validate_exact_model(
+        captured,
+        CapturedEvaluationCandidateV1,
+        "captured",
+    )
+    validated_baseline = _validate_exact_model(
+        runnable_baseline,
+        PromotionCandidateV1,
+        "runnable_baseline",
+    )
+    if trial_request is None:
+        validated_trial_request = TrialRequestSpec()
+    elif type(trial_request) is TrialRequestSpec:
+        validated_trial_request = TrialRequestSpec.model_validate(
+            _model_python_input(trial_request)
+        )
+    else:
+        raise TypeError("trial_request must be an exact TrialRequestSpec or None.")
+    captured_source = validated_captured.source
+    runnable_source = validated_baseline.source
+    if (
+        validated_captured.target_key != validated_baseline.target_key
+        or validated_captured.evidence_policy != validated_baseline.evidence_policy
+        or validated_captured.pricing_profile != validated_baseline.pricing_profile
+        or validated_captured.evidence != validated_baseline.evidence
+        or captured_source.source_agent_name != runnable_source.source_agent_name
+        or captured_source.application_release_id != runnable_source.application_release_id
+        or captured_source.app_manifest_schema_version
+        != runnable_source.app_manifest_schema_version
+        or captured_source.app_manifest_fingerprint != runnable_source.app_manifest_fingerprint
+        or captured_source.evidence_revision != runnable_source.evidence_revision
+        or captured_source.evidence_policy_revision != runnable_source.evidence_policy_revision
+        or captured_source.pricing_profile_fingerprint
+        != runnable_source.pricing_profile_fingerprint
+        or captured_source.source_label != runnable_source.source_label
+    ):
+        raise ValueError("Captured evaluation does not match the runnable baseline.")
+    if validated_baseline.case.input is None:
+        raise ValueError("Runnable baseline does not contain attested input.")
+    suite = EvalSuiteSpec.create(
+        id=validated_captured.suite.id,
+        name=validated_captured.suite.name,
+        description=validated_captured.suite.description,
+        trial_request=validated_trial_request,
+    )
+    case = EvalCaseSpec.create(
+        id=validated_captured.case.id,
+        suite_id=suite.id,
+        name=validated_captured.case.name,
+        description=validated_captured.case.description,
+        source=runnable_source.case_source(),
+        input=validated_baseline.case.input,
+        assertions=validated_captured.case.assertions,
+    )
+    return PromotionCandidateV1.create(
+        target_key=validated_captured.target_key,
+        source=runnable_source,
+        evidence_policy=validated_captured.evidence_policy,
+        pricing_profile=validated_captured.pricing_profile,
+        evidence=validated_captured.evidence,
+        suite=suite,
+        case=case,
     )
 
 

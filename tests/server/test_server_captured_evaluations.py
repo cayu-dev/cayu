@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -26,6 +28,9 @@ from cayu.project_control_plane import (
     ProjectControlPlaneAccess,
     _create_project_control_plane_context,
 )
+from cayu.runtime import default_price_book
+from cayu.runtime.costs import ModelPrice, PriceBook
+from cayu.runtime.invocation import InvocationOriginTrust, SessionExecutionSource
 from cayu.server import DashboardConfig, ServerConfig, create_server
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 
@@ -370,5 +375,220 @@ def test_baseline_rejects_an_authenticated_actor_that_cannot_be_published(tmp_pa
         assert baseline.json()["detail"] == (
             "The authenticated baseline actor cannot cross the public boundary."
         )
+
+    asyncio.run(context.close())
+
+
+def test_reviewed_simple_session_launches_one_fresh_trial_with_http_operator_provenance(
+    tmp_path,
+) -> None:
+    app = asyncio.run(_seed_app())
+    store = SQLiteEvalStore(tmp_path / "cayu.db")
+    context = _create_project_control_plane_context(
+        project_root=Path(__file__).resolve().parents[2],
+        project_id="fresh-captured-workflow",
+        configured_release_id="release-current",
+        eval_store=store,
+        store_backend="sqlite",
+        store_source="project",
+        access=ProjectControlPlaneAccess.AUTHENTICATED_PRODUCTION,
+    )
+    server = create_server(
+        app,
+        config=ServerConfig.protected(
+            _authenticate,
+            dashboard=DashboardConfig(enabled=False),
+        ),
+        project_context=context,
+    )
+
+    with TestClient(server) as client:
+        preview = client.post(
+            f"/api/evals/sessions/{_SESSION_ID}/evaluation/preview",
+            headers=_AUTH_HEADERS,
+            json={},
+        )
+        assert preview.status_code == 200
+        candidate = preview.json()["candidate"]
+        request = {
+            "expected_candidate_revision": candidate["revision"],
+            "candidate": candidate,
+            "trial_request": {"trials": 1, "timeout_seconds": 30},
+            "max_concurrency": 1,
+            "max_steps": 3,
+            "limits": {
+                "max_total_tokens": 100,
+                "max_tool_calls": 2,
+                "max_elapsed_seconds": 30,
+                "scope": "run",
+            },
+        }
+        launch_url = f"/api/evals/sessions/{_SESSION_ID}/evaluation/launch"
+        launched = client.post(
+            launch_url,
+            headers={**_AUTH_HEADERS, "Idempotency-Key": "fresh-trial-one"},
+            json=request,
+        )
+        assert launched.status_code == 202
+        body = launched.json()
+        assert (
+            body["captured"]["record"]["corpus_revision"] == body["run"]["spec"]["corpus_revision"]
+        )
+        assert body["captured"]["result"]["score"]["candidate_revision"] != candidate["revision"]
+        invocation = body["run"]["spec"]["invocation"]
+        assert invocation == {
+            "schema_version": 1,
+            "source": "http_run",
+            "origin": {
+                "trust": "server_verified",
+                "subject": "eval-operator",
+                "tenant": None,
+            },
+            "max_steps": 3,
+            "limits": {
+                "max_input_tokens": None,
+                "max_output_tokens": None,
+                "max_total_tokens": 100,
+                "max_tool_calls": 2,
+                "max_elapsed_seconds": 30,
+                "scope": "run",
+            },
+            "cost_budget": None,
+        }
+        replay = client.post(
+            launch_url,
+            headers={**_AUTH_HEADERS, "Idempotency-Key": "fresh-trial-one"},
+            json=request,
+        )
+        assert replay.status_code == 202
+        assert replay.json()["run"]["spec"]["run_id"] == body["run"]["spec"]["run_id"]
+
+        run_id = body["run"]["spec"]["run_id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            run = client.get(f"/api/evals/runs/{run_id}", headers=_AUTH_HEADERS).json()
+            if run["status"] in {"completed", "failed", "cancelled"}:
+                break
+            time.sleep(0.01)
+        assert run["status"] == "completed"
+        assert run["result"]["status"] == "passed"
+
+        sessions = asyncio.run(app.session_store.list_sessions()).sessions
+        fresh = next(session for session in sessions if session.id != _SESSION_ID)
+        assert fresh.invocation.source is SessionExecutionSource.HTTP_RUN
+        assert fresh.invocation.origin.trust is InvocationOriginTrust.SERVER_VERIFIED
+        assert fresh.invocation.origin.subject == "eval-operator"
+        assert fresh.invocation.origin.tenant is None
+
+        too_many_trials = client.post(
+            launch_url,
+            headers={**_AUTH_HEADERS, "Idempotency-Key": "fresh-trial-scale"},
+            json={
+                **request,
+                "trial_request": {"trials": 2, "timeout_seconds": 30},
+            },
+        )
+        assert too_many_trials.status_code == 400
+        assert "target or bounds" in too_many_trials.json()["detail"]
+
+        missing_server_pricing = client.post(
+            launch_url,
+            headers={**_AUTH_HEADERS, "Idempotency-Key": "fresh-trial-cost"},
+            json={
+                **request,
+                "cost_budget": {"max_estimated_cost": "1.00", "currency": "USD"},
+            },
+        )
+        assert missing_server_pricing.status_code == 400
+        assert "target or bounds" in missing_server_pricing.json()["detail"]
+
+    asyncio.run(context.close())
+
+
+@pytest.mark.parametrize(
+    ("priced_target", "requested_currency", "published_currencies"),
+    (
+        (True, "EUR", ["USD"]),
+        (False, "USD", []),
+    ),
+)
+def test_fresh_launch_rejects_incompatible_cost_budget_before_writing(
+    tmp_path,
+    priced_target: bool,
+    requested_currency: str,
+    published_currencies: list[str],
+) -> None:
+    app = asyncio.run(_seed_app())
+    store = SQLiteEvalStore(tmp_path / "cayu.db")
+    context = _create_project_control_plane_context(
+        project_root=Path(__file__).resolve().parents[2],
+        project_id="fresh-cost-preflight",
+        configured_release_id="release-current",
+        eval_store=store,
+        store_backend="sqlite",
+        store_source="project",
+        access=ProjectControlPlaneAccess.AUTHENTICATED_PRODUCTION,
+    )
+    pricing = (
+        PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="promotion-provider",
+                    model="promotion-model",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("2"),
+                    currency="USD",
+                ),
+            )
+        )
+        if priced_target
+        else default_price_book()
+    )
+    server = create_server(
+        app,
+        config=ServerConfig.protected(
+            _authenticate,
+            dashboard=DashboardConfig(runtime_config={"priceBook": pricing}),
+        ),
+        project_context=context,
+    )
+
+    with TestClient(server) as client:
+        target = client.get("/api/evals/targets", headers=_AUTH_HEADERS).json()["items"][0]
+        assert target["cost_budget_available"] is bool(published_currencies)
+        assert target["cost_budget_currencies"] == published_currencies
+        preview = client.post(
+            f"/api/evals/sessions/{_SESSION_ID}/evaluation/preview",
+            headers=_AUTH_HEADERS,
+            json={},
+        )
+        assert preview.status_code == 200
+        candidate = preview.json()["candidate"]
+
+        rejected = client.post(
+            f"/api/evals/sessions/{_SESSION_ID}/evaluation/launch",
+            headers={**_AUTH_HEADERS, "Idempotency-Key": "fresh-cost-eur"},
+            json={
+                "expected_candidate_revision": candidate["revision"],
+                "candidate": candidate,
+                "cost_budget": {
+                    "max_estimated_cost": "1.00",
+                    "currency": requested_currency,
+                },
+            },
+        )
+
+        assert rejected.status_code == 400
+        assert "target or bounds" in rejected.json()["detail"]
+        for resource in ("corpora", "results", "runs"):
+            response = client.get(
+                f"/api/evals/{resource}",
+                headers=_AUTH_HEADERS,
+                params={"target_key": target["target_key"]},
+            )
+            assert response.status_code == 200
+            assert response.json()["items"] == []
+        sessions = asyncio.run(app.session_store.list_sessions()).sessions
+        assert [session.id for session in sessions] == [_SESSION_ID]
 
     asyncio.run(context.close())

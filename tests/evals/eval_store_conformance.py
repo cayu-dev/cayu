@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import threading
+from decimal import Decimal
 from typing import Literal
 
 import pytest
@@ -34,7 +35,9 @@ from cayu.evals.store import (
     EvalCatalogQuery,
     EvalResultQuery,
     EvalRunClaimLost,
+    EvalRunCostBudget,
     EvalRunFailureCode,
+    EvalRunInvocation,
     EvalRunQuery,
     EvalRunRequest,
     EvalRunStateConflict,
@@ -44,7 +47,13 @@ from cayu.evals.store import (
     EvalStoreResultTooLarge,
     EvalSuiteCatalogQuery,
 )
+from cayu.runtime.invocation import (
+    InvocationOrigin,
+    InvocationOriginTrust,
+    SessionExecutionSource,
+)
 from cayu.runtime.manifest import AppManifest, ToolManifest
+from cayu.runtime.stop_policy import RunLimits
 from cayu.vaults.redaction import SecretRedactor
 
 _NO_SECRETS = SecretRedactor()
@@ -199,7 +208,13 @@ def _results_with_conflicting_corpus_contract(
     )
 
 
-def _request(corpus, *, suffix: str, concurrency: int = 1) -> EvalRunRequest:
+def _request(
+    corpus,
+    *,
+    suffix: str,
+    concurrency: int = 1,
+    invocation: EvalRunInvocation | None = None,
+) -> EvalRunRequest:
     suite = corpus.suites[0]
     digest_character = {"a": "a", "b": "b", "c": "c"}[suffix]
     return EvalRunRequest(
@@ -210,6 +225,7 @@ def _request(corpus, *, suffix: str, concurrency: int = 1) -> EvalRunRequest:
         suite_id=suite.id,
         suite_revision=suite.revision,
         max_concurrency=concurrency,
+        invocation=EvalRunInvocation() if invocation is None else invocation,
     )
 
 
@@ -364,7 +380,21 @@ async def assert_eval_store_conformance(
         (corpus.cases[0].id, corpus.cases[0].revision)
     ]
 
-    cancel_request = _request(corpus, suffix="a")
+    invocation = EvalRunInvocation(
+        source=SessionExecutionSource.HTTP_RUN,
+        origin=InvocationOrigin(
+            trust=InvocationOriginTrust.SERVER_VERIFIED,
+            subject="eval-operator",
+            tenant="tenant-a",
+        ),
+        max_steps=7,
+        limits=RunLimits(max_total_tokens=2_000, max_tool_calls=3, scope="run"),
+        cost_budget=EvalRunCostBudget(
+            max_estimated_cost=Decimal("1.25"),
+            currency="USD",
+        ),
+    )
+    cancel_request = _request(corpus, suffix="a", invocation=invocation)
     with pytest.raises(EvalStorePublicationRejected, match="configured workload secret"):
         await store.admit_run(
             cancel_request,
@@ -375,6 +405,7 @@ async def assert_eval_store_conformance(
         cancel_request,
         redact_json=_NO_SECRETS.redact_json,
     )
+    assert admitted.spec.invocation == invocation
     assert (
         await store.admit_run(
             cancel_request.model_copy(update={"run_id": "conformance-a-retry"}),
@@ -386,7 +417,9 @@ async def assert_eval_store_conformance(
     assert claimed is not None
     assert claimed.run.id == admitted.id
     active_public_record = await store.load_run(admitted.id)
+    assert active_public_record is not None
     assert active_public_record == claimed.run
+    assert active_public_record.spec.invocation == invocation
     active_public_json = active_public_record.model_dump_json()
     assert "claim_id" not in active_public_json
     assert "idempotency_key" not in active_public_json

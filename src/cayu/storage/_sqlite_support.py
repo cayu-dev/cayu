@@ -1538,6 +1538,7 @@ _MIGRATION_STEPS: dict[int, str] = {
             suite_revision TEXT NOT NULL,
             max_concurrency INTEGER NOT NULL
                 CHECK (max_concurrency >= 1 AND max_concurrency <= 32),
+            invocation_json TEXT NOT NULL,
             status TEXT NOT NULL CHECK (
                 status IN ('queued', 'running', 'cancelling', 'completed', 'failed', 'cancelled')
             ),
@@ -2385,6 +2386,15 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
             "cayu_knowledge_publication_receipts",
             "access_snapshot_json",
             "TEXT NOT NULL",
+        ),
+    ),
+    50: (
+        (
+            "cayu_eval_runs",
+            "invocation_json",
+            "TEXT NOT NULL DEFAULT "
+            '\'{"schema_version":1,"source":"sdk_run","origin":null,'
+            '"max_steps":null,"limits":null,"cost_budget":null}\'',
         ),
     ),
 }
@@ -3449,6 +3459,8 @@ def reconcile_schema(
         _validate_captured_eval_case_schema(connection)
     if app_min_supported >= 49:
         _validate_verified_work_schema(connection)
+    if app_min_supported >= 50:
+        _validate_eval_run_invocation_column(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -4786,6 +4798,19 @@ def _validate_verified_work_schema(connection: sqlite3.Connection) -> None:
             )
 
 
+def _validate_eval_run_invocation_column(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]))
+        for row in connection.execute("PRAGMA table_info(cayu_eval_runs)")
+    }
+    if columns.get("invocation_json") != ("TEXT", 1):
+        raise RuntimeError(
+            "SQLite schema object 'cayu_eval_runs.invocation_json' conflicts with "
+            "Cayu's revision-50 durable eval invocation contract. Run "
+            "`cayu storage migrate` or restore the database from a known-good backup."
+        )
+
+
 def initialize_schema(connection: sqlite3.Connection) -> None:
     reconcile_schema(connection, schema.SchemaMode.CREATE)
 
@@ -5069,6 +5094,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_captured_eval_case_schema(connection)
         if rev.revision == 49:
             _validate_verified_work_schema(connection)
+        if rev.revision == 50:
+            _validate_eval_run_invocation_column(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

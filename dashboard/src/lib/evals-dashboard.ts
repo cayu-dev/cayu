@@ -1,4 +1,4 @@
-import type { EvalRun, EvalStatus } from "./api.ts"
+import type { CapturedEvaluationLaunch, EvalRun, EvalStatus } from "./api.ts"
 import type {
   CorpusComparisonReason,
   PublishedAssertionResult,
@@ -200,6 +200,30 @@ export function evalLaunchRequestIdentity(
   maxConcurrency: number,
 ): string {
   return JSON.stringify([corpusRevision, suiteId, maxConcurrency])
+}
+
+export function capturedEvalLaunchRequestIdentity(
+  sessionId: string,
+  candidateRevision: string,
+  request: Omit<CapturedEvaluationLaunch, "candidate" | "expected_candidate_revision">,
+): string {
+  return JSON.stringify([
+    "captured-v1",
+    sessionId,
+    candidateRevision,
+    request.trial_request?.trials ?? 1,
+    request.trial_request?.timeout_seconds ?? 300,
+    request.max_concurrency ?? 1,
+    request.max_steps ?? null,
+    request.limits?.max_input_tokens ?? null,
+    request.limits?.max_output_tokens ?? null,
+    request.limits?.max_total_tokens ?? null,
+    request.limits?.max_tool_calls ?? null,
+    request.limits?.max_elapsed_seconds ?? null,
+    request.limits?.scope ?? null,
+    request.cost_budget?.max_estimated_cost ?? null,
+    request.cost_budget?.currency ?? null,
+  ])
 }
 
 export function evalTrialCostSummary(assertions: Array<PublishedAssertionResult>): string {

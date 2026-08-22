@@ -6209,6 +6209,37 @@ class SessionEngine:
         finally:
             _deactivate_session_interaction(session.id)
 
+    def _resolve_initial_model_target(
+        self,
+        request: RunRequest,
+        registered_agent: runtime_records.RegisteredAgentState,
+    ) -> tuple[runtime_records.RegisteredProvider, str]:
+        if request.target is not None:
+            return (
+                self._get_registered_provider(request.target.provider_name),
+                request.target.model,
+            )
+        model = registered_agent.spec.model
+        if registered_agent.spec.provider_name is not None:
+            return self._get_registered_provider(registered_agent.spec.provider_name), model
+        return (
+            self._route_registered_provider_for_model(model=model)
+            or self._get_registered_provider(),
+            model,
+        )
+
+    def resolve_initial_model_target(self, request: RunRequest) -> ModelTarget:
+        """Resolve initial provider/model routing without preparing or admitting a session."""
+
+        if type(request) is not RunRequest:
+            raise TypeError("Initial model-target resolution requires a RunRequest.")
+        registered_agent = self._get_registered_agent(request.agent_name)
+        registered_provider, model = self._resolve_initial_model_target(
+            request,
+            registered_agent,
+        )
+        return ModelTarget(provider_name=registered_provider.name, model=model)
+
     async def _prepare_initial_run(
         self,
         request: RunRequest,
@@ -6285,20 +6316,10 @@ class SessionEngine:
         )
         # An explicit target is exact. Otherwise the agent model and optional
         # provider pin feed the existing routing/default selection.
-        if request.target is not None:
-            model = request.target.model
-            registered_provider = self._get_registered_provider(request.target.provider_name)
-        else:
-            model = registered_agent.spec.model
-            if registered_agent.spec.provider_name is not None:
-                registered_provider = self._get_registered_provider(
-                    registered_agent.spec.provider_name
-                )
-            else:
-                registered_provider = (
-                    self._route_registered_provider_for_model(model=model)
-                    or self._get_registered_provider()
-                )
+        registered_provider, model = self._resolve_initial_model_target(
+            request,
+            registered_agent,
+        )
         for field_name, value in (
             ("agent_name", registered_agent.spec.name),
             ("provider_name", registered_provider.name),

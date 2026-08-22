@@ -3,6 +3,7 @@ import test from "node:test"
 import { QueryClient, QueryObserver } from "@tanstack/react-query"
 
 import {
+  capturedEvalLaunchRequestIdentity,
   createEvalIdempotencyKey,
   EVAL_RESULT_QUERY_RETENTION,
   EvalLaunchIdempotencyRegistry,
@@ -160,6 +161,40 @@ test("eval launch retries reuse their key across page reloads until reconciled",
 
   new EvalLaunchIdempotencyRegistry(storage, "/api").resolve(identity)
   assert.notEqual(new EvalLaunchIdempotencyRegistry(storage, "/api").keyFor(identity), originalKey)
+})
+
+test("captured eval retry identities include every execution contraction", () => {
+  const request = {
+    trial_request: { trials: 1, timeout_seconds: 45 },
+    max_concurrency: 1,
+    max_steps: 8,
+    limits: {
+      max_input_tokens: 100,
+      max_output_tokens: 200,
+      max_total_tokens: 300,
+      max_tool_calls: 4,
+      max_elapsed_seconds: 30,
+      scope: "run",
+    },
+    cost_budget: { max_estimated_cost: "0.25", currency: "USD" },
+  }
+  const identity = capturedEvalLaunchRequestIdentity("session-1", "sha256:candidate", request)
+
+  assert.notEqual(
+    identity,
+    capturedEvalLaunchRequestIdentity("session-1", "sha256:candidate", {
+      ...request,
+      limits: { ...request.limits, scope: "session" },
+    }),
+  )
+  assert.notEqual(
+    identity,
+    capturedEvalLaunchRequestIdentity("session-1", "sha256:candidate", {
+      ...request,
+      cost_budget: { ...request.cost_budget, max_estimated_cost: "0.50" },
+    }),
+  )
+  assert.notEqual(identity, capturedEvalLaunchRequestIdentity("session-1", "sha256:other", request))
 })
 
 test("eval launch retries are isolated between API mounts on one origin", () => {

@@ -4724,6 +4724,88 @@
         "title": "CapturedEvaluationExportRequest",
         "type": "object"
       },
+      "CapturedEvaluationLaunchRequest": {
+        "additionalProperties": false,
+        "description": "Reviewed captured contract plus bounded fresh-execution settings.",
+        "properties": {
+          "candidate": {
+            "$ref": "#/components/schemas/CapturedEvaluationCandidateV1"
+          },
+          "cost_budget": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalRunCostBudget-Input"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expected_candidate_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Expected Candidate Revision",
+            "type": "string"
+          },
+          "limits": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunLimits"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "max_concurrency": {
+            "default": 1,
+            "maximum": 32.0,
+            "minimum": 1.0,
+            "title": "Max Concurrency",
+            "type": "integer"
+          },
+          "max_steps": {
+            "anyOf": [
+              {
+                "maximum": 256.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps"
+          },
+          "trial_request": {
+            "$ref": "#/components/schemas/TrialRequestSpec"
+          }
+        },
+        "required": [
+          "expected_candidate_revision",
+          "candidate"
+        ],
+        "title": "CapturedEvaluationLaunchRequest",
+        "type": "object"
+      },
+      "CapturedEvaluationLaunchResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "captured": {
+            "$ref": "#/components/schemas/CapturedEvaluationSaveResponse"
+          },
+          "run": {
+            "$ref": "#/components/schemas/EvalRunRecord"
+          }
+        },
+        "required": [
+          "captured",
+          "run"
+        ],
+        "title": "CapturedEvaluationLaunchResponse",
+        "type": "object"
+      },
       "CapturedEvaluationPreviewRequest": {
         "additionalProperties": false,
         "properties": {
@@ -7275,6 +7357,60 @@
         "title": "EvalResultTargetIdentityV1",
         "type": "object"
       },
+      "EvalRunCostBudget-Input": {
+        "additionalProperties": false,
+        "description": "One server-priced cost ceiling applied independently to each eval-trial session.",
+        "properties": {
+          "currency": {
+            "default": "USD",
+            "maxLength": 16,
+            "minLength": 1,
+            "title": "Currency",
+            "type": "string"
+          },
+          "max_estimated_cost": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "title": "Max Estimated Cost"
+          }
+        },
+        "required": [
+          "max_estimated_cost"
+        ],
+        "title": "EvalRunCostBudget",
+        "type": "object"
+      },
+      "EvalRunCostBudget-Output": {
+        "additionalProperties": false,
+        "description": "One server-priced cost ceiling applied independently to each eval-trial session.",
+        "properties": {
+          "currency": {
+            "default": "USD",
+            "maxLength": 16,
+            "minLength": 1,
+            "title": "Currency",
+            "type": "string"
+          },
+          "max_estimated_cost": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Max Estimated Cost",
+            "type": "string"
+          }
+        },
+        "required": [
+          "max_estimated_cost"
+        ],
+        "title": "EvalRunCostBudget",
+        "type": "object"
+      },
       "EvalRunFailureCode": {
         "description": "Safe terminal diagnostics; arbitrary exception text is never persisted.",
         "enum": [
@@ -7285,6 +7421,67 @@
         ],
         "title": "EvalRunFailureCode",
         "type": "string"
+      },
+      "EvalRunInvocation": {
+        "additionalProperties": false,
+        "description": "Durable, authority-free execution contractions and trusted caller provenance.\n\nThe HTTP API constructs this value after authentication. It retains only the\nbounded subject/tenant projection needed to mint ordinary runtime invocation\nprovenance after a worker restart; authentication claims never enter EvalStore.\n``None`` bounds inherit the server-owned target request base.",
+        "properties": {
+          "cost_budget": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalRunCostBudget-Output"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "limits": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunLimits"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "max_steps": {
+            "anyOf": [
+              {
+                "maximum": 256.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InvocationOrigin"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "source": {
+            "$ref": "#/components/schemas/SessionExecutionSource",
+            "default": "sdk_run"
+          }
+        },
+        "title": "EvalRunInvocation",
+        "type": "object"
       },
       "EvalRunOwnership": {
         "additionalProperties": false,
@@ -7496,6 +7693,9 @@
             "title": "Corpus Revision",
             "type": "string"
           },
+          "invocation": {
+            "$ref": "#/components/schemas/EvalRunInvocation"
+          },
           "max_concurrency": {
             "maximum": 32.0,
             "minimum": 1.0,
@@ -7706,11 +7906,47 @@
             "title": "Application Release Id",
             "type": "string"
           },
+          "cost_budget_available": {
+            "title": "Cost Budget Available",
+            "type": "boolean"
+          },
+          "cost_budget_currencies": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 32,
+            "title": "Cost Budget Currencies",
+            "type": "array"
+          },
           "label": {
             "maxLength": 512,
             "minLength": 1,
             "title": "Label",
             "type": "string"
+          },
+          "max_concurrency": {
+            "maximum": 32.0,
+            "minimum": 1.0,
+            "title": "Max Concurrency",
+            "type": "integer"
+          },
+          "max_steps": {
+            "maximum": 256.0,
+            "minimum": 1.0,
+            "title": "Max Steps",
+            "type": "integer"
+          },
+          "max_timeout_seconds": {
+            "maximum": 3600.0,
+            "minimum": 1.0,
+            "title": "Max Timeout Seconds",
+            "type": "integer"
+          },
+          "max_trials": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Max Trials",
+            "type": "integer"
           },
           "profile_id": {
             "maxLength": 128,
@@ -7755,7 +7991,13 @@
           "label",
           "source",
           "application_release_id",
-          "app_manifest_fingerprint"
+          "app_manifest_fingerprint",
+          "max_trials",
+          "max_concurrency",
+          "max_timeout_seconds",
+          "max_steps",
+          "cost_budget_available",
+          "cost_budget_currencies"
         ],
         "title": "EvalTargetCatalogEntry",
         "type": "object"
@@ -8718,6 +8960,44 @@
           }
         },
         "title": "InterruptSessionBody",
+        "type": "object"
+      },
+      "InvocationOrigin": {
+        "additionalProperties": false,
+        "description": "Immutable root identity retained across a complete session tree.",
+        "properties": {
+          "subject": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subject"
+          },
+          "tenant": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tenant"
+          },
+          "trust": {
+            "$ref": "#/components/schemas/InvocationOriginTrust"
+          }
+        },
+        "required": [
+          "trust"
+        ],
+        "title": "InvocationOrigin",
         "type": "object"
       },
       "InvocationOriginTrust": {
@@ -17292,12 +17572,152 @@
                     "title": "Corpus Revision",
                     "type": "string"
                   },
+                  "cost_budget": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "description": "One server-priced cost ceiling applied independently to each eval-trial session.",
+                        "properties": {
+                          "currency": {
+                            "default": "USD",
+                            "maxLength": 16,
+                            "minLength": 1,
+                            "title": "Currency",
+                            "type": "string"
+                          },
+                          "max_estimated_cost": {
+                            "anyOf": [
+                              {
+                                "exclusiveMinimum": 0.0,
+                                "type": "number"
+                              },
+                              {
+                                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                                "type": "string"
+                              }
+                            ],
+                            "title": "Max Estimated Cost"
+                          }
+                        },
+                        "required": [
+                          "max_estimated_cost"
+                        ],
+                        "title": "EvalRunCostBudget",
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "limits": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "description": "Optional hard limits for one session run or resume call.\n\nEvery limit is evaluated against the clock selected by ``scope``:\n\n- ``scope=\"run\"`` (the default): token, tool-call, and elapsed-time\n  limits all measure the current runtime invocation \u2014 usage deltas since\n  the run entered and wall time since the run started.\n- ``scope=\"session\"``: token, tool-call, and elapsed-time limits all\n  measure the whole durable session \u2014 cumulative usage from the session\n  event stream and wall time since the session was created. A resumed\n  session that already meets a limit stops immediately.",
+                        "properties": {
+                          "max_elapsed_seconds": {
+                            "anyOf": [
+                              {
+                                "maximum": 9223372036854775807,
+                                "minimum": 1,
+                                "type": "integer"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Max Elapsed Seconds"
+                          },
+                          "max_input_tokens": {
+                            "anyOf": [
+                              {
+                                "maximum": 9223372036854775807,
+                                "minimum": 1,
+                                "type": "integer"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Max Input Tokens"
+                          },
+                          "max_output_tokens": {
+                            "anyOf": [
+                              {
+                                "maximum": 9223372036854775807,
+                                "minimum": 1,
+                                "type": "integer"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Max Output Tokens"
+                          },
+                          "max_tool_calls": {
+                            "anyOf": [
+                              {
+                                "maximum": 9223372036854775807,
+                                "minimum": 1,
+                                "type": "integer"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Max Tool Calls"
+                          },
+                          "max_total_tokens": {
+                            "anyOf": [
+                              {
+                                "maximum": 9223372036854775807,
+                                "minimum": 1,
+                                "type": "integer"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "title": "Max Total Tokens"
+                          },
+                          "scope": {
+                            "default": "run",
+                            "enum": [
+                              "session",
+                              "run"
+                            ],
+                            "title": "Scope",
+                            "type": "string"
+                          }
+                        },
+                        "title": "RunLimits",
+                        "type": "object"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
                   "max_concurrency": {
                     "default": 1,
                     "maximum": 32,
                     "minimum": 1,
                     "title": "Max Concurrency",
                     "type": "integer"
+                  },
+                  "max_steps": {
+                    "anyOf": [
+                      {
+                        "maximum": 256,
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Max Steps"
                   },
                   "suite_id": {
                     "maxLength": 128,
@@ -17599,6 +18019,71 @@
           }
         },
         "summary": "Export Captured Evaluation"
+      }
+    },
+    "/api/evals/sessions/{session_id}/evaluation/launch": {
+      "post": {
+        "operationId": "launch_captured_evaluation_api_evals_sessions__session_id__evaluation_launch_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 512,
+              "minLength": 1,
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CapturedEvaluationLaunchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapturedEvaluationLaunchResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The edited captured evaluation is invalid or unsafe."
+          },
+          "404": {
+            "description": "The requested session or evaluation resource does not exist."
+          },
+          "409": {
+            "description": "The captured evidence or compare-and-swap baseline changed."
+          },
+          "413": {
+            "description": "The bounded captured evidence or result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Launch Captured Evaluation"
       }
     },
     "/api/evals/sessions/{session_id}/evaluation/preview": {

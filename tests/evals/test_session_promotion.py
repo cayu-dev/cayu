@@ -44,6 +44,7 @@ from cayu import (
     TextPart,
     ToolResultPart,
     Trajectory,
+    TrialRequestSpec,
     build_captured_evaluation_candidate,
     build_promotion_candidate,
     corpus_from_captured_evaluation_candidate,
@@ -52,6 +53,7 @@ from cayu import (
     export_promotion_corpus,
     file_attachment,
     promotable_run_input,
+    runnable_promotion_candidate,
     score_captured_evaluation_candidate,
     score_promotion_candidate,
     scripted_structured_output,
@@ -1286,6 +1288,65 @@ def test_captured_failed_session_defaults_to_a_regression_to_fix():
         application_release_id="failed-release",
     )
     assert score.status == "failed"
+
+
+def test_reviewed_captured_contract_converts_only_with_server_attested_runnable_input():
+    async def scenario():
+        return await _run_trajectory(InMemorySessionStore())
+
+    app, trajectory = asyncio.run(scenario())
+    policy = EvaluationEvidencePolicySpec.standard()
+    captured = build_captured_evaluation_candidate(
+        app,
+        trajectory,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="runnable-release",
+        evidence_policy=policy,
+    )
+    baseline = build_promotion_candidate(
+        app,
+        trajectory,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="runnable-release",
+        evidence_policy=policy,
+    )
+    runnable = runnable_promotion_candidate(
+        captured,
+        baseline,
+        trial_request=TrialRequestSpec(trials=2, timeout_seconds=45),
+    )
+    assert runnable.case.id == captured.case.id
+    assert runnable.case.name == captured.case.name
+    assert runnable.case.assertions == captured.case.assertions
+    assert runnable.case.input == baseline.case.input
+    assert runnable.source == baseline.source
+    assert runnable.suite.trial_request == TrialRequestSpec(trials=2, timeout_seconds=45)
+    corpus = corpus_from_promotion_candidate(runnable)
+    assert corpus.cases[0].input == baseline.case.input
+    assert (
+        score_promotion_candidate(
+            app,
+            trajectory,
+            runnable,
+            target_key="assistant",
+            source_agent_name="assistant",
+            application_release_id="runnable-release",
+        ).status
+        == "passed"
+    )
+
+    another_release = build_promotion_candidate(
+        app,
+        trajectory,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="different-release",
+        evidence_policy=policy,
+    )
+    with pytest.raises(ValueError, match="does not match the runnable baseline"):
+        runnable_promotion_candidate(captured, another_release)
 
 
 def test_promotion_redacts_input_before_returning_a_public_model():

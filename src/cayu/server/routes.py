@@ -67,6 +67,8 @@ from cayu.core.messages import Message, MessageRole
 from cayu.core.thinking import ThinkingConfig
 from cayu.evals.corpus import EvalCaseSpec, EvalCorpusDocument, EvalSuiteSpec, eval_corpus_to_json
 from cayu.evals.execution import (
+    CompiledCorpusSuite,
+    CorpusTarget,
     _validate_corpus_target_compatibility,
     compile_corpus_suite,
     evaluation_target_identity,
@@ -88,6 +90,7 @@ from cayu.evals.promotion import (
     corpus_from_promotion_candidate,
     export_captured_evaluation_corpus,
     export_promotion_corpus,
+    runnable_promotion_candidate,
     score_captured_evaluation_candidate,
     score_promotion_candidate,
 )
@@ -116,6 +119,8 @@ from cayu.evals.store import (
     EvalResultPage,
     EvalResultQuery,
     EvalRunAdmissionConflict,
+    EvalRunCostBudget,
+    EvalRunInvocation,
     EvalRunPage,
     EvalRunQuery,
     EvalRunRecord,
@@ -303,6 +308,8 @@ from cayu.server.contracts import (
     CapturedEvaluationConversion,
     CapturedEvaluationDraft,
     CapturedEvaluationExportRequest,
+    CapturedEvaluationLaunchRequest,
+    CapturedEvaluationLaunchResponse,
     CapturedEvaluationPreviewRequest,
     CapturedEvaluationPreviewResponse,
     CapturedEvaluationSaveRequest,
@@ -347,6 +354,7 @@ from cayu.server.evals_registry import (
     EvalTargetRegistration,
     generated_eval_target_registry,
     resolved_evals_runtime,
+    target_for_eval_invocation,
 )
 from cayu.server.evals_worker import EvalRunCoordinator
 from cayu.server.sse import (
@@ -484,11 +492,36 @@ async def _validated_private_json_body(
 
 
 def _json_request_openapi(model: str | type[BaseModel]) -> dict[str, Any]:
-    schema = (
-        {"$ref": f"#/components/schemas/{model}"}
-        if isinstance(model, str)
-        else model.model_json_schema()
-    )
+    if isinstance(model, str):
+        schema = {"$ref": f"#/components/schemas/{model}"}
+    else:
+        generated = model.model_json_schema()
+        definitions = generated.pop("$defs", {})
+
+        def inline_definitions(value: Any, active: frozenset[str] = frozenset()) -> Any:
+            if isinstance(value, list):
+                return [inline_definitions(item, active) for item in value]
+            if not isinstance(value, dict):
+                return value
+            reference = value.get("$ref")
+            if isinstance(reference, str) and reference.startswith("#/$defs/"):
+                name = reference.removeprefix("#/$defs/").replace("~1", "/").replace("~0", "~")
+                if name in active or name not in definitions:
+                    raise ValueError(
+                        "Private request OpenAPI schema contains an invalid reference."
+                    )
+                replacement = inline_definitions(definitions[name], active | {name})
+                return {
+                    **replacement,
+                    **{
+                        key: inline_definitions(item, active)
+                        for key, item in value.items()
+                        if key != "$ref"
+                    },
+                }
+            return {key: inline_definitions(item, active) for key, item in value.items()}
+
+        schema = inline_definitions(generated)
     return {
         "requestBody": {
             "required": True,
@@ -3448,6 +3481,7 @@ def create_router(
     dashboard_pricing_metadata: tuple[str, str] | None = None,
     evaluation_promotion: EvaluationPromotionConfig | None = None,
     evaluation_promotion_pricing: PriceBook | None = None,
+    generated_evals_pricing: PriceBook | None = None,
     evals: EvalsConfig | None = None,
     continuation_loop_policy_provider: (
         Callable[[str], Awaitable[tuple[LoopPolicy, ...]]] | None
@@ -3492,6 +3526,8 @@ def create_router(
             policy. When absent, no promotion route or enabled capability exists.
         evaluation_promotion_pricing: Optional already-validated dashboard price
             book reused for captured cost evidence.
+        generated_evals_pricing: Optional server-owned dashboard price book used
+            by generated execution targets for cost assertions and run ceilings.
         evals: Complete authenticated durable execution wiring for one explicit
             V1 corpus target. It takes indivisible precedence over generated
             project targets. When both it and project authority are absent, no
@@ -3551,6 +3587,8 @@ def create_router(
         raise TypeError("evaluation_promotion_pricing must be a PriceBook or None.")
     if evaluation_promotion is None and evaluation_promotion_pricing is not None:
         raise ValueError("evaluation_promotion_pricing requires evaluation_promotion.")
+    if generated_evals_pricing is not None and type(generated_evals_pricing) is not PriceBook:
+        raise TypeError("generated_evals_pricing must be a PriceBook or None.")
 
     if evals is not None:
         if type(evals) is not EvalsConfig:
@@ -3588,6 +3626,7 @@ def create_router(
             application_release_id=_project_context.application_release_id,
             app_manifest_fingerprint=_project_context.app_manifest_fingerprint,
             app_manifest_project_root=_project_context.app_manifest_project_root,
+            price_book=generated_evals_pricing,
         )
     eval_runtime = resolved_evals_runtime(
         explicit=evals,
@@ -4414,36 +4453,6 @@ def create_router(
                 ) from exc
 
         @bounded_captured_evaluation_router.post(
-            "/evals/sessions/{session_id}/evaluation/preview",
-            response_model=CapturedEvaluationPreviewResponse,
-            responses=CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
-            dependencies=protected,
-        )
-        async def preview_captured_evaluation(
-            session_id: str,
-            body: CapturedEvaluationPreviewRequest,
-        ) -> CapturedEvaluationPreviewResponse:
-            trajectory, registration, baseline = await _load_captured_evaluation_baseline(
-                session_id
-            )
-            candidate = (
-                baseline
-                if body.draft is None
-                else _captured_candidate_from_draft(baseline, body.draft)
-            )
-            captured_score = _score_current_captured_candidate(
-                trajectory,
-                registration,
-                candidate,
-            )
-            return CapturedEvaluationPreviewResponse(
-                baseline_revision=baseline.revision,
-                candidate=candidate,
-                captured_score=captured_score,
-                runnable_conversion=_runnable_conversion(trajectory, registration),
-            )
-
-        @bounded_captured_evaluation_router.post(
             "/evals/sessions/{session_id}/evaluation/save",
             response_model=CapturedEvaluationSaveResponse,
             status_code=201,
@@ -4504,6 +4513,36 @@ def create_router(
                     detail="The captured evaluation exceeds the server byte limit.",
                 ) from exc
             return CapturedEvaluationSaveResponse(record=record, result=result)
+
+        @bounded_captured_evaluation_router.post(
+            "/evals/sessions/{session_id}/evaluation/preview",
+            response_model=CapturedEvaluationPreviewResponse,
+            responses=CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def preview_captured_evaluation(
+            session_id: str,
+            body: CapturedEvaluationPreviewRequest,
+        ) -> CapturedEvaluationPreviewResponse:
+            trajectory, registration, baseline = await _load_captured_evaluation_baseline(
+                session_id
+            )
+            candidate = (
+                baseline
+                if body.draft is None
+                else _captured_candidate_from_draft(baseline, body.draft)
+            )
+            captured_score = _score_current_captured_candidate(
+                trajectory,
+                registration,
+                candidate,
+            )
+            return CapturedEvaluationPreviewResponse(
+                baseline_revision=baseline.revision,
+                candidate=candidate,
+                captured_score=captured_score,
+                runnable_conversion=_runnable_conversion(trajectory, registration),
+            )
 
         @bounded_captured_evaluation_router.post(
             "/evals/sessions/{session_id}/evaluation/export",
@@ -4690,6 +4729,128 @@ def create_router(
         def _eval_query_error() -> NoReturn:
             raise HTTPException(status_code=422, detail="Invalid Evals query.")
 
+        def _eval_run_invocation(
+            auth_context: AuthContext | None,
+            *,
+            max_steps: int | None,
+            limits: RunLimits | None,
+            cost_budget: EvalRunCostBudget | None,
+        ) -> EvalRunInvocation:
+            try:
+                origin = (
+                    None
+                    if auth_context is None
+                    else InvocationOrigin(
+                        trust=InvocationOriginTrust.SERVER_VERIFIED,
+                        subject=auth_context.subject,
+                        tenant=auth_context.tenant,
+                    )
+                )
+                return EvalRunInvocation(
+                    source=SessionExecutionSource.HTTP_RUN,
+                    origin=origin,
+                    max_steps=max_steps,
+                    limits=limits,
+                    cost_budget=cost_budget,
+                )
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Eval execution bounds or authenticated provenance are invalid.",
+                ) from exc
+
+        def _eval_idempotency_digest(target_key: str, idempotency_key: str) -> str:
+            try:
+                clean_key = require_clean_nonblank(idempotency_key, "Idempotency-Key")
+                require_unicode_scalar_text(clean_key, "Idempotency-Key")
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="Invalid Idempotency-Key.") from exc
+            return (
+                "sha256:"
+                + hashlib.sha256(
+                    b"cayu-server-eval-idempotency-v1\0"
+                    + target_key.encode("ascii")
+                    + b"\0"
+                    + clean_key.encode("utf-8")
+                ).hexdigest()
+            )
+
+        async def _admit_eval_run(
+            *,
+            corpus: EvalCorpusDocument,
+            max_concurrency: int,
+            invocation: EvalRunInvocation,
+            idempotency_key: str,
+            eval_target: CorpusTarget,
+            compiled: CompiledCorpusSuite,
+        ) -> EvalRunRecord:
+            if eval_target.key != corpus.target_key:
+                raise RuntimeError("Prepared eval target does not match its corpus.")
+            run_request = EvalRunRequest(
+                run_id=f"eval-{uuid4().hex}",
+                corpus_revision=corpus.revision,
+                target_key=eval_target.key,
+                suite_id=compiled.run_contract.suite_id,
+                suite_revision=compiled.run_contract.suite_revision,
+                max_concurrency=max_concurrency,
+                invocation=invocation,
+                idempotency_key=_eval_idempotency_digest(
+                    eval_target.key,
+                    idempotency_key,
+                ),
+            )
+            try:
+                return await eval_store.admit_run(
+                    run_request,
+                    redact_json=eval_target.app.redact_json,
+                )
+            except EvalRunAdmissionConflict as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency-Key is already bound to another eval run request.",
+                ) from exc
+            except EvalStorePublicationRejected as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Eval run request contains unsafe public data.",
+                ) from exc
+
+        async def _prepare_eval_run(
+            *,
+            corpus: EvalCorpusDocument,
+            suite_id: str,
+            max_concurrency: int,
+            invocation: EvalRunInvocation,
+        ) -> tuple[CorpusTarget, CompiledCorpusSuite]:
+            eval_target = _eval_target(corpus.target_key)
+            if any(case.suite_id == suite_id and case.input is None for case in corpus.cases):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "This captured evaluation has no runnable input. Author runnable "
+                        "input or a scenario before launching fresh work."
+                    ),
+                )
+            try:
+                effective_target = target_for_eval_invocation(eval_target, invocation)
+                compiled = await asyncio.to_thread(
+                    compile_corpus_suite,
+                    corpus,
+                    effective_target,
+                    suite_id,
+                )
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Eval run is incompatible with the attached target or bounds.",
+                ) from exc
+            if max_concurrency > eval_target.limits.max_concurrency:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Eval run exceeds the attached target concurrency limit.",
+                )
+            return eval_target, compiled
+
         async def _load_eval_corpus(corpus_revision: str) -> EvalCorpusDocument:
             try:
                 corpus = await eval_store.load_corpus(corpus_revision)
@@ -4737,6 +4898,138 @@ def create_router(
             # cannot pair it with the active record observed above.
             run = await _load_eval_run(run_id)
             return run, result
+
+        @bounded_captured_evaluation_router.post(
+            "/evals/sessions/{session_id}/evaluation/launch",
+            response_model=CapturedEvaluationLaunchResponse,
+            status_code=202,
+            responses=CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def launch_captured_evaluation(
+            session_id: str,
+            body: CapturedEvaluationLaunchRequest,
+            idempotency_key: Annotated[
+                str,
+                Header(alias="Idempotency-Key", min_length=1, max_length=512),
+            ],
+            auth_context: AuthContext | None = optional_auth_context,
+        ) -> CapturedEvaluationLaunchResponse:
+            if not eval_store.captured_results:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Durable captured-result persistence is not available.",
+                )
+            trajectory, registration, _ = await _require_current_captured_candidate(
+                session_id,
+                body.candidate,
+                body.expected_candidate_revision,
+            )
+            target = registration.target
+            try:
+                runnable_baseline = build_promotion_candidate(
+                    cayu_app,
+                    trajectory,
+                    target_key=target.key,
+                    source_agent_name=target.request_base.agent_name,
+                    application_release_id=target.application_release_id,
+                    evidence_policy=target.evidence_policy,
+                    pricing=target.price_book,
+                    project_root=registration.manifest_project_root,
+                )
+            except SessionPromotionError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_promotion_error_detail(
+                        "source_ineligible",
+                        str(exc),
+                        reason=exc.code.value,
+                    ),
+                ) from exc
+            try:
+                runnable_candidate = runnable_promotion_candidate(
+                    body.candidate,
+                    runnable_baseline,
+                    trial_request=body.trial_request,
+                )
+                score = score_promotion_candidate(
+                    cayu_app,
+                    trajectory,
+                    runnable_candidate,
+                    target_key=target.key,
+                    source_agent_name=target.request_base.agent_name,
+                    application_release_id=target.application_release_id,
+                    pricing=target.price_book,
+                    project_root=registration.manifest_project_root,
+                )
+                corpus = corpus_from_promotion_candidate(runnable_candidate)
+                result = CapturedEvaluationResultV1.create(
+                    corpus=corpus,
+                    target=EvalResultTargetIdentityV1(
+                        target_key=runnable_candidate.target_key,
+                        application_release_id=(runnable_candidate.source.application_release_id),
+                        app_manifest_schema_version=(
+                            runnable_candidate.source.app_manifest_schema_version
+                        ),
+                        app_manifest_fingerprint=(
+                            runnable_candidate.source.app_manifest_fingerprint
+                        ),
+                    ),
+                    score=score,
+                )
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=_promotion_error_detail(
+                        "candidate_rejected",
+                        "The reviewed evaluation cannot be converted to runnable work.",
+                    ),
+                ) from exc
+            invocation = _eval_run_invocation(
+                auth_context,
+                max_steps=body.max_steps,
+                limits=body.limits,
+                cost_budget=body.cost_budget,
+            )
+            eval_target, compiled = await _prepare_eval_run(
+                corpus=corpus,
+                suite_id=runnable_candidate.suite.id,
+                max_concurrency=body.max_concurrency,
+                invocation=invocation,
+            )
+            try:
+                record = await eval_store.save_captured_result(
+                    corpus,
+                    result,
+                    redact_json=target.app.redact_json,
+                )
+            except (EvalCorpusConflict, EvalResultConflict) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The immutable runnable evaluation conflicts with stored content.",
+                ) from exc
+            except EvalStorePublicationRejected as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="The runnable evaluation contains unsafe public data.",
+                ) from exc
+            except EvalStoreResultTooLarge as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail="The runnable evaluation exceeds the server byte limit.",
+                ) from exc
+            run = await _admit_eval_run(
+                corpus=corpus,
+                max_concurrency=body.max_concurrency,
+                invocation=invocation,
+                idempotency_key=idempotency_key,
+                eval_target=eval_target,
+                compiled=compiled,
+            )
+            return CapturedEvaluationLaunchResponse(
+                captured=CapturedEvaluationSaveResponse(record=record, result=result),
+                run=run,
+            )
 
         @bounded_evals_router.post(
             "/evals/corpora",
@@ -4950,7 +5243,6 @@ def create_router(
             response_model=EvalRunRecord,
             status_code=202,
             responses=EVALS_ENDPOINT_RESPONSES,
-            dependencies=protected,
             openapi_extra=_json_request_openapi(EvalRunCreateRequest),
         )
         async def create_eval_run(
@@ -4959,6 +5251,7 @@ def create_router(
                 str,
                 Header(alias="Idempotency-Key", min_length=1, max_length=512),
             ],
+            auth_context: AuthContext | None = optional_auth_context,
         ):
             body = await _validated_private_json_body(
                 request,
@@ -4966,70 +5259,26 @@ def create_router(
                 invalid_detail="Invalid Evals request.",
             )
             corpus = await _load_eval_corpus(body.corpus_revision)
-            eval_target = _eval_target(corpus.target_key)
-            if any(case.suite_id == body.suite_id and case.input is None for case in corpus.cases):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "This captured evaluation has no runnable input. Author runnable "
-                        "input or a scenario before launching fresh work."
-                    ),
-                )
-            try:
-                idempotency_key = require_clean_nonblank(
-                    idempotency_key,
-                    "Idempotency-Key",
-                )
-                require_unicode_scalar_text(idempotency_key, "Idempotency-Key")
-                compiled = await asyncio.to_thread(
-                    compile_corpus_suite,
-                    corpus,
-                    eval_target,
-                    body.suite_id,
-                )
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Eval run is incompatible with the attached target.",
-                ) from exc
-            if body.max_concurrency > eval_target.limits.max_concurrency:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Eval run exceeds the attached target concurrency limit.",
-                )
-            digest = (
-                "sha256:"
-                + hashlib.sha256(
-                    b"cayu-server-eval-idempotency-v1\0"
-                    + eval_target.key.encode("ascii")
-                    + b"\0"
-                    + idempotency_key.encode("utf-8")
-                ).hexdigest()
+            invocation = _eval_run_invocation(
+                auth_context,
+                max_steps=body.max_steps,
+                limits=body.limits,
+                cost_budget=body.cost_budget,
             )
-            run_request = EvalRunRequest(
-                run_id=f"eval-{uuid4().hex}",
-                corpus_revision=corpus.revision,
-                target_key=eval_target.key,
-                suite_id=compiled.run_contract.suite_id,
-                suite_revision=compiled.run_contract.suite_revision,
+            eval_target, compiled = await _prepare_eval_run(
+                corpus=corpus,
+                suite_id=body.suite_id,
                 max_concurrency=body.max_concurrency,
-                idempotency_key=digest,
+                invocation=invocation,
             )
-            try:
-                return await eval_store.admit_run(
-                    run_request,
-                    redact_json=eval_target.app.redact_json,
-                )
-            except EvalRunAdmissionConflict as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Idempotency-Key is already bound to another eval run request.",
-                ) from exc
-            except EvalStorePublicationRejected as exc:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Eval run request contains unsafe public data.",
-                ) from exc
+            return await _admit_eval_run(
+                corpus=corpus,
+                max_concurrency=body.max_concurrency,
+                invocation=invocation,
+                idempotency_key=idempotency_key,
+                eval_target=eval_target,
+                compiled=compiled,
+            )
 
         @bounded_evals_router.get(
             "/evals/runs",

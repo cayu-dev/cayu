@@ -85,6 +85,7 @@ from cayu.evals.store import (
     decode_run_cursor,
     decode_suite_cursor,
     eval_result_record,
+    eval_run_invocation_from_json,
     result_summary,
     validate_result_for_run,
 )
@@ -92,7 +93,7 @@ from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage.sqlite import _run_off_thread_with_connection_ownership
 
-_SQLITE_EVAL_MIN_REQUIRED_REVISION = 48
+_SQLITE_EVAL_MIN_REQUIRED_REVISION = 50
 
 _RUN_COLUMNS = """
     run_id,
@@ -102,6 +103,7 @@ _RUN_COLUMNS = """
     suite_id,
     suite_revision,
     max_concurrency,
+    invocation_json,
     status,
     created_at,
     updated_at,
@@ -152,6 +154,7 @@ def _request_from_row(row: sqlite3.Row) -> EvalRunRequest:
         suite_id=row["suite_id"],
         suite_revision=row["suite_revision"],
         max_concurrency=row["max_concurrency"],
+        invocation=eval_run_invocation_from_json(row["invocation_json"]),
     )
 
 
@@ -179,6 +182,7 @@ def _run_record_from_row(row: sqlite3.Row) -> EvalRunRecord:
             suite_id=row["suite_id"],
             suite_revision=row["suite_revision"],
             max_concurrency=row["max_concurrency"],
+            invocation=eval_run_invocation_from_json(row["invocation_json"]),
         ),
         status=status,
         attempt_count=row["ownership_epoch"],
@@ -530,9 +534,9 @@ class SQLiteEvalStore(EvalStore):
                     """
                     INSERT INTO cayu_eval_runs (
                         run_id, idempotency_key, corpus_revision, target_key,
-                        suite_id, suite_revision, max_concurrency, status,
+                        suite_id, suite_revision, max_concurrency, invocation_json, status,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         request.run_id,
@@ -542,6 +546,7 @@ class SQLiteEvalStore(EvalStore):
                         request.suite_id,
                         request.suite_revision,
                         request.max_concurrency,
+                        request.invocation.model_dump_json(),
                         str(EvalRunStatus.QUEUED),
                         timestamp,
                         timestamp,

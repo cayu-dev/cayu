@@ -18,6 +18,7 @@ from cayu.evals.store import (
     EvalBaselineKey,
     EvalBaselineUpdate,
     EvalRunClaim,
+    EvalRunInvocation,
     EvalRunRecord,
     EvalRunRequest,
     EvalRunStatus,
@@ -109,7 +110,7 @@ def test_postgres_eval_store_shared_conformance(postgres_dsn) -> None:
     asyncio.run(exercise())
 
 
-def test_postgres_eval_store_creates_revision_forty_eight_schema(postgres_dsn) -> None:
+def test_postgres_eval_store_creates_revision_fifty_schema(postgres_dsn) -> None:
     async def exercise() -> None:
         import psycopg
 
@@ -129,12 +130,20 @@ def test_postgres_eval_store_creates_revision_forty_eight_schema(postgres_dsn) -
         ):
             await cur.execute(
                 "SELECT revision, kind, compatible_from FROM cayu_schema_migrations "
-                "WHERE revision IN (47, 48) ORDER BY revision"
+                "WHERE revision IN (47, 48, 49, 50) ORDER BY revision"
             )
             assert await cur.fetchall() == [
                 (47, "breaking", 47),
                 (48, "breaking", 48),
+                (49, "breaking", 49),
+                (50, "breaking", 50),
             ]
+            await cur.execute(
+                "SELECT data_type, is_nullable, column_default "
+                "FROM information_schema.columns WHERE table_schema = current_schema() "
+                "AND table_name = 'cayu_eval_runs' AND column_name = 'invocation_json'"
+            )
+            assert await cur.fetchone() == ("text", "NO", None)
             await cur.execute(
                 """
                 SELECT pg_get_constraintdef(constraint_record.oid)
@@ -274,6 +283,41 @@ def test_postgres_revision_forty_eight_preserves_cases_and_admits_zero_messages(
                     "Captured contract check",
                 ),
             )
+
+    asyncio.run(exercise())
+
+
+def test_postgres_revision_fifty_backfills_existing_eval_run_invocation(
+    postgres_dsn,
+) -> None:
+    async def exercise() -> None:
+        import psycopg
+
+        from cayu.storage.evals_postgres import PostgresEvalStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _drop_eval_tables(postgres_dsn)
+        corpus = _corpus(trials=1)
+        initialized = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            await _save_corpus(initialized, corpus)
+            await _admit_run(initialized, _request(corpus))
+        finally:
+            await initialized.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("ALTER TABLE cayu_eval_runs DROP COLUMN invocation_json")
+            await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 50")
+
+        migrated = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            run = await migrated.load_run("run-1")
+            assert run.spec.invocation == EvalRunInvocation()
+        finally:
+            await migrated.close()
 
     asyncio.run(exercise())
 

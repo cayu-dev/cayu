@@ -20,9 +20,12 @@ import type {
   ArtifactsResponse,
   CapturedEvaluationDraft,
   CapturedEvaluationExportRequest,
+  CapturedEvaluationLaunchRequest,
+  CapturedEvaluationLaunchResponse,
   CapturedEvaluationPreviewResponse,
   CapturedEvaluationSaveRequest,
   CapturedEvaluationSaveResponse,
+  CreateEvalRunApiEvalsRunsPostData,
   EnvironmentsResponse,
   EvalBaselineSelectionRequest,
   EvalBaselineSelectionResponse,
@@ -187,6 +190,8 @@ export type CapturedEvaluationCandidateDraft = CapturedEvaluationDraft
 export type CapturedEvaluationExport = CapturedEvaluationExportRequest
 export type CapturedEvaluationSave = CapturedEvaluationSaveRequest
 export type CapturedEvaluationSaved = CapturedEvaluationSaveResponse
+export type CapturedEvaluationLaunch = CapturedEvaluationLaunchRequest
+export type CapturedEvaluationLaunched = CapturedEvaluationLaunchResponse
 export type EvalBaselineSelection = EvalBaselineSelectionRequest
 export type EvalBaselineSelected = EvalBaselineSelectionResponse
 export type EvalResultDetail = EvalResultDetailResponse
@@ -479,6 +484,23 @@ export async function saveCapturedEvaluation(
   )
 }
 
+export async function launchCapturedEvaluation(
+  sessionId: string,
+  body: CapturedEvaluationLaunch,
+  idempotencyKey: string,
+  signal?: AbortSignal,
+): Promise<CapturedEvaluationLaunched> {
+  return requestJson<CapturedEvaluationLaunched>(
+    `/evals/sessions/${encodeURIComponent(sessionId)}/evaluation/launch`,
+    {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify(body),
+      signal,
+    },
+  )
+}
+
 export async function exportCapturedEvaluation(
   sessionId: string,
   body: CapturedEvaluationExport,
@@ -586,7 +608,7 @@ export async function fetchEvalRuns(
 }
 
 export async function createEvalRun(
-  request: { corpus_revision: string; suite_id: string; max_concurrency: number },
+  request: CreateEvalRunApiEvalsRunsPostData["body"],
   idempotencyKey: string,
   signal?: AbortSignal,
 ): Promise<EvalRun> {

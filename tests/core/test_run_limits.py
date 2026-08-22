@@ -59,6 +59,7 @@ from cayu.runtime.budgets import (
     InMemoryBudgetLedger,
     SessionBudgetStore,
     _effective_budget_limit_id,
+    budget_pricing_preflight_error,
     has_deferred_contextual_price,
     request_budget_limits_for_session,
 )
@@ -190,6 +191,77 @@ def test_deferred_bedrock_price_does_not_shadow_direct_gateway_price() -> None:
         provider_name="bedrock",
         model="shared-model",
     )
+
+
+def test_budget_pricing_preflight_requires_model_and_currency_compatibility() -> None:
+    pricing = _pricing()
+
+    assert (
+        budget_pricing_preflight_error(
+            pricing,
+            provider_name="fake",
+            model="fake-model",
+            currency="USD",
+        )
+        is None
+    )
+    currency_error = budget_pricing_preflight_error(
+        pricing,
+        provider_name="fake",
+        model="fake-model",
+        currency="EUR",
+    )
+    missing_model_error = budget_pricing_preflight_error(
+        pricing,
+        provider_name="fake",
+        model="missing-model",
+        currency="USD",
+    )
+    assert currency_error is not None
+    assert "does not match requested EUR" in currency_error
+    assert missing_model_error is not None
+    assert "no matching model pricing" in missing_model_error
+
+
+def test_budget_pricing_preflight_rejects_ambiguous_contextual_currencies() -> None:
+    pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="bedrock",
+                model="shared-model",
+                match="exact",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("2"),
+                currency="USD",
+                pricing_context={
+                    "source_region": ("us-east-1",),
+                    "service_tier": ("default",),
+                },
+            ),
+            ModelPrice.fixed(
+                provider_name="bedrock",
+                model="shared-model",
+                match="exact",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("2"),
+                currency="EUR",
+                pricing_context={
+                    "source_region": ("eu-west-1",),
+                    "service_tier": ("default",),
+                },
+            ),
+        )
+    )
+
+    error = budget_pricing_preflight_error(
+        pricing,
+        provider_name="bedrock",
+        model="shared-model",
+        currency="USD",
+    )
+
+    assert error is not None
+    assert "currencies EUR, USD do not uniquely match requested USD" in error
 
 
 class _RecordingProvider(ModelProvider):

@@ -29,11 +29,22 @@ import cayu.storage.evals_sqlite as evals_sqlite_module
 from cayu import AgentSpec, CayuApp, ModelJudgeTarget, ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.evals.corpus import EvalCaseSpec, EvalCorpusDocument
 from cayu.evals.execution import run_corpus_suite
-from cayu.evals.store import EvalRunRequest, EvalRunStatus, InMemoryEvalStore
+from cayu.evals.store import (
+    EvalRunInvocation,
+    EvalRunRequest,
+    EvalRunStatus,
+    InMemoryEvalStore,
+)
 from cayu.project_control_plane import (
     ProjectControlPlaneAccess,
     _create_project_control_plane_context,
 )
+from cayu.runtime.invocation import (
+    InvocationOrigin,
+    InvocationOriginTrust,
+    SessionExecutionSource,
+)
+from cayu.runtime.stop_policy import RunLimits
 from cayu.server import (
     AuthContext,
     AuthenticatedAccess,
@@ -242,7 +253,34 @@ def test_evals_openapi_has_no_dangling_manual_request_schema_references(tmp_path
             ]
             for path in ("/api/evals/corpora", "/api/evals/runs", "/api/evals/comparisons")
         }
-        assert request_schemas["/api/evals/runs"] == EvalRunCreateRequest.model_json_schema()
+
+        def without_null_defaults(value):
+            if isinstance(value, dict):
+                return {
+                    key: without_null_defaults(item)
+                    for key, item in value.items()
+                    if not (key == "default" and item is None)
+                }
+            if isinstance(value, list):
+                return [without_null_defaults(item) for item in value]
+            return value
+
+        expected_run_schema = EvalRunCreateRequest.model_json_schema()
+        definitions = expected_run_schema.pop("$defs")
+
+        def inline_definitions(value):
+            if isinstance(value, dict):
+                reference = value.get("$ref")
+                if isinstance(reference, str) and reference.startswith("#/$defs/"):
+                    return inline_definitions(definitions[reference.rsplit("/", 1)[-1]])
+                return {key: inline_definitions(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [inline_definitions(item) for item in value]
+            return value
+
+        assert request_schemas["/api/evals/runs"] == without_null_defaults(
+            inline_definitions(expected_run_schema)
+        )
         assert (
             request_schemas["/api/evals/comparisons"] == EvalComparisonRequest.model_json_schema()
         )
@@ -448,6 +486,8 @@ def test_evals_api_imports_executes_compares_and_exports_deterministically(tmp_p
                 "corpus_revision": corpus.revision,
                 "suite_id": corpus.suites[0].id,
                 "max_concurrency": 1,
+                "max_steps": 1,
+                "limits": {"max_total_tokens": 100, "scope": "run"},
             }
             admitted = client.post(
                 "/api/evals/runs",
@@ -455,6 +495,25 @@ def test_evals_api_imports_executes_compares_and_exports_deterministically(tmp_p
                 json=request,
             )
             assert admitted.status_code == 202
+            assert admitted.json()["spec"]["invocation"] == {
+                "schema_version": 1,
+                "source": "http_run",
+                "origin": {
+                    "trust": "server_verified",
+                    "subject": "eval-operator",
+                    "tenant": None,
+                },
+                "max_steps": 1,
+                "limits": {
+                    "max_input_tokens": None,
+                    "max_output_tokens": None,
+                    "max_total_tokens": 100,
+                    "max_tool_calls": None,
+                    "max_elapsed_seconds": None,
+                    "scope": "run",
+                },
+                "cost_budget": None,
+            }
             run_id = admitted.json()["spec"]["run_id"]
             replayed = client.post(
                 "/api/evals/runs",
@@ -467,6 +526,14 @@ def test_evals_api_imports_executes_compares_and_exports_deterministically(tmp_p
             terminal = _wait_for_terminal(client, run_id)
             assert terminal["status"] == "completed"
             assert terminal["result"]["status"] == "passed"
+            sessions = asyncio.run(target.app.session_store.list_sessions()).sessions
+            assert len(sessions) == 2
+            assert all(
+                session.invocation.source is SessionExecutionSource.HTTP_RUN
+                and session.invocation.origin.trust is InvocationOriginTrust.SERVER_VERIFIED
+                and session.invocation.origin.subject == "eval-operator"
+                for session in sessions
+            )
 
             result = client.get(f"/api/evals/runs/{run_id}/result", headers=_AUTH_HEADERS)
             assert result.status_code == 200
@@ -1524,6 +1591,69 @@ def test_shutdown_releases_owned_eval_for_restart_recovery(tmp_path) -> None:
         assert provider.cancelled.wait(timeout=2)
     finally:
         asyncio.run(store.close())
+
+
+def test_restarted_worker_recreates_persisted_http_provenance_and_run_bounds(tmp_path) -> None:
+    provider = _provider(trials=1)
+    target = _target(provider)
+    corpus = _corpus(trials=1)
+    database = tmp_path / "evals.db"
+
+    async def exercise() -> None:
+        first = SQLiteEvalStore(database)
+        request = EvalRunRequest(
+            run_id="eval-restart-provenance",
+            idempotency_key="sha256:" + "9" * 64,
+            corpus_revision=corpus.revision,
+            target_key=target.key,
+            suite_id=corpus.suites[0].id,
+            suite_revision=corpus.suites[0].revision,
+            max_concurrency=1,
+            invocation=EvalRunInvocation(
+                source=SessionExecutionSource.HTTP_RUN,
+                origin=InvocationOrigin(
+                    trust=InvocationOriginTrust.SERVER_VERIFIED,
+                    subject="restart-operator",
+                    tenant="restart-tenant",
+                ),
+                max_steps=1,
+                limits=RunLimits(max_total_tokens=100, scope="run"),
+            ),
+        )
+        await first.save_corpus(corpus, redact_json=target.app.redact_json)
+        await first.admit_run(request, redact_json=target.app.redact_json)
+        await first.close()
+
+        reopened = SQLiteEvalStore(database, schema_mode=SchemaMode.VALIDATE)
+        coordinator = evals_worker_module.EvalRunCoordinator(_evals_config(target, reopened))
+        coordinator.start()
+        try:
+            deadline = asyncio.get_running_loop().time() + 5
+            while asyncio.get_running_loop().time() < deadline:
+                record = await reopened.load_run(request.run_id)
+                assert record is not None
+                if record.status in {
+                    EvalRunStatus.COMPLETED,
+                    EvalRunStatus.FAILED,
+                    EvalRunStatus.CANCELLED,
+                }:
+                    break
+                await asyncio.sleep(0.01)
+            assert record.status is EvalRunStatus.COMPLETED
+            sessions = (await target.app.session_store.list_sessions()).sessions
+            assert len(sessions) == 1
+            session = sessions[0]
+            assert session.invocation.source is SessionExecutionSource.HTTP_RUN
+            assert session.invocation.origin == InvocationOrigin(
+                trust=InvocationOriginTrust.SERVER_VERIFIED,
+                subject="restart-operator",
+                tenant="restart-tenant",
+            )
+        finally:
+            await coordinator.stop()
+            await reopened.close()
+
+    asyncio.run(exercise())
 
 
 def test_shutdown_grace_bounds_a_stalled_durable_release(tmp_path, monkeypatch) -> None:

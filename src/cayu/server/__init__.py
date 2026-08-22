@@ -361,10 +361,14 @@ def create_server(
             if resolved_config.dashboard.enabled
             else None
         )
-        evaluation_promotion_pricing = (
+        configured_dashboard_price_book = (
             _configured_dashboard_price_book(resolved_dashboard_runtime_config)
             if resolved_config.dashboard.enabled
-            and resolved_config.evaluation_promotion is not None
+            else None
+        )
+        evaluation_promotion_pricing = (
+            configured_dashboard_price_book
+            if resolved_config.evaluation_promotion is not None
             else None
         )
         router = create_router(
@@ -389,6 +393,7 @@ def create_server(
             dashboard_pricing_metadata=pricing_metadata,
             evaluation_promotion=resolved_config.evaluation_promotion,
             evaluation_promotion_pricing=evaluation_promotion_pricing,
+            generated_evals_pricing=configured_dashboard_price_book,
             evals=resolved_config.evals,
             _project_context=resolved_project_context,
         )
@@ -556,6 +561,11 @@ def mount_cayu(
         evaluation_promotion_pricing=(
             None
             if prepared_dashboard is None or evaluation_promotion is None
+            else _configured_dashboard_price_book(resolved_dashboard_config)
+        ),
+        generated_evals_pricing=(
+            None
+            if prepared_dashboard is None
             else _configured_dashboard_price_book(resolved_dashboard_config)
         ),
         evals=evals,

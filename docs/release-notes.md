@@ -89,6 +89,35 @@ guard.
 
 ## Unreleased
 
+### Captured sessions can launch bounded fresh trials from the Control Plane
+
+Simple captured sessions with safely reconstructable input can now move directly
+from evidence review to a fresh one-trial run. The review sheet keeps preview
+side-effect free, exposes the published target ceilings and optional runtime and
+cost contractions, saves the reviewed captured result, and queues fresh work
+through the existing durable eval worker. Generated project targets default to
+one trial and concurrency one and reuse normal provider, tool, environment,
+approval, and operator policy; broader scale or changed authority still requires
+an explicit application-owned target. Runtime and estimated-cost ceilings apply
+to each trial independently, while trial count and concurrency bound aggregate
+run scale.
+
+Authenticated HTTP provenance and all execution contractions are now part of the
+immutable run admission record. Restarted workers reconstruct the same bounded
+runtime invocation instead of falling back to unattributed SDK authority. Cost
+ceilings use only a server-owned `PriceBook` that currently prices the resolved
+target model; the catalog publishes its compatible currencies and admission
+rejects missing model pricing or a currency mismatch before writing. The browser
+cannot supply pricing or executable configuration. Ambiguous dashboard retries
+retain the original idempotency key, and the fresh launch uses the same
+run/result and reporting contracts as every other eval.
+
+Storage revision 50 is a breaking boundary that adds the durable eval-run
+invocation projection. Stop revision-49 workers, back up each SQLite or
+PostgreSQL store, run `cayu storage migrate`, and confirm revision 50 before
+starting current workers. Mixed revision-49 and revision-50 eval workers are
+unsupported.
+
 ### OpenAI subscription retries are bounded with migration-explicit authority
 
 OpenAI subscription HTTP and SSE errors now preserve bounded typed retry
@@ -239,12 +268,12 @@ workers together. The server contract advances from version 10 to version 16,
 and the public application manifest and generator plan advance from schema 7
 to schema 9.
 
-The storage schema advances from revision 36 to revision 49. Follow the
-revision-specific migration boundaries below: revisions 39 through 49 contain
+The storage schema advances from revision 36 to revision 50. Follow the
+revision-specific migration boundaries below: revisions 39 through 50 contain
 breaking durable contracts, and populated legacy knowledge or task stores may
 require the explicitly documented rebuild or drain procedure. Run `cayu storage
 status` followed by `cayu storage migrate` against every configured SQLite or
-PostgreSQL store, and confirm revision 49 with no pending migrations before
+PostgreSQL store, and confirm revision 50 with no pending migrations before
 starting `v0.3.0` workers. Mixed-version deployment and application-only
 rollback across these boundaries are unsupported.
 

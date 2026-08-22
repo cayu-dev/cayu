@@ -2349,6 +2349,38 @@ export type CapturedEvaluationExportRequest = {
 };
 
 /**
+ * CapturedEvaluationLaunchRequest
+ *
+ * Reviewed captured contract plus bounded fresh-execution settings.
+ */
+export type CapturedEvaluationLaunchRequest = {
+    candidate: CapturedEvaluationCandidateV1;
+    cost_budget?: EvalRunCostBudgetInput | null;
+    /**
+     * Expected Candidate Revision
+     */
+    expected_candidate_revision: string;
+    limits?: RunLimits | null;
+    /**
+     * Max Concurrency
+     */
+    max_concurrency?: number;
+    /**
+     * Max Steps
+     */
+    max_steps?: number | null;
+    trial_request?: TrialRequestSpec;
+};
+
+/**
+ * CapturedEvaluationLaunchResponse
+ */
+export type CapturedEvaluationLaunchResponse = {
+    captured: CapturedEvaluationSaveResponse;
+    run: EvalRunRecord;
+};
+
+/**
  * CapturedEvaluationPreviewRequest
  */
 export type CapturedEvaluationPreviewRequest = {
@@ -3681,11 +3713,68 @@ export type EvalResultTargetIdentityV1 = {
 };
 
 /**
+ * EvalRunCostBudget
+ *
+ * One server-priced cost ceiling applied independently to each eval-trial session.
+ */
+export type EvalRunCostBudgetInput = {
+    /**
+     * Currency
+     */
+    currency?: string;
+    /**
+     * Max Estimated Cost
+     */
+    max_estimated_cost: number | string;
+};
+
+/**
+ * EvalRunCostBudget
+ *
+ * One server-priced cost ceiling applied independently to each eval-trial session.
+ */
+export type EvalRunCostBudgetOutput = {
+    /**
+     * Currency
+     */
+    currency?: string;
+    /**
+     * Max Estimated Cost
+     */
+    max_estimated_cost: string;
+};
+
+/**
  * EvalRunFailureCode
  *
  * Safe terminal diagnostics; arbitrary exception text is never persisted.
  */
 export type EvalRunFailureCode = 'target_unavailable' | 'corpus_unavailable' | 'execution_failed' | 'worker_interrupted';
+
+/**
+ * EvalRunInvocation
+ *
+ * Durable, authority-free execution contractions and trusted caller provenance.
+ *
+ * The HTTP API constructs this value after authentication. It retains only the
+ * bounded subject/tenant projection needed to mint ordinary runtime invocation
+ * provenance after a worker restart; authentication claims never enter EvalStore.
+ * ``None`` bounds inherit the server-owned target request base.
+ */
+export type EvalRunInvocation = {
+    cost_budget?: EvalRunCostBudgetOutput | null;
+    limits?: RunLimits | null;
+    /**
+     * Max Steps
+     */
+    max_steps?: number | null;
+    origin?: InvocationOrigin | null;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    source?: SessionExecutionSource;
+};
 
 /**
  * EvalRunOwnership
@@ -3784,6 +3873,7 @@ export type EvalRunSpec = {
      * Corpus Revision
      */
     corpus_revision: string;
+    invocation?: EvalRunInvocation;
     /**
      * Max Concurrency
      */
@@ -3915,9 +4005,33 @@ export type EvalTargetCatalogEntry = {
      */
     application_release_id: string;
     /**
+     * Cost Budget Available
+     */
+    cost_budget_available: boolean;
+    /**
+     * Cost Budget Currencies
+     */
+    cost_budget_currencies: Array<string>;
+    /**
      * Label
      */
     label: string;
+    /**
+     * Max Concurrency
+     */
+    max_concurrency: number;
+    /**
+     * Max Steps
+     */
+    max_steps: number;
+    /**
+     * Max Timeout Seconds
+     */
+    max_timeout_seconds: number;
+    /**
+     * Max Trials
+     */
+    max_trials: number;
     /**
      * Profile Id
      */
@@ -4435,6 +4549,23 @@ export type InterruptSessionBody = {
      */
     reason?: string | null;
     requested_by?: ResolutionActor | null;
+};
+
+/**
+ * InvocationOrigin
+ *
+ * Immutable root identity retained across a complete session tree.
+ */
+export type InvocationOrigin = {
+    /**
+     * Subject
+     */
+    subject?: string | null;
+    /**
+     * Tenant
+     */
+    tenant?: string | null;
+    trust: InvocationOriginTrust;
 };
 
 /**
@@ -9175,10 +9306,50 @@ export type CreateEvalRunApiEvalsRunsPostData = {
          * Corpus Revision
          */
         corpus_revision: string;
+        cost_budget?: {
+            /**
+             * Currency
+             */
+            currency?: string;
+            /**
+             * Max Estimated Cost
+             */
+            max_estimated_cost: number | string;
+        } | null;
+        limits?: {
+            /**
+             * Max Elapsed Seconds
+             */
+            max_elapsed_seconds?: number | null;
+            /**
+             * Max Input Tokens
+             */
+            max_input_tokens?: number | null;
+            /**
+             * Max Output Tokens
+             */
+            max_output_tokens?: number | null;
+            /**
+             * Max Tool Calls
+             */
+            max_tool_calls?: number | null;
+            /**
+             * Max Total Tokens
+             */
+            max_total_tokens?: number | null;
+            /**
+             * Scope
+             */
+            scope?: 'session' | 'run';
+        } | null;
         /**
          * Max Concurrency
          */
         max_concurrency?: number;
+        /**
+         * Max Steps
+         */
+        max_steps?: number | null;
         /**
          * Suite Id
          */
@@ -9484,6 +9655,56 @@ export type ExportCapturedEvaluationApiEvalsSessionsSessionIdEvaluationExportPos
      */
     200: unknown;
 };
+
+export type LaunchCapturedEvaluationApiEvalsSessionsSessionIdEvaluationLaunchPostData = {
+    body: CapturedEvaluationLaunchRequest;
+    headers: {
+        /**
+         * Idempotency-Key
+         */
+        'Idempotency-Key': string;
+    };
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: never;
+    url: '/api/evals/sessions/{session_id}/evaluation/launch';
+};
+
+export type LaunchCapturedEvaluationApiEvalsSessionsSessionIdEvaluationLaunchPostErrors = {
+    /**
+     * The edited captured evaluation is invalid or unsafe.
+     */
+    400: unknown;
+    /**
+     * The requested session or evaluation resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The captured evidence or compare-and-swap baseline changed.
+     */
+    409: unknown;
+    /**
+     * The bounded captured evidence or result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type LaunchCapturedEvaluationApiEvalsSessionsSessionIdEvaluationLaunchPostResponses = {
+    /**
+     * Successful Response
+     */
+    202: CapturedEvaluationLaunchResponse;
+};
+
+export type LaunchCapturedEvaluationApiEvalsSessionsSessionIdEvaluationLaunchPostResponse = LaunchCapturedEvaluationApiEvalsSessionsSessionIdEvaluationLaunchPostResponses[keyof LaunchCapturedEvaluationApiEvalsSessionsSessionIdEvaluationLaunchPostResponses];
 
 export type PreviewCapturedEvaluationApiEvalsSessionsSessionIdEvaluationPreviewPostData = {
     body: CapturedEvaluationPreviewRequest;

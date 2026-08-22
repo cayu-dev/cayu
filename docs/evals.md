@@ -527,7 +527,9 @@ The same suite/assertion surface supports several modes:
   no live runtime, on any machine, from a saved JSON file.
 - **Production replay** — promote a completed or failed durable session tree with
   `trajectory_from_session(...)`, then score or export the resulting `Trajectory` without running
-  the application again. Corpus management and fresh re-execution are planned follow-ups.
+  the application again. The Control Plane can persist this captured result and, for a simple
+  safely reconstructable invocation, launch a bounded fresh trial; multi-stage scenario replay is
+  a separate versioned contract.
 
 ## Results and repeated trials
 
@@ -770,6 +772,41 @@ need an authored runnable input or scenario. Fresh-run admission rejects a
 captured-only case with that precise explanation. This is an honest boundary of
 reconstructing execution, not a reason to block captured scoring or persistence.
 
+When that conversion is available, the same review sheet exposes **Run fresh
+trial**. The default is one trial at concurrency one. Operators can contract the
+published target's trial timeout and model-step ceiling, add run-scoped token,
+tool-call, or elapsed-time limits, and—when the server owns a compatible
+`PriceBook`—set an estimated-cost ceiling. The browser never supplies tools,
+environments, credentials, pricing schedules, approval rules, or other execution
+authority. It submits the reviewed expectation contract and bounded settings;
+the server reconstructs runnable input from its current target baseline, scores
+and saves the captured result, then admits the fresh run through the ordinary
+durable worker.
+
+Runtime and estimated-cost ceilings apply independently to each fresh trial;
+they are not aggregate ceilings across the eval run. Trial count and concurrency
+bound the run's aggregate scale. Generated project targets permit only one trial,
+while an application-owned target that permits multiple trials must account for
+that multiplication when choosing per-trial limits.
+
+The fresh session uses the target's normal provider, tools, environment,
+approval, and operator policy. Authenticated HTTP provenance and every requested
+contraction are persisted with run admission, so a worker restart cannot silently
+turn an operator launch into unattributed SDK work or recover with broader
+limits. Before writing, the server resolves the target's normal provider/model
+route and accepts a cost ceiling only when the current server-owned price book
+has compatible pricing in the selected published currency. It then preflights
+the complete effective request and enforces target ceilings again during
+compilation and execution. Tool-effect metadata neither grants nor denies
+authority.
+
+Generated project targets deliberately permit only one trial at concurrency one.
+Increasing repetition or parallelism, substituting fixtures, bypassing normal
+approvals, or selecting different tool/environment authority requires an
+explicit application-owned target profile. A simple session that cannot be
+reconstructed is not partially replayed; captured scoring remains usable while
+portable multi-stage scenarios are a separate versioned capability.
+
 Saved results appear in the target-scoped **Evals → Results** catalog alongside
 fresh results. Selecting a result exposes its immutable public-safe score and
 corpus identity. **Approve baseline** performs an actor-attributed, idempotent
@@ -783,7 +820,7 @@ must survive beyond the promotion request. `SQLiteEvalStore` is restart-durable
 for one embedded database; `PostgresEvalStore` supports shared multi-worker
 claims; `InMemoryEvalStore` is intentionally process-local and is suitable for
 tests and transient SDK workflows only. SQLite and PostgreSQL require storage
-schema revision 48. Corpus saves, run admission, and result publication require
+schema revision 50. Corpus saves, run admission, and result publication require
 the active application's complete JSON redaction boundary. A configured workload
 secret or redaction failure rejects before any write; the store never retains
 the redaction function or secret registry.
@@ -969,7 +1006,13 @@ The generated profile id is currently `default`. It preserves normal agent
 provider, tool, environment, approval, and policy selection. The profile
 dimension is part of stable identity now so later server-published profiles can
 represent deliberate fixture, isolation, or authority changes without changing
-existing keys. An explicit `EvalsConfig` remains the complete low-level contract
+existing keys. Generated targets default to one trial and concurrency one; their
+catalog entries publish the server-enforced trial, concurrency, timeout, and
+model-step ceilings plus the target-compatible cost currencies, if any. A
+non-empty currency list is the only condition that marks cost budgets available;
+the browser cannot invent another currency and admission repeats compatibility
+preflight against current pricing. An
+explicit `EvalsConfig` remains the complete low-level contract
 and takes precedence as one indivisible singleton registry; Cayu never merges its
 target with the automatically assembled store. Arbitrary embedded
 `create_server(...)` and `mount_cayu(...)` integrations continue to provide
@@ -1019,7 +1062,9 @@ results, requests cancellation, checks comparison compatibility, and downloads
 deterministic JSON or standalone HTML reports. Run admission requires an
 `Idempotency-Key` header; Cayu persists only a target-scoped SHA-256 digest of
 that value. HTTP documents can select only a stored corpus revision, suite, and
-bounded concurrency. They cannot carry an application, import path, provider
+bounded concurrency, and can contract model steps or run-scoped token,
+tool-call, elapsed-time, and server-priced cost limits. They cannot broaden the
+target request or carry an application, import path, provider
 credential, callback, PriceBook, tool/environment wiring, request template, or
 another target.
 
@@ -1030,6 +1075,14 @@ creation repeats the selected-suite compatibility check before persisting
 admission, and the provider is never invoked in either path. A shared store is
 filtered at its query and claim boundaries by target key; another target's
 corpora and runs are neither exposed nor claimed by this server.
+
+HTTP admission records a bounded server-verified subject/tenant projection, or
+an explicitly unattributed HTTP source when the server is configured for open
+access, alongside those contractions. It contains no authentication claims or
+executable authority. The worker combines that durable invocation with the
+current server-owned target and may only narrow the target's request. A stored
+HTTP run that tries to inherit host-asserted SDK origin is rejected rather than
+laundered across the server boundary.
 
 The embedded coordinator claims persisted work with the store's private token,
 epoch, and expiring lease, then invokes the same compiled execution core used by
@@ -1078,8 +1131,9 @@ When `surfaces.evals.read` and `evals_readiness.catalog_read` are enabled, the
 catalog pages through immutable corpus revisions, suites, and cases without
 hydrating complete corpus documents. Operators can import an 8 MiB-or-smaller
 corpus file, download canonical corpus JSON, select a suite, choose bounded
-concurrency, and launch a durable run against the one attached target. After a
-bounded browser preflight, import forwards the selected file bytes unchanged so
+concurrency and runtime ceilings, and launch a durable run against the selected
+published target. After a bounded browser preflight, import forwards the selected
+file bytes unchanged so
 the server's strict duplicate-key, UTF-8, portable-JSON, and corpus validation
 remains authoritative. Mutation controls remain disabled when
 `surfaces.evals.mutate` is unavailable even when catalog reads are allowed.
@@ -1092,6 +1146,12 @@ terminal state. Opaque catalog/run cursors and selected corpus, suite, run,
 status, and comparison identities remain in bounded URL state. Superseded reads
 are cancelled and a changed corpus never reuses another corpus's suite or case
 projection.
+
+The session-side **Run fresh trial** action uses the same retry registry and run
+worker. Its request identity includes the captured candidate revision and every
+execution setting, so changing a bound creates a new admission identity while an
+ambiguous retry of unchanged work remains idempotent. Successful launch opens the
+ordinary Evals run view; there is no dashboard-only execution engine.
 
 A completed run exposes the complete safe published graph. The result view
 shows target release/AppManifest identity, run/case/trial status and score,

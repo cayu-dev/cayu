@@ -21,6 +21,7 @@ from cayu.evals.store import (
     EvalBaselineKey,
     EvalBaselineUpdate,
     EvalRunClaim,
+    EvalRunInvocation,
     EvalRunRecord,
     EvalRunRequest,
     EvalRunStatus,
@@ -95,7 +96,7 @@ def test_sqlite_eval_store_shared_conformance(tmp_path) -> None:
     asyncio.run(exercise())
 
 
-def test_sqlite_eval_store_creates_revision_forty_eight_schema(tmp_path) -> None:
+def test_sqlite_eval_store_creates_revision_fifty_schema(tmp_path) -> None:
     path = tmp_path / "evals.db"
 
     async def initialize() -> None:
@@ -107,8 +108,9 @@ def test_sqlite_eval_store_creates_revision_forty_eight_schema(tmp_path) -> None
     try:
         revisions = connection.execute(
             "SELECT revision, kind, compatible_from FROM cayu_schema_migrations "
-            "WHERE revision IN (47, 48) ORDER BY revision"
+            "WHERE revision IN (47, 48, 49, 50) ORDER BY revision"
         ).fetchall()
+        invocation_column = connection.execute("PRAGMA table_info(cayu_eval_runs)").fetchall()
         case_table = connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cayu_eval_cases'"
         ).fetchone()
@@ -129,7 +131,16 @@ def test_sqlite_eval_store_creates_revision_forty_eight_schema(tmp_path) -> None
         }
     finally:
         connection.close()
-    assert revisions == [(47, "breaking", 47), (48, "breaking", 48)]
+    assert revisions == [
+        (47, "breaking", 47),
+        (48, "breaking", 48),
+        (49, "breaking", 49),
+        (50, "breaking", 50),
+    ]
+    assert next(row for row in invocation_column if row[1] == "invocation_json")[2:4] == (
+        "TEXT",
+        1,
+    )
     assert case_table is not None
     normalized_case_table = "".join(case_table[0].lower().split())
     assert "check(message_count>=0andmessage_count<=16)" in normalized_case_table
@@ -231,6 +242,45 @@ def test_sqlite_revision_forty_eight_preserves_cases_and_admits_zero_messages(
         )
     finally:
         connection.close()
+
+
+def test_sqlite_revision_fifty_backfills_existing_eval_run_invocation(
+    tmp_path,
+) -> None:
+    path = tmp_path / "evals.db"
+    corpus = _corpus(trials=1)
+
+    async def initialize_revision_forty_nine() -> None:
+        store = SQLiteEvalStore(path)
+        try:
+            await _save_corpus(store, corpus)
+            await _admit_run(store, _request(corpus))
+        finally:
+            await store.close()
+
+    asyncio.run(initialize_revision_forty_nine())
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            ALTER TABLE cayu_eval_runs DROP COLUMN invocation_json;
+            DELETE FROM cayu_schema_migrations WHERE revision = 50;
+            PRAGMA user_version = 49;
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    async def migrate() -> None:
+        store = SQLiteEvalStore(path, schema_mode=SchemaMode.MIGRATE)
+        try:
+            run = await store.load_run("run-1")
+            assert run.spec.invocation == EvalRunInvocation()
+        finally:
+            await store.close()
+
+    asyncio.run(migrate())
 
 
 def test_sqlite_eval_store_is_restart_durable_and_idempotent(tmp_path) -> None:

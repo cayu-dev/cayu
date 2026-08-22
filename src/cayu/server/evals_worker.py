@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from dataclasses import dataclass
 from enum import StrEnum
 
 from cayu.evals.corpus import EvalCorpusDocument
@@ -28,9 +29,16 @@ from cayu.server.evals_registry import (
     EvalTargetRegistration,
     ResolvedEvalsRuntime,
     resolved_evals_runtime,
+    target_for_eval_invocation,
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedEvalRun:
+    target: CorpusTarget
+    compiled: CompiledCorpusSuite
 
 
 class _ClaimMonitorOutcome(StrEnum):
@@ -210,7 +218,7 @@ class EvalRunCoordinator:
         self,
         lease: EvalRunLease,
         registration: EvalTargetRegistration,
-    ) -> CompiledCorpusSuite | EvalRunFailureCode:
+    ) -> _PreparedEvalRun | EvalRunFailureCode:
         try:
             corpus = await self._config.store.load_corpus(lease.run.spec.corpus_revision)
         except asyncio.CancelledError:
@@ -232,8 +240,14 @@ class EvalRunCoordinator:
         corpus: EvalCorpusDocument,
         lease: EvalRunLease,
         registration: EvalTargetRegistration,
-    ) -> CompiledCorpusSuite | EvalRunFailureCode:
-        target = registration.target
+    ) -> _PreparedEvalRun | EvalRunFailureCode:
+        try:
+            target = target_for_eval_invocation(
+                registration.target,
+                lease.run.spec.invocation,
+            )
+        except Exception:
+            return EvalRunFailureCode.TARGET_UNAVAILABLE
         try:
             identity = evaluation_target_identity(
                 target,
@@ -257,20 +271,20 @@ class EvalRunCoordinator:
                 raise ValueError("Persisted eval run does not match its compiled suite.")
         except Exception:
             return EvalRunFailureCode.CORPUS_UNAVAILABLE
-        return compiled
+        return _PreparedEvalRun(target=target, compiled=compiled)
 
     async def _execute_compiled_lease(
         self,
         lease: EvalRunLease,
         registration: EvalTargetRegistration,
-        compiled: CompiledCorpusSuite,
+        prepared: _PreparedEvalRun,
         monitor: asyncio.Task[_ClaimMonitorOutcome],
     ) -> None:
-        target = registration.target
+        target = prepared.target
         execution = asyncio.create_task(
             _run_compiled_corpus_suite(
                 target,
-                compiled,
+                prepared.compiled,
                 max_concurrency=lease.run.spec.max_concurrency,
                 manifest_project_root=registration.manifest_project_root,
                 expected_app_manifest_fingerprint=(

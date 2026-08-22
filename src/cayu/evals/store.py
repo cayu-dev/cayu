@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any, ClassVar, Literal
 from uuid import uuid4
@@ -59,6 +60,13 @@ from cayu.evals.results import (
     eval_result_projection,
     validate_captured_result_for_corpus,
 )
+from cayu.runtime.invocation import (
+    InvocationOrigin,
+    InvocationOriginTrust,
+    SessionExecutionSource,
+    copy_invocation_origin,
+)
+from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 
 EVAL_STORE_DEFAULT_PAGE_SIZE = 50
 EVAL_STORE_MAX_PAGE_SIZE = 200
@@ -69,6 +77,7 @@ EVAL_STORE_MAX_IDENTIFIER_CHARS = 128
 EVAL_STORE_MAX_LEASE_SECONDS = 3_600
 EVAL_STORE_MAX_CLAIM_TARGETS = 128
 _EVAL_STORE_MAX_BIGINT = 2**63 - 1
+EVAL_RUN_INVOCATION_MAX_BYTES = 64 << 10
 
 _STORE_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _CURSOR_VERSION = 1
@@ -650,6 +659,110 @@ class EvalCaseCatalogPage(_EvalStoreModel):
         return self
 
 
+class EvalRunCostBudget(_EvalStoreModel):
+    """One server-priced cost ceiling applied independently to each eval-trial session."""
+
+    max_estimated_cost: Decimal = Field(gt=0)
+    currency: StrictStr = Field(default="USD", min_length=1, max_length=16)
+
+    @field_validator("max_estimated_cost")
+    @classmethod
+    def validate_cost(cls, value: Decimal, info) -> Decimal:
+        if not value.is_finite():
+            raise ValueError(f"{info.field_name} must be finite.")
+        return value
+
+    @field_validator("currency")
+    @classmethod
+    def validate_currency(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value.upper(),
+            info.field_name,
+            max_chars=16,
+            nonblank=True,
+            clean=True,
+        )
+
+
+class EvalRunInvocation(_EvalStoreModel):
+    """Durable, authority-free execution contractions and trusted caller provenance.
+
+    The HTTP API constructs this value after authentication. It retains only the
+    bounded subject/tenant projection needed to mint ordinary runtime invocation
+    provenance after a worker restart; authentication claims never enter EvalStore.
+    ``None`` bounds inherit the server-owned target request base.
+    """
+
+    schema_version: Literal[1] = 1
+    source: SessionExecutionSource = SessionExecutionSource.SDK_RUN
+    origin: InvocationOrigin | None = None
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    limits: RunLimits | None = None
+    cost_budget: EvalRunCostBudget | None = None
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be the integer 1.")
+        return value
+
+    @field_validator("origin", mode="before")
+    @classmethod
+    def copy_origin(cls, value: object) -> object:
+        if value is None:
+            return None
+        if type(value) is InvocationOrigin:
+            return copy_invocation_origin(value)
+        return value
+
+    @field_validator("limits", mode="before")
+    @classmethod
+    def copy_limits(cls, value: object) -> object:
+        if value is None:
+            return None
+        if type(value) is RunLimits:
+            return copy_run_limits(value)
+        return value
+
+    @field_validator("cost_budget", mode="before")
+    @classmethod
+    def copy_cost_budget(cls, value: object) -> object:
+        if value is None:
+            return None
+        if type(value) is EvalRunCostBudget:
+            return EvalRunCostBudget.model_validate(value.model_dump(mode="python"))
+        return value
+
+    @model_validator(mode="after")
+    def validate_provenance(self) -> EvalRunInvocation:
+        if self.source not in {
+            SessionExecutionSource.SDK_RUN,
+            SessionExecutionSource.HTTP_RUN,
+        }:
+            raise ValueError("Eval runs support only SDK or HTTP root invocation sources.")
+        if self.origin is not None and (
+            self.source is not SessionExecutionSource.HTTP_RUN
+            or self.origin.trust is not InvocationOriginTrust.SERVER_VERIFIED
+        ):
+            raise ValueError("Eval run origins require server-verified HTTP provenance.")
+        if self.limits is not None and self.limits.scope != "run":
+            raise ValueError("Eval run invocation limits must use run scope.")
+        if not json_utf8_size_within_limit(self, EVAL_RUN_INVOCATION_MAX_BYTES):
+            raise ValueError(
+                f"Eval run invocation exceeds {EVAL_RUN_INVOCATION_MAX_BYTES} JSON bytes."
+            )
+        return self
+
+
+def eval_run_invocation_from_json(source: str) -> EvalRunInvocation:
+    if type(source) is not str:
+        raise TypeError("Eval run invocation JSON must be text.")
+    if len(source.encode("utf-8")) > EVAL_RUN_INVOCATION_MAX_BYTES:
+        raise ValueError(f"Eval run invocation exceeds {EVAL_RUN_INVOCATION_MAX_BYTES} JSON bytes.")
+    return EvalRunInvocation.model_validate_json(source)
+
+
 class EvalRunSpec(_EvalStoreModel):
     run_id: StrictStr
     corpus_revision: StrictStr
@@ -657,6 +770,7 @@ class EvalRunSpec(_EvalStoreModel):
     suite_id: StrictStr
     suite_revision: StrictStr
     max_concurrency: StrictInt = Field(ge=1, le=CORPUS_EXECUTION_MAX_CONCURRENCY)
+    invocation: EvalRunInvocation = Field(default_factory=EvalRunInvocation)
 
     @field_validator("run_id")
     @classmethod
@@ -672,6 +786,13 @@ class EvalRunSpec(_EvalStoreModel):
     @classmethod
     def validate_portable_ids(cls, value: str, info) -> str:
         return _portable_id(value, info.field_name)
+
+    @field_validator("invocation", mode="before")
+    @classmethod
+    def copy_invocation(cls, value: object) -> object:
+        if type(value) is EvalRunInvocation:
+            return EvalRunInvocation.model_validate(value.model_dump(mode="python"))
+        return value
 
     @property
     def id(self) -> str:
@@ -2579,6 +2700,7 @@ def _bounded_result_page(
 
 
 __all__ = [
+    "EVAL_RUN_INVOCATION_MAX_BYTES",
     "EVAL_STORE_DEFAULT_PAGE_BYTES",
     "EVAL_STORE_DEFAULT_PAGE_SIZE",
     "EVAL_STORE_MAX_CLAIM_TARGETS",
@@ -2600,7 +2722,9 @@ __all__ = [
     "EvalRunAdmissionConflict",
     "EvalRunClaim",
     "EvalRunClaimLost",
+    "EvalRunCostBudget",
     "EvalRunFailureCode",
+    "EvalRunInvocation",
     "EvalRunLease",
     "EvalRunOwnership",
     "EvalRunPage",

@@ -2450,6 +2450,12 @@ def test_maintained_service_uses_the_same_generated_eval_target_registry(tmp_pat
                     "source": "generated",
                     "application_release_id": "release-current",
                     "app_manifest_fingerprint": body["items"][0]["app_manifest_fingerprint"],
+                    "max_trials": 1,
+                    "max_concurrency": 1,
+                    "max_timeout_seconds": 3600,
+                    "max_steps": 16,
+                    "cost_budget_available": False,
+                    "cost_budget_currencies": [],
                 }
             ]
     finally:

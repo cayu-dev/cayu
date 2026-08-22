@@ -224,6 +224,8 @@ def test_release_notes_preserve_storage_revision_chronology() -> None:
     assert "advances from revision 29 to revision 34" in v0_2_0
     assert "Storage revision 48 is a breaking boundary" in unreleased
     assert "confirm revision 48 before starting current workers" in unreleased
+    assert "Storage revision 50 is a breaking boundary" in unreleased
+    assert "confirm revision 50 before starting current workers" in unreleased
     assert "confirm revision 34 with no pending migrations" in v0_2_0
     assert "revision 39" not in v0_2_0
 
@@ -231,8 +233,8 @@ def test_release_notes_preserve_storage_revision_chronology() -> None:
     assert "confirm revision 36 with no pending migrations" in v0_2_1
     assert "revision 39" not in v0_2_1
 
-    assert "advances from revision 36 to revision 49" in v0_3_0
-    assert "confirm revision 49 with no pending migrations" in v0_3_0
+    assert "advances from revision 36 to revision 50" in v0_3_0
+    assert "confirm revision 50 with no pending migrations" in v0_3_0
     assert "Revision 47 adds the origin-aware immutable Evals result index" in v0_3_0
     assert "revision-46 workers must be stopped before migration" in v0_3_0
     assert "Breaking schema revision 39" in v0_3_0

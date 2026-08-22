@@ -1313,6 +1313,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
             suite_revision TEXT NOT NULL,
             max_concurrency INTEGER NOT NULL
                 CHECK (max_concurrency >= 1 AND max_concurrency <= 32),
+            invocation_json TEXT NOT NULL,
             status TEXT NOT NULL CHECK (
                 status IN ('queued', 'running', 'cancelling', 'completed', 'failed', 'cancelled')
             ),
@@ -2085,6 +2086,13 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "ON cayu_tasks(session_id, created_at, id) WHERE work_contract IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS idx_cayu_work_attempts_task_latest "
         "ON cayu_work_attempts(task_id, ordinal DESC)",
+    ),
+    50: (
+        "ALTER TABLE cayu_eval_runs ADD COLUMN IF NOT EXISTS invocation_json TEXT "
+        "NOT NULL DEFAULT "
+        '\'{"schema_version":1,"source":"sdk_run","origin":null,'
+        '"max_steps":null,"limits":null,"cost_budget":null}\'',
+        "ALTER TABLE cayu_eval_runs ALTER COLUMN invocation_json DROP DEFAULT",
     ),
 }
 
@@ -3422,6 +3430,8 @@ class _PostgresStoreBase:
                             await self._validate_captured_eval_case_schema(cur)
                         if self._min_required_revision >= 49:
                             await self._validate_verified_work_schema(cur)
+                        if self._min_required_revision >= 50:
+                            await self._validate_eval_run_invocation_column(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -3590,6 +3600,8 @@ class _PostgresStoreBase:
             await self._validate_captured_eval_case_schema(cur)
         if self._min_required_revision >= 49:
             await self._validate_verified_work_schema(cur)
+        if self._min_required_revision >= 50:
+            await self._validate_eval_run_invocation_column(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -3676,6 +3688,8 @@ class _PostgresStoreBase:
             await self._validate_captured_eval_case_schema(cur)
         if revision.revision == 49:
             await self._validate_verified_work_schema(cur)
+        if revision.revision == 50:
+            await self._validate_eval_run_invocation_column(cur)
 
     async def _validate_transcript_search_document_column(self, cur: Any) -> None:
         await cur.execute(
@@ -4860,6 +4874,23 @@ class _PostgresStoreBase:
                 "Postgres schema object 'cayu_eval_cases.message_count' conflicts with "
                 "Cayu's revision-48 captured-evaluation contract. Run `cayu storage "
                 "migrate` or restore the database from a known-good backup."
+            )
+
+    async def _validate_eval_run_invocation_column(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT data_type, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_eval_runs'
+              AND column_name = 'invocation_json'
+            """
+        )
+        if await cur.fetchone() != ("text", "NO", None):
+            raise RuntimeError(
+                "Postgres schema object 'cayu_eval_runs.invocation_json' conflicts "
+                "with Cayu's revision-50 durable eval invocation contract. Run "
+                "`cayu storage migrate` or restore the database from a known-good backup."
             )
 
     @staticmethod

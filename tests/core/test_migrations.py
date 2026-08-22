@@ -157,6 +157,22 @@ def test_revision_forty_nine_adds_durable_verified_work_authority() -> None:
         )
 
 
+def test_revision_fifty_persists_eval_run_invocation_authority() -> None:
+    state = m.SchemaState(revision=50, compatible_from=50)
+
+    # A revision-49 worker would recover queued work without the authenticated
+    # HTTP origin and runtime contractions persisted at admission.
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 50"):
+        m.validate(state, app_latest=49, app_min_supported=49)
+    m.validate(state, app_latest=50, app_min_supported=50)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 50"):
+        m.validate(
+            m.SchemaState(revision=49, compatible_from=49),
+            app_latest=50,
+            app_min_supported=50,
+        )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

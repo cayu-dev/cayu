@@ -82,12 +82,13 @@ from cayu.evals.store import (
     decode_run_cursor,
     decode_suite_cursor,
     eval_result_record,
+    eval_run_invocation_from_json,
     result_summary,
     validate_result_for_run,
 )
 from cayu.storage.postgres import _PostgresStoreBase
 
-_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 48
+_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 50
 
 _RUN_COLUMNS = """
     run_id,
@@ -97,6 +98,7 @@ _RUN_COLUMNS = """
     suite_id,
     suite_revision,
     max_concurrency,
+    invocation_json,
     status,
     created_at,
     updated_at,
@@ -152,24 +154,25 @@ def _request_from_row(row: Any) -> EvalRunRequest:
         suite_id=row[4],
         suite_revision=row[5],
         max_concurrency=row[6],
+        invocation=eval_run_invocation_from_json(row[7]),
     )
 
 
 def _run_record_from_row(row: Any) -> EvalRunRecord:
-    status = EvalRunStatus(row[7])
+    status = EvalRunStatus(row[8])
     ownership = None
     if status in {EvalRunStatus.RUNNING, EvalRunStatus.CANCELLING}:
         ownership = EvalRunOwnership(
-            epoch=row[14],
-            lease_expires_at=row[15],
+            epoch=row[15],
+            lease_expires_at=row[16],
         )
     result = None
-    if row[16] is not None:
+    if row[17] is not None:
         result = EvalRunResultSummary(
-            revision=row[16],
-            status=row[17],
-            score=row[18],
-            duration_ms=row[19],
+            revision=row[17],
+            status=row[18],
+            score=row[19],
+            duration_ms=row[20],
         )
     return EvalRunRecord(
         spec=EvalRunSpec(
@@ -179,17 +182,18 @@ def _run_record_from_row(row: Any) -> EvalRunRecord:
             suite_id=row[4],
             suite_revision=row[5],
             max_concurrency=row[6],
+            invocation=eval_run_invocation_from_json(row[7]),
         ),
         status=status,
-        attempt_count=row[14],
-        created_at=row[8],
-        updated_at=row[9],
-        started_at=row[10],
-        finished_at=row[11],
-        cancel_requested_at=row[12],
+        attempt_count=row[15],
+        created_at=row[9],
+        updated_at=row[10],
+        started_at=row[11],
+        finished_at=row[12],
+        cancel_requested_at=row[13],
         ownership=ownership,
         result=result,
-        failure_code=None if row[20] is None else EvalRunFailureCode(row[20]),
+        failure_code=None if row[21] is None else EvalRunFailureCode(row[21]),
     )
 
 
@@ -471,9 +475,9 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                         """
                         INSERT INTO cayu_eval_runs (
                             run_id, idempotency_key, corpus_revision, target_key,
-                            suite_id, suite_revision, max_concurrency, status,
+                            suite_id, suite_revision, max_concurrency, invocation_json, status,
                             created_at, updated_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT DO NOTHING
                         RETURNING run_id
                         """,
@@ -485,6 +489,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                             request.suite_id,
                             request.suite_revision,
                             request.max_concurrency,
+                            request.invocation.model_dump_json(),
                             str(EvalRunStatus.QUEUED),
                             now,
                             now,
@@ -607,7 +612,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                         await conn.commit()
                         return None
                     status = (
-                        EvalRunStatus.CANCELLING if row[12] is not None else EvalRunStatus.RUNNING
+                        EvalRunStatus.CANCELLING if row[13] is not None else EvalRunStatus.RUNNING
                     )
                     await cur.execute(
                         """
@@ -636,8 +641,8 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                     run=record,
                     claim=EvalRunClaim(
                         run_id=record.id,
-                        claim_id=claimed[13],
-                        epoch=claimed[14],
+                        claim_id=claimed[14],
+                        epoch=claimed[15],
                     ),
                 )
             except BaseException:
@@ -683,7 +688,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                         await conn.commit()
                         return None
                     status = (
-                        EvalRunStatus.CANCELLING if row[12] is not None else EvalRunStatus.RUNNING
+                        EvalRunStatus.CANCELLING if row[13] is not None else EvalRunStatus.RUNNING
                     )
                     claim_id = str(uuid4())
                     await cur.execute(
@@ -713,8 +718,8 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                     run=record,
                     claim=EvalRunClaim(
                         run_id=record.id,
-                        claim_id=claimed[13],
-                        epoch=claimed[14],
+                        claim_id=claimed[14],
+                        epoch=claimed[15],
                     ),
                 )
             except BaseException:
@@ -764,15 +769,15 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
             try:
                 async with conn.cursor() as cur:
                     row = await self._require_run_row(cur, run_id, for_update=True)
-                    status = EvalRunStatus(row[7])
+                    status = EvalRunStatus(row[8])
                     if status in TERMINAL_EVAL_RUN_STATUSES:
                         await conn.commit()
                         return _run_record_from_row(row)
                     now = await _database_now(cur)
                     claim_expired = (
                         status in {EvalRunStatus.RUNNING, EvalRunStatus.CANCELLING}
-                        and row[15] is not None
-                        and row[15] <= now
+                        and row[16] is not None
+                        and row[16] <= now
                     )
                     next_status = (
                         EvalRunStatus.CANCELLED
@@ -844,7 +849,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                         raise EvalRunStateConflict(
                             "Eval run request changed during result publication."
                         )
-                    status = EvalRunStatus(row[7])
+                    status = EvalRunStatus(row[8])
                     if status is EvalRunStatus.COMPLETED:
                         await cur.execute(
                             "SELECT revision, result FROM cayu_eval_results WHERE run_id = %s",
@@ -947,11 +952,11 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                     row = await self._require_run_row(cur, claim.run_id, for_update=True)
                     now = await _database_now(cur)
                     self._require_live_claim(row, claim, now)
-                    status = EvalRunStatus(row[7])
+                    status = EvalRunStatus(row[8])
                     if status is EvalRunStatus.CANCELLING:
                         next_status = EvalRunStatus.CANCELLED
                         finished_at = now
-                        cancel_requested_at = row[12] or now
+                        cancel_requested_at = row[13] or now
                     elif status is EvalRunStatus.RUNNING:
                         next_status = EvalRunStatus.QUEUED
                         finished_at = None
@@ -1330,9 +1335,9 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
             try:
                 async with conn.cursor() as cur:
                     row = await self._require_run_row(cur, claim.run_id, for_update=True)
-                    status = EvalRunStatus(row[7])
+                    status = EvalRunStatus(row[8])
                     if status is terminal_status:
-                        stored_code = None if row[20] is None else EvalRunFailureCode(row[20])
+                        stored_code = None if row[21] is None else EvalRunFailureCode(row[21])
                         if self._claim_matches(row, claim) and stored_code is failure_code:
                             await conn.commit()
                             return _run_record_from_row(row)
@@ -1343,7 +1348,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                         raise EvalRunStateConflict(
                             f"Eval run must be {required_status} before becoming {terminal_status}."
                         )
-                    cancel_requested_at = row[12]
+                    cancel_requested_at = row[13]
                     if terminal_status is EvalRunStatus.CANCELLED and cancel_requested_at is None:
                         cancel_requested_at = now
                     await cur.execute(
@@ -1372,15 +1377,15 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
 
     @staticmethod
     def _claim_matches(row: Any, claim: EvalRunClaim) -> bool:
-        return row[13] == claim.claim_id and row[14] == claim.epoch
+        return row[14] == claim.claim_id and row[15] == claim.epoch
 
     @classmethod
     def _require_live_claim(cls, row: Any, claim: EvalRunClaim, now: datetime) -> None:
         if not cls._claim_matches(row, claim):
             raise EvalRunClaimLost("Eval run claim is no longer owned by this worker.")
-        if EvalRunStatus(row[7]) not in {EvalRunStatus.RUNNING, EvalRunStatus.CANCELLING}:
+        if EvalRunStatus(row[8]) not in {EvalRunStatus.RUNNING, EvalRunStatus.CANCELLING}:
             raise EvalRunClaimLost("Eval run is no longer active.")
-        if row[15] is None or row[15] <= now:
+        if row[16] is None or row[16] <= now:
             raise EvalRunClaimLost("Eval run claim lease has expired.")
 
     @staticmethod

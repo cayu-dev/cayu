@@ -5,14 +5,27 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 
 from cayu._validation import require_durable_clean_nonblank, require_unicode_scalar_text
-from cayu.evals.execution import CorpusTarget, evaluation_target_identity
-from cayu.evals.store import EvalStore
+from cayu.evals.execution import (
+    CorpusExecutionLimits,
+    CorpusTarget,
+    evaluation_target_identity,
+)
+from cayu.evals.store import EvalRunInvocation, EvalStore
 from cayu.runtime.app import CayuApp
-from cayu.runtime.sessions import RunRequest
+from cayu.runtime.budgets import BudgetLimit, budget_pricing_preflight_error
+from cayu.runtime.costs import PriceBook
+from cayu.runtime.invocation import SessionExecutionSource
+from cayu.runtime.sessions import (
+    RunRequest,
+    copy_run_request,
+    run_request_with_runtime_invocation,
+)
+from cayu.runtime.stop_policy import RunLimits
 from cayu.server.config import (
     DEFAULT_EVAL_LEASE_SECONDS,
     DEFAULT_EVAL_POLL_INTERVAL_SECONDS,
@@ -29,6 +42,152 @@ from cayu.server.contracts import (
 DEFAULT_EVAL_PROFILE_ID = "default"
 _EXPLICIT_EVAL_PROFILE_ID = "explicit"
 _TARGET_KEY_DOMAIN = b"cayu-generated-eval-target-v1\0"
+
+
+def _narrow_optional_limit(current: int | None, requested: int | None) -> int | None:
+    if current is None:
+        return requested
+    if requested is None:
+        return current
+    return min(current, requested)
+
+
+def _narrow_run_limits(current: RunLimits, requested: RunLimits | None) -> RunLimits:
+    if requested is None:
+        return RunLimits.model_validate(current.model_dump(mode="python"))
+    return RunLimits(
+        max_input_tokens=_narrow_optional_limit(
+            current.max_input_tokens,
+            requested.max_input_tokens,
+        ),
+        max_output_tokens=_narrow_optional_limit(
+            current.max_output_tokens,
+            requested.max_output_tokens,
+        ),
+        max_total_tokens=_narrow_optional_limit(
+            current.max_total_tokens,
+            requested.max_total_tokens,
+        ),
+        max_tool_calls=_narrow_optional_limit(
+            current.max_tool_calls,
+            requested.max_tool_calls,
+        ),
+        max_elapsed_seconds=_narrow_optional_limit(
+            current.max_elapsed_seconds,
+            requested.max_elapsed_seconds,
+        ),
+        # Every eval trial creates a fresh session, so run and session scope
+        # measure the same initial invocation. The persisted operator ceilings
+        # deliberately use run scope and cannot broaden a target base limit.
+        scope="run",
+    )
+
+
+def cost_budget_currencies_for_target(target: CorpusTarget) -> tuple[str, ...]:
+    """Return currencies currently compatible with one target's resolved model route."""
+
+    if type(target) is not CorpusTarget:
+        raise TypeError("target must be an exact CorpusTarget.")
+    pricing = target.price_book
+    if pricing is None:
+        return ()
+    try:
+        model_target = target.app.resolve_run_model_target(target.request_base)
+        provider = target.app.get_provider(model_target.provider_name)
+    except (KeyError, RuntimeError, ValueError):
+        # Provider readiness is independent from catalog availability. A server
+        # with an unroutable target must remain inspectable, but it cannot safely
+        # advertise or admit a model-priced cost ceiling.
+        return ()
+    pricing_provider_name = provider.billing_provider_name or model_target.provider_name
+    effective_at = datetime.now(UTC)
+    candidate_currencies = tuple(
+        sorted(
+            {
+                schedule.pricing.currency.upper()
+                for price in pricing.prices
+                for schedule in price.schedules
+            }
+        )
+    )
+    return tuple(
+        currency
+        for currency in candidate_currencies
+        if budget_pricing_preflight_error(
+            pricing,
+            provider_name=pricing_provider_name,
+            model=model_target.model,
+            currency=currency,
+            effective_at=effective_at,
+        )
+        is None
+    )
+
+
+def target_for_eval_invocation(
+    target: CorpusTarget,
+    invocation: EvalRunInvocation,
+) -> CorpusTarget:
+    """Apply one durable run's contractions and trusted provenance to a target."""
+
+    if type(target) is not CorpusTarget:
+        raise TypeError("target must be an exact CorpusTarget.")
+    if type(invocation) is not EvalRunInvocation:
+        raise TypeError("invocation must be an exact EvalRunInvocation.")
+    request = copy_run_request(target.request_base)
+    if (
+        invocation.source is SessionExecutionSource.HTTP_RUN
+        and request.invocation_origin is not None
+    ):
+        raise ValueError("HTTP eval execution cannot inherit a host-asserted SDK origin.")
+    budget_limits = request.budget_limits
+    if invocation.cost_budget is not None:
+        if target.price_book is None:
+            raise ValueError("A cost-bounded eval run requires server-owned target pricing.")
+        compatible_currencies = cost_budget_currencies_for_target(target)
+        if invocation.cost_budget.currency not in compatible_currencies:
+            raise ValueError(
+                "A cost-bounded eval run requires pricing compatible with the target model "
+                "and requested currency."
+            )
+        budget_limits = (
+            *budget_limits,
+            BudgetLimit(
+                scope="run",
+                max_estimated_cost=invocation.cost_budget.max_estimated_cost,
+                pricing=target.price_book,
+                currency=invocation.cost_budget.currency,
+                allow_unpriced=False,
+                action="interrupt",
+            ),
+        )
+    request = request.model_copy(
+        update={
+            "max_steps": (
+                request.max_steps
+                if invocation.max_steps is None
+                else min(request.max_steps, invocation.max_steps)
+            ),
+            "limits": _narrow_run_limits(request.limits, invocation.limits),
+            "budget_limits": budget_limits,
+        }
+    )
+    request = run_request_with_runtime_invocation(
+        copy_run_request(request),
+        source=invocation.source,
+        verified_origin=invocation.origin,
+    )
+    return CorpusTarget(
+        key=target.key,
+        app=target.app,
+        request_base=request,
+        bootstrap_messages=target.bootstrap_messages,
+        application_release_id=target.application_release_id,
+        evidence_policy=target.evidence_policy,
+        price_book=target.price_book,
+        model_judges=target.model_judges,
+        limits=target.limits,
+    )
 
 
 def _target_identity_component(value: str, field_name: str) -> str:
@@ -223,6 +382,7 @@ def generated_eval_target_registry(
     application_release_id: str,
     app_manifest_fingerprint: str,
     app_manifest_project_root: Path | None = None,
+    price_book: PriceBook | None = None,
 ) -> EvalTargetRegistry | None:
     """Build one normal-authority target per currently registered agent."""
 
@@ -256,7 +416,10 @@ def generated_eval_target_registry(
             app=app,
             request_base=RunRequest(agent_name=agent_name, messages=[]),
             application_release_id=application_release_id,
+            price_book=price_book,
+            limits=CorpusExecutionLimits(max_trials=1, max_concurrency=1),
         )
+        cost_budget_currencies = cost_budget_currencies_for_target(target)
         entry = EvalTargetCatalogEntry(
             target_key=target_key,
             project_id=project_id,
@@ -266,6 +429,12 @@ def generated_eval_target_registry(
             source="generated",
             application_release_id=application_release_id,
             app_manifest_fingerprint=app_manifest_fingerprint,
+            max_trials=target.limits.max_trials,
+            max_concurrency=target.limits.max_concurrency,
+            max_timeout_seconds=target.limits.max_timeout_seconds,
+            max_steps=target.request_base.max_steps,
+            cost_budget_available=bool(cost_budget_currencies),
+            cost_budget_currencies=cost_budget_currencies,
         )
         _require_public_catalog_entry(app, entry)
         registrations.append(
@@ -285,6 +454,7 @@ def explicit_eval_target_registry(target: CorpusTarget) -> EvalTargetRegistry:
         raise TypeError("target must be an exact CorpusTarget.")
     identity = evaluation_target_identity(target)
     agent_name = _target_identity_component(target.request_base.agent_name, "agent_name")
+    cost_budget_currencies = cost_budget_currencies_for_target(target)
     entry = EvalTargetCatalogEntry(
         target_key=target.key,
         project_id=None,
@@ -294,6 +464,12 @@ def explicit_eval_target_registry(target: CorpusTarget) -> EvalTargetRegistry:
         source="explicit",
         application_release_id=identity.application_release_id,
         app_manifest_fingerprint=identity.app_manifest.fingerprint,
+        max_trials=target.limits.max_trials,
+        max_concurrency=target.limits.max_concurrency,
+        max_timeout_seconds=target.limits.max_timeout_seconds,
+        max_steps=target.request_base.max_steps,
+        cost_budget_available=bool(cost_budget_currencies),
+        cost_budget_currencies=cost_budget_currencies,
     )
     _require_public_catalog_entry(target.app, entry)
     return EvalTargetRegistry((EvalTargetRegistration(catalog_entry=entry, target=target),))
@@ -348,4 +524,5 @@ __all__ = [
     "explicit_eval_target_registry",
     "generated_eval_target_registry",
     "resolved_evals_runtime",
+    "target_for_eval_invocation",
 ]

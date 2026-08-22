@@ -54,6 +54,7 @@ from cayu.core.events import (
 )
 from cayu.runtime.costs import (
     CostLineItem,
+    ModelPrice,
     PriceBook,
     Provenance,
     SessionCostSummary,
@@ -3002,13 +3003,32 @@ def _budget_preflight_error(
     billing_identity_state: BillingIdentityState,
     effective_at: datetime | None,
 ) -> str | None:
+    return _budget_pricing_preflight_error(
+        pricing=limit.pricing,
+        currency=limit.currency,
+        provider_name=provider_name,
+        model=model,
+        billing_identity_state=billing_identity_state,
+        effective_at=effective_at,
+    )
+
+
+def _budget_pricing_preflight_error(
+    *,
+    pricing: PriceBook,
+    currency: str,
+    provider_name: str | None,
+    model: str | None,
+    billing_identity_state: BillingIdentityState,
+    effective_at: datetime | None,
+) -> str | None:
     billing_identity = billing_identity_value(billing_identity_state)
     reference = (
         datetime.now(UTC) if effective_at is None else _utc_datetime(effective_at, "effective_at")
     )
     for pricing_context in _budget_pricing_contexts(billing_identity):
         resolution = _resolve_price_book(
-            limit.pricing,
+            pricing,
             provider_name=provider_name,
             model=model,
             input_tokens=0,
@@ -3021,33 +3041,78 @@ def _budget_preflight_error(
             # Contextual dimensions are request-specific. The run loop repeats
             # preflight with the provider-resolved identity immediately before
             # reserving and dispatching.
-            if not isinstance(
-                billing_identity_state, ResolvedBillingIdentity
-            ) and has_deferred_contextual_price(
-                limit.pricing,
-                provider_name=provider_name,
-                model=model,
-            ):
-                return None
+            if not isinstance(billing_identity_state, ResolvedBillingIdentity):
+                deferred_prices = _deferred_contextual_prices(
+                    pricing,
+                    provider_name=provider_name,
+                    model=model,
+                )
+                if deferred_prices:
+                    schedules = tuple(
+                        price.schedule_on(reference.astimezone(UTC).date())
+                        for price in deferred_prices
+                    )
+                    if any(schedule is None for schedule in schedules):
+                        return (
+                            "Budget cannot be verified because "
+                            f"{provider_name}/{model} has contextual pricing without an "
+                            "applicable schedule."
+                        )
+                    currencies = {
+                        schedule.pricing.currency.upper()
+                        for schedule in schedules
+                        if schedule is not None
+                    }
+                    if currencies == {currency.upper()}:
+                        return None
+                    available = ", ".join(sorted(currencies))
+                    return (
+                        "Budget cannot be verified because "
+                        f"{provider_name}/{model} contextual pricing currencies "
+                        f"{available} do not uniquely match requested {currency}."
+                    )
             reason = resolution.missing_reason or "no matching model pricing"
             return f"Budget cannot be verified because {provider_name}/{model}: {reason}."
-        if price.currency.upper() != limit.currency.upper():
+        if price.currency.upper() != currency.upper():
             return (
                 "Budget cannot be verified because "
                 f"{provider_name}/{model} pricing currency {price.currency} "
-                f"does not match requested {limit.currency}."
+                f"does not match requested {currency}."
             )
     return None
 
 
-def has_deferred_contextual_price(
+def budget_pricing_preflight_error(
     pricing: PriceBook,
     *,
     provider_name: str | None,
     model: str | None,
-) -> bool:
+    currency: str,
+    effective_at: datetime | None = None,
+) -> str | None:
+    """Validate target pricing without dispatching a provider or mutating runtime state."""
+
+    if type(pricing) is not PriceBook:
+        raise TypeError("pricing must be an exact PriceBook.")
+    currency = require_clean_nonblank(currency, "currency").upper()
+    return _budget_pricing_preflight_error(
+        pricing=pricing,
+        currency=currency,
+        provider_name=provider_name,
+        model=model,
+        billing_identity_state=UNRESOLVED_BILLING_IDENTITY,
+        effective_at=effective_at,
+    )
+
+
+def _deferred_contextual_prices(
+    pricing: PriceBook,
+    *,
+    provider_name: str | None,
+    model: str | None,
+) -> tuple[ModelPrice, ...]:
     if provider_name is None or model is None:
-        return False
+        return ()
     # A directly matching context-free price belongs to the declared provider and
     # does not need deferred resolution. This also prevents an unrelated contextual
     # row with the same model identifier from shadowing it.
@@ -3059,7 +3124,7 @@ def has_deferred_contextual_price(
         )
         is not None
     ):
-        return False
+        return ()
     pricing_model = next(
         (
             mapping.pricing_model
@@ -3069,11 +3134,27 @@ def has_deferred_contextual_price(
         ),
         model,
     )
-    return any(
-        _normalize_provider(price.provider_name) == _normalize_provider(provider_name)
+    return tuple(
+        price
+        for price in pricing.prices
+        if _normalize_provider(price.provider_name) == _normalize_provider(provider_name)
         and price.model == pricing_model
         and price.pricing_context is not None
-        for price in pricing.prices
+    )
+
+
+def has_deferred_contextual_price(
+    pricing: PriceBook,
+    *,
+    provider_name: str | None,
+    model: str | None,
+) -> bool:
+    return bool(
+        _deferred_contextual_prices(
+            pricing,
+            provider_name=provider_name,
+            model=model,
+        )
     )
 
 

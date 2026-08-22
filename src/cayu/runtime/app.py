@@ -310,6 +310,7 @@ from cayu.runtime.sessions import (
     InMemorySessionStore,
     InterruptSessionRequest,
     ModelCompletionStage,
+    ModelTarget,
     PendingActionQuery,
     PendingActionResultTooLarge,
     QueuedDispatchTerminalReceipt,
@@ -2186,6 +2187,11 @@ class CayuApp:
                 copy_openai_web_search(tool) for tool in registered_agent.hosted_tools
             ),
         )
+
+    def resolve_run_model_target(self, request: RunRequest) -> ModelTarget:
+        """Resolve initial provider/model routing without preparing runtime state."""
+
+        return self._session_engine.resolve_initial_model_target(request)
 
     async def current_prompt_anatomy_sha256(
         self,

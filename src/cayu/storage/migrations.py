@@ -285,6 +285,11 @@ REVISIONS: tuple[Revision, ...] = (
     # so mixed-version task workers are unsafe even though existing ordinary
     # tasks remain valid.
     Revision(revision=49, kind=RevisionKind.BREAKING, compatible_from=49),
+    # Revision 50 persists the authenticated eval invocation projection and bounded
+    # execution contractions needed to recreate the same runtime authority after
+    # a durable worker restart. Pre-50 workers would silently lose that contract,
+    # so mixed-version eval workers are unsafe.
+    Revision(revision=50, kind=RevisionKind.BREAKING, compatible_from=50),
 )
 
 #: The revision an empty database is initialized to.
