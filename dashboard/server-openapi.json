@@ -10561,6 +10561,13 @@
             "title": "Max Delay S",
             "type": "number"
           },
+          "max_unknown_attempts": {
+            "default": 2,
+            "maximum": 10.0,
+            "minimum": 1.0,
+            "title": "Max Unknown Attempts",
+            "type": "integer"
+          },
           "retry_on_connection_error": {
             "default": true,
             "title": "Retry On Connection Error",

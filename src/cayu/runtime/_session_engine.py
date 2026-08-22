@@ -2922,12 +2922,11 @@ def _execution_profile_identity(
         request_budget_limit_ids=request_limit_ids,
         structured_output=_execution_profile_structured_output(structured_output),
         finalization=(
-            {
-                "kind": "cayu:model-finalization:v1",
-                "max_steps": max_steps,
-                "limits": copy_run_limits(limits).model_dump(mode="json"),
-                "retry_policy": copy_retry_policy(retry_policy).model_dump(mode="json"),
-            }
+            execution_profile_admission.model_finalization_material(
+                max_steps=max_steps,
+                limits=copy_run_limits(limits),
+                retry_policy=copy_retry_policy(retry_policy),
+            )
             if finalization_material is None
             else copy_json_value(finalization_material, "finalization_material")
         ),
@@ -4236,12 +4235,11 @@ class SessionEngine:
             app_budget_limit_ids=app_limit_ids,
             request_budget_limit_ids=request_limit_ids,
             structured_output=_execution_profile_structured_output(structured_output),
-            finalization={
-                "kind": "cayu:model-finalization:v1",
-                "max_steps": max_steps,
-                "limits": copy_run_limits(limits).model_dump(mode="json"),
-                "retry_policy": copy_retry_policy(retry_policy).model_dump(mode="json"),
-            },
+            finalization=execution_profile_admission.model_finalization_material(
+                max_steps=max_steps,
+                limits=copy_run_limits(limits),
+                retry_policy=copy_retry_policy(retry_policy),
+            ),
             invocation_semantics_available=invocation_semantics_available,
             tool_capability_ceiling=_session_tool_capability_ceiling(
                 session,

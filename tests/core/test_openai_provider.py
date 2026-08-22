@@ -3234,6 +3234,15 @@ async def test_openai_stream_events_extracts_top_level_error_event() -> None:
     ("error_type", "error_code", "expected_status", "expected_retryable"),
     [
         pytest.param("authentication_error", None, 401, False, id="authentication"),
+        pytest.param("permission_error", None, 403, False, id="permission"),
+        pytest.param("not_found_error", None, 404, False, id="not-found"),
+        pytest.param(
+            "insufficient_quota",
+            "insufficient_quota",
+            429,
+            False,
+            id="insufficient-quota",
+        ),
         pytest.param("invalid_request_error", "bad_request", 400, False, id="request"),
         pytest.param(
             "invalid_request_error",
@@ -3276,6 +3285,92 @@ async def test_openai_stream_error_classifies_only_consistent_known_identity(
 
     assert exc_info.value.status_code == expected_status
     assert exc_info.value.retryable is expected_retryable
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status_code", [429, 500, 502, 503, 504])
+async def test_openai_http_and_sse_errors_have_equal_retry_classification(
+    status_code: int,
+) -> None:
+    error_type = "rate_limit_error" if status_code == 429 else "server_error"
+    error_code = "rate_limit_exceeded" if status_code == 429 else "server_error"
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    response = httpx.Response(
+        status_code,
+        headers={"content-type": "application/json"},
+        json={"error": {"type": error_type, "code": error_code}},
+        request=request,
+    )
+    http_error = openai_module._openai_api_error_from_response(
+        response,
+        "OpenAI HTTP error",
+        None,
+    )
+
+    async def raw_events():
+        yield {
+            "type": "response.failed",
+            "response": {
+                "status_code": status_code,
+                "error": {"type": error_type, "code": error_code},
+            },
+        }
+
+    with pytest.raises(OpenAIAPIError) as exc_info:
+        [event async for event in openai_stream_events(raw_events())]
+
+    assert (exc_info.value.status_code, exc_info.value.retryable) == (
+        http_error.status_code,
+        http_error.retryable,
+    )
+    assert exc_info.value.status_code == status_code
+    assert exc_info.value.retryable is True
+
+
+@pytest.mark.anyio
+async def test_openai_stream_error_conflicting_status_fields_fail_closed() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.failed",
+            "response": {
+                "status_code": 503,
+                "error": {
+                    "type": "server_error",
+                    "code": "server_error",
+                    "status_code": 502,
+                },
+            },
+        }
+
+    with pytest.raises(OpenAIAPIError) as exc_info:
+        [event async for event in openai_stream_events(raw_events())]
+
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.anyio
+async def test_openai_stream_error_conflicting_statuses_cannot_authorize_overflow() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.failed",
+            "response": {
+                "status_code": 503,
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                    "status_code": 400,
+                    "message": "This model's maximum context length was exceeded.",
+                },
+            },
+        }
+
+    with pytest.raises(OpenAIAPIError) as exc_info:
+        [event async for event in openai_stream_events(raw_events())]
+
+    assert type(exc_info.value) is OpenAIAPIError
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.retryable is False
 
 
 @pytest.mark.anyio
@@ -3618,6 +3713,57 @@ async def test_runtime_does_not_recover_conflicting_openai_context_identity() ->
     model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
     assert model_error.payload["retryable"] is False
     assert model_error.payload["provider_error_type"] == "authentication_error"
+    assert model_error.payload["provider_error_code"] == "context_length_exceeded"
+    assert events[-1].type == EventType.SESSION_FAILED
+
+
+@pytest.mark.anyio
+async def test_runtime_does_not_recover_conflicting_openai_context_statuses() -> None:
+    transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "status_code": 503,
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "context_length_exceeded",
+                            "status_code": 400,
+                            "message": "This model's maximum context length was exceeded.",
+                        },
+                    },
+                }
+            ]
+        ]
+    )
+    provider = OpenAIProvider(api_key="test-key", transport=transport)
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="gpt-test"),
+        context_overflow_policy=RecentTurnsContextPolicy(max_user_turns=1),
+    )
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "hello")],
+                max_steps=1,
+                retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            )
+        )
+    ]
+
+    assert len(transport.calls) == 1
+    assert EventType.MODEL_RETRY not in [event.type for event in events]
+    assert EventType.CONTEXT_OVERFLOW_RECOVERING not in [event.type for event in events]
+    model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
+    assert model_error.payload["status_code"] == 400
+    assert model_error.payload["retryable"] is False
+    assert model_error.payload["provider_error_type"] == "invalid_request_error"
     assert model_error.payload["provider_error_code"] == "context_length_exceeded"
     assert events[-1].type == EventType.SESSION_FAILED
 

@@ -151,6 +151,71 @@ def test_openai_background_mode_is_part_of_the_builtin_provider_profile() -> Non
     assert synchronous != background
 
 
+def test_unknown_provider_retry_contract_is_an_explicit_finalization_migration() -> None:
+    previous_retry_policy = RetryPolicy().model_dump(mode="json")
+    previous_retry_policy.pop("max_unknown_attempts")
+    previous = build_execution_profile_identity(
+        runtime_name="cayu",
+        runtime_version="test-runtime",
+        provider_name="fake",
+        model="fake-model",
+        durable_system_prompt=None,
+        direct_tools=(),
+        finalization={
+            "kind": "cayu:model-finalization:v1",
+            "max_steps": 16,
+            "limits": RunLimits().model_dump(mode="json"),
+            "retry_policy": previous_retry_policy,
+        },
+    )
+    current_material = execution_profile_admission.model_finalization_material(
+        max_steps=16,
+        limits=RunLimits(),
+        retry_policy=RetryPolicy(),
+    )
+    current = build_execution_profile_identity(
+        runtime_name="cayu",
+        runtime_version="test-runtime",
+        provider_name="fake",
+        model="fake-model",
+        durable_system_prompt=None,
+        direct_tools=(),
+        finalization=current_material,
+    )
+
+    assert current_material["kind"] == "cayu:model-finalization:v2"
+    assert current_material["retry_policy"]["max_unknown_attempts"] == 2
+    assert changed_execution_profile_components(previous, current) == (
+        ExecutionProfileComponentClass.FINALIZATION,
+    )
+
+
+@pytest.mark.parametrize(
+    "compactor",
+    [
+        ModelCompactor(
+            provider=ScriptedModelProvider([], name="model-compactor-provider"),
+            model="summary-model",
+        ),
+        PromptCacheCompactor(
+            provider=ScriptedModelProvider([], name="prompt-cache-compactor-provider"),
+        ),
+    ],
+)
+def test_builtin_retrying_compactors_version_the_unknown_provider_allowance(
+    compactor: ModelCompactor | PromptCacheCompactor,
+) -> None:
+    material = execution_profile_admission._cayu_compactor_material(
+        compactor,
+        behavior_identities={},
+        process_identity="retry-contract-migration-test",
+    )
+
+    assert material is not None
+    assert material["version"] == 2
+    assert material["retry_policy"]["max_unknown_attempts"] == 2
+
+
 def test_dashboard_profile_fixture_delegates_to_the_runtime_resolver() -> None:
     path = Path(__file__).resolve().parents[2] / "examples/dashboard_behavior_live.py"
     source = path.read_text(encoding="utf-8")
@@ -6140,7 +6205,16 @@ def test_model_retry_and_each_attempt_share_the_frozen_governing_profile() -> No
         async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
             self.requests.append(request)
             if len(self.requests) == 1:
-                yield ModelStreamEvent.error("OpenAI API request failed with HTTP 429: rate limit")
+                yield ModelStreamEvent.model_validate(
+                    {
+                        "type": "error",
+                        "payload": {
+                            "error": "OpenAI API request failed with HTTP 429: rate limit",
+                            "reason": "provider_spoof",
+                            "effective_max_attempts": 99,
+                        },
+                    }
+                )
                 return
             yield ModelStreamEvent.text_delta("done")
             yield ModelStreamEvent.completed(
@@ -6193,6 +6267,9 @@ def test_model_retry_and_each_attempt_share_the_frozen_governing_profile() -> No
         assert {event.payload.get("execution_profile_fingerprint") for event in governed} == {
             profile.fingerprint
         }
+        model_error = next(event for event in governed if event.type is EventType.MODEL_ERROR)
+        assert model_error.payload["reason"] == "http_status"
+        assert model_error.payload["effective_max_attempts"] == 2
 
     asyncio.run(exercise())
 

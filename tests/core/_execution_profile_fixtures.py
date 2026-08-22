@@ -372,12 +372,11 @@ def profiled_session_identity(
             structured_output=session_engine_module._execution_profile_structured_output(
                 structured_output
             ),
-            finalization={
-                "kind": "cayu:model-finalization:v1",
-                "max_steps": max_steps,
-                "limits": copy_run_limits(limits).model_dump(mode="json"),
-                "retry_policy": copy_retry_policy(retry_policy).model_dump(mode="json"),
-            },
+            finalization=execution_profile_admission.model_finalization_material(
+                max_steps=max_steps,
+                limits=copy_run_limits(limits),
+                retry_policy=copy_retry_policy(retry_policy),
+            ),
             invocation_loop_policies=resolved_invocation_loop_policies,
             invocation_loop_policy_identities=tuple(
                 copy_execution_profile_behavior_identity(policy.execution_profile_identity)

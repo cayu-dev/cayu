@@ -5452,6 +5452,10 @@ export type RetryPolicy = {
      */
     max_delay_s?: number;
     /**
+     * Max Unknown Attempts
+     */
+    max_unknown_attempts?: number;
+    /**
      * Retry On Connection Error
      */
     retry_on_connection_error?: boolean;

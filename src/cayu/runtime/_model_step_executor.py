@@ -672,6 +672,7 @@ class ModelAttemptFailed(Exception):
         cause: Exception | None = None,
         completion_observed: bool = False,
         automatic_retry_disabled: bool = False,
+        retry_decision: RetryDecision | None = None,
     ) -> None:
         self.message = require_nonblank(message, "message")
         self.payload = copy_json_value(payload, "payload")
@@ -679,6 +680,9 @@ class ModelAttemptFailed(Exception):
         self.cause = cause
         self.completion_observed = completion_observed
         self.automatic_retry_disabled = automatic_retry_disabled
+        if retry_decision is not None and type(retry_decision) is not RetryDecision:
+            raise TypeError("retry_decision must be a RetryDecision or None.")
+        self.retry_decision = retry_decision
         super().__init__(self.message)
 
 
@@ -4390,6 +4394,7 @@ class ModelStepExecutor:
                 step=step,
                 attempt=attempt,
                 max_attempts=retry_policy.max_attempts,
+                retry_policy=retry_policy,
                 model_attempt_identity=model_attempt_identity,
                 transcript_cursor_before_request=transcript_cursor_before_request,
                 record_model_completion=record_model_completion,
@@ -4463,15 +4468,30 @@ class ModelStepExecutor:
                 yield None, result
                 return
             except ModelAttemptFailed as exc:
-                status_code, retryable, retry_after_s = _typed_retry_fields(exc)
-                decision = retry_decision(
-                    policy=retry_policy,
-                    attempt=attempt,
-                    error=exc.message,
-                    status_code=status_code,
-                    retryable=retryable,
-                    retry_after_s=retry_after_s,
-                )
+                (
+                    status_code,
+                    retryable,
+                    retry_after_s,
+                    unknown_provider_error,
+                ) = _typed_retry_fields(exc)
+                decision = exc.retry_decision
+                if decision is None:
+                    decision = retry_decision(
+                        policy=retry_policy,
+                        attempt=attempt,
+                        error=exc.message,
+                        status_code=status_code,
+                        retryable=retryable,
+                        retry_after_s=retry_after_s,
+                        unknown_provider_error=unknown_provider_error,
+                    )
+                elif (
+                    decision.attempt != attempt
+                    or decision.max_attempts != retry_policy.max_attempts
+                ):
+                    raise RuntimeError(
+                        "Model attempt retained a retry decision for different attempt authority."
+                    ) from exc
                 if decision.reason is not None and not exc.emitted_error_event:
                     yield (
                         await self._event_writer.emit(
@@ -4487,6 +4507,7 @@ class ModelStepExecutor:
                                         attempt=attempt,
                                         max_attempts=retry_policy.max_attempts,
                                         model_attempt_identity=model_attempt_identity,
+                                        decision=decision,
                                     ),
                                 ),
                                 execution_profile,
@@ -4507,6 +4528,7 @@ class ModelStepExecutor:
                                 step=step,
                                 decision=decision,
                                 error=exc.message,
+                                provider_error_payload=exc.payload,
                                 model_attempt_identity=model_attempt_identity,
                             ),
                             execution_profile,
@@ -4792,6 +4814,7 @@ class ModelStepExecutor:
         step: int,
         attempt: int,
         max_attempts: int,
+        retry_policy: RetryPolicy,
         model_attempt_identity: ModelAttemptIdentity,
         transcript_cursor_before_request: int,
         record_model_completion: Callable[[Event], Event],
@@ -4809,6 +4832,9 @@ class ModelStepExecutor:
         execution_profile: ExecutionProfileIdentity | None,
         tool_exposure: ResolvedToolExposure | None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
+        retry_policy = copy_retry_policy(retry_policy)
+        if retry_policy.max_attempts != max_attempts:
+            raise ValueError("Retry policy does not match the model-attempt ceiling.")
         assistant_parts: list[transcript_helpers.AssistantContentPart] = []
         thinking_options = model_request.options.get("thinking")
         include_thinking_in_transcript = (
@@ -5734,10 +5760,15 @@ class ModelStepExecutor:
                         break
                     continue
 
+                stream_retry_decision: RetryDecision | None = None
+                provider_error: ModelProviderError | None = None
+                message = ""
                 if stream_event.type == ModelStreamEventType.ERROR:
+                    message = str(stream_event.payload.get("error") or "Model provider error")
                     provider_error = model_provider_error_from_payload(
                         stream_event.payload,
                         fallback_provider=registered_provider.name,
+                        fallback_message=message,
                     )
                     if (
                         isinstance(provider_error, ModelContextOverflowError)
@@ -5747,6 +5778,41 @@ class ModelStepExecutor:
                         # event. Rehydrate it so bounded recovery can shrink the
                         # request instead of spending generic retries on it.
                         raise provider_error
+
+                    stream_retry_decision = retry_decision(
+                        policy=retry_policy,
+                        attempt=attempt,
+                        error=message,
+                        status_code=(
+                            provider_error.status_code
+                            if isinstance(provider_error, ModelProviderError)
+                            else None
+                        ),
+                        retryable=(
+                            False
+                            if provider_operation_state is not None
+                            else (
+                                provider_error.retryable
+                                if isinstance(provider_error, ModelProviderError)
+                                else None
+                            )
+                        ),
+                        retry_after_s=(
+                            None
+                            if provider_operation_state is not None
+                            else (
+                                provider_error.retry_after_s
+                                if isinstance(provider_error, ModelProviderError)
+                                else None
+                            )
+                        ),
+                        unknown_provider_error=(
+                            provider_operation_state is None
+                            and isinstance(provider_error, ModelProviderError)
+                            and provider_error.status_code is None
+                            and provider_error.retryable is None
+                        ),
+                    )
 
                     if provider_operation_state is not None:
                         if completion_dispatch is None:  # pragma: no cover - checked at start
@@ -5767,6 +5833,7 @@ class ModelStepExecutor:
                             execution_profile_fingerprint=(
                                 None if execution_profile is None else execution_profile.fingerprint
                             ),
+                            retry_decision=stream_retry_decision,
                         )
                         (
                             progress,
@@ -5805,17 +5872,18 @@ class ModelStepExecutor:
                         execution_profile_fingerprint=(
                             None if execution_profile is None else execution_profile.fingerprint
                         ),
+                        retry_decision=(
+                            stream_retry_decision
+                            if stream_event.type == ModelStreamEventType.ERROR
+                            else None
+                        ),
                     )
                     emitted_event = await self._event_writer.emit(event)
                 else:
                     emitted_event = progress_emitted_event
                 if stream_event.type == ModelStreamEventType.ERROR:
-                    message = str(stream_event.payload.get("error") or "Model provider error")
-                    provider_error = model_provider_error_from_payload(
-                        stream_event.payload,
-                        fallback_provider=registered_provider.name,
-                        fallback_message=message,
-                    )
+                    if stream_retry_decision is None:  # pragma: no cover - set above
+                        raise AssertionError("Model error lost its retry decision.")
                     yield emitted_event, None
                     if provider_operation_state is not None and isinstance(
                         provider_error, ModelContextOverflowError
@@ -5828,6 +5896,7 @@ class ModelStepExecutor:
                         payload=copy_json_value(stream_event.payload, "payload"),
                         emitted_error_event=True,
                         cause=provider_error or RuntimeError(message),
+                        retry_decision=stream_retry_decision,
                     )
                 yield emitted_event, None
             else:
@@ -10357,6 +10426,7 @@ def _model_stream_event_to_runtime_event(
     usage_normalization_failed: bool = False,
     completion_diagnostics: dict[str, Any] | None = None,
     execution_profile_fingerprint: str | None = None,
+    retry_decision: RetryDecision | None = None,
 ) -> Event:
     if type(stream_event) is not ModelStreamEvent:
         raise TypeError("Model stream events must be ModelStreamEvent instances.")
@@ -10499,6 +10569,7 @@ def _model_stream_event_to_runtime_event(
         attempt=attempt,
         max_attempts=max_attempts,
         model_attempt_identity=model_attempt_identity,
+        decision=retry_decision,
     )
     if tool_round_identity is not None:
         payload.update(copy_tool_round_identity(tool_round_identity).payload())
@@ -10611,16 +10682,21 @@ def _require_unique_tool_call_ids(
 
 def _typed_retry_fields(
     exc: ModelAttemptFailed,
-) -> tuple[int | None, bool | None, float | None]:
+) -> tuple[int | None, bool | None, float | None, bool]:
     cause = exc.cause
     if exc.completion_observed or exc.automatic_retry_disabled:
         # A valid completed frame is the authoritative terminal attempt. A
         # later transport/control failure cannot authorize another provider
         # charge for the same logical step.
         status_code = cause.status_code if isinstance(cause, ModelProviderError) else None
-        return status_code, False, None
+        return status_code, False, None, False
     if isinstance(cause, ModelProviderError):
-        return cause.status_code, cause.retryable, cause.retry_after_s
+        return (
+            cause.status_code,
+            cause.retryable,
+            cause.retry_after_s,
+            cause.status_code is None and cause.retryable is None,
+        )
     status_code = exc.payload.get("status_code")
     retryable = exc.payload.get("retryable")
     retry_after_s = exc.payload.get("retry_after_s")
@@ -10628,6 +10704,7 @@ def _typed_retry_fields(
         status_code if type(status_code) is int else None,
         retryable if type(retryable) is bool else None,
         float(retry_after_s) if type(retry_after_s) in {int, float} else None,
+        False,
     )
 
 
@@ -10640,6 +10717,7 @@ def _model_retry_event(
     step: int,
     decision: RetryDecision,
     error: str,
+    provider_error_payload: dict[str, Any],
     model_attempt_identity: ModelAttemptIdentity,
 ) -> Event:
     model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
@@ -10650,6 +10728,13 @@ def _model_retry_event(
         step=step,
         error=error,
     )
+    for key in ("provider_error_type", "provider_error_code"):
+        value = provider_error_payload.get(key)
+        if type(value) is str:
+            payload[key] = value
+    retryable = provider_error_payload.get("retryable")
+    if type(retryable) is bool:
+        payload["retryable"] = retryable
     payload.update(model_attempt_identity.payload())
     return _event_with_model_identity_authority(
         Event(
@@ -10686,6 +10771,7 @@ def _model_attempt_discarded_event(
                 "attempt": decision.attempt,
                 "next_attempt": decision.next_attempt,
                 "max_attempts": decision.max_attempts,
+                "effective_max_attempts": decision.effective_max_attempts,
                 "reason": None if decision.reason is None else decision.reason.value,
                 "status_code": decision.status_code,
                 **copy_model_attempt_identity(model_attempt_identity).payload(),
@@ -10702,12 +10788,23 @@ def _retry_attempt_payload(
     attempt: int,
     max_attempts: int,
     model_attempt_identity: ModelAttemptIdentity,
+    decision: RetryDecision | None = None,
 ) -> dict[str, Any]:
     enriched = dict(payload)
     strip_runtime_owned_execution_identity(enriched)
     enriched["step"] = step
     enriched["attempt"] = attempt
     enriched["max_attempts"] = max_attempts
+    if decision is not None:
+        if type(decision) is not RetryDecision:
+            raise TypeError("decision must be a RetryDecision or None.")
+        if decision.attempt != attempt or decision.max_attempts != max_attempts:
+            raise ValueError("Retry decision does not match the model-attempt evidence.")
+        enriched.pop("effective_max_attempts", None)
+        enriched.pop("reason", None)
+        enriched["effective_max_attempts"] = decision.effective_max_attempts
+        if decision.reason is not None:
+            enriched["reason"] = decision.reason.value
     enriched.update(copy_model_attempt_identity(model_attempt_identity).payload())
     return enriched
 

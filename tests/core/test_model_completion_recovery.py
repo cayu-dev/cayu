@@ -211,12 +211,11 @@ def _test_execution_profile(
         redactor=profile_app._secret_redactor,
         process_identity=profile_app._execution_profile_process_identity,
         registered_provider=profile_app._providers[provider_name],
-        finalization={
-            "kind": "cayu:model-finalization:v1",
-            "max_steps": 16,
-            "limits": (RunLimits() if limits is None else limits).model_dump(mode="json"),
-            "retry_policy": profile_app._effective_retry_policy(None).model_dump(mode="json"),
-        },
+        finalization=execution_profile_admission.model_finalization_material(
+            max_steps=16,
+            limits=RunLimits() if limits is None else limits,
+            retry_policy=profile_app._effective_retry_policy(None),
+        ),
     )
 
 

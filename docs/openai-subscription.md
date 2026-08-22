@@ -127,6 +127,17 @@ and any visible commentary, then requests the next model step inside the same
 run and interaction. It does not add a synthetic user message. Normal Cayu
 step, budget, interruption, cancellation, and recovery limits remain in force.
 
+Subscription HTTP and SSE failures retain only bounded typed retry evidence:
+valid status, retryability, `Retry-After`, and allowlisted error identities.
+Known authentication, permission, invalid-request, missing-resource, hosted-tool,
+and context-overflow failures remain terminal. A provider error that has no safe
+classification may use `RetryPolicy.max_unknown_attempts`, which defaults to at
+most two total attempts and remains capped by the caller's `max_attempts`.
+Durable retry evidence reports the caller's general `max_attempts` separately
+from the classification-specific `effective_max_attempts`; unknown failures
+carry `reason="unknown_provider"`, including the terminal failure at the nested
+ceiling.
+
 ## Support and policy boundary
 
 This is not an OpenAI API key and does not turn a ChatGPT subscription into

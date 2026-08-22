@@ -1372,6 +1372,10 @@ def test_started_provider_operation_stream_failure_is_never_retried(adapter_type
     assert adapter.start_calls == 1
     assert EventType.MODEL_RETRY not in {event.type for event in events}
     assert EventType.MODEL_ATTEMPT_DISCARDED not in {event.type for event in events}
+    for error in (event for event in events if event.type is EventType.MODEL_ERROR):
+        assert error.payload["max_attempts"] == 2
+        assert error.payload["effective_max_attempts"] == error.payload["attempt"]
+        assert "reason" not in error.payload
     inspection = asyncio.run(
         inspect_provider_operation(app.session_store, "failed_background_stream")
     )

@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-from cayu import Message, __version__
+from cayu import AgentSpec, CayuApp, EventType, Message, RetryPolicy, RunRequest, __version__
 from cayu.providers import (
     HostedToolCapabilityError,
     ModelContextOverflowError,
@@ -16,6 +16,7 @@ from cayu.providers import (
     ModelStreamEventType,
     OpenAIWebSearch,
 )
+from cayu.providers.openai import OpenAIAPIError
 from cayu.providers.openai_subscription import (
     OpenAISubscriptionAuthError,
     OpenAISubscriptionCredentials,
@@ -376,6 +377,288 @@ def test_subscription_transport_error_projection_redacts_all_provider_authority(
     rendered = repr(events[0]) + str(events[0].model_dump(mode="json"))
     assert all(value not in rendered for value in canaries.values())
     assert events[0].payload["error"] == "OpenAI subscription provider failed."
+
+
+@pytest.mark.anyio
+async def test_subscription_runtime_retries_generic_stream_error_once_then_completes() -> None:
+    canary = "raw-provider-error-canary-0123456789"
+
+    class SequencedTransport(RecordingTransport):
+        async def stream_response_events(self, **kwargs: Any):
+            self.calls.append(dict(kwargs))
+            if len(self.calls) == 1:
+                yield {
+                    "type": "error",
+                    "message": canary,
+                }
+                return
+            yield {"type": "response.output_text.delta", "delta": "recovered"}
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-subscription-retry",
+                    "model": "gpt-5.4",
+                    "status": "completed",
+                    "output": [],
+                    "usage": {},
+                },
+            }
+
+    transport = SequencedTransport()
+    provider = OpenAISubscriptionProvider(auth=StaticSubscriptionAuth(), transport=transport)
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gpt-5.4"))
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "hello")],
+                max_steps=1,
+                retry_policy=RetryPolicy(
+                    max_attempts=5,
+                    max_unknown_attempts=2,
+                    initial_delay_s=0.0,
+                ),
+            )
+        )
+    ]
+
+    assert len(transport.calls) == 2
+    model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
+    retry = next(event for event in events if event.type == EventType.MODEL_RETRY)
+    assert model_error.payload["attempt"] == 1
+    assert model_error.payload["max_attempts"] == 5
+    assert model_error.payload["effective_max_attempts"] == 2
+    assert model_error.payload["reason"] == "unknown_provider"
+    assert model_error.payload["provider_error_type"] == "error"
+    assert retry.payload["reason"] == "unknown_provider"
+    assert retry.payload["max_attempts"] == 5
+    assert retry.payload["effective_max_attempts"] == 2
+    assert retry.payload["provider_error_type"] == "error"
+    assert retry.payload["delay_seconds"] == 0.0
+    assert canary not in repr([event.model_dump(mode="json") for event in events])
+    assert events[-1].type == EventType.SESSION_COMPLETED
+
+
+@pytest.mark.anyio
+async def test_subscription_runtime_unknown_stream_error_uses_nested_attempt_cap() -> None:
+    class FailingTransport(RecordingTransport):
+        async def stream_response_events(self, **kwargs: Any):
+            self.calls.append(dict(kwargs))
+            yield {"type": "error", "message": "provider detail must stay private"}
+
+    transport = FailingTransport()
+    provider = OpenAISubscriptionProvider(auth=StaticSubscriptionAuth(), transport=transport)
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gpt-5.4"))
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "hello")],
+                max_steps=1,
+                retry_policy=RetryPolicy(
+                    max_attempts=5,
+                    max_unknown_attempts=2,
+                    initial_delay_s=0.0,
+                ),
+            )
+        )
+    ]
+
+    model_errors = [event for event in events if event.type == EventType.MODEL_ERROR]
+    retries = [event for event in events if event.type == EventType.MODEL_RETRY]
+    assert len(transport.calls) == 2
+    assert [event.payload["attempt"] for event in model_errors] == [1, 2]
+    assert [event.payload["max_attempts"] for event in model_errors] == [5, 5]
+    assert [event.payload["effective_max_attempts"] for event in model_errors] == [2, 2]
+    assert [event.payload["reason"] for event in model_errors] == [
+        "unknown_provider",
+        "unknown_provider",
+    ]
+    assert len(retries) == 1
+    assert retries[0].payload["reason"] == "unknown_provider"
+    assert retries[0].payload["max_attempts"] == 5
+    assert retries[0].payload["effective_max_attempts"] == 2
+    assert events[-1].type == EventType.SESSION_FAILED
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status_code", [429, 500, 502, 503, 504])
+async def test_subscription_runtime_retries_typed_sse_status(status_code: int) -> None:
+    class SequencedTransport(RecordingTransport):
+        async def stream_response_events(self, **kwargs: Any):
+            self.calls.append(dict(kwargs))
+            if len(self.calls) == 1:
+                yield {
+                    "type": "error",
+                    "status_code": status_code,
+                    "message": "raw provider detail",
+                }
+                return
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": f"resp-subscription-{status_code}",
+                    "model": "gpt-5.4",
+                    "status": "completed",
+                    "output": [],
+                    "usage": {},
+                },
+            }
+
+    transport = SequencedTransport()
+    provider = OpenAISubscriptionProvider(auth=StaticSubscriptionAuth(), transport=transport)
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gpt-5.4"))
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "hello")],
+                max_steps=1,
+                retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            )
+        )
+    ]
+
+    retry = next(event for event in events if event.type == EventType.MODEL_RETRY)
+    assert len(transport.calls) == 2
+    assert retry.payload["status_code"] == status_code
+    assert retry.payload["reason"] == "http_status"
+    assert retry.payload["provider_error_type"] == "error"
+    assert events[-1].type == EventType.SESSION_COMPLETED
+
+
+@pytest.mark.anyio
+async def test_subscription_runtime_honors_bounded_typed_retry_after() -> None:
+    class SequencedTransport(RecordingTransport):
+        async def stream_response_events(self, **kwargs: Any):
+            self.calls.append(dict(kwargs))
+            if len(self.calls) == 1:
+                raise OpenAIAPIError(
+                    "raw rate-limit detail",
+                    status_code=429,
+                    error_type="rate_limit_error",
+                    retryable=True,
+                    retry_after_s=120.0,
+                )
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-subscription-retry-after",
+                    "model": "gpt-5.4",
+                    "status": "completed",
+                    "output": [],
+                    "usage": {},
+                },
+            }
+
+    transport = SequencedTransport()
+    provider = OpenAISubscriptionProvider(auth=StaticSubscriptionAuth(), transport=transport)
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gpt-5.4"))
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "hello")],
+                max_steps=1,
+                retry_policy=RetryPolicy(
+                    max_attempts=2,
+                    initial_delay_s=0.0,
+                    max_delay_s=0.01,
+                ),
+            )
+        )
+    ]
+
+    model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
+    retry = next(event for event in events if event.type == EventType.MODEL_RETRY)
+    assert len(transport.calls) == 2
+    assert model_error.payload["retry_after_s"] == 120.0
+    assert retry.payload["delay_seconds"] == 0.01
+    assert retry.payload["provider_error_type"] == "rate_limit_error"
+    assert "raw rate-limit detail" not in repr([event.model_dump(mode="json") for event in events])
+    assert events[-1].type == EventType.SESSION_COMPLETED
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("error_type", "error_code", "status_code"),
+    [
+        ("authentication_error", None, 401),
+        ("permission_error", None, 403),
+        ("insufficient_quota", "insufficient_quota", 429),
+        ("invalid_request_error", "bad_request", 400),
+        ("invalid_request_error", "unsupported_tool", 400),
+        ("not_found_error", None, 404),
+    ],
+)
+async def test_subscription_runtime_keeps_known_permanent_sse_errors_terminal(
+    error_type: str,
+    error_code: str | None,
+    status_code: int,
+) -> None:
+    class FailingTransport(RecordingTransport):
+        async def stream_response_events(self, **kwargs: Any):
+            self.calls.append(dict(kwargs))
+            yield {
+                "type": "response.failed",
+                "response": {
+                    "status_code": status_code,
+                    "error": {
+                        "type": error_type,
+                        "code": error_code,
+                        "message": "raw permanent provider detail",
+                    },
+                },
+            }
+
+    transport = FailingTransport()
+    provider = OpenAISubscriptionProvider(auth=StaticSubscriptionAuth(), transport=transport)
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gpt-5.4"))
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "hello")],
+                max_steps=1,
+                retry_policy=RetryPolicy(
+                    max_attempts=5,
+                    max_unknown_attempts=2,
+                    initial_delay_s=0.0,
+                ),
+            )
+        )
+    ]
+
+    model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
+    assert len(transport.calls) == 1
+    assert EventType.MODEL_RETRY not in [event.type for event in events]
+    assert model_error.payload["status_code"] == status_code
+    assert model_error.payload["retryable"] is False
+    assert model_error.payload["provider_error_type"] == error_type
+    assert "raw permanent provider detail" not in repr(
+        [event.model_dump(mode="json") for event in events]
+    )
+    assert events[-1].type == EventType.SESSION_FAILED
 
 
 def test_subscription_authentication_error_projection_is_allowlisted() -> None:

@@ -2746,17 +2746,28 @@ def _openai_stream_error_exception(event: Mapping[str, Any]) -> OpenAIAPIError:
     if event_type == "response.failed":
         response = _stream_response_object(event)
         error = response.get("error")
+        error_mapping = error if isinstance(error, Mapping) else {}
+        status_code, status_conflict = _openai_stream_status_code(
+            error_mapping,
+            response,
+            event,
+        )
         return _openai_error_value_exception(
             response if error is None else error,
             safe_message=f"OpenAI streaming error: {OMITTED_PROVIDER_ERROR_BODY}",
             request_id=optional_error_string(response.get("request_id")),
             retry_after_s=retry_after_s,
+            transport_status_code=status_code,
+            status_conflict=status_conflict,
         )
+    status_code, status_conflict = _openai_stream_status_code(event)
     return _openai_error_value_exception(
         event,
         safe_message=f"OpenAI streaming error: {OMITTED_PROVIDER_ERROR_BODY}",
         request_id=optional_error_string(event.get("request_id")),
         retry_after_s=retry_after_s,
+        transport_status_code=status_code,
+        status_conflict=status_conflict,
     )
 
 
@@ -2766,6 +2777,8 @@ def _openai_error_value_exception(
     safe_message: str,
     request_id: str | None,
     retry_after_s: float | None = None,
+    transport_status_code: int | None = None,
+    status_conflict: bool = False,
 ) -> OpenAIAPIError:
     error_mapping = error if isinstance(error, Mapping) else {}
     error_type = optional_error_string(error_mapping.get("type"))
@@ -2773,24 +2786,27 @@ def _openai_error_value_exception(
     param = optional_error_string(error_mapping.get("param"))
     resolved_request_id = request_id or optional_error_string(error_mapping.get("request_id"))
     raw_message = optional_error_string(error_mapping.get("message"))
-    if _is_openai_context_overflow(
-        status_code=None,
+    if not status_conflict and _is_openai_context_overflow(
+        status_code=transport_status_code,
         error_type=error_type,
         code=error_code,
         message=raw_message,
     ):
         return OpenAIContextOverflowError(
             "OpenAI model context overflow",
+            status_code=transport_status_code,
             error_type=error_type,
             error_code=error_code,
             request_id=resolved_request_id,
             response_body=None,
         )
     status_code, retryable = _openai_retry_metadata(
-        transport_status_code=None,
+        transport_status_code=transport_status_code,
         error_type=error_type,
         error_code=error_code,
     )
+    if status_conflict:
+        retryable = False
     return OpenAIAPIError(
         safe_message,
         status_code=status_code,
@@ -2804,12 +2820,28 @@ def _openai_error_value_exception(
     )
 
 
+def _openai_stream_status_code(
+    *values: Mapping[str, Any],
+) -> tuple[int | None, bool]:
+    """Read only explicit SSE status fields and fail closed on disagreement."""
+
+    statuses = {
+        status
+        for value in values
+        if type(status := value.get("status_code")) is int and 100 <= status <= 599
+    }
+    if len(statuses) > 1:
+        return None, True
+    return (next(iter(statuses)), False) if statuses else (None, False)
+
+
 _STALE_CHAIN_ERROR_CODE = "previous_response_not_found"
 _STALE_CHAIN_PARAM = "previous_response_id"
 
 
 _OPENAI_ERROR_TYPE_CLASSIFICATION = {
     "authentication_error": (401, False),
+    "insufficient_quota": (429, False),
     "invalid_request_error": (400, False),
     "not_found_error": (404, False),
     "permission_error": (403, False),
@@ -2819,11 +2851,13 @@ _OPENAI_ERROR_TYPE_CLASSIFICATION = {
 _OPENAI_ERROR_CODE_CLASSIFICATION = {
     "bad_request": (400, False),
     "context_length_exceeded": (400, False),
+    "insufficient_quota": (429, False),
     "internal_error": (500, True),
     "previous_response_not_found": (404, False),
     "rate_limit_exceeded": (429, True),
     "server_error": (500, True),
 }
+_OPENAI_RETRYABLE_SERVER_STATUS_CODES = frozenset({500, 502, 503, 504})
 
 
 def _openai_retry_metadata(
@@ -2855,6 +2889,11 @@ def _openai_retry_metadata(
         classification = next(iter(classifications))
     canonical_status, retryable = classification
     if transport_status_code is not None and transport_status_code != canonical_status:
+        if retryable and canonical_status == 500:
+            return (
+                transport_status_code,
+                transport_status_code in _OPENAI_RETRYABLE_SERVER_STATUS_CODES,
+            )
         return transport_status_code, False
     return canonical_status, retryable
 

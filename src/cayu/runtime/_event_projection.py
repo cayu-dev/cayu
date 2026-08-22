@@ -234,7 +234,9 @@ _POLICY_DENIAL_ERRORS = frozenset(
         "command_denied",
     }
 )
-_NON_NEGATIVE_INTEGER_CONTROL_KEYS = frozenset({"attempt", "max_attempts", "next_attempt", "step"})
+_NON_NEGATIVE_INTEGER_CONTROL_KEYS = frozenset(
+    {"attempt", "effective_max_attempts", "max_attempts", "next_attempt", "step"}
+)
 _POSITIVE_INTEGER_CONTROL_KEYS = frozenset(
     {
         "accepted_event_sequence",
@@ -1763,6 +1765,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "error",
         "error_code",
         "error_type",
+        "effective_max_attempts",
         "max_attempts",
         "model",
         "model_attempt_id",
@@ -1780,6 +1783,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     policies[EventType.MODEL_ERROR] = _policy(
         *model_failure_keys,
         "provider_operation_progress",
+        "reason",
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS,
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         internal_keys={"provider_operation_progress"},
@@ -1796,6 +1800,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.MODEL_ATTEMPT_DISCARDED] = _policy(
         "attempt",
+        "effective_max_attempts",
         "max_attempts",
         "model",
         "model_attempt_id",

@@ -170,6 +170,27 @@ def test_event_payload_policies_cover_every_exact_builtin_type() -> None:
             } <= policy.owned_nested_paths
 
 
+def test_model_error_projects_the_effective_retry_ceiling() -> None:
+    event = Event(
+        type=EventType.MODEL_ERROR,
+        session_id="bounded-unknown-provider-retry",
+        payload={
+            "attempt": 2,
+            "max_attempts": 5,
+            "effective_max_attempts": 2,
+            "reason": "unknown_provider",
+        },
+    )
+
+    prepared = prepare_new_runtime_event(event, redactor=SecretRedactor())
+    public = project_runtime_event(prepared, sequence=1, redactor=SecretRedactor())
+
+    assert public.payload["attempt"] == 2
+    assert public.payload["max_attempts"] == 5
+    assert public.payload["effective_max_attempts"] == 2
+    assert public.payload["reason"] == "unknown_provider"
+
+
 def test_fingerprint_only_profile_rejection_remains_projectable() -> None:
     payload = {
         "expected_profile_fingerprint": "a" * 64,

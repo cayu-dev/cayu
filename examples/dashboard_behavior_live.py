@@ -353,12 +353,11 @@ def _profiled_session_identity(
             loop_policies=engine._loop_policies,
             loop_policy_identities=engine._loop_policy_execution_profile_identities,
             registered_provider=app._providers.get(provider_name),
-            finalization={
-                "kind": "cayu:model-finalization:v1",
-                "max_steps": max_steps,
-                "limits": RunLimits().model_dump(mode="json"),
-                "retry_policy": RetryPolicy().model_dump(mode="json"),
-            },
+            finalization=execution_profile_admission.model_finalization_material(
+                max_steps=max_steps,
+                limits=RunLimits(),
+                retry_policy=RetryPolicy(),
+            ),
         ),
     )
 

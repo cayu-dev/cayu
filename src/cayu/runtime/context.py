@@ -5120,6 +5120,11 @@ async def _run_compaction_model(
                         retry_after_s=(
                             None if provider_error is None else provider_error.retry_after_s
                         ),
+                        unknown_provider_error=(
+                            provider_error is not None
+                            and provider_error.status_code is None
+                            and provider_error.retryable is None
+                        ),
                     )
                     if not decision.retry or decision.next_attempt is None:
                         terminal_dispatch_error = failure

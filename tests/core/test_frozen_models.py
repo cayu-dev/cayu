@@ -206,7 +206,12 @@ def test_retry_policy_is_frozen_and_shared_instead_of_rebuilt() -> None:
     with pytest.raises(TypeError, match="RetryPolicy"):
         copy_retry_policy(object())  # type: ignore[arg-type]
 
-    decision = RetryDecision(retry=False, attempt=1, max_attempts=3)
+    decision = RetryDecision(
+        retry=False,
+        attempt=1,
+        max_attempts=3,
+        effective_max_attempts=1,
+    )
     with pytest.raises(ValidationError):
         decision.retry = True  # type: ignore[misc]
 

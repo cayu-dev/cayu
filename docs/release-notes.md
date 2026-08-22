@@ -89,6 +89,28 @@ guard.
 
 ## Unreleased
 
+### OpenAI subscription retries are bounded with migration-explicit authority
+
+OpenAI subscription HTTP and SSE errors now preserve bounded typed retry
+classification. Known terminal failures remain terminal, known transient
+failures follow the caller's ordinary retry policy, and genuinely unclassified
+provider failures use the stricter `RetryPolicy.max_unknown_attempts` ceiling,
+which defaults to at most two total attempts. Durable `model.error`,
+`model.retry`, and `model.attempt_discarded` evidence keeps the caller's general
+`max_attempts` separate from the classification-specific
+`effective_max_attempts` and records `reason="unknown_provider"` for unknown
+failures through terminal exhaustion.
+
+This semantic addition deliberately advances model-finalization profile
+material from v1 to v2 and the built-in `ModelCompactor` and
+`PromptCacheCompactor` materials from version 1 to version 2. Existing
+schema-v3 sessions can therefore report `finalization` and, where applicable,
+`context_compaction` drift. Start a new session or explicitly adopt the new
+profile through an application policy and an authority-authorized adoption
+intent; the default policy rejects the drift before work. Pre-change serialized
+adoption requests have a different fingerprint and must be resubmitted under
+the new contract. No storage migration is required.
+
 ### OpenAI Responses background work survives worker loss
 
 `OpenAIProvider(background=True)` now starts stored, streamed Responses API

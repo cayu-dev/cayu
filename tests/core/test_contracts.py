@@ -1981,6 +1981,9 @@ def test_retry_policy_validates_retry_controls():
     with pytest.raises(ValidationError):
         RetryPolicy(retry_on_status_codes=(600,))
 
+    with pytest.raises(ValidationError):
+        RetryPolicy(max_unknown_attempts=0)
+
 
 def test_retry_policy_classifies_common_status_code_formats():
     policy = RetryPolicy(max_attempts=2, retry_on_status_codes=(429, 500, 503, 529))
@@ -2101,6 +2104,66 @@ def test_retry_policy_typed_retryable_true_is_honored_without_pattern_match():
     assert decision.retry is True
     assert decision.reason == RetryReason.CONNECTION
     assert decision.status_code == 418
+
+
+def test_retry_policy_bounds_typed_unknown_provider_failures() -> None:
+    policy = RetryPolicy(
+        max_attempts=5,
+        max_unknown_attempts=2,
+        initial_delay_s=0.0,
+    )
+
+    first = retry_decision(
+        policy=policy,
+        attempt=1,
+        error="Provider failed with no safe classification",
+        unknown_provider_error=True,
+    )
+    exhausted = retry_decision(
+        policy=policy,
+        attempt=2,
+        error="Provider failed with no safe classification",
+        unknown_provider_error=True,
+    )
+
+    assert first.retry is True
+    assert first.reason == RetryReason.UNKNOWN_PROVIDER
+    assert first.next_attempt == 2
+    assert first.max_attempts == 5
+    assert first.effective_max_attempts == 2
+    assert exhausted.retry is False
+    assert exhausted.reason == RetryReason.UNKNOWN_PROVIDER
+    assert exhausted.next_attempt is None
+    assert exhausted.max_attempts == 5
+    assert exhausted.effective_max_attempts == 2
+
+
+def test_retry_policy_unknown_allowance_requires_typed_provider_boundary() -> None:
+    decision = retry_decision(
+        policy=RetryPolicy(max_attempts=5, max_unknown_attempts=2),
+        attempt=1,
+        error="unclassified local runtime failure",
+    )
+
+    assert decision.retry is False
+    assert decision.reason is None
+    assert decision.max_attempts == 5
+    assert decision.effective_max_attempts == 1
+
+
+def test_retry_policy_known_terminal_verdict_overrides_unknown_allowance() -> None:
+    decision = retry_decision(
+        policy=RetryPolicy(max_attempts=5, max_unknown_attempts=2),
+        attempt=1,
+        error="OpenAI subscription provider failed.",
+        retryable=False,
+        unknown_provider_error=True,
+    )
+
+    assert decision.retry is False
+    assert decision.reason is None
+    assert decision.max_attempts == 5
+    assert decision.effective_max_attempts == 1
 
 
 def test_retry_policy_honors_retry_after_directive_capped_by_max_delay():

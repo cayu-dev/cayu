@@ -57,6 +57,7 @@ class RetryReason(StrEnum):
     TIMEOUT = "timeout"
     CONNECTION = "connection"
     RATE_LIMIT = "rate_limit"
+    UNKNOWN_PROVIDER = "unknown_provider"
 
 
 class RetryPolicy(BaseModel):
@@ -72,6 +73,7 @@ class RetryPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     max_attempts: StrictInt = Field(default=1, ge=1, le=10)
+    max_unknown_attempts: StrictInt = Field(default=2, ge=1, le=10)
     initial_delay_s: StrictFloat = Field(default=0.5, ge=0.0, le=60.0)
     max_delay_s: StrictFloat = Field(default=10.0, ge=0.0, le=300.0)
     backoff_multiplier: StrictFloat = Field(default=2.0, ge=1.0, le=10.0)
@@ -104,6 +106,7 @@ class RetryDecision(BaseModel):
     attempt: StrictInt = Field(ge=1)
     next_attempt: StrictInt | None = Field(default=None, ge=2)
     max_attempts: StrictInt = Field(ge=1)
+    effective_max_attempts: StrictInt = Field(ge=1)
 
 
 def copy_retry_policy(policy: RetryPolicy | None) -> RetryPolicy:
@@ -128,6 +131,7 @@ def retry_decision(
     status_code: int | None = None,
     retryable: bool | None = None,
     retry_after_s: float | None = None,
+    unknown_provider_error: bool = False,
 ) -> RetryDecision:
     """Classify one failed model attempt into a retry decision.
 
@@ -137,6 +141,10 @@ def retry_decision(
     `retryable=False` forces a terminal decision, and `retry_after_s` overrides
     the computed backoff so a provider `Retry-After` directive is honored. They
     default to `None` so string-only callers keep the legacy regex behavior.
+    `unknown_provider_error=True` identifies a provider failure that retained no
+    safe retry classification after typed parsing. Such failures use the stricter
+    `max_unknown_attempts` ceiling and never consume the caller's full general
+    retry budget by default.
     """
 
     policy = copy_retry_policy(policy)
@@ -146,6 +154,8 @@ def retry_decision(
         raise ValueError("attempt must be greater than or equal to 1.")
     if type(error) is not str:
         raise TypeError("error must be a string.")
+    if type(unknown_provider_error) is not bool:
+        raise TypeError("unknown_provider_error must be a boolean.")
     if retry_after_s is not None:
         if type(retry_after_s) not in {int, float}:
             raise ValueError("retry_after_s must be a finite non-negative number.")
@@ -162,7 +172,18 @@ def retry_decision(
         status_code=status_code,
         retryable=retryable,
     )
-    can_retry = reason is not None and attempt < policy.max_attempts
+    if reason is None and unknown_provider_error and status_code is None and retryable is None:
+        reason = RetryReason.UNKNOWN_PROVIDER
+    if reason is RetryReason.UNKNOWN_PROVIDER:
+        effective_max_attempts = min(policy.max_attempts, policy.max_unknown_attempts)
+    elif reason is None:
+        # A terminal classification cannot consume any later caller-authorized
+        # attempt. Preserve the general ceiling separately while reporting the
+        # actual ceiling that applied to this failure.
+        effective_max_attempts = attempt
+    else:
+        effective_max_attempts = policy.max_attempts
+    can_retry = reason is not None and attempt < effective_max_attempts
     return RetryDecision(
         retry=can_retry,
         reason=reason,
@@ -173,6 +194,7 @@ def retry_decision(
         attempt=attempt,
         next_attempt=attempt + 1 if can_retry else None,
         max_attempts=policy.max_attempts,
+        effective_max_attempts=effective_max_attempts,
     )
 
 
@@ -256,6 +278,7 @@ def retry_event_payload(
         "attempt": decision.attempt,
         "next_attempt": decision.next_attempt,
         "max_attempts": decision.max_attempts,
+        "effective_max_attempts": decision.effective_max_attempts,
         "delay_seconds": decision.delay_seconds,
         "reason": None if decision.reason is None else decision.reason.value,
         "status_code": decision.status_code,

@@ -1598,6 +1598,20 @@ The schema-v3 component contract and its default comparison behavior are:
 
 The default policy rejects every changed or unverifiable required component. Equality requires the same component class, strength, availability, and fingerprint; two unavailable values do not become equal merely because both lack evidence. A custom `ExecutionProfilePolicy` cannot return `compatible_reuse` for provider-target or authority-bearing changes. Adoption of any authority-bearing change requires explicit caller adoption intent and the separate `authority_decision="authorized"`; Cayu applies this conservative rule to contractions as well as apparent expansions because opaque application behavior can make directionality unverifiable.
 
+The bounded unknown-provider retry contract advances Cayu's built-in model
+finalization material from `cayu:model-finalization:v1` to `v2`, and advances
+the built-in `ModelCompactor` and `PromptCacheCompactor` materials from version
+1 to version 2. This is intentional: adding `max_unknown_attempts` changes
+retry and finalization semantics, so an existing schema-v3 session may report
+`finalization` and, when either built-in retrying compactor is configured,
+`context_compaction` drift. The default policy rejects that drift before work.
+Start a new session or use an application `ExecutionProfilePolicy` plus an
+explicit, authority-authorized adoption intent after reviewing the change; do
+not silently reuse the old fingerprint. Because the retry policy is also part
+of serialized resume/adoption authority, an adoption request fingerprint made
+before this change is not replayable as the new request and must be resubmitted
+under the new contract.
+
 An execution profile and a request footprint are deliberately different records. The profile is pre-dispatch semantic authority and governs admission, retries, recovery, and adoption. A request footprint is post-projection evidence of one concrete provider request and references the governing profile fingerprint. The footprint does not authorize execution, and the profile does not claim byte-for-byte equality with a provider payload. Model attempts, structured-output and compaction lifecycle evidence, usage/cost line items, and runtime-evidence reports carry the same governing fingerprint when that authority is available. Retry and recovery reuse the frozen profile rather than adopting mutable registrations again. Before context construction, provider-owned request analysis, and each actual provider dispatch, Cayu reprojects transparent live context/provider configuration only as a guard against the frozen profile; drift fails the invocation before the changed semantics can be attributed to the old fingerprint. Application-versioned opaque extensions remain responsible for keeping the behavior represented by their declared identity stable.
 
 Applications version custom behavior with the public `ExecutionProfileBehaviorIdentity` value. `name` identifies the logical component, `behavior_version` changes when externally observable semantics or authority changes, and `implementation_version` changes for every deployed implementation revision, even when the public behavior contract is intended to stay stable:
@@ -4707,13 +4721,23 @@ configured as a `CayuApp(retry_policy=...)` default or attached to
 `RunRequest`, `ResumeRequest`, `DispatchRequest`, `ToolApprovalRequest`, and
 `ToolApprovalRecoveryRequest`. Request-level policy overrides the app default.
 The default policy has `max_attempts=1`, which means retries are disabled.
+`max_unknown_attempts` is a stricter nested ceiling for typed provider failures
+that remain unclassified after safe parsing. It defaults to two total attempts
+and never raises the caller's overall `max_attempts` ceiling. Setting it to one
+keeps unknown provider failures terminal while leaving known transient retries
+enabled. Retry evidence keeps those two ceilings distinct: `max_attempts` is
+the caller's general ceiling, while `effective_max_attempts` is the ceiling
+that applies to the classified failure. Unknown failures also carry
+`reason="unknown_provider"` on `model.error`, `model.retry`, and
+`model.attempt_discarded` evidence, including the terminal unknown failure.
 
 Retries are deliberately scoped to the model provider request. The runtime emits
 `model.started` for each attempt. If a retryable provider error happens, Cayu
 emits `model.error`, emits durable `model.retry` with attempt, next attempt,
-reason, status code, delay, provider, and model fields, waits for the configured
-backoff delay, and starts a new provider attempt. Retried failed attempts do not
-append assistant messages to the provider-neutral transcript.
+general and effective ceilings, reason, status code, delay, provider, model,
+and any already-sanitized provider error identity fields, waits for the
+configured backoff delay, and starts a new provider attempt. Retried failed
+attempts do not append assistant messages to the provider-neutral transcript.
 A dispatched typed context-overflow failure also emits one terminal `model.error`
 with its exact model-step and attempt identity, but it bypasses generic retry
 policy. When a context-overflow policy is configured, the specialized
@@ -4735,13 +4759,17 @@ OpenAI, Chat Completions, Vertex, and Anthropic HTTP errors also preserve valid
 an in-band error carried by a successful HTTP stream. This delay comes only
 from the trusted response header, never an event JSON field; the runtime uses
 it in preference to exponential backoff, capped by `RetryPolicy.max_delay_s`.
-Structured in-band stream errors use the same retry contract:
+Structured in-band stream errors use the same retry contract and retain an
+explicit valid `status_code` when the event supplies one:
 Anthropic-shaped overload/rate-limit/API/timeout identities map to
-529/429/500/504, and OpenAI-shaped server/rate-limit identities map to 500/429.
+529/429/500/504, and OpenAI-shaped server/rate-limit identities map to
+500/502/503/504 and 429.
 Known permanent identities are explicitly non-retryable; absent or unrecognized
-authoritative identities and conflicting recognized identities never become
-retryable from message text. A recognized identity that conflicts with context
-overflow likewise cannot become context-recoverable from message text. An SSE
+authoritative identities never become generally retryable from message text.
+A typed provider failure that remains genuinely unknown can use only the
+`max_unknown_attempts` allowance. Conflicting recognized identities fail
+closed. A recognized identity that conflicts with context overflow likewise
+cannot become context-recoverable from message text. An SSE
 stream that receives no bytes or decoded lines before its idle deadline is
 normalized to a typed retryable provider error. Every non-empty response chunk
 and received line resets that idle deadline, while one incomplete line/event

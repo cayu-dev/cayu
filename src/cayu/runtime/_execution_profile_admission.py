@@ -33,6 +33,10 @@ from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.user_input import pending_user_input_from_checkpoint
 from cayu.vaults import SecretRedactor
 
+_MODEL_FINALIZATION_MATERIAL_KIND = "cayu:model-finalization:v2"
+_MODEL_COMPACTOR_MATERIAL_VERSION = 2
+_PROMPT_CACHE_COMPACTOR_MATERIAL_VERSION = 2
+
 
 @dataclass(frozen=True)
 class ExecutionProfileContinuationPlan:
@@ -41,6 +45,28 @@ class ExecutionProfileContinuationPlan:
     snapshot: ActiveInvocationExecutionProfile
     candidate_profile: ExecutionProfileIdentity
     changed_component_classes: tuple[ExecutionProfileComponentClass, ...]
+
+
+def model_finalization_material(
+    *,
+    max_steps: int,
+    limits: RunLimits,
+    retry_policy: RetryPolicy,
+) -> dict[str, Any]:
+    """Return the versioned structural identity for model-loop finalization."""
+
+    if type(max_steps) is not int:
+        raise TypeError("max_steps must be an integer.")
+    if type(limits) is not RunLimits:
+        raise TypeError("limits must be a RunLimits instance.")
+    if type(retry_policy) is not RetryPolicy:
+        raise TypeError("retry_policy must be a RetryPolicy instance.")
+    return {
+        "kind": _MODEL_FINALIZATION_MATERIAL_KIND,
+        "max_steps": max_steps,
+        "limits": limits.model_dump(mode="json"),
+        "retry_policy": retry_policy.model_dump(mode="json"),
+    }
 
 
 class ProcessLocalBehaviorIdentityRegistry:
@@ -480,12 +506,11 @@ def resolve_execution_profile_identity(
             {"kind": "none", "version": 1} if structured_output is None else structured_output
         ),
         finalization=(
-            {
-                "kind": "cayu:model-finalization:v1",
-                "max_steps": 16,
-                "limits": RunLimits().model_dump(mode="json"),
-                "retry_policy": RetryPolicy().model_dump(mode="json"),
-            }
+            model_finalization_material(
+                max_steps=16,
+                limits=RunLimits(),
+                retry_policy=RetryPolicy(),
+            )
             if finalization is None
             else finalization
         ),
@@ -1422,7 +1447,7 @@ def _cayu_compactor_material(
         )
         material = {
             "kind": "model_compactor",
-            "version": 1,
+            "version": _MODEL_COMPACTOR_MATERIAL_VERSION,
             "provider": provider,
             "provider_name": compactor._provider_snapshot.provider_name,
             "pricing_provider_name": compactor._provider_snapshot.pricing_provider_name,
@@ -1492,7 +1517,7 @@ def _cayu_compactor_material(
             )
         material = {
             "kind": "prompt_cache_compactor",
-            "version": 1,
+            "version": _PROMPT_CACHE_COMPACTOR_MATERIAL_VERSION,
             "provider": provider,
             "provider_name": compactor._provider_snapshot.provider_name,
             "pricing_provider_name": compactor._provider_snapshot.pricing_provider_name,

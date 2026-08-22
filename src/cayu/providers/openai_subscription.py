@@ -1199,15 +1199,22 @@ def _safe_subscription_error_identity(
     allowed = (
         {
             "authentication_error",
+            "context_length_exceeded",
             "error",
+            "insufficient_quota",
             "invalid_request_error",
+            "not_found_error",
+            "permission_error",
             "rate_limit_error",
             "server_error",
         }
         if field_name == "error_type"
         else {
+            "bad_request",
             "context_length_exceeded",
+            "insufficient_quota",
             "internal_error",
+            "previous_response_not_found",
             "rate_limit_exceeded",
             "server_error",
         }
