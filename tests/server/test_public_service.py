@@ -681,6 +681,8 @@ def test_precreated_product_task_is_verified_before_redelivery() -> None:
 
 def test_product_task_creation_acknowledgement_loss_is_reconstructed() -> None:
     class CommitThenRaiseTaskStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def create_task(self, request):
             await super().create_task(request)
             raise RuntimeError("task creation acknowledgement lost")
@@ -1741,6 +1743,8 @@ def test_progressed_product_work_release_resists_caller_cancellation() -> None:
 
 def test_product_reconciliation_failure_releases_execution_claim() -> None:
     class UnavailableTaskStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def create_task(self, request):
             del request
             raise RuntimeError("task create unavailable")

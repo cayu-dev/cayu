@@ -231,6 +231,7 @@ from cayu.runtime._structured_output_tool_round import (
 from cayu.runtime._task_store_operation_boundary import (
     capture_sensitive_validation,
     capture_task_store_operation,
+    raise_task_store_operation_failure,
 )
 from cayu.runtime._terminal_evidence import interruption_request_id_from_payload
 from cayu.runtime._tool_round_executor import (
@@ -4806,7 +4807,7 @@ class SessionEngine:
                         )
                         if admission_failure is not None:
                             del marker, result, session
-                            raise admission_failure from None
+                            raise_task_store_operation_failure(admission_failure)
                         if requires_completion_decision:
                             # Keep both the stale parent and its durable cascade marker
                             # untouched for the verifier-aware recovery owner.
@@ -4828,7 +4829,7 @@ class SessionEngine:
                                 session_id=session_id,
                             )
                             if admission_failure is not None:
-                                raise admission_failure from None
+                                raise_task_store_operation_failure(admission_failure)
                             if requires_completion_decision:
                                 raise TaskCompletionDecisionRequired(
                                     "Contracted tasks require the verifier-aware execution "
@@ -4970,7 +4971,7 @@ class SessionEngine:
         )
         if admission_failure is not None:
             del request
-            raise admission_failure from None
+            raise_task_store_operation_failure(admission_failure)
         if requires_completion_decision:
             del request
             raise TaskCompletionDecisionRequired(
@@ -5001,7 +5002,7 @@ class SessionEngine:
                     session_id=request.session_id,
                 )
                 if admission_failure is not None:
-                    raise admission_failure from None
+                    raise_task_store_operation_failure(admission_failure)
                 if requires_completion_decision:
                     raise TaskCompletionDecisionRequired(
                         "Contracted tasks require the verifier-aware execution entrance."
@@ -5038,7 +5039,7 @@ class SessionEngine:
                 admit_session=False,
             )
             if admission_failure is not None:
-                raise admission_failure from None
+                raise_task_store_operation_failure(admission_failure)
             if requires_completion_decision:
                 raise TaskCompletionDecisionRequired(
                     "Contracted tasks require the verifier-aware execution entrance."
@@ -5063,7 +5064,7 @@ class SessionEngine:
                 session_id=session_id,
             )
             if admission_failure is not None:
-                raise admission_failure from None
+                raise_task_store_operation_failure(admission_failure)
             if requires_completion_decision:
                 raise TaskCompletionDecisionRequired(
                     "Contracted tasks require the verifier-aware execution entrance."
@@ -6259,7 +6260,7 @@ class SessionEngine:
         )
         if admission_failure is not None:
             del request
-            raise admission_failure from None
+            raise_task_store_operation_failure(admission_failure)
         if requires_completion_decision:
             return None
         budget_policy = copy_budget_policy(self._get_budget_policy())
@@ -6401,7 +6402,7 @@ class SessionEngine:
         )
         if admission_failure is not None:
             del request, workspace_instructions, rendered_system_prompt, prompt_contributions
-            raise admission_failure from None
+            raise_task_store_operation_failure(admission_failure)
         if requires_completion_decision:
             return None
         return _PreparedInitialRun(
@@ -6542,7 +6543,7 @@ class SessionEngine:
             admit_session=admit_session,
         )
         if admission_failure is not None:
-            raise admission_failure from None
+            raise_task_store_operation_failure(admission_failure)
         if requires_completion_decision:
             raise TaskCompletionDecisionRequired(
                 "Contracted tasks require the verifier-aware execution entrance."
@@ -7322,7 +7323,7 @@ class SessionEngine:
         )
         if admission_failure is not None:
             del request
-            raise admission_failure from None
+            raise_task_store_operation_failure(admission_failure)
         if requires_completion_decision:
             del request
             raise TaskCompletionDecisionRequired(
@@ -7526,7 +7527,7 @@ class SessionEngine:
                 )
                 if admission_failure is not None:
                     del loaded_session, request
-                    raise admission_failure from None
+                    raise_task_store_operation_failure(admission_failure)
                 if requires_completion_decision:
                     del loaded_session, request
                     raise TaskCompletionDecisionRequired(
@@ -7563,7 +7564,7 @@ class SessionEngine:
                     )
                     if admission_failure is not None:
                         del loaded_session, request
-                        raise admission_failure from None
+                        raise_task_store_operation_failure(admission_failure)
                     if requires_completion_decision:
                         del loaded_session, request
                         raise TaskCompletionDecisionRequired(
@@ -7647,7 +7648,7 @@ class SessionEngine:
         )
         if admission_failure is not None:
             del loaded_session, request, transcript
-            raise admission_failure from None
+            raise_task_store_operation_failure(admission_failure)
         if requires_completion_decision:
             del loaded_session, request, transcript
             raise TaskCompletionDecisionRequired(
@@ -11555,7 +11556,7 @@ class SessionEngine:
         )
         if admission_failure is not None:
             del request
-            raise admission_failure from None
+            raise_task_store_operation_failure(admission_failure)
         if requires_completion_decision:
             del request
             raise TaskCompletionDecisionRequired(
@@ -11909,7 +11910,7 @@ class SessionEngine:
         )
         if admission_failure is not None:
             del request
-            raise admission_failure from None
+            raise_task_store_operation_failure(admission_failure)
         if requires_completion_decision:
             del request
             raise TaskCompletionDecisionRequired(

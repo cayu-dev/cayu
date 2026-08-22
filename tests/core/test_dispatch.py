@@ -858,6 +858,8 @@ def test_sqlite_target_adoption_redelivery_accepts_governed_profile(tmp_path) ->
 
 def test_submit_reconciles_queue_publication_acknowledgement_loss() -> None:
     class CommitThenRaiseCreateStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def create_task(self, request: TaskCreate):
             await super().create_task(request)
             raise ConnectionError("queue publication acknowledgement lost")
@@ -880,6 +882,8 @@ def test_submit_reconciles_terminal_peer_after_duplicate_publication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class PeerTerminalThenRaiseStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         on_created = None
 
         async def create_task(self, request: TaskCreate):
@@ -1555,6 +1559,8 @@ def test_worker_missing_required_agent_fails_dispatch_terminally() -> None:
 
 def test_operator_cancellation_wins_permanent_authority_rejection() -> None:
     class CancelBeforeAuthorityRejectionStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def terminalize_task(self, request: TaskTerminalizationRequest):
             if request.kind is TaskTerminalKind.FAILED:
                 await super().cancel_task(
@@ -2036,6 +2042,8 @@ def test_queue_preparation_preserves_released_profile_for_pending_tool_recovery(
 
 def test_redelivery_replays_old_terminal_dispatch_during_newer_profile_ownership() -> None:
     class LoseFirstTerminalClaimStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.lose_first_terminal = True
@@ -2104,6 +2112,8 @@ def test_sqlite_pruning_retains_terminal_evidence_until_queue_acknowledgement(
     tmp_path,
 ) -> None:
     class LoseFirstTerminalClaimStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.lose_first_terminal = True
@@ -2292,6 +2302,8 @@ def test_sqlite_pruning_uses_queued_terminal_retention_markers(
 
 def test_terminal_redelivery_settles_independently_of_a_newer_active_invocation() -> None:
     class LoseFirstTerminalClaimStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.lose_first_terminal = True
@@ -2485,6 +2497,8 @@ def test_sqlite_restart_preserves_queued_profile_and_executes_once(tmp_path) -> 
 
 def test_process_next_reconciles_terminalization_acknowledgement_loss() -> None:
     class CommitThenRaiseStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.terminalize_calls = 0
@@ -2514,6 +2528,8 @@ def test_process_next_reconciles_terminalization_acknowledgement_loss() -> None:
 
 def test_same_dispatcher_reconciles_cancellation_after_task_terminal_commit() -> None:
     class CommitThenBlockStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.terminal_committed = asyncio.Event()
@@ -2581,6 +2597,8 @@ def test_same_dispatcher_reconciles_cancellation_after_task_terminal_commit() ->
 
 def test_same_dispatcher_reconciles_load_failure_after_task_terminal_commit() -> None:
     class FailPostCommitLoadOnceStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.fail_post_commit_load = False
@@ -2644,6 +2662,8 @@ def test_same_dispatcher_reconciles_load_failure_after_task_terminal_commit() ->
 
 def test_process_next_rejects_peer_terminalization_without_exact_dispatch_evidence() -> None:
     class PeerWinningStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def terminalize_task(self, request: TaskTerminalizationRequest):
             await super().complete_task(
                 request.task_id,
@@ -4017,6 +4037,8 @@ def test_worker_rejects_claimed_task_row_that_conflicts_with_envelope(
     field_value: str,
 ) -> None:
     class ConflictingClaimTaskStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def claim_task(self, *args, **kwargs):
             task = await super().claim_task(*args, **kwargs)
             if task is None:
@@ -4311,6 +4333,8 @@ def test_terminalize_does_not_clobber_a_reclaimed_task() -> None:
 
 def test_malformed_dispatch_claim_loss_returns_without_clobbering_new_owner() -> None:
     class ReclaimBeforeMalformedFailureStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def terminalize_task(self, request: TaskTerminalizationRequest):
             if request.worker_id is not None:
                 await super().release_task(request.task_id, request.worker_id)

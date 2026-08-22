@@ -98,6 +98,8 @@ def test_task_retry_migration_documentation_matches_schema_revision() -> None:
 
 def test_cayu_app_rejects_retry_policy_before_unsupported_store_create() -> None:
     class UnsupportedRetryStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         supports_task_retry_series = False
 
         def __init__(self) -> None:
@@ -128,6 +130,8 @@ def test_cayu_app_rejects_secret_bearing_retry_currency_before_store_create(
     secret: str,
 ) -> None:
     class RecordingStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.create_calls = 0
@@ -429,6 +433,8 @@ def test_task_retry_receipt_rejects_changed_successor_authority(
 
 def test_task_retry_settlement_boundary_revalidates_mutated_custom_store_receipt() -> None:
     class MutatingReceiptStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def settle_task_retry_attempt(self, request):
             receipt = await super().settle_task_retry_attempt(request)
             assert receipt.successor is not None
@@ -479,6 +485,8 @@ def test_task_retry_settlement_rejects_immediate_receipt_for_another_operation(
     wrong_value: str,
 ) -> None:
     class WrongOperationReceiptStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def settle_task_retry_attempt(self, request):
             receipt = await super().settle_task_retry_attempt(request)
             return receipt.model_copy(update={field_name: wrong_value})
@@ -513,6 +521,8 @@ def test_task_retry_settlement_rejects_immediate_receipt_for_another_operation(
 
 def test_task_retry_settlement_rejects_immediate_receipt_for_another_task() -> None:
     class WrongTaskReceiptStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         wrong_receipt: TaskRetrySettlementResult | None = None
 
         async def settle_task_retry_attempt(self, request):
@@ -2018,6 +2028,8 @@ def test_task_worker_cancellation_during_deadline_drain_preserves_claim_until_qu
 
 def test_task_worker_defers_cancellation_during_deadline_terminalization() -> None:
     class BlockingDeadlineStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.terminalization_started = asyncio.Event()
@@ -2082,6 +2094,8 @@ def test_task_worker_defers_cancellation_during_deadline_terminalization() -> No
 
 def test_task_worker_reconciles_lost_deadline_enforcement_acknowledgement() -> None:
     class _AckLostDeadlineStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.lost = False
@@ -2148,6 +2162,8 @@ def test_task_worker_reconciles_lost_deadline_enforcement_acknowledgement() -> N
 
 def test_task_worker_retries_indeterminate_deadline_enforcement() -> None:
     class _TransientDeadlineStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.enforcement_calls = 0
@@ -2205,6 +2221,8 @@ def test_task_worker_retries_indeterminate_deadline_enforcement() -> None:
 
 def test_task_worker_reconciles_lost_retry_settlement_acknowledgement() -> None:
     class _AckLostStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.lost = False
@@ -2255,6 +2273,8 @@ def test_task_worker_reconciles_lost_retry_settlement_acknowledgement() -> None:
 
 def test_task_retry_worker_retains_lease_and_settles_before_redelivering_cancellation() -> None:
     class BlockingSettlementStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.settlement_started = asyncio.Event()
@@ -2381,6 +2401,8 @@ def test_task_retry_worker_classifies_child_cancellation_as_handler_failure() ->
 
 def test_task_retry_worker_does_not_classify_heartbeat_failure_as_handler_failure() -> None:
     class FailingHeartbeatStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.heartbeat_failed = asyncio.Event()
@@ -2435,6 +2457,8 @@ def test_task_retry_worker_does_not_classify_heartbeat_failure_as_handler_failur
 
 def test_task_retry_worker_preserves_cancellation_when_heartbeat_fails_during_settlement() -> None:
     class FailingSettlementHeartbeatStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.settlement_started = asyncio.Event()

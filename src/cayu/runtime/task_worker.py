@@ -40,6 +40,7 @@ from cayu._exception_groups import (
 from cayu._validation import canonical_durable_json_bytes, require_clean_nonblank
 from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
+    raise_task_store_operation_failure,
     task_store_mutation_is_cancellation_quiescent,
 )
 from cayu.runtime.sessions import SessionStatus
@@ -204,7 +205,7 @@ async def run_task_worker(
                 if reclaim_outcome.failure is not None:
                     failure = reclaim_outcome.failure
                     del reclaim_outcome
-                    raise failure from None
+                    raise_task_store_operation_failure(failure)
                 del reclaim_outcome
             else:
                 await task_store.reclaim_expired(query=query)
@@ -219,7 +220,7 @@ async def run_task_worker(
             if claim_outcome.failure is not None:
                 failure = claim_outcome.failure
                 del claim_outcome
-                raise failure from None
+                raise_task_store_operation_failure(failure)
             task = claim_outcome.result
             del claim_outcome
         else:
@@ -252,7 +253,7 @@ async def run_task_worker(
             if parking_outcome.failure is not None:
                 failure = parking_outcome.failure
                 del contract, parking_outcome, task, task_id
-                raise failure from None
+                raise_task_store_operation_failure(failure)
             del contract, parking_outcome, task_id
             handled += 1
             continue

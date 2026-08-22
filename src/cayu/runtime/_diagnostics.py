@@ -33,9 +33,34 @@ def _runtime_owned_exception_renderings(error: BaseException) -> tuple[str, ...]
             str(error),
             repr(error),
             "".join(traceback_module.format_exception_only(type(error), error)),
+            "".join(traceback_module.format_exception(error)),
         )
     except BaseException:
         return None
+
+
+def runtime_owned_exception_renderings_are_credential_safe(
+    error: BaseException,
+    *,
+    redactor: SecretRedactor,
+) -> bool:
+    """Validate every public rendering of one runtime-owned exception graph.
+
+    The complete traceback rendering matters when an explicit cause is present:
+    Python inserts fixed separator text between two otherwise safe exceptions,
+    and that composition can reconstruct a registered secret.
+    """
+
+    if not isinstance(error, BaseException):
+        raise TypeError("error must be a BaseException.")
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+    rendered = _runtime_owned_exception_renderings(error)
+    return rendered is not None and all(
+        len(value.encode("utf-8")) <= MAX_DIAGNOSTIC_UTF8_BYTES
+        and redactor.redact_text(value) == value
+        for value in rendered
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,11 +208,9 @@ def credential_safe_runtime_exception(
     )
     for candidate_message in candidates:
         candidate = exception_type(candidate_message)
-        rendered = _runtime_owned_exception_renderings(candidate)
-        if rendered is not None and all(
-            len(value.encode("utf-8")) <= MAX_DIAGNOSTIC_UTF8_BYTES
-            and redactor.redact_text(value) == value
-            for value in rendered
+        if runtime_owned_exception_renderings_are_credential_safe(
+            candidate,
+            redactor=redactor,
         ):
             return candidate
     # A secret registry that deliberately contains every fixed runtime
@@ -236,13 +259,9 @@ def credential_safe_runtime_exception_group(
         )
 
     def rendering_is_safe(candidate: BaseExceptionGroup) -> bool:
-        rendered = _runtime_owned_exception_renderings(candidate)
-        if rendered is None:
-            return False
-        return all(
-            len(value.encode("utf-8")) <= MAX_DIAGNOSTIC_UTF8_BYTES
-            and redactor.redact_text(value) == value
-            for value in rendered
+        return runtime_owned_exception_renderings_are_credential_safe(
+            candidate,
+            redactor=redactor,
         )
 
     bounded = rebuild_exception_group(

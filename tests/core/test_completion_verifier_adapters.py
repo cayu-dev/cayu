@@ -1477,6 +1477,140 @@ def test_post_commit_failure_cannot_turn_caller_cancellation_into_success() -> N
     assert any(isinstance(item, asyncio.CancelledError) for item in failure.exceptions)
 
 
+def test_decision_publication_cancellation_retains_store_settlement_evidence(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = "completion-publication-settlement-secret"
+
+    class SettlementEvidenceStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.decision_committed = asyncio.Event()
+
+        async def record_completion_decision(self, request):
+            decision = await super().record_completion_decision(request)
+            self.decision_committed.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as cancellation:
+                raise cancellation from BaseExceptionGroup(
+                    "Postgres mutation cancellation settlement failed.",
+                    [
+                        ConnectionError(secret),
+                        RuntimeError("connection abort failed"),
+                    ],
+                )
+            return decision  # pragma: no cover - the test always cancels publication
+
+    async def scenario() -> tuple[asyncio.CancelledError, asyncio.Task[CompletionDecision]]:
+        store = SettlementEvidenceStore()
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        verifier = RecordingVerifier(_accepted_decision())
+        app = CayuApp(
+            task_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        app.register_completion_verifier(contract.verifier, verifier)
+        request = _execution_request(proposal_id)
+
+        owner = asyncio.create_task(app.verify_completion_proposal(request))
+        await store.decision_committed.wait()
+        owner.cancel("stop during decision publication settlement")
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await owner
+        assert await store.load_completion_decision(request.decision_id) is not None
+        assert len(verifier.requests) == 1
+        return captured.value, owner
+
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        cancellation, owner = asyncio.run(scenario())
+
+    assert owner.cancelled()
+    assert owner.cancelling() == 1
+    assert isinstance(cancellation.__cause__, BaseExceptionGroup)
+    assert _exception_leaf_types(cancellation.__cause__) == (ConnectionError, RuntimeError)
+    _assert_secret_absent_from_cayu_error(cancellation, secret)
+    captured = capsys.readouterr()
+    assert secret not in caplog.text
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert all(secret not in str(item.message) for item in caught_warnings)
+
+
+def test_public_cancellation_cause_chain_cannot_reconstruct_split_secret(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cause_fragment = "settlement-left-edge"
+    cancellation_fragment = "caller-right-edge"
+    probe = asyncio.CancelledError(cancellation_fragment)
+    probe.__cause__ = ConnectionError(cause_fragment)
+    probe_rendering = "".join(traceback_module.format_exception(probe))
+    secret_start = probe_rendering.index(cause_fragment)
+    secret_end = probe_rendering.index(cancellation_fragment) + len(cancellation_fragment)
+    split_secret = probe_rendering[secret_start:secret_end]
+
+    class SettlementEvidenceStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.decision_committed = asyncio.Event()
+
+        async def record_completion_decision(self, request):
+            decision = await super().record_completion_decision(request)
+            self.decision_committed.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as cancellation:
+                raise cancellation from ConnectionError(cause_fragment)
+            return decision  # pragma: no cover - the test always cancels publication
+
+    async def scenario() -> tuple[asyncio.CancelledError, asyncio.Task[CompletionDecision]]:
+        store = SettlementEvidenceStore()
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        app = CayuApp(
+            task_store=store,
+            secret_redactor=SecretRedactor(split_secret),
+            enable_logging=False,
+        )
+        app.register_completion_verifier(
+            contract.verifier,
+            RecordingVerifier(_accepted_decision()),
+        )
+        request = _execution_request(proposal_id)
+
+        owner = asyncio.create_task(app.verify_completion_proposal(request))
+        await store.decision_committed.wait()
+        owner.cancel(cancellation_fragment)
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await owner
+        assert await store.load_completion_decision(request.decision_id) is not None
+        return captured.value, owner
+
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        cancellation, owner = asyncio.run(scenario())
+
+    assert owner.cancelled()
+    assert owner.cancelling() == 1
+    assert isinstance(cancellation.__cause__, ConnectionError)
+    assert cause_fragment not in str(cancellation.__cause__)
+    _assert_secret_absent_from_cayu_error(cancellation, split_secret)
+    captured = capsys.readouterr()
+    assert split_secret not in caplog.text
+    assert split_secret not in captured.out
+    assert split_secret not in captured.err
+    assert all(split_secret not in str(item.message) for item in caught_warnings)
+
+
 def test_claim_failure_after_caller_cancellation_is_bounded_and_split_secret_safe(
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
@@ -1532,6 +1666,70 @@ def test_claim_failure_after_caller_cancellation_is_bounded_and_split_secret_saf
     assert len(str(failure).encode("utf-8")) <= MAX_DIAGNOSTIC_UTF8_BYTES
     assert len(repr(failure).encode("utf-8")) <= MAX_DIAGNOSTIC_UTF8_BYTES
     _assert_secret_absent_from_cayu_error(failure, secret)
+    captured = capsys.readouterr()
+    assert secret not in caplog.text
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert all(secret not in str(item.message) for item in caught_warnings)
+
+
+def test_claim_cancellation_retains_store_settlement_evidence_through_coordinator(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = "completion-claim-settlement-secret"
+
+    class SettlementEvidenceStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.claim_started = asyncio.Event()
+
+        async def claim_completion_verification(self, request):
+            del request
+            self.claim_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as cancellation:
+                raise cancellation from BaseExceptionGroup(
+                    "Postgres mutation cancellation settlement failed.",
+                    [
+                        ConnectionError(secret),
+                        RuntimeError("connection abort failed"),
+                    ],
+                )
+
+    async def scenario() -> tuple[asyncio.CancelledError, asyncio.Task[CompletionDecision]]:
+        store = SettlementEvidenceStore()
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        verifier = RecordingVerifier(_accepted_decision())
+        app = CayuApp(
+            task_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        app.register_completion_verifier(contract.verifier, verifier)
+
+        owner = asyncio.create_task(app.verify_completion_proposal(_execution_request(proposal_id)))
+        await store.claim_started.wait()
+        owner.cancel("stop during claim settlement")
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await owner
+        assert await store.load_completion_verification_claim(proposal_id) is None
+        assert verifier.requests == []
+        return captured.value, owner
+
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        cancellation, owner = asyncio.run(scenario())
+
+    assert owner.cancelled()
+    assert owner.cancelling() == 1
+    assert isinstance(cancellation.__cause__, BaseExceptionGroup)
+    assert _exception_leaf_types(cancellation.__cause__) == (ConnectionError, RuntimeError)
+    _assert_secret_absent_from_cayu_error(cancellation, secret)
     captured = capsys.readouterr()
     assert secret not in caplog.text
     assert secret not in captured.out
@@ -1643,6 +1841,8 @@ def test_malformed_store_proposal_is_item_bounded_before_context_copy() -> None:
                 yield object()
 
     class MalformedProposalStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.values = EndlessEvidence()
@@ -1679,6 +1879,8 @@ def test_malformed_store_contract_is_item_bounded_before_context_copy() -> None:
                 yield object()
 
     class MalformedContractStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.values = EndlessCriteria()
@@ -1715,6 +1917,8 @@ def test_malformed_store_decision_is_item_bounded_before_replay_copy() -> None:
                 yield _accepted_decision().criterion_outcomes[0]
 
     class MalformedDecisionStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.values = EndlessOutcomes()
@@ -1880,6 +2084,8 @@ def test_store_returned_decision_content_must_match_its_integrity_evidence() -> 
 
 def test_corrupt_durable_proposal_integrity_fails_before_claim_or_adapter() -> None:
     class CorruptProposalStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def load_completion_proposal(self, proposal_id):
             proposal = await super().load_completion_proposal(proposal_id)
             if proposal is None:
@@ -1904,6 +2110,8 @@ def test_corrupt_durable_proposal_integrity_fails_before_claim_or_adapter() -> N
 
 def test_corrupt_replayed_decision_integrity_fails_without_adapter_rerun() -> None:
     class CorruptDecisionStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         corrupt_decision = False
 
         async def load_completion_decision(self, decision_id):
@@ -2237,6 +2445,8 @@ def test_custom_store_failure_final_composition_is_split_secret_safe(
         pass
 
     class FailingStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def load_completion_proposal(self, proposal_id):
             del proposal_id
             raise SplitStoreFailure("token" + ("x" * 8_192))
@@ -2274,6 +2484,8 @@ def test_custom_store_failure_traceback_composition_is_split_secret_safe(
         pass
 
     class FailingStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def load_completion_proposal(self, proposal_id):
             del proposal_id
             raise SplitStoreFailure("token")
@@ -2389,6 +2601,8 @@ def test_custom_store_failure_group_is_bounded_and_final_composition_is_secret_s
     )
 
     class FailingStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def load_completion_proposal(self, proposal_id):
             del proposal_id
             raise ExceptionGroup(
@@ -2474,6 +2688,8 @@ def test_rejected_public_verifier_inputs_are_detached_and_secret_safe(
 
 def test_oversized_mutated_execution_identity_fails_before_store_lookup() -> None:
     class LookupCountingStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.proposal_lookups = 0
@@ -2961,6 +3177,8 @@ def test_raw_nested_adapter_outcome_is_field_bounded_before_copying() -> None:
 
 def test_store_returned_attempt_and_claim_are_field_bounded_before_copying() -> None:
     class MalformedAttemptStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.mapping = _CountingMapping(4)
@@ -3202,6 +3420,93 @@ def test_claim_renewal_failure_after_publication_is_observable_and_secret_safe(
         failure = asyncio.run(scenario())
 
     assert _exception_leaf_types(failure) == (ConnectionError,)
+    _assert_secret_absent_from_cayu_error(failure, secret)
+    captured = capsys.readouterr()
+    assert secret not in caplog.text
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert all(secret not in str(item.message) for item in caught_warnings)
+
+
+def test_claim_renewal_cancellation_retains_settlement_evidence_after_publication(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = "heartbeat-settlement-secret"
+
+    class SettlementFailureStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.renewal_count = 0
+            self.background_started = asyncio.Event()
+
+        async def renew_completion_verification_claim(self, request):
+            self.renewal_count += 1
+            if self.renewal_count == 1:
+                return await super().renew_completion_verification_claim(request)
+            self.background_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as cancellation:
+                raise cancellation from BaseExceptionGroup(
+                    "Postgres mutation cancellation settlement failed.",
+                    [
+                        ConnectionError(secret),
+                        RuntimeError("connection abort failed"),
+                    ],
+                )
+
+    class CompleteDuringRenewalVerifier(DeterministicCompletionVerifier):
+        def __init__(self, store: SettlementFailureStore) -> None:
+            self.store = store
+
+        async def verify(
+            self,
+            request: CompletionVerifierRequest,
+        ) -> CompletionVerifierDecision:
+            del request
+            await self.store.background_started.wait()
+            return _accepted_decision()
+
+    async def scenario() -> BaseExceptionGroup:
+        store = SettlementFailureStore()
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        request = _execution_request(
+            proposal_id,
+            lease_seconds=1,
+            timeout_seconds=0.9,
+        )
+        app = CayuApp(
+            task_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        app.register_completion_verifier(
+            contract.verifier,
+            CompleteDuringRenewalVerifier(store),
+        )
+        with pytest.raises(BaseExceptionGroup) as captured:
+            await app.verify_completion_proposal(request)
+        assert await store.load_completion_decision(request.decision_id) is not None
+
+        restarted = CayuApp(
+            task_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        assert await restarted.verify_completion_proposal(request) == (
+            await store.load_completion_decision(request.decision_id)
+        )
+        return captured.value
+
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        failure = asyncio.run(scenario())
+
+    assert _exception_leaf_types(failure) == (ConnectionError, RuntimeError)
     _assert_secret_absent_from_cayu_error(failure, secret)
     captured = capsys.readouterr()
     assert secret not in caplog.text

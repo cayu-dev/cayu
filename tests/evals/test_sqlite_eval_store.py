@@ -192,7 +192,7 @@ def test_sqlite_revision_forty_eight_preserves_cases_and_admits_zero_messages(
             DROP TABLE cayu_eval_cases_revision_48;
             CREATE INDEX idx_cayu_eval_cases_suite
                 ON cayu_eval_cases(corpus_revision, suite_id, case_id ASC);
-            DELETE FROM cayu_schema_migrations WHERE revision = 48;
+            DELETE FROM cayu_schema_migrations WHERE revision >= 48;
             PRAGMA user_version = 47;
             """
         )

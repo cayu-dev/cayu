@@ -196,6 +196,7 @@ def test_session_topology_reports_optional_task_projection_states() -> None:
     }
 
     class UnsupportedTaskTopologyStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
         supports_task_topology = False
 
         async def query_task_topology(self, query):
@@ -210,6 +211,8 @@ def test_session_topology_reports_optional_task_projection_states() -> None:
     assert unsupported.json()["focus"]["id"] == "focus"
 
     class InconsistentTaskTopologyStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def query_task_topology(self, query):
             return await super().query_task_topology(
                 query.model_copy(

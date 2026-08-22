@@ -164,6 +164,7 @@ from cayu.runtime._task_store_operation_boundary import (
     TaskStoreOperationOutcome,
     capture_sensitive_validation,
     capture_task_store_operation,
+    raise_task_store_operation_failure,
 )
 from cayu.runtime._terminal_evidence import (
     SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
@@ -2862,7 +2863,7 @@ class CayuApp:
         )
         if admission_failure is not None:
             del private_session_id, request
-            raise admission_failure from None
+            raise_task_store_operation_failure(admission_failure)
         if contract_rejected:
             del private_session_id, request
             raise TaskCompletionDecisionRequired(
@@ -3051,7 +3052,7 @@ class CayuApp:
         )
         if admission_failure is not None:
             del private_session_id, request
-            raise admission_failure from None
+            raise_task_store_operation_failure(admission_failure)
         if contract_rejected:
             del private_session_id, request
             raise TaskCompletionDecisionRequired(
@@ -3151,7 +3152,7 @@ class CayuApp:
         )
         if admission_failure is not None:
             del durable_request, private_session_id, request
-            raise admission_failure from None
+            raise_task_store_operation_failure(admission_failure)
         if contract_rejected:
             del durable_request, private_session_id, request
             raise TaskCompletionDecisionRequired(
@@ -3664,7 +3665,7 @@ class CayuApp:
         )
         if publication_failure is not None:
             del contract, published_value
-            raise publication_failure from None
+            raise_task_store_operation_failure(publication_failure)
         validation = _copied_public_work_contract(
             published_value,
             redactor=self._secret_redactor,
@@ -3728,7 +3729,7 @@ class CayuApp:
         )
         if lookup_failure is not None:
             del copied_reference, loaded_value
-            raise lookup_failure from None
+            raise_task_store_operation_failure(lookup_failure)
         if loaded_value is None:
             return None
         validation = _copied_public_work_contract(
@@ -3873,7 +3874,7 @@ class CayuApp:
             )
             if parent_lookup_failure is not None:
                 del parent_snapshot_value, request
-                raise parent_lookup_failure from None
+                raise_task_store_operation_failure(parent_lookup_failure)
             parent_validation = _copied_public_task_invocation_snapshot(
                 parent_snapshot_value,
                 redactor=self._secret_redactor,
@@ -3934,7 +3935,7 @@ class CayuApp:
         )
         if creation_failure is not None:
             del parent_invocation_snapshot, request, task
-            raise creation_failure from None
+            raise_task_store_operation_failure(creation_failure)
         validation = _copied_public_task(
             task,
             redactor=self._secret_redactor,
@@ -3968,7 +3969,7 @@ class CayuApp:
         )
         if invocation_lookup_failure is not None:
             del invocation_snapshot, parent_invocation_snapshot, request, task
-            raise invocation_lookup_failure from None
+            raise_task_store_operation_failure(invocation_lookup_failure)
         validation = _copied_public_task_invocation_snapshot(
             invocation_snapshot,
             redactor=self._secret_redactor,
@@ -4531,7 +4532,7 @@ class CayuApp:
             admit_session=admit_session,
         )
         if admission_failure is not None:
-            raise admission_failure from None
+            raise_task_store_operation_failure(admission_failure)
         if requires_completion_decision:
             raise TaskCompletionDecisionRequired(
                 "Contracted tasks require the verifier-aware execution entrance."
@@ -4550,7 +4551,7 @@ class CayuApp:
         )
         if admission_failure is not None:
             del request
-            raise admission_failure from None
+            raise_task_store_operation_failure(admission_failure)
         if requires_completion_decision:
             del request
             raise TaskCompletionDecisionRequired(
@@ -4803,7 +4804,7 @@ class CayuApp:
         )
         if admission_failure is not None:
             del response
-            raise admission_failure from None
+            raise_task_store_operation_failure(admission_failure)
         if requires_completion_decision:
             del response
             raise TaskCompletionDecisionRequired(
@@ -4874,7 +4875,7 @@ class CayuApp:
         )
         if admission_failure is not None:
             del request
-            raise admission_failure from None
+            raise_task_store_operation_failure(admission_failure)
         if requires_completion_decision:
             del request
             raise TaskCompletionDecisionRequired(
@@ -4951,7 +4952,7 @@ class CayuApp:
         )
         if admission_failure is not None:
             del request
-            raise admission_failure from None
+            raise_task_store_operation_failure(admission_failure)
         if requires_completion_decision:
             del request
             raise TaskCompletionDecisionRequired(
@@ -4986,7 +4987,7 @@ class CayuApp:
         )
         if admission_failure is not None:
             del request
-            raise admission_failure from None
+            raise_task_store_operation_failure(admission_failure)
         if requires_completion_decision:
             del request
             raise TaskCompletionDecisionRequired(
@@ -5054,7 +5055,7 @@ class CayuApp:
         )
         if admission_failure is not None:
             del request
-            raise admission_failure from None
+            raise_task_store_operation_failure(admission_failure)
         if requires_completion_decision:
             del request
             raise TaskCompletionDecisionRequired(
@@ -5138,7 +5139,7 @@ class CayuApp:
         )
         if admission_failure is not None:
             del request
-            raise admission_failure from None
+            raise_task_store_operation_failure(admission_failure)
         if requires_completion_decision:
             del request
             raise TaskCompletionDecisionRequired(

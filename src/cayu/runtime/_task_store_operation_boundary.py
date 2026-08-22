@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from types import FunctionType, MethodType
-from typing import Generic, TypeVar
+from typing import Generic, NoReturn, TypeVar
 
 from cayu._exception_groups import exception_group_children, rebuild_exception_group
 from cayu._task_wait import CapturedAwaitableOutcome, capture_awaitable_outcome
@@ -16,6 +16,7 @@ from cayu.runtime._diagnostics import (
     credential_safe_runtime_exception,
     credential_safe_runtime_exception_group,
     exception_diagnostic,
+    runtime_owned_exception_renderings_are_credential_safe,
 )
 from cayu.runtime.tasks import TaskClaimLost, TaskStore
 from cayu.runtime.work_contracts import (
@@ -31,6 +32,7 @@ from cayu.vaults import SecretRedactor
 
 _ResultT = TypeVar("_ResultT")
 _BASE_EXCEPTION_ARGS_DESCRIPTOR = BaseException.__dict__["args"]
+_BASE_EXCEPTION_CAUSE_DESCRIPTOR = BaseException.__dict__["__cause__"]
 
 
 class _TaskStoreOperationCancellationMarker:
@@ -89,21 +91,12 @@ def task_store_mutation_is_cancellation_quiescent(
     if isinstance(instance_state, dict) and method_name in instance_state:
         return False
 
-    proof_owner = next(
-        (
-            candidate
-            for candidate in mro
-            if "verified_work_mutations_are_cancellation_quiescent"
-            in type.__getattribute__(candidate, "__dict__")
-        ),
-        None,
-    )
-    if proof_owner is None or (
-        type.__getattribute__(proof_owner, "__dict__").get(
-            "verified_work_mutations_are_cancellation_quiescent"
-        )
-        is not True
-    ):
+    # An inherited public method can still dispatch through helpers, wrappers,
+    # or readiness hooks replaced by the concrete subclass.  Inherited proof is
+    # therefore not positive evidence for that concrete implementation graph:
+    # every subclass must opt in explicitly after reviewing its dependencies.
+    concrete_declarations = type.__getattribute__(task_store_type, "__dict__")
+    if concrete_declarations.get("verified_work_mutations_are_cancellation_quiescent") is not True:
         return False
     implementation_owner = next(
         (
@@ -148,6 +141,86 @@ def _task_store_cancellation(
         redactor=redactor,
         fallback_message=f"{operation_name} cancellation diagnostic was redacted.",
     )
+
+
+def _task_store_forwarded_cancellation(
+    caller_cancellation: asyncio.CancelledError,
+    forwarded_cancellation: asyncio.CancelledError,
+    *,
+    operation_name: str,
+    redactor: SecretRedactor,
+) -> asyncio.CancelledError:
+    """Detach one authenticated cancellation and its settlement evidence."""
+
+    safe_cancellation = _task_store_cancellation(
+        caller_cancellation,
+        operation_name=operation_name,
+        redactor=redactor,
+    )
+    try:
+        settlement_evidence = _BASE_EXCEPTION_CAUSE_DESCRIPTOR.__get__(
+            forwarded_cancellation,
+            BaseException,
+        )
+    except BaseException:
+        settlement_evidence = RuntimeError(
+            f"{operation_name} cancellation settlement evidence was inaccessible."
+        )
+    if settlement_evidence is None:
+        return safe_cancellation
+    if isinstance(settlement_evidence, BaseExceptionGroup):
+        safe_evidence: BaseException = _detached_task_store_group(
+            settlement_evidence,
+            operation_name=operation_name,
+            redactor=redactor,
+        )
+    else:
+        safe_evidence = _detached_task_store_failure(
+            settlement_evidence,
+            operation_name=operation_name,
+            redactor=redactor,
+        )
+    safe_cancellation.__cause__ = safe_evidence
+    if runtime_owned_exception_renderings_are_credential_safe(
+        safe_cancellation,
+        redactor=redactor,
+    ):
+        return safe_cancellation
+
+    # The evidence and cancellation can each be safe while Python's fixed
+    # direct-cause separator composes their renderings into a registered
+    # secret. Preserve the evidence classification with a generic diagnostic,
+    # then validate the complete chain again before it crosses the boundary.
+    generic_evidence = _generic_task_store_settlement_evidence(
+        safe_evidence,
+        operation_name=operation_name,
+        redactor=redactor,
+    )
+    safe_cancellation.__cause__ = generic_evidence
+    if runtime_owned_exception_renderings_are_credential_safe(
+        safe_cancellation,
+        redactor=redactor,
+    ):
+        return safe_cancellation
+
+    fallback_evidence = credential_safe_runtime_exception(
+        RuntimeError,
+        f"{operation_name} cancellation settlement evidence was redacted.",
+        redactor=redactor,
+        fallback_message="Task-store cancellation settlement evidence was withheld.",
+    )
+    safe_cancellation.__cause__ = fallback_evidence
+    if runtime_owned_exception_renderings_are_credential_safe(
+        safe_cancellation,
+        redactor=redactor,
+    ):
+        return safe_cancellation
+
+    # A registry can deliberately contain every fixed cause-chain rendering.
+    # In that degenerate case, keep caller cancellation authoritative and omit
+    # the optional diagnostic evidence rather than publish a registered secret.
+    safe_cancellation.__cause__ = None
+    return safe_cancellation
 
 
 def _detached_task_store_failure(
@@ -355,6 +428,43 @@ def _generic_task_store_failure(
     )
 
 
+def _generic_task_store_settlement_evidence(
+    error: BaseException,
+    *,
+    operation_name: str,
+    redactor: SecretRedactor,
+) -> BaseException:
+    """Discard evidence text while retaining its bounded failure structure."""
+
+    if not isinstance(error, BaseExceptionGroup):
+        return _generic_task_store_failure(
+            error,
+            operation_name=operation_name,
+            redactor=redactor,
+        )
+    return credential_safe_runtime_exception_group(
+        error,
+        group_message=f"{operation_name} cancellation settlement evidence was redacted.",
+        leaf_mapper=lambda leaf: _generic_task_store_failure(
+            leaf,
+            operation_name=operation_name,
+            redactor=redactor,
+        ),
+        invalid_leaf_factory=lambda: RuntimeError(
+            f"{operation_name} reported invalid cancellation settlement evidence."
+        ),
+        truncated_leaf_factory=lambda: RuntimeError(
+            f"{operation_name} omitted additional cancellation settlement evidence."
+        ),
+        fallback_leaf_mapper=lambda leaf: _generic_task_store_failure(
+            leaf,
+            operation_name=operation_name,
+            redactor=redactor,
+        ),
+        redactor=redactor,
+    )
+
+
 def _deduplicate_detached_task_store_group(
     error: BaseExceptionGroup,
     *,
@@ -489,6 +599,18 @@ def _task_store_mutation_quiescence_failure(
             "verified-work mutations are cancellation-quiescent."
         )
     return None
+
+
+def raise_task_store_operation_failure(failure: BaseException) -> NoReturn:
+    """Raise one detached failure without erasing safe explicit evidence."""
+
+    try:
+        cause = _BASE_EXCEPTION_CAUSE_DESCRIPTOR.__get__(failure, BaseException)
+    except BaseException:
+        cause = None
+    if cause is None:
+        raise failure from None
+    raise failure from cause
 
 
 async def _capture_validated_task_store_operation(
@@ -639,8 +761,9 @@ async def capture_task_store_operation(
         ):
             if caller_cancellation is None:  # pragma: no cover - construction invariant
                 raise AssertionError("Caller cancellation was not retained.")
-            failure: BaseException = _task_store_cancellation(
+            failure: BaseException = _task_store_forwarded_cancellation(
                 caller_cancellation,
+                error,
                 operation_name=operation_name,
                 redactor=redactor,
             )
@@ -722,5 +845,6 @@ __all__ = [
     "TaskStoreOperationOutcome",
     "capture_sensitive_validation",
     "capture_task_store_operation",
+    "raise_task_store_operation_failure",
     "task_store_mutation_is_cancellation_quiescent",
 ]

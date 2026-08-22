@@ -241,7 +241,7 @@ def test_postgres_revision_forty_eight_preserves_cases_and_admits_zero_messages(
                 "cayu_eval_cases_message_count_check "
                 "CHECK (message_count >= 1 AND message_count <= 16)"
             )
-            await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 48")
+            await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 48")
 
         migrated = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
         try:

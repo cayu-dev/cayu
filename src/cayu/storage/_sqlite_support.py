@@ -44,6 +44,7 @@ from cayu.runtime.tasks import (
     TaskTopologyInconsistent,
     TaskTopologyNode,
 )
+from cayu.runtime.work_contracts import WorkContractRef
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migrations as schema
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
@@ -2202,6 +2203,116 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX idx_cayu_eval_cases_suite
             ON cayu_eval_cases(corpus_revision, suite_id, case_id ASC);
     """,
+    49: """
+        CREATE TABLE IF NOT EXISTS cayu_work_contracts (
+            contract_id TEXT NOT NULL,
+            version INTEGER NOT NULL CHECK (version >= 1),
+            fingerprint TEXT NOT NULL CHECK (
+                length(fingerprint) = 64
+                AND fingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+            contract_json TEXT NOT NULL CHECK (json_valid(contract_json)),
+            PRIMARY KEY (contract_id, version)
+        );
+
+        CREATE TABLE IF NOT EXISTS cayu_task_session_execution_authority (
+            session_id TEXT NOT NULL PRIMARY KEY,
+            authority_kind TEXT NOT NULL CHECK (
+                authority_kind IN ('ordinary', 'contracted')
+            ),
+            committed_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS cayu_work_attempts (
+            attempt_id TEXT NOT NULL PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES cayu_tasks(id) ON DELETE RESTRICT,
+            ordinal INTEGER NOT NULL CHECK (ordinal >= 1),
+            request_sha256 TEXT NOT NULL CHECK (
+                length(request_sha256) = 64
+                AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            started_at TEXT NOT NULL,
+            attempt_json TEXT NOT NULL CHECK (json_valid(attempt_json)),
+            UNIQUE (task_id, ordinal)
+        );
+
+        CREATE TABLE IF NOT EXISTS cayu_completion_proposals (
+            proposal_id TEXT NOT NULL PRIMARY KEY,
+            attempt_id TEXT NOT NULL UNIQUE
+                REFERENCES cayu_work_attempts(attempt_id) ON DELETE RESTRICT,
+            task_id TEXT NOT NULL REFERENCES cayu_tasks(id) ON DELETE RESTRICT,
+            request_sha256 TEXT NOT NULL CHECK (
+                length(request_sha256) = 64
+                AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            proposed_at TEXT NOT NULL,
+            proposal_json TEXT NOT NULL CHECK (json_valid(proposal_json))
+        );
+
+        CREATE TABLE IF NOT EXISTS cayu_completion_verification_claims (
+            claim_id TEXT NOT NULL PRIMARY KEY,
+            proposal_id TEXT NOT NULL
+                REFERENCES cayu_completion_proposals(proposal_id) ON DELETE RESTRICT,
+            attempt_number INTEGER NOT NULL CHECK (attempt_number >= 1),
+            request_sha256 TEXT NOT NULL CHECK (
+                length(request_sha256) = 64
+                AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            lease_expires_at TEXT NOT NULL,
+            is_current INTEGER NOT NULL CHECK (is_current IN (0, 1)),
+            claim_json TEXT NOT NULL CHECK (json_valid(claim_json)),
+            UNIQUE (proposal_id, attempt_number)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_completion_claim_current
+            ON cayu_completion_verification_claims(proposal_id)
+            WHERE is_current = 1;
+
+        CREATE TABLE IF NOT EXISTS cayu_completion_decisions (
+            decision_id TEXT NOT NULL PRIMARY KEY,
+            proposal_id TEXT NOT NULL UNIQUE
+                REFERENCES cayu_completion_proposals(proposal_id) ON DELETE RESTRICT,
+            task_id TEXT NOT NULL REFERENCES cayu_tasks(id) ON DELETE RESTRICT,
+            attempt_id TEXT NOT NULL
+                REFERENCES cayu_work_attempts(attempt_id) ON DELETE RESTRICT,
+            claim_id TEXT NOT NULL
+                REFERENCES cayu_completion_verification_claims(claim_id) ON DELETE RESTRICT,
+            verdict TEXT NOT NULL CHECK (
+                verdict IN ('accepted', 'rejected', 'blocked', 'needs_review')
+            ),
+            gap_fingerprint TEXT NOT NULL CHECK (
+                length(gap_fingerprint) = 64
+                AND gap_fingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+            request_sha256 TEXT NOT NULL CHECK (
+                length(request_sha256) = 64
+                AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            decided_at TEXT NOT NULL,
+            decision_json TEXT NOT NULL CHECK (json_valid(decision_json))
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_completion_decisions_task_gap
+            ON cayu_completion_decisions(task_id, verdict, gap_fingerprint);
+
+        CREATE TABLE IF NOT EXISTS cayu_completion_decision_application_receipts (
+            task_id TEXT NOT NULL REFERENCES cayu_tasks(id) ON DELETE RESTRICT,
+            idempotency_key TEXT NOT NULL,
+            decision_id TEXT NOT NULL UNIQUE
+                REFERENCES cayu_completion_decisions(decision_id) ON DELETE RESTRICT,
+            request_sha256 TEXT NOT NULL CHECK (
+                length(request_sha256) = 64
+                AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            applied_at TEXT NOT NULL,
+            receipt_json TEXT NOT NULL CHECK (json_valid(receipt_json)),
+            PRIMARY KEY (task_id, idempotency_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_tasks_contracted_session
+            ON cayu_tasks(session_id, created_at, id)
+            WHERE work_contract_json IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_cayu_work_attempts_task_latest
+            ON cayu_work_attempts(task_id, ordinal DESC);
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -2220,6 +2331,13 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
         ("cayu_tasks", "status_payload_json", "TEXT"),
     ),
     45: (("cayu_tasks", "retry_series_json", "TEXT"),),
+    49: (
+        (
+            "cayu_tasks",
+            "work_contract_json",
+            "TEXT CHECK (work_contract_json IS NULL OR json_valid(work_contract_json))",
+        ),
+    ),
     46: (("cayu_transcript_messages", "transcript_search_document", "TEXT NOT NULL"),),
     14: (
         (
@@ -3329,6 +3447,8 @@ def reconcile_schema(
         _validate_eval_result_baseline_schema(connection)
     if app_min_supported >= 48:
         _validate_captured_eval_case_schema(connection)
+    if app_min_supported >= 49:
+        _validate_verified_work_schema(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -4463,6 +4583,209 @@ def _validate_captured_eval_case_schema(connection: sqlite3.Connection) -> None:
         )
 
 
+def _validate_verified_work_schema(connection: sqlite3.Connection) -> None:
+    task_columns = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]))
+        for row in connection.execute("PRAGMA table_info(cayu_tasks)")
+    }
+    if task_columns.get("work_contract_json") != ("TEXT", 0):
+        raise RuntimeError(
+            "SQLite task work-contract storage conflicts with Cayu's revision-49 contract."
+        )
+    required_columns = {
+        "cayu_work_contracts": (
+            ("contract_id", "TEXT", 1, 1),
+            ("version", "INTEGER", 1, 2),
+            ("fingerprint", "TEXT", 1, 0),
+            ("contract_json", "TEXT", 1, 0),
+        ),
+        "cayu_task_session_execution_authority": (
+            ("session_id", "TEXT", 1, 1),
+            ("authority_kind", "TEXT", 1, 0),
+            ("committed_at", "TEXT", 1, 0),
+        ),
+        "cayu_work_attempts": (
+            ("attempt_id", "TEXT", 1, 1),
+            ("task_id", "TEXT", 1, 0),
+            ("ordinal", "INTEGER", 1, 0),
+            ("request_sha256", "TEXT", 1, 0),
+            ("started_at", "TEXT", 1, 0),
+            ("attempt_json", "TEXT", 1, 0),
+        ),
+        "cayu_completion_proposals": (
+            ("proposal_id", "TEXT", 1, 1),
+            ("attempt_id", "TEXT", 1, 0),
+            ("task_id", "TEXT", 1, 0),
+            ("request_sha256", "TEXT", 1, 0),
+            ("proposed_at", "TEXT", 1, 0),
+            ("proposal_json", "TEXT", 1, 0),
+        ),
+        "cayu_completion_verification_claims": (
+            ("claim_id", "TEXT", 1, 1),
+            ("proposal_id", "TEXT", 1, 0),
+            ("attempt_number", "INTEGER", 1, 0),
+            ("request_sha256", "TEXT", 1, 0),
+            ("lease_expires_at", "TEXT", 1, 0),
+            ("is_current", "INTEGER", 1, 0),
+            ("claim_json", "TEXT", 1, 0),
+        ),
+        "cayu_completion_decisions": (
+            ("decision_id", "TEXT", 1, 1),
+            ("proposal_id", "TEXT", 1, 0),
+            ("task_id", "TEXT", 1, 0),
+            ("attempt_id", "TEXT", 1, 0),
+            ("claim_id", "TEXT", 1, 0),
+            ("verdict", "TEXT", 1, 0),
+            ("gap_fingerprint", "TEXT", 1, 0),
+            ("request_sha256", "TEXT", 1, 0),
+            ("decided_at", "TEXT", 1, 0),
+            ("decision_json", "TEXT", 1, 0),
+        ),
+        "cayu_completion_decision_application_receipts": (
+            ("task_id", "TEXT", 1, 1),
+            ("idempotency_key", "TEXT", 1, 2),
+            ("decision_id", "TEXT", 1, 0),
+            ("request_sha256", "TEXT", 1, 0),
+            ("applied_at", "TEXT", 1, 0),
+            ("receipt_json", "TEXT", 1, 0),
+        ),
+    }
+    for table, expected in required_columns.items():
+        actual = tuple(
+            (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        )
+        if actual != expected:
+            raise RuntimeError(
+                f"SQLite schema object {table!r} conflicts with Cayu's "
+                "revision-49 verified-work contract."
+            )
+
+    def normalized_sql(name: str, object_type: str) -> str:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = ? AND name = ?",
+            (object_type, name),
+        ).fetchone()
+        return "" if row is None or row[0] is None else " ".join(str(row[0]).lower().split())
+
+    if (
+        "work_contract_json text check (work_contract_json is null or "
+        "json_valid(work_contract_json))" not in normalized_sql("cayu_tasks", "table")
+    ):
+        raise RuntimeError(
+            "SQLite task work-contract storage conflicts with Cayu's revision-49 contract."
+        )
+
+    required_table_fragments = {
+        "cayu_work_contracts": (
+            "primary key (contract_id, version)",
+            "check (version >= 1)",
+            "length(fingerprint) = 64",
+            "fingerprint not glob '*[^0-9a-f]*'",
+            "check (json_valid(contract_json))",
+        ),
+        "cayu_task_session_execution_authority": (
+            "session_id text not null primary key",
+            "authority_kind in ('ordinary', 'contracted')",
+        ),
+        "cayu_work_attempts": (
+            "references cayu_tasks(id) on delete restrict",
+            "unique (task_id, ordinal)",
+            "check (ordinal >= 1)",
+            "length(request_sha256) = 64",
+            "request_sha256 not glob '*[^0-9a-f]*'",
+            "check (json_valid(attempt_json))",
+        ),
+        "cayu_completion_proposals": (
+            "attempt_id text not null unique references cayu_work_attempts(attempt_id) on delete restrict",
+            "task_id text not null references cayu_tasks(id) on delete restrict",
+            "length(request_sha256) = 64",
+            "request_sha256 not glob '*[^0-9a-f]*'",
+            "check (json_valid(proposal_json))",
+        ),
+        "cayu_completion_verification_claims": (
+            "references cayu_completion_proposals(proposal_id) on delete restrict",
+            "unique (proposal_id, attempt_number)",
+            "check (attempt_number >= 1)",
+            "length(request_sha256) = 64",
+            "request_sha256 not glob '*[^0-9a-f]*'",
+            "check (is_current in (0, 1))",
+            "check (json_valid(claim_json))",
+        ),
+        "cayu_completion_decisions": (
+            "proposal_id text not null unique references cayu_completion_proposals(proposal_id) on delete restrict",
+            "task_id text not null references cayu_tasks(id) on delete restrict",
+            "references cayu_work_attempts(attempt_id) on delete restrict",
+            "references cayu_completion_verification_claims(claim_id) on delete restrict",
+            "verdict in ('accepted', 'rejected', 'blocked', 'needs_review')",
+            "length(gap_fingerprint) = 64",
+            "gap_fingerprint not glob '*[^0-9a-f]*'",
+            "length(request_sha256) = 64",
+            "request_sha256 not glob '*[^0-9a-f]*'",
+            "check (json_valid(decision_json))",
+        ),
+        "cayu_completion_decision_application_receipts": (
+            "primary key (task_id, idempotency_key)",
+            "task_id text not null references cayu_tasks(id) on delete restrict",
+            "decision_id text not null unique references cayu_completion_decisions(decision_id) on delete restrict",
+            "length(request_sha256) = 64",
+            "request_sha256 not glob '*[^0-9a-f]*'",
+            "check (json_valid(receipt_json))",
+        ),
+    }
+    for table, fragments in required_table_fragments.items():
+        definition = normalized_sql(table, "table")
+        if any(fragment not in definition for fragment in fragments):
+            raise RuntimeError(
+                f"SQLite schema object {table!r} conflicts with Cayu's "
+                "revision-49 verified-work contract."
+            )
+    required_indexes = {
+        "idx_cayu_completion_claim_current": (
+            "cayu_completion_verification_claims",
+            ("proposal_id",),
+            True,
+            "where is_current = 1",
+        ),
+        "idx_cayu_completion_decisions_task_gap": (
+            "cayu_completion_decisions",
+            ("task_id", "verdict", "gap_fingerprint"),
+            False,
+            None,
+        ),
+        "idx_cayu_tasks_contracted_session": (
+            "cayu_tasks",
+            ("session_id", "created_at", "id"),
+            False,
+            "where work_contract_json is not null",
+        ),
+        "idx_cayu_work_attempts_task_latest": (
+            "cayu_work_attempts",
+            ("task_id", "ordinal"),
+            False,
+            None,
+        ),
+    }
+    for index, (table, columns, unique, predicate) in required_indexes.items():
+        index_rows = {str(row[1]): row for row in connection.execute(f"PRAGMA index_list({table})")}
+        row = index_rows.get(index)
+        actual_columns = tuple(
+            str(column[2]) for column in connection.execute(f"PRAGMA index_info({index})")
+        )
+        definition = normalized_sql(index, "index")
+        if (
+            row is None
+            or bool(row[2]) is not unique
+            or actual_columns != columns
+            or (predicate is None and int(row[4]) != 0)
+            or (predicate is not None and (int(row[4]) != 1 or predicate not in definition))
+        ):
+            raise RuntimeError(
+                f"SQLite schema object {index!r} conflicts with Cayu's "
+                "revision-49 verified-work contract."
+            )
+
+
 def initialize_schema(connection: sqlite3.Connection) -> None:
     reconcile_schema(connection, schema.SchemaMode.CREATE)
 
@@ -4744,6 +5067,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_eval_result_baseline_schema(connection)
         if rev.revision == 48:
             _validate_captured_eval_case_schema(connection)
+        if rev.revision == 49:
+            _validate_verified_work_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 
@@ -4917,6 +5242,11 @@ def task_to_row_values(task: Task) -> tuple[object, ...]:
             if task.retry_series is None
             else json_dumps(task.retry_series.model_dump(mode="json"))
         ),
+        (
+            None
+            if task.work_contract is None
+            else json_dumps(task.work_contract.model_dump(mode="json", warnings=False))
+        ),
     )
 
 
@@ -4951,6 +5281,11 @@ def task_from_row(row: sqlite3.Row) -> Task:
             None
             if row["retry_series_json"] is None
             else TaskRetrySeriesSnapshot.model_validate(json.loads(row["retry_series_json"]))
+        ),
+        work_contract=(
+            None
+            if row["work_contract_json"] is None
+            else WorkContractRef.model_validate(json.loads(row["work_contract_json"]))
         ),
     )
 

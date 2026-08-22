@@ -1812,9 +1812,9 @@ class TaskStore(ABC):
     # ``supports_verified_work_contracts`` alone is not settlement authority.
     # A class may set this flag to exactly ``True`` only when each verified-work
     # mutation implementation it owns has stopped mutating before its awaitable
-    # returns or raises, including after caller cancellation. A subclass may
-    # inherit proof for an unchanged method, but an override becomes a new
-    # implementation owner and must declare its own proof.
+    # returns or raises, including after caller cancellation. Every concrete
+    # subclass must redeclare the proof even when the public mutation is
+    # inherited, because subclass helpers and wrappers can change its behavior.
 
     async def publish_work_contract(self, contract: WorkContract) -> WorkContract:
         """Publish one immutable version or replay its exact canonical content."""

@@ -333,6 +333,8 @@ class _BlockingFailOnceDurableChildCreationStore(InMemorySessionStore):
 
 
 class _BlockingFailOnceDurableTaskReadStore(InMemoryTaskStore):
+    verified_work_mutations_are_cancellation_quiescent = True
+
     def __init__(self) -> None:
         super().__init__()
         self.read_started = asyncio.Event()
@@ -349,6 +351,8 @@ class _BlockingFailOnceDurableTaskReadStore(InMemoryTaskStore):
 
 
 class _BlockingDurableTaskReadStore(InMemoryTaskStore):
+    verified_work_mutations_are_cancellation_quiescent = True
+
     def __init__(self) -> None:
         super().__init__()
         self.block_next_durable_read = False
@@ -476,6 +480,8 @@ class _CommitThenRaiseDurableChildStore(InMemorySessionStore):
 
 
 class _CrashBeforeDurableTaskStore(InMemoryTaskStore):
+    verified_work_mutations_are_cancellation_quiescent = True
+
     def __init__(self) -> None:
         super().__init__()
         self.crash_before_task = True
@@ -493,6 +499,8 @@ class _CrashBeforeDurableTaskStore(InMemoryTaskStore):
 
 
 class _CommitThenRaiseDurableTaskStore(InMemoryTaskStore):
+    verified_work_mutations_are_cancellation_quiescent = True
+
     def __init__(self) -> None:
         super().__init__()
         self.raise_after_task = True
@@ -511,6 +519,8 @@ class _CommitThenRaiseDurableTaskStore(InMemoryTaskStore):
 
 
 class _FailOnceAfterDurableChildTaskStore(InMemoryTaskStore):
+    verified_work_mutations_are_cancellation_quiescent = True
+
     def __init__(self) -> None:
         super().__init__()
         self._durable_task_reads = 0
@@ -524,6 +534,8 @@ class _FailOnceAfterDurableChildTaskStore(InMemoryTaskStore):
 
 
 class _ConflictingDurableTaskReadStore(InMemoryTaskStore):
+    verified_work_mutations_are_cancellation_quiescent = True
+
     corrupt_reads = False
 
     async def load_task(self, task_id):
@@ -538,6 +550,8 @@ class _ConflictingDurableTaskReadStore(InMemoryTaskStore):
 
 
 class _CorruptPreparedDispatchRequestStore(InMemoryTaskStore):
+    verified_work_mutations_are_cancellation_quiescent = True
+
     async def claim_task(self, *args, **kwargs):
         task = await super().claim_task(*args, **kwargs)
         if task is None:
@@ -581,6 +595,10 @@ class _CrashBeforeDurableChildPostgresStore(PostgresSessionStore):
 
 
 class _CrashBeforeDurableTaskSQLiteStore(SQLiteTaskStore):
+    # The override either fails before dispatch or delegates to SQLite's
+    # synchronous mutation boundary.
+    verified_work_mutations_are_cancellation_quiescent = True
+
     def __init__(self, path) -> None:
         super().__init__(path)
         self.crash_before_task = True
@@ -617,6 +635,10 @@ class _BlockingAfterPreparedSubmissionDispatcher(TaskStoreDispatcher):
 
 
 class _CrashAfterClaimSQLiteTaskStore(SQLiteTaskStore):
+    # The injected failure runs only after SQLite's synchronous claim mutation
+    # has settled, so this override preserves the inherited quiescence proof.
+    verified_work_mutations_are_cancellation_quiescent = True
+
     def __init__(self, path) -> None:
         super().__init__(path)
         self.crash_after_claim = True

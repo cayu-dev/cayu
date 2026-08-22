@@ -129,6 +129,7 @@ def test_injected_availability_clock_does_not_expire_new_task_leases(tmp_path) -
 
 def test_app_rejects_delayed_tasks_before_calling_an_unsupported_custom_store() -> None:
     class UnsupportedDelayedAvailabilityStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
         supports_delayed_availability = False
 
         def __init__(self) -> None:

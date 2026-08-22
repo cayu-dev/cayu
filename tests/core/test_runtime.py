@@ -23441,6 +23441,8 @@ def test_cayu_app_links_claimed_task_to_successful_run():
 
 def test_cayu_app_reconciles_claimed_task_completion_acknowledgement_loss():
     class CommitThenRaiseTaskStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.terminalize_calls = 0
@@ -23539,6 +23541,8 @@ def test_cayu_app_fails_task_when_run_fails():
 
 def test_cayu_app_reconciles_claimed_task_failure_acknowledgement_loss():
     class CommitThenRaiseTaskStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.terminalize_calls = 0

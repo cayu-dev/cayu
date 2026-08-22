@@ -279,6 +279,12 @@ REVISIONS: tuple[Revision, ...] = (
     # retain the existing one-to-sixteen bound. Older EvalStore writers cannot
     # publish this representation, so mixed-version writers are unsafe.
     Revision(revision=48, kind=RevisionKind.BREAKING, compatible_from=48),
+    # Revision 49 persists the complete verified-work authority lifecycle in
+    # task stores. Pre-49 task workers ignore contract bindings and could
+    # complete contracted work through an ordinary terminalization entrance,
+    # so mixed-version task workers are unsafe even though existing ordinary
+    # tasks remain valid.
+    Revision(revision=49, kind=RevisionKind.BREAKING, compatible_from=49),
 )
 
 #: The revision an empty database is initialized to.

@@ -45,6 +45,8 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
             return False
 
     class FalsyTaskStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __bool__(self) -> bool:
             return False
 

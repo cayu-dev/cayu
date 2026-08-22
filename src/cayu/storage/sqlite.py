@@ -303,15 +303,16 @@ from cayu.runtime.sessions import (
 from cayu.runtime.tasks import (
     _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
     TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
+    CompletionDecisionApplicationReceipt,
     Task,
     TaskAggregateFilter,
+    TaskClaimLost,
     TaskCreate,
     TaskInvocationSnapshot,
     TaskOperationalSnapshot,
     TaskOrder,
     TaskQuery,
     TaskRetrySeriesDisposition,
-    TaskRetrySeriesSnapshot,
     TaskRetrySettlementRequest,
     TaskRetrySettlementResult,
     TaskStatus,
@@ -341,7 +342,6 @@ from cayu.runtime.tasks import (
     _ensure_claim_query_supported,
     _ensure_owned_active_task_lease,
     _ensure_retry_series_queue_attempt,
-    _ensure_task_status_can_transition,
     _expired_task_retry_settlement,
     _raise_task_claim_attach_error,
     _replay_task_retry_settlement,
@@ -356,6 +356,7 @@ from cayu.runtime.tasks import (
     _validate_task_topology_ancestry,
     _validated_task_retry_terminal_accounting,
     build_task_topology_result,
+    copy_task,
     copy_task_aggregate_filter,
     copy_task_create,
     copy_task_query,
@@ -366,15 +367,49 @@ from cayu.runtime.tasks import (
     task_query_from_aggregate_filter,
 )
 from cayu.runtime.tool_exposure import ToolCapabilityCeiling
+from cayu.runtime.work_contracts import (
+    CompletionDecision,
+    CompletionDecisionApplicationRequest,
+    CompletionDecisionCreate,
+    CompletionProposal,
+    CompletionProposalCreate,
+    CompletionVerdict,
+    CompletionVerificationClaim,
+    CompletionVerificationClaimLost,
+    CompletionVerificationClaimRequest,
+    TaskCompletionDecisionRequired,
+    WorkAttempt,
+    WorkAttemptCreate,
+    WorkCompletionConflict,
+    WorkContract,
+    WorkContractConflict,
+    WorkContractRef,
+    completion_decision_application_request_sha256,
+    completion_decision_request_sha256,
+    completion_gap_fingerprint,
+    completion_proposal_request_sha256,
+    completion_verification_claim_request_sha256,
+    copy_completion_decision_application_request,
+    copy_completion_decision_create,
+    copy_completion_proposal_create,
+    copy_completion_verification_claim_request,
+    copy_work_attempt_create,
+    copy_work_contract,
+    copy_work_contract_ref,
+    validate_completion_decision_contract,
+    validate_work_completion_idempotency_key,
+    work_attempt_request_sha256,
+)
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_aggregates as sqlite_aggregates
 from cayu.storage import _sqlite_support as sqlite_support
+from cayu.storage import _verified_work_support as verified_work_support
 from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
 _SQLITE_SESSION_MIN_REQUIRED_REVISION = 46
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 45
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 49
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -9597,6 +9632,8 @@ class SQLiteTaskStore(TaskStore):
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
+    supports_verified_work_contracts: ClassVar[bool] = True
+    verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -9626,19 +9663,922 @@ class SQLiteTaskStore(TaskStore):
         self._connection = self._connect(db_path)
         self._initialize_schema()
 
+    def _verified_transaction_unlocked(self):
+        return sqlite_support._transaction(self._connection)
+
+    def _load_work_contract_unlocked(
+        self,
+        reference: WorkContractRef,
+    ) -> WorkContract | None:
+        row = self._connection.execute(
+            "SELECT contract_id, version, fingerprint, contract_json "
+            "FROM cayu_work_contracts WHERE contract_id = ? AND version = ?",
+            (reference.contract_id, reference.version),
+        ).fetchone()
+        if row is None:
+            return None
+        contract = WorkContract.model_validate(json.loads(row["contract_json"]))
+        if (
+            contract.contract_id != row["contract_id"]
+            or contract.version != row["version"]
+            or contract.fingerprint != row["fingerprint"]
+        ):
+            raise WorkContractConflict(
+                "Stored work-contract indexes conflict with canonical content."
+            )
+        return verified_work_support.require_contract_reference(contract, reference)
+
+    def _load_work_attempt_unlocked(self, attempt_id: str) -> WorkAttempt | None:
+        row = self._connection.execute(
+            "SELECT attempt_id, task_id, ordinal, request_sha256, started_at, attempt_json "
+            "FROM cayu_work_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        attempt = WorkAttempt.model_validate(json.loads(row["attempt_json"]))
+        if (
+            attempt.attempt_id != row["attempt_id"]
+            or attempt.task_id != row["task_id"]
+            or attempt.ordinal != row["ordinal"]
+            or attempt.request_sha256 != row["request_sha256"]
+            or attempt.started_at != sqlite_support.parse_datetime(row["started_at"])
+        ):
+            raise WorkCompletionConflict(
+                "Stored work-attempt indexes conflict with canonical content."
+            )
+        return attempt
+
+    def _latest_work_attempt_id_unlocked(self, task_id: str) -> str | None:
+        row = self._connection.execute(
+            "SELECT attempt_id FROM cayu_work_attempts "
+            "WHERE task_id = ? ORDER BY ordinal DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return None if row is None else row["attempt_id"]
+
+    def _load_completion_proposal_unlocked(
+        self,
+        proposal_id: str,
+    ) -> CompletionProposal | None:
+        row = self._connection.execute(
+            "SELECT proposal_id, attempt_id, task_id, request_sha256, proposed_at, "
+            "proposal_json FROM cayu_completion_proposals WHERE proposal_id = ?",
+            (proposal_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        proposal = CompletionProposal.model_validate(json.loads(row["proposal_json"]))
+        if (
+            proposal.proposal_id != row["proposal_id"]
+            or proposal.attempt_id != row["attempt_id"]
+            or proposal.task_id != row["task_id"]
+            or proposal.request_sha256 != row["request_sha256"]
+            or proposal.proposed_at != sqlite_support.parse_datetime(row["proposed_at"])
+        ):
+            raise WorkCompletionConflict(
+                "Stored completion-proposal indexes conflict with canonical content."
+            )
+        return proposal
+
+    def _load_completion_claim_unlocked(
+        self,
+        proposal_id: str,
+    ) -> CompletionVerificationClaim | None:
+        row = self._connection.execute(
+            "SELECT claim_id, proposal_id, attempt_number, request_sha256, "
+            "lease_expires_at, claim_json FROM cayu_completion_verification_claims "
+            "WHERE proposal_id = ? AND is_current = 1",
+            (proposal_id,),
+        ).fetchone()
+        return None if row is None else self._completion_claim_from_row(row)
+
+    def _load_completion_claim_by_id_unlocked(
+        self,
+        claim_id: str,
+    ) -> CompletionVerificationClaim | None:
+        row = self._connection.execute(
+            "SELECT claim_id, proposal_id, attempt_number, request_sha256, "
+            "lease_expires_at, claim_json FROM cayu_completion_verification_claims "
+            "WHERE claim_id = ?",
+            (claim_id,),
+        ).fetchone()
+        return None if row is None else self._completion_claim_from_row(row)
+
+    @staticmethod
+    def _completion_claim_from_row(row: sqlite3.Row) -> CompletionVerificationClaim:
+        claim = CompletionVerificationClaim.model_validate(json.loads(row["claim_json"]))
+        if (
+            claim.claim_id != row["claim_id"]
+            or claim.proposal_id != row["proposal_id"]
+            or claim.attempt_number != row["attempt_number"]
+            or claim.request_sha256 != row["request_sha256"]
+            or claim.lease_expires_at != sqlite_support.parse_datetime(row["lease_expires_at"])
+        ):
+            raise WorkCompletionConflict(
+                "Stored verification-claim indexes conflict with canonical content."
+            )
+        return claim
+
+    def _load_completion_decision_unlocked(
+        self,
+        decision_id: str,
+    ) -> CompletionDecision | None:
+        row = self._connection.execute(
+            "SELECT decision_id, proposal_id, task_id, attempt_id, claim_id, verdict, "
+            "gap_fingerprint, request_sha256, decided_at, decision_json "
+            "FROM cayu_completion_decisions WHERE decision_id = ?",
+            (decision_id,),
+        ).fetchone()
+        return None if row is None else self._completion_decision_from_row(row)
+
+    def _load_completion_decision_for_proposal_unlocked(
+        self,
+        proposal_id: str,
+    ) -> CompletionDecision | None:
+        row = self._connection.execute(
+            "SELECT decision_id, proposal_id, task_id, attempt_id, claim_id, verdict, "
+            "gap_fingerprint, request_sha256, decided_at, decision_json "
+            "FROM cayu_completion_decisions WHERE proposal_id = ?",
+            (proposal_id,),
+        ).fetchone()
+        return None if row is None else self._completion_decision_from_row(row)
+
+    @staticmethod
+    def _completion_decision_from_row(row: sqlite3.Row) -> CompletionDecision:
+        decision = CompletionDecision.model_validate(json.loads(row["decision_json"]))
+        if (
+            decision.decision_id != row["decision_id"]
+            or decision.proposal_id != row["proposal_id"]
+            or decision.task_id != row["task_id"]
+            or decision.attempt_id != row["attempt_id"]
+            or decision.claim_id != row["claim_id"]
+            or decision.verdict.value != row["verdict"]
+            or decision.gap_fingerprint != row["gap_fingerprint"]
+            or decision.request_sha256 != row["request_sha256"]
+            or decision.decided_at != sqlite_support.parse_datetime(row["decided_at"])
+        ):
+            raise WorkCompletionConflict(
+                "Stored completion-decision indexes conflict with canonical content."
+            )
+        return decision
+
+    def _load_decision_application_receipt_unlocked(
+        self,
+        task_id: str,
+        idempotency_key: str,
+    ) -> CompletionDecisionApplicationReceipt | None:
+        row = self._connection.execute(
+            "SELECT task_id, idempotency_key, decision_id, request_sha256, applied_at, "
+            "receipt_json FROM cayu_completion_decision_application_receipts "
+            "WHERE task_id = ? AND idempotency_key = ?",
+            (task_id, idempotency_key),
+        ).fetchone()
+        if row is None:
+            return None
+        receipt = CompletionDecisionApplicationReceipt.model_validate(
+            json.loads(row["receipt_json"])
+        )
+        if (
+            receipt.task_id != row["task_id"]
+            or receipt.idempotency_key != row["idempotency_key"]
+            or receipt.decision_id != row["decision_id"]
+            or receipt.request_sha256 != row["request_sha256"]
+            or receipt.applied_at != sqlite_support.parse_datetime(row["applied_at"])
+        ):
+            raise WorkCompletionConflict(
+                "Stored decision-application receipt indexes conflict with canonical content."
+            )
+        return receipt
+
+    def _ensure_session_execution_authority_unlocked(
+        self,
+        session_id: str,
+        authority_kind: Literal["ordinary", "contracted"],
+    ) -> None:
+        now = datetime.now(UTC)
+        self._connection.execute(
+            "INSERT OR IGNORE INTO cayu_task_session_execution_authority "
+            "(session_id, authority_kind, committed_at) VALUES (?, ?, ?)",
+            (session_id, authority_kind, sqlite_support.format_datetime(now)),
+        )
+        row = self._connection.execute(
+            "SELECT authority_kind FROM cayu_task_session_execution_authority WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            raise TaskTopologyInconsistent("Session execution authority was not persisted.")
+        if row["authority_kind"] != authority_kind:
+            if authority_kind == "ordinary":
+                raise TaskCompletionDecisionRequired(
+                    "Contracted tasks require the verifier-aware execution entrance."
+                )
+            raise WorkCompletionConflict(
+                "Work-contract attachment conflicts with prior ordinary session execution."
+            )
+
+    def _require_task_contract_unlocked(
+        self,
+        task: Task,
+        reference: WorkContractRef,
+    ) -> WorkContract:
+        return verified_work_support.require_task_contract(
+            task,
+            reference,
+            self._load_work_contract_unlocked(reference),
+        )
+
+    def _update_task_snapshot_unlocked(self, task: Task) -> None:
+        if task.work_contract is not None:
+            task = copy_task(task)
+        cursor = self._connection.execute(
+            """
+            UPDATE cayu_tasks
+            SET status = ?, session_id = ?, worker_id = ?, lease_expires_at = ?,
+                status_reason = ?, status_payload_json = ?, result_json = ?, error_json = ?,
+                updated_at = ?, started_at = ?, completed_at = ?, retry_series_json = ?,
+                work_contract_json = ?
+            WHERE id = ?
+            """,
+            (
+                str(task.status),
+                task.session_id,
+                task.worker_id,
+                sqlite_support.format_optional_datetime(task.lease_expires_at),
+                task.status_reason,
+                None
+                if task.status_payload is None
+                else sqlite_support.json_dumps(task.status_payload),
+                None if task.result is None else sqlite_support.json_dumps(task.result),
+                None if task.error is None else sqlite_support.json_dumps(task.error),
+                sqlite_support.format_datetime(task.updated_at),
+                sqlite_support.format_optional_datetime(task.started_at),
+                sqlite_support.format_optional_datetime(task.completed_at),
+                None
+                if task.retry_series is None
+                else sqlite_support.json_dumps(task.retry_series.model_dump(mode="json")),
+                None
+                if task.work_contract is None
+                else sqlite_support.json_dumps(
+                    task.work_contract.model_dump(mode="json", warnings=False)
+                ),
+                task.id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise KeyError(f"Task not found: {task.id}")
+
+    async def publish_work_contract(self, contract: WorkContract) -> WorkContract:
+        contract = copy_work_contract(contract)
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                existing = self._load_work_contract_unlocked(contract.reference())
+                if existing is not None:
+                    if existing != contract:
+                        raise WorkContractConflict(
+                            "Work-contract identity is already bound to different content."
+                        )
+                    return copy_work_contract(existing)
+                if contract.supersedes is not None:
+                    predecessor = self._load_work_contract_unlocked(contract.supersedes)
+                    verified_work_support.require_contract_reference(
+                        predecessor,
+                        contract.supersedes,
+                    )
+                self._connection.execute(
+                    "INSERT INTO cayu_work_contracts "
+                    "(contract_id, version, fingerprint, contract_json) VALUES (?, ?, ?, ?)",
+                    (
+                        contract.contract_id,
+                        contract.version,
+                        contract.fingerprint,
+                        sqlite_support.json_dumps(contract.model_dump(mode="json", warnings=False)),
+                    ),
+                )
+                return copy_work_contract(contract)
+
+    async def load_work_contract(self, reference: WorkContractRef) -> WorkContract | None:
+        copied = copy_work_contract_ref(reference)
+        if copied is None:
+            raise TypeError("reference must be a WorkContractRef.")
+        async with self._lock:
+            contract = self._load_work_contract_unlocked(copied)
+            return None if contract is None else copy_work_contract(contract)
+
+    async def load_active_work_contract_task_for_session(
+        self,
+        session_id: str,
+    ) -> Task | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            authority = self._connection.execute(
+                "SELECT authority_kind FROM cayu_task_session_execution_authority "
+                "WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if authority is None or authority["authority_kind"] == "ordinary":
+                return None
+            row = self._connection.execute(
+                "SELECT * FROM cayu_tasks WHERE session_id = ? "
+                "AND work_contract_json IS NOT NULL ORDER BY created_at, id LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise TaskTopologyInconsistent(
+                    "Contracted session authority has no matching durable task."
+                )
+            return sqlite_support.task_from_row(row)
+
+    async def admit_ordinary_session_execution(self, session_id: str) -> None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                self._ensure_session_execution_authority_unlocked(session_id, "ordinary")
+
+    async def hold_claimed_work_contract_task(
+        self,
+        task_id: str,
+        *,
+        worker_id: str,
+        contract: WorkContractRef,
+    ) -> Task:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        worker_id = require_clean_nonblank(worker_id, "worker_id")
+        copied_contract = copy_work_contract_ref(contract)
+        if copied_contract is None:
+            raise TypeError("contract must be a WorkContractRef.")
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                task = self._require_task_unlocked(task_id)
+                now = datetime.now(UTC)
+                _ensure_owned_active_task_lease(task, worker_id, now=now)
+                if task.status is not TaskStatus.CLAIMED or task.session_id is not None:
+                    raise TaskClaimLost(
+                        "Only the current worker may park its unattached claimed task."
+                    )
+                self._require_task_contract_unlocked(task, copied_contract)
+                updated = task.model_copy(
+                    update={
+                        "status": TaskStatus.NEEDS_ATTENTION,
+                        "status_reason": "verified_work_contract_runner_required",
+                        "status_payload": {
+                            "contract_id": copied_contract.contract_id,
+                            "contract_version": copied_contract.version,
+                        },
+                        "worker_id": None,
+                        "lease_expires_at": None,
+                        "updated_at": now,
+                    }
+                )
+                self._update_task_snapshot_unlocked(updated)
+                return updated.model_copy(deep=True)
+
+    async def begin_work_attempt(self, request: WorkAttemptCreate) -> WorkAttempt:
+        request = copy_work_attempt_create(request)
+        request_sha256 = work_attempt_request_sha256(request)
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                existing = self._load_work_attempt_unlocked(request.attempt_id)
+                if existing is not None:
+                    if existing.request_sha256 != request_sha256:
+                        raise WorkCompletionConflict(
+                            "Work-attempt identity is already bound to another request."
+                        )
+                    return existing.model_copy(deep=True)
+                task = self._require_task_unlocked(request.task_id)
+                contract = self._require_task_contract_unlocked(task, request.contract)
+                if task.status is not TaskStatus.RUNNING:
+                    raise ValueError("Work attempts require a running contracted task.")
+                if task.session_id != request.session_id:
+                    raise WorkCompletionConflict(
+                        "Work attempt is bound to a different task session."
+                    )
+                verified_work_support.require_attempt_worker(
+                    task,
+                    request.worker_id,
+                    now=datetime.now(UTC),
+                )
+                prior_id = self._latest_work_attempt_id_unlocked(task.id)
+                prior = None if prior_id is None else self._load_work_attempt_unlocked(prior_id)
+                ordinal = 1 if prior is None else prior.ordinal + 1
+                if ordinal > contract.continuation_policy.max_attempts:
+                    raise WorkCompletionConflict(
+                        "Work-contract attempt limit forbids another work attempt."
+                    )
+                if prior is not None:
+                    row = self._connection.execute(
+                        "SELECT decision.decision_id, receipt.decision_id AS applied_decision_id "
+                        "FROM cayu_completion_proposals AS proposal "
+                        "LEFT JOIN cayu_completion_decisions AS decision "
+                        "ON decision.proposal_id = proposal.proposal_id "
+                        "LEFT JOIN cayu_completion_decision_application_receipts AS receipt "
+                        "ON receipt.decision_id = decision.decision_id "
+                        "WHERE proposal.attempt_id = ?",
+                        (prior.attempt_id,),
+                    ).fetchone()
+                    if row is None or row["decision_id"] is None:
+                        raise WorkCompletionConflict(
+                            "A prior work attempt has not reached a durable decision."
+                        )
+                    if row["applied_decision_id"] is None:
+                        raise WorkCompletionConflict(
+                            "A prior verifier decision has not reached durable task application."
+                        )
+                attempt = WorkAttempt(
+                    attempt_id=request.attempt_id,
+                    task_id=request.task_id,
+                    session_id=request.session_id,
+                    contract=request.contract,
+                    execution_profile_fingerprint=request.execution_profile_fingerprint,
+                    worker_id=request.worker_id,
+                    ordinal=ordinal,
+                    request_sha256=request_sha256,
+                    started_at=self._clock(),
+                )
+                self._connection.execute(
+                    "INSERT INTO cayu_work_attempts "
+                    "(attempt_id, task_id, ordinal, request_sha256, started_at, attempt_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        attempt.attempt_id,
+                        attempt.task_id,
+                        attempt.ordinal,
+                        attempt.request_sha256,
+                        sqlite_support.format_datetime(attempt.started_at),
+                        sqlite_support.json_dumps(attempt.model_dump(mode="json", warnings=False)),
+                    ),
+                )
+                return attempt.model_copy(deep=True)
+
+    async def load_work_attempt(self, attempt_id: str) -> WorkAttempt | None:
+        attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
+        async with self._lock:
+            attempt = self._load_work_attempt_unlocked(attempt_id)
+            return None if attempt is None else attempt.model_copy(deep=True)
+
+    async def submit_completion_proposal(
+        self,
+        request: CompletionProposalCreate,
+    ) -> CompletionProposal:
+        request = copy_completion_proposal_create(request)
+        request_sha256 = completion_proposal_request_sha256(request)
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                existing = self._load_completion_proposal_unlocked(request.proposal_id)
+                if existing is not None:
+                    if existing.request_sha256 != request_sha256:
+                        raise WorkCompletionConflict(
+                            "Completion-proposal identity is already bound to another request."
+                        )
+                    return existing.model_copy(deep=True)
+                occupied = self._connection.execute(
+                    "SELECT proposal_id FROM cayu_completion_proposals WHERE attempt_id = ?",
+                    (request.attempt_id,),
+                ).fetchone()
+                if occupied is not None:
+                    raise WorkCompletionConflict(
+                        "Work attempt already has a different completion proposal."
+                    )
+                attempt = self._load_work_attempt_unlocked(request.attempt_id)
+                if attempt is None:
+                    raise KeyError(f"Work attempt not found: {request.attempt_id}")
+                task = self._require_task_unlocked(attempt.task_id)
+                contract = self._load_work_contract_unlocked(attempt.contract)
+                verified_work_support.require_attempt_current(
+                    task,
+                    attempt,
+                    latest_attempt_id=self._latest_work_attempt_id_unlocked(task.id),
+                    contract=contract,
+                    now=datetime.now(UTC),
+                )
+                proposal = CompletionProposal(
+                    proposal_id=request.proposal_id,
+                    attempt_id=request.attempt_id,
+                    result=request.result,
+                    evidence_references=request.evidence_references,
+                    task_id=attempt.task_id,
+                    contract=attempt.contract,
+                    request_sha256=request_sha256,
+                    proposed_at=self._clock(),
+                )
+                self._connection.execute(
+                    "INSERT INTO cayu_completion_proposals "
+                    "(proposal_id, attempt_id, task_id, request_sha256, proposed_at, "
+                    "proposal_json) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        proposal.proposal_id,
+                        proposal.attempt_id,
+                        proposal.task_id,
+                        proposal.request_sha256,
+                        sqlite_support.format_datetime(proposal.proposed_at),
+                        sqlite_support.json_dumps(proposal.model_dump(mode="json", warnings=False)),
+                    ),
+                )
+                return proposal.model_copy(deep=True)
+
+    async def load_completion_proposal(self, proposal_id: str) -> CompletionProposal | None:
+        proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
+        async with self._lock:
+            proposal = self._load_completion_proposal_unlocked(proposal_id)
+            return None if proposal is None else proposal.model_copy(deep=True)
+
+    async def claim_completion_verification(
+        self,
+        request: CompletionVerificationClaimRequest,
+    ) -> CompletionVerificationClaim:
+        request = copy_completion_verification_claim_request(request)
+        request_sha256 = completion_verification_claim_request_sha256(request)
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                claim_by_id = self._load_completion_claim_by_id_unlocked(request.claim_id)
+                if claim_by_id is not None and (
+                    claim_by_id.proposal_id != request.proposal_id
+                    or claim_by_id.request_sha256 != request_sha256
+                ):
+                    raise WorkCompletionConflict(
+                        "Verification-claim identity is already bound to another request."
+                    )
+                proposal = self._load_completion_proposal_unlocked(request.proposal_id)
+                if proposal is None:
+                    raise KeyError(f"Completion proposal not found: {request.proposal_id}")
+                contract = self._load_work_contract_unlocked(proposal.contract)
+                contract = verified_work_support.require_contract_reference(
+                    contract,
+                    proposal.contract,
+                )
+                if request.verifier != contract.verifier:
+                    raise WorkCompletionConflict(
+                        "Verification claim uses a verifier other than the frozen contract verifier."
+                    )
+                now = self._clock()
+                current = self._load_completion_claim_unlocked(request.proposal_id)
+                decision = self._load_completion_decision_for_proposal_unlocked(request.proposal_id)
+                if (
+                    current is not None
+                    and current.claim_id == request.claim_id
+                    and current.request_sha256 == request_sha256
+                ):
+                    if current.lease_expires_at > now or decision is not None:
+                        return current.model_copy(deep=True)
+                    raise CompletionVerificationClaimLost(
+                        "Verification claim expired and cannot regain authority by replay."
+                    )
+                if decision is not None:
+                    raise WorkCompletionConflict(
+                        "Completion proposal already has a durable decision."
+                    )
+                if current is not None and current.lease_expires_at > now:
+                    raise CompletionVerificationClaimLost(
+                        "Completion proposal is owned by another live verifier claim."
+                    )
+                if claim_by_id is not None:
+                    raise CompletionVerificationClaimLost(
+                        "Verification claim expired and cannot regain authority by replay."
+                    )
+                attempt = self._load_work_attempt_unlocked(proposal.attempt_id)
+                if attempt is None:
+                    raise WorkCompletionConflict("Completion proposal has no durable work attempt.")
+                task = self._require_task_unlocked(proposal.task_id)
+                verified_work_support.require_proposal_chain(
+                    proposal,
+                    attempt,
+                    task,
+                    latest_attempt_id=self._latest_work_attempt_id_unlocked(task.id),
+                    contract=contract,
+                )
+                attempt_number = 1 if current is None else current.attempt_number + 1
+                claim = CompletionVerificationClaim(
+                    claim_id=request.claim_id,
+                    proposal_id=request.proposal_id,
+                    worker_id=request.worker_id,
+                    execution_owner_id=request.execution_owner_id,
+                    execution_timeout_seconds=request.execution_timeout_seconds,
+                    verifier=request.verifier,
+                    attempt_number=attempt_number,
+                    request_sha256=request_sha256,
+                    claimed_at=now,
+                    lease_expires_at=now + timedelta(seconds=request.lease_seconds),
+                )
+                self._connection.execute(
+                    "UPDATE cayu_completion_verification_claims SET is_current = 0 "
+                    "WHERE proposal_id = ? AND is_current = 1",
+                    (request.proposal_id,),
+                )
+                self._connection.execute(
+                    "INSERT INTO cayu_completion_verification_claims "
+                    "(claim_id, proposal_id, attempt_number, request_sha256, "
+                    "lease_expires_at, is_current, claim_json) VALUES (?, ?, ?, ?, ?, 1, ?)",
+                    (
+                        claim.claim_id,
+                        claim.proposal_id,
+                        claim.attempt_number,
+                        claim.request_sha256,
+                        sqlite_support.format_datetime(claim.lease_expires_at),
+                        sqlite_support.json_dumps(claim.model_dump(mode="json", warnings=False)),
+                    ),
+                )
+                return claim.model_copy(deep=True)
+
+    async def load_completion_verification_claim(
+        self,
+        proposal_id: str,
+    ) -> CompletionVerificationClaim | None:
+        proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
+        async with self._lock:
+            claim = self._load_completion_claim_unlocked(proposal_id)
+            return None if claim is None else claim.model_copy(deep=True)
+
+    async def renew_completion_verification_claim(
+        self,
+        request: CompletionVerificationClaimRequest,
+    ) -> CompletionVerificationClaim:
+        request = copy_completion_verification_claim_request(request)
+        request_sha256 = completion_verification_claim_request_sha256(request)
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                proposal = self._load_completion_proposal_unlocked(request.proposal_id)
+                if proposal is None:
+                    raise KeyError(f"Completion proposal not found: {request.proposal_id}")
+                current = self._load_completion_claim_unlocked(request.proposal_id)
+                now = self._clock()
+                if (
+                    current is None
+                    or current.claim_id != request.claim_id
+                    or current.worker_id != request.worker_id
+                    or current.execution_owner_id != request.execution_owner_id
+                    or current.execution_timeout_seconds != request.execution_timeout_seconds
+                    or current.verifier != request.verifier
+                    or current.request_sha256 != request_sha256
+                    or current.lease_expires_at <= now
+                    or self._load_completion_decision_for_proposal_unlocked(proposal.proposal_id)
+                    is not None
+                ):
+                    raise CompletionVerificationClaimLost(
+                        "Verification claim cannot be renewed without exact current live authority."
+                    )
+                attempt = self._load_work_attempt_unlocked(proposal.attempt_id)
+                if attempt is None:
+                    raise WorkCompletionConflict("Completion proposal has no durable work attempt.")
+                task = self._require_task_unlocked(proposal.task_id)
+                contract = self._load_work_contract_unlocked(proposal.contract)
+                verified_work_support.require_proposal_chain(
+                    proposal,
+                    attempt,
+                    task,
+                    latest_attempt_id=self._latest_work_attempt_id_unlocked(task.id),
+                    contract=contract,
+                )
+                renewed = current.model_copy(
+                    update={
+                        "lease_expires_at": max(
+                            current.lease_expires_at,
+                            now + timedelta(seconds=request.lease_seconds),
+                        )
+                    }
+                )
+                self._connection.execute(
+                    "UPDATE cayu_completion_verification_claims "
+                    "SET lease_expires_at = ?, claim_json = ? "
+                    "WHERE claim_id = ? AND is_current = 1",
+                    (
+                        sqlite_support.format_datetime(renewed.lease_expires_at),
+                        sqlite_support.json_dumps(renewed.model_dump(mode="json", warnings=False)),
+                        renewed.claim_id,
+                    ),
+                )
+                return renewed.model_copy(deep=True)
+
+    async def record_completion_decision(
+        self,
+        request: CompletionDecisionCreate,
+    ) -> CompletionDecision:
+        request = copy_completion_decision_create(request)
+        request_sha256 = completion_decision_request_sha256(request)
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                existing = self._load_completion_decision_unlocked(request.decision_id)
+                if existing is not None:
+                    if existing.request_sha256 != request_sha256:
+                        raise WorkCompletionConflict(
+                            "Completion-decision identity is already bound to another request."
+                        )
+                    return existing.model_copy(deep=True)
+                prior = self._load_completion_decision_for_proposal_unlocked(request.proposal_id)
+                if prior is not None:
+                    raise WorkCompletionConflict(
+                        "Completion proposal already has a different durable decision."
+                    )
+                proposal = self._load_completion_proposal_unlocked(request.proposal_id)
+                if proposal is None:
+                    raise KeyError(f"Completion proposal not found: {request.proposal_id}")
+                claim = self._load_completion_claim_unlocked(proposal.proposal_id)
+                now = self._clock()
+                if (
+                    claim is None
+                    or claim.claim_id != request.claim_id
+                    or claim.worker_id != request.worker_id
+                    or claim.verifier != request.verifier
+                    or claim.lease_expires_at <= now
+                ):
+                    raise CompletionVerificationClaimLost(
+                        "Completion decision requires the current live verifier claim."
+                    )
+                attempt = self._load_work_attempt_unlocked(proposal.attempt_id)
+                if attempt is None:
+                    raise WorkCompletionConflict("Completion proposal has no durable work attempt.")
+                task = self._require_task_unlocked(proposal.task_id)
+                contract = self._load_work_contract_unlocked(proposal.contract)
+                contract = verified_work_support.require_proposal_chain(
+                    proposal,
+                    attempt,
+                    task,
+                    latest_attempt_id=self._latest_work_attempt_id_unlocked(task.id),
+                    contract=contract,
+                )
+                validate_completion_decision_contract(contract, request)
+                decision = CompletionDecision(
+                    decision_id=request.decision_id,
+                    proposal_id=request.proposal_id,
+                    claim_id=request.claim_id,
+                    worker_id=request.worker_id,
+                    verifier=request.verifier,
+                    decision_version=request.decision_version,
+                    verdict=request.verdict,
+                    criterion_outcomes=request.criterion_outcomes,
+                    constraint_outcomes=request.constraint_outcomes,
+                    gaps=request.gaps,
+                    evidence_references=request.evidence_references,
+                    task_id=proposal.task_id,
+                    attempt_id=proposal.attempt_id,
+                    contract=proposal.contract,
+                    request_sha256=request_sha256,
+                    gap_fingerprint=completion_gap_fingerprint(request),
+                    decided_at=now,
+                )
+                self._connection.execute(
+                    "INSERT INTO cayu_completion_decisions "
+                    "(decision_id, proposal_id, task_id, attempt_id, claim_id, verdict, "
+                    "gap_fingerprint, request_sha256, decided_at, decision_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        decision.decision_id,
+                        decision.proposal_id,
+                        decision.task_id,
+                        decision.attempt_id,
+                        decision.claim_id,
+                        decision.verdict.value,
+                        decision.gap_fingerprint,
+                        decision.request_sha256,
+                        sqlite_support.format_datetime(decision.decided_at),
+                        sqlite_support.json_dumps(decision.model_dump(mode="json", warnings=False)),
+                    ),
+                )
+                return decision.model_copy(deep=True)
+
+    async def load_completion_decision(
+        self,
+        decision_id: str,
+    ) -> CompletionDecision | None:
+        decision_id = require_clean_nonblank(decision_id, "decision_id")
+        async with self._lock:
+            decision = self._load_completion_decision_unlocked(decision_id)
+            return None if decision is None else decision.model_copy(deep=True)
+
+    async def load_completion_decision_for_proposal(
+        self,
+        proposal_id: str,
+    ) -> CompletionDecision | None:
+        proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
+        async with self._lock:
+            decision = self._load_completion_decision_for_proposal_unlocked(proposal_id)
+            return None if decision is None else decision.model_copy(deep=True)
+
+    async def apply_completion_decision(
+        self,
+        request: CompletionDecisionApplicationRequest,
+    ) -> Task:
+        try:
+            copied_request = copy_completion_decision_application_request(request)
+        except BaseException:
+            del request
+            raise
+        request = copied_request
+        del copied_request
+        request_sha256 = completion_decision_application_request_sha256(request)
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                receipt = self._load_decision_application_receipt_unlocked(
+                    request.task_id,
+                    request.idempotency_key,
+                )
+                if receipt is not None:
+                    if receipt.request_sha256 != request_sha256:
+                        raise WorkCompletionConflict(
+                            "Decision-application identity is already bound to another request."
+                        )
+                    return receipt.task.model_copy(deep=True)
+                prior = self._connection.execute(
+                    "SELECT task_id, idempotency_key FROM "
+                    "cayu_completion_decision_application_receipts WHERE decision_id = ?",
+                    (request.decision_id,),
+                ).fetchone()
+                if prior is not None:
+                    raise WorkCompletionConflict(
+                        "Completion decision was already applied under another identity."
+                    )
+                task = self._require_task_unlocked(request.task_id)
+                decision = self._load_completion_decision_unlocked(request.decision_id)
+                if decision is None:
+                    raise KeyError(f"Completion decision not found: {request.decision_id}")
+                if decision.task_id != task.id:
+                    raise WorkCompletionConflict("Completion decision belongs to another task.")
+                contract = self._require_task_contract_unlocked(task, decision.contract)
+                attempt = self._load_work_attempt_unlocked(decision.attempt_id)
+                if attempt is None:
+                    raise WorkCompletionConflict("Completion decision has no work attempt.")
+                verified_work_support.require_decision_attempt_current(
+                    task,
+                    attempt,
+                    latest_attempt_id=self._latest_work_attempt_id_unlocked(task.id),
+                    contract=contract,
+                )
+                proposal = self._load_completion_proposal_unlocked(decision.proposal_id)
+                if proposal is None:
+                    raise WorkCompletionConflict("Completion decision has no completion proposal.")
+                row = self._connection.execute(
+                    "SELECT COUNT(*) AS matching FROM cayu_completion_decisions "
+                    "WHERE task_id = ? AND verdict = ? AND gap_fingerprint = ?",
+                    (task.id, CompletionVerdict.REJECTED.value, decision.gap_fingerprint),
+                ).fetchone()
+                matching_gap_count = 0 if row is None else int(row["matching"])
+                updated, receipt = verified_work_support.plan_decision_application(
+                    request,
+                    request_sha256=request_sha256,
+                    task=task,
+                    decision=decision,
+                    proposal=proposal,
+                    attempt=attempt,
+                    contract=contract,
+                    matching_gap_count=matching_gap_count,
+                    now=datetime.now(UTC),
+                )
+                if updated != task:
+                    self._update_task_snapshot_unlocked(updated)
+                self._connection.execute(
+                    "INSERT INTO cayu_completion_decision_application_receipts "
+                    "(task_id, idempotency_key, decision_id, request_sha256, applied_at, "
+                    "receipt_json) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        receipt.task_id,
+                        receipt.idempotency_key,
+                        receipt.decision_id,
+                        receipt.request_sha256,
+                        sqlite_support.format_datetime(receipt.applied_at),
+                        sqlite_support.json_dumps(receipt.model_dump(mode="json", warnings=False)),
+                    ),
+                )
+                return updated.model_copy(deep=True)
+
+    async def load_completion_decision_application_receipt(
+        self,
+        task_id: str,
+        idempotency_key: str,
+    ) -> CompletionDecisionApplicationReceipt | None:
+        task_id = require_clean_nonblank(task_id, "task_id")
+        idempotency_key = validate_work_completion_idempotency_key(idempotency_key)
+        async with self._lock:
+            receipt = self._load_decision_application_receipt_unlocked(
+                task_id,
+                idempotency_key,
+            )
+            return None if receipt is None else receipt.model_copy(deep=True)
+
     async def create_task(self, request: TaskCreate) -> Task:
         request = copy_task_create(request)
         async with self._lock:
-            task_id = request.task_id or str(uuid4())
-            parent = self._task_parent_for_create_unlocked(request, task_id=task_id)
-            task = _task_from_create(
-                request,
-                task_id=task_id,
-                parent_task=parent,
-                retry_started_at=self._clock(),
-            )
-            self._insert_task_unlocked(task)
-            return task.model_copy(deep=True)
+            with self._verified_transaction_unlocked():
+                task_id = request.task_id or str(uuid4())
+                parent = self._task_parent_for_create_unlocked(request, task_id=task_id)
+                if request.work_contract is not None:
+                    contract = self._load_work_contract_unlocked(request.work_contract)
+                    verified_work_support.require_contract_reference(
+                        contract,
+                        request.work_contract,
+                    )
+                    if request.session_id is not None:
+                        self._ensure_session_execution_authority_unlocked(
+                            request.session_id,
+                            "contracted",
+                        )
+                task = _task_from_create(
+                    request,
+                    task_id=task_id,
+                    parent_task=parent,
+                    retry_started_at=self._clock(),
+                    supports_verified_work_contracts=True,
+                )
+                self._insert_task_unlocked(task)
+                return task.model_copy(deep=True)
 
     async def create_running_task(
         self,
@@ -9649,52 +10589,65 @@ class SQLiteTaskStore(TaskStore):
         request = copy_task_create(request)
         session_binding = _copy_required_session_binding(session_invocation)
         async with self._lock:
-            task_id = request.task_id or str(uuid4())
-            parent = self._task_parent_for_create_unlocked(request, task_id=task_id)
-            task = _running_task_from_create(
-                request,
-                task_id=task_id,
-                parent_task=parent,
-                session_invocation=session_binding,
-                retry_started_at=self._clock(),
-            )
-            self._insert_task_unlocked(task)
-            return task.model_copy(deep=True)
+            with self._verified_transaction_unlocked():
+                task_id = request.task_id or str(uuid4())
+                parent = self._task_parent_for_create_unlocked(request, task_id=task_id)
+                if request.work_contract is not None:
+                    contract = self._load_work_contract_unlocked(request.work_contract)
+                    verified_work_support.require_contract_reference(
+                        contract,
+                        request.work_contract,
+                    )
+                    if request.session_id is not None:
+                        self._ensure_session_execution_authority_unlocked(
+                            request.session_id,
+                            "contracted",
+                        )
+                task = _running_task_from_create(
+                    request,
+                    task_id=task_id,
+                    parent_task=parent,
+                    session_invocation=session_binding,
+                    retry_started_at=self._clock(),
+                    supports_verified_work_contracts=True,
+                )
+                self._insert_task_unlocked(task)
+                return task.model_copy(deep=True)
 
     def _insert_task_unlocked(self, task: Task) -> None:
         try:
-            with self._connection:
-                self._connection.execute(
-                    """
-                    INSERT INTO cayu_tasks (
-                        id,
-                        type,
-                        title,
-                        description,
-                        status,
-                        session_id,
-                        parent_task_id,
-                        assigned_agent_name,
-                        available_at,
-                        worker_id,
-                        lease_expires_at,
-                        status_reason,
-                        status_payload_json,
-                        input_json,
-                        result_json,
-                        error_json,
-                        metadata_json,
-                        created_at,
-                        updated_at,
-                        started_at,
-                        completed_at,
-                        invocation_json,
-                        retry_series_json
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    sqlite_support.task_to_row_values(task),
+            self._connection.execute(
+                """
+                INSERT INTO cayu_tasks (
+                    id,
+                    type,
+                    title,
+                    description,
+                    status,
+                    session_id,
+                    parent_task_id,
+                    assigned_agent_name,
+                    available_at,
+                    worker_id,
+                    lease_expires_at,
+                    status_reason,
+                    status_payload_json,
+                    input_json,
+                    result_json,
+                    error_json,
+                    metadata_json,
+                    created_at,
+                    updated_at,
+                    started_at,
+                    completed_at,
+                    invocation_json,
+                    retry_series_json,
+                    work_contract_json
                 )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                sqlite_support.task_to_row_values(task),
+            )
         except sqlite3.IntegrityError as exc:
             if self._task_exists_unlocked(task.id):
                 raise ValueError(f"Task already exists: {task.id}") from exc
@@ -10043,59 +10996,41 @@ class SQLiteTaskStore(TaskStore):
             session_id = require_clean_nonblank(session_id, "session_id")
         session_binding = _copy_optional_session_binding(session_invocation)
         async with self._lock:
-            row = self._connection.execute(
-                "SELECT status, session_id, invocation_json, retry_series_json "
-                "FROM cayu_tasks WHERE id = ?",
-                (task_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"Task not found: {task_id}")
-            _ensure_retry_series_queue_attempt(
-                None
-                if row["retry_series_json"] is None
-                else TaskRetrySeriesSnapshot.model_validate(json.loads(row["retry_series_json"]))
-            )
-            _ensure_task_status_can_transition(
-                task_id,
-                TaskStatus(row["status"]),
-                TaskStatus.RUNNING,
-            )
-            effective_session_id = _task_session_id_for_start(
-                task_id=task_id,
-                stored_session_id=row["session_id"],
-                requested_session_id=session_id,
-            )
-            _task_invocation_for_attachment(
-                TaskInvocation.model_validate(json.loads(row["invocation_json"])),
-                session_id=effective_session_id,
-                session_binding=session_binding,
-            )
-            now = datetime.now(UTC)
-            with self._connection:
-                cursor = self._connection.execute(
-                    """
-                    UPDATE cayu_tasks
-                    SET status = ?,
-                        session_id = COALESCE(?, session_id),
-                        started_at = COALESCE(started_at, ?),
-                        updated_at = ?
-                    WHERE id = ? AND status = ?
-                    """,
-                    (
-                        str(TaskStatus.RUNNING),
-                        effective_session_id,
-                        sqlite_support.format_datetime(now),
-                        sqlite_support.format_datetime(now),
-                        task_id,
-                        str(TaskStatus.PENDING),
-                    ),
+            with self._verified_transaction_unlocked():
+                task = self._require_task_unlocked(task_id)
+                _ensure_retry_series_queue_attempt(task.retry_series)
+                _ensure_can_transition(task, TaskStatus.RUNNING)
+                effective_session_id = _task_session_id_for_start(
+                    task_id=task_id,
+                    stored_session_id=task.session_id,
+                    requested_session_id=session_id,
                 )
-            if cursor.rowcount == 1:
-                updated = self._require_task_unlocked(task_id)
+                if task.work_contract is not None:
+                    self._require_task_contract_unlocked(task, task.work_contract)
+                    if effective_session_id is None:
+                        raise WorkCompletionConflict(
+                            "Contracted tasks require a session binding before starting."
+                        )
+                    self._ensure_session_execution_authority_unlocked(
+                        effective_session_id,
+                        "contracted",
+                    )
+                _task_invocation_for_attachment(
+                    task.invocation,
+                    session_id=effective_session_id,
+                    session_binding=session_binding,
+                )
+                now = datetime.now(UTC)
+                updated = task.model_copy(
+                    update={
+                        "status": TaskStatus.RUNNING,
+                        "session_id": effective_session_id,
+                        "started_at": task.started_at or now,
+                        "updated_at": now,
+                    }
+                )
+                self._update_task_snapshot_unlocked(updated)
                 return updated.model_copy(deep=True)
-            task = self._require_task_unlocked(task_id)
-            _ensure_can_transition(task, TaskStatus.RUNNING)
-            raise ValueError(f"Task {task.id} cannot transition to running from {task.status}")
 
     async def attach_task(
         self,
@@ -10109,68 +11044,44 @@ class SQLiteTaskStore(TaskStore):
         session_id = require_clean_nonblank(session_id, "session_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
         session_binding = _copy_required_session_binding(session_invocation)
-        now = datetime.now(UTC)
         async with self._lock:
-            row = self._connection.execute(
-                """
-                SELECT status, session_id, worker_id, lease_expires_at, invocation_json,
-                       retry_series_json
-                FROM cayu_tasks
-                WHERE id = ?
-                """,
-                (task_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"Task not found: {task_id}")
-            _ensure_retry_series_queue_attempt(
-                None
-                if row["retry_series_json"] is None
-                else TaskRetrySeriesSnapshot.model_validate(json.loads(row["retry_series_json"]))
-            )
-            if not _can_attach_claimed_task_state(
-                status=TaskStatus(row["status"]),
-                session_id=row["session_id"],
-                worker_id=row["worker_id"],
-                lease_expires_at=sqlite_support.parse_optional_datetime(row["lease_expires_at"]),
-                expected_worker_id=worker_id,
-                now=now,
-            ):
-                self._raise_task_claim_attach_error(task_id, worker_id)
-            _task_invocation_for_attachment(
-                TaskInvocation.model_validate(json.loads(row["invocation_json"])),
-                session_id=session_id,
-                session_binding=session_binding,
-            )
-            with self._connection:
-                cursor = self._connection.execute(
-                    """
-                    UPDATE cayu_tasks
-                    SET status = ?,
-                        session_id = ?,
-                        started_at = COALESCE(started_at, ?),
-                        updated_at = ?
-                    WHERE id = ?
-                      AND status = ?
-                      AND worker_id = ?
-                      AND session_id IS NULL
-                      AND lease_expires_at IS NOT NULL
-                      AND lease_expires_at > ?
-                    """,
-                    (
-                        str(TaskStatus.RUNNING),
+            with self._verified_transaction_unlocked():
+                # Lease authority must be sampled only after BEGIN IMMEDIATE
+                # has acquired SQLite's cross-process writer lock. A timestamp
+                # captured before that wait could outlive the worker lease.
+                now = datetime.now(UTC)
+                task = self._require_task_unlocked(task_id)
+                _ensure_retry_series_queue_attempt(task.retry_series)
+                if not _can_attach_claimed_task_state(
+                    status=task.status,
+                    session_id=task.session_id,
+                    worker_id=task.worker_id,
+                    lease_expires_at=task.lease_expires_at,
+                    expected_worker_id=worker_id,
+                    now=now,
+                ):
+                    self._raise_task_claim_attach_error(task_id, worker_id)
+                if task.work_contract is not None:
+                    self._require_task_contract_unlocked(task, task.work_contract)
+                    self._ensure_session_execution_authority_unlocked(
                         session_id,
-                        sqlite_support.format_datetime(now),
-                        sqlite_support.format_datetime(now),
-                        task_id,
-                        str(TaskStatus.CLAIMED),
-                        worker_id,
-                        sqlite_support.format_datetime(now),
-                    ),
+                        "contracted",
+                    )
+                _task_invocation_for_attachment(
+                    task.invocation,
+                    session_id=session_id,
+                    session_binding=session_binding,
                 )
-            if cursor.rowcount != 1:
-                self._raise_task_claim_attach_error(task_id, worker_id)
-            updated = self._require_task_unlocked(task_id)
-            return updated.model_copy(deep=True)
+                updated = task.model_copy(
+                    update={
+                        "status": TaskStatus.RUNNING,
+                        "session_id": session_id,
+                        "started_at": task.started_at or now,
+                        "updated_at": now,
+                    }
+                )
+                self._update_task_snapshot_unlocked(updated)
+                return updated.model_copy(deep=True)
 
     async def complete_task(
         self, task_id: str, result: dict[str, Any], *, worker_id: str | None = None
@@ -10245,6 +11156,10 @@ class SQLiteTaskStore(TaskStore):
                     TaskStatus.COMPLETED
                     if request.kind is TaskTerminalKind.COMPLETED
                     else TaskStatus.FAILED
+                )
+                verified_work_support.require_contracted_completion_authority(
+                    task,
+                    status,
                 )
                 cursor = self._connection.execute(
                     """
@@ -10416,8 +11331,9 @@ class SQLiteTaskStore(TaskStore):
                             parent_task_id, assigned_agent_name, available_at, worker_id,
                             lease_expires_at, status_reason, status_payload_json, input_json,
                             result_json, error_json, metadata_json, created_at, updated_at,
-                            started_at, completed_at, invocation_json, retry_series_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            started_at, completed_at, invocation_json, retry_series_json,
+                            work_contract_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         sqlite_support.task_to_row_values(successor),
                     )
@@ -11048,6 +11964,7 @@ class SQLiteTaskStore(TaskStore):
     ) -> Task:
         now = datetime.now(UTC)
         task = self._require_task_unlocked(task_id)
+        verified_work_support.require_contracted_completion_authority(task, status)
         cancellation = None
         if task.retry_series is not None:
             if status is not TaskStatus.CANCELLED:

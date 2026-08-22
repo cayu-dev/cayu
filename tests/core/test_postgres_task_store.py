@@ -30,13 +30,28 @@ from tests.core.task_topology_conformance import (
     assert_task_topology_bounded_projection_conformance,
     assert_task_topology_store_conformance,
 )
+from tests.core.test_verified_work_contracts import (
+    _accepted_decision,
+    _approval_evidence,
+    _artifact_evidence,
+    _contract,
+    _digest,
+    _rejected_decision,
+    _result_reference,
+    _task_result,
+)
 
 from cayu import (
+    CompletionDecisionApplicationRequest,
+    CompletionProposalCreate,
+    CompletionVerificationClaimLost,
+    CompletionVerificationClaimRequest,
     InvocationOrigin,
     InvocationOriginClaim,
     InvocationOriginTrust,
     Task,
     TaskClaimLost,
+    TaskCompletionDecisionRequired,
     TaskCreate,
     TaskExecutionSource,
     TaskInvocation,
@@ -53,6 +68,8 @@ from cayu import (
     TaskTerminalizationRetryPolicy,
     TaskTerminalKind,
     TaskTopologyQuery,
+    WorkAttemptCreate,
+    WorkCompletionConflict,
     task_create_with_execution_source,
     terminalize_task_with_retry,
 )
@@ -70,6 +87,13 @@ _TABLES = (
     "cayu_knowledge_index_readiness_events",
     "cayu_task_retry_settlements",
     "cayu_task_terminalization_receipts",
+    "cayu_completion_decision_application_receipts",
+    "cayu_completion_decisions",
+    "cayu_completion_verification_claims",
+    "cayu_completion_proposals",
+    "cayu_work_attempts",
+    "cayu_task_session_execution_authority",
+    "cayu_work_contracts",
     "cayu_knowledge_change_acknowledgements",
     "cayu_knowledge_change_consumers",
     "cayu_knowledge_change_labels",
@@ -107,6 +131,971 @@ _TABLES = (
     "cayu_eval_corpora",
     "cayu_schema_migrations",
 )
+
+
+def test_postgres_verified_work_lifecycle_survives_restart(postgres_dsn):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        contract = _contract(contract_id="postgres-restart-contract")
+        store = _new_store(postgres_dsn)
+        try:
+            assert await store.publish_work_contract(contract) == contract
+            task = await store.create_running_task(
+                TaskCreate(
+                    task_id="postgres-verified-task",
+                    type="bid",
+                    session_id="session:postgres:verified",
+                    work_contract=contract.reference(),
+                ),
+                session_invocation=unattributed_session_invocation_binding(
+                    "session:postgres:verified"
+                ),
+            )
+            attempt = await store.begin_work_attempt(
+                WorkAttemptCreate(
+                    attempt_id="postgres-attempt-1",
+                    task_id=task.id,
+                    session_id="session:postgres:verified",
+                    contract=contract.reference(),
+                    execution_profile_fingerprint=_digest("postgres-worker-profile"),
+                )
+            )
+            proposal = await store.submit_completion_proposal(
+                CompletionProposalCreate(
+                    proposal_id="postgres-proposal-1",
+                    attempt_id=attempt.attempt_id,
+                    result=_result_reference("postgres"),
+                    evidence_references=(_artifact_evidence(), _approval_evidence()),
+                )
+            )
+            claim_request = CompletionVerificationClaimRequest(
+                claim_id="postgres-claim-1",
+                proposal_id=proposal.proposal_id,
+                worker_id="postgres-verifier",
+                verifier=contract.verifier,
+            )
+            claim = await store.claim_completion_verification(claim_request)
+            decision_request = _rejected_decision(
+                proposal_id=proposal.proposal_id,
+                claim_id=claim.claim_id,
+                worker_id=claim.worker_id,
+            )
+            decision = await store.record_completion_decision(decision_request)
+            with pytest.raises(TaskCompletionDecisionRequired):
+                await store.complete_task(task.id, _task_result("postgres"))
+            rejection_application = CompletionDecisionApplicationRequest(
+                task_id=task.id,
+                decision_id=decision.decision_id,
+                idempotency_key="postgres-apply-rejected",
+            )
+            still_running = await store.apply_completion_decision(rejection_application)
+            assert still_running.status is TaskStatus.RUNNING
+        finally:
+            await store.close()
+
+        reopened = _new_store(postgres_dsn)
+        try:
+            assert await reopened.load_work_contract(contract.reference()) == contract
+            assert await reopened.load_work_attempt(attempt.attempt_id) == attempt
+            assert await reopened.load_completion_proposal(proposal.proposal_id) == proposal
+            assert await reopened.load_completion_verification_claim(proposal.proposal_id) == claim
+            assert await reopened.load_completion_decision(decision.decision_id) == decision
+            assert await reopened.record_completion_decision(decision_request) == decision
+            assert await reopened.apply_completion_decision(rejection_application) == still_running
+            with pytest.raises(
+                WorkCompletionConflict,
+                match="already applied under another identity",
+            ):
+                await reopened.apply_completion_decision(
+                    rejection_application.model_copy(
+                        update={"task_id": "missing-postgres-application-task"}
+                    )
+                )
+            attempt_two = await reopened.begin_work_attempt(
+                WorkAttemptCreate(
+                    attempt_id="postgres-attempt-2",
+                    task_id=task.id,
+                    session_id="session:postgres:verified",
+                    contract=contract.reference(),
+                    execution_profile_fingerprint=_digest("postgres-worker-profile"),
+                )
+            )
+            proposal_two = await reopened.submit_completion_proposal(
+                CompletionProposalCreate(
+                    proposal_id="postgres-proposal-2",
+                    attempt_id=attempt_two.attempt_id,
+                    result=_result_reference("postgres"),
+                    evidence_references=(_artifact_evidence(), _approval_evidence()),
+                )
+            )
+            claim_two = await reopened.claim_completion_verification(
+                CompletionVerificationClaimRequest(
+                    claim_id="postgres-claim-2",
+                    proposal_id=proposal_two.proposal_id,
+                    worker_id="postgres-verifier",
+                    verifier=contract.verifier,
+                )
+            )
+            accepted_request = _accepted_decision(
+                proposal_id=proposal_two.proposal_id,
+                claim_id=claim_two.claim_id,
+                worker_id=claim_two.worker_id,
+            )
+            accepted = await reopened.record_completion_decision(accepted_request)
+            application = CompletionDecisionApplicationRequest(
+                task_id=task.id,
+                decision_id=accepted.decision_id,
+                idempotency_key="postgres-apply-accepted",
+                result=_task_result("postgres"),
+                result_reference=proposal_two.result,
+            )
+            completed = await reopened.apply_completion_decision(application)
+            assert completed.status is TaskStatus.COMPLETED
+            assert await reopened.apply_completion_decision(application) == completed
+            receipt = await reopened.load_completion_decision_application_receipt(
+                task.id,
+                application.idempotency_key,
+            )
+            assert receipt is not None
+            assert receipt.task == completed
+            assert (
+                await reopened.load_active_work_contract_task_for_session(
+                    "session:postgres:verified"
+                )
+                == completed
+            )
+            with pytest.raises(TaskCompletionDecisionRequired):
+                await reopened.admit_ordinary_session_execution("session:postgres:verified")
+        finally:
+            await reopened.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_verified_work_authority_races_are_single_winner(postgres_dsn):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        first = _new_store(postgres_dsn)
+        second = _new_store(postgres_dsn)
+        contract = _contract(contract_id="postgres-authority-race")
+        try:
+            await first.publish_work_contract(contract)
+
+            async def ordinary() -> str:
+                try:
+                    await first.admit_ordinary_session_execution("session:postgres:race")
+                except TaskCompletionDecisionRequired:
+                    return "contracted"
+                return "ordinary"
+
+            async def contracted() -> str:
+                try:
+                    await second.create_running_task(
+                        TaskCreate(
+                            task_id="postgres-authority-race-task",
+                            type="bid",
+                            session_id="session:postgres:race",
+                            work_contract=contract.reference(),
+                        ),
+                        session_invocation=unattributed_session_invocation_binding(
+                            "session:postgres:race"
+                        ),
+                    )
+                except WorkCompletionConflict:
+                    return "ordinary"
+                return "contracted"
+
+            outcomes = await asyncio.gather(ordinary(), contracted())
+            assert outcomes[0] == outcomes[1]
+            task = await first.load_task("postgres-authority-race-task")
+            if outcomes[0] == "ordinary":
+                assert task is None
+            else:
+                assert task is not None
+                with pytest.raises(TaskCompletionDecisionRequired):
+                    await first.admit_ordinary_session_execution("session:postgres:race")
+
+            verified = await first.create_running_task(
+                TaskCreate(
+                    task_id="postgres-claim-race-task",
+                    type="bid",
+                    session_id="session:postgres:claim-race",
+                    work_contract=contract.reference(),
+                ),
+                session_invocation=unattributed_session_invocation_binding(
+                    "session:postgres:claim-race"
+                ),
+            )
+            attempt = await first.begin_work_attempt(
+                WorkAttemptCreate(
+                    attempt_id="postgres-claim-race-attempt",
+                    task_id=verified.id,
+                    session_id="session:postgres:claim-race",
+                    contract=contract.reference(),
+                    execution_profile_fingerprint=_digest("claim-race-profile"),
+                )
+            )
+            proposal = await first.submit_completion_proposal(
+                CompletionProposalCreate(
+                    proposal_id="postgres-claim-race-proposal",
+                    attempt_id=attempt.attempt_id,
+                    result=_result_reference("claim-race"),
+                    evidence_references=(_artifact_evidence(),),
+                )
+            )
+
+            async def claim(store, suffix: str):
+                try:
+                    return await store.claim_completion_verification(
+                        CompletionVerificationClaimRequest(
+                            claim_id=f"postgres-claim-race-{suffix}",
+                            proposal_id=proposal.proposal_id,
+                            worker_id=f"verifier-{suffix}",
+                            verifier=contract.verifier,
+                        )
+                    )
+                except CompletionVerificationClaimLost as exc:
+                    return exc
+
+            claims = await asyncio.gather(claim(first, "a"), claim(second, "b"))
+            assert sum(not isinstance(result, BaseException) for result in claims) == 1
+            assert (
+                sum(isinstance(result, CompletionVerificationClaimLost) for result in claims) == 1
+            )
+        finally:
+            await first.close()
+            await second.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_cancelled_worker_claim_aborts_close_return_pool_connection(
+    postgres_dsn,
+    monkeypatch,
+):
+    async def run() -> None:
+        import psycopg
+        from psycopg_pool import AsyncConnectionPool
+
+        from cayu import PostgresTaskStore
+        from cayu.storage import _postgres_verified_work as postgres_verified_work
+        from cayu.storage.migrations import SchemaMode
+
+        await _truncate(postgres_dsn)
+        monkeypatch.setattr(
+            postgres_verified_work,
+            "_POSTGRES_MUTATION_CANCELLATION_GRACE_SECONDS",
+            0.0,
+        )
+        pool = AsyncConnectionPool(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            open=False,
+            close_returns=True,
+        )
+        await pool.open()
+        store = PostgresTaskStore(pool=pool, schema_mode=SchemaMode.CREATE)
+        lock_connection = await psycopg.AsyncConnection.connect(postgres_dsn)
+        caller: asyncio.Task[object] | None = None
+        try:
+            await store.create_task(TaskCreate(task_id="claim-cancellation", type="job"))
+            await lock_connection.execute("LOCK TABLE cayu_tasks IN ACCESS EXCLUSIVE MODE")
+            caller = asyncio.create_task(
+                store.claim_task("claim-cancellation-worker"),
+                name="postgres-claim-cancellation-caller",
+            )
+            await asyncio.sleep(0.1)
+            caller.cancel("stop waiting after dispatch")
+            assert caller.cancelling() == 1
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(caller), timeout=5)
+            assert caller.cancelled()
+            assert not any(
+                task.get_name() == "cayu-postgres-store-mutation" for task in asyncio.all_tasks()
+            )
+
+            # The cancelled mutation is already quiescent while the competing
+            # transaction still owns the table lock. Releasing that lock must
+            # not allow a delayed stale claim to commit.
+            await lock_connection.commit()
+            claimed = await store.load_task("claim-cancellation")
+            assert claimed is not None
+            assert claimed.status is TaskStatus.PENDING
+            assert claimed.worker_id is None
+
+            retry = await store.claim_task("claim-cancellation-successor")
+            assert retry is not None
+            assert retry.status is TaskStatus.CLAIMED
+            assert retry.worker_id == "claim-cancellation-successor"
+        finally:
+            await lock_connection.rollback()
+            if caller is not None and not caller.done():
+                caller.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await caller
+            await lock_connection.close()
+            await store.close()
+            await pool.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_rollback_failure_physically_discards_close_return_connection(
+    postgres_dsn,
+    monkeypatch,
+):
+    async def run() -> None:
+        from psycopg import AsyncConnection
+        from psycopg_pool import AsyncConnectionPool
+
+        from cayu import PostgresTaskStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _truncate(postgres_dsn)
+        pool = AsyncConnectionPool(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            open=False,
+            close_returns=True,
+        )
+        await pool.open()
+        store = PostgresTaskStore(pool=pool, schema_mode=SchemaMode.CREATE)
+        contract = _contract(contract_id="postgres-rollback-abort")
+        primary_failure = RuntimeError("commit failed before acknowledgement")
+        rollback_failure = RuntimeError("rollback outcome remained uncertain")
+        failed_connections: list[AsyncConnection] = []
+        return_counts: dict[int, int] = {}
+        try:
+            # Complete lazy schema setup before faulting the mutation transaction.
+            assert await store.load_work_contract(contract.reference()) is None
+            original_putconn = pool.putconn
+
+            async def count_putconn(connection: AsyncConnection) -> None:
+                identity = id(connection)
+                return_counts[identity] = return_counts.get(identity, 0) + 1
+                await original_putconn(connection)
+
+            async def fail_commit(connection: AsyncConnection) -> None:
+                failed_connections.append(connection)
+                raise primary_failure
+
+            async def fail_rollback(connection: AsyncConnection) -> None:
+                del connection
+                raise rollback_failure
+
+            with monkeypatch.context() as faults:
+                faults.setattr(pool, "putconn", count_putconn)
+                faults.setattr(AsyncConnection, "commit", fail_commit)
+                faults.setattr(AsyncConnection, "rollback", fail_rollback)
+
+                with pytest.raises(BaseExceptionGroup) as captured:
+                    await store.publish_work_contract(contract)
+
+            assert captured.value.exceptions == (primary_failure, rollback_failure)
+            assert len(failed_connections) == 1
+            failed_connection = failed_connections[0]
+            assert failed_connection.closed
+            assert return_counts[id(failed_connection)] == 1
+
+            # The failed transaction was not published, and the pool replaces
+            # rather than reuses the physically revoked connection.
+            assert await store.load_work_contract(contract.reference()) is None
+            async with pool.connection() as successor:
+                assert successor is not failed_connection
+        finally:
+            await store.close()
+            await pool.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_first_claim_cancellation_settles_lazy_schema_readiness(postgres_dsn):
+    async def run() -> None:
+        import psycopg
+
+        from cayu.storage.postgres import _SCHEMA_ADVISORY_LOCK_KEY
+
+        await _truncate(postgres_dsn)
+        bootstrap = _new_store(postgres_dsn)
+        try:
+            await bootstrap.create_task(
+                TaskCreate(task_id="claim-readiness-cancellation", type="job")
+            )
+        finally:
+            await bootstrap.close()
+
+        lock_connection = await psycopg.AsyncConnection.connect(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        caller: asyncio.Task[object] | None = None
+        try:
+            await lock_connection.execute(
+                "SELECT pg_advisory_lock(%s)",
+                (_SCHEMA_ADVISORY_LOCK_KEY,),
+            )
+            caller = asyncio.create_task(
+                store.claim_task("claim-readiness-worker"),
+                name="postgres-first-claim-readiness-caller",
+            )
+
+            async def wait_until_pool_opens() -> None:
+                while not store._opened:
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(wait_until_pool_opens(), timeout=5)
+            await asyncio.sleep(0.05)
+            assert store._schema_ready is False
+
+            caller.cancel("stop first claim during schema readiness")
+            assert caller.cancelling() == 1
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(caller), timeout=5)
+            assert caller.cancelled()
+            assert not any(
+                task.get_name() == "cayu-postgres-store-mutation" for task in asyncio.all_tasks()
+            )
+
+            await lock_connection.execute(
+                "SELECT pg_advisory_unlock(%s)",
+                (_SCHEMA_ADVISORY_LOCK_KEY,),
+            )
+            pending = await store.load_task("claim-readiness-cancellation")
+            assert pending is not None
+            assert pending.status is TaskStatus.PENDING
+            assert pending.worker_id is None
+
+            claimed = await store.claim_task("claim-readiness-successor")
+            assert claimed is not None
+            assert claimed.status is TaskStatus.CLAIMED
+            assert claimed.worker_id == "claim-readiness-successor"
+        finally:
+            await lock_connection.execute("SELECT pg_advisory_unlock_all()")
+            if caller is not None and not caller.done():
+                caller.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await caller
+            await lock_connection.close()
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_verified_work_clock_does_not_expire_task_worker_lease(postgres_dsn):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        verifier_now = datetime(2100, 1, 1, tzinfo=UTC)
+        store = _new_store(postgres_dsn, clock=lambda: verifier_now)
+        contract = _contract(contract_id="postgres-separate-clock-domains")
+        try:
+            await store.publish_work_contract(contract)
+            task = await store.create_task(
+                TaskCreate(
+                    task_id="postgres-separate-clock-task",
+                    type="verified-work",
+                    work_contract=contract.reference(),
+                )
+            )
+            claimed = await store.claim_task(
+                "postgres-task-worker",
+                TaskQuery(type=task.type),
+                lease_seconds=30,
+            )
+            assert claimed is not None
+            running = await store.attach_task(
+                task.id,
+                session_id="session:postgres:separate-clock",
+                session_invocation=await task_backed_session_invocation(
+                    store,
+                    task.id,
+                    "session:postgres:separate-clock",
+                ),
+                worker_id="postgres-task-worker",
+            )
+            attempt = await store.begin_work_attempt(
+                WorkAttemptCreate(
+                    attempt_id="postgres-separate-clock-attempt",
+                    task_id=task.id,
+                    session_id=running.session_id or "missing-session",
+                    contract=contract.reference(),
+                    execution_profile_fingerprint=_digest("postgres-separate-clock-profile"),
+                    worker_id="postgres-task-worker",
+                )
+            )
+
+            assert attempt.started_at == verifier_now
+            assert attempt.worker_id == "postgres-task-worker"
+            assert running.updated_at < verifier_now
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_verified_work_lease_checks_use_post_lock_time(postgres_dsn):
+    async def run() -> None:
+        import psycopg
+
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        lock_connection = await psycopg.AsyncConnection.connect(postgres_dsn)
+        contract = _contract(contract_id="postgres-post-lock-clock")
+        attempt_caller: asyncio.Task[object] | None = None
+        claim_caller: asyncio.Task[object] | None = None
+        renewal_caller: asyncio.Task[object] | None = None
+        task_row_renewal_caller: asyncio.Task[object] | None = None
+        decision_caller: asyncio.Task[object] | None = None
+        try:
+            await store.publish_work_contract(contract)
+            task = await store.create_task(
+                TaskCreate(
+                    task_id="postgres-post-lock-task-lease",
+                    type="verified-work",
+                    work_contract=contract.reference(),
+                )
+            )
+            claimed = await store.claim_task("postgres-post-lock-worker", lease_seconds=1)
+            assert claimed is not None
+            await store.attach_task(
+                task.id,
+                session_id="session:postgres:post-lock-task-lease",
+                session_invocation=await task_backed_session_invocation(
+                    store,
+                    task.id,
+                    "session:postgres:post-lock-task-lease",
+                ),
+                worker_id="postgres-post-lock-worker",
+            )
+            await lock_connection.execute(
+                "SELECT id FROM cayu_tasks WHERE id = %s FOR UPDATE",
+                (task.id,),
+            )
+            attempt_caller = asyncio.create_task(
+                store.begin_work_attempt(
+                    WorkAttemptCreate(
+                        attempt_id="postgres-post-lock-expired-attempt",
+                        task_id=task.id,
+                        session_id="session:postgres:post-lock-task-lease",
+                        contract=contract.reference(),
+                        execution_profile_fingerprint=_digest("post-lock-task-profile"),
+                        worker_id="postgres-post-lock-worker",
+                    )
+                )
+            )
+            await asyncio.sleep(1.1)
+            await lock_connection.commit()
+            with pytest.raises(TaskClaimLost):
+                await attempt_caller
+            assert await store.load_work_attempt("postgres-post-lock-expired-attempt") is None
+
+            verifier_task = await store.create_running_task(
+                TaskCreate(
+                    task_id="postgres-post-lock-verifier-lease",
+                    type="verified-work",
+                    session_id="session:postgres:post-lock-verifier-lease",
+                    work_contract=contract.reference(),
+                ),
+                session_invocation=unattributed_session_invocation_binding(
+                    "session:postgres:post-lock-verifier-lease"
+                ),
+            )
+            attempt = await store.begin_work_attempt(
+                WorkAttemptCreate(
+                    attempt_id="postgres-post-lock-verifier-attempt",
+                    task_id=verifier_task.id,
+                    session_id=verifier_task.session_id or "missing-session",
+                    contract=contract.reference(),
+                    execution_profile_fingerprint=_digest("post-lock-verifier-profile"),
+                )
+            )
+            proposal = await store.submit_completion_proposal(
+                CompletionProposalCreate(
+                    proposal_id="postgres-post-lock-verifier-proposal",
+                    attempt_id=attempt.attempt_id,
+                    result=_result_reference("post-lock-verifier"),
+                    evidence_references=(_artifact_evidence(),),
+                )
+            )
+            claim_request = CompletionVerificationClaimRequest(
+                claim_id="postgres-post-lock-verifier-claim",
+                proposal_id=proposal.proposal_id,
+                worker_id="postgres-post-lock-verifier",
+                verifier=contract.verifier,
+                lease_seconds=1,
+            )
+            await lock_connection.execute(
+                "SELECT id FROM cayu_tasks WHERE id = %s FOR UPDATE",
+                (verifier_task.id,),
+            )
+            claim_caller = asyncio.create_task(store.claim_completion_verification(claim_request))
+            await asyncio.sleep(1.1)
+            await lock_connection.commit()
+            claim = await claim_caller
+            assert claim.lease_expires_at > datetime.now(UTC)
+            await lock_connection.execute(
+                "SELECT claim_id FROM cayu_completion_verification_claims "
+                "WHERE claim_id = %s FOR UPDATE",
+                (claim.claim_id,),
+            )
+            renewal_caller = asyncio.create_task(
+                store.renew_completion_verification_claim(claim_request)
+            )
+            await asyncio.sleep(1.1)
+            await lock_connection.commit()
+            with pytest.raises(CompletionVerificationClaimLost):
+                await renewal_caller
+            assert await store.load_completion_verification_claim(proposal.proposal_id) == claim
+
+            task_row_renewal_request = claim_request.model_copy(
+                update={"claim_id": "postgres-post-lock-task-row-renewal-claim"}
+            )
+            task_row_renewal_claim = await store.claim_completion_verification(
+                task_row_renewal_request
+            )
+            await lock_connection.execute(
+                "SELECT id FROM cayu_tasks WHERE id = %s FOR UPDATE",
+                (verifier_task.id,),
+            )
+            task_row_renewal_caller = asyncio.create_task(
+                store.renew_completion_verification_claim(task_row_renewal_request)
+            )
+            await asyncio.sleep(1.1)
+            await lock_connection.commit()
+            with pytest.raises(CompletionVerificationClaimLost):
+                await task_row_renewal_caller
+            assert (
+                await store.load_completion_verification_claim(proposal.proposal_id)
+                == task_row_renewal_claim
+            )
+
+            decision_claim_request = claim_request.model_copy(
+                update={"claim_id": "postgres-post-lock-decision-claim"}
+            )
+            decision_claim = await store.claim_completion_verification(decision_claim_request)
+            decision_request = _rejected_decision(
+                proposal_id=proposal.proposal_id,
+                claim_id=decision_claim.claim_id,
+                worker_id=decision_claim.worker_id,
+                decision_id="postgres-post-lock-expired-decision",
+            )
+            await lock_connection.execute(
+                "SELECT id FROM cayu_tasks WHERE id = %s FOR UPDATE",
+                (verifier_task.id,),
+            )
+            decision_caller = asyncio.create_task(
+                store.record_completion_decision(decision_request)
+            )
+            await asyncio.sleep(1.1)
+            await lock_connection.commit()
+            with pytest.raises(CompletionVerificationClaimLost):
+                await decision_caller
+            assert (
+                await store.load_completion_decision("postgres-post-lock-expired-decision") is None
+            )
+        finally:
+            await lock_connection.rollback()
+            for caller in (
+                attempt_caller,
+                claim_caller,
+                renewal_caller,
+                task_row_renewal_caller,
+                decision_caller,
+            ):
+                if caller is not None and not caller.done():
+                    caller.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await caller
+            await lock_connection.close()
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_verified_work_global_identity_races_remain_typed(postgres_dsn):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        first = _new_store(postgres_dsn)
+        second = _new_store(postgres_dsn)
+        contract = _contract(contract_id="postgres-global-identity-races")
+        try:
+            await first.publish_work_contract(contract)
+
+            async def running_task(suffix: str):
+                return await first.create_running_task(
+                    TaskCreate(
+                        task_id=f"postgres-global-identity-task-{suffix}",
+                        type="verified-work",
+                        session_id=f"session:postgres:global-identity:{suffix}",
+                        work_contract=contract.reference(),
+                    ),
+                    session_invocation=unattributed_session_invocation_binding(
+                        f"session:postgres:global-identity:{suffix}"
+                    ),
+                )
+
+            async def unique_attempt(suffix: str):
+                task = await running_task(suffix)
+                attempt = await first.begin_work_attempt(
+                    WorkAttemptCreate(
+                        attempt_id=f"postgres-global-identity-attempt-{suffix}",
+                        task_id=task.id,
+                        session_id=task.session_id or "missing-session",
+                        contract=contract.reference(),
+                        execution_profile_fingerprint=_digest(f"profile-{suffix}"),
+                    )
+                )
+                return task, attempt
+
+            async def unique_proposal(suffix: str):
+                task, attempt = await unique_attempt(suffix)
+                proposal = await first.submit_completion_proposal(
+                    CompletionProposalCreate(
+                        proposal_id=f"postgres-global-identity-proposal-{suffix}",
+                        attempt_id=attempt.attempt_id,
+                        result=_result_reference(suffix),
+                        evidence_references=(_artifact_evidence(),),
+                    )
+                )
+                return task, proposal
+
+            attempt_tasks = await asyncio.gather(
+                running_task("attempt-a"),
+                running_task("attempt-b"),
+            )
+            attempt_outcomes = await asyncio.gather(
+                first.begin_work_attempt(
+                    WorkAttemptCreate(
+                        attempt_id="postgres-global-shared-attempt",
+                        task_id=attempt_tasks[0].id,
+                        session_id=attempt_tasks[0].session_id or "missing-session",
+                        contract=contract.reference(),
+                        execution_profile_fingerprint=_digest("shared-attempt-a"),
+                    )
+                ),
+                second.begin_work_attempt(
+                    WorkAttemptCreate(
+                        attempt_id="postgres-global-shared-attempt",
+                        task_id=attempt_tasks[1].id,
+                        session_id=attempt_tasks[1].session_id or "missing-session",
+                        contract=contract.reference(),
+                        execution_profile_fingerprint=_digest("shared-attempt-b"),
+                    )
+                ),
+                return_exceptions=True,
+            )
+            assert sum(isinstance(value, WorkCompletionConflict) for value in attempt_outcomes) == 1
+            assert sum(not isinstance(value, BaseException) for value in attempt_outcomes) == 1
+
+            proposal_chains = await asyncio.gather(
+                unique_attempt("proposal-a"),
+                unique_attempt("proposal-b"),
+            )
+            proposal_outcomes = await asyncio.gather(
+                first.submit_completion_proposal(
+                    CompletionProposalCreate(
+                        proposal_id="postgres-global-shared-proposal",
+                        attempt_id=proposal_chains[0][1].attempt_id,
+                        result=_result_reference("shared-proposal-a"),
+                        evidence_references=(_artifact_evidence(),),
+                    )
+                ),
+                second.submit_completion_proposal(
+                    CompletionProposalCreate(
+                        proposal_id="postgres-global-shared-proposal",
+                        attempt_id=proposal_chains[1][1].attempt_id,
+                        result=_result_reference("shared-proposal-b"),
+                        evidence_references=(_artifact_evidence(),),
+                    )
+                ),
+                return_exceptions=True,
+            )
+            assert (
+                sum(isinstance(value, WorkCompletionConflict) for value in proposal_outcomes) == 1
+            )
+            assert sum(not isinstance(value, BaseException) for value in proposal_outcomes) == 1
+
+            claim_chains = await asyncio.gather(
+                unique_proposal("claim-a"),
+                unique_proposal("claim-b"),
+            )
+            claim_requests = tuple(
+                CompletionVerificationClaimRequest(
+                    claim_id="postgres-global-shared-claim",
+                    proposal_id=chain[1].proposal_id,
+                    worker_id=f"postgres-global-claim-worker-{index}",
+                    verifier=contract.verifier,
+                )
+                for index, chain in enumerate(claim_chains)
+            )
+            claim_outcomes = await asyncio.gather(
+                first.claim_completion_verification(claim_requests[0]),
+                second.claim_completion_verification(claim_requests[1]),
+                return_exceptions=True,
+            )
+            assert sum(isinstance(value, WorkCompletionConflict) for value in claim_outcomes) == 1
+            assert sum(not isinstance(value, BaseException) for value in claim_outcomes) == 1
+
+            decision_chains = await asyncio.gather(
+                unique_proposal("decision-a"),
+                unique_proposal("decision-b"),
+            )
+            decision_claims = await asyncio.gather(
+                first.claim_completion_verification(
+                    CompletionVerificationClaimRequest(
+                        claim_id="postgres-global-decision-claim-a",
+                        proposal_id=decision_chains[0][1].proposal_id,
+                        worker_id="postgres-global-decision-worker-a",
+                        verifier=contract.verifier,
+                    )
+                ),
+                second.claim_completion_verification(
+                    CompletionVerificationClaimRequest(
+                        claim_id="postgres-global-decision-claim-b",
+                        proposal_id=decision_chains[1][1].proposal_id,
+                        worker_id="postgres-global-decision-worker-b",
+                        verifier=contract.verifier,
+                    )
+                ),
+            )
+            decision_outcomes = await asyncio.gather(
+                first.record_completion_decision(
+                    _rejected_decision(
+                        proposal_id=decision_chains[0][1].proposal_id,
+                        claim_id=decision_claims[0].claim_id,
+                        worker_id=decision_claims[0].worker_id,
+                        decision_id="postgres-global-shared-decision",
+                    )
+                ),
+                second.record_completion_decision(
+                    _rejected_decision(
+                        proposal_id=decision_chains[1][1].proposal_id,
+                        claim_id=decision_claims[1].claim_id,
+                        worker_id=decision_claims[1].worker_id,
+                        decision_id="postgres-global-shared-decision",
+                    )
+                ),
+                return_exceptions=True,
+            )
+            assert (
+                sum(isinstance(value, WorkCompletionConflict) for value in decision_outcomes) == 1
+            )
+            assert sum(not isinstance(value, BaseException) for value in decision_outcomes) == 1
+
+            with pytest.raises(WorkCompletionConflict):
+                await first.begin_work_attempt(
+                    WorkAttemptCreate(
+                        attempt_id="postgres-global-shared-attempt",
+                        task_id="missing-global-identity-task",
+                        session_id="session:postgres:missing-global-identity-task",
+                        contract=contract.reference(),
+                        execution_profile_fingerprint=_digest("missing-attempt-parent"),
+                    )
+                )
+            with pytest.raises(WorkCompletionConflict):
+                await first.submit_completion_proposal(
+                    CompletionProposalCreate(
+                        proposal_id="postgres-global-shared-proposal",
+                        attempt_id="missing-global-identity-attempt",
+                        result=_result_reference("missing-proposal-parent"),
+                        evidence_references=(_artifact_evidence(),),
+                    )
+                )
+            with pytest.raises(WorkCompletionConflict):
+                await first.claim_completion_verification(
+                    CompletionVerificationClaimRequest(
+                        claim_id="postgres-global-shared-claim",
+                        proposal_id="missing-global-identity-proposal",
+                        worker_id="missing-global-identity-verifier",
+                        verifier=contract.verifier,
+                    )
+                )
+            with pytest.raises(WorkCompletionConflict):
+                await first.record_completion_decision(
+                    _rejected_decision(
+                        proposal_id="missing-global-identity-proposal",
+                        claim_id="missing-global-identity-claim",
+                        worker_id="missing-global-identity-verifier",
+                        decision_id="postgres-global-shared-decision",
+                    )
+                )
+        finally:
+            await first.close()
+            await second.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_decision_application_and_claim_replay_do_not_deadlock(postgres_dsn):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        first = _new_store(postgres_dsn)
+        second = _new_store(postgres_dsn)
+        contract = _contract(contract_id="postgres-application-lock-order")
+        try:
+            await first.publish_work_contract(contract)
+            task = await first.create_running_task(
+                TaskCreate(
+                    task_id="postgres-application-lock-order-task",
+                    type="verified-work",
+                    session_id="session:postgres:application-lock-order",
+                    work_contract=contract.reference(),
+                ),
+                session_invocation=unattributed_session_invocation_binding(
+                    "session:postgres:application-lock-order"
+                ),
+            )
+            attempt = await first.begin_work_attempt(
+                WorkAttemptCreate(
+                    attempt_id="postgres-application-lock-order-attempt",
+                    task_id=task.id,
+                    session_id=task.session_id or "missing-session",
+                    contract=contract.reference(),
+                    execution_profile_fingerprint=_digest("application-lock-order-profile"),
+                )
+            )
+            proposal = await first.submit_completion_proposal(
+                CompletionProposalCreate(
+                    proposal_id="postgres-application-lock-order-proposal",
+                    attempt_id=attempt.attempt_id,
+                    result=_result_reference("application-lock-order"),
+                    evidence_references=(_artifact_evidence(),),
+                )
+            )
+            claim_request = CompletionVerificationClaimRequest(
+                claim_id="postgres-application-lock-order-claim",
+                proposal_id=proposal.proposal_id,
+                worker_id="postgres-application-lock-order-verifier",
+                verifier=contract.verifier,
+            )
+            claim = await first.claim_completion_verification(claim_request)
+            decision = await first.record_completion_decision(
+                _rejected_decision(
+                    proposal_id=proposal.proposal_id,
+                    claim_id=claim.claim_id,
+                    worker_id=claim.worker_id,
+                    decision_id="postgres-application-lock-order-decision",
+                )
+            )
+            application = CompletionDecisionApplicationRequest(
+                task_id=task.id,
+                decision_id=decision.decision_id,
+                idempotency_key="postgres-application-lock-order-apply",
+            )
+
+            applied, replayed_claim = await asyncio.wait_for(
+                asyncio.gather(
+                    first.apply_completion_decision(application),
+                    second.claim_completion_verification(claim_request),
+                ),
+                timeout=5,
+            )
+            assert applied.status is TaskStatus.RUNNING
+            assert replayed_claim == claim
+        finally:
+            await first.close()
+            await second.close()
+
+    asyncio.run(run())
 
 
 def _retry_causal_budget_id(task: Task) -> str:
@@ -973,6 +1962,34 @@ def test_postgres_production_claim_uses_database_clock(postgres_dsn):
     asyncio.run(run())
 
 
+def test_postgres_reclaim_ignores_a_fast_process_clock(postgres_dsn, monkeypatch):
+    async def run() -> None:
+        from cayu.storage import postgres as postgres_module
+
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        try:
+            await store.create_task(TaskCreate(task_id="database-reclaim-clock", type="job"))
+            claimed = await store.claim_task("worker-a", lease_seconds=300)
+            assert claimed is not None
+
+            real_datetime = datetime
+
+            class FastProcessDatetime(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    value = real_datetime.now(UTC) + timedelta(days=1)
+                    return value if tz is None else value.astimezone(tz)
+
+            monkeypatch.setattr(postgres_module, "datetime", FastProcessDatetime)
+            assert await store.reclaim_expired(query=TaskQuery(type="job")) == []
+            assert await store.load_task(claimed.id) == claimed
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
 def test_postgres_task_store_task_topology_conformance(postgres_dsn):
     async def ops(store):
         await assert_task_topology_store_conformance(store)
@@ -1671,6 +2688,108 @@ def test_postgres_task_store_rejects_expired_claim_handoff(postgres_dsn):
             await store.heartbeat("task_expired_handoff", "worker_a")
 
     _run(postgres_dsn, ops)
+
+
+def test_postgres_heartbeat_rechecks_lease_after_row_lock_wait(postgres_dsn):
+    async def run() -> None:
+        import psycopg
+
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        blocker = await psycopg.AsyncConnection.connect(postgres_dsn)
+        try:
+            await store.ensure_schema()
+            await store.create_task(TaskCreate(task_id="heartbeat-lock-expiry", type="job"))
+            claimed = await store.claim_task("worker-a", lease_seconds=300)
+            assert claimed is not None
+
+            async with blocker.cursor() as cur:
+                await cur.execute(
+                    "UPDATE cayu_tasks "
+                    "SET lease_expires_at = clock_timestamp() + INTERVAL '250 milliseconds' "
+                    "WHERE id = %s",
+                    (claimed.id,),
+                )
+            heartbeat = asyncio.create_task(
+                store.heartbeat(claimed.id, "worker-a", extend_seconds=300)
+            )
+            await asyncio.sleep(0.05)
+            assert not heartbeat.done()
+            await asyncio.sleep(0.30)
+            await blocker.commit()
+
+            with pytest.raises(TaskClaimLost, match="has expired"):
+                await heartbeat
+            unchanged = await store.load_task(claimed.id)
+            assert unchanged is not None
+            assert unchanged.worker_id == "worker-a"
+            assert unchanged.lease_expires_at is not None
+            assert unchanged.lease_expires_at <= datetime.now(UTC)
+        finally:
+            await blocker.close()
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_retry_settlement_rechecks_lease_after_row_lock_wait(postgres_dsn):
+    async def run() -> None:
+        import psycopg
+
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        blocker = await psycopg.AsyncConnection.connect(postgres_dsn)
+        try:
+            await store.ensure_schema()
+            await store.create_task(
+                TaskCreate(
+                    task_id="retry-settlement-lock-expiry",
+                    type="job",
+                    retry_policy=TaskRetryPolicy(max_attempts=2),
+                )
+            )
+            claimed = await store.claim_task("worker-a", lease_seconds=300)
+            assert claimed is not None
+            request = TaskRetrySettlementRequest(
+                task_id=claimed.id,
+                worker_id="worker-a",
+                idempotency_key="lock-expiry-attempt",
+                causal_budget_id=_retry_causal_budget_id(claimed),
+                disposition=TaskRetryAttemptDisposition.RETRYABLE_FAILURE,
+                error={"code": "temporary"},
+            )
+
+            async with blocker.cursor() as cur:
+                await cur.execute(
+                    "UPDATE cayu_tasks "
+                    "SET lease_expires_at = clock_timestamp() + INTERVAL '250 milliseconds' "
+                    "WHERE id = %s",
+                    (claimed.id,),
+                )
+            settlement = asyncio.create_task(store.settle_task_retry_attempt(request))
+            await asyncio.sleep(0.05)
+            assert not settlement.done()
+            await asyncio.sleep(0.30)
+            await blocker.commit()
+
+            with pytest.raises(TaskClaimLost, match="has expired"):
+                await settlement
+            assert (
+                await store.load_task_retry_settlement(
+                    claimed.id,
+                    request.idempotency_key,
+                )
+                is None
+            )
+            unchanged = await store.load_task(claimed.id)
+            assert unchanged is not None
+            assert unchanged.status is TaskStatus.CLAIMED
+            assert unchanged.worker_id == "worker-a"
+        finally:
+            await blocker.close()
+            await store.close()
+
+    asyncio.run(run())
 
 
 def test_postgres_task_store_rejects_release_after_session_attachment(postgres_dsn):

@@ -231,8 +231,8 @@ def test_release_notes_preserve_storage_revision_chronology() -> None:
     assert "confirm revision 36 with no pending migrations" in v0_2_1
     assert "revision 39" not in v0_2_1
 
-    assert "advances from revision 36 to revision 47" in v0_3_0
-    assert "confirm revision 47 with no pending migrations" in v0_3_0
+    assert "advances from revision 36 to revision 49" in v0_3_0
+    assert "confirm revision 49 with no pending migrations" in v0_3_0
     assert "Revision 47 adds the origin-aware immutable Evals result index" in v0_3_0
     assert "revision-46 workers must be stopped before migration" in v0_3_0
     assert "Breaking schema revision 39" in v0_3_0
@@ -286,6 +286,45 @@ def test_project_worker_command_is_release_visible() -> None:
     assert "run_task_worker(" in guide
     for exit_code in ("`130`", "`143`", "`124`"):
         assert exit_code in guide
+
+
+def test_verified_work_durable_store_parity_and_migration_are_documented() -> None:
+    runtime_contract = " ".join(
+        (_REPO_ROOT / "docs" / "runtime-contracts.md").read_text(encoding="utf-8").split()
+    )
+    release_notes = " ".join(
+        (_REPO_ROOT / "docs" / "release-notes.md").read_text(encoding="utf-8").split()
+    )
+
+    for document in (runtime_contract, release_notes):
+        for required in (
+            "`InMemoryTaskStore`",
+            "`SQLiteTaskStore`",
+            "`PostgresTaskStore`",
+            "revision 49",
+            "Mixed-version",
+        ):
+            assert required in document
+
+    assert "Existing ordinary task rows migrate" in runtime_contract
+    assert "Existing ordinary tasks migrate" in release_notes
+    assert "Exact application replay returns its stored canonical snapshot" in runtime_contract
+    assert "Verification-claim replay is different" in runtime_contract
+    assert "An expired exact claim cannot regain verifier authority through replay" in (
+        runtime_contract
+    )
+    assert "Every exact replay returns" not in runtime_contract
+
+    for required in (
+        "persist the same contract, attempt, proposal, current claim, decision, task transition, and immutable application-receipt authority",
+        "An ordinary admission and contracted attachment",
+        "application-consistent backup",
+        "no historical contract or verifier evidence is inferred",
+    ):
+        assert required in runtime_contract
+
+    assert "does not persist work contracts" not in release_notes
+    assert "does not persist work contracts" not in runtime_contract
 
 
 def test_mcp_transport_limits_are_documented_as_one_shared_contract() -> None:

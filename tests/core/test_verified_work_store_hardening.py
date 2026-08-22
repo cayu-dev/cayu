@@ -11,6 +11,7 @@ from tests.core.task_invocation_fixtures import (
 )
 
 from cayu import (
+    CayuApp,
     CompletionCriterionOutcome,
     CompletionDecision,
     CompletionDecisionApplicationRequest,
@@ -41,6 +42,24 @@ from cayu import (
     work_contract_from_draft,
 )
 from cayu.runtime import tasks as tasks_module
+from cayu.storage import _postgres_verified_work as postgres_verified_work
+from cayu.storage._postgres_verified_work import PostgresVerifiedWorkMixin
+from cayu.vaults import SecretRedactor
+
+
+def _allow_test_postgres_mutation_boundary(monkeypatch) -> None:
+    """Let focused owner tests use small fakes instead of a live driver."""
+
+    monkeypatch.setattr(
+        postgres_verified_work,
+        "_require_quiescent_postgres_mutation_pool",
+        lambda _pool, *, allowed_configure=None: None,
+    )
+    monkeypatch.setattr(
+        postgres_verified_work,
+        "_require_quiescent_postgres_mutation_connection",
+        lambda _connection: None,
+    )
 
 
 def _digest(value: str) -> str:
@@ -544,5 +563,513 @@ def test_contracted_session_authority_does_not_scan_unrelated_tasks() -> None:
             await store.admit_ordinary_session_execution(session_id)
         await store.admit_ordinary_session_execution("session:uncontracted")
         assert tasks.values_call_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_postgres_task_store_rejects_unproven_mutation_connection_class() -> None:
+    from psycopg import AsyncConnection
+    from psycopg_pool import AsyncConnectionPool
+
+    from cayu import PostgresTaskStore
+
+    class CancellationResistantConnection(AsyncConnection):
+        pass
+
+    pool = AsyncConnectionPool(
+        "",
+        connection_class=CancellationResistantConnection,
+        open=False,
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="require the built-in psycopg AsyncConnection implementation",
+    ):
+        PostgresTaskStore(pool=pool)
+
+
+def test_postgres_task_store_rejects_unproven_mutation_pool_subclass() -> None:
+    from psycopg_pool import AsyncConnectionPool
+
+    from cayu import PostgresTaskStore
+
+    class CancellationResistantPool(AsyncConnectionPool):
+        pass
+
+    pool = CancellationResistantPool("", open=False)
+
+    with pytest.raises(
+        TypeError,
+        match="require the built-in AsyncConnectionPool implementation",
+    ):
+        PostgresTaskStore(pool=pool)
+
+
+@pytest.mark.parametrize(
+    ("callback_option", "message"),
+    [
+        ("check", "pool check callback"),
+        ("configure", "unverified pool configure callback"),
+        ("reset", "pool reset callback"),
+        ("reconnect_failed", "pool reconnect callback"),
+    ],
+)
+def test_postgres_task_store_rejects_unproven_pool_callbacks(
+    callback_option: str,
+    message: str,
+) -> None:
+    from psycopg_pool import AsyncConnectionPool
+
+    from cayu import PostgresTaskStore
+
+    async def callback(_owner) -> None:
+        await asyncio.Event().wait()
+
+    pool = AsyncConnectionPool(
+        "",
+        open=False,
+        **{callback_option: callback},
+    )
+
+    with pytest.raises(TypeError, match=message):
+        PostgresTaskStore(pool=pool)
+
+
+def test_postgres_task_store_rejects_connection_behavior_factories() -> None:
+    from psycopg import AsyncCursor
+    from psycopg_pool import AsyncConnectionPool
+
+    from cayu import PostgresTaskStore
+
+    class CancellationResistantCursor(AsyncCursor):
+        pass
+
+    pool = AsyncConnectionPool(
+        "",
+        open=False,
+        kwargs={"cursor_factory": CancellationResistantCursor},
+    )
+
+    with pytest.raises(TypeError, match="connection behavior factories"):
+        PostgresTaskStore(pool=pool)
+
+
+def test_postgres_task_store_revalidates_pool_before_lazy_readiness() -> None:
+    from psycopg_pool import AsyncConnectionPool
+
+    from cayu import PostgresTaskStore
+
+    pool = AsyncConnectionPool("", open=False)
+    store = PostgresTaskStore(pool=pool)
+
+    async def cancellation_resistant_check(_connection) -> None:
+        await asyncio.Event().wait()
+
+    pool._check = cancellation_resistant_check
+
+    async def scenario() -> None:
+        with pytest.raises(TypeError, match="pool check callback"):
+            await store.load_task("pool-drift-must-fail-before-readiness")
+
+    asyncio.run(scenario())
+
+
+def test_postgres_task_store_accepts_static_nonbehavioral_pool_options() -> None:
+    from psycopg_pool import AsyncConnectionPool
+
+    from cayu import PostgresTaskStore
+
+    pool = AsyncConnectionPool(
+        "",
+        open=False,
+        kwargs={"prepare_threshold": None},
+    )
+
+    assert PostgresTaskStore(pool=pool)._pool is pool
+
+
+def test_postgres_verified_work_rollback_failure_preserves_primary_and_fences_connection(
+    monkeypatch,
+) -> None:
+    _allow_test_postgres_mutation_boundary(monkeypatch)
+    primary = ValueError("primary mutation failure")
+    rollback_failure = RuntimeError("rollback failure")
+
+    class Cursor:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Connection:
+        def __init__(self) -> None:
+            self.closed = False
+            self.pgconn = PgConnection(self)
+
+        def cursor(self):
+            return Cursor()
+
+        async def commit(self) -> None:
+            raise AssertionError("failing operation must not commit")
+
+        async def rollback(self) -> None:
+            raise rollback_failure
+
+        async def close(self) -> None:
+            raise AssertionError("rollback fencing must not call close()")
+
+    class PgConnection:
+        def __init__(self, connection: Connection) -> None:
+            self.connection = connection
+            self.finish_count = 0
+
+        def finish(self) -> None:
+            self.finish_count += 1
+            self.connection.closed = True
+
+    connection = Connection()
+
+    class ConnectionContext:
+        async def __aenter__(self):
+            return connection
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Pool:
+        def connection(self):
+            return ConnectionContext()
+
+    class Store(PostgresVerifiedWorkMixin):
+        _pool = Pool()
+
+    async def scenario() -> None:
+        async def operation(conn, cursor) -> None:
+            del conn, cursor
+            raise primary
+
+        with pytest.raises(BaseExceptionGroup) as captured:
+            await Store()._run_verified_work_mutation(operation)
+
+        assert captured.value.exceptions == (primary, rollback_failure)
+        assert connection.closed is True
+        assert connection.pgconn.finish_count == 1
+        assert rollback_failure.__context__ is None
+
+    asyncio.run(scenario())
+
+
+def test_postgres_cancelled_mutation_closes_exact_connection_before_return(
+    monkeypatch,
+) -> None:
+    _allow_test_postgres_mutation_boundary(monkeypatch)
+    monkeypatch.setattr(
+        postgres_verified_work,
+        "_POSTGRES_MUTATION_CANCELLATION_GRACE_SECONDS",
+        0.01,
+    )
+
+    async def scenario() -> None:
+        operation_started = asyncio.Event()
+        cancellation_received = asyncio.Event()
+        connection_closed = asyncio.Event()
+
+        class Cursor:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        class Connection:
+            def __init__(self) -> None:
+                self.closed = False
+                self.commit_count = 0
+                self.rollback_count = 0
+                self.pgconn = PgConnection(self)
+
+            def cursor(self):
+                return Cursor()
+
+            async def commit(self) -> None:
+                self.commit_count += 1
+
+            async def rollback(self) -> None:
+                self.rollback_count += 1
+
+        class PgConnection:
+            def __init__(self, connection: Connection) -> None:
+                self.connection = connection
+
+            def finish(self) -> None:
+                self.connection.closed = True
+                connection_closed.set()
+
+        connection = Connection()
+
+        class ConnectionContext:
+            async def __aenter__(self):
+                return connection
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        class Pool:
+            def connection(self):
+                return ConnectionContext()
+
+        class Store(PostgresVerifiedWorkMixin):
+            _pool = Pool()
+
+        async def operation(conn, cursor) -> None:
+            del conn, cursor
+            operation_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Model a driver operation that cannot finish its cancellation
+                # unwind until the exact checked-out connection is discarded.
+                cancellation_received.set()
+                await connection_closed.wait()
+                raise
+
+        caller = asyncio.create_task(Store()._run_verified_work_mutation(operation))
+        await operation_started.wait()
+        caller.cancel("stop blocked Postgres mutation")
+        assert caller.cancelling() == 1
+        await cancellation_received.wait()
+        caller.cancel("repeat blocked Postgres mutation cancellation")
+        assert caller.cancelling() == 2
+        with pytest.raises(asyncio.CancelledError, match="stop blocked Postgres mutation"):
+            await caller
+
+        assert caller.cancelled()
+        assert caller.cancelling() == 2
+        assert connection.closed is True
+        assert connection.commit_count == 0
+        assert connection.rollback_count == 1
+        assert not any(
+            task.get_name() == "cayu-postgres-store-mutation" for task in asyncio.all_tasks()
+        )
+
+    asyncio.run(scenario())
+
+
+def test_postgres_cancelled_mutation_preserves_owner_and_abort_failures(
+    monkeypatch,
+) -> None:
+    _allow_test_postgres_mutation_boundary(monkeypatch)
+    monkeypatch.setattr(
+        postgres_verified_work,
+        "_POSTGRES_MUTATION_CANCELLATION_GRACE_SECONDS",
+        0.01,
+    )
+
+    primary_rollback_failure = RuntimeError("rollback after cancellation failed")
+    abort_failure = OSError("physical abort reported failure")
+
+    async def scenario() -> None:
+        operation_started = asyncio.Event()
+        connection_aborted = asyncio.Event()
+
+        class Cursor:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        class Connection:
+            def __init__(self) -> None:
+                self.closed = False
+                self.pgconn = PgConnection(self)
+
+            def cursor(self):
+                return Cursor()
+
+            async def commit(self) -> None:
+                raise AssertionError("cancelled mutation must not commit")
+
+            async def rollback(self) -> None:
+                await connection_aborted.wait()
+                raise primary_rollback_failure
+
+            async def close(self) -> None:
+                self.closed = True
+
+        class PgConnection:
+            def __init__(self, connection: Connection) -> None:
+                self.connection = connection
+
+            def finish(self) -> None:
+                self.connection.closed = True
+                connection_aborted.set()
+                raise abort_failure
+
+        connection = Connection()
+
+        class ConnectionContext:
+            async def __aenter__(self):
+                return connection
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        class Pool:
+            def connection(self):
+                return ConnectionContext()
+
+        class Store(PostgresVerifiedWorkMixin):
+            _pool = Pool()
+
+        async def operation(conn, cursor) -> None:
+            del conn, cursor
+            operation_started.set()
+            await asyncio.Event().wait()
+
+        caller = asyncio.create_task(Store()._run_verified_work_mutation(operation))
+        await operation_started.wait()
+        caller.cancel("cancel with compound settlement failures")
+
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await caller
+
+        assert captured.value.args == ("cancel with compound settlement failures",)
+        cause = captured.value.__cause__
+        assert isinstance(cause, BaseExceptionGroup)
+        assert len(cause.exceptions) == 2
+        owner_failure, retained_abort_failure = cause.exceptions
+        assert isinstance(owner_failure, BaseExceptionGroup)
+        assert owner_failure.exceptions == (primary_rollback_failure,)
+        assert retained_abort_failure is abort_failure
+        assert connection.closed is True
+        assert not any(
+            task.get_name() == "cayu-postgres-store-mutation" for task in asyncio.all_tasks()
+        )
+
+    asyncio.run(scenario())
+
+
+def test_public_boundary_preserves_redacted_postgres_cancellation_settlement_failures(
+    monkeypatch,
+) -> None:
+    _allow_test_postgres_mutation_boundary(monkeypatch)
+    monkeypatch.setattr(
+        postgres_verified_work,
+        "_POSTGRES_MUTATION_CANCELLATION_GRACE_SECONDS",
+        0.01,
+    )
+    secret = "postgres.settlement.secret"
+
+    async def scenario() -> None:
+        operation_started = asyncio.Event()
+        connection_aborted = asyncio.Event()
+
+        class Cursor:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        class Connection:
+            def __init__(self) -> None:
+                self.closed = False
+                self.pgconn = PgConnection(self)
+
+            def cursor(self):
+                return Cursor()
+
+            async def commit(self) -> None:
+                raise AssertionError("cancelled mutation must not commit")
+
+            async def rollback(self) -> None:
+                await connection_aborted.wait()
+                raise RuntimeError(f"rollback failed with {secret}")
+
+            async def close(self) -> None:
+                self.closed = True
+
+        class PgConnection:
+            def __init__(self, connection: Connection) -> None:
+                self.connection = connection
+
+            def finish(self) -> None:
+                self.connection.closed = True
+                connection_aborted.set()
+                raise OSError(f"abort failed with {secret}")
+
+        connection = Connection()
+
+        class ConnectionContext:
+            async def __aenter__(self):
+                return connection
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        class Pool:
+            def connection(self):
+                return ConnectionContext()
+
+        class Store(PostgresVerifiedWorkMixin, InMemoryTaskStore):
+            verified_work_mutations_are_cancellation_quiescent = True
+            _pool = Pool()
+
+            async def publish_work_contract(self, contract: WorkContract) -> WorkContract:
+                async def operation(conn, cursor) -> WorkContract:
+                    del conn, cursor
+                    operation_started.set()
+                    await asyncio.Event().wait()
+                    return contract
+
+                return await self._run_verified_work_mutation(operation)
+
+        app = CayuApp(
+            task_store=Store(),
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        draft = WorkContractDraft(
+            contract_id="postgres-settlement-boundary-contract",
+            version=1,
+            objective="Preserve bounded settlement evidence.",
+            criteria=(
+                WorkCriterion(
+                    criterion_id="settlement",
+                    ordinal=1,
+                    description="Settlement failures remain observable.",
+                ),
+            ),
+            verifier=CompletionVerifierRef(
+                verifier_id="deterministic-settlement",
+                version="v1",
+                configuration_fingerprint=_digest("deterministic-settlement-v1"),
+            ),
+        )
+        caller = asyncio.create_task(app.create_work_contract(draft))
+        await operation_started.wait()
+        caller.cancel("cancel public Postgres mutation")
+
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await caller
+
+        assert caller.cancelled()
+        assert captured.value.args == ("cancel public Postgres mutation",)
+        cause = captured.value.__cause__
+        assert isinstance(cause, BaseExceptionGroup)
+        pending: list[BaseException] = [cause]
+        leaves: list[BaseException] = []
+        while pending:
+            candidate = pending.pop()
+            if isinstance(candidate, BaseExceptionGroup):
+                pending.extend(reversed(candidate.exceptions))
+            else:
+                leaves.append(candidate)
+        assert len(leaves) == 2
+        assert all(secret not in str(leaf) and secret not in repr(leaf) for leaf in leaves)
+        assert connection.closed is True
 
     asyncio.run(scenario())

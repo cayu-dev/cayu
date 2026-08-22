@@ -239,12 +239,12 @@ workers together. The server contract advances from version 10 to version 16,
 and the public application manifest and generator plan advance from schema 7
 to schema 9.
 
-The storage schema advances from revision 36 to revision 47. Follow the
-revision-specific migration boundaries below: revisions 39 through 47 contain
+The storage schema advances from revision 36 to revision 49. Follow the
+revision-specific migration boundaries below: revisions 39 through 49 contain
 breaking durable contracts, and populated legacy knowledge or task stores may
 require the explicitly documented rebuild or drain procedure. Run `cayu storage
 status` followed by `cayu storage migrate` against every configured SQLite or
-PostgreSQL store, and confirm revision 47 with no pending migrations before
+PostgreSQL store, and confirm revision 49 with no pending migrations before
 starting `v0.3.0` workers. Mixed-version deployment and application-only
 rollback across these boundaries are unsupported.
 
@@ -685,10 +685,46 @@ continue to reconcile from convergent durable claim and decision indexes,
 including revision-1 claims whose absent execution-owner field retains its
 historical request digest.
 
-This is the deterministic execution-to-decision slice of verified work. It does
-not yet add provider-backed judges, an automatic continuation/application
-worker, or verified-work persistence to built-in SQLite and PostgreSQL task
-stores.
+This is the deterministic execution-to-decision slice of verified work. The
+complete contract, task binding, attempt, proposal, verifier claim, decision,
+and decision-application receipt lifecycle now persists with matching semantics
+in `InMemoryTaskStore`, `SQLiteTaskStore`, and `PostgresTaskStore`. Session
+execution authority is also durable: an ordinary admission and a contracted
+task attachment race to one database-owned decision, and neither process
+restart nor task terminalization weakens the winner.
+
+Breaking storage revision 49 adds those task-store records and the task's
+immutable contract reference. Stop all revision-48 and older task workers,
+take an application-consistent backup, run `cayu storage migrate`, and confirm
+revision 49 before starting current workers. Existing ordinary tasks migrate
+with no contract binding. Mixed-version task workers and application-only
+rollback are unsupported because older workers can complete contracted tasks
+through an ordinary terminal entrance.
+
+Every concrete `InMemoryTaskStore`, `SQLiteTaskStore`, and `PostgresTaskStore`
+subclass must explicitly re-establish the documented
+`verified_work_mutations_are_cancellation_quiescent` proof, including when its
+public verified-work mutations are inherited unchanged. This prevents an
+extension from inheriting settlement authority after replacing a readiness
+hook, wrapper, or other dynamically resolved dependency.
+Externally managed pools supplied to `PostgresTaskStore` must likewise retain
+the exact built-in `AsyncConnectionPool` and psycopg async connection classes;
+custom pool or connection subclasses, pool callbacks, callable configuration,
+and custom row/cursor behavior cannot establish the built-in mutation
+settlement proof and are rejected before database dispatch.
+PostgreSQL worker-lease attachment, heartbeat, release, retry settlement, and
+terminalization now sample PostgreSQL's current clock after the authoritative
+row-lock wait. Reclamation uses one PostgreSQL clock value in its single
+`FOR UPDATE SKIP LOCKED` statement, so locked rows are skipped and newly expired
+leases become eligible on the next poll. Process-clock skew and a transaction
+timestamp captured before contention can no longer renew, settle, or reclaim the
+wrong lease. If caller cancellation encounters rollback, abort, or unwind
+failures, the public `CancelledError` remains authoritative and carries one
+bounded, redacted cause with that ordered settlement evidence through the runtime
+API.
+
+This slice still does not add provider-backed judges or an automatic
+continuation/application worker.
 
 ### Durable tasks retain immutable invocation provenance
 

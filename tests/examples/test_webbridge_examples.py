@@ -61,6 +61,8 @@ from cayu.vaults import ResolvedSecret
 
 
 class _ConcurrentSettlementSQLiteTaskStore(SQLiteTaskStore):
+    verified_work_mutations_are_cancellation_quiescent = True
+
     def __init__(self, path: Path, *, terminal_status: TaskStatus) -> None:
         super().__init__(path)
         self._terminal_status = terminal_status

@@ -30,6 +30,7 @@ from cayu.runtime._task_store_operation_boundary import (
     TaskStoreOperationOutcome,
     capture_sensitive_validation,
     capture_task_store_operation,
+    raise_task_store_operation_failure,
 )
 from cayu.runtime.completion_verifiers import (
     CompletionVerifierExecutionError,
@@ -80,6 +81,7 @@ _ModelT = TypeVar("_ModelT", bound=BaseModel)
 _ExecutionKey = str
 _MAX_ACTIVE_COMPLETION_VERIFIERS = 64
 _BASE_EXCEPTION_ARGS_DESCRIPTOR = BaseException.__dict__["args"]
+_BASE_EXCEPTION_CAUSE_DESCRIPTOR = BaseException.__dict__["__cause__"]
 
 
 class _ClaimHeartbeatCancellationMarker:
@@ -379,6 +381,7 @@ def _prune_exception_graph(
     error: BaseException,
     *,
     should_prune: Callable[[BaseException], bool],
+    pruned_leaf_replacement: Callable[[BaseException], BaseException | None] | None = None,
 ) -> BaseException | None:
     """Remove authenticated leaves without recursive or extension-owned traversal."""
 
@@ -415,7 +418,13 @@ def _prune_exception_graph(
                 prune = should_prune(candidate)
             except BaseException:
                 prune = False
-            rebuilt_by_token[token] = None if prune else candidate
+            replacement: BaseException | None = None
+            if prune and pruned_leaf_replacement is not None:
+                try:
+                    replacement = pruned_leaf_replacement(candidate)
+                except BaseException:
+                    replacement = None
+            rebuilt_by_token[token] = replacement if prune else candidate
             continue
         children = exception_group_children(candidate)
         if children is None:
@@ -499,9 +508,30 @@ def _ordered_failure_group(
             group,
             pending_cancellation_requests,
         )
-    group = credential_safe_runtime_exception_group(
+    group = _credential_safe_verifier_group(
         group,
         group_message=message,
+        redactor=redactor,
+    )
+    if pending_cancellation_requests:
+        retain_workspace_observation_pending_cancellation_requests(
+            group,
+            pending_cancellation_requests,
+        )
+    return group
+
+
+def _credential_safe_verifier_group(
+    error: BaseExceptionGroup,
+    *,
+    group_message: str,
+    redactor: SecretRedactor,
+) -> BaseExceptionGroup:
+    """Validate one group after every runtime-owned composition step."""
+
+    return credential_safe_runtime_exception_group(
+        error,
+        group_message=group_message,
         leaf_mapper=lambda leaf: leaf,
         invalid_leaf_factory=lambda: CompletionVerifierExecutionError(
             "Concurrent failure group was invalid."
@@ -515,12 +545,6 @@ def _ordered_failure_group(
         ),
         redactor=redactor,
     )
-    if pending_cancellation_requests:
-        retain_workspace_observation_pending_cancellation_requests(
-            group,
-            pending_cancellation_requests,
-        )
-    return group
 
 
 class CompletionVerifierCoordinator:
@@ -597,7 +621,7 @@ class CompletionVerifierCoordinator:
         if validation.failure is not None:
             failure = validation.failure
             del validation, verifier
-            raise failure from None
+            raise_task_store_operation_failure(failure)
         copied = validation.result
         del validation
         if copied is None:
@@ -740,7 +764,7 @@ class CompletionVerifierCoordinator:
             except BaseException as failure:
                 del existing
                 del claim, existing_validation, authority, store_owner
-                raise failure from None
+                raise_task_store_operation_failure(failure)
 
         if authority.contract.verifier.kind is not CompletionVerifierKind.DETERMINISTIC:
             raise credential_safe_runtime_exception(
@@ -804,7 +828,7 @@ class CompletionVerifierCoordinator:
                 mutation_method_name="claim_completion_verification",
             )
             if claim_outcome.failure is not None:
-                raise claim_outcome.failure from None
+                raise_task_store_operation_failure(claim_outcome.failure)
             claim_validation = _copy_exact_model(
                 claim_outcome.result,
                 CompletionVerificationClaim,
@@ -863,7 +887,7 @@ class CompletionVerifierCoordinator:
             del verifier, authority, store_owner
             if propagated is None:  # pragma: no cover - primary failure is authoritative
                 raise AssertionError("Completion verifier failure was lost.") from None
-            raise propagated from None
+            raise_task_store_operation_failure(propagated)
         finally:
             self._release_adapter_capacity_reservation(capacity_reservation)
         try:
@@ -891,7 +915,7 @@ class CompletionVerifierCoordinator:
             del outcome, verifier, claim, claim_request, authority, store_owner
             if propagated is None:  # pragma: no cover - primary failure is authoritative
                 raise AssertionError("Completion decision publication failure was lost.") from None
-            raise propagated from None
+            raise_task_store_operation_failure(propagated)
         if heartbeat is not None:
             settlement = await self._settle_claim_heartbeat(heartbeat)
             propagated = self._failure_after_heartbeat_settlement(
@@ -902,7 +926,7 @@ class CompletionVerifierCoordinator:
             del settlement
             if propagated is not None:
                 del decision, outcome, verifier, claim, claim_request, authority, store_owner
-                raise propagated from None
+                raise_task_store_operation_failure(propagated)
         return decision
 
     async def _load_verifier_authority(
@@ -990,7 +1014,7 @@ class CompletionVerifierCoordinator:
             )
         except BaseException as failure:
             del proposal, attempt, contract, context_validation, adapter_request, store_owner
-            raise failure from None
+            raise_task_store_operation_failure(failure)
 
     async def _publish_adapter_outcome(
         self,
@@ -1050,7 +1074,7 @@ class CompletionVerifierCoordinator:
                 # for ordinary failures.  Cancellation and process-control
                 # signals remain authoritative even if the mutation committed.
                 if not isinstance(failure, Exception):
-                    raise failure from None
+                    raise_task_store_operation_failure(failure)
                 try:
                     reconciled = await self._load_converged_decision(
                         store_owner,
@@ -1078,7 +1102,7 @@ class CompletionVerifierCoordinator:
                     raise combined from None
                 if reconciliation_matches:
                     return reconciled
-                raise failure from None
+                raise_task_store_operation_failure(failure)
             decision_validation = _copy_exact_model(
                 record_outcome.result,
                 CompletionDecision,
@@ -1114,7 +1138,7 @@ class CompletionVerifierCoordinator:
             del decision_request, contract, attempt, proposal, store_owner
             del record_outcome, reconciled, decision_validation, decision, indexed_decision
             del contract_validation
-            raise failure from None
+            raise_task_store_operation_failure(failure)
 
     def _require_store(self) -> TaskStore:
         store = self._task_store
@@ -1141,7 +1165,7 @@ class CompletionVerifierCoordinator:
             redactor=self._secret_redactor,
         )
         if outcome.failure is not None:
-            raise outcome.failure from None
+            raise_task_store_operation_failure(outcome.failure)
         if outcome.result is None:
             raise KeyError(f"{operation_name.removesuffix(' lookup')} not found.") from None
         validation = _copy_exact_model(
@@ -1186,7 +1210,7 @@ class CompletionVerifierCoordinator:
             redactor=self._secret_redactor,
         )
         if outcome.failure is not None:
-            raise outcome.failure from None
+            raise_task_store_operation_failure(outcome.failure)
         if outcome.result is None:
             return None
         validation = _copy_exact_model(
@@ -1218,7 +1242,7 @@ class CompletionVerifierCoordinator:
             redactor=self._secret_redactor,
         )
         if outcome.failure is not None:
-            raise outcome.failure from None
+            raise_task_store_operation_failure(outcome.failure)
         if outcome.result is None:
             return None
         validation = _copy_exact_model(
@@ -1466,7 +1490,7 @@ class CompletionVerifierCoordinator:
             mutation_method_name="renew_completion_verification_claim",
         )
         if outcome.failure is not None:
-            raise outcome.failure from None
+            raise_task_store_operation_failure(outcome.failure)
         validation = _copy_exact_model(
             outcome.result,
             CompletionVerificationClaim,
@@ -1550,12 +1574,36 @@ class CompletionVerifierCoordinator:
                 return
             except TimeoutError:
                 pass
-            current = await self._renew_claim(
-                store_owner,
-                claim_request,
-                execution_request,
-                prior_claim=current,
-            )
+            try:
+                current = await self._renew_claim(
+                    store_owner,
+                    claim_request,
+                    execution_request,
+                    prior_claim=current,
+                )
+            except asyncio.CancelledError as cancellation:
+                try:
+                    settlement_evidence = _BASE_EXCEPTION_CAUSE_DESCRIPTOR.__get__(
+                        cancellation,
+                        BaseException,
+                    )
+                except BaseException:
+                    settlement_evidence = RuntimeError(
+                        "Completion-verification claim renewal settlement "
+                        "evidence was inaccessible."
+                    )
+                if settlement_evidence is None:
+                    raise
+                # A Task may normalize its terminal CancelledError before an
+                # owner calls result(), losing an explicit cause. Publish the
+                # already-detached evidence as a sibling while still inside
+                # the private heartbeat task. Settlement later removes only
+                # this authenticated shutdown cancellation.
+                cancellation.__cause__ = None
+                raise BaseExceptionGroup(
+                    "Completion-verification claim renewal was cancelled during settlement.",
+                    [settlement_evidence, cancellation],
+                ) from None
 
     @staticmethod
     def _request_claim_heartbeat_stop(heartbeat: _ClaimHeartbeat) -> bool:
@@ -1599,7 +1647,29 @@ class CompletionVerifierCoordinator:
                     return True
                 return False
 
-            failure = _prune_exception_graph(failure, should_prune=is_owned_shutdown)
+            def shutdown_settlement_evidence(
+                leaf: BaseException,
+            ) -> BaseException | None:
+                try:
+                    cause = _BASE_EXCEPTION_CAUSE_DESCRIPTOR.__get__(leaf, BaseException)
+                except BaseException:
+                    return RuntimeError(
+                        "Completion-verification claim renewal settlement "
+                        "evidence was inaccessible."
+                    )
+                return cause if isinstance(cause, BaseException) else None
+
+            failure = _prune_exception_graph(
+                failure,
+                should_prune=is_owned_shutdown,
+                pruned_leaf_replacement=shutdown_settlement_evidence,
+            )
+            if isinstance(failure, BaseExceptionGroup):
+                failure = _credential_safe_verifier_group(
+                    failure,
+                    group_message="Completion verifier heartbeat settlement failed.",
+                    redactor=self._secret_redactor,
+                )
         caller_cancellation = (
             None
             if shielded.cancellation is None

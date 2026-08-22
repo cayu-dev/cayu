@@ -2682,11 +2682,20 @@ that owns a verified-work mutation must also declare
 implementation owner before Cayu will call the mutation. The declaration means
 every such awaitable has stopped all mutation—including work delegated to
 threads, executors, remote clients, or other tasks—before it returns or raises
-after cancellation. A subclass can use an unchanged inherited mutation under
-its owner's proof unless the subclass explicitly revokes the guarantee, but
-each override is a new implementation and must repeat the declaration after
-verifying its own behavior. Instance-shadowed methods and classes with dynamic
-attribute lookup do not provide stable structural proof and are rejected.
+after cancellation. Every concrete subclass must repeat the declaration even
+when it inherits the public mutation unchanged: subclass-owned readiness hooks,
+wrappers, or other dynamically resolved dependencies can change the mutation's
+settlement behavior. Each declaration is therefore positive evidence for that
+concrete implementation graph, not an inherited capability. Instance-shadowed
+public mutation methods and classes with dynamic attribute lookup do not provide
+stable structural proof and are rejected.
+`PostgresTaskStore` applies the same fail-closed rule to its driver boundary:
+an externally managed pool must use the exact built-in `AsyncConnectionPool`
+and psycopg async connection implementations whose physical-abort and context
+settlement behavior establishes the store's cancellation-quiescence proof. It
+must also use static connection configuration without pool callbacks or custom
+row/cursor behavior. Cayu revalidates that boundary before database readiness
+and mutation ownership; unsupported configuration fails before dispatch.
 Stores that cannot make this
 guarantee must leave the declaration false and expose a separate owned
 settlement boundary before opting in. Read-only verified-work lookups do not
@@ -2697,6 +2706,12 @@ queue claiming, and contracted-task parking; an override of any one of those
 methods must independently satisfy the same contract before the worker begins
 its claim loop. Ordinary stores retain the direct worker-call exception and
 cancellation behavior that predates verified-work support.
+When caller cancellation triggers PostgreSQL rollback, physical abort, or
+Python unwind failures, caller cancellation remains the public authoritative
+signal and carries one detached, workload-secret-redacted cause containing the
+ordered settlement failures. Every runtime layer that transports the detached
+cancellation preserves that explicit cause; it must not reconstruct a clean
+cancellation and discard the settlement evidence.
 The ordinary built-in task worker does not execute contract-bound tasks. After
 claiming one, it atomically parks the task in `needs_attention` with
 `status_reason="verified_work_contract_runner_required"`; that claimed item
@@ -2798,10 +2813,12 @@ A different claim tuple or decision publication remains a conflict. This method
 ends at durable decision publication: it deliberately does not call
 `apply_completion_decision(...)`, transition the task or session, create a
 hidden continuation loop, or add provider-verifier usage. Those are separate
-verified-work lifecycle boundaries. At present, only `TaskStore`
-implementations that opt into the verified-work capability can use this API;
-`InMemoryTaskStore` remains the built-in reference implementation for that
-lifecycle.
+verified-work lifecycle boundaries. Only `TaskStore` implementations that opt
+into the verified-work capability can use this API. All three built-in task
+stores implement the complete lifecycle: `InMemoryTaskStore` is the
+process-local reference, while `SQLiteTaskStore` and `PostgresTaskStore`
+persist the same contract, attempt, proposal, current claim, decision, task
+transition, and immutable application-receipt authority.
 
 `InMemoryTaskStore(clock=...)` uses its injectable clock for availability,
 retry-series timing, and verified-work attempt, proposal, claim, and decision
@@ -2811,15 +2828,54 @@ lifecycle timestamps, for the immutable receipt's `applied_at` and any matching
 `Task.updated_at` or `Task.completed_at` transition. Exact application replay
 returns the original receipt snapshot before consulting either clock.
 
+`SQLiteTaskStore(clock=...)` and `PostgresTaskStore(clock=...)` apply that same
+split: the injected clock controls attempt, proposal, claim, and decision
+evidence, while worker leases and core task lifecycle transitions use wall-clock
+UTC or PostgreSQL's current database clock. A custom verifier clock therefore
+cannot expire worker authority or move task timestamps. Exact application replay
+returns its stored canonical snapshot without reading either source of time.
+Verification-claim replay is different: it re-evaluates the claim against the
+current verifier clock and returns the stored claim only while its lease remains
+live or a durable decision has already closed the proposal. An expired exact
+claim cannot regain verifier authority through replay.
+
 The in-memory store also maintains contracted-session authority in a dedicated
 session index under the same lock as task publication and ordinary-session
 admission. Contracted creation, running creation, start, and attachment update
 the index atomically with the task snapshot. Multiple contracted tasks may bind
 one session; any binding denies ordinary execution. Terminalization does not
 remove a binding, because no verifier-aware release operation exists yet. The
-index is an in-memory implementation detail rather than a new `TaskStore` API;
-other supporting stores must provide an equivalent bounded, atomic authority
-decision.
+index is an in-memory implementation detail rather than a new `TaskStore` API.
+SQLite and PostgreSQL persist the equivalent decision in
+`cayu_task_session_execution_authority`, in the same writer transaction as
+contracted creation, start, or attachment. PostgreSQL row locking and SQLite's
+immediate writer transaction serialize separate processes and store instances.
+An ordinary admission and contracted attachment therefore have exactly one
+winner; the losing mutation publishes neither a task update nor substitute
+authority. That row is retained across terminalization and restart because no
+verifier-aware release operation exists yet.
+
+PostgreSQL serializes each global attempt, proposal, claim, and decision identity
+before taking one transaction-scoped authority lock for the affected task. This
+keeps cross-scope identity collisions typed and gives every lifecycle mutation a
+common first lock before it acquires its detailed rows. Blocking worker-lease
+attachment, renewal, release, retry settlement, and terminalization use the
+current database clock after their authoritative row-lock wait, never a process
+clock or the transaction's pre-wait start time. Reclamation evaluates eligibility
+against one database-clock value inside its single `FOR UPDATE SKIP LOCKED`
+statement; locked work is skipped, and a lease that expires after that statement's
+eligibility snapshot becomes reclaimable on the next poll. Verifier-claim lease
+decisions apply the same post-lock database-clock rule when no verifier clock was
+injected.
+
+Breaking schema revision 49 adds the task contract reference and normalized
+verified-work authority tables. Existing ordinary task rows migrate with a null
+contract reference; no historical contract or verifier evidence is inferred.
+Pre-49 task workers must be stopped before migration because they do not honor
+the completion gate or maintain the new records. Operators must take an
+application-consistent backup, run `cayu storage migrate`, confirm revision 49,
+and deploy only revision-49-aware workers. Mixed-version operation and
+application-only rollback are unsupported.
 
 `terminalize_task(...)` is the claim-fenced, replay-safe completion/failure
 boundary for worker-owned tasks. A request carries the exact task and worker,

@@ -2057,7 +2057,7 @@ def test_sqlite_profiled_dispatch_stores_reject_revision_thirty_nine(tmp_path) -
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 46"):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 45"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 49"):
         SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
 
@@ -2728,8 +2728,8 @@ def test_sqlite_revision_forty_six_migrates_empty_transcript_database(tmp_path) 
     finally:
         connection.close()
 
-    assert revision == (48,)
-    assert version == (48,)
+    assert revision == (schema_migrations.LATEST_REVISION,)
+    assert version == (schema_migrations.LATEST_REVISION,)
     assert transcript_column == ("TEXT", 1)
     assert fts is not None
     assert tokenizer_configuration == (1, TRANSCRIPT_SEARCH_TOKENIZER_VERSION)
@@ -2898,6 +2898,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (46, 46),
         (47, 47),
         (48, 48),
+        (49, 49),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

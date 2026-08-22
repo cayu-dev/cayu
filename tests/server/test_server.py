@@ -684,6 +684,8 @@ def test_mutation_acceptance_log_projects_private_session_identity(caplog) -> No
 
 def test_server_run_task_setup_failure_finalizes_claimed_session(caplog) -> None:
     class FailingTaskStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def create_running_task(self, request, *, session_invocation):
             raise OSError("task store unavailable with secret-token")
 
@@ -3129,6 +3131,8 @@ def test_server_exposes_separate_store_local_operational_snapshots() -> None:
     assert not_configured.json()["task_snapshot_status"] == "not_configured"
 
     class UnsupportedTaskAggregateStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def aggregate_operational_snapshot(self, filters=None):
             raise NotImplementedError
 
@@ -10230,6 +10234,8 @@ def test_interrupt_before_observer_start_cancels_environment_factory() -> None:
 
 def test_interrupt_during_run_acceptance_finishes_task_bookkeeping() -> None:
     class BlockingTaskStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.create_started = asyncio.Event()

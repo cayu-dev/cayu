@@ -294,6 +294,8 @@ def test_run_task_worker_claims_runs_and_completes_a_task(tmp_path: Path) -> Non
 
 def test_run_task_worker_reconciles_failure_terminalization_acknowledgement_loss() -> None:
     class CommitThenRaiseTaskStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.terminalize_calls = 0
@@ -367,6 +369,8 @@ def test_run_task_worker_continues_after_handler_terminalizes_then_raises() -> N
 
 def test_run_task_worker_keeps_same_key_changed_intent_conflict_explicit() -> None:
     class ChangedIntentStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def terminalize_task(self, request: TaskTerminalizationRequest):
             await super().terminalize_task(
                 TaskTerminalizationRequest(
@@ -634,6 +638,8 @@ def test_task_worker_cancellation_during_failure_write_does_not_retain_raw_error
     secret = "task-worker-cancelled-publication-secret-canary"
 
     class BlockingFailureStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.failure_started = asyncio.Event()

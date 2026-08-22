@@ -1669,6 +1669,8 @@ def test_explicit_falsy_dependencies_are_not_replaced(tmp_path) -> None:
             return False
 
     class FalsyTaskStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __bool__(self) -> bool:
             return False
 
@@ -2042,6 +2044,8 @@ def test_durable_receipt_and_settlement_acknowledgements_are_reconstructed(
 
 def test_concurrent_durable_replacement_workers_dispatch_once(tmp_path) -> None:
     class BlockingTaskStore(SQLiteTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self, path):
             super().__init__(path)
             self.create_started = asyncio.Event()

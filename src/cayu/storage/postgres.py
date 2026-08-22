@@ -386,7 +386,6 @@ from cayu.runtime.tasks import (
     TaskOrder,
     TaskQuery,
     TaskRetrySeriesDisposition,
-    TaskRetrySeriesSnapshot,
     TaskRetrySettlementRequest,
     TaskRetrySettlementResult,
     TaskStatus,
@@ -416,7 +415,6 @@ from cayu.runtime.tasks import (
     _ensure_claim_query_supported,
     _ensure_owned_active_task_lease,
     _ensure_retry_series_queue_attempt,
-    _ensure_task_status_can_transition,
     _expired_task_retry_settlement,
     _raise_task_claim_attach_error,
     _replay_task_retry_settlement,
@@ -441,10 +439,17 @@ from cayu.runtime.tasks import (
     task_query_from_aggregate_filter,
 )
 from cayu.runtime.tool_exposure import ToolCapabilityCeiling
+from cayu.runtime.work_contracts import WorkCompletionConflict
 from cayu.storage import _postgres_aggregates as postgres_aggregates
 from cayu.storage import _postgres_support as pg_support
 from cayu.storage import _session_store_sql as session_store_sql
+from cayu.storage import _verified_work_support as verified_work_support
 from cayu.storage import migrations as schema
+from cayu.storage._postgres_verified_work import (
+    PostgresVerifiedWorkMixin,
+    _PostgresMutationConnectionOwner,
+    _require_quiescent_postgres_mutation_pool,
+)
 from cayu.storage.knowledge_transition import require_empty_knowledge_revision_transition
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT,
@@ -570,7 +575,7 @@ _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
 _POSTGRES_SESSION_MIN_REQUIRED_REVISION = 46
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 45
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 49
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
     event_type IN (
@@ -617,7 +622,7 @@ _TASK_RETURNING_COLUMNS = (
     "task.parent_task_id, task.assigned_agent_name, task.available_at, task.worker_id, "
     "task.lease_expires_at, task.status_reason, task.status_payload, task.input, task.result, "
     "task.error, task.metadata, task.created_at, task.updated_at, task.started_at, "
-    "task.completed_at, task.invocation, task.retry_series"
+    "task.completed_at, task.invocation, task.retry_series, task.work_contract"
 )
 _SESSION_MESSAGE_QUEUE_COLUMNS = (
     "ordering_key, queue_id, session_id, idempotency_key, content, delivery_mode, status, "
@@ -1986,6 +1991,101 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "cayu_eval_cases_message_count_check "
         "CHECK (message_count >= 0 AND message_count <= 16)",
     ),
+    49: (
+        "ALTER TABLE cayu_tasks ADD COLUMN IF NOT EXISTS work_contract JSONB",
+        """
+        CREATE TABLE IF NOT EXISTS cayu_work_contracts (
+            contract_id TEXT NOT NULL,
+            version BIGINT NOT NULL CHECK (version >= 1),
+            fingerprint TEXT NOT NULL CHECK (fingerprint ~ '^[0-9a-f]{64}$'),
+            contract_json JSONB NOT NULL,
+            PRIMARY KEY (contract_id, version)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_task_session_execution_authority (
+            session_id TEXT PRIMARY KEY,
+            authority_kind TEXT NOT NULL CHECK (
+                authority_kind IN ('ordinary', 'contracted')
+            ),
+            committed_at TIMESTAMPTZ NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_work_attempts (
+            attempt_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES cayu_tasks(id) ON DELETE RESTRICT,
+            ordinal BIGINT NOT NULL CHECK (ordinal >= 1),
+            request_sha256 TEXT NOT NULL CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
+            started_at TIMESTAMPTZ NOT NULL,
+            attempt_json JSONB NOT NULL,
+            UNIQUE (task_id, ordinal)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_completion_proposals (
+            proposal_id TEXT PRIMARY KEY,
+            attempt_id TEXT NOT NULL UNIQUE
+                REFERENCES cayu_work_attempts(attempt_id) ON DELETE RESTRICT,
+            task_id TEXT NOT NULL REFERENCES cayu_tasks(id) ON DELETE RESTRICT,
+            request_sha256 TEXT NOT NULL CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
+            proposed_at TIMESTAMPTZ NOT NULL,
+            proposal_json JSONB NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_completion_verification_claims (
+            claim_id TEXT PRIMARY KEY,
+            proposal_id TEXT NOT NULL
+                REFERENCES cayu_completion_proposals(proposal_id) ON DELETE RESTRICT,
+            attempt_number BIGINT NOT NULL CHECK (attempt_number >= 1),
+            request_sha256 TEXT NOT NULL CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
+            lease_expires_at TIMESTAMPTZ NOT NULL,
+            is_current BOOLEAN NOT NULL,
+            claim_json JSONB NOT NULL,
+            UNIQUE (proposal_id, attempt_number)
+        )
+        """,
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_completion_claim_current "
+        "ON cayu_completion_verification_claims(proposal_id) WHERE is_current",
+        """
+        CREATE TABLE IF NOT EXISTS cayu_completion_decisions (
+            decision_id TEXT PRIMARY KEY,
+            proposal_id TEXT NOT NULL UNIQUE
+                REFERENCES cayu_completion_proposals(proposal_id) ON DELETE RESTRICT,
+            task_id TEXT NOT NULL REFERENCES cayu_tasks(id) ON DELETE RESTRICT,
+            attempt_id TEXT NOT NULL
+                REFERENCES cayu_work_attempts(attempt_id) ON DELETE RESTRICT,
+            claim_id TEXT NOT NULL
+                REFERENCES cayu_completion_verification_claims(claim_id) ON DELETE RESTRICT,
+            verdict TEXT NOT NULL CHECK (
+                verdict IN ('accepted', 'rejected', 'blocked', 'needs_review')
+            ),
+            gap_fingerprint TEXT NOT NULL CHECK (gap_fingerprint ~ '^[0-9a-f]{64}$'),
+            request_sha256 TEXT NOT NULL CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
+            decided_at TIMESTAMPTZ NOT NULL,
+            decision_json JSONB NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_completion_decisions_task_gap "
+        "ON cayu_completion_decisions(task_id, verdict, gap_fingerprint)",
+        """
+        CREATE TABLE IF NOT EXISTS cayu_completion_decision_application_receipts (
+            task_id TEXT NOT NULL REFERENCES cayu_tasks(id) ON DELETE RESTRICT,
+            idempotency_key TEXT NOT NULL,
+            decision_id TEXT NOT NULL UNIQUE
+                REFERENCES cayu_completion_decisions(decision_id) ON DELETE RESTRICT,
+            request_sha256 TEXT NOT NULL CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
+            applied_at TIMESTAMPTZ NOT NULL,
+            receipt_json JSONB NOT NULL,
+            PRIMARY KEY (task_id, idempotency_key)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_tasks_contracted_session "
+        "ON cayu_tasks(session_id, created_at, id) WHERE work_contract IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_work_attempts_task_latest "
+        "ON cayu_work_attempts(task_id, ordinal DESC)",
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -3320,6 +3420,8 @@ class _PostgresStoreBase:
                             await self._validate_eval_result_baseline_schema(cur)
                         if self._min_required_revision >= 48:
                             await self._validate_captured_eval_case_schema(cur)
+                        if self._min_required_revision >= 49:
+                            await self._validate_verified_work_schema(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -3486,6 +3588,8 @@ class _PostgresStoreBase:
             await self._validate_eval_result_baseline_schema(cur)
         if self._min_required_revision >= 48:
             await self._validate_captured_eval_case_schema(cur)
+        if self._min_required_revision >= 49:
+            await self._validate_verified_work_schema(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -3570,6 +3674,8 @@ class _PostgresStoreBase:
             await self._validate_eval_result_baseline_schema(cur)
         if revision.revision == 48:
             await self._validate_captured_eval_case_schema(cur)
+        if revision.revision == 49:
+            await self._validate_verified_work_schema(cur)
 
     async def _validate_transcript_search_document_column(self, cur: Any) -> None:
         await cur.execute(
@@ -4762,6 +4868,287 @@ class _PostgresStoreBase:
             f"Postgres schema object {name!r} conflicts with Cayu's revision-47 "
             "Evals result and baseline contract. Run `cayu storage migrate` or "
             "restore the database from a known-good backup."
+        )
+
+    async def _validate_verified_work_schema(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_tasks'
+              AND column_name = 'work_contract'
+            """
+        )
+        if await cur.fetchone() != ("jsonb", "YES"):
+            self._raise_verified_work_schema_error("cayu_tasks.work_contract")
+        required_columns = {
+            "cayu_work_contracts": (
+                ("contract_id", "text", "NO"),
+                ("version", "bigint", "NO"),
+                ("fingerprint", "text", "NO"),
+                ("contract_json", "jsonb", "NO"),
+            ),
+            "cayu_task_session_execution_authority": (
+                ("session_id", "text", "NO"),
+                ("authority_kind", "text", "NO"),
+                ("committed_at", "timestamp with time zone", "NO"),
+            ),
+            "cayu_work_attempts": (
+                ("attempt_id", "text", "NO"),
+                ("task_id", "text", "NO"),
+                ("ordinal", "bigint", "NO"),
+                ("request_sha256", "text", "NO"),
+                ("started_at", "timestamp with time zone", "NO"),
+                ("attempt_json", "jsonb", "NO"),
+            ),
+            "cayu_completion_proposals": (
+                ("proposal_id", "text", "NO"),
+                ("attempt_id", "text", "NO"),
+                ("task_id", "text", "NO"),
+                ("request_sha256", "text", "NO"),
+                ("proposed_at", "timestamp with time zone", "NO"),
+                ("proposal_json", "jsonb", "NO"),
+            ),
+            "cayu_completion_verification_claims": (
+                ("claim_id", "text", "NO"),
+                ("proposal_id", "text", "NO"),
+                ("attempt_number", "bigint", "NO"),
+                ("request_sha256", "text", "NO"),
+                ("lease_expires_at", "timestamp with time zone", "NO"),
+                ("is_current", "boolean", "NO"),
+                ("claim_json", "jsonb", "NO"),
+            ),
+            "cayu_completion_decisions": (
+                ("decision_id", "text", "NO"),
+                ("proposal_id", "text", "NO"),
+                ("task_id", "text", "NO"),
+                ("attempt_id", "text", "NO"),
+                ("claim_id", "text", "NO"),
+                ("verdict", "text", "NO"),
+                ("gap_fingerprint", "text", "NO"),
+                ("request_sha256", "text", "NO"),
+                ("decided_at", "timestamp with time zone", "NO"),
+                ("decision_json", "jsonb", "NO"),
+            ),
+            "cayu_completion_decision_application_receipts": (
+                ("task_id", "text", "NO"),
+                ("idempotency_key", "text", "NO"),
+                ("decision_id", "text", "NO"),
+                ("request_sha256", "text", "NO"),
+                ("applied_at", "timestamp with time zone", "NO"),
+                ("receipt_json", "jsonb", "NO"),
+            ),
+        }
+        for table, expected in required_columns.items():
+            await cur.execute(
+                """
+                SELECT column_name, data_type, is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (table,),
+            )
+            if tuple(await cur.fetchall()) != expected:
+                self._raise_verified_work_schema_error(table)
+
+        required_constraints = {
+            "cayu_work_contracts": (
+                ("p", ("primary key (contract_id, version)",)),
+                ("c", ("version >= 1",)),
+                ("c", ("fingerprint", "[0-9a-f]{64}")),
+            ),
+            "cayu_task_session_execution_authority": (
+                ("p", ("primary key (session_id)",)),
+                ("c", ("authority_kind", "ordinary", "contracted")),
+            ),
+            "cayu_work_attempts": (
+                ("p", ("primary key (attempt_id)",)),
+                ("u", ("unique (task_id, ordinal)",)),
+                ("f", ("foreign key (task_id)", "references cayu_tasks(id)")),
+                ("c", ("ordinal >= 1",)),
+                ("c", ("request_sha256", "[0-9a-f]{64}")),
+            ),
+            "cayu_completion_proposals": (
+                ("p", ("primary key (proposal_id)",)),
+                ("u", ("unique (attempt_id)",)),
+                (
+                    "f",
+                    (
+                        "foreign key (attempt_id)",
+                        "references cayu_work_attempts(attempt_id)",
+                    ),
+                ),
+                ("f", ("foreign key (task_id)", "references cayu_tasks(id)")),
+                ("c", ("request_sha256", "[0-9a-f]{64}")),
+            ),
+            "cayu_completion_verification_claims": (
+                ("p", ("primary key (claim_id)",)),
+                ("u", ("unique (proposal_id, attempt_number)",)),
+                (
+                    "f",
+                    (
+                        "foreign key (proposal_id)",
+                        "references cayu_completion_proposals(proposal_id)",
+                    ),
+                ),
+                ("c", ("attempt_number >= 1",)),
+                ("c", ("request_sha256", "[0-9a-f]{64}")),
+            ),
+            "cayu_completion_decisions": (
+                ("p", ("primary key (decision_id)",)),
+                ("u", ("unique (proposal_id)",)),
+                (
+                    "f",
+                    (
+                        "foreign key (proposal_id)",
+                        "references cayu_completion_proposals(proposal_id)",
+                    ),
+                ),
+                ("f", ("foreign key (task_id)", "references cayu_tasks(id)")),
+                (
+                    "f",
+                    (
+                        "foreign key (attempt_id)",
+                        "references cayu_work_attempts(attempt_id)",
+                    ),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (claim_id)",
+                        "references cayu_completion_verification_claims(claim_id)",
+                    ),
+                ),
+                ("c", ("verdict", "accepted", "rejected", "blocked", "needs_review")),
+                ("c", ("gap_fingerprint", "[0-9a-f]{64}")),
+                ("c", ("request_sha256", "[0-9a-f]{64}")),
+            ),
+            "cayu_completion_decision_application_receipts": (
+                ("p", ("primary key (task_id, idempotency_key)",)),
+                ("u", ("unique (decision_id)",)),
+                ("f", ("foreign key (task_id)", "references cayu_tasks(id)")),
+                (
+                    "f",
+                    (
+                        "foreign key (decision_id)",
+                        "references cayu_completion_decisions(decision_id)",
+                    ),
+                ),
+                ("c", ("request_sha256", "[0-9a-f]{64}")),
+            ),
+        }
+        await cur.execute(
+            """
+            SELECT table_record.relname,
+                   constraint_record.contype,
+                   pg_get_constraintdef(constraint_record.oid)
+            FROM pg_catalog.pg_constraint AS constraint_record
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = constraint_record.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = ANY(%s)
+            """,
+            (list(required_constraints),),
+        )
+        actual_constraints: dict[str, list[tuple[str, str]]] = {}
+        for table, constraint_type, definition in await cur.fetchall():
+            actual_constraints.setdefault(str(table), []).append(
+                (str(constraint_type), " ".join(str(definition).lower().split()))
+            )
+        for table, expected_constraints in required_constraints.items():
+            actual = actual_constraints.get(table, [])
+            if any(
+                not any(
+                    candidate_type == constraint_type
+                    and all(fragment in definition for fragment in fragments)
+                    for candidate_type, definition in actual
+                )
+                for constraint_type, fragments in expected_constraints
+            ):
+                self._raise_verified_work_schema_error(table)
+
+        required_indexes = {
+            "idx_cayu_completion_claim_current": (
+                "cayu_completion_verification_claims",
+                True,
+                "(proposal_id)",
+                "is_current",
+            ),
+            "idx_cayu_completion_decisions_task_gap": (
+                "cayu_completion_decisions",
+                False,
+                "(task_id, verdict, gap_fingerprint)",
+                None,
+            ),
+            "idx_cayu_tasks_contracted_session": (
+                "cayu_tasks",
+                False,
+                "(session_id, created_at, id)",
+                "work_contract is not null",
+            ),
+            "idx_cayu_work_attempts_task_latest": (
+                "cayu_work_attempts",
+                False,
+                "(task_id, ordinal desc)",
+                None,
+            ),
+        }
+        await cur.execute(
+            """
+            SELECT index_record.relname,
+                   table_record.relname,
+                   index_state.indisunique,
+                   index_state.indisvalid,
+                   index_state.indisready,
+                   pg_get_indexdef(index_record.oid),
+                   pg_get_expr(index_state.indpred, index_state.indrelid)
+            FROM pg_catalog.pg_index AS index_state
+            JOIN pg_catalog.pg_class AS index_record
+              ON index_record.oid = index_state.indexrelid
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = index_state.indrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND index_record.relname = ANY(%s)
+            """,
+            (list(required_indexes),),
+        )
+        actual_indexes = {
+            str(row[0]): (
+                str(row[1]),
+                bool(row[2]),
+                bool(row[3]),
+                bool(row[4]),
+                " ".join(str(row[5]).lower().split()),
+                None if row[6] is None else " ".join(str(row[6]).lower().split()),
+            )
+            for row in await cur.fetchall()
+        }
+        for index, (table, unique, columns, predicate) in required_indexes.items():
+            actual = actual_indexes.get(index)
+            if (
+                actual is None
+                or actual[0] != table
+                or actual[1] is not unique
+                or not actual[2]
+                or not actual[3]
+                or columns not in actual[4]
+                or (predicate is None and actual[5] is not None)
+                or (predicate is not None and predicate not in (actual[5] or ""))
+            ):
+                self._raise_verified_work_schema_error(index)
+
+    @staticmethod
+    def _raise_verified_work_schema_error(name: str) -> NoReturn:
+        raise RuntimeError(
+            f"Postgres schema object {name!r} conflicts with Cayu's revision-49 "
+            "verified-work contract. Run `cayu storage migrate` or restore the "
+            "database from a known-good backup."
         )
 
     @staticmethod
@@ -20044,13 +20431,15 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         return None
 
 
-class PostgresTaskStore(_PostgresStoreBase, TaskStore):
+class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore):
     """Postgres-backed task store for durable multi-tenant work items."""
 
     supports_delayed_availability: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
     supports_idempotent_terminalization: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
+    supports_verified_work_contracts: ClassVar[bool] = True
+    verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
     _min_required_revision = _POSTGRES_TASK_MIN_REQUIRED_REVISION
 
@@ -20065,6 +20454,8 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         schema_mode: schema.SchemaMode = schema.SchemaMode.VALIDATE,
         read_only: bool = False,
     ) -> None:
+        if pool is not None:
+            _require_quiescent_postgres_mutation_pool(pool)
         super().__init__(
             conninfo,
             pool=pool,
@@ -20073,8 +20464,24 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
             schema_mode=schema_mode,
             read_only=read_only,
         )
+        self._postgres_mutation_allowed_configure = (
+            None if pool is not None else _configure_store_connection
+        )
+        _require_quiescent_postgres_mutation_pool(
+            self._pool,
+            allowed_configure=self._postgres_mutation_allowed_configure,
+        )
         self._clock = utc_clock(clock)
         self._clock_is_injected = clock is not None
+
+    async def _ensure_ready(self) -> None:
+        # Re-authenticate before every store entrance so private configuration
+        # drift cannot run an extension callback during lazy readiness.
+        _require_quiescent_postgres_mutation_pool(
+            self._pool,
+            allowed_configure=self._postgres_mutation_allowed_configure,
+        )
+        await super()._ensure_ready()
 
     async def create_task(self, request: TaskCreate) -> Task:
         request = copy_task_create(request)
@@ -20106,78 +20513,89 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         session_invocation: SessionInvocationBinding | None = None,
     ) -> Task:
         task_id = request.task_id or str(uuid4())
-        async with self._pool.connection() as conn:
-            try:
-                async with conn.cursor() as cur:
-                    await cur.execute("SELECT transaction_timestamp()")
-                    transaction_timestamp_row = await cur.fetchone()
-                    if transaction_timestamp_row is None:
-                        raise RuntimeError("Postgres did not return a transaction timestamp.")
-                    retry_started_at = (
-                        self._clock() if self._clock_is_injected else transaction_timestamp_row[0]
+
+        async def operation(conn: Any, cur: Any) -> Task:
+            del conn
+            await self._lock_verified_work_task(cur, task_id)
+            retry_started_at = await self._verified_now(cur)
+            parent: TaskInvocationSnapshot | None = None
+            if request.parent_task_id is not None:
+                if request.parent_task_id == task_id:
+                    raise ValueError("Task cannot be its own parent.")
+                await cur.execute(
+                    """
+                    SELECT id, session_id, invocation
+                    FROM cayu_tasks
+                    WHERE id = %s
+                    FOR KEY SHARE
+                    """,
+                    (request.parent_task_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    raise ValueError(f"Parent task not found: {request.parent_task_id}")
+                invocation_value = row[2]
+                if isinstance(invocation_value, str):
+                    invocation_value = json.loads(invocation_value)
+                parent = TaskInvocationSnapshot(
+                    id=row[0],
+                    session_id=row[1],
+                    invocation=TaskInvocation.model_validate(invocation_value),
+                )
+            if request.work_contract is not None:
+                contract = await self._load_work_contract_row(
+                    cur,
+                    request.work_contract,
+                    for_update=True,
+                )
+                verified_work_support.require_contract_reference(
+                    contract,
+                    request.work_contract,
+                )
+                if request.session_id is not None:
+                    await self._ensure_session_authority(
+                        cur,
+                        request.session_id,
+                        "contracted",
                     )
-                    parent: TaskInvocationSnapshot | None = None
-                    if request.parent_task_id is not None:
-                        if request.parent_task_id == task_id:
-                            raise ValueError("Task cannot be its own parent.")
-                        await cur.execute(
-                            """
-                            SELECT id, session_id, invocation
-                            FROM cayu_tasks
-                            WHERE id = %s
-                            FOR KEY SHARE
-                            """,
-                            (request.parent_task_id,),
-                        )
-                        row = await cur.fetchone()
-                        if row is None:
-                            raise ValueError(f"Parent task not found: {request.parent_task_id}")
-                        invocation_value = row[2]
-                        if isinstance(invocation_value, str):
-                            invocation_value = json.loads(invocation_value)
-                        parent = TaskInvocationSnapshot(
-                            id=row[0],
-                            session_id=row[1],
-                            invocation=TaskInvocation.model_validate(invocation_value),
-                        )
-                    if running:
-                        if session_invocation is None:
-                            raise AssertionError(
-                                "Running task insertion requires session invocation provenance."
-                            )
-                        task = _running_task_from_create(
-                            request,
-                            task_id=task_id,
-                            parent_task=parent,
-                            session_invocation=session_invocation,
-                            retry_started_at=retry_started_at,
-                        )
-                    else:
-                        task = _task_from_create(
-                            request,
-                            task_id=task_id,
-                            parent_task=parent,
-                            retry_started_at=retry_started_at,
-                        )
-                    await cur.execute(
-                        f"""
-                        INSERT INTO cayu_tasks ({pg_support.TASK_COLUMNS})
-                        VALUES (
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s
-                        )
-                        """,
-                        pg_support.task_insert_values(task),
+            if running:
+                if session_invocation is None:
+                    raise AssertionError(
+                        "Running task insertion requires session invocation provenance."
                     )
-                await conn.commit()
-                return task
-            except UniqueViolation as exc:
-                await conn.rollback()
-                raise ValueError(f"Task already exists: {task.id}") from exc
-            except BaseException:
-                await conn.rollback()
-                raise
+                task = _running_task_from_create(
+                    request,
+                    task_id=task_id,
+                    parent_task=parent,
+                    session_invocation=session_invocation,
+                    retry_started_at=retry_started_at,
+                    supports_verified_work_contracts=True,
+                )
+            else:
+                task = _task_from_create(
+                    request,
+                    task_id=task_id,
+                    parent_task=parent,
+                    retry_started_at=retry_started_at,
+                    supports_verified_work_contracts=True,
+                )
+            await cur.execute(
+                f"""
+                INSERT INTO cayu_tasks ({pg_support.TASK_COLUMNS})
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s
+                )
+                """,
+                pg_support.task_insert_values(task),
+            )
+            return task
+
+        try:
+            return await self._run_verified_work_mutation(operation)
+        except UniqueViolation as exc:
+            raise ValueError(f"Task already exists: {task_id}") from exc
 
     async def load_task(self, task_id: str) -> Task | None:
         task_id = require_clean_nonblank(task_id, "task_id")
@@ -20573,64 +20991,47 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
             session_id = require_clean_nonblank(session_id, "session_id")
         session_binding = _copy_optional_session_binding(session_invocation)
         await self._ensure_ready()
-        now = datetime.now(UTC)
-        async with self._pool.connection() as conn, conn.cursor() as cur:
-            await cur.execute(
-                "SELECT status, session_id, invocation, retry_series FROM cayu_tasks "
-                "WHERE id = %s FOR UPDATE",
-                (task_id,),
-            )
-            row = await cur.fetchone()
-            if row is None:
-                raise KeyError(f"Task not found: {task_id}")
-            _ensure_retry_series_queue_attempt(
-                None
-                if row[3] is None
-                else TaskRetrySeriesSnapshot.model_validate(_json_obj(row[3]))
-            )
-            _ensure_task_status_can_transition(
-                task_id,
-                TaskStatus(row[0]),
-                TaskStatus.RUNNING,
-            )
+
+        async def operation(conn: Any, cur: Any) -> Task:
+            del conn
+            await self._lock_verified_work_task(cur, task_id)
+            task = await self._load_task_locked(cur, task_id)
+            _ensure_retry_series_queue_attempt(task.retry_series)
+            _ensure_can_transition(task, TaskStatus.RUNNING)
             effective_session_id = _task_session_id_for_start(
                 task_id=task_id,
-                stored_session_id=row[1],
+                stored_session_id=task.session_id,
                 requested_session_id=session_id,
             )
-            invocation_value = row[2]
-            if isinstance(invocation_value, str):
-                invocation_value = json.loads(invocation_value)
+            if task.work_contract is not None:
+                await self._require_task_contract(cur, task, task.work_contract)
+                if effective_session_id is None:
+                    raise WorkCompletionConflict(
+                        "Contracted tasks require a session binding before starting."
+                    )
+                await self._ensure_session_authority(
+                    cur,
+                    effective_session_id,
+                    "contracted",
+                )
             _task_invocation_for_attachment(
-                TaskInvocation.model_validate(invocation_value),
+                task.invocation,
                 session_id=effective_session_id,
                 session_binding=session_binding,
             )
-            await cur.execute(
-                """
-                UPDATE cayu_tasks
-                SET status = %s,
-                    session_id = COALESCE(%s, session_id),
-                    started_at = COALESCE(started_at, %s),
-                    updated_at = %s
-                WHERE id = %s AND status = %s
-                """,
-                (
-                    str(TaskStatus.RUNNING),
-                    effective_session_id,
-                    now,
-                    now,
-                    task_id,
-                    str(TaskStatus.PENDING),
-                ),
+            now = await self._database_now(cur)
+            updated = task.model_copy(
+                update={
+                    "status": TaskStatus.RUNNING,
+                    "session_id": effective_session_id,
+                    "started_at": task.started_at or now,
+                    "updated_at": now,
+                }
             )
-            if cur.rowcount == 1:
-                updated = await self._require_task(cur, task_id)
-                await conn.commit()
-                return updated.model_copy(deep=True)
-            task = await self._require_task(cur, task_id)
-            _ensure_can_transition(task, TaskStatus.RUNNING)
-            raise ValueError(f"Task {task.id} cannot transition to running from {task.status}")
+            await self._update_task_snapshot(cur, updated)
+            return updated.model_copy(deep=True)
+
+        return await self._run_verified_work_mutation(operation)
 
     async def attach_task(
         self,
@@ -20645,76 +21046,47 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         worker_id = require_clean_nonblank(worker_id, "worker_id")
         session_binding = _copy_required_session_binding(session_invocation)
         await self._ensure_ready()
-        now = datetime.now(UTC)
-        async with self._pool.connection() as conn, conn.cursor() as cur:
-            await cur.execute(
-                """
-                SELECT status, session_id, worker_id, lease_expires_at, invocation,
-                       retry_series
-                FROM cayu_tasks
-                WHERE id = %s
-                FOR UPDATE
-                """,
-                (task_id,),
-            )
-            row = await cur.fetchone()
-            if row is None:
-                raise KeyError(f"Task not found: {task_id}")
-            _ensure_retry_series_queue_attempt(
-                None
-                if row[5] is None
-                else TaskRetrySeriesSnapshot.model_validate(_json_obj(row[5]))
-            )
+
+        async def operation(conn: Any, cur: Any) -> Task:
+            del conn
+            await self._lock_verified_work_task(cur, task_id)
+            task = await self._load_task_locked(cur, task_id)
+            _ensure_retry_series_queue_attempt(task.retry_series)
+            now = await self._database_now(cur)
             if not _can_attach_claimed_task_state(
-                status=TaskStatus(row[0]),
-                session_id=row[1],
-                worker_id=row[2],
-                lease_expires_at=pg_support.to_utc_optional(row[3]),
+                status=task.status,
+                session_id=task.session_id,
+                worker_id=task.worker_id,
+                lease_expires_at=task.lease_expires_at,
                 expected_worker_id=worker_id,
                 now=now,
             ):
-                await self._raise_task_claim_attach_error(cur, task_id, worker_id)
-            invocation_value = row[4]
-            if isinstance(invocation_value, str):
-                invocation_value = json.loads(invocation_value)
+                await self._raise_task_claim_attach_error(
+                    cur,
+                    task_id,
+                    worker_id,
+                    now=now,
+                )
+            if task.work_contract is not None:
+                await self._require_task_contract(cur, task, task.work_contract)
+                await self._ensure_session_authority(cur, session_id, "contracted")
             _task_invocation_for_attachment(
-                TaskInvocation.model_validate(invocation_value),
+                task.invocation,
                 session_id=session_id,
                 session_binding=session_binding,
             )
-            await cur.execute(
-                f"""
-                UPDATE cayu_tasks
-                SET status = %s,
-                    session_id = %s,
-                    started_at = COALESCE(started_at, %s),
-                    updated_at = %s
-                WHERE id = %s
-                  AND status = %s
-                  AND worker_id = %s
-                  AND session_id IS NULL
-                  AND lease_expires_at IS NOT NULL
-                  AND lease_expires_at > %s
-                RETURNING {pg_support.TASK_COLUMNS}
-                """,
-                (
-                    str(TaskStatus.RUNNING),
-                    session_id,
-                    now,
-                    now,
-                    task_id,
-                    str(TaskStatus.CLAIMED),
-                    worker_id,
-                    now,
-                ),
+            updated = task.model_copy(
+                update={
+                    "status": TaskStatus.RUNNING,
+                    "session_id": session_id,
+                    "started_at": task.started_at or now,
+                    "updated_at": now,
+                }
             )
-            row = await cur.fetchone()
-            if row is None:
-                await self._raise_task_claim_attach_error(cur, task_id, worker_id)
-            assert row is not None
-            updated = pg_support.task_from_row(row)
-            await conn.commit()
+            await self._update_task_snapshot(cur, updated)
             return updated.model_copy(deep=True)
+
+        return await self._run_verified_work_mutation(operation)
 
     async def complete_task(
         self, task_id: str, result: dict[str, Any], *, worker_id: str | None = None
@@ -20740,14 +21112,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
-                    await cur.execute(
-                        f"SELECT {pg_support.TASK_COLUMNS} FROM cayu_tasks "
-                        "WHERE id = %s FOR UPDATE",
-                        (request.task_id,),
-                    )
-                    task_row = await cur.fetchone()
-                    if task_row is None:
-                        raise KeyError(f"Task not found: {request.task_id}")
+                    task = await self._load_task_locked(cur, request.task_id)
 
                     await cur.execute(
                         "SELECT request_sha256, worker_id, terminal_kind, "
@@ -20766,12 +21131,11 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         replayed = _replay_task_terminalization_receipt(
                             request_sha256=request_sha256,
                             receipt=receipt,
-                            current_task=pg_support.task_from_row(task_row),
+                            current_task=task,
                         )
                         await conn.commit()
                         return replayed
 
-                    task = pg_support.task_from_row(task_row)
                     if task.retry_series is not None:
                         raise ValueError(
                             "Retry-series tasks require settle_task_retry_attempt for "
@@ -20785,12 +21149,16 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         raise TaskTerminalizationConflict(
                             "Task is terminal without the matching terminalization receipt."
                         )
-                    _ensure_owned_active_task_lease(task, request.worker_id)
-                    now = datetime.now(UTC)
+                    now = await self._database_now(cur)
+                    _ensure_owned_active_task_lease(task, request.worker_id, now=now)
                     status = (
                         TaskStatus.COMPLETED
                         if request.kind is TaskTerminalKind.COMPLETED
                         else TaskStatus.FAILED
+                    )
+                    verified_work_support.require_contracted_completion_authority(
+                        task,
+                        status,
                     )
                     await cur.execute(
                         f"""
@@ -20829,7 +21197,10 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                     terminal_row = await cur.fetchone()
                     if terminal_row is None:
                         await self._raise_task_active_lease_error(
-                            cur, request.task_id, request.worker_id
+                            cur,
+                            request.task_id,
+                            request.worker_id,
+                            now=now,
                         )
                     assert terminal_row is not None
                     terminal_task = pg_support.task_from_row(terminal_row)
@@ -20889,20 +21260,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         async with self._pool.connection() as conn:
             try:
                 async with conn.cursor() as cur:
-                    await cur.execute("SELECT transaction_timestamp()")
-                    transaction_timestamp_row = await cur.fetchone()
-                    if transaction_timestamp_row is None:
-                        raise RuntimeError("Postgres did not return a transaction timestamp.")
-                    now = transaction_timestamp_row[0]
-                    series_now = self._clock() if self._clock_is_injected else now
-                    await cur.execute(
-                        f"SELECT {pg_support.TASK_COLUMNS} FROM cayu_tasks "
-                        "WHERE id = %s FOR UPDATE",
-                        (request.task_id,),
-                    )
-                    task_row = await cur.fetchone()
-                    if task_row is None:
-                        raise KeyError(f"Task not found: {request.task_id}")
+                    task = await self._load_task_locked(cur, request.task_id)
                     await cur.execute(
                         "SELECT request_sha256, receipt_json "
                         "FROM cayu_task_retry_settlements "
@@ -20917,12 +21275,13 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         replayed = _replay_task_retry_settlement(
                             request_sha256=request_sha256,
                             receipt=receipt,
-                            current_task=pg_support.task_from_row(task_row),
+                            current_task=task,
                         )
                         await conn.commit()
                         return replayed
 
-                    task = pg_support.task_from_row(task_row)
+                    now = await self._database_now(cur)
+                    series_now = self._clock() if self._clock_is_injected else now
                     _ensure_owned_active_task_lease(task, request.worker_id, now=now)
                     settled, successor = _settled_task_retry_attempt(
                         task,
@@ -20965,6 +21324,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                             cur,
                             request.task_id,
                             request.worker_id,
+                            now=now,
                         )
                     assert settled_row is not None
                     durable_task = pg_support.task_from_row(settled_row)
@@ -20973,9 +21333,9 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                             f"""
                             INSERT INTO cayu_tasks ({pg_support.TASK_COLUMNS})
                             VALUES (
-                                %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s
+                                %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s, %s
                             )
                             """,
                             pg_support.task_insert_values(successor),
@@ -21101,7 +21461,12 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         ),
                     )
                     if await cur.fetchone() is None:
-                        await self._raise_task_active_lease_error(cur, task_id, worker_id)
+                        await self._raise_task_active_lease_error(
+                            cur,
+                            task_id,
+                            worker_id,
+                            now=lease_now,
+                        )
                     await cur.execute(
                         "INSERT INTO cayu_task_retry_settlements "
                         "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
@@ -21260,6 +21625,32 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         lease_seconds = _validate_task_positive_int(lease_seconds, "lease_seconds")
         if query.status is not None and query.status is not TaskStatus.PENDING:
             return None
+        # Finish lazy readiness before creating the bounded mutation owner so
+        # a first-use schema wait cannot be mistaken for an already-dispatched
+        # task claim or escape as a detached mutation owner.
+        await self._ensure_ready()
+        connection_owner = _PostgresMutationConnectionOwner(
+            self._pool,
+            allowed_configure=self._postgres_mutation_allowed_configure,
+        )
+        return await self._await_owned_store_mutation(
+            self._claim_task_unowned(
+                worker_id,
+                query,
+                lease_seconds=lease_seconds,
+                connection_owner=connection_owner,
+            ),
+            connection_owner=connection_owner,
+        )
+
+    async def _claim_task_unowned(
+        self,
+        worker_id: str,
+        query: TaskQuery,
+        *,
+        lease_seconds: int = 300,
+        connection_owner: _PostgresMutationConnectionOwner,
+    ) -> Task | None:
         clauses, params = self._task_filter_clauses(query)
         if self._clock_is_injected:
             series_now = self._clock()
@@ -21307,8 +21698,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         # Claiming is always FIFO by creation time, independent of the query's
         # display ordering, so the oldest pending task is dispatched first.
         order_sql = pg_support.task_order_sql(TaskOrder.CREATED_AT_ASC)
-        await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with self._owned_store_connection(connection_owner) as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT transaction_timestamp()")
                 transaction_timestamp_row = await cur.fetchone()
@@ -21431,12 +21821,14 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
         extend_seconds = _validate_task_positive_int(extend_seconds, "extend_seconds")
-        now = datetime.now(UTC)
-        lease_expires_at = now + timedelta(seconds=extend_seconds)
 
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
+                task = await self._load_task_locked(cur, task_id)
+                now = await self._database_now(cur)
+                _ensure_owned_active_task_lease(task, worker_id, now=now)
+                lease_expires_at = now + timedelta(seconds=extend_seconds)
                 await cur.execute(
                     f"""
                     UPDATE cayu_tasks
@@ -21458,7 +21850,12 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                 )
                 row = await cur.fetchone()
                 if row is None:
-                    await self._raise_task_active_lease_error(cur, task_id, worker_id)
+                    await self._raise_task_active_lease_error(
+                        cur,
+                        task_id,
+                        worker_id,
+                        now=now,
+                    )
                 assert row is not None
                 updated = pg_support.task_from_row(row)
             await conn.commit()
@@ -21467,11 +21864,12 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
     async def release_task(self, task_id: str, worker_id: str) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        now = datetime.now(UTC)
 
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
+                await self._load_task_locked(cur, task_id)
+                now = await self._database_now(cur)
                 await cur.execute(
                     f"""
                     UPDATE cayu_tasks
@@ -21497,7 +21895,12 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                 )
                 row = await cur.fetchone()
                 if row is None:
-                    await self._raise_task_release_error(cur, task_id, worker_id)
+                    await self._raise_task_release_error(
+                        cur,
+                        task_id,
+                        worker_id,
+                        now=now,
+                    )
                 assert row is not None
                 updated = pg_support.task_from_row(row)
             await conn.commit()
@@ -21506,11 +21909,12 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
     async def release_attached_task_worker(self, task_id: str, worker_id: str) -> Task:
         task_id = require_clean_nonblank(task_id, "task_id")
         worker_id = require_clean_nonblank(worker_id, "worker_id")
-        now = datetime.now(UTC)
 
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
+                await self._load_task_locked(cur, task_id)
+                now = await self._database_now(cur)
                 await cur.execute(
                     f"""
                     UPDATE cayu_tasks
@@ -21536,6 +21940,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         cur,
                         task_id,
                         worker_id,
+                        now=now,
                     )
                 assert row is not None
                 updated = pg_support.task_from_row(row)
@@ -21553,29 +21958,53 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         max_reclaims = _validate_task_positive_int(max_reclaims, "max_reclaims")
         if query.status is not None and query.status is not TaskStatus.CLAIMED:
             return []
+        # Keep lazy schema reconciliation outside the mutation owner for the
+        # same first-use cancellation contract as claim_task().
+        await self._ensure_ready()
+        connection_owner = _PostgresMutationConnectionOwner(
+            self._pool,
+            allowed_configure=self._postgres_mutation_allowed_configure,
+        )
+        return await self._await_owned_store_mutation(
+            self._reclaim_expired_unowned(
+                query=query,
+                max_reclaims=max_reclaims,
+                connection_owner=connection_owner,
+            ),
+            connection_owner=connection_owner,
+        )
+
+    async def _reclaim_expired_unowned(
+        self,
+        *,
+        query: TaskQuery,
+        max_reclaims: int = 100,
+        connection_owner: _PostgresMutationConnectionOwner,
+    ) -> list[Task]:
         clauses, params = self._task_filter_clauses(query)
         where_sql = " AND ".join(
             [
                 "status = %s",
                 "session_id IS NULL",
                 "lease_expires_at IS NOT NULL",
-                "lease_expires_at <= %s",
+                "lease_expires_at <= timing.now",
                 "status_reason IS DISTINCT FROM %s",
                 *clauses,
             ]
         )
-        now = datetime.now(UTC)
 
-        await self._ensure_ready()
-        async with self._pool.connection() as conn:
+        async with self._owned_store_connection(connection_owner) as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     cast(
                         "LiteralString",
                         f"""
-                        WITH expired AS (
+                        WITH timing AS MATERIALIZED (
+                            SELECT clock_timestamp() AS now
+                        ), expired AS (
                             SELECT id
                             FROM cayu_tasks
+                            CROSS JOIN timing
                             WHERE {where_sql}
                             ORDER BY lease_expires_at ASC, id ASC
                             FOR UPDATE SKIP LOCKED
@@ -21585,20 +22014,19 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         SET status = %s,
                             worker_id = NULL,
                             lease_expires_at = NULL,
-                            updated_at = %s
+                            updated_at = timing.now
                         FROM expired
+                        CROSS JOIN timing
                         WHERE task.id = expired.id
                         RETURNING {_TASK_RETURNING_COLUMNS}
                         """,
                     ),
                     [
                         str(TaskStatus.CLAIMED),
-                        now,
                         _TASK_RETRY_CANCELLATION_REQUESTED_REASON,
                         *params,
                         max_reclaims,
                         str(TaskStatus.PENDING),
-                        now,
                     ],
                 )
                 rows = await cur.fetchall()
@@ -21677,7 +22105,6 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         worker_id: str | None = None,
     ) -> Task:
         await self._ensure_ready()
-        now = datetime.now(UTC)
         # When a worker_id is given, only terminalize if that worker still owns an active
         # lease — a worker that lost its lease must not clobber a task another has reclaimed.
         owner_clause = ""
@@ -21687,17 +22114,14 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                 "\n                      AND worker_id = %s"
                 "\n                      AND lease_expires_at IS NOT NULL AND lease_expires_at > %s"
             )
-            owner_params = [worker_id, now]
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute(
-                    f"SELECT {pg_support.TASK_COLUMNS} FROM cayu_tasks WHERE id = %s FOR UPDATE",
-                    (task_id,),
-                )
-                task_row = await cur.fetchone()
-                if task_row is None:
-                    raise KeyError(f"Task not found: {task_id}")
-                task = pg_support.task_from_row(task_row)
+                task = await self._load_task_locked(cur, task_id)
+                now = await self._database_now(cur)
+                if worker_id is not None:
+                    _ensure_owned_active_task_lease(task, worker_id, now=now)
+                    owner_params = [worker_id, now]
+                verified_work_support.require_contracted_completion_authority(task, status)
                 cancellation = None
                 if task.retry_series is not None:
                     if status is not TaskStatus.CANCELLED:
@@ -21798,7 +22222,12 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                 )
                 if cur.rowcount != 1:
                     if worker_id is not None:
-                        await self._raise_task_active_lease_error(cur, task_id, worker_id)
+                        await self._raise_task_active_lease_error(
+                            cur,
+                            task_id,
+                            worker_id,
+                            now=now,
+                        )
                     task = await self._require_task(cur, task_id)
                     _ensure_can_transition(task, status)
                     raise ValueError(f"Task {task.id} cannot transition from {task.status}")
@@ -21857,9 +22286,11 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         cur: Any,
         task_id: str,
         worker_id: str,
+        *,
+        now: datetime,
     ) -> None:
         task = await self._require_task(cur, task_id)
-        _ensure_owned_active_task_lease(task, worker_id)
+        _ensure_owned_active_task_lease(task, worker_id, now=now)
         raise RuntimeError(f"Task {task.id} active-lease mutation did not update a row.")
 
     async def _raise_task_release_error(
@@ -21867,9 +22298,11 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         cur: Any,
         task_id: str,
         worker_id: str,
+        *,
+        now: datetime,
     ) -> None:
         task = await self._require_task(cur, task_id)
-        _ensure_owned_active_task_lease(task, worker_id)
+        _ensure_owned_active_task_lease(task, worker_id, now=now)
         if task.session_id is not None:
             raise ValueError(f"Task {task.id} is already attached to session {task.session_id}.")
         if task.status is not TaskStatus.CLAIMED:
@@ -21885,9 +22318,11 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         cur: Any,
         task_id: str,
         worker_id: str,
+        *,
+        now: datetime,
     ) -> None:
         task = await self._require_task(cur, task_id)
-        _ensure_owned_active_task_lease(task, worker_id)
+        _ensure_owned_active_task_lease(task, worker_id, now=now)
         if task.status is not TaskStatus.RUNNING:
             raise ValueError(f"Task {task.id} is not running.")
         if task.session_id is None:
@@ -21899,9 +22334,11 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         cur: Any,
         task_id: str,
         worker_id: str,
+        *,
+        now: datetime,
     ) -> None:
         task = await self._require_task(cur, task_id)
-        _raise_task_claim_attach_error(task, worker_id)
+        _raise_task_claim_attach_error(task, worker_id, now=now)
 
 
 def _new_id() -> str:

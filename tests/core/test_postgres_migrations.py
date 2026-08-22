@@ -139,6 +139,125 @@ def test_revision_forty_six_builds_transcript_search_index_concurrently() -> Non
     assert postgres_storage._required_concurrent_indexes(46)[-1] == index
 
 
+def test_revision_forty_nine_migrates_existing_ordinary_tasks(postgres_dsn: str) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.create_task(TaskCreate(task_id="pre-49-task", type="ordinary"))
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                for table in (
+                    "cayu_completion_decision_application_receipts",
+                    "cayu_completion_decisions",
+                    "cayu_completion_verification_claims",
+                    "cayu_completion_proposals",
+                    "cayu_work_attempts",
+                    "cayu_task_session_execution_authority",
+                    "cayu_work_contracts",
+                ):
+                    await cur.execute(f"DROP TABLE {table}")
+                await cur.execute("ALTER TABLE cayu_tasks DROP COLUMN work_contract")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 49")
+            await conn.commit()
+
+        migrated = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            task = await migrated.load_task("pre-49-task")
+            assert task is not None
+            assert task.work_contract is None
+        finally:
+            await migrated.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 49"
+            )
+            assert await cur.fetchone() == ("breaking", 49)
+
+    asyncio.run(runner())
+
+
+def test_revision_forty_nine_rejects_weakened_authority_index(postgres_dsn: str) -> None:
+    async def runner() -> None:
+        import psycopg
+        from psycopg import sql
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        await creator.ensure_schema()
+        await creator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("DROP INDEX idx_cayu_completion_claim_current")
+            await cur.execute(
+                "CREATE INDEX idx_cayu_completion_claim_current "
+                "ON cayu_completion_verification_claims(proposal_id)"
+            )
+            await conn.commit()
+
+        validator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            with pytest.raises(RuntimeError, match="idx_cayu_completion_claim_current"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+        migrator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(RuntimeError, match="idx_cayu_completion_claim_current"):
+                await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("DROP INDEX idx_cayu_completion_claim_current")
+            await cur.execute(
+                "CREATE UNIQUE INDEX idx_cayu_completion_claim_current "
+                "ON cayu_completion_verification_claims(proposal_id) WHERE is_current"
+            )
+            await cur.execute(
+                "SELECT conname FROM pg_catalog.pg_constraint "
+                "WHERE conrelid = 'cayu_work_attempts'::regclass "
+                "AND contype = 'c' "
+                "AND pg_get_constraintdef(oid) LIKE '%request_sha256%'"
+            )
+            row = await cur.fetchone()
+            assert row is not None
+            await cur.execute(
+                sql.SQL("ALTER TABLE cayu_work_attempts DROP CONSTRAINT {}").format(
+                    sql.Identifier(row[0])
+                )
+            )
+            await conn.commit()
+
+        constraint_validator = PostgresTaskStore(
+            postgres_dsn,
+            schema_mode=SchemaMode.VALIDATE,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="cayu_work_attempts"):
+                await constraint_validator.ensure_schema()
+        finally:
+            await constraint_validator.close()
+
+    asyncio.run(runner())
+
+
 def test_revision_forty_six_rejects_populated_transcript_database_without_mutation(
     postgres_dsn: str,
 ) -> None:
@@ -251,7 +370,7 @@ def test_revision_forty_six_migrates_empty_transcript_database(
             await cur.execute("SELECT to_regclass('idx_cayu_transcript_messages_narrative_fts')")
             assert await cur.fetchone() == ("idx_cayu_transcript_messages_narrative_fts",)
             await cur.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
-            assert await cur.fetchone() == (48,)
+            assert await cur.fetchone() == (schema.LATEST_REVISION,)
             await cur.execute(
                 "SELECT singleton, tokenizer_version FROM cayu_transcript_search_configuration"
             )
@@ -478,6 +597,13 @@ _TABLES = (
     "cayu_budget_reservations",
     "cayu_task_retry_settlements",
     "cayu_task_terminalization_receipts",
+    "cayu_completion_decision_application_receipts",
+    "cayu_completion_decisions",
+    "cayu_completion_verification_claims",
+    "cayu_completion_proposals",
+    "cayu_work_attempts",
+    "cayu_task_session_execution_authority",
+    "cayu_work_contracts",
     "cayu_knowledge_change_acknowledgements",
     "cayu_knowledge_change_consumers",
     "cayu_knowledge_change_labels",
@@ -1241,6 +1367,43 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
                 "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 47"
             )
             assert await cur.fetchone() == ("breaking", 47)
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 48"
+            )
+            assert await cur.fetchone() == ("breaking", 48)
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 49"
+            )
+            assert await cur.fetchone() == ("breaking", 49)
+            await cur.execute(
+                "SELECT data_type, is_nullable FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'cayu_tasks' AND column_name = 'work_contract'"
+            )
+            assert await cur.fetchone() == ("jsonb", "YES")
+            await cur.execute(
+                "SELECT to_regclass(table_name) FROM unnest(%s::text[]) AS table_name",
+                (
+                    [
+                        "cayu_work_contracts",
+                        "cayu_task_session_execution_authority",
+                        "cayu_work_attempts",
+                        "cayu_completion_proposals",
+                        "cayu_completion_verification_claims",
+                        "cayu_completion_decisions",
+                        "cayu_completion_decision_application_receipts",
+                    ],
+                ),
+            )
+            assert [row[0] for row in await cur.fetchall()] == [
+                "cayu_work_contracts",
+                "cayu_task_session_execution_authority",
+                "cayu_work_attempts",
+                "cayu_completion_proposals",
+                "cayu_completion_verification_claims",
+                "cayu_completion_decisions",
+                "cayu_completion_decision_application_receipts",
+            ]
             await cur.execute(
                 "SELECT data_type, is_nullable, is_generated "
                 "FROM information_schema.columns "

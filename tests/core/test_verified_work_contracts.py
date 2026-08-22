@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+import threading
 import warnings
 from collections.abc import AsyncIterator, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
@@ -92,6 +94,7 @@ from cayu import (
     TaskQuery,
     TaskRetryPolicy,
     TaskStatus,
+    TaskStore,
     TaskStoreDispatcher,
     TaskTerminalizationRequest,
     TaskTerminalKind,
@@ -147,6 +150,7 @@ from cayu.runtime.work_contracts import (
 from cayu.runtime.workspace_observation_recovery import (
     workspace_observation_pending_cancellation_requests,
 )
+from cayu.storage import migrations as schema_migrations
 from cayu.tools import UserInputTool
 
 
@@ -1652,9 +1656,14 @@ def test_public_contracted_creation_enforces_headroom_for_custom_stores() -> Non
     asyncio.run(scenario())
 
 
-def test_in_memory_verified_work_lifecycle_rejects_then_accepts_exactly() -> None:
+@pytest.mark.parametrize(
+    "store_factory",
+    [InMemoryTaskStore, lambda: SQLiteTaskStore(":memory:")],
+    ids=("memory", "sqlite"),
+)
+def test_verified_work_store_lifecycle_rejects_then_accepts_exactly(store_factory) -> None:
     async def scenario() -> None:
-        store = InMemoryTaskStore()
+        store = store_factory()
         contract = _contract()
         assert await store.publish_work_contract(contract) == contract
         assert await store.publish_work_contract(contract) == contract
@@ -1758,6 +1767,17 @@ def test_in_memory_verified_work_lifecycle_rejects_then_accepts_exactly() -> Non
         still_running = await store.apply_completion_decision(rejected_application)
         assert still_running.status is TaskStatus.RUNNING
         assert await store.apply_completion_decision(rejected_application) == still_running
+        with pytest.raises(
+            WorkCompletionConflict,
+            match="already applied under another identity",
+        ):
+            await store.apply_completion_decision(
+                rejected_application.model_copy(
+                    update={
+                        "task_id": "missing-application-task",
+                    }
+                )
+            )
 
         second_attempt = await store.begin_work_attempt(
             WorkAttemptCreate(
@@ -1850,6 +1870,9 @@ def test_in_memory_verified_work_lifecycle_rejects_then_accepts_exactly() -> Non
         assert receipt is not None
         assert receipt.decision_id == accepted.decision_id
         assert receipt.task == completed
+        assert await store.load_active_work_contract_task_for_session("session:bid:1") == completed
+        with pytest.raises(TaskCompletionDecisionRequired):
+            await store.admit_ordinary_session_execution("session:bid:1")
 
         with pytest.raises(WorkCompletionConflict, match="another request"):
             await store.apply_completion_decision(
@@ -2115,48 +2138,61 @@ def test_contracted_task_transitions_require_a_bounded_session_binding() -> None
     asyncio.run(scenario())
 
 
-def test_task_worker_lease_uses_wall_clock_not_verification_clock() -> None:
+@pytest.mark.parametrize(
+    "store_factory",
+    [
+        lambda clock: InMemoryTaskStore(clock=clock),
+        lambda clock: SQLiteTaskStore(":memory:", clock=clock),
+    ],
+    ids=("memory", "sqlite"),
+)
+def test_task_worker_lease_uses_wall_clock_not_verification_clock(store_factory) -> None:
     async def scenario() -> None:
-        store = InMemoryTaskStore(clock=lambda: datetime(2100, 1, 1, tzinfo=UTC))
-        contract = _contract(contract_id="separate-clock-domains")
-        await store.publish_work_contract(contract)
-        task = await store.create_task(
-            TaskCreate(
-                task_id="separate-clock-task",
-                type="verified-work",
-                work_contract=contract.reference(),
+        store = store_factory(lambda: datetime(2100, 1, 1, tzinfo=UTC))
+        try:
+            contract = _contract(contract_id="separate-clock-domains")
+            await store.publish_work_contract(contract)
+            task = await store.create_task(
+                TaskCreate(
+                    task_id="separate-clock-task",
+                    type="verified-work",
+                    work_contract=contract.reference(),
+                )
             )
-        )
-        claimed = await store.claim_task(
-            "task-worker",
-            TaskQuery(type=task.type),
-            lease_seconds=30,
-        )
-        assert claimed is not None
-        running = await store.attach_task(
-            task.id,
-            session_id="session:separate-clock",
-            session_invocation=await task_backed_session_invocation(
-                store,
+            claimed = await store.claim_task(
+                "task-worker",
+                TaskQuery(type=task.type),
+                lease_seconds=30,
+            )
+            assert claimed is not None
+            running = await store.attach_task(
                 task.id,
-                "session:separate-clock",
-            ),
-            worker_id="task-worker",
-        )
-
-        attempt = await store.begin_work_attempt(
-            WorkAttemptCreate(
-                attempt_id="separate-clock-attempt",
-                task_id=task.id,
-                session_id=running.session_id or "missing",
-                contract=contract.reference(),
-                execution_profile_fingerprint=_digest("worker-profile"),
+                session_id="session:separate-clock",
+                session_invocation=await task_backed_session_invocation(
+                    store,
+                    task.id,
+                    "session:separate-clock",
+                ),
                 worker_id="task-worker",
             )
-        )
 
-        assert attempt.started_at == datetime(2100, 1, 1, tzinfo=UTC)
-        assert attempt.worker_id == "task-worker"
+            attempt = await store.begin_work_attempt(
+                WorkAttemptCreate(
+                    attempt_id="separate-clock-attempt",
+                    task_id=task.id,
+                    session_id=running.session_id or "missing",
+                    contract=contract.reference(),
+                    execution_profile_fingerprint=_digest("worker-profile"),
+                    worker_id="task-worker",
+                )
+            )
+
+            assert attempt.started_at == datetime(2100, 1, 1, tzinfo=UTC)
+            assert attempt.worker_id == "task-worker"
+        finally:
+            close = getattr(store, "close", None)
+            if close is not None:
+                await close()
 
     asyncio.run(scenario())
 
@@ -2567,9 +2603,16 @@ def test_explicit_verifier_assertions_cover_outcomes_without_evidence_requiremen
     asyncio.run(scenario())
 
 
-def test_rejection_policy_interrupts_and_enforces_attempt_and_repeated_gap_limits() -> None:
+@pytest.mark.parametrize(
+    "store_factory",
+    [InMemoryTaskStore, lambda: SQLiteTaskStore(":memory:")],
+    ids=("memory", "sqlite"),
+)
+def test_rejection_policy_interrupts_and_enforces_attempt_and_repeated_gap_limits(
+    store_factory,
+) -> None:
     async def reject_attempt(
-        store: InMemoryTaskStore,
+        store: TaskStore,
         contract: WorkContract,
         task: Task,
         *,
@@ -2618,7 +2661,7 @@ def test_rejection_policy_interrupts_and_enforces_attempt_and_repeated_gap_limit
         )
 
     async def running_task(
-        store: InMemoryTaskStore,
+        store: TaskStore,
         contract: WorkContract,
         task_id: str,
     ) -> Task:
@@ -2635,7 +2678,7 @@ def test_rejection_policy_interrupts_and_enforces_attempt_and_repeated_gap_limit
         )
 
     async def scenario() -> None:
-        interrupt_store = InMemoryTaskStore()
+        interrupt_store = store_factory()
         interrupt_contract = _contract(
             contract_id="interrupt-contract",
             continuation_policy=CompletionContinuationPolicy(
@@ -2658,7 +2701,7 @@ def test_rejection_policy_interrupts_and_enforces_attempt_and_repeated_gap_limit
         assert interrupted.status is TaskStatus.PAUSED
         assert interrupted.status_reason == "work_contract_rejected"
 
-        attempt_limit_store = InMemoryTaskStore()
+        attempt_limit_store = store_factory()
         attempt_limit_contract = _contract(
             contract_id="attempt-limit-contract",
             continuation_policy=CompletionContinuationPolicy(
@@ -2701,7 +2744,7 @@ def test_rejection_policy_interrupts_and_enforces_attempt_and_repeated_gap_limit
                 )
             )
 
-        repeated_gap_store = InMemoryTaskStore()
+        repeated_gap_store = store_factory()
         repeated_gap_contract = _contract(
             contract_id="repeated-gap-contract",
             continuation_policy=CompletionContinuationPolicy(
@@ -2828,9 +2871,16 @@ def test_decision_application_prepares_receipt_before_publishing_task_transition
     asyncio.run(scenario())
 
 
-def test_oversized_completed_task_rejects_before_task_or_receipt_mutation() -> None:
+@pytest.mark.parametrize(
+    "store_factory",
+    [InMemoryTaskStore, lambda: SQLiteTaskStore(":memory:")],
+    ids=("memory", "sqlite"),
+)
+def test_oversized_completed_task_rejects_before_task_or_receipt_mutation(
+    store_factory,
+) -> None:
     async def scenario() -> None:
-        store = InMemoryTaskStore()
+        store = store_factory()
         contract = _contract(contract_id="bounded-application-transition")
         await store.publish_work_contract(contract)
         task = await store.create_running_task(
@@ -2944,12 +2994,18 @@ def test_decision_application_receipt_requires_exact_embedded_task_identity() ->
         (CompletionVerdict.NEEDS_REVIEW, TaskStatus.NEEDS_ATTENTION),
     ],
 )
-def test_in_memory_decision_application_holds_attached_tasks(
+@pytest.mark.parametrize(
+    "store_factory",
+    [InMemoryTaskStore, lambda: SQLiteTaskStore(":memory:")],
+    ids=("memory", "sqlite"),
+)
+def test_decision_application_holds_attached_tasks(
     verdict: CompletionVerdict,
     expected_status: TaskStatus,
+    store_factory,
 ) -> None:
     async def scenario() -> None:
-        store = InMemoryTaskStore()
+        store = store_factory()
         contract = _contract(
             continuation_policy=CompletionContinuationPolicy(
                 rejection_action=CompletionRejectionAction.INTERRUPT,
@@ -3751,6 +3807,8 @@ def test_direct_fork_validates_source_authority_before_contract_store_preflight(
     secret = "verified-work-fork-source-secret-canary"
 
     class LookupRecordingStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.session_lookups: list[str] = []
@@ -5836,28 +5894,91 @@ def test_contracted_task_rejects_every_legacy_completion_entrance() -> None:
     asyncio.run(scenario())
 
 
-def test_unmigrated_persistent_store_fails_closed_before_contract_binding(tmp_path) -> None:
+def test_sqlite_store_persists_contract_binding_and_keeps_ordinary_work_compatible(
+    tmp_path,
+) -> None:
     async def scenario() -> None:
-        store = SQLiteTaskStore(tmp_path / "tasks.sqlite")
+        path = tmp_path / "tasks.sqlite"
+        store = SQLiteTaskStore(path)
         try:
-            assert store.supports_verified_work_contracts is False
+            assert store.supports_verified_work_contracts is True
             contract = _contract()
-            with pytest.raises(NotImplementedError, match="verified work contracts"):
-                await store.publish_work_contract(contract)
-            with pytest.raises(NotImplementedError, match="work-contract task bindings"):
-                await store.create_task(
-                    TaskCreate(
-                        task_id="unsupported-contract-task",
-                        type="bid",
-                        work_contract=contract.reference(),
-                    )
+            assert await store.publish_work_contract(contract) == contract
+            contracted = await store.create_running_task(
+                TaskCreate(
+                    task_id="persistent-contract-task",
+                    type="bid",
+                    session_id="session:persistent-contract",
+                    work_contract=contract.reference(),
+                ),
+                session_invocation=unattributed_session_invocation_binding(
+                    "session:persistent-contract"
+                ),
+            )
+            assert contracted.work_contract == contract.reference()
+            attempt = await store.begin_work_attempt(
+                WorkAttemptCreate(
+                    attempt_id="persistent-contract-attempt",
+                    task_id=contracted.id,
+                    session_id=contracted.session_id or "missing-session",
+                    contract=contract.reference(),
+                    execution_profile_fingerprint=_digest("persistent-contract-profile"),
                 )
-            assert await store.load_task("unsupported-contract-task") is None
+            )
+            proposal = await store.submit_completion_proposal(
+                CompletionProposalCreate(
+                    proposal_id="persistent-contract-proposal",
+                    attempt_id=attempt.attempt_id,
+                    result=_result_reference("persistent-contract"),
+                    evidence_references=(_artifact_evidence(),),
+                )
+            )
+            claim_request = CompletionVerificationClaimRequest(
+                claim_id="persistent-contract-claim",
+                proposal_id=proposal.proposal_id,
+                worker_id="persistent-contract-verifier",
+                verifier=contract.verifier,
+            )
+            claim = await store.claim_completion_verification(claim_request)
+            decision_request = _rejected_decision(
+                proposal_id=proposal.proposal_id,
+                claim_id=claim.claim_id,
+                worker_id=claim.worker_id,
+                decision_id="persistent-contract-decision",
+            )
+            decision = await store.record_completion_decision(decision_request)
+            application = CompletionDecisionApplicationRequest(
+                task_id=contracted.id,
+                decision_id=decision.decision_id,
+                idempotency_key="persistent-contract-application",
+            )
+            applied = await store.apply_completion_decision(application)
+            assert applied.status is TaskStatus.RUNNING
+        finally:
+            await store.close()
 
+        reopened = SQLiteTaskStore(path)
+        try:
+            assert await reopened.load_work_contract(contract.reference()) == contract
+            contracted = await reopened.load_task("persistent-contract-task")
+            assert contracted is not None
+            assert contracted.work_contract == contract.reference()
+            assert await reopened.load_work_attempt(attempt.attempt_id) == attempt
+            assert await reopened.load_completion_proposal(proposal.proposal_id) == proposal
+            assert await reopened.load_completion_verification_claim(proposal.proposal_id) == claim
+            assert await reopened.load_completion_decision(decision.decision_id) == decision
+            assert await reopened.record_completion_decision(decision_request) == decision
+            assert await reopened.apply_completion_decision(application) == applied
+            receipt = await reopened.load_completion_decision_application_receipt(
+                contracted.id,
+                application.idempotency_key,
+            )
+            assert receipt is not None
+            assert receipt.task == applied
             provider = _RecordingProvider()
             app = CayuApp(
                 session_store=InMemorySessionStore(),
-                task_store=store,
+                task_store=reopened,
                 enable_logging=False,
             )
             app.register_provider(provider, default=True)
@@ -5874,9 +5995,270 @@ def test_unmigrated_persistent_store_fails_closed_before_contract_binding(tmp_pa
             assert provider.requests
             assert events[-1].type is EventType.SESSION_COMPLETED
         finally:
-            await store.close()
+            await reopened.close()
 
     asyncio.run(scenario())
+
+
+def test_sqlite_session_authority_race_is_atomic_across_store_instances(tmp_path) -> None:
+    path = tmp_path / "session-authority-race.sqlite"
+    contract = _contract(contract_id="sqlite-session-authority-race")
+
+    async def seed() -> None:
+        store = SQLiteTaskStore(path)
+        try:
+            await store.publish_work_contract(contract)
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    barrier = threading.Barrier(2)
+
+    def run_ordinary() -> str:
+        async def operation() -> str:
+            store = SQLiteTaskStore(path)
+            try:
+                barrier.wait(timeout=5)
+                try:
+                    await store.admit_ordinary_session_execution("session:sqlite:race")
+                except TaskCompletionDecisionRequired:
+                    return "contracted"
+                return "ordinary"
+            finally:
+                await store.close()
+
+        return asyncio.run(operation())
+
+    def run_contracted() -> str:
+        async def operation() -> str:
+            store = SQLiteTaskStore(path)
+            try:
+                barrier.wait(timeout=5)
+                try:
+                    await store.create_running_task(
+                        TaskCreate(
+                            task_id="sqlite-session-authority-race-task",
+                            type="verified-work",
+                            session_id="session:sqlite:race",
+                            work_contract=contract.reference(),
+                        ),
+                        session_invocation=unattributed_session_invocation_binding(
+                            "session:sqlite:race"
+                        ),
+                    )
+                except WorkCompletionConflict:
+                    return "ordinary"
+                return "contracted"
+            finally:
+                await store.close()
+
+        return asyncio.run(operation())
+
+    async def race() -> tuple[str, str]:
+        ordinary, contracted = await asyncio.gather(
+            asyncio.to_thread(run_ordinary),
+            asyncio.to_thread(run_contracted),
+        )
+        return ordinary, contracted
+
+    ordinary_outcome, contracted_outcome = asyncio.run(race())
+    assert ordinary_outcome == contracted_outcome
+
+    async def verify() -> None:
+        store = SQLiteTaskStore(path)
+        try:
+            task = await store.load_task("sqlite-session-authority-race-task")
+            if ordinary_outcome == "ordinary":
+                assert task is None
+                assert (
+                    await store.load_active_work_contract_task_for_session("session:sqlite:race")
+                    is None
+                )
+            else:
+                assert task is not None
+                assert task.work_contract == contract.reference()
+                with pytest.raises(TaskCompletionDecisionRequired):
+                    await store.admit_ordinary_session_execution("session:sqlite:race")
+        finally:
+            await store.close()
+
+    asyncio.run(verify())
+
+
+def test_sqlite_attachment_rechecks_worker_lease_after_writer_lock_wait(tmp_path) -> None:
+    path = tmp_path / "attachment-lease-writer-wait.sqlite"
+    contract = _contract(contract_id="sqlite-attachment-lease-writer-wait")
+    session_id = "session:sqlite:expired-attachment"
+    task_id = "sqlite-expired-attachment-task"
+    worker_id = "sqlite-expired-attachment-worker"
+
+    async def seed():
+        store = SQLiteTaskStore(path)
+        try:
+            await store.publish_work_contract(contract)
+            await store.create_task(
+                TaskCreate(
+                    task_id=task_id,
+                    type="verified-work",
+                    work_contract=contract.reference(),
+                )
+            )
+            claimed = await store.claim_task(worker_id, lease_seconds=2)
+            assert claimed is not None
+            binding = await task_backed_session_invocation(store, task_id, session_id)
+            return claimed, binding
+        finally:
+            await store.close()
+
+    claimed, binding = asyncio.run(seed())
+    assert claimed.lease_expires_at is not None
+    ready = threading.Event()
+    begin_attach = threading.Event()
+    attaching = threading.Event()
+
+    def attach_after_release() -> BaseException | None:
+        async def operation() -> None:
+            store = SQLiteTaskStore(path)
+            try:
+                ready.set()
+                if not begin_attach.wait(timeout=5):
+                    raise AssertionError("attachment writer was not released")
+                attaching.set()
+                await store.attach_task(
+                    task_id,
+                    session_id=session_id,
+                    session_invocation=binding,
+                    worker_id=worker_id,
+                )
+            finally:
+                await store.close()
+
+        try:
+            asyncio.run(operation())
+        except BaseException as exc:
+            return exc
+        return None
+
+    async def contend() -> BaseException | None:
+        attachment = asyncio.create_task(asyncio.to_thread(attach_after_release))
+        assert await asyncio.to_thread(ready.wait, 5)
+        lock_connection = sqlite3.connect(path)
+        try:
+            lock_connection.execute("PRAGMA busy_timeout = 5000")
+            lock_connection.execute("BEGIN IMMEDIATE")
+            begin_attach.set()
+            assert await asyncio.to_thread(attaching.wait, 5)
+            await asyncio.sleep(
+                max(
+                    0.0,
+                    (claimed.lease_expires_at - datetime.now(UTC)).total_seconds(),
+                )
+                + 0.05
+            )
+            lock_connection.commit()
+            return await attachment
+        finally:
+            begin_attach.set()
+            lock_connection.rollback()
+            lock_connection.close()
+
+    failure = asyncio.run(contend())
+    assert isinstance(failure, TaskClaimLost)
+
+    authority_connection = sqlite3.connect(path)
+    try:
+        authority = authority_connection.execute(
+            "SELECT authority_kind FROM cayu_task_session_execution_authority WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        assert authority is None
+    finally:
+        authority_connection.close()
+
+    async def verify() -> None:
+        store = SQLiteTaskStore(path)
+        try:
+            unchanged = await store.load_task(task_id)
+            assert unchanged is not None
+            assert unchanged.status is TaskStatus.CLAIMED
+            assert unchanged.worker_id == worker_id
+            assert unchanged.session_id is None
+        finally:
+            await store.close()
+
+    asyncio.run(verify())
+
+
+def test_sqlite_revision_49_migrates_existing_ordinary_tasks(tmp_path) -> None:
+    path = tmp_path / "revision-49.sqlite"
+
+    async def seed() -> None:
+        store = SQLiteTaskStore(path)
+        try:
+            await store.create_task(TaskCreate(task_id="pre-49-task", type="ordinary"))
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    connection = sqlite3.connect(path)
+    try:
+        for table in (
+            "cayu_completion_decision_application_receipts",
+            "cayu_completion_decisions",
+            "cayu_completion_verification_claims",
+            "cayu_completion_proposals",
+            "cayu_work_attempts",
+            "cayu_task_session_execution_authority",
+            "cayu_work_contracts",
+        ):
+            connection.execute(f"DROP TABLE {table}")
+        connection.execute("DROP INDEX idx_cayu_tasks_contracted_session")
+        connection.execute("ALTER TABLE cayu_tasks DROP COLUMN work_contract_json")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 49")
+        connection.execute("PRAGMA user_version = 48")
+        connection.commit()
+    finally:
+        connection.close()
+
+    async def migrate() -> None:
+        store = SQLiteTaskStore(path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+        try:
+            existing = await store.load_task("pre-49-task")
+            assert existing is not None
+            assert existing.work_contract is None
+            contract = _contract(contract_id="revision-49-contract")
+            await store.publish_work_contract(contract)
+            created = await store.create_task(
+                TaskCreate(
+                    task_id="post-49-task",
+                    type="contracted",
+                    work_contract=contract.reference(),
+                )
+            )
+            assert created.work_contract == contract.reference()
+        finally:
+            await store.close()
+
+    asyncio.run(migrate())
+
+
+def test_sqlite_revision_49_validation_rejects_missing_authority_table(tmp_path) -> None:
+    path = tmp_path / "invalid-revision-49.sqlite"
+
+    async def create() -> None:
+        store = SQLiteTaskStore(path)
+        await store.close()
+
+    asyncio.run(create())
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP TABLE cayu_task_session_execution_authority")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="revision-49 verified-work contract"):
+        SQLiteTaskStore(path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
 
 def test_contract_publication_requires_exact_content_and_lineage() -> None:
@@ -5946,6 +6328,8 @@ def test_application_rejects_retry_series_with_verified_work_contract_before_mut
     policy = TaskRetryPolicy(max_attempts=2)
 
     class RecordingTaskStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.create_called = False
@@ -6565,7 +6949,18 @@ def test_work_contract_store_conflicts_do_not_retain_sensitive_payloads(
 
 
 def test_verified_work_mutations_require_concrete_cancellation_quiescence() -> None:
+    class UndeclaredInheritedStore(InMemoryTaskStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mutation_dispatched = False
+
+        def _store_task(self, task: Task) -> None:
+            self.mutation_dispatched = True
+            super()._store_task(task)
+
     class LookupOnlyStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def load_task(self, task_id: str) -> Task | None:
             return await super().load_task(task_id)
 
@@ -6585,6 +6980,26 @@ def test_verified_work_mutations_require_concrete_cancellation_quiescence() -> N
         verified_work_mutations_are_cancellation_quiescent = False
 
     async def scenario() -> None:
+        undeclared_store = UndeclaredInheritedStore()
+        undeclared_contract = _contract(
+            contract_id="undeclared-inherited-mutation-settlement-contract"
+        )
+        await InMemoryTaskStore.publish_work_contract(undeclared_store, undeclared_contract)
+        undeclared_app = CayuApp(task_store=undeclared_store, enable_logging=False)
+        with pytest.raises(NotImplementedError, match="cancellation-quiescent"):
+            await undeclared_app.create_task(
+                TaskCreate(
+                    task_id="undeclared-inherited-mutation-settlement-task",
+                    type="verified-work",
+                    work_contract=undeclared_contract.reference(),
+                )
+            )
+        assert (
+            await undeclared_store.load_task("undeclared-inherited-mutation-settlement-task")
+            is None
+        )
+        assert undeclared_store.mutation_dispatched is False
+
         inherited_store = LookupOnlyStore()
         inherited_contract = _contract(contract_id="inherited-mutation-settlement-contract")
         await inherited_store.publish_work_contract(inherited_contract)
@@ -7045,9 +7460,9 @@ def test_unproven_worker_claim_mutations_are_rejected_before_dispatch() -> None:
     async def scenario() -> None:
         claim_store = OpaqueClaimStore()
         reclaim_store = OpaqueReclaimStore()
-        for task_store, message, identity in (
-            (claim_store, "task claiming", "claim"),
-            (reclaim_store, "expired-claim reclamation", "reclaim"),
+        for task_store, identity in (
+            (claim_store, "claim"),
+            (reclaim_store, "reclaim"),
         ):
             ordinary = await task_store.create_task(
                 TaskCreate(task_id=f"unproven-{identity}-task", type="ordinary")
@@ -7066,7 +7481,7 @@ def test_unproven_worker_claim_mutations_are_rejected_before_dispatch() -> None:
                 == 0
             )
 
-            with pytest.raises(NotImplementedError, match=message):
+            with pytest.raises(NotImplementedError, match="cancellation-quiescent"):
                 await run_task_worker(
                     app,
                     task_store,

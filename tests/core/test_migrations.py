@@ -141,6 +141,22 @@ def test_revision_forty_eight_adds_explicit_captured_only_eval_cases() -> None:
         )
 
 
+def test_revision_forty_nine_adds_durable_verified_work_authority() -> None:
+    state = m.SchemaState(revision=49, compatible_from=49)
+
+    # A revision-48 task worker can complete contracted work through an
+    # ordinary terminal entrance, so it cannot share the migrated database.
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 49"):
+        m.validate(state, app_latest=48, app_min_supported=48)
+    m.validate(state, app_latest=49, app_min_supported=49)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 49"):
+        m.validate(
+            m.SchemaState(revision=48, compatible_from=48),
+            app_latest=49,
+            app_min_supported=49,
+        )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

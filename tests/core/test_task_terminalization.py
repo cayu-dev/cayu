@@ -91,6 +91,8 @@ def test_terminalization_retry_policy_rejects_coerced_or_unbounded_values() -> N
 
 def test_terminalization_helper_requires_store_capability() -> None:
     class LegacyStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         supports_idempotent_terminalization = False
 
     async def run() -> None:
@@ -102,6 +104,8 @@ def test_terminalization_helper_requires_store_capability() -> None:
 
 def test_terminalization_helper_reconstructs_commit_before_error() -> None:
     class CommitThenRaiseStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.terminalize_calls = 0
@@ -143,6 +147,8 @@ def test_terminalization_helper_reconstructs_commit_before_error() -> None:
 
 def test_terminalization_helper_rejects_receipt_current_task_inconsistency() -> None:
     class InconsistentReceiptStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.reported_current_task: Task | None = None
@@ -184,6 +190,8 @@ def test_terminalization_helper_rejects_receipt_current_task_inconsistency() -> 
 
 def test_terminalization_helper_retries_exact_request_after_precommit_error() -> None:
     class FailBeforeCommitStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.terminalize_calls = 0
@@ -226,6 +234,8 @@ def test_terminalization_helper_retries_exact_request_after_precommit_error() ->
 
 def test_terminalization_helper_detaches_request_for_every_retry() -> None:
     class MutatingFailureStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.terminalize_calls = 0
@@ -266,6 +276,8 @@ def test_terminalization_helper_detaches_request_for_every_retry() -> None:
 
 def test_terminalization_helper_exhaustion_is_bounded_and_content_free() -> None:
     class AlwaysUnavailableStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.terminalize_calls = 0
@@ -327,6 +339,8 @@ def test_terminalization_uncertain_bounds_each_evidence_field_in_utf8_bytes() ->
 
 def test_terminalization_helper_bounds_each_store_attempt() -> None:
     class HungStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.terminalize_calls = 0
@@ -357,6 +371,8 @@ def test_terminalization_helper_bounds_each_store_attempt() -> None:
 
 def test_terminalization_helper_does_not_retry_caller_cancellation() -> None:
     class CancelledStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.terminalize_calls = 0
@@ -400,6 +416,8 @@ def test_terminalization_helper_does_not_retry_caller_cancellation() -> None:
 )
 def test_terminalization_helper_does_not_retry_deterministic_failures(raised: Exception) -> None:
     class DeterministicFailureStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.terminalize_calls = 0
@@ -440,6 +458,8 @@ def test_terminalization_helper_does_not_retry_deterministic_store_errors(
     raised: Exception,
 ) -> None:
     class DeterministicStoreFailureStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.terminalize_calls = 0
@@ -480,6 +500,8 @@ def test_terminalization_helper_does_not_catch_base_exception() -> None:
         pass
 
     class AbortedStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.terminalize_calls = 0
@@ -499,6 +521,8 @@ def test_terminalization_helper_does_not_catch_base_exception() -> None:
 
 def test_terminalization_helper_exhausts_when_write_and_receipt_acknowledgements_fail() -> None:
     class ReceiptUnavailableStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         def __init__(self) -> None:
             super().__init__()
             self.terminalize_calls = 0
@@ -547,11 +571,15 @@ def test_terminalization_boundaries_reject_hostile_subclasses() -> None:
         pass
 
     class HostileResultStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def terminalize_task(self, request: TaskTerminalizationRequest):
             task = await super().terminalize_task(request)
             return HostileTask.model_validate(task.model_dump(mode="python"))
 
     class HostileReceiptStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
         async def terminalize_task(self, request: TaskTerminalizationRequest):
             raise ConnectionError("acknowledgement unavailable")
 
