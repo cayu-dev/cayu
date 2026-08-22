@@ -145,6 +145,34 @@ PostgreSQL store, run `cayu storage migrate`, and confirm revision 50 before
 starting current workers. Mixed revision-49 and revision-50 eval workers are
 unsupported.
 
+### Recall and provider exposure become separately auditable
+
+Session stores now persist immutable, bounded `RecallReceipt` records for exact
+retrieval/admission decisions and revision-fenced `ContextExposure` lifecycles
+for exact model/provider attempts. Per-item links must match receipt identity,
+revision, representation, content hash, and locator exactly. Reused identities,
+cross-step links, duplicate items, stale transitions, and post-terminal updates
+fail closed. In-memory, SQLite, and PostgreSQL implementations share the same
+idempotency, concurrency, pagination, and session-deletion behavior.
+
+The lifecycle deliberately distinguishes planned composition, prepared request,
+durable dispatch intent, provider acknowledgement, completion, conclusive
+failure/cancellation, and ambiguous transport. Planning or dispatch intent is
+never reported as positive evidence that the model saw memory. Evidence stores
+retain bounded identifiers and hashes, not raw user queries, recalled text,
+prompts, or provider payloads. Private structured material uses keyed,
+domain-separated HMAC fingerprints so stored digests do not become offline
+guessing oracles. Built-in source locators use a closed typed union; custom
+locators retain only a domain-separated keyed fingerprint, so arbitrary source
+metadata or credentials cannot enter durable evidence. Receipt/exposure page
+reads use bounded keyset lookahead and do not count or scan the remaining
+history.
+
+Storage revision 51 is additive and creates only empty evidence tables and
+indexes. It does not backfill historical sessions or add a legacy compatibility
+path. Runtime provider-boundary publication will be wired in a later slice;
+this release establishes the strict public values and durable store contract.
+
 ### OpenAI subscription retries are bounded with migration-explicit authority
 
 OpenAI subscription HTTP and SSE errors now preserve bounded typed retry
@@ -327,12 +355,12 @@ workers together. The server contract advances from version 10 to version 16,
 and the public application manifest and generator plan advance from schema 7
 to schema 9.
 
-The storage schema advances from revision 36 to revision 50. Follow the
+The storage schema advances from revision 36 to revision 51. Follow the
 revision-specific migration boundaries below: revisions 39 through 50 contain
 breaking durable contracts, and populated legacy knowledge or task stores may
 require the explicitly documented rebuild or drain procedure. Run `cayu storage
 status` followed by `cayu storage migrate` against every configured SQLite or
-PostgreSQL store, and confirm revision 50 with no pending migrations before
+PostgreSQL store, and confirm revision 51 with no pending migrations before
 starting `v0.3.0` workers. Mixed-version deployment and application-only
 rollback across these boundaries are unsupported.
 

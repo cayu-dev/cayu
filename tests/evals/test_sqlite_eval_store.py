@@ -264,7 +264,7 @@ def test_sqlite_revision_fifty_backfills_existing_eval_run_invocation(
         connection.executescript(
             """
             ALTER TABLE cayu_eval_runs DROP COLUMN invocation_json;
-            DELETE FROM cayu_schema_migrations WHERE revision = 50;
+            DELETE FROM cayu_schema_migrations WHERE revision >= 50;
             PRAGMA user_version = 49;
             """
         )

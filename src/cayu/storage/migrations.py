@@ -290,6 +290,11 @@ REVISIONS: tuple[Revision, ...] = (
     # a durable worker restart. Pre-50 workers would silently lose that contract,
     # so mixed-version eval workers are unsafe.
     Revision(revision=50, kind=RevisionKind.BREAKING, compatible_from=50),
+    # Add bounded recall receipts, exact context-exposure lifecycle records,
+    # and per-item exposure evidence. Revision-50 writers do not touch these
+    # tables, so they remain compatible until runtime wiring
+    # makes pre-dispatch evidence mandatory in a later breaking revision.
+    Revision(revision=51, kind=RevisionKind.ADDITIVE, compatible_from=50),
 )
 
 #: The revision an empty database is initialized to.

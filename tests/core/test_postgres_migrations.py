@@ -92,6 +92,33 @@ def test_revision_twenty_nine_builds_workflow_replay_indexes_concurrently() -> N
     assert all("CREATE INDEX CONCURRENTLY" in index.create_statement for index in indexes.values())
 
 
+def test_constraint_fragment_matching_is_catalog_order_independent() -> None:
+    candidates = (
+        (
+            "c",
+            "check (((receipt_item_ordinal >= 0) and (receipt_item_ordinal < 64)))",
+        ),
+        ("c", "check (((ordinal >= 0) and (ordinal < 64)))"),
+    )
+    required = (
+        ("c", ("ordinal >= 0", "ordinal < 64")),
+        (
+            "c",
+            ("receipt_item_ordinal >= 0", "receipt_item_ordinal < 64"),
+        ),
+    )
+
+    assert postgres_storage._constraint_fragments_match_exactly(candidates, required)
+    assert postgres_storage._constraint_fragments_match_exactly(
+        tuple(reversed(candidates)),
+        required,
+    )
+    assert not postgres_storage._constraint_fragments_match_exactly(
+        candidates[:1],
+        required,
+    )
+
+
 def test_revision_thirty_rebuilds_session_lineage_index_with_c_collation() -> None:
     indexes = postgres_storage._CONCURRENT_INDEX_MIGRATIONS[30]
 
@@ -604,6 +631,9 @@ _TABLES = (
     "cayu_work_attempts",
     "cayu_task_session_execution_authority",
     "cayu_work_contracts",
+    "cayu_recall_item_exposures",
+    "cayu_context_exposures",
+    "cayu_recall_receipts",
     "cayu_knowledge_change_acknowledgements",
     "cayu_knowledge_change_consumers",
     "cayu_knowledge_change_labels",
@@ -699,6 +729,81 @@ def test_create_mode_initializes_and_records_baseline(postgres_dsn: str) -> None
             await store.close()
         # A new database is initialized through every known revision.
         assert await _recorded_revisions(postgres_dsn) == _expected_revisions()
+
+    asyncio.run(runner())
+
+
+def test_memory_evidence_schema_validation_fails_closed(postgres_dsn: str) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP INDEX idx_cayu_context_exposures_interaction_step_page")
+                await cur.execute(
+                    """
+                    CREATE INDEX idx_cayu_context_exposures_interaction_step_page
+                    ON cayu_context_exposures(
+                        session_id, interaction_id, model_step_id, created_at, exposure_id
+                    )
+                    WHERE state = 'planned'
+                    """
+                )
+            await conn.commit()
+
+        validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            with pytest.raises(RuntimeError, match="revision-51 memory evidence contract"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+    asyncio.run(runner())
+
+
+@pytest.mark.parametrize(
+    "unique_index_ddl",
+    (
+        "CREATE UNIQUE INDEX unexpected_memory_receipt_session_unique "
+        "ON cayu_recall_receipts(session_id)",
+        "CREATE UNIQUE INDEX unexpected_memory_exposure_session_unique "
+        "ON cayu_context_exposures(session_id)",
+        "CREATE UNIQUE INDEX unexpected_memory_item_receipt_unique "
+        "ON cayu_recall_item_exposures(receipt_id)",
+    ),
+)
+def test_memory_evidence_schema_rejects_standalone_unique_indexes(
+    postgres_dsn: str,
+    unique_index_ddl: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(unique_index_ddl)
+            await conn.commit()
+
+        validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            with pytest.raises(RuntimeError, match="revision-51 memory evidence contract"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
 
     asyncio.run(runner())
 

@@ -56,6 +56,31 @@ from cayu.embeddings import (
     TextEmbeddingRequest,
     copy_text_embedding_result,
 )
+from cayu.memory_evidence import (
+    ContextExposure,
+    ContextExposurePage,
+    ContextExposureTransitionConflict,
+    ContextExposureTransitionRequest,
+    RecallEvidenceConflict,
+    RecallEvidenceQuery,
+    RecallItemExposure,
+    RecallReceipt,
+    RecallReceiptPage,
+    append_context_exposure_transition,
+    context_exposure_creation_matches,
+    context_exposure_transition_replays,
+    copy_context_exposure,
+    copy_recall_item_exposure,
+    copy_recall_receipt,
+    decode_recall_evidence_cursor,
+    encode_recall_evidence_cursor,
+    memory_evidence_document_bytes,
+    recall_item_exposure_matches_receipt_item,
+    require_memory_evidence_id,
+    require_memory_evidence_session_id,
+    validate_context_exposure_receipt_scope,
+    validate_new_context_exposure,
+)
 from cayu.runtime._provider_operation_cancellation_claim import (
     active_provider_operation_cancellation_claim_from_checkpoint,
 )
@@ -574,8 +599,101 @@ from cayu.storage.memory import (
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 46
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 51
 _POSTGRES_TASK_MIN_REQUIRED_REVISION = 49
+
+
+async def _postgres_lock_memory_evidence_id(cur: Any, lock_id: str) -> None:
+    await cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        (lock_id,),
+    )
+
+
+def _postgres_json_document(value: Any, field_name: str) -> dict[str, Any]:
+    if type(value) is str:
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Postgres {field_name} contains invalid JSON.") from exc
+    if type(value) is not dict:
+        raise RuntimeError(f"Postgres {field_name} must be a JSON object.")
+    return value
+
+
+def _postgres_recall_receipt(row: Sequence[Any]) -> RecallReceipt:
+    try:
+        receipt = RecallReceipt.model_validate(_postgres_json_document(row[5], "recall receipt"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Postgres recall receipt contains invalid durable material.") from exc
+    document = memory_evidence_document_bytes(receipt, "stored recall receipt")
+    if (
+        receipt.receipt_id != row[0]
+        or receipt.session_id != row[1]
+        or receipt.interaction_id != row[2]
+        or receipt.model_step_id != row[3]
+        or receipt.created_at != pg_support.to_utc(row[4])
+        or len(document) != row[6]
+    ):
+        raise RuntimeError("Postgres recall receipt index columns conflict with its document.")
+    return receipt
+
+
+def _postgres_context_exposure(row: Sequence[Any]) -> ContextExposure:
+    try:
+        exposure = ContextExposure.model_validate(
+            _postgres_json_document(row[10], "context exposure")
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Postgres context exposure contains invalid durable material.") from exc
+    document = memory_evidence_document_bytes(exposure, "stored context exposure")
+    if (
+        exposure.exposure_id != row[0]
+        or exposure.session_id != row[1]
+        or exposure.interaction_id != row[2]
+        or exposure.model_step_id != row[3]
+        or exposure.model_attempt_id != row[4]
+        or exposure.provider_attempt_id != row[5]
+        or str(exposure.state) != row[6]
+        or exposure.state_revision != row[7]
+        or exposure.created_at != pg_support.to_utc(row[8])
+        or exposure.updated_at != pg_support.to_utc(row[9])
+        or len(document) != row[11]
+    ):
+        raise RuntimeError("Postgres context exposure index columns conflict with its document.")
+    return exposure
+
+
+def _postgres_recall_item_exposures(
+    rows: Sequence[Sequence[Any]],
+) -> tuple[RecallItemExposure, ...]:
+    items: list[RecallItemExposure] = []
+    for row in rows:
+        try:
+            item = RecallItemExposure.model_validate(
+                _postgres_json_document(row[4], "recall item exposure")
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Postgres recall item exposure contains invalid durable material."
+            ) from exc
+        document = memory_evidence_document_bytes(item, "stored recall item exposure")
+        if (
+            item.exposure_id != row[0]
+            or item.ordinal != row[1]
+            or item.receipt_id != row[2]
+            or item.receipt_item_ordinal != row[3]
+            or len(document) != row[5]
+        ):
+            raise RuntimeError(
+                "Postgres recall item exposure index columns conflict with its document."
+            )
+        items.append(item)
+    if tuple(item.ordinal for item in items) != tuple(range(len(items))):
+        raise RuntimeError("Postgres recall item exposure ordinals are incomplete.")
+    return tuple(items)
+
+
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
     event_type IN (
@@ -2094,6 +2212,90 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         '"max_steps":null,"limits":null,"cost_budget":null}\'',
         "ALTER TABLE cayu_eval_runs ALTER COLUMN invocation_json DROP DEFAULT",
     ),
+    51: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_recall_receipts (
+            receipt_id TEXT COLLATE "C" PRIMARY KEY,
+            session_id TEXT COLLATE "C" NOT NULL
+                REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            interaction_id TEXT COLLATE "C" NOT NULL,
+            model_step_id TEXT COLLATE "C" NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            receipt_json JSONB NOT NULL,
+            document_bytes BIGINT NOT NULL CHECK (
+                document_bytes >= 1 AND document_bytes <= 256000
+            )
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_context_exposures (
+            exposure_id TEXT COLLATE "C" PRIMARY KEY,
+            session_id TEXT COLLATE "C" NOT NULL
+                REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            interaction_id TEXT COLLATE "C" NOT NULL,
+            model_step_id TEXT COLLATE "C" NOT NULL,
+            model_attempt_id TEXT COLLATE "C" NOT NULL,
+            provider_attempt_id TEXT COLLATE "C" NOT NULL,
+            state TEXT NOT NULL CHECK (state IN (
+                'planned', 'prepared', 'dispatch_started', 'acknowledged',
+                'completed', 'failed', 'cancelled', 'indeterminate'
+            )),
+            state_revision INTEGER NOT NULL CHECK (
+                state_revision >= 0 AND state_revision < 16
+            ),
+            created_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            exposure_json JSONB NOT NULL,
+            document_bytes BIGINT NOT NULL CHECK (
+                document_bytes >= 1 AND document_bytes <= 128000
+            ),
+            UNIQUE (session_id, model_attempt_id),
+            UNIQUE (session_id, provider_attempt_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_recall_item_exposures (
+            exposure_id TEXT COLLATE "C" NOT NULL
+                REFERENCES cayu_context_exposures(exposure_id) ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL CHECK (ordinal >= 0 AND ordinal < 64),
+            receipt_id TEXT COLLATE "C" NOT NULL
+                REFERENCES cayu_recall_receipts(receipt_id) ON DELETE CASCADE,
+            receipt_item_ordinal INTEGER NOT NULL CHECK (
+                receipt_item_ordinal >= 0 AND receipt_item_ordinal < 64
+            ),
+            item_json JSONB NOT NULL,
+            document_bytes BIGINT NOT NULL CHECK (
+                document_bytes >= 1 AND document_bytes <= 16384
+            ),
+            PRIMARY KEY (exposure_id, ordinal),
+            UNIQUE (exposure_id, receipt_id, receipt_item_ordinal)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_recall_receipts_session_page "
+        'ON cayu_recall_receipts(session_id, created_at, receipt_id COLLATE "C")',
+        "CREATE INDEX IF NOT EXISTS idx_cayu_recall_receipts_interaction_page "
+        "ON cayu_recall_receipts("
+        'session_id, interaction_id, created_at, receipt_id COLLATE "C")',
+        "CREATE INDEX IF NOT EXISTS idx_cayu_recall_receipts_step_page "
+        "ON cayu_recall_receipts("
+        'session_id, model_step_id, created_at, receipt_id COLLATE "C")',
+        "CREATE INDEX IF NOT EXISTS idx_cayu_recall_receipts_interaction_step_page "
+        "ON cayu_recall_receipts(session_id, interaction_id, model_step_id, created_at, "
+        'receipt_id COLLATE "C")',
+        "CREATE INDEX IF NOT EXISTS idx_cayu_context_exposures_session_page "
+        'ON cayu_context_exposures(session_id, created_at, exposure_id COLLATE "C")',
+        "CREATE INDEX IF NOT EXISTS idx_cayu_context_exposures_interaction_page "
+        "ON cayu_context_exposures("
+        'session_id, interaction_id, created_at, exposure_id COLLATE "C")',
+        "CREATE INDEX IF NOT EXISTS idx_cayu_context_exposures_step_page "
+        "ON cayu_context_exposures("
+        'session_id, model_step_id, created_at, exposure_id COLLATE "C")',
+        "CREATE INDEX IF NOT EXISTS idx_cayu_context_exposures_interaction_step_page "
+        "ON cayu_context_exposures(session_id, interaction_id, model_step_id, created_at, "
+        'exposure_id COLLATE "C")',
+        "CREATE INDEX IF NOT EXISTS idx_cayu_recall_item_exposures_receipt "
+        "ON cayu_recall_item_exposures(receipt_id, exposure_id, ordinal)",
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -3018,6 +3220,42 @@ def _required_concurrent_indexes(revision: int) -> tuple[_ConcurrentIndexMigrati
     return tuple(latest_by_name.values())
 
 
+def _constraint_fragments_match_exactly(
+    candidates: Sequence[tuple[str, str]],
+    required: Sequence[tuple[str, tuple[str, ...]]],
+) -> bool:
+    """Match every required constraint to one distinct catalog constraint."""
+
+    if len(candidates) != len(required):
+        return False
+    compatible_candidates = tuple(
+        tuple(
+            candidate_index
+            for candidate_index, (candidate_kind, definition) in enumerate(candidates)
+            if candidate_kind == required_kind
+            and all(fragment in definition for fragment in fragments)
+        )
+        for required_kind, fragments in required
+    )
+    if any(not compatible for compatible in compatible_candidates):
+        return False
+
+    required_by_candidate: dict[int, int] = {}
+
+    def assign(required_index: int, visited_candidates: set[int]) -> bool:
+        for candidate_index in compatible_candidates[required_index]:
+            if candidate_index in visited_candidates:
+                continue
+            visited_candidates.add(candidate_index)
+            previous_required = required_by_candidate.get(candidate_index)
+            if previous_required is None or assign(previous_required, visited_candidates):
+                required_by_candidate[candidate_index] = required_index
+                return True
+        return False
+
+    return all(assign(required_index, set()) for required_index in range(len(required)))
+
+
 async def read_schema_state(cur: Any) -> schema.SchemaState:
     """Read the recorded schema state from an open cursor without applying DDL.
 
@@ -3432,6 +3670,8 @@ class _PostgresStoreBase:
                             await self._validate_verified_work_schema(cur)
                         if self._min_required_revision >= 50:
                             await self._validate_eval_run_invocation_column(cur)
+                        if self._min_required_revision >= 51:
+                            await self._validate_memory_evidence_schema(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -3602,6 +3842,8 @@ class _PostgresStoreBase:
             await self._validate_verified_work_schema(cur)
         if self._min_required_revision >= 50:
             await self._validate_eval_run_invocation_column(cur)
+        if self._min_required_revision >= 51:
+            await self._validate_memory_evidence_schema(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -3690,6 +3932,8 @@ class _PostgresStoreBase:
             await self._validate_verified_work_schema(cur)
         if revision.revision == 50:
             await self._validate_eval_run_invocation_column(cur)
+        if revision.revision == 51:
+            await self._validate_memory_evidence_schema(cur)
 
     async def _validate_transcript_search_document_column(self, cur: Any) -> None:
         await cur.execute(
@@ -4892,6 +5136,314 @@ class _PostgresStoreBase:
                 "with Cayu's revision-50 durable eval invocation contract. Run "
                 "`cayu storage migrate` or restore the database from a known-good backup."
             )
+
+    async def _validate_memory_evidence_schema(self, cur: Any) -> None:
+        expected_columns = {
+            "cayu_recall_receipts": (
+                ("receipt_id", "text", "NO"),
+                ("session_id", "text", "NO"),
+                ("interaction_id", "text", "NO"),
+                ("model_step_id", "text", "NO"),
+                ("created_at", "timestamp with time zone", "NO"),
+                ("receipt_json", "jsonb", "NO"),
+                ("document_bytes", "bigint", "NO"),
+            ),
+            "cayu_context_exposures": (
+                ("exposure_id", "text", "NO"),
+                ("session_id", "text", "NO"),
+                ("interaction_id", "text", "NO"),
+                ("model_step_id", "text", "NO"),
+                ("model_attempt_id", "text", "NO"),
+                ("provider_attempt_id", "text", "NO"),
+                ("state", "text", "NO"),
+                ("state_revision", "integer", "NO"),
+                ("created_at", "timestamp with time zone", "NO"),
+                ("updated_at", "timestamp with time zone", "NO"),
+                ("exposure_json", "jsonb", "NO"),
+                ("document_bytes", "bigint", "NO"),
+            ),
+            "cayu_recall_item_exposures": (
+                ("exposure_id", "text", "NO"),
+                ("ordinal", "integer", "NO"),
+                ("receipt_id", "text", "NO"),
+                ("receipt_item_ordinal", "integer", "NO"),
+                ("item_json", "jsonb", "NO"),
+                ("document_bytes", "bigint", "NO"),
+            ),
+        }
+        for table, expected in expected_columns.items():
+            await cur.execute(
+                """
+                SELECT column_name, data_type, is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (table,),
+            )
+            if tuple(await cur.fetchall()) != expected:
+                self._raise_memory_evidence_schema_error(table)
+
+        await cur.execute(
+            """
+            SELECT table_name, column_name, collation_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND (table_name, column_name) IN (
+                  ('cayu_recall_receipts', 'receipt_id'),
+                  ('cayu_recall_receipts', 'session_id'),
+                  ('cayu_recall_receipts', 'interaction_id'),
+                  ('cayu_recall_receipts', 'model_step_id'),
+                  ('cayu_context_exposures', 'exposure_id'),
+                  ('cayu_context_exposures', 'session_id'),
+                  ('cayu_context_exposures', 'interaction_id'),
+                  ('cayu_context_exposures', 'model_step_id'),
+                  ('cayu_context_exposures', 'model_attempt_id'),
+                  ('cayu_context_exposures', 'provider_attempt_id'),
+                  ('cayu_recall_item_exposures', 'exposure_id'),
+                  ('cayu_recall_item_exposures', 'receipt_id')
+              )
+            """
+        )
+        if set(await cur.fetchall()) != {
+            ("cayu_recall_receipts", "receipt_id", "C"),
+            ("cayu_recall_receipts", "session_id", "C"),
+            ("cayu_recall_receipts", "interaction_id", "C"),
+            ("cayu_recall_receipts", "model_step_id", "C"),
+            ("cayu_context_exposures", "exposure_id", "C"),
+            ("cayu_context_exposures", "session_id", "C"),
+            ("cayu_context_exposures", "interaction_id", "C"),
+            ("cayu_context_exposures", "model_step_id", "C"),
+            ("cayu_context_exposures", "model_attempt_id", "C"),
+            ("cayu_context_exposures", "provider_attempt_id", "C"),
+            ("cayu_recall_item_exposures", "exposure_id", "C"),
+            ("cayu_recall_item_exposures", "receipt_id", "C"),
+        }:
+            self._raise_memory_evidence_schema_error("memory evidence identity collation")
+
+        required_constraints = {
+            "cayu_recall_receipts": (
+                ("p", ("primary key (receipt_id)",)),
+                (
+                    "f",
+                    (
+                        "foreign key (session_id)",
+                        "references cayu_sessions(id)",
+                        "on delete cascade",
+                    ),
+                ),
+                ("c", ("document_bytes >= 1", "document_bytes <= 256000")),
+            ),
+            "cayu_context_exposures": (
+                ("p", ("primary key (exposure_id)",)),
+                ("u", ("unique (session_id, model_attempt_id)",)),
+                ("u", ("unique (session_id, provider_attempt_id)",)),
+                (
+                    "f",
+                    (
+                        "foreign key (session_id)",
+                        "references cayu_sessions(id)",
+                        "on delete cascade",
+                    ),
+                ),
+                (
+                    "c",
+                    (
+                        "planned",
+                        "prepared",
+                        "dispatch_started",
+                        "acknowledged",
+                        "completed",
+                        "failed",
+                        "cancelled",
+                        "indeterminate",
+                    ),
+                ),
+                ("c", ("state_revision >= 0", "state_revision < 16")),
+                ("c", ("document_bytes >= 1", "document_bytes <= 128000")),
+            ),
+            "cayu_recall_item_exposures": (
+                ("p", ("primary key (exposure_id, ordinal)",)),
+                (
+                    "u",
+                    ("unique (exposure_id, receipt_id, receipt_item_ordinal)",),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (exposure_id)",
+                        "references cayu_context_exposures(exposure_id)",
+                        "on delete cascade",
+                    ),
+                ),
+                (
+                    "f",
+                    (
+                        "foreign key (receipt_id)",
+                        "references cayu_recall_receipts(receipt_id)",
+                        "on delete cascade",
+                    ),
+                ),
+                ("c", ("ordinal >= 0", "ordinal < 64")),
+                (
+                    "c",
+                    ("receipt_item_ordinal >= 0", "receipt_item_ordinal < 64"),
+                ),
+                ("c", ("document_bytes >= 1", "document_bytes <= 16384")),
+            ),
+        }
+        for table, required in required_constraints.items():
+            await cur.execute(
+                """
+                SELECT constraint_record.contype,
+                       pg_get_constraintdef(constraint_record.oid)
+                FROM pg_catalog.pg_constraint AS constraint_record
+                JOIN pg_catalog.pg_class AS table_record
+                  ON table_record.oid = constraint_record.conrelid
+                JOIN pg_catalog.pg_namespace AS namespace
+                  ON namespace.oid = table_record.relnamespace
+                WHERE namespace.nspname = current_schema()
+                  AND table_record.relname = %s
+                  AND constraint_record.contype IN ('p', 'u', 'f', 'c')
+                """,
+                (table,),
+            )
+            candidates = [
+                (str(kind), " ".join(str(definition).lower().split()))
+                for kind, definition in await cur.fetchall()
+            ]
+            if not _constraint_fragments_match_exactly(candidates, required):
+                self._raise_memory_evidence_schema_error(table)
+
+        await cur.execute(
+            """
+            SELECT table_record.relname, index_record.relname
+            FROM pg_catalog.pg_index AS index_state
+            JOIN pg_catalog.pg_class AS index_record
+              ON index_record.oid = index_state.indexrelid
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = index_state.indrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            LEFT JOIN pg_catalog.pg_constraint AS constraint_record
+              ON constraint_record.conindid = index_state.indexrelid
+             AND constraint_record.contype IN ('p', 'u')
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = ANY(%s)
+              AND index_state.indisunique
+              AND constraint_record.oid IS NULL
+            ORDER BY table_record.relname, index_record.relname
+            LIMIT 1
+            """,
+            (list(expected_columns),),
+        )
+        unexpected_unique_index = await cur.fetchone()
+        if unexpected_unique_index is not None:
+            self._raise_memory_evidence_schema_error(str(unexpected_unique_index[1]))
+
+        expected_indexes = {
+            "idx_cayu_recall_receipts_session_page": (
+                "cayu_recall_receipts",
+                "using btree (session_id, created_at, receipt_id)",
+            ),
+            "idx_cayu_recall_receipts_interaction_page": (
+                "cayu_recall_receipts",
+                "using btree (session_id, interaction_id, created_at, receipt_id)",
+            ),
+            "idx_cayu_recall_receipts_step_page": (
+                "cayu_recall_receipts",
+                "using btree (session_id, model_step_id, created_at, receipt_id)",
+            ),
+            "idx_cayu_recall_receipts_interaction_step_page": (
+                "cayu_recall_receipts",
+                "using btree (session_id, interaction_id, model_step_id, created_at, receipt_id)",
+            ),
+            "idx_cayu_context_exposures_session_page": (
+                "cayu_context_exposures",
+                "using btree (session_id, created_at, exposure_id)",
+            ),
+            "idx_cayu_context_exposures_interaction_page": (
+                "cayu_context_exposures",
+                "using btree (session_id, interaction_id, created_at, exposure_id)",
+            ),
+            "idx_cayu_context_exposures_step_page": (
+                "cayu_context_exposures",
+                "using btree (session_id, model_step_id, created_at, exposure_id)",
+            ),
+            "idx_cayu_context_exposures_interaction_step_page": (
+                "cayu_context_exposures",
+                "using btree (session_id, interaction_id, model_step_id, created_at, exposure_id)",
+            ),
+            "idx_cayu_recall_item_exposures_receipt": (
+                "cayu_recall_item_exposures",
+                "using btree (receipt_id, exposure_id, ordinal)",
+            ),
+        }
+        await cur.execute(
+            """
+            SELECT table_record.relname, index_record.relname,
+                   index_state.indisvalid, index_state.indisready,
+                   index_state.indisunique, index_state.indpred IS NULL,
+                   index_state.indexprs IS NULL,
+                   index_state.indnatts = index_state.indnkeyatts,
+                   pg_get_indexdef(index_record.oid)
+            FROM pg_catalog.pg_index AS index_state
+            JOIN pg_catalog.pg_class AS index_record
+              ON index_record.oid = index_state.indexrelid
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = index_state.indrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND index_record.relname = ANY(%s)
+            """,
+            (list(expected_indexes),),
+        )
+        indexes = {
+            str(index): (
+                str(table),
+                bool(valid),
+                bool(ready),
+                bool(unique),
+                bool(unconditional),
+                bool(plain_columns),
+                bool(key_columns_only),
+                " ".join(str(definition).lower().split()),
+            )
+            for (
+                table,
+                index,
+                valid,
+                ready,
+                unique,
+                unconditional,
+                plain_columns,
+                key_columns_only,
+                definition,
+            ) in await cur.fetchall()
+        }
+        for name, (table, definition_fragment) in expected_indexes.items():
+            value = indexes.get(name)
+            if (
+                value is None
+                or value[0] != table
+                or not value[1]
+                or not value[2]
+                or value[3]
+                or not value[4]
+                or not value[5]
+                or not value[6]
+                or definition_fragment not in value[7]
+            ):
+                self._raise_memory_evidence_schema_error(name)
+
+    @staticmethod
+    def _raise_memory_evidence_schema_error(name: str) -> NoReturn:
+        raise RuntimeError(
+            f"Postgres schema object {name!r} conflicts with Cayu's revision-51 "
+            "memory evidence contract. Recreate the database or restore a known-good "
+            "revision-51 backup."
+        )
 
     @staticmethod
     def _raise_eval_result_baseline_schema_error(name: str) -> NoReturn:
@@ -11974,6 +12526,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
+    supports_recall_evidence: ClassVar[bool] = True
     supports_owned_off_thread_session_commit_guards: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
     _min_required_revision = _POSTGRES_SESSION_MIN_REQUIRED_REVISION
@@ -13072,6 +13625,538 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 status=SessionStatus(row[1]),
                 invocation=SessionInvocation.model_validate(invocation_value),
             )
+
+    async def create_recall_receipt(self, receipt: RecallReceipt) -> RecallReceipt:
+        copied = copy_recall_receipt(receipt)
+        document = memory_evidence_document_bytes(copied, "recall receipt")
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await _postgres_lock_memory_evidence_id(
+                        cur,
+                        f"recall-receipt:{copied.receipt_id}",
+                    )
+                    await cur.execute(
+                        """
+                        SELECT receipt_id, session_id, interaction_id, model_step_id,
+                               created_at, receipt_json, document_bytes
+                        FROM cayu_recall_receipts
+                        WHERE receipt_id = %s
+                        """,
+                        (copied.receipt_id,),
+                    )
+                    row = await cur.fetchone()
+                    if row is not None:
+                        current = _postgres_recall_receipt(row)
+                        if (
+                            memory_evidence_document_bytes(current, "stored recall receipt")
+                            != document
+                        ):
+                            raise RecallEvidenceConflict("Recall receipt", copied.receipt_id)
+                        await conn.commit()
+                        return current
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_sessions WHERE id = %s FOR KEY SHARE",
+                        (copied.session_id,),
+                    )
+                    if await cur.fetchone() is None:
+                        raise KeyError(f"Session not found: {copied.session_id}")
+                    await cur.execute(
+                        """
+                        INSERT INTO cayu_recall_receipts (
+                            receipt_id, session_id, interaction_id, model_step_id,
+                            created_at, receipt_json, document_bytes
+                        ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)
+                        """,
+                        (
+                            copied.receipt_id,
+                            copied.session_id,
+                            copied.interaction_id,
+                            copied.model_step_id,
+                            copied.created_at,
+                            document.decode("utf-8"),
+                            len(document),
+                        ),
+                    )
+                await conn.commit()
+                return copied
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def load_recall_receipt(
+        self,
+        session_id: str,
+        receipt_id: str,
+    ) -> RecallReceipt | None:
+        session_id = require_memory_evidence_session_id(session_id)
+        receipt_id = require_memory_evidence_id(receipt_id, "receipt_id")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT receipt_id, session_id, interaction_id, model_step_id,
+                       created_at, receipt_json, document_bytes
+                FROM cayu_recall_receipts
+                WHERE session_id = %s AND receipt_id = %s
+                """,
+                (session_id, receipt_id),
+            )
+            row = await cur.fetchone()
+            return None if row is None else _postgres_recall_receipt(row)
+
+    async def list_recall_receipts(
+        self,
+        query: RecallEvidenceQuery,
+    ) -> RecallReceiptPage:
+        copied_query = RecallEvidenceQuery.model_validate(query.model_dump(mode="python"))
+        query_fingerprint = copied_query.fingerprint("receipt")
+        after = (
+            None
+            if copied_query.cursor is None
+            else decode_recall_evidence_cursor(
+                copied_query.cursor,
+                record_kind="receipt",
+                query_fingerprint=query_fingerprint,
+            )
+        )
+        clauses = ["session_id = %s"]
+        parameters: list[object] = [copied_query.session_id]
+        if copied_query.interaction_id is not None:
+            clauses.append("interaction_id = %s")
+            parameters.append(copied_query.interaction_id)
+        if copied_query.model_step_id is not None:
+            clauses.append("model_step_id = %s")
+            parameters.append(copied_query.model_step_id)
+        if after is not None:
+            clauses.append('(created_at, receipt_id COLLATE "C") > (%s, %s)')
+            parameters.extend(after)
+        where = " AND ".join(clauses)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                SELECT receipt_id, session_id, interaction_id, model_step_id,
+                       created_at, receipt_json, document_bytes
+                FROM cayu_recall_receipts
+                WHERE {where}
+                ORDER BY created_at, receipt_id COLLATE "C"
+                LIMIT %s
+                """,
+                (*parameters, copied_query.limit + 1),
+            )
+            rows = await cur.fetchall()
+        retained: list[RecallReceipt] = []
+        retained_bytes = 2
+        for row in rows:
+            if len(retained) >= copied_query.limit:
+                break
+            receipt = _postgres_recall_receipt(row)
+            document_bytes = len(
+                memory_evidence_document_bytes(receipt, "recall receipt page item")
+            )
+            separator_bytes = 1 if retained else 0
+            if retained_bytes + separator_bytes + document_bytes > copied_query.max_bytes:
+                break
+            retained.append(receipt)
+            retained_bytes += separator_bytes + document_bytes
+        truncated = len(retained) < len(rows)
+        return RecallReceiptPage(
+            items=tuple(retained),
+            next_cursor=(
+                encode_recall_evidence_cursor(
+                    record_kind="receipt",
+                    query_fingerprint=query_fingerprint,
+                    created_at=retained[-1].created_at,
+                    record_id=retained[-1].receipt_id,
+                )
+                if truncated and retained
+                else None
+            ),
+            truncated=truncated,
+        )
+
+    async def create_context_exposure(
+        self,
+        exposure: ContextExposure,
+        item_exposures: tuple[RecallItemExposure, ...] = (),
+    ) -> ContextExposure:
+        copied = copy_context_exposure(exposure)
+        copied_items = tuple(copy_recall_item_exposure(item) for item in item_exposures)
+        validate_new_context_exposure(copied, copied_items)
+        document = memory_evidence_document_bytes(copied, "context exposure")
+        item_documents = tuple(
+            memory_evidence_document_bytes(item, "recall item exposure") for item in copied_items
+        )
+        lock_ids = sorted(
+            {
+                f"context-exposure:{copied.exposure_id}",
+                f"model-attempt:{copied.session_id}:{copied.model_attempt_id}",
+                f"provider-attempt:{copied.session_id}:{copied.provider_attempt_id}",
+            }
+        )
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    for lock_id in lock_ids:
+                        await _postgres_lock_memory_evidence_id(cur, lock_id)
+                    await cur.execute(
+                        """
+                        SELECT exposure_id, session_id, interaction_id, model_step_id,
+                               model_attempt_id, provider_attempt_id, state, state_revision,
+                               created_at, updated_at, exposure_json, document_bytes
+                        FROM cayu_context_exposures
+                        WHERE exposure_id = %s
+                        FOR UPDATE
+                        """,
+                        (copied.exposure_id,),
+                    )
+                    row = await cur.fetchone()
+                    if row is not None:
+                        current = _postgres_context_exposure(row)
+                        await cur.execute(
+                            """
+                            SELECT exposure_id, ordinal, receipt_id, receipt_item_ordinal,
+                                   item_json, document_bytes
+                            FROM cayu_recall_item_exposures
+                            WHERE exposure_id = %s
+                            ORDER BY ordinal
+                            """,
+                            (copied.exposure_id,),
+                        )
+                        current_items = _postgres_recall_item_exposures(await cur.fetchall())
+                        if (
+                            not context_exposure_creation_matches(current, copied)
+                            or tuple(
+                                memory_evidence_document_bytes(item, "stored recall item exposure")
+                                for item in current_items
+                            )
+                            != item_documents
+                        ):
+                            raise RecallEvidenceConflict(
+                                "Context exposure",
+                                copied.exposure_id,
+                            )
+                        await conn.commit()
+                        return current
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_sessions WHERE id = %s FOR KEY SHARE",
+                        (copied.session_id,),
+                    )
+                    if await cur.fetchone() is None:
+                        raise KeyError(f"Session not found: {copied.session_id}")
+                    await cur.execute(
+                        """
+                        SELECT exposure_id
+                        FROM cayu_context_exposures
+                        WHERE session_id = %s AND model_attempt_id = %s
+                        """,
+                        (copied.session_id, copied.model_attempt_id),
+                    )
+                    model_attempt_collision = await cur.fetchone()
+                    if model_attempt_collision is not None:
+                        raise RecallEvidenceConflict(
+                            "Model-attempt exposure",
+                            str(model_attempt_collision[0]),
+                        )
+                    await cur.execute(
+                        """
+                        SELECT exposure_id
+                        FROM cayu_context_exposures
+                        WHERE session_id = %s AND provider_attempt_id = %s
+                        """,
+                        (copied.session_id, copied.provider_attempt_id),
+                    )
+                    provider_attempt_collision = await cur.fetchone()
+                    if provider_attempt_collision is not None:
+                        raise RecallEvidenceConflict(
+                            "Provider-attempt exposure",
+                            str(provider_attempt_collision[0]),
+                        )
+                    receipts: dict[str, RecallReceipt] = {}
+                    for receipt_id in copied.receipt_ids:
+                        await cur.execute(
+                            """
+                            SELECT receipt_id, session_id, interaction_id, model_step_id,
+                                   created_at, receipt_json, document_bytes
+                            FROM cayu_recall_receipts
+                            WHERE receipt_id = %s
+                            FOR SHARE
+                            """,
+                            (receipt_id,),
+                        )
+                        receipt_row = await cur.fetchone()
+                        if receipt_row is None:
+                            raise KeyError(f"Recall receipt not found: {receipt_id}")
+                        receipt = _postgres_recall_receipt(receipt_row)
+                        validate_context_exposure_receipt_scope(copied, receipt)
+                        receipts[receipt_id] = receipt
+                    for item in copied_items:
+                        if not recall_item_exposure_matches_receipt_item(
+                            item,
+                            receipts[item.receipt_id],
+                        ):
+                            raise ValueError(
+                                "Recall item exposure differs from its immutable receipt item."
+                            )
+                    await cur.execute(
+                        """
+                        INSERT INTO cayu_context_exposures (
+                            exposure_id, session_id, interaction_id, model_step_id,
+                            model_attempt_id, provider_attempt_id, state, state_revision,
+                            created_at, updated_at, exposure_json, document_bytes
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s::jsonb, %s
+                        )
+                        """,
+                        (
+                            copied.exposure_id,
+                            copied.session_id,
+                            copied.interaction_id,
+                            copied.model_step_id,
+                            copied.model_attempt_id,
+                            copied.provider_attempt_id,
+                            str(copied.state),
+                            copied.state_revision,
+                            copied.created_at,
+                            copied.updated_at,
+                            document.decode("utf-8"),
+                            len(document),
+                        ),
+                    )
+                    await cur.executemany(
+                        """
+                        INSERT INTO cayu_recall_item_exposures (
+                            exposure_id, ordinal, receipt_id, receipt_item_ordinal,
+                            item_json, document_bytes
+                        ) VALUES (%s, %s, %s, %s, %s::jsonb, %s)
+                        """,
+                        (
+                            (
+                                item.exposure_id,
+                                item.ordinal,
+                                item.receipt_id,
+                                item.receipt_item_ordinal,
+                                item_document.decode("utf-8"),
+                                len(item_document),
+                            )
+                            for item, item_document in zip(
+                                copied_items,
+                                item_documents,
+                                strict=True,
+                            )
+                        ),
+                    )
+                await conn.commit()
+                return copied
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def load_context_exposure(
+        self,
+        session_id: str,
+        exposure_id: str,
+    ) -> ContextExposure | None:
+        session_id = require_memory_evidence_session_id(session_id)
+        exposure_id = require_memory_evidence_id(exposure_id, "exposure_id")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT exposure_id, session_id, interaction_id, model_step_id,
+                       model_attempt_id, provider_attempt_id, state, state_revision,
+                       created_at, updated_at, exposure_json, document_bytes
+                FROM cayu_context_exposures
+                WHERE session_id = %s AND exposure_id = %s
+                """,
+                (session_id, exposure_id),
+            )
+            row = await cur.fetchone()
+            return None if row is None else _postgres_context_exposure(row)
+
+    async def load_recall_item_exposures(
+        self,
+        session_id: str,
+        exposure_id: str,
+    ) -> tuple[RecallItemExposure, ...]:
+        session_id = require_memory_evidence_session_id(session_id)
+        exposure_id = require_memory_evidence_id(exposure_id, "exposure_id")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT item.exposure_id, item.ordinal, item.receipt_id,
+                       item.receipt_item_ordinal, item.item_json, item.document_bytes
+                FROM cayu_recall_item_exposures AS item
+                JOIN cayu_context_exposures AS exposure
+                  ON exposure.exposure_id = item.exposure_id
+                WHERE exposure.session_id = %s AND exposure.exposure_id = %s
+                ORDER BY item.ordinal
+                """,
+                (session_id, exposure_id),
+            )
+            return _postgres_recall_item_exposures(await cur.fetchall())
+
+    async def list_context_exposures(
+        self,
+        query: RecallEvidenceQuery,
+    ) -> ContextExposurePage:
+        copied_query = RecallEvidenceQuery.model_validate(query.model_dump(mode="python"))
+        query_fingerprint = copied_query.fingerprint("exposure")
+        after = (
+            None
+            if copied_query.cursor is None
+            else decode_recall_evidence_cursor(
+                copied_query.cursor,
+                record_kind="exposure",
+                query_fingerprint=query_fingerprint,
+            )
+        )
+        clauses = ["session_id = %s"]
+        parameters: list[object] = [copied_query.session_id]
+        if copied_query.interaction_id is not None:
+            clauses.append("interaction_id = %s")
+            parameters.append(copied_query.interaction_id)
+        if copied_query.model_step_id is not None:
+            clauses.append("model_step_id = %s")
+            parameters.append(copied_query.model_step_id)
+        if after is not None:
+            clauses.append('(created_at, exposure_id COLLATE "C") > (%s, %s)')
+            parameters.extend(after)
+        where = " AND ".join(clauses)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                SELECT exposure_id, session_id, interaction_id, model_step_id,
+                       model_attempt_id, provider_attempt_id, state, state_revision,
+                       created_at, updated_at, exposure_json, document_bytes
+                FROM cayu_context_exposures
+                WHERE {where}
+                ORDER BY created_at, exposure_id COLLATE "C"
+                LIMIT %s
+                """,
+                (*parameters, copied_query.limit + 1),
+            )
+            rows = await cur.fetchall()
+        retained: list[ContextExposure] = []
+        retained_bytes = 2
+        for row in rows:
+            if len(retained) >= copied_query.limit:
+                break
+            exposure = _postgres_context_exposure(row)
+            document_bytes = len(
+                memory_evidence_document_bytes(exposure, "context exposure page item")
+            )
+            separator_bytes = 1 if retained else 0
+            if retained_bytes + separator_bytes + document_bytes > copied_query.max_bytes:
+                break
+            retained.append(exposure)
+            retained_bytes += separator_bytes + document_bytes
+        truncated = len(retained) < len(rows)
+        return ContextExposurePage(
+            items=tuple(retained),
+            next_cursor=(
+                encode_recall_evidence_cursor(
+                    record_kind="exposure",
+                    query_fingerprint=query_fingerprint,
+                    created_at=retained[-1].created_at,
+                    record_id=retained[-1].exposure_id,
+                )
+                if truncated and retained
+                else None
+            ),
+            truncated=truncated,
+        )
+
+    async def transition_context_exposure(
+        self,
+        session_id: str,
+        exposure_id: str,
+        request: ContextExposureTransitionRequest,
+    ) -> ContextExposure:
+        session_id = require_memory_evidence_session_id(session_id)
+        exposure_id = require_memory_evidence_id(exposure_id, "exposure_id")
+        copied_request = ContextExposureTransitionRequest.model_validate(
+            request.model_dump(mode="python")
+        )
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        SELECT exposure_id, session_id, interaction_id, model_step_id,
+                               model_attempt_id, provider_attempt_id, state, state_revision,
+                               created_at, updated_at, exposure_json, document_bytes
+                        FROM cayu_context_exposures
+                        WHERE session_id = %s AND exposure_id = %s
+                        FOR UPDATE
+                        """,
+                        (session_id, exposure_id),
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        raise KeyError(f"Context exposure not found: {exposure_id}")
+                    current = _postgres_context_exposure(row)
+                    replay = next(
+                        (
+                            transition
+                            for transition in current.transitions
+                            if transition.transition_id == copied_request.transition_id
+                        ),
+                        None,
+                    )
+                    if replay is not None:
+                        if not context_exposure_transition_replays(current, copied_request):
+                            raise RecallEvidenceConflict(
+                                "Context exposure transition",
+                                copied_request.transition_id,
+                            )
+                        await conn.commit()
+                        return current
+                    updated = append_context_exposure_transition(current, copied_request)
+                    updated_document = memory_evidence_document_bytes(
+                        updated,
+                        "context exposure",
+                    )
+                    await cur.execute(
+                        """
+                        UPDATE cayu_context_exposures
+                        SET state = %s, state_revision = %s, updated_at = %s,
+                            exposure_json = %s::jsonb, document_bytes = %s
+                        WHERE session_id = %s AND exposure_id = %s
+                          AND state = %s AND state_revision = %s
+                        """,
+                        (
+                            str(updated.state),
+                            updated.state_revision,
+                            updated.updated_at,
+                            updated_document.decode("utf-8"),
+                            len(updated_document),
+                            session_id,
+                            exposure_id,
+                            str(copied_request.expected_state),
+                            copied_request.expected_revision,
+                        ),
+                    )
+                    if cur.rowcount != 1:
+                        raise ContextExposureTransitionConflict(
+                            exposure_id,
+                            expected_state=copied_request.expected_state,
+                            expected_revision=copied_request.expected_revision,
+                            actual_state=current.state,
+                            actual_revision=current.state_revision,
+                        )
+                await conn.commit()
+                return updated
+            except BaseException:
+                await conn.rollback()
+                raise
 
     async def inspect_identity(self, session_id: str) -> SessionInspectionIdentity:
         session_id = require_clean_nonblank(session_id, "session_id")

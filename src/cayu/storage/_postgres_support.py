@@ -278,6 +278,84 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS cayu_recall_receipts (
+        receipt_id TEXT COLLATE "C" PRIMARY KEY,
+        session_id TEXT COLLATE "C" NOT NULL
+            REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+        interaction_id TEXT COLLATE "C" NOT NULL,
+        model_step_id TEXT COLLATE "C" NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL,
+        receipt_json JSONB NOT NULL,
+        document_bytes BIGINT NOT NULL CHECK (
+            document_bytes >= 1 AND document_bytes <= 256000
+        )
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_context_exposures (
+        exposure_id TEXT COLLATE "C" PRIMARY KEY,
+        session_id TEXT COLLATE "C" NOT NULL
+            REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+        interaction_id TEXT COLLATE "C" NOT NULL,
+        model_step_id TEXT COLLATE "C" NOT NULL,
+        model_attempt_id TEXT COLLATE "C" NOT NULL,
+        provider_attempt_id TEXT COLLATE "C" NOT NULL,
+        state TEXT NOT NULL CHECK (state IN (
+            'planned', 'prepared', 'dispatch_started', 'acknowledged',
+            'completed', 'failed', 'cancelled', 'indeterminate'
+        )),
+        state_revision INTEGER NOT NULL CHECK (
+            state_revision >= 0 AND state_revision < 16
+        ),
+        created_at TIMESTAMPTZ NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL,
+        exposure_json JSONB NOT NULL,
+        document_bytes BIGINT NOT NULL CHECK (
+            document_bytes >= 1 AND document_bytes <= 128000
+        ),
+        UNIQUE (session_id, model_attempt_id),
+        UNIQUE (session_id, provider_attempt_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_recall_item_exposures (
+        exposure_id TEXT COLLATE "C" NOT NULL
+            REFERENCES cayu_context_exposures(exposure_id) ON DELETE CASCADE,
+        ordinal INTEGER NOT NULL CHECK (ordinal >= 0 AND ordinal < 64),
+        receipt_id TEXT COLLATE "C" NOT NULL
+            REFERENCES cayu_recall_receipts(receipt_id) ON DELETE CASCADE,
+        receipt_item_ordinal INTEGER NOT NULL CHECK (
+            receipt_item_ordinal >= 0 AND receipt_item_ordinal < 64
+        ),
+        item_json JSONB NOT NULL,
+        document_bytes BIGINT NOT NULL CHECK (
+            document_bytes >= 1 AND document_bytes <= 16384
+        ),
+        PRIMARY KEY (exposure_id, ordinal),
+        UNIQUE (exposure_id, receipt_id, receipt_item_ordinal)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_cayu_recall_receipts_session_page "
+    'ON cayu_recall_receipts(session_id, created_at, receipt_id COLLATE "C")',
+    "CREATE INDEX IF NOT EXISTS idx_cayu_recall_receipts_interaction_page "
+    'ON cayu_recall_receipts(session_id, interaction_id, created_at, receipt_id COLLATE "C")',
+    "CREATE INDEX IF NOT EXISTS idx_cayu_recall_receipts_step_page "
+    'ON cayu_recall_receipts(session_id, model_step_id, created_at, receipt_id COLLATE "C")',
+    "CREATE INDEX IF NOT EXISTS idx_cayu_recall_receipts_interaction_step_page "
+    "ON cayu_recall_receipts(session_id, interaction_id, model_step_id, created_at, "
+    'receipt_id COLLATE "C")',
+    "CREATE INDEX IF NOT EXISTS idx_cayu_context_exposures_session_page "
+    'ON cayu_context_exposures(session_id, created_at, exposure_id COLLATE "C")',
+    "CREATE INDEX IF NOT EXISTS idx_cayu_context_exposures_interaction_page "
+    'ON cayu_context_exposures(session_id, interaction_id, created_at, exposure_id COLLATE "C")',
+    "CREATE INDEX IF NOT EXISTS idx_cayu_context_exposures_step_page "
+    'ON cayu_context_exposures(session_id, model_step_id, created_at, exposure_id COLLATE "C")',
+    "CREATE INDEX IF NOT EXISTS idx_cayu_context_exposures_interaction_step_page "
+    "ON cayu_context_exposures(session_id, interaction_id, model_step_id, created_at, "
+    'exposure_id COLLATE "C")',
+    "CREATE INDEX IF NOT EXISTS idx_cayu_recall_item_exposures_receipt "
+    "ON cayu_recall_item_exposures(receipt_id, exposure_id, ordinal)",
+    """
     CREATE TABLE IF NOT EXISTS cayu_event_watcher_state (
         watcher_name TEXT PRIMARY KEY,
         cursor_sequence BIGINT NOT NULL,

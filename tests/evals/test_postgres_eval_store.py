@@ -310,7 +310,7 @@ def test_postgres_revision_fifty_backfills_existing_eval_run_invocation(
             conn.cursor() as cur,
         ):
             await cur.execute("ALTER TABLE cayu_eval_runs DROP COLUMN invocation_json")
-            await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 50")
+            await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 50")
 
         migrated = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
         try:

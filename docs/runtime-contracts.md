@@ -364,6 +364,36 @@ exposure. A `ContextPolicy` remains the separate application boundary that
 chooses the actual provider-visible message list, including whether and where
 any recalled representation is admitted.
 
+`SessionStore` has a separate optional `supports_recall_evidence` capability for
+durable recall receipts and context-exposure lifecycles. A `RecallReceipt`
+records the bounded retrieval/admission decision without raw query, candidate,
+prompt, or provider payload text. `create_recall_receipt(...)` is exact-byte
+idempotent: reusing an ID with different durable material raises
+`RecallEvidenceConflict`. `list_recall_receipts(...)` and
+`list_context_exposures(...)` are session-scoped, item-count/byte-bounded keyset
+queries whose cursor is bound to the interaction/model-step filters. They use
+bounded lookahead rather than counting or scanning the remaining history.
+Private structured material is content-bound with domain-separated
+`KeyedEvidenceFingerprint` values. Each carries an HMAC-SHA-256 digest and a
+non-secret key ID; the secret key and a guessable raw SHA-256 never enter the
+record.
+Built-in evidence locators are closed typed values for knowledge-entry
+revisions, knowledge chunks, and transcript messages. A custom locator is
+stored only as a domain-separated keyed fingerprint; arbitrary locator objects
+are rejected so private source fields cannot leak into durable evidence.
+
+`create_context_exposure(...)` atomically stores one revision-zero planned
+composition and its exact `RecallItemExposure` links. It rejects receipt drift,
+cross-interaction or cross-step links, duplicate receipt items, and reused model
+or provider attempt IDs. `transition_context_exposure(...)` requires the exact
+current state and revision and appends one evidence-typed transition. An exact
+transition-ID replay is idempotent even after later states; a competing writer
+gets `ContextExposureTransitionConflict`. Terminal states cannot be reopened.
+Planned, prepared, and dispatch-started records are not positive evidence that
+a provider received context—only acknowledgement or completion evidence is.
+Provider request IDs are optional because not every adapter can expose one
+safely. See [Memory foundation contracts](memory-foundation.md#recall-receipts-and-context-exposure-evidence).
+
 ## ContextPolicy
 
 Builds the model-facing message list immediately before each provider request.

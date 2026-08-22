@@ -1886,6 +1886,127 @@ def test_sqlite_session_store_validate_mode_fails_fast_on_uninitialized(tmp_path
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
 
+def test_sqlite_memory_evidence_schema_validation_fails_closed(tmp_path) -> None:
+    db_path = tmp_path / "malformed-memory-evidence.sqlite"
+    store = SQLiteSessionStore(db_path)
+    asyncio.run(_close(store))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP INDEX idx_cayu_context_exposures_interaction_step_page")
+        connection.execute(
+            """
+            CREATE INDEX idx_cayu_context_exposures_interaction_step_page
+            ON cayu_context_exposures(
+                session_id, interaction_id, model_step_id, created_at, exposure_id
+            )
+            WHERE state = 'planned'
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="revision-51 memory evidence contract"):
+        SQLiteSessionStore(
+            db_path,
+            schema_mode=schema_migrations.SchemaMode.VALIDATE,
+        )
+
+
+@pytest.mark.parametrize(
+    "unique_index_ddl",
+    (
+        "CREATE UNIQUE INDEX unexpected_memory_receipt_session_unique "
+        "ON cayu_recall_receipts(session_id)",
+        "CREATE UNIQUE INDEX unexpected_memory_exposure_session_unique "
+        "ON cayu_context_exposures(session_id)",
+        "CREATE UNIQUE INDEX unexpected_memory_item_receipt_unique "
+        "ON cayu_recall_item_exposures(receipt_id)",
+    ),
+)
+def test_sqlite_memory_evidence_schema_rejects_standalone_unique_indexes(
+    tmp_path,
+    unique_index_ddl: str,
+) -> None:
+    db_path = tmp_path / "overrestricted-memory-evidence.sqlite"
+    store = SQLiteSessionStore(db_path)
+    asyncio.run(_close(store))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(unique_index_ddl)
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="revision-51 memory evidence contract"):
+        SQLiteSessionStore(
+            db_path,
+            schema_mode=schema_migrations.SchemaMode.VALIDATE,
+        )
+
+
+def test_sqlite_memory_evidence_combined_scope_pages_use_composite_indexes(tmp_path) -> None:
+    db_path = tmp_path / "memory-evidence-page-plan.sqlite"
+    store = SQLiteSessionStore(db_path)
+    asyncio.run(_close(store))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        receipt_details = [
+            row[3]
+            for row in connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT * FROM cayu_recall_receipts
+                WHERE session_id = ? AND interaction_id = ? AND model_step_id = ?
+                  AND (created_at, receipt_id) > (?, ?)
+                ORDER BY created_at, receipt_id COLLATE BINARY
+                LIMIT ?
+                """,
+                (
+                    "session",
+                    "interaction",
+                    "mstep_" + "1" * 32,
+                    "2026-08-22T00:00:00.000000+00:00",
+                    "receipt",
+                    51,
+                ),
+            )
+        ]
+        exposure_details = [
+            row[3]
+            for row in connection.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT * FROM cayu_context_exposures
+                WHERE session_id = ? AND interaction_id = ? AND model_step_id = ?
+                  AND (created_at, exposure_id) > (?, ?)
+                ORDER BY created_at, exposure_id COLLATE BINARY
+                LIMIT ?
+                """,
+                (
+                    "session",
+                    "interaction",
+                    "mstep_" + "1" * 32,
+                    "2026-08-22T00:00:00.000000+00:00",
+                    "exposure",
+                    51,
+                ),
+            )
+        ]
+    finally:
+        connection.close()
+
+    assert any(
+        "idx_cayu_recall_receipts_interaction_step_page" in detail for detail in receipt_details
+    )
+    assert any(
+        "idx_cayu_context_exposures_interaction_step_page" in detail for detail in exposure_details
+    )
+
+
 def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     db_path = tmp_path / "sessions.sqlite"
     store = SQLiteSessionStore(db_path)
@@ -2055,7 +2176,10 @@ def test_sqlite_profiled_dispatch_stores_reject_revision_thirty_nine(tmp_path) -
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 46"):
+    with pytest.raises(
+        schema_migrations.SchemaTooOld,
+        match=rf"requires >= {sqlite_storage._SQLITE_SESSION_MIN_REQUIRED_REVISION}",
+    ):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
     with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 49"):
         SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
@@ -2088,7 +2212,10 @@ def test_sqlite_session_store_rejects_populated_revision_thirteen_database(tmp_p
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 46"):
+    with pytest.raises(
+        schema_migrations.SchemaTooOld,
+        match=rf"requires >= {sqlite_storage._SQLITE_SESSION_MIN_REQUIRED_REVISION}",
+    ):
         SQLiteSessionStore(db_path)
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="clean prerelease break"):
@@ -2134,7 +2261,10 @@ def test_sqlite_session_store_rejects_populated_revision_fourteen_database(tmp_p
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 46"):
+    with pytest.raises(
+        schema_migrations.SchemaTooOld,
+        match=rf"requires >= {sqlite_storage._SQLITE_SESSION_MIN_REQUIRED_REVISION}",
+    ):
         SQLiteSessionStore(db_path)
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="clean prerelease break"):
@@ -2210,7 +2340,10 @@ def test_sqlite_revision_seventeen_requires_session_operation_migration(tmp_path
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 46"):
+    with pytest.raises(
+        schema_migrations.SchemaTooOld,
+        match=rf"requires >= {sqlite_storage._SQLITE_SESSION_MIN_REQUIRED_REVISION}",
+    ):
         SQLiteSessionStore(db_path)
 
     migrated = SQLiteSessionStore(
@@ -2900,6 +3033,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (48, 48),
         (49, 49),
         (50, 50),
+        (51, 50),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

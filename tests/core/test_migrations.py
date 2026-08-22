@@ -173,6 +173,20 @@ def test_revision_fifty_persists_eval_run_invocation_authority() -> None:
         )
 
 
+def test_revision_fifty_one_adds_empty_memory_evidence_tables_additively() -> None:
+    state = m.SchemaState(revision=51, compatible_from=50)
+
+    # Revision 51 only adds unused tables. Revision-50 binaries neither need to
+    # read nor maintain them, and no historical runtime rows are synthesized.
+    m.validate(state, app_latest=50, app_min_supported=50)
+    m.validate(state, app_latest=51, app_min_supported=50)
+    m.validate(
+        m.SchemaState(revision=50, compatible_from=50),
+        app_latest=51,
+        app_min_supported=50,
+    )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

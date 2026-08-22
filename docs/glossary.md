@@ -55,6 +55,10 @@ disambiguates them so a name never sends you down the wrong path.
   retrieve permitted knowledge, transcript episodes, and artifact-derived
   documents. A `KnowledgeStore` is one memory source, not the whole memory
   system. See [Memory foundation contracts](memory-foundation.md).
+- **Recall receipt vs context exposure.** A recall receipt proves what a bounded
+  retrieval/admission operation selected. A context exposure tracks whether one
+  exact composition was merely planned/prepared/dispatched or was positively
+  acknowledged/completed by a provider. Selection is not exposure.
 - **Model-provider credential.** Host/control-process authority used by a
   `ModelProvider` or its refresh transport to make model requests. It is
   non-delegable by default; provider registration never makes it a runner,

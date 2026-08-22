@@ -3,7 +3,8 @@
 This document records Cayu's v5.1 long-term-memory foundations, immutable
 knowledge revisions, and the bounded cross-source recall layer built on them.
 Context composition, curation, admission, and exposure evidence remain separate
-layers; the first automatic recall-admission boundary is now implemented.
+layers. Automatic recall admission and the durable evidence-store boundary are
+implemented; provider-boundary publication remains a later integration step.
 
 ## Knowledge and memory are different layers
 
@@ -102,6 +103,67 @@ around a guessed lost-in-the-middle region. Those remain future composition and
 exposure-evidence decisions. The credential-free
 [cross-source example](../examples/cross_source_recall.py) shows retrieval and
 admission as explicit separate steps.
+
+## Recall receipts and context-exposure evidence
+
+`RecallReceipt` is an immutable, bounded record of one already-computed recall
+and admission operation. It binds the situation, engine/configuration/policy,
+access-scope fingerprint, source frontier, honest source coverage, exhaustive
+outcome counts, and every admitted or offered representation by canonical
+identity, revision, representation ID, content hash, locator, reason, and
+fusion rank. It does not store query text, recalled text, prompt text, or
+provider payloads. An unavailable or failed source is explicitly incomplete;
+it cannot masquerade as an empty complete search.
+Locators are a closed union for exact knowledge-entry revisions, knowledge
+chunks, and transcript messages. Custom sources retain only a domain-separated
+keyed fingerprint of their canonical locator, never the arbitrary locator
+object itself. This keeps replay identity exact without turning the evidence
+store into a path for credentials, queries, or source-specific private fields.
+Private situation, access-scope, configuration, frontier, composition, profile,
+policy, tool, and request material is bound through `KeyedEvidenceFingerprint`:
+a domain-separated HMAC-SHA-256 digest plus a non-secret key ID. Raw SHA-256 of
+low-entropy private material is rejected as a receipt/exposure field because it
+would create an offline guessing oracle; HMAC keys never enter the record.
+
+A receipt proves what retrieval inspected and selected. It does **not** prove
+that a provider saw the material. `ContextExposure` records that separate fact
+as a compare-and-swap lifecycle for one exact model and provider attempt:
+
+- `planned`: context composition selected exact contributors and receipt IDs;
+- `prepared`: the provider-neutral request was prepared;
+- `dispatch_started`: durable dispatch intent was committed before network I/O;
+- `acknowledged`: provider or recovery evidence establishes acknowledgement;
+- `completed`: provider or recovery evidence establishes completion; and
+- `failed`, `cancelled`, or `indeterminate`: conclusive or explicitly ambiguous
+  terminal evidence prevents a guessed success.
+
+Only `acknowledged` or `completed` is positive provider-exposure evidence.
+`planned`, `prepared`, and `dispatch_started` must never be counted as “the
+model saw this.” A provider request ID is retained only when the adapter can
+expose one safely; acknowledgement can still be proven by a bounded internal
+evidence reference when no such ID is available.
+
+`RecallItemExposure` links each exact recalled representation in the planned
+composition back to its immutable receipt item. Stores reject altered hashes,
+locators, identities, duplicate receipt items, cross-interaction links, and
+reused model/provider attempt identities. Lifecycle transitions carry an exact
+expected state and revision. Concurrent writers therefore produce one winner
+and a typed conflict instead of a lost update; replaying the same transition ID
+returns the current durable record.
+
+The `SessionStore` evidence surface provides exact create/load, bounded
+session-scoped keyset pages, item lookup, and fenced transition methods.
+In-memory, SQLite, and PostgreSQL implementations share one conformance suite.
+Every record and page has item-count and serialized-byte bounds, cursors are
+bound to their query scope, and page reads use bounded lookahead rather than a
+full remaining-row count. Deleting the owning session cascades its receipts,
+exposures, and item links. Custom stores advertise the complete surface with
+`supports_recall_evidence = True`.
+
+Storage revision 51 only creates empty evidence tables and indexes. It does not
+scan runtime history, synthesize receipts for past recall, or carry a legacy
+reader/writer path. Existing sessions remain unchanged; evidence exists only
+for operations that explicitly publish it through this contract.
 
 ## Storage-enforced access
 
