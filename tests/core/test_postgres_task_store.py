@@ -42,6 +42,7 @@ from tests.core.test_verified_work_contracts import (
 )
 
 from cayu import (
+    CayuApp,
     CompletionDecisionApplicationRequest,
     CompletionProposalCreate,
     CompletionVerificationClaimLost,
@@ -78,6 +79,8 @@ from cayu._validation import (
     DurableValueError,
     extract_durable_value_error,
 )
+from cayu.runtime.sessions import InMemorySessionStore
+from cayu.runtime.work_contracts import completion_verification_claim_authority_sha256
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
@@ -181,6 +184,9 @@ def test_postgres_verified_work_lifecycle_survives_restart(postgres_dsn):
                 worker_id=claim.worker_id,
             )
             decision = await store.record_completion_decision(decision_request)
+            assert decision.claim_authority_sha256 == (
+                completion_verification_claim_authority_sha256(claim)
+            )
             with pytest.raises(TaskCompletionDecisionRequired):
                 await store.complete_task(task.id, _task_result("postgres"))
             rejection_application = CompletionDecisionApplicationRequest(
@@ -249,9 +255,14 @@ def test_postgres_verified_work_lifecycle_survives_restart(postgres_dsn):
                 result=_task_result("postgres"),
                 result_reference=proposal_two.result,
             )
-            completed = await reopened.apply_completion_decision(application)
+            app = CayuApp(
+                session_store=InMemorySessionStore(),
+                task_store=reopened,
+                enable_logging=False,
+            )
+            completed = await app.apply_completion_decision(application)
             assert completed.status is TaskStatus.COMPLETED
-            assert await reopened.apply_completion_decision(application) == completed
+            assert await app.apply_completion_decision(application) == completed
             receipt = await reopened.load_completion_decision_application_receipt(
                 task.id,
                 application.idempotency_key,

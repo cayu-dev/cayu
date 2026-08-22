@@ -1526,6 +1526,7 @@ class CompletionDecision(CompletionDecisionCreate):
     task_id: str
     attempt_id: str
     contract: WorkContractRef
+    claim_authority_sha256: str
     request_sha256: str
     gap_fingerprint: str
     decided_at: datetime
@@ -1545,7 +1546,7 @@ class CompletionDecision(CompletionDecisionCreate):
     def copy_contract(cls, value: object) -> object:
         return revalidate_model_input(value, WorkContractRef)
 
-    @field_validator("request_sha256", "gap_fingerprint")
+    @field_validator("claim_authority_sha256", "request_sha256", "gap_fingerprint")
     @classmethod
     def validate_digest(cls, value: str, info) -> str:
         return _sha256_digest(value, info.field_name)
@@ -1891,6 +1892,7 @@ def copy_completion_decision(value: CompletionDecision) -> CompletionDecision:
             "task_id": value.task_id,
             "attempt_id": value.attempt_id,
             "contract": _copy_bounded_model_input(value.contract, WorkContractRef, 3),
+            "claim_authority_sha256": value.claim_authority_sha256,
             "request_sha256": value.request_sha256,
             "gap_fingerprint": value.gap_fingerprint,
             "decided_at": value.decided_at,
@@ -2057,6 +2059,20 @@ def completion_verification_claim_request_sha256(
     ).hexdigest()
 
 
+def completion_verification_claim_authority_sha256(
+    value: CompletionVerificationClaim,
+) -> str:
+    """Bind a decision to the complete final durable verification claim."""
+
+    copied = copy_completion_verification_claim(value)
+    return sha256(
+        canonical_durable_json_bytes(
+            copied.model_dump(mode="json", warnings=False),
+            "completion_verification_claim_authority",
+        )
+    ).hexdigest()
+
+
 def completion_decision_request_sha256(value: CompletionDecisionCreate) -> str:
     return _request_sha256(copy_completion_decision_create(value), "completion_decision")
 
@@ -2143,6 +2159,7 @@ __all__ = [
     "completion_gap_fingerprint",
     "completion_proposal_request_sha256",
     "completion_result_sha256",
+    "completion_verification_claim_authority_sha256",
     "completion_verification_claim_request_sha256",
     "copy_completion_decision",
     "copy_completion_decision_application_request",

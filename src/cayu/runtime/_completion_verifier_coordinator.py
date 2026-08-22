@@ -32,6 +32,12 @@ from cayu.runtime._task_store_operation_boundary import (
     capture_task_store_operation,
     raise_task_store_operation_failure,
 )
+from cayu.runtime._verified_work_authority import (
+    completion_decision_claim_authority_matches,
+    completion_decision_request_from_record,
+    require_completion_decision_integrity,
+    require_completion_proposal_integrity,
+)
 from cayu.runtime.completion_verifiers import (
     CompletionVerifierExecutionError,
     CompletionVerifierExecutionRequest,
@@ -45,7 +51,6 @@ from cayu.runtime.work_contracts import (
     CompletionDecision,
     CompletionDecisionCreate,
     CompletionProposal,
-    CompletionProposalCreate,
     CompletionVerificationClaim,
     CompletionVerificationClaimLost,
     CompletionVerificationClaimRequest,
@@ -54,13 +59,11 @@ from cayu.runtime.work_contracts import (
     CompletionVerifierRef,
     TaskCompletionDecisionRequired,
     WorkAttempt,
-    WorkAttemptCreate,
     WorkCompletionConflict,
     WorkContract,
     WorkContractConflict,
     completion_decision_request_sha256,
     completion_gap_fingerprint,
-    completion_proposal_request_sha256,
     completion_verification_claim_request_sha256,
     copy_completion_decision,
     copy_completion_proposal,
@@ -69,7 +72,6 @@ from cayu.runtime.work_contracts import (
     copy_work_attempt,
     copy_work_contract,
     validate_completion_decision_contract,
-    work_attempt_request_sha256,
 )
 from cayu.runtime.workspace_observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,
@@ -1044,6 +1046,7 @@ class CompletionVerifierCoordinator:
         decision_validation = None
         decision: CompletionDecision | None = None
         indexed_decision: CompletionDecision | None = None
+        published_claim: CompletionVerificationClaim | None = None
         contract_validation = None
         try:
             contract_validation = capture_sensitive_validation(
@@ -1081,16 +1084,20 @@ class CompletionVerifierCoordinator:
                         decision_id=request.decision_id,
                         proposal_id=request.proposal_id,
                     )
-                    reconciliation_matches = (
-                        reconciled is not None
-                        and self._decision_matches_request(
+                    if reconciled is not None:
+                        published_claim = await self._load_required_claim(
+                            store_owner,
+                            request.proposal_id,
+                        )
+                        if self._decision_matches_request(
                             reconciled,
                             decision_request,
+                            claim=published_claim,
                             proposal=proposal,
                             attempt=attempt,
                             contract=contract,
-                        )
-                    )
+                        ):
+                            return reconciled
                 except BaseException as reconciliation_failure:
                     combined = _ordered_failure_group(
                         "Completion decision publication and reconciliation failed.",
@@ -1100,8 +1107,6 @@ class CompletionVerifierCoordinator:
                     )
                     del failure, reconciliation_failure
                     raise combined from None
-                if reconciliation_matches:
-                    return reconciled
                 raise_task_store_operation_failure(failure)
             decision_validation = _copy_exact_model(
                 record_outcome.result,
@@ -1114,9 +1119,14 @@ class CompletionVerifierCoordinator:
                 raise decision_validation.failure from None
             decision = decision_validation.result
             decision_validation = None
+            published_claim = await self._load_required_claim(
+                store_owner,
+                request.proposal_id,
+            )
             if decision is None or not self._decision_matches_request(
                 decision,
                 decision_request,
+                claim=published_claim,
                 proposal=proposal,
                 attempt=attempt,
                 contract=contract,
@@ -1137,7 +1147,7 @@ class CompletionVerifierCoordinator:
         except BaseException as failure:
             del decision_request, contract, attempt, proposal, store_owner
             del record_outcome, reconciled, decision_validation, decision, indexed_decision
-            del contract_validation
+            del published_claim, contract_validation
             raise_task_store_operation_failure(failure)
 
     def _require_store(self) -> TaskStore:
@@ -1388,26 +1398,21 @@ class CompletionVerifierCoordinator:
             raise WorkCompletionConflict(
                 "Durable completion decision conflicts with the exact execution request."
             ) from None
-        durable_request = CompletionDecisionCreate(
-            decision_id=decision.decision_id,
-            proposal_id=decision.proposal_id,
-            claim_id=decision.claim_id,
-            worker_id=decision.worker_id,
-            verifier=decision.verifier,
-            decision_version=decision.decision_version,
-            verdict=decision.verdict,
-            criterion_outcomes=decision.criterion_outcomes,
-            constraint_outcomes=decision.constraint_outcomes,
-            gaps=decision.gaps,
-            evidence_references=decision.evidence_references,
+        require_completion_decision_integrity(
+            decision=decision,
+            proposal=proposal,
+            attempt=attempt,
+            contract=contract,
         )
-        if decision.request_sha256 != completion_decision_request_sha256(
-            durable_request
-        ) or decision.gap_fingerprint != completion_gap_fingerprint(durable_request):
+        if not completion_decision_claim_authority_matches(
+            decision=decision,
+            claim=claim,
+            proposal=proposal,
+            contract=contract,
+        ):
             raise WorkCompletionConflict(
-                "Durable completion decision has conflicting integrity evidence."
+                "Durable completion decision conflicts with its verification-claim authority."
             ) from None
-        validate_completion_decision_contract(contract, durable_request)
         return True
 
     def _decision_matches_request(
@@ -1415,26 +1420,21 @@ class CompletionVerifierCoordinator:
         decision: CompletionDecision,
         request: CompletionDecisionCreate,
         *,
+        claim: CompletionVerificationClaim,
         proposal: CompletionProposal,
         attempt: WorkAttempt,
         contract: WorkContract,
     ) -> bool:
-        returned_request = CompletionDecisionCreate(
-            decision_id=decision.decision_id,
-            proposal_id=decision.proposal_id,
-            claim_id=decision.claim_id,
-            worker_id=decision.worker_id,
-            verifier=decision.verifier,
-            decision_version=decision.decision_version,
-            verdict=decision.verdict,
-            criterion_outcomes=decision.criterion_outcomes,
-            constraint_outcomes=decision.constraint_outcomes,
-            gaps=decision.gaps,
-            evidence_references=decision.evidence_references,
-        )
+        returned_request = completion_decision_request_from_record(decision)
         validate_completion_decision_contract(contract, returned_request)
         return (
             returned_request == request
+            and completion_decision_claim_authority_matches(
+                decision=decision,
+                claim=claim,
+                proposal=proposal,
+                contract=contract,
+            )
             and decision.request_sha256 == completion_decision_request_sha256(returned_request)
             and decision.gap_fingerprint == completion_gap_fingerprint(returned_request)
             and decision.proposal_id == proposal.proposal_id
@@ -1449,30 +1449,7 @@ class CompletionVerifierCoordinator:
         proposal: CompletionProposal,
         attempt: WorkAttempt,
     ) -> None:
-        attempt_request = WorkAttemptCreate(
-            attempt_id=attempt.attempt_id,
-            task_id=attempt.task_id,
-            session_id=attempt.session_id,
-            contract=attempt.contract,
-            execution_profile_fingerprint=attempt.execution_profile_fingerprint,
-            worker_id=attempt.worker_id,
-        )
-        proposal_request = CompletionProposalCreate(
-            proposal_id=proposal.proposal_id,
-            attempt_id=proposal.attempt_id,
-            result=proposal.result,
-            evidence_references=proposal.evidence_references,
-        )
-        if attempt.request_sha256 != work_attempt_request_sha256(attempt_request):
-            del attempt_request, proposal_request, proposal, attempt
-            raise WorkCompletionConflict(
-                "Durable work attempt has conflicting request integrity evidence."
-            ) from None
-        if proposal.request_sha256 != completion_proposal_request_sha256(proposal_request):
-            del attempt_request, proposal_request, proposal, attempt
-            raise WorkCompletionConflict(
-                "Durable completion proposal has conflicting request integrity evidence."
-            ) from None
+        require_completion_proposal_integrity(proposal=proposal, attempt=attempt)
 
     async def _renew_claim(
         self,

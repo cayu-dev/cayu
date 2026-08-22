@@ -2810,7 +2810,11 @@ timeout retains the historical request hash that omitted that field; any
 non-null value is part of the current exact hash.
 Stores expose the one decision indexed by proposal as well as lookup by
 decision ID; publication and replay require both indexes to exist and converge
-on the same content. A durable decision's complete
+on the same content. Each store computes, inside the atomic decision write, a
+canonical digest of the complete final verification-claim snapshot: claim,
+proposal, worker, execution-owner generation, execution timeout, verifier,
+attempt number, claim-request digest, claim time, and final renewed lease
+expiry. The durable decision binds that digest. Its complete
 proposal/attempt/contract/claim authority and content-derived integrity evidence
 are checked before process-local adapter resolution, so acknowledgement-loss and
 later app reconstruction replay the decision without invoking or re-registering
@@ -2828,6 +2832,37 @@ stores implement the complete lifecycle: `InMemoryTaskStore` is the
 process-local reference, while `SQLiteTaskStore` and `PostgresTaskStore`
 persist the same contract, attempt, proposal, current claim, decision, task
 transition, and immutable application-receipt authority.
+
+`CayuApp.apply_completion_decision(CompletionDecisionApplicationRequest(...))`
+is the runtime-owned application boundary for a decision that is already
+durable. The complete exact-operation tuple is the task ID, decision ID,
+idempotency key, task result, and result reference. Cayu first checks for an
+exact immutable receipt, so a retry returns the original applied `Task`
+snapshot even if a later attempt has advanced the live task. Without a receipt,
+it validates the convergent decision indexes and immutable
+decision/verification-claim/proposal/attempt/contract chain before invoking the
+store's atomic application mutation. The durable claim must retain the exact
+complete snapshot bound by the decision, including its execution-owner
+generation, execution timeout, request digest, attempt number, and timestamps;
+the decision time must also remain inside that claim's lease window. A
+successful mutation is not returned until its receipt is
+readable and agrees with the returned task. Exact receipt replay additionally
+requires the stored task snapshot's creation fields, input, metadata, and
+invocation provenance to agree with the current durable task's immutable
+authority; later lifecycle status, ownership, result, and timestamp progress do
+not replace the original receipt snapshot.
+
+An ordinary mutation failure is reconciled once through a read-only receipt
+lookup. An exact receipt proves the committed result; no receipt preserves the
+original failure, and conflicting authority fails closed. Cancellation and
+process-control signals remain authoritative even when the store committed, so
+a later caller must retry the exact request to observe its receipt. Supporting
+custom stores must make `apply_completion_decision(...)` cancellation-quiescent
+and publish the task transition and receipt atomically. Accepted decisions
+require the application to reconstruct the bounded task result from an
+application-owned durable source and provide the exact proposal result
+reference and digest. This boundary does not register process-local result
+resolvers, start another attempt, resume a session, or schedule continuation.
 
 `InMemoryTaskStore(clock=...)` uses its injectable clock for availability,
 retry-series timing, and verified-work attempt, proposal, claim, and decision

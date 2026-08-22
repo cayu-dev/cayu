@@ -86,6 +86,9 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
+from cayu.runtime._completion_decision_application_coordinator import (
+    CompletionDecisionApplicationCoordinator,
+)
 from cayu.runtime._completion_verifier_coordinator import CompletionVerifierCoordinator
 from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
 from cayu.runtime._durable_subagent_coordinator import (
@@ -175,6 +178,9 @@ from cayu.runtime._tool_round_executor import (
     ToolRoundExecutor,
     ToolRoundLimitRequest,
 )
+from cayu.runtime._verified_work_authority import (
+    invocation_contains_secret_public_identity,
+)
 from cayu.runtime.approvals import (
     PendingToolApproval,
     ToolApprovalDecision,
@@ -263,10 +269,8 @@ from cayu.runtime.hooks import (
 from cayu.runtime.invocation import (
     InvocationOrigin,
     InvocationOriginTrust,
-    SessionInvocation,
     SessionInvocationBinding,
     TaskExecutionSource,
-    TaskInvocation,
     copy_session_invocation_binding,
 )
 from cayu.runtime.loop_policies import (
@@ -403,6 +407,7 @@ from cayu.runtime.user_input import (
 )
 from cayu.runtime.work_contracts import (
     CompletionDecision,
+    CompletionDecisionApplicationRequest,
     CompletionVerifierRef,
     TaskCompletionDecisionRequired,
     WorkCompletionConflict,
@@ -996,6 +1001,12 @@ class CayuApp:
         self._completion_verifier_coordinator = CompletionVerifierCoordinator(
             task_store=self.task_store,
             secret_redactor=self._secret_redactor,
+        )
+        self._completion_decision_application_coordinator = (
+            CompletionDecisionApplicationCoordinator(
+                task_store=self.task_store,
+                secret_redactor=self._secret_redactor,
+            )
         )
         self._default_retry_policy = copy_retry_policy(retry_policy)
         self._runtime_hooks = tuple(hooks)
@@ -3680,6 +3691,16 @@ class CayuApp:
         del request
         return await operation
 
+    async def apply_completion_decision(
+        self,
+        request: CompletionDecisionApplicationRequest,
+    ) -> Task:
+        """Apply or exactly replay one durable verifier decision."""
+
+        operation = self._completion_decision_application_coordinator.apply(request)
+        del request
+        return await operation
+
     async def create_work_contract(self, request: WorkContractDraft) -> WorkContract:
         if type(request) is not WorkContractDraft:
             del request
@@ -3951,14 +3972,14 @@ class CayuApp:
                 ) from None
         session_invocation_contains_secret = (
             request._runtime_session_binding is not None
-            and _invocation_contains_secret_public_identity(
+            and invocation_contains_secret_public_identity(
                 request._runtime_session_binding.invocation,
                 self._secret_redactor,
             )
         )
         parent_invocation_contains_secret = (
             parent_invocation_snapshot is not None
-            and _invocation_contains_secret_public_identity(
+            and invocation_contains_secret_public_identity(
                 parent_invocation_snapshot.invocation,
                 self._secret_redactor,
             )
@@ -6114,7 +6135,7 @@ def _contracted_task_invocation_matches_request(
         is not (request._runtime_invocation_source or TaskExecutionSource.SDK_TASK)
     ):
         return False
-    if redactor.redact_text(task.id) != task.id or _invocation_contains_secret_public_identity(
+    if redactor.redact_text(task.id) != task.id or invocation_contains_secret_public_identity(
         invocation,
         redactor,
     ):
@@ -6157,23 +6178,6 @@ def _contracted_task_invocation_matches_request(
     else:
         expected_origin = InvocationOrigin(trust=InvocationOriginTrust.UNATTRIBUTED)
     return invocation.origin == expected_origin and invocation.root_session_id == request.session_id
-
-
-def _invocation_contains_secret_public_identity(
-    invocation: SessionInvocation | TaskInvocation,
-    redactor: SecretRedactor,
-) -> bool:
-    """Return whether immutable invocation authority contains a known workload secret."""
-
-    public_identities = (
-        invocation.origin.subject,
-        invocation.origin.tenant,
-        invocation.root_invocation_id,
-        invocation.root_session_id,
-    )
-    return any(
-        value is not None and redactor.redact_text(value) != value for value in public_identities
-    )
 
 
 def _contracted_task_creation_result_matches_request(

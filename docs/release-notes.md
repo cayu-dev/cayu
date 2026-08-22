@@ -752,8 +752,23 @@ failures, the public `CancelledError` remains authoritative and carries one
 bounded, redacted cause with that ordered settlement evidence through the runtime
 API.
 
-This slice still does not add provider-backed judges or an automatic
-continuation/application worker.
+`CayuApp.apply_completion_decision(...)` now owns the public transition from a
+durable verifier decision to task state. It validates the immutable authority
+chain, including a decision-bound canonical digest of the complete final durable
+verification claim (execution-owner generation, execution timeout, request
+digest, attempt number, and final lease timestamps included), applies the
+bounded exact request through the cancellation-quiescent store boundary, and
+requires the atomic application receipt before returning the applied `Task`.
+Exact retries replay the receipt snapshot, including after later task progress,
+while checking that its immutable task fields and invocation provenance still
+agree with the durable task authority. Ordinary acknowledgement loss reconciles
+from that receipt; cancellation and process-control remain authoritative and
+require a later exact retry. Accepted results remain application-owned and must
+be reconstructed from a durable result reference whose digest matches the
+accepted proposal.
+
+This slice still does not add provider-backed judges, automatic result
+resolution, or an automatic continuation worker.
 
 ### Durable tasks retain immutable invocation provenance
 

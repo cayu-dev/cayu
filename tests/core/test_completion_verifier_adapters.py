@@ -2008,6 +2008,7 @@ def test_verifier_decision_headroom_covers_worst_case_authority_escaping() -> No
             version=1,
             fingerprint=_digest("escaped-contract"),
         ),
+        claim_authority_sha256=_digest("escaped-claim-authority"),
         request_sha256=completion_decision_request_sha256(publication),
         gap_fingerprint=completion_gap_fingerprint(publication),
         decided_at=datetime(2026, 1, 1, tzinfo=UTC),
@@ -2131,6 +2132,37 @@ def test_corrupt_replayed_decision_integrity_fails_without_adapter_rerun() -> No
         await app.verify_completion_proposal(request)
 
         store.corrupt_decision = True
+        restarted = CayuApp(task_store=store, enable_logging=False)
+        with pytest.raises(WorkCompletionConflict, match="conflicting authority"):
+            await restarted.verify_completion_proposal(request)
+        assert len(verifier.requests) == 1
+
+    asyncio.run(scenario())
+
+
+def test_replayed_decision_requires_its_exact_final_claim_snapshot() -> None:
+    class CorruptClaimStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        corrupt_claim = False
+
+        async def load_completion_verification_claim(self, proposal_id):
+            claim = await super().load_completion_verification_claim(proposal_id)
+            if claim is None or not self.corrupt_claim:
+                return claim
+            return claim.model_copy(update={"attempt_number": claim.attempt_number + 1})
+
+    async def scenario() -> None:
+        store = CorruptClaimStore()
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        verifier = RecordingVerifier(_accepted_decision())
+        app = CayuApp(task_store=store, enable_logging=False)
+        app.register_completion_verifier(contract.verifier, verifier)
+        request = _execution_request(proposal_id)
+        await app.verify_completion_proposal(request)
+
+        store.corrupt_claim = True
         restarted = CayuApp(task_store=store, enable_logging=False)
         with pytest.raises(WorkCompletionConflict, match="conflicting authority"):
             await restarted.verify_completion_proposal(request)
