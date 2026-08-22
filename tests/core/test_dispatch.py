@@ -544,6 +544,12 @@ def test_queued_dispatch_operation_identity_binds_source_and_governed_profiles()
         source_profile=source_profile,
         required_profile=required_profile,
     )
+    assert envelope.schema_version == 2
+    old_schema = envelope.model_dump(mode="json")
+    old_schema["schema_version"] = 1
+    with pytest.raises(ValueError, match="schema_version"):
+        _QueuedDispatchEnvelope.model_validate(old_schema)
+
     tampered = envelope.model_dump(mode="json")
     tampered["source_profile"] = required_profile.model_dump(mode="json")
 

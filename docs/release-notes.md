@@ -128,7 +128,9 @@ which defaults to at most two total attempts. Durable `model.error`,
 `model.retry`, and `model.attempt_discarded` evidence keeps the caller's general
 `max_attempts` separate from the classification-specific
 `effective_max_attempts` and records `reason="unknown_provider"` for unknown
-failures through terminal exhaustion.
+failures through terminal exhaustion. Conflicting explicit SSE status fields
+remain terminal and now omit `status_code` instead of publishing a synthesized
+status as observed evidence.
 
 This semantic addition deliberately advances model-finalization profile
 material from v1 to v2 and the built-in `ModelCompactor` and
@@ -138,7 +140,11 @@ schema-v3 sessions can therefore report `finalization` and, where applicable,
 profile through an application policy and an authority-authorized adoption
 intent; the default policy rejects the drift before work. Pre-change serialized
 adoption requests have a different fingerprint and must be resubmitted under
-the new contract. No storage migration is required.
+the new contract. Queued-dispatch envelope authority advances from schema v1 to
+v2, while fork-group operation records and lifecycle event payloads advance
+from schema v2 to v3. Readers accept only the current versions; discard
+pre-change records and recreate disposable prerelease state. No compatibility
+migration is provided.
 
 ### Captured sessions become durable evaluations from the Control Plane
 

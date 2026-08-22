@@ -136,7 +136,8 @@ most two total attempts and remains capped by the caller's `max_attempts`.
 Durable retry evidence reports the caller's general `max_attempts` separately
 from the classification-specific `effective_max_attempts`; unknown failures
 carry `reason="unknown_provider"`, including the terminal failure at the nested
-ceiling.
+ceiling. Conflicting explicit SSE statuses remain terminal and omit
+`status_code` from durable evidence rather than reporting a synthesized status.
 
 ## Support and policy boundary
 

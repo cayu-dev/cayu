@@ -243,7 +243,7 @@ class _DurableDispatchRuntime(DispatchRuntime, _SessionInvocationRuntime, Protoc
 
 
 _QUEUED_DISPATCH_RECORD_TYPE = "cayu.queued-dispatch"
-_QUEUED_DISPATCH_SCHEMA_VERSION = 1
+_QUEUED_DISPATCH_SCHEMA_VERSION = 2
 
 
 class _QueuedDispatchSettlementState(StrEnum):
@@ -289,7 +289,7 @@ class _QueuedDispatchEnvelope(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     record_type: Literal["cayu.queued-dispatch"] = _QUEUED_DISPATCH_RECORD_TYPE
-    schema_version: Literal[1] = _QUEUED_DISPATCH_SCHEMA_VERSION
+    schema_version: Literal[2] = _QUEUED_DISPATCH_SCHEMA_VERSION
     queue_task_id: str
     dispatch_operation_id: str
     terminal_event_id: str

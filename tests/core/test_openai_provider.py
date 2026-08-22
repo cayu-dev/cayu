@@ -3345,7 +3345,7 @@ async def test_openai_stream_error_conflicting_status_fields_fail_closed() -> No
     with pytest.raises(OpenAIAPIError) as exc_info:
         [event async for event in openai_stream_events(raw_events())]
 
-    assert exc_info.value.status_code == 500
+    assert exc_info.value.status_code is None
     assert exc_info.value.retryable is False
 
 
@@ -3369,7 +3369,7 @@ async def test_openai_stream_error_conflicting_statuses_cannot_authorize_overflo
         [event async for event in openai_stream_events(raw_events())]
 
     assert type(exc_info.value) is OpenAIAPIError
-    assert exc_info.value.status_code == 400
+    assert exc_info.value.status_code is None
     assert exc_info.value.retryable is False
 
 
@@ -3761,7 +3761,7 @@ async def test_runtime_does_not_recover_conflicting_openai_context_statuses() ->
     assert EventType.MODEL_RETRY not in [event.type for event in events]
     assert EventType.CONTEXT_OVERFLOW_RECOVERING not in [event.type for event in events]
     model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
-    assert model_error.payload["status_code"] == 400
+    assert "status_code" not in model_error.payload
     assert model_error.payload["retryable"] is False
     assert model_error.payload["provider_error_type"] == "invalid_request_error"
     assert model_error.payload["provider_error_code"] == "context_length_exceeded"

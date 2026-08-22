@@ -2806,6 +2806,7 @@ def _openai_error_value_exception(
         error_code=error_code,
     )
     if status_conflict:
+        status_code = None
         retryable = False
     return OpenAIAPIError(
         safe_message,

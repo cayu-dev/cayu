@@ -886,7 +886,7 @@ def test_run_fork_group_replays_terminal_result_and_rejects_conflicts() -> None:
             "fork_group.completed",
         ]
         terminal_payload = records[-1].event.payload
-        assert terminal_payload["schema_version"] == 2
+        assert terminal_payload["schema_version"] == 3
         assert terminal_payload["selected_branch_id"] == "alpha"
         assert terminal_payload["selected_attempt_id"] == first.branches[0].attempt_id
         assert terminal_payload["dispositions"] == [
@@ -931,6 +931,17 @@ def test_run_fork_group_replays_terminal_result_and_rejects_conflicts() -> None:
         with pytest.raises(ForkGroupConflict, match="different request"):
             await app.run_fork_group(request.model_copy(update={"max_parallelism": 1}))
         assert len(provider.requests) == request_count
+
+        stored = await app.session_store.load_session_operation(
+            request.source_session_id,
+            fork_group_runtime._storage_key(request.group_id),
+        )
+        assert stored is not None
+        assert stored["schema_version"] == 3
+        old_schema = json.loads(json.dumps(stored))
+        old_schema["schema_version"] = 2
+        with pytest.raises(ValidationError, match="Unsupported fork-group operation record"):
+            fork_group_runtime._ForkGroupRecord.model_validate(old_schema)
 
     asyncio.run(run())
 
