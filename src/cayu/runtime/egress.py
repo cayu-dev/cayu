@@ -20,7 +20,7 @@ import shutil
 import tempfile
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from typing import Any, Literal, TypeVar
 
@@ -34,9 +34,14 @@ from cayu._task_wait import (
     ShieldedTaskOutcome,
     await_shielded_task_outcome,
     consume_pending_task_cancellation,
+    restore_task_cancellation_requests,
     unexpected_child_cancellation_error,
 )
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import (
+    canonical_durable_json_bytes,
+    copy_json_value,
+    require_clean_nonblank,
+)
 from cayu._workspace_mutation import detached_workspace_mutation_process_signal
 from cayu.artifacts import ArtifactStore
 from cayu.core.events import Event, EventType
@@ -49,6 +54,14 @@ from cayu.egress import (
     CredentialKind,
     CredentialMode,
     EgressAdapterRegistry,
+    EgressAuthorityBindingIdentity,
+    EgressAuthorityCutoverNeedsAttention,
+    EgressAuthorityCutoverRequest,
+    EgressAuthorityCutoverResult,
+    EgressAuthorityCutoverStrategy,
+    EgressAuthorityIdentity,
+    EgressAuthorityRenewalRequest,
+    EgressAuthorityTransitionState,
     EgressBinding,
     EgressCapabilityEvidence,
     EgressDecision,
@@ -64,11 +77,13 @@ from cayu.egress import (
     VirtualCredentialGrant,
     VirtualCredentialRegistry,
     VirtualEgressRunnerRequest,
+    build_egress_authority_identity,
 )
 from cayu.egress.adapter import (
     DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
     _await_bounded_cleanup_task,
 )
+from cayu.egress.authority import _copy_egress_authority_identity
 from cayu.egress.credential_kinds import validate_credential_kind
 from cayu.egress.destinations import normalize_egress_hostname, validate_approved_destinations
 from cayu.environments.admission import (
@@ -87,7 +102,9 @@ from cayu.environments.bindings import (
     copy_workspace_snapshot,
 )
 from cayu.environments.factory import (
+    EnvironmentAllocationContext,
     EnvironmentAllocationScope,
+    EnvironmentAllocationState,
     EnvironmentAllocationUnsupportedError,
     EnvironmentFactory,
     EnvironmentFactoryOperation,
@@ -130,6 +147,17 @@ from cayu.runtime._binding_cleanup import (
     binding_finalize_fatal_signal,
     record_binding_finalize_failures,
 )
+from cayu.runtime.egress_authority_transitions import (
+    _EGRESS_AUTHORITY_PARKED_OUTCOME,
+    EgressAuthorityAdoptionResult,
+    EgressAuthorityTransitionConflict,
+    EgressAuthorityTransitionCoordinator,
+    EgressAuthorityTransitionRecord,
+    _cutover_cancellation_requests,
+    _egress_transition_fatal_signal,
+    _runtime_egress_authority_adoption_result,
+    egress_authority_owner_fingerprint,
+)
 from cayu.runtime.execution_profiles import (
     event_with_execution_profile_fingerprint_authority,
 )
@@ -150,6 +178,9 @@ DEFAULT_SANDBOX_IMAGE = "python:3.12-slim"
 VIRTUAL_EGRESS_RECONNECT_VERSION = 1
 _FACTORY_CLEANUP_RETRY_INITIAL_BACKOFF_SECONDS = 0.05
 _FACTORY_CLEANUP_RETRY_MAX_BACKOFF_SECONDS = 1.0
+_CREDENTIALLESS_EGRESS_AUTHORITY_FINGERPRINT = sha256(
+    b"cayu.egress-credential-authority.v1\0credentialless"
+).hexdigest()
 VIRTUAL_EGRESS_EVENT_TYPES = (
     EventType.CREDENTIAL_MODE_SELECTED,
     EventType.EGRESS_GRANT_MINTED,
@@ -157,6 +188,20 @@ VIRTUAL_EGRESS_EVENT_TYPES = (
     EventType.EGRESS_REQUEST_DENIED,
     EventType.EGRESS_GRANT_REVOKED,
 )
+
+
+def _egress_credential_authority_fingerprint(ref: SecretRef) -> str:
+    """Commit a secret reference identity without publishing any of its fields."""
+
+    if type(ref) is not SecretRef:
+        raise TypeError("Egress credential authority requires a SecretRef.")
+    return sha256(
+        b"cayu.egress-credential-authority.v1\0"
+        + canonical_durable_json_bytes(
+            ref.model_dump(mode="json"),
+            "egress_credential_authority",
+        )
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -186,8 +231,9 @@ _RECONNECT_COMMON_FIELDS = {
     "environment_name",
     "capability",
 }
-_SUPPORTED_RECONNECT_FIELDS = _RECONNECT_COMMON_FIELDS | {"identity"}
-_UNSUPPORTED_RECONNECT_FIELDS = _RECONNECT_COMMON_FIELDS | {"reason"}
+_RECONNECT_OPTIONAL_FIELDS = {"allocation_fingerprint"}
+_SUPPORTED_RECONNECT_FIELDS = _RECONNECT_COMMON_FIELDS | _RECONNECT_OPTIONAL_FIELDS | {"identity"}
+_UNSUPPORTED_RECONNECT_FIELDS = _RECONNECT_COMMON_FIELDS | _RECONNECT_OPTIONAL_FIELDS | {"reason"}
 _REPLAYABLE_AUTHORITY_KEY_PARTS = {
     "auth",
     "authorization",
@@ -216,7 +262,10 @@ def _parse_reconnect_metadata(
     request: EnvironmentFactoryRequest,
     *,
     runner_kind: str,
+    require_allocation_fingerprint: bool,
 ) -> dict[str, Any] | None:
+    if type(require_allocation_fingerprint) is not bool:
+        raise TypeError("require_allocation_fingerprint must be a bool.")
     metadata = request.reconnect_metadata
     if request.operation is EnvironmentFactoryOperation.RECONNECT and not metadata:
         raise InvalidEgressReconnectMetadataError(
@@ -235,7 +284,7 @@ def _parse_reconnect_metadata(
         raise InvalidEgressReconnectMetadataError(
             "Virtual-egress reconnect metadata capability must be supported or unsupported."
         )
-    missing = expected_fields - fields
+    missing = (expected_fields - _RECONNECT_OPTIONAL_FIELDS) - fields
     unexpected = fields - expected_fields
     if missing or unexpected:
         details: list[str] = []
@@ -260,6 +309,22 @@ def _parse_reconnect_metadata(
         raise InvalidEgressReconnectMetadataError(
             "Virtual-egress reconnect metadata belongs to a different environment."
         )
+    if (
+        request.operation is EnvironmentFactoryOperation.RECONNECT
+        and capability == "supported"
+        and require_allocation_fingerprint
+        and "allocation_fingerprint" not in metadata
+    ):
+        raise InvalidEgressReconnectMetadataError(
+            "Fresh-path virtual-egress reconnect metadata requires an allocation fingerprint."
+        )
+    if "allocation_fingerprint" in metadata:
+        try:
+            _validate_environment_fingerprint(metadata["allocation_fingerprint"])
+        except (TypeError, ValueError) as exc:
+            raise InvalidEgressReconnectMetadataError(
+                "Virtual-egress reconnect metadata has an invalid allocation fingerprint."
+            ) from exc
     identity: dict[str, Any] | None = None
     if capability == "supported":
         candidate_identity = metadata["identity"]
@@ -302,15 +367,18 @@ def _build_reconnect_metadata(
     runner_kind: str,
     identity: dict[str, Any],
     supported: bool,
+    allocation_fingerprint: str | None,
 ) -> dict[str, Any]:
     if not isinstance(identity, dict):
         raise TypeError("Egress adapter reconnect metadata must be a dictionary.")
-    common = {
+    common: dict[str, Any] = {
         "version": VIRTUAL_EGRESS_RECONNECT_VERSION,
         "runner_kind": runner_kind,
         "session_id": request.session_id,
         "environment_name": request.environment_name,
     }
+    if allocation_fingerprint is not None:
+        common["allocation_fingerprint"] = _validate_environment_fingerprint(allocation_fingerprint)
     if not supported:
         return {
             **common,
@@ -331,6 +399,16 @@ def _build_reconnect_metadata(
         "capability": "supported",
         "identity": copied_identity,
     }
+
+
+def _validate_environment_fingerprint(value: object) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError("allocation_fingerprint must be a lowercase SHA-256 digest.")
+    return value
 
 
 def _reject_replayable_authority(value: Any, *, path: str = "identity") -> None:
@@ -410,6 +488,10 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         upstream: EgressUpstream | None = None,
         require_test_mode_credentials: bool = True,
         execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
+        egress_authority_generation: int = 1,
+        egress_authority_source: str | None = None,
+        egress_authority_scope: str = "session",
+        egress_policy_version: str | None = None,
     ) -> None:
         if not credentials and not approved_destinations:
             raise ValueError(
@@ -484,12 +566,266 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         self._execution_environment_authority = _virtual_egress_environment_authority(
             self._execution_profile_identity
         )
+        adapter_for_authority = self._adapter or self._resolve_adapter(None)
+        authority_source = egress_authority_source
+        policy_version = egress_policy_version
+        if self._execution_profile_identity is not None:
+            authority_source = authority_source or self._execution_profile_identity.name
+            policy_version = policy_version or ":".join(
+                (
+                    self._execution_profile_identity.behavior_version,
+                    self._execution_profile_identity.implementation_version,
+                )
+            )
+        self._egress_authority_identity = build_egress_authority_identity(
+            policies=self._policies,
+            bindings=(
+                *(
+                    EgressAuthorityBindingIdentity(
+                        destination=spec.destination,
+                        policy_name=spec.policy_name,
+                        credential_kind=spec.credential_kind,
+                        credential_authority_fingerprint=(
+                            _egress_credential_authority_fingerprint(spec.secret)
+                        ),
+                    )
+                    for spec in self._credentials
+                ),
+                *(
+                    EgressAuthorityBindingIdentity(
+                        destination=destination.destination,
+                        policy_name=destination.policy_name,
+                        credential_kind="credentialless",
+                        credential_authority_fingerprint=(
+                            _CREDENTIALLESS_EGRESS_AUTHORITY_FINGERPRINT
+                        ),
+                    )
+                    for destination in self._approved_destinations
+                ),
+            ),
+            generation=egress_authority_generation,
+            authority_source=authority_source or "cayu:virtual-egress-factory:v1",
+            authority_scope=egress_authority_scope,
+            policy_version=policy_version or "cayu:virtual-egress-policy:v1",
+            runner_kind=self._runner_kind,
+            cutover_strategy=adapter_for_authority.egress_authority_cutover_strategy,
+        )
 
     @property
     def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
         """Return the application declaration for this configured egress factory."""
 
         return self._execution_profile_identity
+
+    @property
+    def egress_authority_identity(self) -> EgressAuthorityIdentity:
+        """Return the secret-free authority proposed for the next invocation."""
+
+        return _copy_egress_authority_identity(self._egress_authority_identity)
+
+    async def adopt_authority(
+        self,
+        *,
+        factory_result: EnvironmentFactoryResult,
+        authorized: EgressAuthorityTransitionRecord,
+        coordinator: EgressAuthorityTransitionCoordinator,
+        owner_token: str,
+        agent_name: str = "agent",
+        execution_profile_fingerprint: str | None = None,
+    ) -> EgressAuthorityAdoptionResult:
+        """Install this factory's target authority on one parked live environment.
+
+        The caller supplies the trusted profile decision converted to ``authorized``
+        and a coordinator backed by the logical session's durable ``SessionStore``.
+        This method owns target credentials, fences all new runner work, rotates the
+        backend path, transfers cleanup ownership, and reopens work only after the
+        exact active receipt is durable.
+        """
+
+        if type(factory_result) is not EnvironmentFactoryResult:
+            raise TypeError("Egress authority adoption requires an owned EnvironmentFactoryResult.")
+        environment = factory_result.environment
+        if type(authorized) is not EgressAuthorityTransitionRecord:
+            raise TypeError("authorized must be EgressAuthorityTransitionRecord.")
+        if not isinstance(coordinator, EgressAuthorityTransitionCoordinator):
+            raise TypeError("coordinator must be EgressAuthorityTransitionCoordinator.")
+        managed_runner = environment.runner
+        if not isinstance(managed_runner, _EgressManagedRunner):
+            raise TypeError("Egress authority adoption requires a live Cayu-managed runner.")
+        if authorized.target_authority != self._egress_authority_identity:
+            raise ValueError("Target factory does not match the authorized egress generation.")
+        owner_fingerprint = egress_authority_owner_fingerprint(owner_token)
+        if authorized.owner_fingerprint != owner_fingerprint:
+            raise ValueError("Egress authority adoption owner does not match authorization.")
+        if managed_runner._adapter.runner_kind != self._runner_kind:
+            raise ValueError("Egress authority adoption cannot change the live runner kind.")
+        if (
+            managed_runner._session_id != authorized.session_id
+            or managed_runner._environment_name != authorized.environment_name
+        ):
+            raise ValueError("Egress authority adoption belongs to another session or environment.")
+        reconnect_fingerprint = factory_result.reconnect_metadata.get("allocation_fingerprint")
+        if (
+            reconnect_fingerprint != authorized.source_environment_fingerprint
+            or managed_runner._environment_fingerprint != authorized.source_environment_fingerprint
+        ):
+            raise EgressAuthorityTransitionConflict(
+                "Egress authority adoption cannot substitute a fresh backend allocation."
+            )
+
+        persisted = await coordinator.authorize(authorized)
+        if persisted.state is EgressAuthorityTransitionState.REFUSED:
+            raise EgressAuthorityTransitionConflict(
+                "A refused egress transition cannot transfer an invocation environment."
+            )
+        if persisted.state in {
+            EgressAuthorityTransitionState.INSTALLING,
+            EgressAuthorityTransitionState.AMBIGUOUS,
+            EgressAuthorityTransitionState.ACTIVE,
+        }:
+            active = await managed_runner._reconcile_egress_authority(
+                coordinator=coordinator,
+                authorized=persisted,
+                owner_token=owner_token,
+                target_authority=self._egress_authority_identity,
+            )
+            return _runtime_egress_authority_adoption_result(
+                transition=active,
+                factory_result=factory_result,
+                coordinator=coordinator,
+            )
+        registry = VirtualCredentialRegistry()
+        grants = tuple(
+            registry.mint(
+                session_id=authorized.session_id,
+                env_name=spec.env_name,
+                secret=spec.secret,
+                destination=spec.destination,
+                credential_kind=spec.credential_kind,
+                policy_name=spec.policy_name,
+                ttl_seconds=spec.ttl_seconds,
+            )
+            for spec in self._credentials
+        )
+        audit = _EgressAuditBridge(
+            loop=asyncio.get_running_loop(),
+            emitter=self._emitter,
+            session_id=authorized.session_id,
+            agent_name=require_clean_nonblank(agent_name, "agent_name"),
+            environment_name=authorized.environment_name,
+            execution_profile_fingerprint=execution_profile_fingerprint,
+        )
+        broker = TransparentEgressBroker(
+            registry=registry,
+            resolver=self._resolver,
+            policies=self._policies,
+            approved_destinations=self._approved_destinations,
+            upstream=self._upstream,
+            audit=audit,
+            require_test_mode_credentials=self._require_test_mode,
+        )
+        revoker = _EgressAuthorityRevoker(grants=grants, broker=broker)
+        target_credential_env = {grant.env_name: grant.presented_value for grant in grants}
+        target_egress_destinations = _ordered_destinations(
+            grants,
+            self._approved_destinations,
+        )
+        target_redactor = SecretRedactor(tuple(grant.presented_value for grant in grants))
+        if persisted.state is not EgressAuthorityTransitionState.AUTHORIZED:
+            raise EgressAuthorityTransitionConflict(
+                "Egress authority adoption has an unsupported durable state."
+            )
+        active = await managed_runner._adopt_egress_authority(
+            coordinator=coordinator,
+            authorized=persisted,
+            owner_token=owner_token,
+            target_authority=self._egress_authority_identity,
+            target_broker=broker,
+            target_grants=grants,
+            target_credential_env=target_credential_env,
+            target_egress_destinations=target_egress_destinations,
+            target_revoker=revoker,
+            target_redactor=target_redactor,
+            target_audit=audit,
+        )
+        return _runtime_egress_authority_adoption_result(
+            transition=active,
+            factory_result=factory_result,
+            coordinator=coordinator,
+        )
+
+    async def renew_parked_authority(
+        self,
+        *,
+        factory_result: EnvironmentFactoryResult,
+        expected_authority: EgressAuthorityIdentity,
+        session_id: str,
+        environment_name: str,
+        agent_name: str,
+        execution_profile_fingerprint: str | None,
+    ) -> None:
+        """Renew revoked grants and verify an unchanged parked authority in place."""
+
+        if type(factory_result) is not EnvironmentFactoryResult:
+            raise TypeError("Egress authority renewal requires an owned factory result.")
+        if expected_authority != self._egress_authority_identity:
+            raise EgressAuthorityTransitionConflict(
+                "The registered factory cannot renew a different egress authority."
+            )
+        managed_runner = factory_result.environment.runner
+        if not isinstance(managed_runner, _EgressManagedRunner):
+            raise EgressAuthorityTransitionConflict(
+                "Egress authority renewal requires a live Cayu-managed runner."
+            )
+        if (
+            managed_runner._session_id != session_id
+            or managed_runner._environment_name != environment_name
+            or managed_runner._adapter.runner_kind != self._runner_kind
+        ):
+            raise EgressAuthorityTransitionConflict(
+                "Egress authority renewal belongs to another session environment."
+            )
+        registry = VirtualCredentialRegistry()
+        grants = tuple(
+            registry.mint(
+                session_id=session_id,
+                env_name=spec.env_name,
+                secret=spec.secret,
+                destination=spec.destination,
+                credential_kind=spec.credential_kind,
+                policy_name=spec.policy_name,
+                ttl_seconds=spec.ttl_seconds,
+            )
+            for spec in self._credentials
+        )
+        audit = _EgressAuditBridge(
+            loop=asyncio.get_running_loop(),
+            emitter=self._emitter,
+            session_id=session_id,
+            agent_name=require_clean_nonblank(agent_name, "agent_name"),
+            environment_name=environment_name,
+            execution_profile_fingerprint=execution_profile_fingerprint,
+        )
+        broker = managed_runner._authority_revoker._broker
+        revoker = _EgressAuthorityRevoker(grants=grants, broker=broker)
+        destinations = _ordered_destinations(grants, self._approved_destinations)
+        await managed_runner._renew_egress_authority(
+            authority=expected_authority,
+            target_grants=grants,
+            target_credential_env={grant.env_name: grant.presented_value for grant in grants},
+            target_egress_destinations=destinations,
+            target_revoker=revoker,
+            target_redactor=SecretRedactor(tuple(grant.presented_value for grant in grants)),
+            target_audit=audit,
+        )
+        await self._emit_grant_events_for_identity(
+            session_id=session_id,
+            agent_name=agent_name,
+            environment_name=environment_name,
+            execution_profile_fingerprint=execution_profile_fingerprint,
+            grants=grants,
+            runner_kind=self._runner_kind,
+        )
 
     def execution_environment_authority(self) -> ExecutionEnvironmentAuthority:
         """Return the exact factory authority every managed runner preserves."""
@@ -546,13 +882,39 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         request: EnvironmentFactoryRequest,
     ) -> EnvironmentAllocationScope | None:
         adapter = self._adapter or self._resolve_adapter(asyncio.get_running_loop())
-        self._require_remote_allocation_supported(request, adapter)
-        return None
+        if request.operation is not EnvironmentFactoryOperation.CREATE:
+            return None
+        process_external_allocation = adapter.process_external_allocation
+        if type(process_external_allocation) is not bool:
+            raise EnvironmentAllocationUnsupportedError(
+                f"Runner {adapter.runner_kind!r} must explicitly classify whether "
+                "creation allocates a process-external provider resource."
+            )
+        if not process_external_allocation:
+            return None
+        provider = adapter.allocation_provider
+        generation = adapter.allocation_adapter_generation
+        if (
+            type(provider) is not str
+            or type(generation) is not str
+            or type(adapter).create_or_recover_runner
+            is SandboxEgressAdapter.create_or_recover_runner
+        ):
+            raise EnvironmentAllocationUnsupportedError(
+                f"Runner {adapter.runner_kind!r} cannot allocate safely because its "
+                "provider adapter does not support durable create-or-lookup recovery."
+            )
+        return EnvironmentAllocationScope(
+            provider=provider,
+            adapter_generation=generation,
+        )
 
     @staticmethod
     def _require_remote_allocation_supported(
         request: EnvironmentFactoryRequest,
         adapter: SandboxEgressAdapter,
+        *,
+        allocation: EnvironmentAllocationContext | None,
     ) -> None:
         if request.operation is not EnvironmentFactoryOperation.CREATE:
             return
@@ -562,17 +924,46 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 f"Runner {adapter.runner_kind!r} must explicitly classify whether "
                 "creation allocates a process-external provider resource."
             )
-        if process_external_allocation:
+        if process_external_allocation and allocation is None:
             raise EnvironmentAllocationUnsupportedError(
                 f"Runner {adapter.runner_kind!r} cannot allocate safely because its "
-                "provider adapter does not support durable create-or-lookup recovery."
+                "provider adapter does not support durable create-or-lookup recovery "
+                "outside the runtime allocation coordinator."
             )
 
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
+        return await self._create(request, allocation=None)
+
+    async def create_recoverable(
+        self,
+        request: EnvironmentFactoryRequest,
+        allocation: EnvironmentAllocationContext,
+    ) -> EnvironmentFactoryResult:
+        if not isinstance(allocation, EnvironmentAllocationContext):
+            raise TypeError("Recoverable virtual egress requires an allocation context.")
+        if allocation.state is EnvironmentAllocationState.UNPREPARED:
+            await allocation.prepare(
+                {
+                    "runner_kind": self._runner_kind,
+                    "allocation_marker": allocation.intent.allocation_id,
+                }
+            )
+        return await self._create(request, allocation=allocation)
+
+    async def _create(
+        self,
+        request: EnvironmentFactoryRequest,
+        *,
+        allocation: EnvironmentAllocationContext | None,
+    ) -> EnvironmentFactoryResult:
         loop = asyncio.get_running_loop()
         adapter = self._adapter or self._resolve_adapter(loop)
         runner_kind = adapter.runner_kind
-        self._require_remote_allocation_supported(request, adapter)
+        self._require_remote_allocation_supported(
+            request,
+            adapter,
+            allocation=allocation,
+        )
         admission_evidence = adapter.execution_capability_evidence()
         evaluate_execution_admission(
             candidate=runner_kind,
@@ -590,6 +981,10 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         reconnect_identity = _parse_reconnect_metadata(
             request,
             runner_kind=runner_kind,
+            require_allocation_fingerprint=(
+                adapter.egress_authority_cutover_strategy
+                is EgressAuthorityCutoverStrategy.FRESH_AUTHORITY_PATH
+            ),
         )
         if reconnect_identity is not None:
             reconnect_identity = adapter.validate_reconnect_metadata(reconnect_identity)
@@ -654,6 +1049,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                     broker=broker,
                     reconnect_metadata=reconnect_identity,
                 )
+            binding.bind_authority(self._egress_authority_identity)
             authority_revoker.teardown_timeout_s = binding.teardown_timeout_s
             ca_dir = tempfile.mkdtemp(prefix="cayu-egress-ca-")
             ca_host = os.path.join(ca_dir, "ca.pem")
@@ -680,8 +1076,23 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 environment_name=request.environment_name,
                 parent_session_id=request.parent_session_id,
                 reconnect_metadata=reconnect_identity or {},
+                allocation_id=(None if allocation is None else allocation.intent.allocation_id),
             )
-            runner = await adapter.create_runner(runner_request)
+            if allocation is None:
+                runner = await adapter.create_runner(runner_request)
+            else:
+                allow_create = allocation.state is EnvironmentAllocationState.PREPARED
+                if allow_create:
+                    await allocation.mark_dispatched()
+                if allocation.state not in {
+                    EnvironmentAllocationState.DISPATCHED,
+                    EnvironmentAllocationState.ACKNOWLEDGED,
+                }:
+                    raise RuntimeError("Recoverable virtual-egress allocation is not dispatchable.")
+                runner = await adapter.create_or_recover_runner(
+                    runner_request,
+                    allow_create=allow_create,
+                )
             runtime_admission_evidence = adapter.execution_capability_evidence(runner)
             runtime_admission = evaluate_execution_admission(
                 candidate=runner_kind,
@@ -698,18 +1109,47 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 )
             else:
                 adapter_reconnect_metadata = {}
-            reconnect_metadata = _build_reconnect_metadata(
-                request,
-                runner_kind=runner_kind,
-                identity=adapter_reconnect_metadata,
-                supported=adapter.supports_reconnect,
-            )
             evidence = adapter.capability_evidence(runner)
             if not isinstance(evidence, EgressCapabilityEvidence):
                 raise TypeError(
                     "Egress adapter capability_evidence must return EgressCapabilityEvidence."
                 )
             capability_metadata = evidence.to_metadata()
+            if (
+                adapter.egress_authority_cutover_strategy
+                is EgressAuthorityCutoverStrategy.FRESH_AUTHORITY_PATH
+            ):
+                environment_fingerprint = await adapter.egress_environment_fingerprint(runner)
+                stable_environment_fingerprint: str | None = environment_fingerprint
+            else:
+                environment_fingerprint = sha256(
+                    f"{request.session_id}\0{request.environment_name}\0{id(runner)}".encode()
+                ).hexdigest()
+                stable_environment_fingerprint = None
+            reconnect_metadata = _build_reconnect_metadata(
+                request,
+                runner_kind=runner_kind,
+                identity=adapter_reconnect_metadata,
+                supported=adapter.supports_reconnect,
+                allocation_fingerprint=stable_environment_fingerprint,
+            )
+            if allocation is not None:
+                if allocation.state is EnvironmentAllocationState.DISPATCHED:
+                    await allocation.acknowledge(reconnect_metadata)
+                elif allocation.acknowledged_reconnect_metadata != reconnect_metadata:
+                    raise RuntimeError(
+                        "Recovered virtual-egress allocation changed its durable identity."
+                    )
+            if request.operation is EnvironmentFactoryOperation.RECONNECT:
+                durable_allocation_fingerprint = request.reconnect_metadata.get(
+                    "allocation_fingerprint"
+                )
+                if durable_allocation_fingerprint is not None and (
+                    stable_environment_fingerprint != durable_allocation_fingerprint
+                ):
+                    raise InvalidEgressReconnectMetadataError(
+                        "Virtual-egress reconnect resolved a different backend allocation."
+                    )
 
             managed_runner = _EgressManagedRunner(
                 runner=runner,
@@ -718,8 +1158,13 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 egress_binding=binding,
                 ca_dir=ca_dir,
                 authority_revoker=authority_revoker,
+                egress_grants=tuple(grants),
+                egress_destinations=runner_request.egress_destinations,
                 output_redactor=SecretRedactor(tuple(grant.presented_value for grant in grants)),
                 audit=audit,
+                session_id=request.session_id,
+                environment_name=request.environment_name,
+                environment_fingerprint=environment_fingerprint,
             )
             runner = None
             binding = None
@@ -980,6 +1425,25 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         *,
         runner_kind: str,
     ) -> None:
+        await self._emit_grant_events_for_identity(
+            session_id=request.session_id,
+            agent_name=request.agent_name,
+            environment_name=request.environment_name,
+            execution_profile_fingerprint=request.execution_profile_fingerprint,
+            grants=grants,
+            runner_kind=runner_kind,
+        )
+
+    async def _emit_grant_events_for_identity(
+        self,
+        *,
+        session_id: str,
+        agent_name: str,
+        environment_name: str,
+        execution_profile_fingerprint: str | None,
+        grants: Sequence[VirtualCredentialGrant],
+        runner_kind: str,
+    ) -> None:
         if self._emitter is None:
             return
         with contextlib.suppress(Exception):
@@ -987,9 +1451,9 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 event_with_execution_profile_fingerprint_authority(
                     Event(
                         type=EventType.CREDENTIAL_MODE_SELECTED,
-                        session_id=request.session_id,
-                        agent_name=request.agent_name,
-                        environment_name=request.environment_name,
+                        session_id=session_id,
+                        agent_name=agent_name,
+                        environment_name=environment_name,
                         payload={
                             "credential_mode": CredentialMode.VIRTUAL_EGRESS.value,
                             "runner_kind": runner_kind,
@@ -997,7 +1461,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                             "approved_destination_count": len(self._approved_destinations),
                         },
                     ),
-                    request.execution_profile_fingerprint,
+                    execution_profile_fingerprint,
                 )
             )
             for grant in grants:
@@ -1005,12 +1469,12 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                     event_with_execution_profile_fingerprint_authority(
                         Event(
                             type=EventType.EGRESS_GRANT_MINTED,
-                            session_id=request.session_id,
-                            agent_name=request.agent_name,
-                            environment_name=request.environment_name,
+                            session_id=session_id,
+                            agent_name=agent_name,
+                            environment_name=environment_name,
                             payload=_grant_payload(grant),
                         ),
-                        request.execution_profile_fingerprint,
+                        execution_profile_fingerprint,
                     )
                 )
 
@@ -1060,6 +1524,27 @@ class _EgressAuthorityRevoker:
             self._revoked = True
 
 
+@dataclass(frozen=True)
+class _RetainedEgressCutoverSettlement:
+    """Exact target resources retained while an opaque cutover may still mutate."""
+
+    task: asyncio.Task[Any]
+    request: EgressAuthorityCutoverRequest
+    target_revoker: _EgressAuthorityRevoker
+    target_redactor: SecretRedactor
+    target_audit: _EgressAuditBridge
+    target_resources_transferred: bool
+
+
+@dataclass(frozen=True)
+class _HarvestedEgressCutoverSettlement:
+    """Completed retained work plus every signal retry must still carry."""
+
+    failure: BaseException | None = None
+    cancellation: asyncio.CancelledError | None = None
+    cancellation_requests_consumed: int = 0
+
+
 async def _await_cleanup_task(
     task: asyncio.Task[None],
     *,
@@ -1079,6 +1564,13 @@ async def _await_cleanup_task(
         task,
         cancellation=cancellation,
     )
+    _raise_cleanup_task_outcome(task_outcome)
+    return task_outcome.cancellation is not None
+
+
+def _raise_cleanup_task_outcome(task_outcome: ShieldedTaskOutcome[None]) -> None:
+    """Raise one settled cleanup failure without discarding caller control."""
+
     if task_outcome.error is not None:
         if isinstance(task_outcome.error, asyncio.CancelledError):
             if task_outcome.cancellation is not None:
@@ -1090,7 +1582,6 @@ async def _await_cleanup_task(
                 [task_outcome.cancellation, task_outcome.error],
             ) from task_outcome.error
         raise task_outcome.error
-    return task_outcome.cancellation is not None
 
 
 async def _await_cleanup(awaitable: Awaitable[None]) -> bool:
@@ -1272,7 +1763,12 @@ class _EgressManagedRunner(Runner):
         egress_binding: EgressBinding,
         ca_dir: str,
         authority_revoker: _EgressAuthorityRevoker,
+        egress_grants: tuple[VirtualCredentialGrant, ...],
+        egress_destinations: tuple[str, ...],
         output_redactor: SecretRedactor,
+        session_id: str,
+        environment_name: str,
+        environment_fingerprint: str,
         audit: _EgressAuditBridge | None = None,
     ) -> None:
         if not isinstance(output_redactor, SecretRedactor):
@@ -1287,8 +1783,22 @@ class _EgressManagedRunner(Runner):
         self._egress_binding = egress_binding
         self._ca_dir = ca_dir
         self._authority_revoker = authority_revoker
+        self._egress_grants = tuple(egress_grants)
+        self._egress_destinations = tuple(egress_destinations)
+        if not self._egress_destinations:
+            raise ValueError("Managed egress runner requires at least one destination.")
         self._output_redactor = output_redactor
         self._audit = audit
+        self._session_id = require_clean_nonblank(session_id, "session_id")
+        self._environment_name = require_clean_nonblank(
+            environment_name,
+            "environment_name",
+        )
+        if len(environment_fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in environment_fingerprint
+        ):
+            raise ValueError("environment_fingerprint must be a lowercase SHA-256 digest.")
+        self._environment_fingerprint = environment_fingerprint
         self._teardown_timeout_s = egress_binding.teardown_timeout_s
         self._runner_close_task: asyncio.Task[RunnerFinalizationResult] | None = None
         self._runner_close_action: str | None = None
@@ -1320,6 +1830,14 @@ class _EgressManagedRunner(Runner):
         self._active_workspace_dispatches_drained = asyncio.Event()
         self._active_workspace_dispatches_drained.set()
         self._workspace_target_unavailable_after_dispatch = False
+        self._authority_parking_task: asyncio.Task[RunnerFinalizationResult] | None = None
+        self._parked_for_authority_adoption = False
+        self._authority_parking_cancellation: asyncio.CancelledError | None = None
+        self._authority_parking_cancellation_requests = 0
+        self._egress_cutover_lock = asyncio.Lock()
+        self._egress_cutover_active = False
+        self._egress_cutover_needs_attention = False
+        self._egress_cutover_settlement: _RetainedEgressCutoverSettlement | None = None
         self.isolation = runner.isolation
         self.default_cwd = runner.default_cwd
         self.system_execution_mode = runner.system_execution_mode
@@ -1363,6 +1881,12 @@ class _EgressManagedRunner(Runner):
     def workspace_mutations_quiescent(self) -> bool:
         result = self._completed_runner_result
         return self._closed and result is not None and result.workspace_mutations_quiescent
+
+    @property
+    def is_parked_for_authority_adoption(self) -> bool:
+        """Whether work is fenced while the exact allocation remains live."""
+
+        return self._parked_for_authority_adoption
 
     @property
     def workspace_target_unavailable_after_dispatch(self) -> bool:
@@ -1791,6 +2315,778 @@ class _EgressManagedRunner(Runner):
     async def revoke_authority(self) -> bool:
         return await self._authority_revoker.revoke()
 
+    def _egress_authority_cutover_request(
+        self,
+        *,
+        authorized: EgressAuthorityTransitionRecord,
+        owner_fingerprint: str,
+        target_authority: EgressAuthorityIdentity,
+        target_broker: TransparentEgressBroker,
+        target_grants: tuple[VirtualCredentialGrant, ...],
+        target_credential_env: Mapping[str, str],
+        target_egress_destinations: tuple[str, ...],
+    ) -> EgressAuthorityCutoverRequest:
+        return EgressAuthorityCutoverRequest(
+            session_id=authorized.session_id,
+            environment_name=authorized.environment_name,
+            owner_fingerprint=owner_fingerprint,
+            environment_fingerprint=self._environment_fingerprint,
+            runner=self._runner,
+            current_binding=self._egress_binding,
+            expected_authority=authorized.expected_authority,
+            target_authority=target_authority,
+            target_broker=target_broker,
+            target_grants=target_grants,
+            target_env_overlay=target_credential_env,
+            target_egress_destinations=target_egress_destinations,
+            revoke_current_authority=self._authority_revoker.revoke,
+            ca_cert_host_path=os.path.join(self._ca_dir, "ca.pem"),
+            guest_ca_path=_required_binding_field(
+                self._egress_binding,
+                "guest_ca_path",
+            ),
+            invocation_quiescent=True,
+        )
+
+    async def _reconcile_egress_authority(
+        self,
+        *,
+        coordinator: EgressAuthorityTransitionCoordinator,
+        authorized: EgressAuthorityTransitionRecord,
+        owner_token: str,
+        target_authority: EgressAuthorityIdentity,
+    ) -> EgressAuthorityTransitionRecord:
+        """Read back and authenticate one durable interrupted cutover."""
+
+        async with self._egress_cutover_lock:
+            owner_fingerprint = egress_authority_owner_fingerprint(owner_token)
+            if (
+                authorized.session_id != self._session_id
+                or authorized.environment_name != self._environment_name
+                or authorized.owner_fingerprint != owner_fingerprint
+            ):
+                raise EgressAuthorityTransitionConflict(
+                    "Egress reconciliation does not own this session environment allocation."
+                )
+            harvested_settlement = self._harvest_completed_egress_cutover_settlement_for_retry()
+
+            def redeliver_reconciliation_cancellation(
+                cancellation: asyncio.CancelledError | None,
+                cancellation_requests_consumed: int,
+                *,
+                failure: BaseException | None = None,
+            ) -> None:
+                carried = cancellation or harvested_settlement.cancellation
+                if carried is None:
+                    return
+                secondary: list[BaseException] = []
+                if (
+                    cancellation is not None
+                    and harvested_settlement.cancellation is not None
+                    and harvested_settlement.cancellation is not cancellation
+                ):
+                    secondary.append(harvested_settlement.cancellation)
+                if failure is not None:
+                    secondary.append(failure)
+                if (
+                    harvested_settlement.failure is not None
+                    and harvested_settlement.failure is not failure
+                ):
+                    secondary.append(harvested_settlement.failure)
+                restore_task_cancellation_requests(
+                    cancellation_requests_consumed
+                    + harvested_settlement.cancellation_requests_consumed,
+                    cancellation=carried,
+                )
+                if len(secondary) == 1:
+                    raise carried from secondary[0]
+                if secondary:
+                    raise carried from BaseExceptionGroup(
+                        "Egress reconciliation retained multiple prior signals.",
+                        secondary,
+                    )
+                raise carried
+
+            observed_environment_fingerprint = await self._adapter.egress_environment_fingerprint(
+                self._runner
+            )
+            if observed_environment_fingerprint != self._environment_fingerprint:
+                raise EgressAuthorityTransitionConflict(
+                    "Egress reconciliation backend allocation identity changed."
+                )
+            if (
+                self._egress_cutover_settlement is not None
+                and not self._egress_cutover_settlement.task.done()
+            ):
+                raise EgressAuthorityTransitionConflict(
+                    "A prior egress cutover mutation still requires local settlement."
+                )
+            if self._audit is None:
+                raise EgressAuthorityTransitionConflict(
+                    "Egress reconciliation requires the managed audit owner."
+                )
+            self._close_exec("egress authority reconciliation is in progress")
+            self._egress_cutover_active = True
+            target_is_bound = (
+                self._egress_binding.authority_fingerprint == target_authority.fingerprint
+                and self._egress_binding.authority_generation == target_authority.generation
+            )
+            activation_verified = False
+            try:
+                self._require_egress_cutover_quiescent(
+                    allow_completed_cutover_settlement=True,
+                )
+                await self._audit.drain()
+                request = self._egress_authority_cutover_request(
+                    authorized=authorized,
+                    owner_fingerprint=owner_fingerprint,
+                    target_authority=target_authority,
+                    target_broker=self._authority_revoker._broker,
+                    target_grants=self._egress_grants,
+                    target_credential_env={
+                        grant.env_name: grant.presented_value for grant in self._egress_grants
+                    },
+                    target_egress_destinations=self._egress_destinations,
+                )
+                reconciliation_task = asyncio.create_task(
+                    coordinator.reconcile(
+                        current=authorized,
+                        adapter=self._adapter,
+                        request=request,
+                        owner_token=owner_token,
+                    ),
+                    name=(f"cayu-egress-authority-reconcile-{authorized.transition_id}"),
+                )
+                outcome = await await_shielded_task_outcome(
+                    reconciliation_task,
+                    timeout_s=DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
+                    timeout_after_cancellation_s=(DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS),
+                )
+                if outcome.timed_out:
+                    self._egress_cutover_settlement = _RetainedEgressCutoverSettlement(
+                        task=reconciliation_task,
+                        request=request,
+                        target_revoker=self._authority_revoker,
+                        target_redactor=self._output_redactor,
+                        target_audit=self._audit,
+                        target_resources_transferred=True,
+                    )
+                    attention = EgressAuthorityCutoverNeedsAttention(
+                        "Egress authority readback did not settle within the bounded "
+                        "ownership window.",
+                        replacement_binding=(self._egress_binding if target_is_bound else None),
+                        environment_fingerprint=self._environment_fingerprint,
+                        target_authority_installed=target_is_bound,
+                        settlement_task=reconciliation_task,
+                        cancellation=outcome.cancellation,
+                        cancellation_requests_consumed=(outcome.cancellation_requests_consumed),
+                    )
+                    self._egress_cutover_needs_attention = True
+                    if outcome.cancellation is not None:
+                        restore_task_cancellation_requests(
+                            outcome.cancellation_requests_consumed,
+                            cancellation=outcome.cancellation,
+                        )
+                        raise outcome.cancellation from attention
+                    raise attention
+                if outcome.error is not None:
+                    reconciliation_fatal = _egress_transition_fatal_signal(outcome.error)
+                    if reconciliation_fatal is None and outcome.error.__cause__ is not None:
+                        reconciliation_fatal = _egress_transition_fatal_signal(
+                            outcome.error.__cause__
+                        )
+                    if reconciliation_fatal is not None:
+                        if (
+                            outcome.cancellation is not None
+                            or harvested_settlement.cancellation is not None
+                        ):
+                            reconciliation_fatal.add_note(
+                                "Cancellation also arrived while egress reconciliation "
+                                "was being durably fenced."
+                            )
+                        raise reconciliation_fatal from None
+                    redeliver_reconciliation_cancellation(
+                        outcome.cancellation,
+                        outcome.cancellation_requests_consumed,
+                        failure=outcome.error,
+                    )
+                    if isinstance(outcome.error, asyncio.CancelledError):
+                        raise unexpected_child_cancellation_error(
+                            outcome.error,
+                            operation="Egress authority reconciliation",
+                        ) from outcome.error
+                    raise outcome.error
+                active = outcome.result
+                if (
+                    type(active) is not EgressAuthorityTransitionRecord
+                    or active.state is not EgressAuthorityTransitionState.ACTIVE
+                    or not target_is_bound
+                ):
+                    attention = EgressAuthorityCutoverNeedsAttention(
+                        "Backend readback did not prove the exact target authority; "
+                        "the environment remains fenced.",
+                        replacement_binding=(self._egress_binding if target_is_bound else None),
+                        environment_fingerprint=self._environment_fingerprint,
+                        target_authority_installed=target_is_bound,
+                    )
+                    redeliver_reconciliation_cancellation(
+                        outcome.cancellation,
+                        outcome.cancellation_requests_consumed,
+                        failure=attention,
+                    )
+                    if harvested_settlement.failure is not None:
+                        raise attention from harvested_settlement.failure
+                    raise attention
+                self._egress_cutover_settlement = None
+                self._egress_cutover_needs_attention = False
+                self._complete_parked_authority_adoption()
+                self._open_exec()
+                activation_verified = True
+                redeliver_reconciliation_cancellation(
+                    outcome.cancellation,
+                    outcome.cancellation_requests_consumed,
+                )
+                return active
+            except BaseException:
+                if not activation_verified:
+                    self._egress_cutover_needs_attention = True
+                raise
+            finally:
+                self._egress_cutover_active = False
+
+    async def _adopt_egress_authority(
+        self,
+        *,
+        coordinator: EgressAuthorityTransitionCoordinator,
+        authorized: EgressAuthorityTransitionRecord,
+        owner_token: str,
+        target_authority: EgressAuthorityIdentity,
+        target_broker: TransparentEgressBroker,
+        target_grants: tuple[VirtualCredentialGrant, ...],
+        target_credential_env: Mapping[str, str],
+        target_egress_destinations: tuple[str, ...],
+        target_revoker: _EgressAuthorityRevoker,
+        target_redactor: SecretRedactor,
+        target_audit: _EgressAuditBridge,
+    ) -> EgressAuthorityTransitionRecord:
+        """Fence the wrapper, rotate its inner path, and transfer cleanup ownership."""
+
+        async with self._egress_cutover_lock:
+            owner_fingerprint = egress_authority_owner_fingerprint(owner_token)
+            if (
+                authorized.session_id != self._session_id
+                or authorized.environment_name != self._environment_name
+                or authorized.owner_fingerprint != owner_fingerprint
+            ):
+                raise EgressAuthorityTransitionConflict(
+                    "Egress cutover does not own this session environment allocation."
+                )
+            try:
+                observed_environment_fingerprint = (
+                    await self._adapter.egress_environment_fingerprint(self._runner)
+                )
+                if observed_environment_fingerprint != self._environment_fingerprint:
+                    raise EgressAuthorityTransitionConflict(
+                        "Egress cutover backend allocation identity changed."
+                    )
+                if self._egress_cutover_needs_attention:
+                    raise EgressAuthorityTransitionConflict(
+                        "The live environment has an unresolved egress-authority cutover."
+                    )
+                self._close_exec("egress authority cutover is in progress")
+                self._egress_cutover_active = True
+                self._require_egress_cutover_quiescent()
+                if self._audit is not None:
+                    await self._audit.drain()
+                request = self._egress_authority_cutover_request(
+                    authorized=authorized,
+                    owner_fingerprint=owner_fingerprint,
+                    target_authority=target_authority,
+                    target_broker=target_broker,
+                    target_grants=target_grants,
+                    target_credential_env=target_credential_env,
+                    target_egress_destinations=target_egress_destinations,
+                )
+                active, result = await coordinator.install(
+                    authorized=authorized,
+                    adapter=self._adapter,
+                    request=request,
+                    owner_token=owner_token,
+                )
+            except EgressAuthorityCutoverNeedsAttention as exc:
+                replacement = exc.replacement_binding
+                fatal_cause = (
+                    None
+                    if exc.__cause__ is None
+                    else _egress_transition_fatal_signal(exc.__cause__)
+                )
+                target_resources_transferred = False
+                if exc.target_authority_installed and type(replacement) is EgressBinding:
+                    self._replace_egress_authority_resources(
+                        binding=replacement,
+                        revoker=target_revoker,
+                        grants=target_grants,
+                        destinations=target_egress_destinations,
+                        redactor=target_redactor,
+                        audit=target_audit,
+                    )
+                    target_resources_transferred = True
+                elif not exc.target_authority_installed:
+                    cleanup_errors: list[BaseException] = []
+                    try:
+                        await target_revoker.revoke()
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(cleanup_error)
+                    try:
+                        await target_audit.drain()
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(cleanup_error)
+                    if cleanup_errors:
+                        self._egress_cutover_needs_attention = True
+                        if fatal_cause is not None:
+                            fatal_cause.add_note(
+                                "Egress cutover ambiguity was durable, but staged target "
+                                "cleanup also failed."
+                            )
+                            secondary_failures = [
+                                *([] if exc.cancellation is None else [exc.cancellation]),
+                                *cleanup_errors,
+                            ]
+                            raise fatal_cause from BaseExceptionGroup(
+                                "Egress cutover staged target cleanup failed.",
+                                secondary_failures,
+                            )
+                        if exc.cancellation is not None:
+                            restore_task_cancellation_requests(
+                                exc.cancellation_requests_consumed,
+                                cancellation=exc.cancellation,
+                            )
+                            raise exc.cancellation from BaseExceptionGroup(
+                                "Egress cutover ambiguity preceded staged target cleanup failure.",
+                                [exc, *cleanup_errors],
+                            )
+                        raise BaseExceptionGroup(
+                            "Egress cutover needs attention and staged target cleanup failed.",
+                            [exc, *cleanup_errors],
+                        ) from exc
+                if isinstance(exc.settlement_task, asyncio.Task):
+                    self._egress_cutover_settlement = _RetainedEgressCutoverSettlement(
+                        task=exc.settlement_task,
+                        request=request,
+                        target_revoker=target_revoker,
+                        target_redactor=target_redactor,
+                        target_audit=target_audit,
+                        target_resources_transferred=target_resources_transferred,
+                    )
+                self._egress_cutover_needs_attention = True
+                if fatal_cause is not None:
+                    if exc.cancellation is not None:
+                        fatal_cause.add_note(
+                            "Caller cancellation also arrived while the egress cutover "
+                            "was being durably fenced."
+                        )
+                    raise fatal_cause from None
+                if exc.cancellation is not None:
+                    restore_task_cancellation_requests(
+                        exc.cancellation_requests_consumed,
+                        cancellation=exc.cancellation,
+                    )
+                    raise exc.cancellation from exc
+                raise
+            except EgressAuthorityTransitionConflict as original:
+                cleanup_errors: list[BaseException] = []
+                try:
+                    await target_revoker.revoke()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                try:
+                    await target_audit.drain()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                self._close_exec("egress authority cutover ownership is unresolved")
+                self._egress_cutover_needs_attention = True
+                if cleanup_errors:
+                    raise BaseExceptionGroup(
+                        "Egress transition ownership was lost and target cleanup failed.",
+                        [original, *cleanup_errors],
+                    ) from original
+                raise
+            except BaseException as original:
+                cleanup_errors: list[BaseException] = []
+                try:
+                    await target_revoker.revoke()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                try:
+                    await target_audit.drain()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                if not self._parked_for_authority_adoption:
+                    self._open_exec()
+                if cleanup_errors:
+                    fatal_signal = _egress_transition_fatal_signal(original)
+                    if fatal_signal is not None:
+                        raise fatal_signal from BaseExceptionGroup(
+                            "Egress cutover target cleanup failed after a fatal signal.",
+                            cleanup_errors,
+                        )
+                    if isinstance(original, asyncio.CancelledError):
+                        restore_task_cancellation_requests(
+                            _cutover_cancellation_requests(original),
+                            cancellation=original,
+                        )
+                        raise original from BaseExceptionGroup(
+                            "Egress cutover target cleanup failed after cancellation.",
+                            cleanup_errors,
+                        )
+                    raise BaseExceptionGroup(
+                        "Egress cutover failed and target authority cleanup also failed.",
+                        [original, *cleanup_errors],
+                    ) from original
+                if isinstance(original, asyncio.CancelledError):
+                    restore_task_cancellation_requests(
+                        _cutover_cancellation_requests(original),
+                        cancellation=original,
+                    )
+                raise
+            else:
+                if result is None:
+                    self._egress_cutover_needs_attention = True
+                    raise RuntimeError("Active egress cutover omitted its live binding result.")
+                self._replace_egress_authority_resources(
+                    binding=result.binding,
+                    revoker=target_revoker,
+                    grants=target_grants,
+                    destinations=target_egress_destinations,
+                    redactor=target_redactor,
+                    audit=target_audit,
+                )
+                self._complete_parked_authority_adoption()
+                self._open_exec()
+                if result.cancellation is not None:
+                    restore_task_cancellation_requests(
+                        result.cancellation_requests_consumed,
+                        cancellation=result.cancellation,
+                    )
+                    raise result.cancellation
+                return active
+            finally:
+                self._egress_cutover_active = False
+
+    async def _renew_egress_authority(
+        self,
+        *,
+        authority: EgressAuthorityIdentity,
+        target_grants: tuple[VirtualCredentialGrant, ...],
+        target_credential_env: Mapping[str, str],
+        target_egress_destinations: tuple[str, ...],
+        target_revoker: _EgressAuthorityRevoker,
+        target_redactor: SecretRedactor,
+        target_audit: _EgressAuditBridge,
+    ) -> None:
+        """Restore fresh grants on one exact parked allocation before reopening it."""
+
+        async with self._egress_cutover_lock:
+            if not self._parked_for_authority_adoption:
+                raise EgressAuthorityTransitionConflict(
+                    "Egress authority renewal requires the exact parked allocation."
+                )
+            if (
+                self._egress_binding.authority_fingerprint != authority.fingerprint
+                or self._egress_binding.authority_generation != authority.generation
+                or self._adapter.runner_kind != authority.runner_kind
+            ):
+                raise EgressAuthorityTransitionConflict(
+                    "Egress authority renewal cannot change the parked authority identity."
+                )
+            observed_environment_fingerprint = await self._adapter.egress_environment_fingerprint(
+                self._runner
+            )
+            if observed_environment_fingerprint != self._environment_fingerprint:
+                raise EgressAuthorityTransitionConflict(
+                    "Egress authority renewal backend allocation identity changed."
+                )
+            self._close_exec("egress authority renewal is in progress")
+            self._egress_cutover_active = True
+            broker = self._authority_revoker._broker
+            renewed = False
+            try:
+                self._require_egress_cutover_quiescent()
+                broker.renew_authority(target_grants)
+                renewed = True
+                renewed_environment_fingerprint = await self._adapter.renew_authority(
+                    EgressAuthorityRenewalRequest(
+                        session_id=self._session_id,
+                        environment_name=self._environment_name,
+                        environment_fingerprint=self._environment_fingerprint,
+                        runner=self._runner,
+                        current_binding=self._egress_binding,
+                        authority=authority,
+                        renewed_grants=target_grants,
+                        renewed_env_overlay=target_credential_env,
+                        egress_destinations=target_egress_destinations,
+                        ca_cert_host_path=os.path.join(self._ca_dir, "ca.pem"),
+                        guest_ca_path=_required_binding_field(
+                            self._egress_binding,
+                            "guest_ca_path",
+                        ),
+                        invocation_quiescent=True,
+                    )
+                )
+                if renewed_environment_fingerprint != self._environment_fingerprint:
+                    raise EgressAuthorityTransitionConflict(
+                        "Egress authority renewal verified a different backend allocation."
+                    )
+            except BaseException as original:
+                cleanup_errors: list[BaseException] = []
+                if renewed:
+                    try:
+                        await target_revoker.revoke()
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(cleanup_error)
+                try:
+                    await target_audit.drain()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                if cleanup_errors:
+                    self._replace_egress_authority_resources(
+                        binding=self._egress_binding,
+                        revoker=target_revoker,
+                        grants=target_grants,
+                        destinations=target_egress_destinations,
+                        redactor=target_redactor,
+                        audit=target_audit,
+                    )
+                    self._egress_cutover_needs_attention = True
+                    raise BaseExceptionGroup(
+                        "Egress authority renewal failed and fresh authority cleanup also failed.",
+                        [original, *cleanup_errors],
+                    ) from original
+                raise
+            else:
+                self._replace_egress_authority_resources(
+                    binding=self._egress_binding,
+                    revoker=target_revoker,
+                    grants=target_grants,
+                    destinations=target_egress_destinations,
+                    redactor=target_redactor,
+                    audit=target_audit,
+                )
+                self._complete_parked_authority_adoption()
+                self._open_exec()
+            finally:
+                self._egress_cutover_active = False
+
+    def _harvest_completed_egress_cutover_settlement_for_retry(
+        self,
+    ) -> _HarvestedEgressCutoverSettlement:
+        """Adopt a quiescent late result before exact backend reconciliation."""
+
+        owner = self._egress_cutover_settlement
+        if owner is None or not owner.task.done():
+            return _HarvestedEgressCutoverSettlement()
+        settlement_result: Any = None
+        settlement_error: BaseException | None = None
+        try:
+            settlement_result = owner.task.result()
+        except BaseException as exc:
+            settlement_error = exc
+        fatal_signal = (
+            None if settlement_error is None else _egress_transition_fatal_signal(settlement_error)
+        )
+        if (
+            fatal_signal is None
+            and settlement_error is not None
+            and settlement_error.__cause__ is not None
+        ):
+            fatal_signal = _egress_transition_fatal_signal(settlement_error.__cause__)
+        if fatal_signal is not None:
+            raise fatal_signal from None
+        if isinstance(settlement_error, asyncio.CancelledError):
+            settlement_error = unexpected_child_cancellation_error(
+                settlement_error,
+                operation="Egress authority retained cutover settlement",
+            )
+
+        replacement: EgressBinding | None = None
+        cancellation: asyncio.CancelledError | None = None
+        cancellation_requests_consumed = 0
+        if type(settlement_result) is EgressAuthorityCutoverResult:
+            replacement = settlement_result.binding
+            cancellation = settlement_result.cancellation
+            cancellation_requests_consumed = settlement_result.cancellation_requests_consumed
+        elif isinstance(settlement_error, EgressAuthorityCutoverNeedsAttention):
+            candidate = settlement_error.replacement_binding
+            if type(candidate) is EgressBinding:
+                replacement = candidate
+            cancellation = settlement_error.cancellation
+            cancellation_requests_consumed = settlement_error.cancellation_requests_consumed
+        if not owner.target_resources_transferred and replacement is not None:
+            if (
+                replacement.authority_fingerprint != owner.request.target_authority.fingerprint
+                or replacement.authority_generation != owner.request.target_authority.generation
+            ):
+                raise EgressAuthorityTransitionConflict(
+                    "Late egress cutover settlement returned a different target authority."
+                ) from settlement_error
+            self._replace_egress_authority_resources(
+                binding=replacement,
+                revoker=owner.target_revoker,
+                grants=owner.request.target_grants,
+                destinations=owner.request.target_egress_destinations,
+                redactor=owner.target_redactor,
+                audit=owner.target_audit,
+            )
+            self._egress_cutover_settlement = replace(
+                owner,
+                target_resources_transferred=True,
+            )
+        return _HarvestedEgressCutoverSettlement(
+            failure=settlement_error,
+            cancellation=cancellation,
+            cancellation_requests_consumed=cancellation_requests_consumed,
+        )
+
+    def _require_egress_cutover_quiescent(
+        self,
+        *,
+        allow_completed_cutover_settlement: bool = False,
+    ) -> None:
+        if self._closed or self._finalization_started or self._binding_release_started:
+            raise RuntimeError("Managed runner finalization overlaps egress cutover.")
+        if self._binding_admissions or self._workspace_sync_access_owner is not None:
+            raise RuntimeError("Workspace binding activity overlaps egress cutover.")
+        if self._active_workspace_dispatches or self._workspace_dispatch_settlement_tasks:
+            raise RuntimeError("Runner work remains active at the egress cutover boundary.")
+        if self._uncertain_workspace_dispatches:
+            raise RuntimeError("Runner work settlement is ambiguous at egress cutover.")
+        if self._runner_close_task is not None or self._binding_close_task is not None:
+            raise RuntimeError("Environment cleanup overlaps egress cutover.")
+        if self._authority_parking_task is not None and not self._authority_parking_task.done():
+            raise RuntimeError("Environment parking remains in flight during egress cutover.")
+        if self._egress_cutover_settlement is not None:
+            if not self._egress_cutover_settlement.task.done():
+                raise RuntimeError("A prior egress cutover mutation remains in flight.")
+            if not allow_completed_cutover_settlement:
+                raise RuntimeError("A prior egress cutover settlement requires reconciliation.")
+        if (
+            self._egress_binding.authority_fingerprint is None
+            or self._egress_binding.authority_generation is None
+        ):
+            raise RuntimeError("Live egress binding has no immutable authority identity.")
+
+    def _replace_egress_authority_resources(
+        self,
+        *,
+        binding: EgressBinding,
+        revoker: _EgressAuthorityRevoker,
+        grants: tuple[VirtualCredentialGrant, ...],
+        destinations: tuple[str, ...],
+        redactor: SecretRedactor,
+        audit: _EgressAuditBridge,
+    ) -> None:
+        self._egress_binding = binding
+        revoker.teardown_timeout_s = binding.teardown_timeout_s
+        self._authority_revoker = revoker
+        self._egress_grants = grants
+        self._egress_destinations = destinations
+        self._output_redactor = self._output_redactor.merged_with(redactor)
+        self._audit = audit
+        self._teardown_timeout_s = binding.teardown_timeout_s
+
+    async def _settle_retained_egress_cutover_for_finalization(
+        self,
+        *,
+        deadline: float,
+    ) -> BaseException | None:
+        """Own a late provider mutation before any environment cleanup can overlap it."""
+
+        owner = self._egress_cutover_settlement
+        if owner is None:
+            return None
+        outcome = await await_shielded_task_outcome(
+            owner.task,
+            timeout_s=self._remaining_teardown_time(deadline),
+        )
+        if outcome.timed_out:
+            attention = EgressAuthorityCutoverNeedsAttention(
+                "Egress cutover still has an unsettled provider mutation; "
+                "environment cleanup remains fenced.",
+                replacement_binding=None,
+                environment_fingerprint=owner.request.environment_fingerprint,
+                settlement_task=owner.task,
+                cancellation=outcome.cancellation,
+                cancellation_requests_consumed=outcome.cancellation_requests_consumed,
+            )
+            if outcome.cancellation is not None:
+                restore_task_cancellation_requests(
+                    outcome.cancellation_requests_consumed,
+                    cancellation=outcome.cancellation,
+                )
+                raise outcome.cancellation from attention
+            raise attention
+
+        settlement_error = outcome.error
+        if isinstance(settlement_error, asyncio.CancelledError):
+            settlement_error = unexpected_child_cancellation_error(
+                settlement_error,
+                operation="Egress authority cutover settlement",
+            )
+        if not owner.target_resources_transferred:
+            replacement: EgressBinding | None = None
+            if type(outcome.result) is EgressAuthorityCutoverResult:
+                replacement = outcome.result.binding
+            elif isinstance(outcome.error, EgressAuthorityCutoverNeedsAttention):
+                candidate = outcome.error.replacement_binding
+                if type(candidate) is EgressBinding:
+                    replacement = candidate
+
+            if replacement is not None and (
+                replacement.authority_fingerprint == owner.request.target_authority.fingerprint
+                and replacement.authority_generation == owner.request.target_authority.generation
+            ):
+                self._replace_egress_authority_resources(
+                    binding=replacement,
+                    revoker=owner.target_revoker,
+                    grants=owner.request.target_grants,
+                    destinations=owner.request.target_egress_destinations,
+                    redactor=owner.target_redactor,
+                    audit=owner.target_audit,
+                )
+            else:
+                cleanup_errors: list[BaseException] = []
+                try:
+                    await owner.target_revoker.revoke(
+                        timeout_s=self._remaining_teardown_time(deadline)
+                    )
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                try:
+                    async with asyncio.timeout(self._remaining_teardown_time(deadline)):
+                        await owner.target_audit.drain()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                if cleanup_errors:
+                    raise BaseExceptionGroup(
+                        "Egress cutover settlement and staged target cleanup failed.",
+                        [
+                            *([] if settlement_error is None else [settlement_error]),
+                            *cleanup_errors,
+                        ],
+                    )
+
+        self._egress_cutover_settlement = None
+        self._egress_cutover_needs_attention = False
+        if outcome.cancellation is not None:
+            restore_task_cancellation_requests(
+                outcome.cancellation_requests_consumed,
+                cancellation=outcome.cancellation,
+            )
+            if settlement_error is not None:
+                raise outcome.cancellation from settlement_error
+            raise outcome.cancellation
+        return settlement_error
+
     async def finalize(self, *, outcome: str | None) -> None:
         await self._finalize(
             outcome=outcome,
@@ -1982,6 +3278,17 @@ class _EgressManagedRunner(Runner):
     ) -> None:
         if type(require_workspace_mutations_quiescent) is not bool:
             raise TypeError("Managed runner quiescence requirement must be a bool.")
+        if outcome == _EGRESS_AUTHORITY_PARKED_OUTCOME:
+            if not require_workspace_mutations_quiescent:
+                raise RuntimeError(
+                    "Egress authority parking requires workspace mutation quiescence."
+                )
+            if workspace_owner_key is not None:
+                self._retire_workspace_binding_owner(workspace_owner_key)
+            elif self._workspace_binding_owners:
+                raise RuntimeError("Egress authority parking requires its exact workspace owner.")
+            await self._park_for_authority_adoption()
+            return
         if require_workspace_mutations_quiescent:
             if workspace_owner_key is None:
                 if self._workspace_binding_owners:
@@ -2003,6 +3310,98 @@ class _EgressManagedRunner(Runner):
         # The quiescence requirement is already monotonic before this await.
         await self.finalize(outcome=outcome)
 
+    async def _park_for_authority_adoption(self) -> None:
+        """Fence workload execution without destroying the exact allocation."""
+
+        if self._closed or self._finalization_started or self._binding_release_started:
+            raise RuntimeError("Managed runner finalization overlaps egress parking.")
+        if self._egress_cutover_active or self._egress_cutover_needs_attention:
+            raise RuntimeError("Egress cutover state overlaps allocation parking.")
+        if self._binding_admissions or self._workspace_binding_owners:
+            raise RuntimeError("Workspace binding ownership overlaps allocation parking.")
+        self._close_exec("egress allocation is parked for governed adoption")
+        await self._active_workspace_dispatches_drained.wait()
+        process_signal = self._claim_workspace_dispatch_process_signal()
+        if process_signal is not None:
+            raise process_signal from None
+        if self._uncertain_workspace_dispatches:
+            raise RuntimeError("Runner work settlement is ambiguous at the parking boundary.")
+        if self._parked_for_authority_adoption:
+            return
+        task = self._authority_parking_task
+        if task is None:
+            task = asyncio.create_task(
+                self._adapter.park_runner_for_authority_adoption(self._runner),
+                name=f"cayu-egress-authority-park-{self._session_id}",
+            )
+            self._authority_parking_task = task
+        parking = await await_shielded_task_outcome(
+            task,
+            timeout_s=self._teardown_timeout_s,
+        )
+        if parking.timed_out:
+            raise TimeoutError(
+                "Egress allocation parking did not settle within the bounded ownership window."
+            )
+        if parking.error is not None:
+            if parking.cancellation is not None:
+                restore_task_cancellation_requests(
+                    parking.cancellation_requests_consumed,
+                    cancellation=parking.cancellation,
+                )
+                raise parking.cancellation from parking.error
+            raise parking.error
+        result = parking.result
+        if (
+            type(result) is not RunnerFinalizationResult
+            or not result.workspace_mutations_quiescent
+            or not result.allocation_preserved
+        ):
+            raise RuntimeError(
+                "Egress adapter did not prove quiescence and exact allocation preservation."
+            )
+        self._parked_for_authority_adoption = True
+        if parking.cancellation is not None:
+            self._authority_parking_cancellation = parking.cancellation
+            self._authority_parking_cancellation_requests = parking.cancellation_requests_consumed
+
+    def _complete_parked_authority_adoption(self) -> None:
+        """Reopen binding admission only after verified target activation."""
+
+        if not self._parked_for_authority_adoption:
+            return
+        if self._workspace_binding_owners or self._active_workspace_dispatches:
+            raise RuntimeError("Parked allocation retained invocation-owned work.")
+        self._workspace_dispatch_gate_owner = None
+        self._parked_for_authority_adoption = False
+        self._authority_parking_task = None
+
+    def _take_authority_parking_cancellation(
+        self,
+    ) -> tuple[asyncio.CancelledError | None, int]:
+        cancellation = self._authority_parking_cancellation
+        requests = self._authority_parking_cancellation_requests
+        self._authority_parking_cancellation = None
+        self._authority_parking_cancellation_requests = 0
+        return cancellation, requests
+
+    def _retain_authority_parking_cancellation(
+        self,
+        cancellation: asyncio.CancelledError,
+        cancellation_requests_consumed: int,
+    ) -> None:
+        """Transfer caller cancellation to the exact parked-allocation owner."""
+
+        if not self._parked_for_authority_adoption:
+            raise RuntimeError("Caller cancellation cannot outlive an unparked allocation.")
+        if not isinstance(cancellation, asyncio.CancelledError):
+            raise TypeError("Egress parking cancellation must be CancelledError.")
+        if type(cancellation_requests_consumed) is not int or cancellation_requests_consumed < 0:
+            raise ValueError("Egress parking cancellation count must be nonnegative.")
+        if self._authority_parking_cancellation is None:
+            self._authority_parking_cancellation = cancellation
+        self._authority_parking_cancellation_requests += cancellation_requests_consumed
+
     def arm_workspace_mutation_quiescence(self) -> None:
         """Monotonically require quiescence before managed claim release."""
 
@@ -2016,6 +3415,8 @@ class _EgressManagedRunner(Runner):
     def begin_workspace_binding(self) -> None:
         """Fence runner finalization before a binding can mutate its workspace."""
 
+        if self._egress_cutover_active or self._egress_cutover_needs_attention:
+            raise RuntimeError("Managed runner egress-authority cutover blocks workspace binding.")
         if self._finalization_started or self._binding_release_started:
             raise RuntimeError(
                 "Managed runner finalization started before workspace binding admission."
@@ -2088,8 +3489,13 @@ class _EgressManagedRunner(Runner):
     ) -> None:
         if type(require_workspace_mutations_quiescent) is not bool:
             raise TypeError("Managed runner quiescence requirement must be a bool.")
+        if self._egress_cutover_active:
+            raise RuntimeError("Managed runner finalization overlaps egress-authority cutover.")
         self._finalization_started = True
         deadline = asyncio.get_running_loop().time() + self._teardown_timeout_s
+        retained_cutover_failure = await self._settle_retained_egress_cutover_for_finalization(
+            deadline=deadline
+        )
         require_quiescence = (
             self._require_workspace_mutations_quiescent or require_workspace_mutations_quiescent
         )
@@ -2140,7 +3546,10 @@ class _EgressManagedRunner(Runner):
             if self._closed:
                 self._closed = False
             try:
-                await self._finalize_serialized(deadline=deadline)
+                await self._finalize_serialized(
+                    deadline=deadline,
+                    retained_cutover_failure=retained_cutover_failure,
+                )
             except BaseException as error:
                 # Publish predecessor ownership before releasing the lock.
                 # This closes the gap in which another direct finalizer could
@@ -2154,7 +3563,12 @@ class _EgressManagedRunner(Runner):
         finally:
             self._finalize_lock.release()
 
-    async def _finalize_serialized(self, *, deadline: float) -> None:
+    async def _finalize_serialized(
+        self,
+        *,
+        deadline: float,
+        retained_cutover_failure: BaseException | None = None,
+    ) -> None:
         cancellation = (
             asyncio.CancelledError()
             if await self._authority_revoker.revoke(
@@ -2165,6 +3579,8 @@ class _EgressManagedRunner(Runner):
         # Do not release enforcement resources unless revocation completed.
         # A revocation error leaves this runner open for a truthful retry.
         errors: list[tuple[str, BaseException]] = []
+        if retained_cutover_failure is not None:
+            errors.append(("egress authority cutover settlement", retained_cutover_failure))
 
         def record_timeout(phase: str, failure: BaseException) -> None:
             nonlocal cancellation
@@ -2511,6 +3927,94 @@ class _EgressManagedRunner(Runner):
 
     def resolve_cwd(self, cwd: str | None = None) -> str:
         return self._runner.resolve_cwd(cwd)
+
+
+async def require_active_egress_transition_environment(
+    *,
+    environment: Environment,
+    transition: EgressAuthorityTransitionRecord,
+) -> None:
+    """Bind durable activation proof to the environment used by the invocation."""
+
+    if type(environment) is not Environment:
+        raise TypeError("Active egress verification requires an Environment.")
+    if type(transition) is not EgressAuthorityTransitionRecord:
+        raise TypeError("transition must be an EgressAuthorityTransitionRecord.")
+    receipt = transition.receipt
+    if transition.state is not EgressAuthorityTransitionState.ACTIVE or receipt is None:
+        raise EgressAuthorityTransitionConflict(
+            "The invocation environment has no durable active egress receipt."
+        )
+    managed = environment.runner
+    if not isinstance(managed, _EgressManagedRunner):
+        raise EgressAuthorityTransitionConflict(
+            "The activated egress profile resolved a non-managed invocation environment."
+        )
+    if (
+        managed._session_id != transition.session_id
+        or managed._environment_name != transition.environment_name
+        or managed._environment_fingerprint != receipt.environment_fingerprint
+        or managed._adapter.runner_kind != transition.target_authority.runner_kind
+        or managed._egress_binding.authority_fingerprint != transition.target_authority.fingerprint
+        or managed._egress_binding.authority_generation != transition.target_authority.generation
+    ):
+        raise EgressAuthorityTransitionConflict(
+            "The invocation environment does not match the durable active egress receipt."
+        )
+    observed_environment_fingerprint = await managed._adapter.egress_environment_fingerprint(
+        managed._runner
+    )
+    if observed_environment_fingerprint != receipt.environment_fingerprint:
+        raise EgressAuthorityTransitionConflict(
+            "The invocation backend allocation does not match the durable active egress receipt."
+        )
+
+
+async def reactivate_parked_egress_environment(
+    *,
+    factory_result: EnvironmentFactoryResult,
+    factory: EnvironmentFactory,
+    expected_authority: EgressAuthorityIdentity,
+    session_id: str,
+    environment_name: str,
+    agent_name: str,
+    execution_profile_fingerprint: str | None,
+) -> None:
+    """Renew and reopen an exact parked allocation without changing its identity."""
+
+    if type(factory_result) is not EnvironmentFactoryResult:
+        raise TypeError("Parked egress reuse requires an EnvironmentFactoryResult.")
+    if type(expected_authority) is not EgressAuthorityIdentity:
+        raise TypeError("Parked egress reuse requires an EgressAuthorityIdentity.")
+    if not isinstance(factory, VirtualEgressEnvironmentFactory):
+        raise EgressAuthorityTransitionConflict(
+            "Parked egress reuse requires its registered virtual-egress factory."
+        )
+    managed = factory_result.environment.runner
+    if not isinstance(managed, _EgressManagedRunner):
+        raise EgressAuthorityTransitionConflict(
+            "The parked invocation environment is not a Cayu-managed runner."
+        )
+    if not managed.is_parked_for_authority_adoption:
+        raise EgressAuthorityTransitionConflict(
+            "The retained invocation environment is no longer parked."
+        )
+    if (
+        managed._adapter.runner_kind != expected_authority.runner_kind
+        or managed._egress_binding.authority_fingerprint != expected_authority.fingerprint
+        or managed._egress_binding.authority_generation != expected_authority.generation
+    ):
+        raise EgressAuthorityTransitionConflict(
+            "The parked invocation environment has a different egress authority."
+        )
+    await factory.renew_parked_authority(
+        factory_result=factory_result,
+        expected_authority=expected_authority,
+        session_id=session_id,
+        environment_name=environment_name,
+        agent_name=agent_name,
+        execution_profile_fingerprint=execution_profile_fingerprint,
+    )
 
 
 class _EgressAuditBridge:
@@ -2905,6 +4409,7 @@ class _EgressTeardownBinding(WorkspaceBinding):
         inner_error: BaseException | None = None
         revoke_cancelled = False
         dispatch_cancellation: asyncio.CancelledError | None = None
+        parking_requested = outcome == _EGRESS_AUTHORITY_PARKED_OUTCOME
         requires_mutation_quiescence = self._inner._requires_mutation_quiescence(bound)
         runner_bound_target = isinstance(
             bound.workspace, RunnerBoundWorkspace
@@ -3033,14 +4538,23 @@ class _EgressTeardownBinding(WorkspaceBinding):
                 # is suspended or a terminal MicroVM is terminated.
                 await self._close_resources(
                     outcome=outcome,
-                    require_workspace_mutations_quiescent=requires_mutation_quiescence,
+                    require_workspace_mutations_quiescent=(
+                        requires_mutation_quiescence or parking_requested
+                    ),
                     workspace_owner_key=(state_key if workspace_owner_active else None),
                 )
-                if not self._runner.is_closed:
+                parked = parking_requested
+                if not self._runner.is_closed and not (
+                    parked and self._runner.is_parked_for_authority_adoption
+                ):
                     raise RuntimeError(
                         "Managed runner remained open after successful finalization."
                     )
-                if requires_mutation_quiescence and not self._runner.workspace_mutations_quiescent:
+                if (
+                    requires_mutation_quiescence
+                    and not self._runner.workspace_mutations_quiescent
+                    and not (parked and self._runner.is_parked_for_authority_adoption)
+                ):
                     raise RuntimeError(
                         "Managed runner closed without proving workspace mutation quiescence."
                     )
@@ -3072,7 +4586,9 @@ class _EgressTeardownBinding(WorkspaceBinding):
         diagnostic_fatal: BaseException | None = None
         if not finalization_state.diagnostics_completed:
             try:
-                if await _await_cleanup(self._drain_audit()):
+                if parking_requested and self._runner.is_parked_for_authority_adoption:
+                    await self._await_parking_cleanup(self._drain_audit())
+                elif await _await_cleanup(self._drain_audit()):
                     diagnostic_cancellation = asyncio.CancelledError()
             except asyncio.CancelledError as cancellation:
                 diagnostic_cancellation = cancellation
@@ -3088,7 +4604,9 @@ class _EgressTeardownBinding(WorkspaceBinding):
                 diagnostic_fatal = fatal_signal
             if diagnostic_fatal is None:
                 try:
-                    if (
+                    if parking_requested and self._runner.is_parked_for_authority_adoption:
+                        await self._await_parking_cleanup(self._emit_revoked())
+                    elif (
                         await _await_cleanup(self._emit_revoked())
                         and diagnostic_cancellation is None
                     ):
@@ -3211,11 +4729,12 @@ class _EgressTeardownBinding(WorkspaceBinding):
         # Releasing the workspace generation then would let that old guest race
         # a new owner. Keep the inner reservation fail-closed until runner
         # finalization positively reaches its terminal boundary.
-        if not self._runner.is_closed:
+        if not (self._runner.is_closed or self._runner.is_parked_for_authority_adoption):
             return False
         if (
             self._inner._requires_mutation_quiescence(bound)
             and not self._runner.workspace_mutations_quiescent
+            and not self._runner.is_parked_for_authority_adoption
         ):
             return False
         state_key = bound.state_key or f"bound:{id(bound)}"
@@ -3237,15 +4756,47 @@ class _EgressTeardownBinding(WorkspaceBinding):
         require_workspace_mutations_quiescent: bool = False,
         workspace_owner_key: str | None = None,
     ) -> None:
-        cancelled = await _await_cleanup(
-            self._runner.finalize_for_binding(
+        async def finalize_runner() -> None:
+            await self._runner.finalize_for_binding(
                 outcome=outcome,
                 require_workspace_mutations_quiescent=(require_workspace_mutations_quiescent),
                 workspace_owner_key=workspace_owner_key,
             )
-        )
+
+        if outcome == _EGRESS_AUTHORITY_PARKED_OUTCOME:
+            # Parking transfers the exact live allocation to the adoption
+            # registry.  Keep caller cancellation owned while that transfer
+            # crosses the nested runner-finalization task; re-raising it here
+            # would erase the consumed-request provenance and make the outer
+            # extension boundary classify it as child cancellation.
+            await self._await_parking_cleanup(
+                finalize_runner(),
+                task_name=f"cayu-egress-binding-park-{self._session_id}",
+            )
+            return
+
+        cancelled = await _await_cleanup(finalize_runner())
         if cancelled:
             raise asyncio.CancelledError()
+
+    async def _await_parking_cleanup(
+        self,
+        awaitable: Awaitable[None],
+        *,
+        task_name: str = "cayu-egress-post-park-cleanup",
+    ) -> None:
+        """Settle one parking phase and retain caller cancellation as handoff data."""
+
+        async def run() -> None:
+            await awaitable
+
+        outcome = await await_shielded_task_outcome(asyncio.create_task(run(), name=task_name))
+        _raise_cleanup_task_outcome(outcome)
+        if outcome.cancellation is not None:
+            self._runner._retain_authority_parking_cancellation(
+                outcome.cancellation,
+                outcome.cancellation_requests_consumed,
+            )
 
     async def _drain_audit(self) -> None:
         if self._audit is None:

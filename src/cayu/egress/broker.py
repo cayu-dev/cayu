@@ -35,7 +35,7 @@ from cayu.egress.destinations import (
     validate_approved_destinations,
 )
 from cayu.egress.errors import VirtualCredentialError
-from cayu.egress.grants import VirtualCredentialRegistry
+from cayu.egress.grants import VirtualCredentialGrant, VirtualCredentialRegistry
 from cayu.egress.policy import BrowserEgressPolicy, EgressPolicy, EgressRequest
 from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretResolver, validate_secret_resolver
 
@@ -557,6 +557,22 @@ class TransparentEgressBroker:
         virtual_drain = asyncio.create_task(self._registry.revoke_values_and_wait(presented_values))
         await asyncio.gather(virtual_drain, self._credentialless_idle.wait())
         return virtual_drain.result()
+
+    def renew_authority(self, grants: Sequence[VirtualCredentialGrant]) -> None:
+        """Install fresh virtual values and reopen unchanged credentialless routes."""
+
+        if self._credentialless_authority_active:
+            raise RuntimeError("Egress authority must be revoked before it can be renewed.")
+        bound_values: list[str] = []
+        try:
+            for grant in grants:
+                self._registry.bind(grant)
+                bound_values.append(grant.presented_value)
+        except BaseException:
+            for value in bound_values:
+                self._registry.revoke(value)
+            raise
+        self._credentialless_authority_active = True
 
     async def _handle_credentialless(self, request: CapturedRequest) -> CapturedResponse:
         destination = self._credentialless_destination(request)

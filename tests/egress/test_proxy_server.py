@@ -6,6 +6,7 @@ import os
 import socket
 import ssl
 import tempfile
+import threading
 from datetime import timedelta
 from typing import Any
 
@@ -136,6 +137,82 @@ def test_tls_interception_swaps_credential_and_captures_traffic() -> None:
     assert upstream.sent.headers["Authorization"] == f"Bearer {REAL_SECRET}"
     # The sandbox-facing response carries no real secret.
     assert REAL_SECRET not in response.text
+
+
+def test_proxy_close_terminates_connection_established_before_authority_cutover() -> None:
+    async def run() -> None:
+        broker, _registry = _broker(_CapturingUpstream())
+        server = TransparentEgressProxyServer(broker, loop=asyncio.get_running_loop())
+        port = await server.start()
+        stale = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+        try:
+            for _ in range(100):
+                with server._connections_lock:
+                    if server._connections:
+                        break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("Proxy did not accept the stale test connection.")
+            await asyncio.wait_for(server.close(), timeout=2.0)
+            stale.settimeout(1.0)
+            try:
+                stale_result = stale.recv(1)
+            except OSError:
+                stale_result = b""
+            assert stale_result == b""
+        finally:
+            stale.close()
+
+    asyncio.run(run())
+
+
+def test_proxy_close_terminates_completed_tls_connection_without_blocking_loop() -> None:
+    async def run() -> None:
+        broker, _registry = _broker(_CapturingUpstream())
+        server = TransparentEgressProxyServer(broker, loop=asyncio.get_running_loop())
+        port = await server.start()
+        tls_connected = threading.Event()
+
+        def hold_tls_connection() -> bool:
+            raw = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+            try:
+                raw.sendall(
+                    b"CONNECT api.stripe.com:443 HTTP/1.1\r\nHost: api.stripe.com:443\r\n\r\n"
+                )
+                assert raw.recv(1024).startswith(b"HTTP/1.1 200 Connection Established")
+                context = ssl._create_unverified_context()
+                with context.wrap_socket(raw, server_hostname="api.stripe.com") as tls:
+                    tls_connected.set()
+                    tls.settimeout(2.0)
+                    try:
+                        return tls.recv(1) == b""
+                    except OSError:
+                        return True
+            finally:
+                raw.close()
+
+        client_task = asyncio.create_task(asyncio.to_thread(hold_tls_connection))
+        try:
+            assert await asyncio.to_thread(tls_connected.wait, 2.0)
+            for _ in range(100):
+                with server._connections_lock:
+                    if any(isinstance(item, ssl.SSLSocket) for item in server._connections):
+                        break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("Proxy did not track the completed TLS connection.")
+
+            heartbeat = asyncio.create_task(asyncio.sleep(0.01))
+            await asyncio.wait_for(server.close(), timeout=1.0)
+            await asyncio.wait_for(heartbeat, timeout=0.1)
+            assert await asyncio.wait_for(client_task, timeout=1.0)
+        finally:
+            if not client_task.done():
+                client_task.cancel()
+            if server._sockets:
+                await server.close()
+
+    asyncio.run(run())
 
 
 def test_proxy_leaf_certificate_uses_standards_compliant_validity_window() -> None:

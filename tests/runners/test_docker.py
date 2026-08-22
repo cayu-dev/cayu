@@ -64,6 +64,43 @@ def test_docker_runner_declares_browser_workload_only_for_exact_image() -> None:
     assert overlaid.output_secret_values_present() is True
 
 
+def test_docker_egress_cutover_fence_terminates_detached_guest_work(monkeypatch) -> None:
+    issued: list[list[str]] = []
+
+    async def fake_run_subprocess(command, **kwargs):
+        del kwargs
+        issued.append(command.argv)
+        return ExecResult()
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    runner = DockerRunner("agent", docker_path="/usr/bin/docker")
+
+    asyncio.run(runner.fence_guest_processes_for_egress_cutover())
+
+    assert issued[0][:7] == [
+        "/usr/bin/docker",
+        "exec",
+        "-u",
+        "root",
+        "agent",
+        "python3",
+        "-c",
+    ]
+    assert 'os.listdir("/proc")' in issued[0][7]
+
+
+def test_docker_egress_cutover_fence_fails_closed(monkeypatch) -> None:
+    async def fake_run_subprocess(command, **kwargs):
+        del command, kwargs
+        return ExecResult(exit_code=70)
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    runner = DockerRunner("agent", docker_path="/usr/bin/docker")
+
+    with pytest.raises(RuntimeError, match="could not be fenced"):
+        asyncio.run(runner.fence_guest_processes_for_egress_cutover())
+
+
 def test_docker_cli_helper_environment_is_operationally_allowlisted(monkeypatch):
     provider_canaries = {
         "OPENAI_API_KEY": "provider-openai-canary-0123456789",

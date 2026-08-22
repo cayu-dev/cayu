@@ -523,7 +523,7 @@ def test_binding_cannot_switch_the_admitted_execution_candidate() -> None:
     finalize_started = next(
         event for event in events if event.type is EventType.ENVIRONMENT_BINDING_FINALIZE_STARTED
     )
-    assert finalize_started.payload["outcome"] == "interrupted"
+    assert finalize_started.payload["outcome"] == "failed"
     assert finalize_started.payload["terminal_outcome"] == "failed"
     assert finalize_started.payload["factory_allocation_action"] == "preserve"
     failed = next(event for event in events if event.type is EventType.SESSION_FAILED)

@@ -150,13 +150,20 @@ import stat
 
 path = os.environ["CAYU_PROTECTED_PATH"]
 mode = int(os.environ["CAYU_PROTECTED_MODE"], 8)
+allow_existing_exact = os.environ.get("CAYU_PROTECTED_ALLOW_EXISTING_EXACT") == "1"
 parts = [part for part in path.split("/") if part]
 current = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
 try:
     for index, part in enumerate(parts):
         final = index == len(parts) - 1
+        created = False
         if final:
-            os.mkdir(part, mode, dir_fd=current)
+            try:
+                os.mkdir(part, mode, dir_fd=current)
+                created = True
+            except FileExistsError:
+                if not allow_existing_exact:
+                    raise
             child = os.open(
                 part,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -180,8 +187,11 @@ try:
         if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
             raise PermissionError("protected path has a guest-writable or non-root ancestor")
         if final:
-            os.fchown(child, 0, 0)
-            os.fchmod(child, mode)
+            if created:
+                os.fchown(child, 0, 0)
+                os.fchmod(child, mode)
+            elif stat.S_IMODE(info.st_mode) != mode:
+                raise PermissionError("existing protected directory metadata differs")
         os.close(current)
         current = child
 finally:
@@ -195,6 +205,7 @@ import stat
 path = os.environ["CAYU_PROTECTED_PATH"]
 stage = os.environ["CAYU_PROTECTED_STAGE"]
 mode = int(os.environ["CAYU_PROTECTED_MODE"], 8)
+allow_existing_exact = os.environ.get("CAYU_PROTECTED_ALLOW_EXISTING_EXACT") == "1"
 parts = [part for part in path.split("/") if part]
 current = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
 try:
@@ -219,23 +230,47 @@ try:
         current = child
     source = os.open(stage, os.O_RDONLY | os.O_NOFOLLOW)
     try:
-        target = os.open(
-            parts[-1],
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            mode,
-            dir_fd=current,
-        )
         try:
-            while chunk := os.read(source, 1024 * 1024):
-                view = memoryview(chunk)
-                while view:
-                    written = os.write(target, view)
-                    view = view[written:]
-            os.fchown(target, 0, 0)
-            os.fchmod(target, mode)
-            os.fsync(target)
-        finally:
-            os.close(target)
+            target = os.open(
+                parts[-1],
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                mode,
+                dir_fd=current,
+            )
+        except FileExistsError:
+            if not allow_existing_exact:
+                raise
+            target = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current)
+            try:
+                info = os.fstat(target)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != 0
+                    or stat.S_IMODE(info.st_mode) != mode
+                    or info.st_nlink != 1
+                ):
+                    raise PermissionError("existing protected file metadata differs")
+                while True:
+                    source_chunk = os.read(source, 1024 * 1024)
+                    target_chunk = os.read(target, 1024 * 1024)
+                    if source_chunk != target_chunk:
+                        raise PermissionError("existing protected file content differs")
+                    if not source_chunk:
+                        break
+            finally:
+                os.close(target)
+        else:
+            try:
+                while chunk := os.read(source, 1024 * 1024):
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(target, view)
+                        view = view[written:]
+                os.fchown(target, 0, 0)
+                os.fchmod(target, mode)
+                os.fsync(target)
+            finally:
+                os.close(target)
     finally:
         os.close(source)
 finally:
@@ -317,6 +352,7 @@ class E2BGuestProvisioner:
         guest_user: str,
         operation_timeout_s: float,
         max_file_bytes: int,
+        allow_existing_exact: bool = False,
         _construction_token: object | None = None,
     ) -> None:
         if _construction_token is not _E2B_PROVISIONER_CONSTRUCTION_TOKEN:
@@ -326,6 +362,7 @@ class E2BGuestProvisioner:
         self._guest_user = guest_user
         self._operation_timeout_s = operation_timeout_s
         self._max_file_bytes = max_file_bytes
+        self._allow_existing_exact = allow_existing_exact
         self._lock = asyncio.Lock()
         self._sealed = False
         self._assets: list[_E2BProtectedAsset] = []
@@ -340,6 +377,7 @@ class E2BGuestProvisioner:
         guest_user: str,
         operation_timeout_s: float,
         max_file_bytes: int,
+        allow_existing_exact: bool = False,
     ) -> E2BGuestProvisioner:
         return cls(
             sandbox,
@@ -347,6 +385,7 @@ class E2BGuestProvisioner:
             guest_user=guest_user,
             operation_timeout_s=operation_timeout_s,
             max_file_bytes=max_file_bytes,
+            allow_existing_exact=allow_existing_exact,
             _construction_token=_E2B_PROVISIONER_CONSTRUCTION_TOKEN,
         )
 
@@ -373,6 +412,9 @@ class E2BGuestProvisioner:
                     envs=_handoff_command_env(
                         CAYU_PROTECTED_PATH=protected_path,
                         CAYU_PROTECTED_MODE=f"{protected_mode:o}",
+                        CAYU_PROTECTED_ALLOW_EXISTING_EXACT=(
+                            "1" if self._allow_existing_exact else "0"
+                        ),
                     ),
                     timeout=self._operation_timeout_s,
                 ),
@@ -448,6 +490,9 @@ class E2BGuestProvisioner:
                         CAYU_PROTECTED_PATH=protected_path,
                         CAYU_PROTECTED_STAGE=stage_path,
                         CAYU_PROTECTED_MODE=f"{protected_mode:o}",
+                        CAYU_PROTECTED_ALLOW_EXISTING_EXACT=(
+                            "1" if self._allow_existing_exact else "0"
+                        ),
                     ),
                     timeout=self._operation_timeout_s,
                 ),
@@ -742,6 +787,7 @@ class E2BRunner(Runner):
         bootstrap: Callable[[E2BGuestProvisioner], Awaitable[None]] | None = None,
         guest_setup: Callable[[E2BRunner], Awaitable[None]] | None = None,
         guest_probe: Callable[[E2BRunner], Awaitable[None]] | None = None,
+        handoff_id: str | None = None,
         e2b_module: ModuleType | Any | None = None,
         **api_options: Any,
     ) -> E2BRunner:
@@ -788,8 +834,12 @@ class E2BRunner(Runner):
         supplied_metadata = _copy_string_dict(metadata, "metadata") or {}
         if _E2B_GUEST_HANDOFF_METADATA_KEY in supplied_metadata:
             raise ValueError(f"E2B metadata key {_E2B_GUEST_HANDOFF_METADATA_KEY!r} is Cayu-owned.")
-        handoff_id = uuid4().hex
-        supplied_metadata[_E2B_GUEST_HANDOFF_METADATA_KEY] = handoff_id
+        resolved_handoff_id = (
+            uuid4().hex
+            if handoff_id is None
+            else require_durable_clean_nonblank(handoff_id, "handoff_id")
+        )
+        supplied_metadata[_E2B_GUEST_HANDOFF_METADATA_KEY] = resolved_handoff_id
         module = _e2b_module(e2b_module)
         connection_options = {
             key: value for key, value in api_options.items() if key in _E2B_CONNECTION_OPTION_KEYS
@@ -896,7 +946,7 @@ class E2BRunner(Runner):
 
         handoff_task = asyncio.create_task(
             perform_handoff(),
-            name=f"cayu-e2b-handoff-{handoff_id}",
+            name=f"cayu-e2b-handoff-{resolved_handoff_id}",
         )
         try:
             done, _ = await asyncio.wait({handoff_task}, timeout=handoff_timeout)
@@ -930,13 +980,127 @@ class E2BRunner(Runner):
             await _cleanup_handoff_failure(
                 module=module,
                 runner=runner,
-                handoff_id=handoff_id,
+                handoff_id=resolved_handoff_id,
                 connection_options=connection_options,
                 original_error=failure,
                 timeout_s=cleanup_timeout,
             )
             if failure is not original:
                 raise failure from None
+            raise
+
+    @classmethod
+    async def recover_hardened(
+        cls,
+        handoff_id: str,
+        *,
+        sandbox_timeout_s: int | None = None,
+        default_cwd: str = DEFAULT_E2B_CWD,
+        close_action: E2BCloseAction = "kill",
+        cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
+        cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
+        timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
+        env_overlay: Mapping[str, str] | None = None,
+        guest_user: str = "user",
+        handoff_timeout_s: float = DEFAULT_E2B_HANDOFF_TIMEOUT_SECONDS,
+        cleanup_timeout_s: float = DEFAULT_E2B_HANDOFF_CLEANUP_TIMEOUT_SECONDS,
+        bootstrap: Callable[[E2BGuestProvisioner], Awaitable[None]] | None = None,
+        guest_setup: Callable[[E2BRunner], Awaitable[None]] | None = None,
+        guest_probe: Callable[[E2BRunner], Awaitable[None]] | None = None,
+        e2b_module: ModuleType | Any | None = None,
+        **api_options: Any,
+    ) -> E2BRunner:
+        """Reattach only to the unique sandbox owned by a durable handoff id.
+
+        Recovery never creates.  Absence therefore remains ambiguous instead
+        of authorizing a second provider allocation after acknowledgement loss.
+        """
+
+        resolved_handoff_id = require_durable_clean_nonblank(handoff_id, "handoff_id")
+        resolved_guest = _validate_hardened_guest_user(guest_user)
+        handoff_timeout = _validate_handoff_timeout(handoff_timeout_s, "handoff_timeout_s")
+        _validate_handoff_timeout(cleanup_timeout_s, "cleanup_timeout_s")
+        _validate_handoff_callback(bootstrap, "bootstrap")
+        module = _e2b_module(e2b_module)
+        connection_options = {
+            key: value for key, value in api_options.items() if key in _E2B_CONNECTION_OPTION_KEYS
+        }
+        sandbox_ids = await _handoff_sandbox_ids_by_metadata(
+            module,
+            handoff_id=resolved_handoff_id,
+            connection_options=connection_options,
+        )
+        if len(sandbox_ids) != 1:
+            reason = (
+                "durable allocation is not yet observable"
+                if not sandbox_ids
+                else "durable allocation identity matched multiple sandboxes"
+            )
+            raise E2BGuestHandoffError(phase="verification", reason=reason)
+        runner: E2BRunner | None = None
+        provisioner: E2BGuestProvisioner | None = None
+        try:
+            runner = await cls.from_existing(
+                sandbox_ids[0],
+                sandbox_timeout_s=sandbox_timeout_s,
+                default_cwd=default_cwd,
+                close_action=close_action,
+                cancel_timeout_s=cancel_timeout_s,
+                cancellation_cleanup=cancellation_cleanup,
+                timeout_cleanup=timeout_cleanup,
+                ensure_default_cwd=False,
+                env_overlay=env_overlay,
+                exec_user=resolved_guest,
+                e2b_module=module,
+                **api_options,
+            )
+            runner._hardened_guest_user = resolved_guest
+            await runner.fence_guest_processes_for_egress_cutover()
+            await _run_handoff_command(
+                runner._sandbox.commands.run(
+                    _HARDEN_GUEST_SCRIPT,
+                    user="root",
+                    envs=_handoff_command_env(CAYU_GUEST_USER=resolved_guest),
+                    timeout=handoff_timeout,
+                ),
+                phase="hardening",
+                reason="recovered guest privilege hardening",
+            )
+            provisioner = E2BGuestProvisioner._create(
+                runner._sandbox,
+                default_cwd=runner.default_cwd,
+                guest_user=resolved_guest,
+                operation_timeout_s=handoff_timeout,
+                max_file_bytes=DEFAULT_E2B_PROTECTED_FILE_MAX_BYTES,
+                allow_existing_exact=True,
+            )
+            if bootstrap is not None:
+                await bootstrap(provisioner)
+            protected_assets = await provisioner._seal()
+            await _verify_guest_handoff(
+                runner,
+                protected_assets=protected_assets,
+                timeout_s=handoff_timeout,
+            )
+            if guest_setup is not None:
+                await guest_setup(runner)
+            if guest_probe is not None:
+                await guest_probe(runner)
+            await _verify_guest_handoff(
+                runner,
+                protected_assets=protected_assets,
+                timeout_s=handoff_timeout,
+            )
+            return runner
+        except BaseException:
+            if provisioner is not None:
+                provisioner._invalidate()
+            if runner is not None:
+                # Recovery owns only a reconnectable local capability. Keep the
+                # exact provider allocation intact when re-hardening or
+                # verification cannot be proven; the durable DISPATCHED intent
+                # remains the sole retry owner.
+                runner._closed = True
             raise
 
     @classmethod
@@ -1019,6 +1183,15 @@ class E2BRunner(Runner):
             return
         raise AssertionError(f"Unsupported E2B close action: {self.close_action}")
 
+    async def detach_preserving_allocation(self) -> None:
+        """Close this local capability without deleting the provider sandbox."""
+
+        if self._closed:
+            return
+        if not await self.await_pending_command_settlement():
+            raise RuntimeError("E2B command settlement is uncertain at allocation detach.")
+        self._closed = True
+
     async def await_pending_command_settlement(self) -> bool:
         """Wait for every deferred late-start cleanup known to this runner."""
 
@@ -1031,6 +1204,37 @@ class E2BRunner(Runner):
             if any(result is not True for result in results):
                 self._command_settlement_uncertain = True
         return not self._command_settlement_uncertain
+
+    async def fence_guest_processes_for_egress_cutover(self) -> None:
+        """Terminate guest-owned processes while preserving sandbox/workspace identity."""
+
+        self._ensure_exec_open()
+        if self._hardened_guest_user is None:
+            raise RuntimeError("E2B egress cutover requires a hardened guest handoff.")
+        if not await self.await_pending_command_settlement():
+            raise RuntimeError("E2B command settlement is uncertain at egress cutover.")
+        guest_user = shlex.quote(self._hardened_guest_user)
+        result = await self._sandbox.commands.run(
+            "if ! command -v pkill >/dev/null 2>&1 "
+            "|| ! command -v pgrep >/dev/null 2>&1; then exit 127; fi; "
+            f"pkill -KILL -u {guest_user} 2>/dev/null; kill_status=$?; "
+            'if [ "$kill_status" -gt 1 ]; then exit "$kill_status"; fi; '
+            f'remaining="$(pgrep -u {guest_user} 2>/dev/null)"; probe_status=$?; '
+            'if [ "$probe_status" -gt 1 ]; then exit "$probe_status"; fi; '
+            'test "$probe_status" -eq 1 || test -z "$remaining"',
+            cwd="/",
+            user="root",
+            envs=_handoff_command_env(),
+            timeout=DEFAULT_E2B_HANDOFF_TIMEOUT_SECONDS,
+        )
+        if result.exit_code != 0:
+            raise RuntimeError("E2B guest processes could not be fenced for egress cutover.")
+
+    async def update_egress_network(self, network: Any) -> None:
+        """Replace the running sandbox network through E2B's control plane."""
+
+        self._ensure_exec_open()
+        await self._sandbox.update_network(network)
 
     def reopen_exec(self) -> None:
         """Accept an operator's positive proof that no deferred command remains."""
@@ -2040,6 +2244,32 @@ async def _kill_handoff_sandboxes_by_metadata(
         if sleep_seconds <= 0:
             raise TimeoutError("E2B guest handoff allocation reconciliation remained ambiguous.")
         await asyncio.sleep(sleep_seconds)
+
+
+async def _handoff_sandbox_ids_by_metadata(
+    module: ModuleType | Any,
+    *,
+    handoff_id: str,
+    connection_options: Mapping[str, Any],
+) -> list[str]:
+    """Read the complete provider-owned match set for one durable handoff."""
+
+    query = module.SandboxQuery(
+        metadata={_E2B_GUEST_HANDOFF_METADATA_KEY: handoff_id},
+    )
+    paginator = module.AsyncSandbox.list(
+        query=query,
+        limit=100,
+        **dict(connection_options),
+    )
+    matching_ids: list[str] = []
+    while paginator.has_next:
+        for sandbox in await paginator.next_items():
+            sandbox_id = getattr(sandbox, "sandbox_id", None)
+            if type(sandbox_id) is not str:
+                raise RuntimeError("E2B sandbox list returned an invalid sandbox id.")
+            matching_ids.append(_validate_sandbox_id(sandbox_id))
+    return sorted(matching_ids)
 
 
 def _contains_cancellation(error: BaseException) -> bool:

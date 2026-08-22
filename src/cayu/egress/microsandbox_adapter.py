@@ -38,6 +38,7 @@ from cayu.egress.adapter import (
     _raise_primary_with_cleanup_cancellation,
     _virtual_egress_execution_capability_evidence,
 )
+from cayu.egress.authority import EgressAuthorityCutoverStrategy
 from cayu.egress.broker import TransparentEgressBroker
 from cayu.egress.errors import (
     EgressReconnectConflictError,
@@ -174,6 +175,7 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
 
     runner_kind = "microsandbox"
     process_external_allocation = True
+    egress_authority_cutover_strategy = EgressAuthorityCutoverStrategy.ALLOCATION_REPLACEMENT
     supports_reconnect = True
 
     def execution_capability_evidence(

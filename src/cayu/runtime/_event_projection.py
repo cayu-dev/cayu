@@ -27,6 +27,11 @@ from cayu.core.tools import (
     ToolEffect,
 )
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
+from cayu.egress.authority import (
+    EgressAuthorityChangeKind,
+    EgressAuthorityCutoverStrategy,
+    EgressAuthorityTransitionState,
+)
 from cayu.providers.base import ModelFinishReason
 from cayu.providers.operations import ProviderOperationStatus
 from cayu.runtime import _tool_argument_publication as tool_argument_publication
@@ -37,6 +42,7 @@ from cayu.runtime._web_access_results import (
     WEB_ACCESS_RESULT_EVENT_SCHEMA_PATHS,
     restore_attested_event_result,
 )
+from cayu.runtime.approvals import ResolutionActorSource
 from cayu.runtime.model_steps import StepClassificationType
 from cayu.runtime.provider_operations import (
     ProviderOperationResolutionAction,
@@ -430,10 +436,59 @@ _PROVIDER_OPERATION_RECOVERY_STATUS_VALUES = (
 _PROVIDER_OPERATION_RESOLUTION_ACTION_VALUES = frozenset(
     action.value for action in ProviderOperationResolutionAction
 )
+_EGRESS_AUTHORITY_CHANGE_VALUES = frozenset(item.value for item in EgressAuthorityChangeKind)
+_EGRESS_AUTHORITY_STRATEGY_VALUES = frozenset(item.value for item in EgressAuthorityCutoverStrategy)
+_EGRESS_AUTHORITY_POLICY_KIND_VALUES = frozenset({"http", "browser", "opaque"})
+_EGRESS_AUTHORITY_OPERATION_MATCH_VALUES = frozenset({"exact", "prefix"})
+_RESOLUTION_ACTOR_SOURCE_VALUES = frozenset(item.value for item in ResolutionActorSource)
+_EGRESS_AUTHORITY_EVENT_STATES = {
+    EventType.EGRESS_AUTHORITY_REQUESTED: EgressAuthorityTransitionState.AUTHORIZED.value,
+    EventType.EGRESS_AUTHORITY_AUTHORIZED: EgressAuthorityTransitionState.AUTHORIZED.value,
+    EventType.EGRESS_AUTHORITY_INSTALLING: EgressAuthorityTransitionState.INSTALLING.value,
+    EventType.EGRESS_AUTHORITY_ACTIVATED: EgressAuthorityTransitionState.ACTIVE.value,
+    EventType.EGRESS_AUTHORITY_REFUSED: EgressAuthorityTransitionState.REFUSED.value,
+    EventType.EGRESS_AUTHORITY_AMBIGUOUS: EgressAuthorityTransitionState.AMBIGUOUS.value,
+}
+_EGRESS_AUTHORITY_EVENT_TYPES = frozenset(_EGRESS_AUTHORITY_EVENT_STATES)
 _DECLARED_FIXED_CONTROLS: Mapping[
     EventType,
     Mapping[tuple[str, ...], frozenset[Any]],
 ] = {
+    **{
+        event_type: {
+            ("schema_version",): frozenset({3}),
+            ("state",): frozenset({_EGRESS_AUTHORITY_EVENT_STATES[event_type]}),
+            ("classification",): _EGRESS_AUTHORITY_CHANGE_VALUES,
+            ("adapter_strategy",): _EGRESS_AUTHORITY_STRATEGY_VALUES,
+            ("actor", "source"): _RESOLUTION_ACTOR_SOURCE_VALUES,
+            ("from_authority", "schema_version"): frozenset({1}),
+            ("from_authority", "cutover_strategy"): _EGRESS_AUTHORITY_STRATEGY_VALUES,
+            ("from_authority", "comparison_available"): frozenset({True, False}),
+            ("from_authority", "policies", "*", "kind"): (_EGRESS_AUTHORITY_POLICY_KIND_VALUES),
+            ("from_authority", "policies", "*", "comparison_available"): frozenset({True, False}),
+            ("from_authority", "policies", "*", "operations", "*", "match"): (
+                _EGRESS_AUTHORITY_OPERATION_MATCH_VALUES
+            ),
+            ("to_authority", "schema_version"): frozenset({1}),
+            ("to_authority", "cutover_strategy"): _EGRESS_AUTHORITY_STRATEGY_VALUES,
+            ("to_authority", "comparison_available"): frozenset({True, False}),
+            ("to_authority", "policies", "*", "kind"): (_EGRESS_AUTHORITY_POLICY_KIND_VALUES),
+            ("to_authority", "policies", "*", "comparison_available"): frozenset({True, False}),
+            ("to_authority", "policies", "*", "operations", "*", "match"): (
+                _EGRESS_AUTHORITY_OPERATION_MATCH_VALUES
+            ),
+            ("receipt", "record_type"): frozenset({"cayu.egress-authority-cutover"}),
+            ("receipt", "schema_version"): frozenset({1}),
+            ("receipt", "state"): frozenset({EgressAuthorityTransitionState.ACTIVE.value}),
+            ("receipt", "strategy"): _EGRESS_AUTHORITY_STRATEGY_VALUES,
+            ("receipt", "same_allocation"): frozenset({True}),
+            ("receipt", "workspace_continuity_verified"): frozenset({True}),
+            ("receipt", "old_authority_revoked"): frozenset({True}),
+            ("receipt", "old_path_closed"): frozenset({True}),
+            ("receipt", "backend_verified"): frozenset({True}),
+        }
+        for event_type in _EGRESS_AUTHORITY_EVENT_TYPES
+    },
     EventType.SESSION_FORKED: {
         ("execution_profile_selection",): frozenset({"inherit_parent", "current_child"}),
         ("source_status",): _SESSION_STATUS_VALUES,
@@ -645,7 +700,7 @@ _DECLARED_FIXED_CONTROLS: Mapping[
         event_type: {
             ("outcome",): frozenset({"completed", "failed", "interrupted"}),
             ("terminal_outcome",): frozenset({"completed", "failed", "interrupted"}),
-            ("factory_allocation_action",): frozenset({"preserve"}),
+            ("factory_allocation_action",): frozenset({"park", "preserve"}),
             ("final_revision", "status"): _WORKSPACE_OBSERVATION_STATUS_VALUES,
             (
                 "final_revision",
@@ -1406,6 +1461,85 @@ def _resolution_actor_nested_paths(*container_names: str) -> frozenset[tuple[str
     )
 
 
+def _egress_authority_event_nested_paths() -> frozenset[tuple[str, ...]]:
+    """Return every schema-owned path in bounded transition evidence."""
+
+    paths: set[tuple[str, ...]] = set()
+    for container_name in ("from_authority", "to_authority"):
+        paths.update(
+            (container_name, field_name)
+            for field_name in {
+                "schema_version",
+                "generation",
+                "fingerprint",
+                "authority_source",
+                "authority_scope",
+                "policy_version",
+                "runner_kind",
+                "cutover_strategy",
+                "comparison_available",
+                "policies",
+                "bindings",
+            }
+        )
+        paths.update(
+            (container_name, "policies", "*", field_name)
+            for field_name in {
+                "name",
+                "kind",
+                "allowed_destinations",
+                "operations",
+                "denied_path_prefixes",
+                "comparison_available",
+            }
+        )
+        paths.update(
+            {
+                (container_name, "policies", "*", "allowed_destinations", "*"),
+                (container_name, "policies", "*", "denied_path_prefixes", "*"),
+            }
+        )
+        paths.update(
+            (container_name, "policies", "*", "operations", "*", field_name)
+            for field_name in {"method", "path", "match"}
+        )
+        paths.update(
+            (container_name, "bindings", "*", field_name)
+            for field_name in {
+                "destination",
+                "policy_name",
+                "credential_kind",
+                "credential_authority_fingerprint",
+            }
+        )
+    paths.update(("actor", field_name) for field_name in _RESOLUTION_ACTOR_NESTED_FIELD_NAMES)
+    paths.update(
+        ("receipt", field_name)
+        for field_name in {
+            "record_type",
+            "schema_version",
+            "state",
+            "from_fingerprint",
+            "to_fingerprint",
+            "from_generation",
+            "to_generation",
+            "runner_kind",
+            "strategy",
+            "environment_fingerprint",
+            "same_allocation",
+            "workspace_continuity_verified",
+            "old_authority_revoked",
+            "old_path_closed",
+            "backend_verified",
+            "fingerprint",
+        }
+    )
+    return frozenset(paths)
+
+
+_EGRESS_AUTHORITY_EVENT_NESTED_PATHS = _egress_authority_event_nested_paths()
+
+
 def public_event_id(sequence: int) -> str:
     if type(sequence) is not int or not 1 <= sequence <= MAX_DURABLE_JSON_INTEGER:
         raise ValueError(f"sequence must be an integer between 1 and {MAX_DURABLE_JSON_INTEGER}.")
@@ -1580,6 +1714,22 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     """
 
     policies = {event_type: _policy() for event_type in EventType}
+
+    egress_authority_transition = _observed_policy(
+        "adapter_strategy actor authorization_reason classification environment_fingerprint "
+        "from_authority policy_identity reason receipt revision schema_version state "
+        "source_environment_fingerprint to_authority transition_fingerprint transition_id",
+        owned_nested_paths=_EGRESS_AUTHORITY_EVENT_NESTED_PATHS,
+        authority_keys={
+            "environment_fingerprint",
+            "source_environment_fingerprint",
+            "transition_fingerprint",
+            "transition_id",
+        },
+        untrusted_container_keys={"actor", "from_authority", "receipt", "to_authority"},
+    )
+    for event_type in _EGRESS_AUTHORITY_EVENT_TYPES:
+        policies[event_type] = egress_authority_transition
 
     interaction_summary = _policy(
         "active_duration_ms",
@@ -2954,6 +3104,9 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "allocation_id causal_budget_id durable_value_error_code durable_value_error_path "
         "environment_factory_release environment_name error error_type execution_profile_fingerprint factory_type labels "
         "parent_session_id reconnect_metadata requested_environment_name result_metadata",
+        owned_nested_paths={
+            ("reconnect_metadata", "allocation_fingerprint"),
+        },
         authority_keys={"execution_profile_fingerprint"},
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
         untrusted_container_keys={
@@ -3671,6 +3824,7 @@ def _restore_publication_safe_execution_profile_decision(
         "candidate_profile",
         "changed_component_classes",
         "decision",
+        "egress_authority_change",
         "expected_profile",
     }
     # A store may still expose the older fingerprint-only rejection shape. It
@@ -3695,6 +3849,7 @@ def _restore_publication_safe_execution_profile_decision(
             policy_identity=payload["policy_identity"],
             policy_reason=payload["policy_reason"],
             authority_decision=payload["authority_decision"],
+            egress_authority_change=payload.get("egress_authority_change"),
             idempotency_identity=payload["idempotency_identity"],
             adoption_request_fingerprint=payload.get("adoption_request_fingerprint"),
             actor=payload["actor"],
@@ -3723,6 +3878,11 @@ def _restore_publication_safe_execution_profile_decision(
                 component.value for component in decision.changed_component_classes
             ],
             "decision": decision.kind.value,
+            **(
+                {}
+                if decision.egress_authority_change is None
+                else {"egress_authority_change": decision.egress_authority_change.value}
+            ),
             "expected_profile": decision.expected_profile.model_dump(mode="json"),
         }
     )

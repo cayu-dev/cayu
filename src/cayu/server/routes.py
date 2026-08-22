@@ -8097,6 +8097,10 @@ def create_router(
     async def delete_session(session_id: NonBlankString):
         session_id = await _resolve_public_session_id(session_id)
         try:
+            if not await cayu_app.discard_parked_egress_allocations(session_id):
+                raise ValueError(
+                    "Session has a parked egress allocation whose cleanup remains in flight."
+                )
             await session_store.delete_session(session_id)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc

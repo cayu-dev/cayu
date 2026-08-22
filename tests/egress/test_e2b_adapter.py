@@ -11,6 +11,7 @@ from cayu.egress import (
     ApprovedEgressDestination,
     EgressBinding,
     HttpEgressPolicy,
+    RunnerFinalizationResult,
     TransparentEgressBroker,
     UnsupportedEgressCapabilityError,
     UnsupportedEgressError,
@@ -475,8 +476,10 @@ def test_e2b_adapter_allows_only_the_exposed_cayu_proxy(tmp_path: Path) -> None:
     assert network_claim.state == "live_verified"
     assert network_claim.observed_at is not None
 
-    finalization = asyncio.run(adapter.finalize_runner(runner, outcome="interrupted"))
+    finalization = asyncio.run(adapter.finalize_runner_for_binding(runner, outcome="interrupted"))
     assert finalization.workspace_mutations_quiescent is True
+    assert finalization.allocation_preserved is True
+    assert runner._sandbox.killed is False
     asyncio.run(binding.close())
     assert exposure.closed is True
     assert _FakeProxyServer.instances[0].closed is True
@@ -513,6 +516,46 @@ def test_e2b_teardown_failure_is_truthful_and_retryable_after_revocation() -> No
     assert exposure.revoked_before_release is True
     assert exposure.closed is True
     assert closed is True
+
+
+def test_e2b_terminal_finalization_kills_the_provider_sandbox(tmp_path: Path) -> None:
+    async def run() -> tuple[E2BRunner, RunnerFinalizationResult]:
+        _FakeAsyncSandbox.created = []
+        _FakeAsyncSandbox.sandbox = None
+        exposure = _FakeExposure()
+        broker, grant = _broker_and_grant()
+        adapter = E2BEgressAdapter(
+            exposure=exposure,
+            e2b_module=_FakeE2BModule,
+            proxy_server_factory=_FakeProxyServer,
+        )
+        binding = await adapter.prepare(
+            session_id="session-1",
+            grants=[grant],
+            broker=broker,
+        )
+        ca_path = tmp_path / "terminal-ca.pem"
+        ca_path.write_bytes(binding.ca_cert_pem or b"")
+        runner = await adapter.create_runner(
+            VirtualEgressRunnerRequest(
+                name="terminal-sandbox",
+                runner_kind="e2b",
+                image="base-template",
+                binding=binding,
+                env_overlay={**binding.env, "STRIPE_SECRET_KEY": grant.presented_value},
+                ca_cert_host_path=str(ca_path),
+                guest_ca_path="/etc/cayu/ca.pem",
+                setup_commands=(),
+                egress_destinations=("api.stripe.com",),
+            )
+        )
+        result = await adapter.finalize_runner(runner, outcome="completed")
+        return runner, result
+
+    runner, result = asyncio.run(run())
+    assert result.workspace_mutations_quiescent is True
+    assert result.allocation_preserved is False
+    assert runner._sandbox.killed is True
 
 
 def test_e2b_adapter_rejects_security_options_that_could_bypass_enforcement() -> None:
@@ -1017,6 +1060,72 @@ def test_e2b_adapter_handoff_budget_covers_every_setup_command(
 
     assert runner is returned_runner
     assert captured["handoff_timeout_s"] == 1080
+
+
+def test_e2b_recoverable_creation_binds_provider_submission_to_allocation_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+    created = E2BRunner(
+        _FakeSandbox(),
+        sandbox_id="e2b-created",
+        e2b_module=_FakeE2BModule,
+    )
+    recovered = E2BRunner(
+        _FakeSandbox(),
+        sandbox_id="e2b-recovered",
+        e2b_module=_FakeE2BModule,
+    )
+
+    async def create_hardened(**options: Any) -> E2BRunner:
+        calls.append(("create", options["handoff_id"]))
+        return created
+
+    async def recover_hardened(handoff_id: str, **_options: Any) -> E2BRunner:
+        calls.append(("recover", handoff_id))
+        return recovered
+
+    monkeypatch.setattr(E2BRunner, "create_hardened", create_hardened)
+    monkeypatch.setattr(E2BRunner, "recover_hardened", recover_hardened)
+    adapter = E2BEgressAdapter(
+        exposure=_FakeExposure(),
+        e2b_module=_FakeE2BModule,
+        proxy_server_factory=_FakeProxyServer,
+    )
+    ca_path = tmp_path / "ca.pem"
+    ca_path.write_bytes(b"session-ca")
+    request = VirtualEgressRunnerRequest(
+        name="sandbox-1",
+        runner_kind="e2b",
+        image="base-template",
+        binding=EgressBinding(
+            proxy_url="http://203.0.113.10:8443",
+            guest_ca_path="/etc/cayu/ca.pem",
+        ),
+        env_overlay={},
+        ca_cert_host_path=str(ca_path),
+        guest_ca_path="/etc/cayu/ca.pem",
+        setup_commands=(),
+        egress_destinations=("api.stripe.com",),
+        allocation_id=f"ealloc_{'a' * 32}",
+    )
+
+    async def exercise() -> tuple[E2BRunner, E2BRunner]:
+        first = await adapter.create_or_recover_runner(request, allow_create=True)
+        second = await adapter.create_or_recover_runner(request, allow_create=False)
+        assert isinstance(first, E2BRunner)
+        assert isinstance(second, E2BRunner)
+        return first, second
+
+    first, second = asyncio.run(exercise())
+
+    assert first is created
+    assert second is recovered
+    assert calls == [
+        ("create", f"ealloc_{'a' * 32}"),
+        ("recover", f"ealloc_{'a' * 32}"),
+    ]
 
 
 def test_e2b_adapter_installs_host_protected_assets_inside_one_way_bootstrap(

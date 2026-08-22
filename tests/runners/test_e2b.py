@@ -428,6 +428,149 @@ def test_e2b_runner_from_existing_can_skip_default_cwd_setup() -> None:
     assert runner._sandbox.commands.calls == []
 
 
+def test_e2b_hardened_recovery_reattaches_unique_durable_handoff_without_create() -> None:
+    class RecoverableAsyncSandbox(FakeAsyncSandbox):
+        @classmethod
+        def list(
+            cls,
+            *,
+            query: FakeSandboxQuery,
+            limit: int,
+            **_options: Any,
+        ) -> FakeSandboxPaginator:
+            assert limit == 100
+            assert query.metadata == {"cayu_guest_handoff_id": f"ealloc_{'a' * 32}"}
+            return FakeSandboxPaginator(
+                [
+                    FakeSandboxInfo(
+                        sandbox_id="e2b_existing",
+                        metadata=dict(query.metadata),
+                    )
+                ]
+            )
+
+    class RecoverableE2BModule:
+        AsyncSandbox = RecoverableAsyncSandbox
+        SandboxQuery = FakeSandboxQuery
+
+    async def run() -> E2BRunner:
+        reset_fake_e2b()
+        RecoverableAsyncSandbox.created = []
+        RecoverableAsyncSandbox.connected = []
+        return await E2BRunner.recover_hardened(
+            f"ealloc_{'a' * 32}",
+            e2b_module=RecoverableE2BModule,
+        )
+
+    runner = asyncio.run(run())
+
+    assert runner.sandbox_id == "e2b_existing"
+    assert RecoverableAsyncSandbox.created == []
+    assert RecoverableAsyncSandbox.connected == [{"sandbox_id": "e2b_existing"}]
+
+
+def test_e2b_hardened_recovery_replays_protected_bootstrap_content_bound() -> None:
+    class RecoverableAsyncSandbox(FakeAsyncSandbox):
+        @classmethod
+        def list(
+            cls,
+            *,
+            query: FakeSandboxQuery,
+            limit: int,
+            **_options: Any,
+        ) -> FakeSandboxPaginator:
+            assert limit == 100
+            return FakeSandboxPaginator(
+                [
+                    FakeSandboxInfo(
+                        sandbox_id="e2b_existing",
+                        metadata=dict(query.metadata),
+                    )
+                ]
+            )
+
+    class RecoverableE2BModule:
+        AsyncSandbox = RecoverableAsyncSandbox
+        SandboxQuery = FakeSandboxQuery
+
+    async def bootstrap(provisioner: E2BGuestProvisioner) -> None:
+        await provisioner.install_directory("/opt/cayu", mode=0o755)
+        await provisioner.install_file("/opt/cayu/config", b"exact", mode=0o444)
+
+    async def run() -> E2BRunner:
+        reset_fake_e2b()
+        RecoverableAsyncSandbox.next_sandbox = FakeSandbox("e2b_existing")
+        return await E2BRunner.recover_hardened(
+            f"ealloc_{'b' * 32}",
+            bootstrap=bootstrap,
+            e2b_module=RecoverableE2BModule,
+        )
+
+    runner = asyncio.run(run())
+    installation_calls = [
+        call
+        for call in runner._sandbox.commands.calls
+        if "CAYU_PROTECTED_ALLOW_EXISTING_EXACT" in call.get("envs", {})
+    ]
+    assert len(installation_calls) == 2
+    assert all(
+        call["envs"]["CAYU_PROTECTED_ALLOW_EXISTING_EXACT"] == "1" for call in installation_calls
+    )
+    assert runner._sandbox.files.writes[0]["data"] == b"exact"
+
+
+def test_e2b_hardened_recovery_rejects_mismatched_protected_bootstrap() -> None:
+    class RecoverableAsyncSandbox(FakeAsyncSandbox):
+        @classmethod
+        def list(
+            cls,
+            *,
+            query: FakeSandboxQuery,
+            limit: int,
+            **_options: Any,
+        ) -> FakeSandboxPaginator:
+            assert limit == 100
+            return FakeSandboxPaginator(
+                [
+                    FakeSandboxInfo(
+                        sandbox_id="e2b_existing",
+                        metadata=dict(query.metadata),
+                    )
+                ]
+            )
+
+    class RecoverableE2BModule:
+        AsyncSandbox = RecoverableAsyncSandbox
+        SandboxQuery = FakeSandboxQuery
+
+    async def bootstrap(provisioner: E2BGuestProvisioner) -> None:
+        await provisioner.install_file("/opt/cayu/config", b"expected", mode=0o444)
+
+    async def run() -> tuple[E2BGuestHandoffError, FakeSandbox]:
+        reset_fake_e2b()
+        sandbox = FakeSandbox("e2b_existing")
+        # Fence, harden, and staging succeed; the content-bound installation
+        # reports that the existing protected asset differs.
+        sandbox.commands.foreground_results = [
+            FakeCommandResult(),
+            FakeCommandResult(),
+            FakeCommandResult(),
+            FakeCommandResult(exit_code=46),
+        ]
+        RecoverableAsyncSandbox.next_sandbox = sandbox
+        with pytest.raises(E2BGuestHandoffError) as exc_info:
+            await E2BRunner.recover_hardened(
+                f"ealloc_{'c' * 32}",
+                bootstrap=bootstrap,
+                e2b_module=RecoverableE2BModule,
+            )
+        return exc_info.value, sandbox
+
+    error, sandbox = asyncio.run(run())
+    assert error.phase == "bootstrap"
+    assert sandbox.kill_calls == 0
+
+
 def test_e2b_reconnect_passes_provider_credential_isolation_probe(
     provider_credential_canaries,
 ) -> None:
@@ -2334,6 +2477,26 @@ def test_e2b_runner_fences_timeout_before_handle_until_operator_verification() -
     runner.reopen_exec()
     after = asyncio.run(runner.exec(ExecCommand.process("pwd")))
     assert after.exit_code == 0
+
+
+def test_e2b_egress_cutover_fence_fails_closed_without_process_control_tools() -> None:
+    sandbox = FakeSandbox()
+
+    async def emulate_template_without_process_tools(cmd: str, **kwargs: Any) -> FakeCommandResult:
+        sandbox.commands.calls.append({"cmd": cmd, **kwargs})
+        tools_are_preflighted = "command -v pkill" in cmd and "command -v pgrep" in cmd
+        return FakeCommandResult(exit_code=127 if tools_are_preflighted else 0)
+
+    sandbox.commands.run = emulate_template_without_process_tools  # type: ignore[method-assign]
+    runner = E2BRunner(sandbox, e2b_module=FakeE2BModule)
+    runner._hardened_guest_user = "cayu"
+
+    with pytest.raises(RuntimeError, match="could not be fenced"):
+        asyncio.run(runner.fence_guest_processes_for_egress_cutover())
+
+    assert len(sandbox.commands.calls) == 1
+    assert "command -v pkill" in sandbox.commands.calls[0]["cmd"]
+    assert "command -v pgrep" in sandbox.commands.calls[0]["cmd"]
 
 
 def test_e2b_runner_times_out_delayed_start_without_hanging() -> None:

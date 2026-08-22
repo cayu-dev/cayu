@@ -116,6 +116,13 @@ from cayu.runtime._environment_allocation import (
     require_bounded_reconnect_metadata as _require_bounded_reconnect_metadata,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime.egress_authority_transitions import (
+    _EGRESS_AUTHORITY_PARKED_OUTCOME,
+    EgressAuthorityAdoptionHandler,
+    _complete_egress_authority_allocation_parking,
+    _discard_egress_authority_allocation_parking_reservation,
+    _reserve_egress_authority_allocation_parking,
+)
 from cayu.runtime.execution_profiles import (
     ExecutionProfileIdentity,
     event_with_execution_profile_authority,
@@ -211,6 +218,23 @@ def _live_allocation_fingerprint(
     ).hexdigest()
 
 
+def _reconnect_allocation_fingerprint(reconnect_metadata: dict[str, Any]) -> str | None:
+    """Read one factory-published backend identity without exposing provider data."""
+
+    value = reconnect_metadata.get("allocation_fingerprint")
+    if value is None:
+        return None
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(
+            "Environment factory allocation fingerprint must be a lowercase SHA-256 digest."
+        )
+    return value
+
+
 class EnvironmentCapacityError(RuntimeError):
     """Raised before provisioning when process-local lifecycle capacity is full."""
 
@@ -233,6 +257,8 @@ class EnvironmentFactoryResolutionResult:
 class EnvironmentBindingFinalizeResult:
     event: Event
     events: list[Event]
+    cancellation: asyncio.CancelledError | None = None
+    cancellation_requests_consumed: int = 0
 
 
 @dataclass(frozen=True)
@@ -287,6 +313,7 @@ class EnvironmentLifecycle:
         checkpoint_transform: CheckpointTransformFactory,
         secret_redactor: SecretRedactor | None = None,
         max_environment_lifecycle_owners: int = DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS,
+        egress_authority_adoption_handler: EgressAuthorityAdoptionHandler | None = None,
     ) -> None:
         self._session_store = session_store
         self._event_writer = event_writer
@@ -303,6 +330,7 @@ class EnvironmentLifecycle:
         ):
             raise ValueError("max_environment_lifecycle_owners must be a positive integer.")
         self._max_environment_lifecycle_owners = max_environment_lifecycle_owners
+        self._egress_authority_adoption_handler = egress_authority_adoption_handler
         # Factory results and bound workspaces contain process-local handles
         # that cannot be reconstructed from durable session state. Retain the
         # authoritative owner across async-generator yield boundaries until the
@@ -842,6 +870,7 @@ class EnvironmentLifecycle:
         started_event: Event | None,
         operation: EnvironmentFactoryOperation,
         execution_profile: ExecutionProfileIdentity | None = None,
+        adopted_factory_result: EnvironmentFactoryResult | None = None,
     ) -> EnvironmentFactoryResolutionResult:
         if registered_environment is None or registered_environment.factory is None:
             if started_event is not None:
@@ -852,6 +881,11 @@ class EnvironmentLifecycle:
             )
         if started_event is None:
             raise AssertionError("Registered environment factory was not started.")
+        if (
+            adopted_factory_result is not None
+            and type(adopted_factory_result) is not EnvironmentFactoryResult
+        ):
+            raise TypeError("adopted_factory_result must be an EnvironmentFactoryResult.")
 
         factory = registered_environment.factory
         environment_name = registered_environment.spec.name
@@ -860,7 +894,7 @@ class EnvironmentLifecycle:
             registered_environment=registered_environment,
         )
         events: list[Event] = []
-        result: EnvironmentFactoryResult | None = None
+        result: EnvironmentFactoryResult | None = adopted_factory_result
         environment: Environment | None = None
         allocation_context: DurableEnvironmentAllocationContext | None = None
         allocation_checkpointed = False
@@ -936,7 +970,22 @@ class EnvironmentLifecycle:
                 evidence=None if admission_candidate is None else admission_candidate.evidence,
                 stage="pre_create",
             ).require_admitted()
-            if effective_operation is EnvironmentFactoryOperation.CREATE:
+            if adopted_factory_result is not None:
+                if operation is not EnvironmentFactoryOperation.RECONNECT:
+                    raise ValueError(
+                        "An adopted egress environment can only continue a resumed session."
+                    )
+                if allocation_record is not None:
+                    raise RuntimeError(
+                        "An adopted egress environment conflicts with an incomplete "
+                        "remote allocation intent."
+                    )
+                if allocation_owner != session.id:
+                    raise RuntimeError(
+                        "An adopted egress environment has no session-owned allocation checkpoint."
+                    )
+                effective_operation = EnvironmentFactoryOperation.RECONNECT
+            elif effective_operation is EnvironmentFactoryOperation.CREATE:
                 allocation_scope = factory.allocation_scope(request)
                 if allocation_scope is not None and type(allocation_scope) is not (
                     EnvironmentAllocationScope
@@ -986,7 +1035,9 @@ class EnvironmentLifecycle:
                     redactor=self._secret_redactor,
                 )
             if type(result) is not EnvironmentFactoryResult:
-                raise TypeError("EnvironmentFactory.create must return EnvironmentFactoryResult.")
+                raise TypeError(
+                    "Environment factory resolution must return EnvironmentFactoryResult."
+                )
             environment = copy_environment(result.environment)
             if environment.spec.name != environment_name:
                 raise ValueError(
@@ -1009,6 +1060,7 @@ class EnvironmentLifecycle:
             self._secret_redactor.require_no_secret_keys(
                 reconnect_metadata,
                 field_name="EnvironmentFactoryResult.reconnect_metadata",
+                preserve_keys={"allocation_fingerprint"},
                 match_short_substrings=True,
             )
             if self._secret_redactor.redact_json_values(reconnect_metadata) != (reconnect_metadata):
@@ -1017,6 +1069,7 @@ class EnvironmentLifecycle:
                     "secret and cannot be checkpointed without changing reconnect semantics."
                 )
             _require_bounded_reconnect_metadata(reconnect_metadata)
+            reconnect_allocation_fingerprint = _reconnect_allocation_fingerprint(reconnect_metadata)
             if (
                 effective_operation is EnvironmentFactoryOperation.RECONNECT
                 and allocation_receipt is not None
@@ -1100,9 +1153,12 @@ class EnvironmentLifecycle:
                     None if admission_candidate is None else admission_candidate.candidate
                 ),
                 unclaimed_factory_result=result,
-                live_allocation_fingerprint=_live_allocation_fingerprint(
-                    allocation_context,
-                    allocation_receipt,
+                live_allocation_fingerprint=(
+                    reconnect_allocation_fingerprint
+                    or _live_allocation_fingerprint(
+                        allocation_context,
+                        allocation_receipt,
+                    )
                 ),
                 workspace_mutation_fence=(
                     registered_environment.workspace_mutation_fence.child_fence()
@@ -1704,6 +1760,7 @@ class EnvironmentLifecycle:
             bound_workspace=bound,
             binding_payload=copy_json_value(base_payload, "binding_payload"),
             execution_candidate=registered_environment.execution_candidate,
+            retained_factory_result=(registered_environment.unclaimed_factory_result),
             preserve_factory_allocation=(
                 registered_environment.unclaimed_factory_result is not None
             ),
@@ -1983,7 +2040,55 @@ class EnvironmentLifecycle:
 
         terminal_outcome = _binding_outcome_for_terminal_event(event.type)
         preserve_factory_allocation = registered_environment.preserve_factory_allocation
-        outcome = "interrupted" if preserve_factory_allocation else terminal_outcome
+        parked_factory_result = registered_environment.retained_factory_result
+        park_for_egress_adoption = (
+            self._egress_authority_adoption_handler is not None
+            and parked_factory_result is not None
+            and registered_environment.live_allocation_fingerprint is not None
+            and execution_profile is not None
+            and execution_profile.egress_authority is not None
+        )
+        parking_reservation = None
+        parking_managed_runner: Runner | None = None
+        parking_handler: EgressAuthorityAdoptionHandler | None = None
+        parking_environment_name: str | None = None
+        parking_fingerprint: str | None = None
+        take_parking_cancellation: (
+            Callable[[], tuple[asyncio.CancelledError | None, int]] | None
+        ) = None
+        if park_for_egress_adoption:
+            if parked_factory_result is None:
+                raise AssertionError("Egress parking lost its exact factory result.")
+            fingerprint = registered_environment.live_allocation_fingerprint
+            if fingerprint is None:
+                raise AssertionError("Egress parking lost its allocation fingerprint.")
+            environment_name = _environment_name(registered_environment)
+            if environment_name is None:
+                raise AssertionError("Egress parking lost its environment name.")
+            handler = self._egress_authority_adoption_handler
+            if handler is None:
+                raise AssertionError("Egress parking lost its adoption handler.")
+            parking_handler = handler
+            parking_environment_name = environment_name
+            parking_fingerprint = fingerprint
+            parking_managed_runner = parked_factory_result.environment.runner
+            if not isinstance(parking_managed_runner, Runner):
+                raise TypeError("Parked egress allocation lost its managed runner.")
+            raw_take_parking_cancellation = getattr(
+                parking_managed_runner,
+                "_take_authority_parking_cancellation",
+                None,
+            )
+            if not callable(raw_take_parking_cancellation):
+                raise TypeError("Parked egress allocation lost its cancellation owner.")
+            take_parking_cancellation = raw_take_parking_cancellation
+        outcome = (
+            _EGRESS_AUTHORITY_PARKED_OUTCOME
+            if park_for_egress_adoption
+            else "interrupted"
+            if preserve_factory_allocation
+            else terminal_outcome
+        )
         environment_name = _environment_name(registered_environment)
         finalize_metadata = {
             "event_type": str(event.type),
@@ -2008,9 +2113,16 @@ class EnvironmentLifecycle:
                 session_id=session.id,
                 public_authority_alias_codec=(self._session_store.public_authority_alias_codec),
             ),
-            "outcome": outcome,
+            # The private parking outcome steers binding teardown, but the
+            # durable event continues to describe the invocation's real
+            # terminal result.  Parking is represented separately as the
+            # allocation action.
+            "outcome": terminal_outcome,
         }
-        if preserve_factory_allocation:
+        if park_for_egress_adoption:
+            base_payload["terminal_outcome"] = terminal_outcome
+            base_payload["factory_allocation_action"] = "park"
+        elif preserve_factory_allocation:
             base_payload["terminal_outcome"] = terminal_outcome
             base_payload["factory_allocation_action"] = "preserve"
         events: list[Event] = []
@@ -2054,14 +2166,58 @@ class EnvironmentLifecycle:
                 binding_generation_id=registered_environment.binding_generation_id,
                 final_observation=final_revision,
             )
-            final_snapshot_value = await environment_operation_boundary.await_environment_operation(
-                lambda: _finalize_binding_after_mutation_quiescence(
+            if park_for_egress_adoption:
+                if (
+                    parking_handler is None
+                    or parking_environment_name is None
+                    or parking_fingerprint is None
+                    or parked_factory_result is None
+                ):
+                    raise AssertionError("Egress parking lost its preflight authority.")
+                parking_reservation = _reserve_egress_authority_allocation_parking(
+                    parking_handler,
+                    session_id=session.id,
+                    environment_name=parking_environment_name,
+                    fingerprint=parking_fingerprint,
+                    factory_result=parked_factory_result,
+                    max_parked_allocations=self._max_environment_lifecycle_owners,
+                )
+
+            async def finalize_and_transfer_parked_allocation() -> tuple[
+                WorkspaceSnapshot | None,
+                asyncio.CancelledError | None,
+                int,
+            ]:
+                final_snapshot_value = await _finalize_binding_after_mutation_quiescence(
                     registered_environment,
                     binding,
                     bound_workspace,
                     outcome=outcome,
                     metadata=finalize_metadata,
-                ),
+                )
+                final_snapshot = copy_workspace_snapshot(final_snapshot_value)
+                if parking_reservation is None:
+                    return final_snapshot, None, 0
+                handler = self._egress_authority_adoption_handler
+                if handler is None or take_parking_cancellation is None:
+                    raise AssertionError("Egress parking lost its reserved handoff owner.")
+                _complete_egress_authority_allocation_parking(
+                    handler,
+                    reservation=parking_reservation,
+                )
+                parking_cancellation, parking_cancellation_requests = take_parking_cancellation()
+                return (
+                    final_snapshot,
+                    parking_cancellation,
+                    parking_cancellation_requests,
+                )
+
+            (
+                final_snapshot,
+                parking_cancellation,
+                parking_cancellation_requests,
+            ) = await environment_operation_boundary.await_environment_operation(
+                finalize_and_transfer_parked_allocation,
                 operation_name="Environment binding finalization",
                 redactor=self._secret_redactor,
             )
@@ -2070,8 +2226,26 @@ class EnvironmentLifecycle:
                 # exact-owner retry state is now safe to discard even if
                 # validating or publishing the resulting snapshot later fails.
                 setup_owner.cleanup_release_safe = True
-            final_snapshot = copy_workspace_snapshot(final_snapshot_value)
         except (BaseExceptionGroup, Exception, asyncio.CancelledError) as exc:
+            if (
+                parking_reservation is not None
+                and not parking_reservation.ready
+                and (
+                    parking_managed_runner is None
+                    or getattr(
+                        parking_managed_runner,
+                        "is_parked_for_authority_adoption",
+                        False,
+                    )
+                    is not True
+                )
+            ):
+                handler = self._egress_authority_adoption_handler
+                if handler is not None:
+                    _discard_egress_authority_allocation_parking_reservation(
+                        handler,
+                        reservation=parking_reservation,
+                    )
             if start_publication_error is not None:
                 exc = BaseExceptionGroup(
                     "Binding finalization and start-event publication failed.",
@@ -2081,7 +2255,7 @@ class EnvironmentLifecycle:
                 setup_owner.cleanup_error = exc
             finalize_error_payload = _binding_finalize_error_payload(
                 exc,
-                outcome=outcome,
+                outcome=terminal_outcome,
                 redactor=self._secret_redactor,
             )
             final_revision_payload = (
@@ -2274,7 +2448,7 @@ class EnvironmentLifecycle:
             terminal_payload["binding_finalize_publication_error"] = (
                 _binding_finalize_publication_failure_payload(
                     publication_failures,
-                    outcome=outcome,
+                    outcome=terminal_outcome,
                     redactor=self._secret_redactor,
                 )
             )
@@ -2287,7 +2461,12 @@ class EnvironmentLifecycle:
                 finalization_delta=finalization_delta,
             )
             event = _copy_event_with_payload(event, terminal_payload)
-        return EnvironmentBindingFinalizeResult(event=event, events=events)
+        return EnvironmentBindingFinalizeResult(
+            event=event,
+            events=events,
+            cancellation=parking_cancellation,
+            cancellation_requests_consumed=parking_cancellation_requests,
+        )
 
     async def abort_environment_setup(
         self,
@@ -2681,6 +2860,29 @@ class EnvironmentLifecycle:
             checkpoint,
             environment_name=environment_name,
         )
+
+    async def require_live_allocation_fingerprint(
+        self,
+        *,
+        session_id: str,
+        environment_name: str,
+    ) -> str:
+        """Load the session-owned pre-cutover backend identity from durable state."""
+
+        reconnect_metadata, allocation_owner = await self._load_factory_reconnect_state(
+            session_id=session_id,
+            environment_name=environment_name,
+        )
+        if allocation_owner != session_id:
+            raise RuntimeError(
+                "Egress authority adoption has no session-owned environment allocation."
+            )
+        fingerprint = _reconnect_allocation_fingerprint(reconnect_metadata)
+        if fingerprint is None:
+            raise RuntimeError(
+                "Egress authority adoption has no durable pre-cutover allocation identity."
+            )
+        return fingerprint
 
     async def _checkpoint_factory_reconnect_metadata(
         self,

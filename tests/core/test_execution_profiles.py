@@ -5,7 +5,7 @@ import json
 import logging
 import sqlite3
 import warnings
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
@@ -41,19 +41,35 @@ from cayu import (
     DenyPatternRule,
     DispatchRequest,
     DockerRunner,
+    EgressAuthorityAdoptionHandler,
+    EgressAuthorityAdoptionResult,
+    EgressAuthorityBindingIdentity,
+    EgressAuthorityChangeKind,
+    EgressAuthorityCutoverRequest,
+    EgressAuthorityCutoverResult,
+    EgressAuthorityCutoverStrategy,
+    EgressAuthorityRenewalRequest,
+    EgressAuthorityTransitionConflict,
+    EgressAuthorityTransitionCoordinator,
+    EgressAuthorityTransitionRecord,
+    EgressAuthorityTransitionState,
     Environment,
     EnvironmentFactory,
+    EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
     EnvironmentFactoryResult,
     EnvironmentSpec,
     Event,
     EventType,
+    ExecCommand,
     ExecCommandTool,
+    ExecResult,
     ExecutionProfileAdoptionIntent,
     ExecutionProfileAdoptionRejected,
     ExecutionProfileAuthorityDecision,
     ExecutionProfileBehaviorIdentity,
     ExecutionProfileComponentClass,
+    ExecutionProfileDecision,
     ExecutionProfileDecisionKind,
     ExecutionProfileIdentity,
     ExecutionProfileIdentityAvailability,
@@ -65,6 +81,7 @@ from cayu import (
     ExecutionProfilePolicyError,
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
+    HttpEgressPolicy,
     InMemoryKnowledgeStore,
     InMemorySessionStore,
     KnowledgeAccessScope,
@@ -89,16 +106,20 @@ from cayu import (
     ResumeRequest,
     RetryPolicy,
     RunLimits,
+    Runner,
     RunRequest,
     RuntimeEvidenceRequest,
     RuntimeHook,
     ScriptedModelProvider,
     SearchTextTool,
     SecretRedactor,
+    SecretRef,
+    SessionCheckpointEgressAuthorityTransitionStore,
     SessionIdentity,
     SessionStatus,
     SQLiteSessionStore,
     StaticToolPolicy,
+    StaticVault,
     StructuredOutputSpec,
     TaintAwareToolPolicy,
     ThinkingConfig,
@@ -113,11 +134,26 @@ from cayu import (
     ToolSpec,
     TranscriptDigestCompactor,
     UsageTriggeredContextPolicy,
+    VirtualCredentialSpec,
+    VirtualEgressEnvironmentFactory,
     WebFetchTool,
     WeightedReciprocalRankFusionConfig,
+    advance_egress_authority_transition,
+    authorized_egress_authority_transition,
+    build_egress_authority_cutover_receipt,
+    build_egress_authority_identity,
+    compare_egress_authority,
+    egress_authority_owner_fingerprint,
     estimate_session_cost,
     runtime_evidence,
 )
+from cayu.egress import (
+    EgressBinding,
+    RunnerFinalizationResult,
+    SandboxEgressAdapter,
+    VirtualCredentialError,
+)
+from cayu.egress.authority import _build_adapter_verified_egress_authority_cutover_receipt
 from cayu.providers import (
     AnthropicProvider,
     ModelProvider,
@@ -129,6 +165,14 @@ from cayu.runtime._event_projection import (
     prepare_new_runtime_event,
     project_persisted_runtime_event,
 )
+from cayu.runtime.egress_authority_transitions import (
+    _build_transition_record,
+    _find_parked_egress_authority_allocation,
+    _park_egress_authority_allocation,
+    _runtime_egress_authority_adoption_result,
+    _with_runtime_verified_active_transition,
+)
+from cayu.runtime.event_sinks import InMemoryEventSink
 from cayu.runtime.execution_profiles import (
     build_execution_profile_identity,
     changed_execution_profile_components,
@@ -355,6 +399,519 @@ class IdentityConfiguredEnvironmentFactory(EnvironmentFactory):
         return EnvironmentFactoryResult(
             environment=Environment(EnvironmentSpec(name=request.environment_name)),
         )
+
+
+class IdentityConfiguredEgressEnvironmentFactory(IdentityConfiguredEnvironmentFactory):
+    def __init__(self, *, generation: int, allow_post: bool) -> None:
+        super().__init__(_test_behavior_identity("egress-environment-factory"))
+        endpoints = [("GET", "/v1/items")]
+        if allow_post:
+            endpoints.append(("POST", "/v1/items"))
+        policy = HttpEgressPolicy(
+            name="provider",
+            allowed_hosts=("api.example.com",),
+            allowed_endpoints=endpoints,
+        )
+        self._egress_authority = build_egress_authority_identity(
+            policies={policy.name: policy},
+            bindings=(
+                EgressAuthorityBindingIdentity(
+                    destination="api.example.com",
+                    policy_name=policy.name,
+                    credential_kind="opaque_bearer",
+                    credential_authority_fingerprint="1" * 64,
+                ),
+            ),
+            generation=generation,
+            authority_source="tests:trusted-application",
+            authority_scope="session",
+            policy_version=f"v{generation}",
+            runner_kind="docker",
+            cutover_strategy=EgressAuthorityCutoverStrategy.FRESH_AUTHORITY_PATH,
+        )
+        self.create_calls = 0
+
+    @property
+    def egress_authority_identity(self):
+        return self._egress_authority
+
+    async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
+        self.create_calls += 1
+        result = await super().create(request)
+        return EnvironmentFactoryResult(
+            environment=result.environment,
+            metadata=result.metadata,
+            reconnect_metadata={"allocation_fingerprint": "2" * 64},
+            release=result.release,
+            release_timeout_s=result.release_timeout_s,
+        )
+
+
+class _AdoptionHandoffRunner(Runner):
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+        del command, kwargs
+        return ExecResult(stdout="ok")
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _AdoptionHandoffAdapter(SandboxEgressAdapter):
+    runner_kind = "docker"
+    process_external_allocation = False
+    egress_authority_cutover_strategy = EgressAuthorityCutoverStrategy.FRESH_AUTHORITY_PATH
+
+    def __init__(
+        self,
+        *,
+        fingerprint: str = "a" * 64,
+        park_started: asyncio.Event | None = None,
+        park_release: asyncio.Event | None = None,
+    ) -> None:
+        self.fingerprint = fingerprint
+        self.create_calls = 0
+        self.cutover_calls = 0
+        self.renewal_calls = 0
+        self.credentialless_authority_renewed = False
+        self.initial_grant_values: tuple[str, ...] = ()
+        self.renewed_grant_values: tuple[str, ...] = ()
+        self.broker = None
+        self.park_started = park_started
+        self.park_release = park_release
+
+    async def prepare(self, *, session_id, grants, broker):
+        del session_id
+        self.initial_grant_values = tuple(grant.presented_value for grant in grants)
+        self.broker = broker
+        return EgressBinding(
+            env={"HTTPS_PROXY": "http://old-proxy:8080"},
+            ca_cert_pem=b"test-ca",
+            runner_kind=self.runner_kind,
+            network="old-network",
+            guest_ca_path="/etc/cayu/ca.pem",
+        )
+
+    async def create_runner(self, request):
+        del request
+        self.create_calls += 1
+        return _AdoptionHandoffRunner()
+
+    async def egress_environment_fingerprint(self, runner: Runner) -> str:
+        assert isinstance(runner, _AdoptionHandoffRunner)
+        return self.fingerprint
+
+    async def cutover_authority(
+        self,
+        request: EgressAuthorityCutoverRequest,
+    ) -> EgressAuthorityCutoverResult:
+        self.cutover_calls += 1
+        self.broker = request.target_broker
+        self.initial_grant_values = tuple(grant.presented_value for grant in request.target_grants)
+        replacement = EgressBinding(
+            env={"HTTPS_PROXY": "http://new-proxy:8080"},
+            ca_cert_pem=b"test-ca",
+            runner_kind=self.runner_kind,
+            network="new-network",
+            guest_ca_path="/etc/cayu/ca.pem",
+        )
+        replacement.bind_authority(request.target_authority)
+        return EgressAuthorityCutoverResult(
+            binding=replacement,
+            receipt=_build_adapter_verified_egress_authority_cutover_receipt(
+                expected=request.expected_authority,
+                target=request.target_authority,
+                environment_fingerprint=self.fingerprint,
+            ),
+        )
+
+    async def renew_authority(self, request: EgressAuthorityRenewalRequest) -> str:
+        assert isinstance(request.runner, _AdoptionHandoffRunner)
+        assert self.broker is not None
+        self.renewed_grant_values = tuple(grant.presented_value for grant in request.renewed_grants)
+        assert self.renewed_grant_values != self.initial_grant_values
+        for value in self.initial_grant_values:
+            with pytest.raises(VirtualCredentialError):
+                self.broker.registry.lookup(value)
+        for value in self.renewed_grant_values:
+            assert self.broker.registry.lookup(value).presented_value == value
+        self.credentialless_authority_renewed = self.broker._credentialless_authority_active
+        self.renewal_calls += 1
+        return self.fingerprint
+
+    async def finalize_runner(
+        self,
+        runner: Runner,
+        *,
+        outcome: str | None,
+    ) -> RunnerFinalizationResult:
+        del outcome
+        await runner.close()
+        return RunnerFinalizationResult(workspace_mutations_quiescent=True)
+
+    async def park_runner_for_authority_adoption(
+        self,
+        runner: Runner,
+    ) -> RunnerFinalizationResult:
+        assert isinstance(runner, _AdoptionHandoffRunner)
+        if self.park_started is not None:
+            self.park_started.set()
+        if self.park_release is not None:
+            await self.park_release.wait()
+        return RunnerFinalizationResult(
+            workspace_mutations_quiescent=True,
+            allocation_preserved=True,
+        )
+
+
+def _adoption_handoff_factory(
+    *,
+    adapter: _AdoptionHandoffAdapter,
+    generation: int,
+    allow_post: bool,
+    execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
+    authority_source: str = "tests:trusted-application",
+    policy_version: str | None = None,
+    policy_name: str = "provider",
+    credential_kind: str = "stripe_bearer",
+) -> VirtualEgressEnvironmentFactory:
+    endpoints = [("GET", "/v1/items")]
+    if allow_post:
+        endpoints.append(("POST", "/v1/items"))
+    policy = HttpEgressPolicy(
+        name=policy_name,
+        allowed_hosts=("api.example.com",),
+        allowed_endpoints=endpoints,
+    )
+    return VirtualEgressEnvironmentFactory(
+        resolver=StaticVault({"provider": "test-secret"}),
+        policies={policy.name: policy},
+        credentials=(
+            VirtualCredentialSpec(
+                env_name="PROVIDER_KEY",
+                secret=SecretRef(name="provider"),
+                destination="api.example.com",
+                policy_name=policy.name,
+                credential_kind=credential_kind,
+            ),
+        ),
+        adapter=adapter,
+        egress_authority_generation=generation,
+        egress_authority_source=authority_source,
+        egress_authority_scope="session",
+        egress_policy_version=(f"v{generation}" if policy_version is None else policy_version),
+        execution_profile_identity=execution_profile_identity,
+    )
+
+
+class _OwnedEnvironmentAdoptionHandler(EgressAuthorityAdoptionHandler):
+    def __init__(
+        self,
+        *,
+        target_factory: VirtualEgressEnvironmentFactory,
+        factory_result_override: EnvironmentFactoryResult | None = None,
+    ) -> None:
+        self._target_factory = target_factory
+        self._factory_result_override = factory_result_override
+        self.calls = 0
+        self.decisions: list[ExecutionProfileDecision] = []
+
+    async def adopt(
+        self,
+        decision: ExecutionProfileDecision,
+        *,
+        coordinator: EgressAuthorityTransitionCoordinator,
+        expected_environment_fingerprint: str,
+        factory_result: EnvironmentFactoryResult,
+    ) -> EgressAuthorityAdoptionResult:
+        self.calls += 1
+        self.decisions.append(decision)
+        owner_token = "owned-environment-cutover"
+        authorized = authorized_egress_authority_transition(
+            decision=decision,
+            transition_id=f"transition-{decision.idempotency_identity}",
+            environment_name="egress",
+            owner_fingerprint=egress_authority_owner_fingerprint(owner_token),
+            source_environment_fingerprint=expected_environment_fingerprint,
+        )
+        return await self._target_factory.adopt_authority(
+            factory_result=(self._factory_result_override or factory_result),
+            authorized=authorized,
+            coordinator=coordinator,
+            owner_token=owner_token,
+            agent_name="assistant",
+            execution_profile_fingerprint=decision.candidate_profile.fingerprint,
+        )
+
+
+class RecordingEgressAuthorityAdoptionHandler(EgressAuthorityAdoptionHandler):
+    def __init__(self, store: InMemorySessionStore) -> None:
+        self._transition_store = SessionCheckpointEgressAuthorityTransitionStore(store)
+        self.decisions: list[ExecutionProfileDecision] = []
+
+    async def adopt(
+        self,
+        decision: ExecutionProfileDecision,
+        *,
+        coordinator: EgressAuthorityTransitionCoordinator,
+        expected_environment_fingerprint: str,
+        factory_result: EnvironmentFactoryResult,
+    ) -> EgressAuthorityTransitionRecord:
+        del coordinator, factory_result
+        self.decisions.append(decision)
+        owner_token = "private-test-cutover-owner"
+        coordinator = EgressAuthorityTransitionCoordinator(self._transition_store)
+        authorized = authorized_egress_authority_transition(
+            decision=decision,
+            transition_id=f"transition-{decision.idempotency_identity}",
+            environment_name=decision.event.environment_name,
+            owner_fingerprint=egress_authority_owner_fingerprint(owner_token),
+            source_environment_fingerprint=expected_environment_fingerprint,
+        )
+        authorized = await coordinator.authorize(authorized)
+        installing = advance_egress_authority_transition(
+            authorized,
+            state=EgressAuthorityTransitionState.INSTALLING,
+            reason="The test cutover is installing.",
+            environment_fingerprint=expected_environment_fingerprint,
+        )
+        installing = await self._transition_store.compare_and_set(
+            expected=authorized,
+            replacement=installing,
+        )
+        receipt = build_egress_authority_cutover_receipt(
+            expected=authorized.expected_authority,
+            target=authorized.target_authority,
+            environment_fingerprint=expected_environment_fingerprint,
+        )
+        active = advance_egress_authority_transition(
+            installing,
+            state=EgressAuthorityTransitionState.ACTIVE,
+            reason="The exact test cutover is active.",
+            receipt=receipt,
+            environment_fingerprint=expected_environment_fingerprint,
+        )
+        return await self._transition_store.compare_and_set(
+            expected=installing,
+            replacement=active,
+        )
+
+
+class NoopEgressAuthorityAdoptionHandler(EgressAuthorityAdoptionHandler):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def adopt(
+        self,
+        decision: ExecutionProfileDecision,
+        *,
+        coordinator: EgressAuthorityTransitionCoordinator,
+        expected_environment_fingerprint: str,
+        factory_result: EnvironmentFactoryResult,
+    ) -> None:
+        del decision, coordinator, expected_environment_fingerprint, factory_result
+        self.calls += 1
+
+
+def _park_test_egress_allocation(
+    handler: EgressAuthorityAdoptionHandler,
+    *,
+    session_id: str,
+    fingerprint: str = "2" * 64,
+) -> EnvironmentFactoryResult:
+    """Seed lower-layer cutover tests through the runtime-owned parking seam."""
+
+    result = EnvironmentFactoryResult(
+        environment=Environment(EnvironmentSpec(name="egress")),
+    )
+    _park_egress_authority_allocation(
+        handler,
+        session_id=session_id,
+        environment_name="egress",
+        fingerprint=fingerprint,
+        factory_result=result,
+        max_parked_allocations=16,
+    )
+    return result
+
+
+def test_parked_egress_allocations_are_bounded_and_drained_before_abandonment() -> None:
+    async def exercise() -> None:
+        release_started = asyncio.Event()
+        release_allowed = asyncio.Event()
+        release_actions: list[EnvironmentFactoryReleaseAction] = []
+
+        async def release(action: EnvironmentFactoryReleaseAction) -> None:
+            release_actions.append(action)
+            release_started.set()
+            await release_allowed.wait()
+
+        handler = NoopEgressAuthorityAdoptionHandler()
+        factory_result = EnvironmentFactoryResult(
+            environment=Environment(EnvironmentSpec(name="egress")),
+            reconnect_metadata={"allocation_fingerprint": "2" * 64},
+            release=release,
+        )
+        _park_egress_authority_allocation(
+            handler,
+            session_id="parked-abandonment",
+            environment_name="egress",
+            fingerprint="2" * 64,
+            factory_result=factory_result,
+            max_parked_allocations=1,
+        )
+        app = CayuApp(
+            egress_authority_adoption_handler=handler,
+            enable_logging=False,
+        )
+
+        assert not await app.discard_parked_egress_allocations(
+            "parked-abandonment",
+            timeout_s=0.01,
+        )
+        assert release_started.is_set()
+        assert release_actions == [EnvironmentFactoryReleaseAction.DISCARD]
+        with pytest.raises(EgressAuthorityTransitionConflict, match="cleanup already owns"):
+            _find_parked_egress_authority_allocation(
+                handler,
+                session_id="parked-abandonment",
+                environment_name="egress",
+                expected_fingerprint="2" * 64,
+            )
+
+        release_allowed.set()
+        assert await app.discard_parked_egress_allocations(
+            "parked-abandonment",
+            timeout_s=1,
+        )
+        assert (
+            _find_parked_egress_authority_allocation(
+                handler,
+                session_id="parked-abandonment",
+                environment_name="egress",
+                expected_fingerprint="2" * 64,
+            )
+            is None
+        )
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "invalid_timeout",
+    [float("nan"), float("inf"), float("-inf"), True],
+)
+def test_parked_egress_cleanup_rejects_invalid_timeout_before_release(
+    invalid_timeout: float,
+) -> None:
+    async def exercise() -> None:
+        release_actions: list[EnvironmentFactoryReleaseAction] = []
+
+        async def release(action: EnvironmentFactoryReleaseAction) -> None:
+            release_actions.append(action)
+
+        handler = NoopEgressAuthorityAdoptionHandler()
+        _park_egress_authority_allocation(
+            handler,
+            session_id="parked-invalid-timeout",
+            environment_name="egress",
+            fingerprint="3" * 64,
+            factory_result=EnvironmentFactoryResult(
+                environment=Environment(EnvironmentSpec(name="egress")),
+                release=release,
+            ),
+            max_parked_allocations=1,
+        )
+        app = CayuApp(
+            egress_authority_adoption_handler=handler,
+            enable_logging=False,
+        )
+
+        with pytest.raises(ValueError, match="finite positive number"):
+            await app.drain_environment_cleanups(timeout_s=invalid_timeout)
+        assert release_actions == []
+
+        with pytest.raises(ValueError, match="finite positive number"):
+            await app.discard_parked_egress_allocations(
+                "parked-invalid-timeout",
+                timeout_s=invalid_timeout,
+            )
+        assert release_actions == []
+
+        assert await app.discard_parked_egress_allocations(
+            "parked-invalid-timeout",
+            timeout_s=1,
+        )
+        assert release_actions == [EnvironmentFactoryReleaseAction.DISCARD]
+
+    asyncio.run(exercise())
+
+
+class RuntimeVerifiedEgressAuthorityAdoptionHandler(RecordingEgressAuthorityAdoptionHandler):
+    async def adopt(
+        self,
+        decision: ExecutionProfileDecision,
+        *,
+        coordinator: EgressAuthorityTransitionCoordinator,
+        expected_environment_fingerprint: str,
+        factory_result: EnvironmentFactoryResult,
+    ):
+        active = await super().adopt(
+            decision,
+            coordinator=coordinator,
+            expected_environment_fingerprint=expected_environment_fingerprint,
+            factory_result=factory_result,
+        )
+        active = _with_runtime_verified_active_transition(
+            active,
+            coordinator=coordinator,
+        )
+        return _runtime_egress_authority_adoption_result(
+            transition=active,
+            factory_result=factory_result,
+            coordinator=coordinator,
+        )
+
+
+class CompetingEgressTransitionAdmissionStore(InMemorySessionStore):
+    """Advance a verified transition immediately before invocation admission."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.competing_target = None
+
+    async def admit_session_invocation(self, session_id: str, **kwargs):
+        target = self.competing_target
+        if target is not None:
+            self.competing_target = None
+            transition_store = SessionCheckpointEgressAuthorityTransitionStore(self)
+            current = await transition_store.load(session_id)
+            assert current is not None
+            assert current.state is EgressAuthorityTransitionState.ACTIVE
+            replacement = _build_transition_record(
+                transition_id="concurrent-egress-generation",
+                session_id=current.session_id,
+                environment_name=current.environment_name,
+                revision=current.revision + 1,
+                state=EgressAuthorityTransitionState.AUTHORIZED,
+                owner_fingerprint="3" * 64,
+                expected_authority=current.target_authority,
+                target_authority=target,
+                classification=compare_egress_authority(current.target_authority, target),
+                policy_identity=current.policy_identity,
+                actor=current.actor,
+                authorization_reason="A concurrent controller authorized the next generation.",
+                reason="The next generation is authorized.",
+                strategy=target.cutover_strategy,
+                source_environment_fingerprint=current.environment_fingerprint,
+            )
+            await transition_store.compare_and_set(
+                expected=current,
+                replacement=replacement,
+            )
+        return await super().admit_session_invocation(session_id, **kwargs)
 
 
 class IdentityConfiguredToolPolicy(ToolPolicy):
@@ -585,12 +1142,13 @@ class BlockingAliasResolutionStore(InMemorySessionStore):
         )
 
 
-def _completed_provider() -> ScriptedModelProvider:
+def _completed_provider(*, batches: int = 1) -> ScriptedModelProvider:
+    events = (
+        ModelStreamEvent.text_delta("done"),
+        ModelStreamEvent.completed({"finish_reason": "stop", "model": "fake-model"}),
+    )
     return ScriptedModelProvider(
-        [
-            ModelStreamEvent.text_delta("done"),
-            ModelStreamEvent.completed({"finish_reason": "stop", "model": "fake-model"}),
-        ],
+        events if batches == 1 else tuple(events for _ in range(batches)),
         name="fake",
     )
 
@@ -1167,7 +1725,7 @@ def _automatic_recall_context(
     )
 
 
-def test_schema_v4_covers_model_decision_semantics_without_raw_material() -> None:
+def test_schema_v5_covers_model_decision_semantics_without_raw_material() -> None:
     context_policy = _automatic_recall_context(
         CheckpointCompactionContextPolicy(
             compactor=TranscriptDigestCompactor(max_summary_chars=4096),
@@ -1195,7 +1753,7 @@ def test_schema_v4_covers_model_decision_semantics_without_raw_material() -> Non
         retry_policy=RetryPolicy(max_attempts=2),
     )
 
-    assert profile.schema_version == 4
+    assert profile.schema_version == 5
     assert {component.component_class for component in profile.components} == set(
         ExecutionProfileComponentClass
     )
@@ -2641,6 +3199,570 @@ def test_request_loop_policy_rejects_workload_secret_identity_before_session_cre
         assert provider.requests == []
 
     asyncio.run(exercise())
+
+
+def test_policy_can_automatically_adopt_exact_egress_narrowing() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-automatic-egress-narrowing"
+        store = InMemorySessionStore()
+        adapter = _AdoptionHandoffAdapter()
+        factory_identity = _test_behavior_identity("automatic-egress-narrowing-factory")
+        current_factory = _adoption_handoff_factory(
+            adapter=adapter,
+            generation=1,
+            allow_post=True,
+            execution_profile_identity=factory_identity,
+        )
+        target_factory = _adoption_handoff_factory(
+            adapter=adapter,
+            generation=2,
+            allow_post=False,
+            execution_profile_identity=factory_identity,
+        )
+        handler = _OwnedEnvironmentAdoptionHandler(target_factory=target_factory)
+
+        original_app = CayuApp(
+            session_store=store,
+            egress_authority_adoption_handler=handler,
+            enable_logging=False,
+        )
+        original_app.register_provider(_completed_provider(), default=True)
+        original_app.register_environment_factory(
+            EnvironmentSpec(
+                name="egress",
+                execution_profile_identity=factory_identity,
+            ),
+            current_factory,
+            default=True,
+        )
+        original_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "initial")],
+                )
+            )
+        )
+
+        policy = RecordingExecutionProfilePolicy(
+            ExecutionProfilePolicyResult(
+                action=ExecutionProfilePolicyAction.ADOPT,
+                reason="Automatically apply the strictly narrower egress policy.",
+            )
+        )
+        provider = _completed_provider()
+        candidate_app = CayuApp(
+            session_store=store,
+            execution_profile_policy=policy,
+            egress_authority_adoption_handler=handler,
+            enable_logging=False,
+        )
+        candidate_app.register_provider(provider, default=True)
+        candidate_app.register_environment_factory(
+            EnvironmentSpec(
+                name="egress",
+                execution_profile_identity=factory_identity,
+            ),
+            target_factory,
+            default=True,
+        )
+        candidate_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        emitted = await _collect(
+            candidate_app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "continue under the narrower policy")],
+                )
+            )
+        )
+
+        assert len(policy.requests) == 1
+        assert policy.requests[0].intent is None
+        assert handler.calls == 1
+        assert adapter.cutover_calls == 1
+        assert len(provider.requests) == 1
+        decision = handler.decisions[0]
+        assert decision.egress_authority_change is EgressAuthorityChangeKind.NARROWER
+        assert decision.authority_decision is ExecutionProfileAuthorityDecision.NOT_REQUIRED
+        assert decision.actor is not None
+        assert decision.actor.source is ResolutionActorSource.SYSTEM
+        assert decision.actor.subject == (
+            "cayu:execution-profile-policy:test:execution-profile-policy:v1"
+        )
+        assert EventType.EGRESS_AUTHORITY_ACTIVATED in {
+            event.type for event in await store.load_events(session_id)
+        }
+        assert EventType.SESSION_COMPLETED in {event.type for event in emitted}
+
+    asyncio.run(exercise())
+
+
+def test_same_permissions_new_egress_generation_cannot_use_compatible_reuse() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-same-authority-next-generation"
+        store = InMemorySessionStore()
+        factory_identity = _test_behavior_identity("same-authority-generation-factory")
+        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app.register_provider(_completed_provider(), default=True)
+        original_app.register_environment_factory(
+            EnvironmentSpec(
+                name="egress",
+                execution_profile_identity=factory_identity,
+            ),
+            IdentityConfiguredEgressEnvironmentFactory(
+                generation=1,
+                allow_post=False,
+            ),
+            default=True,
+        )
+        original_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "initial")],
+                )
+            )
+        )
+
+        policy = RecordingExecutionProfilePolicy(
+            ExecutionProfilePolicyResult(
+                action=ExecutionProfilePolicyAction.COMPATIBLE_REUSE,
+                reason="The effective permissions are unchanged.",
+            )
+        )
+        provider = _completed_provider()
+        handler = NoopEgressAuthorityAdoptionHandler()
+        candidate_app = CayuApp(
+            session_store=store,
+            execution_profile_policy=policy,
+            egress_authority_adoption_handler=handler,
+            enable_logging=False,
+        )
+        candidate_app.register_provider(provider, default=True)
+        candidate_app.register_environment_factory(
+            EnvironmentSpec(
+                name="egress",
+                execution_profile_identity=factory_identity,
+            ),
+            IdentityConfiguredEgressEnvironmentFactory(
+                generation=2,
+                allow_post=False,
+            ),
+            default=True,
+        )
+        candidate_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                candidate_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "continue")],
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.EGRESS_AUTHORITY,
+        )
+        assert len(policy.requests) == 1
+        assert policy.requests[0].egress_authority_change is EgressAuthorityChangeKind.UNCHANGED
+        assert handler.calls == 0
+        assert provider.requests == []
+        events = await store.load_events(session_id)
+        assert events[-1].type is EventType.SESSION_EXECUTION_PROFILE_REJECTED
+        assert events[-1].payload["decision"] == ExecutionProfileDecisionKind.REJECTED
+        assert all(
+            event.type
+            not in {
+                EventType.EGRESS_AUTHORITY_AUTHORIZED,
+                EventType.EGRESS_AUTHORITY_INSTALLING,
+                EventType.EGRESS_AUTHORITY_ACTIVATED,
+            }
+            for event in events
+        )
+
+    asyncio.run(exercise())
+
+
+def test_adoption_handler_cannot_publish_a_different_source_allocation() -> None:
+    class MismatchedSourceHandler(EgressAuthorityAdoptionHandler):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def adopt(
+            self,
+            decision: ExecutionProfileDecision,
+            *,
+            coordinator: EgressAuthorityTransitionCoordinator,
+            expected_environment_fingerprint: str,
+            factory_result: EnvironmentFactoryResult,
+        ) -> EgressAuthorityAdoptionResult:
+            del factory_result
+            self.calls += 1
+            assert expected_environment_fingerprint == "2" * 64
+            authorized = authorized_egress_authority_transition(
+                decision=decision,
+                transition_id="mismatched-source-allocation",
+                environment_name="egress",
+                owner_fingerprint=egress_authority_owner_fingerprint("private-owner"),
+                source_environment_fingerprint="f" * 64,
+            )
+            await coordinator.authorize(authorized)
+            raise AssertionError("A mismatched source allocation was durably authorized.")
+
+    async def exercise() -> None:
+        session_id = "execution-profile-mismatched-source-allocation"
+        store = InMemorySessionStore()
+        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app.register_provider(_completed_provider(), default=True)
+        original_app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            IdentityConfiguredEgressEnvironmentFactory(
+                generation=1,
+                allow_post=False,
+            ),
+            default=True,
+        )
+        original_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "initial")],
+                )
+            )
+        )
+
+        provider = _completed_provider()
+        handler = MismatchedSourceHandler()
+        _park_test_egress_allocation(handler, session_id=session_id)
+        candidate_app = CayuApp(
+            session_store=store,
+            execution_profile_policy=RecordingExecutionProfilePolicy(
+                ExecutionProfilePolicyResult(
+                    action=ExecutionProfilePolicyAction.ADOPT,
+                    reason="Authorize generation two.",
+                    authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+                )
+            ),
+            egress_authority_adoption_handler=handler,
+            enable_logging=False,
+        )
+        candidate_app.register_provider(provider, default=True)
+        candidate_app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            IdentityConfiguredEgressEnvironmentFactory(
+                generation=2,
+                allow_post=True,
+            ),
+            default=True,
+        )
+        candidate_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        with pytest.raises(
+            EgressAuthorityTransitionConflict,
+            match="retained backend allocation",
+        ):
+            await _collect(
+                candidate_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "continue")],
+                        profile_adoption=ExecutionProfileAdoptionIntent(
+                            idempotency_key="mismatched-source-allocation",
+                            reason="Adopt generation two.",
+                            requested_by=ResolutionActor(
+                                subject="deployment-controller",
+                                source=ResolutionActorSource.SYSTEM,
+                            ),
+                        ),
+                    )
+                )
+            )
+
+        assert handler.calls == 1
+        assert provider.requests == []
+        transition_store = SessionCheckpointEgressAuthorityTransitionStore(store)
+        assert await transition_store.load(session_id) is None
+        events = await store.load_events(session_id)
+        assert all(
+            event.type
+            not in {
+                EventType.EGRESS_AUTHORITY_REQUESTED,
+                EventType.EGRESS_AUTHORITY_AUTHORIZED,
+                EventType.EGRESS_AUTHORITY_INSTALLING,
+                EventType.EGRESS_AUTHORITY_ACTIVATED,
+            }
+            for event in events
+        )
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("authority_field", "secret", "factory_options"),
+    (
+        (
+            "authority_source",
+            "egress-authority-source-secret-canary",
+            {"authority_source": "egress-authority-source-secret-canary"},
+        ),
+        (
+            "policy_version",
+            "egress-authority-version-secret-canary",
+            {"policy_version": "egress-authority-version-secret-canary"},
+        ),
+        (
+            "policy_name",
+            "egress-authority-policy-secret-canary",
+            {"policy_name": "egress-authority-policy-secret-canary"},
+        ),
+        (
+            "credential_kind",
+            "stripe_bearer",
+            {"credential_kind": "stripe_bearer"},
+        ),
+    ),
+)
+def test_egress_authority_identity_rejects_workload_secrets_before_persistence(
+    authority_field: str,
+    secret: str,
+    factory_options: dict[str, str],
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def exercise() -> tuple[Exception, list[warnings.WarningMessage]]:
+        session_id = f"egress-secret-free-authority-{authority_field}"
+        store = InMemorySessionStore()
+        adapter = _AdoptionHandoffAdapter()
+        factory = _adoption_handoff_factory(
+            adapter=adapter,
+            generation=1,
+            allow_post=False,
+            **factory_options,
+        )
+        provider = _completed_provider()
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        with (
+            warnings.catch_warnings(record=True) as emitted,
+            pytest.raises(ValueError) as caught,
+        ):
+            warnings.simplefilter("always")
+            await _collect(
+                app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "initial")],
+                    )
+                )
+            )
+
+        assert await store.load(session_id) is None
+        assert await store.query_events() == []
+        assert provider.requests == []
+        assert adapter.create_calls == 0
+        return caught.value, emitted
+
+    with caplog.at_level(logging.WARNING):
+        caught, emitted = asyncio.run(exercise())
+    captured = capsys.readouterr()
+    diagnostic_output = "\n".join(
+        (
+            str(caught),
+            repr(caught),
+            caplog.text,
+            captured.out,
+            captured.err,
+            *(str(item.message) for item in emitted),
+        )
+    )
+    assert emitted == []
+    assert secret not in diagnostic_output
+
+
+@pytest.mark.parametrize(
+    "secret",
+    ("version", "cayu.egress-authority", "http", "exact", "fresh_authority_path"),
+)
+def test_egress_authority_fixed_controls_do_not_collide_with_short_secrets(
+    secret: str,
+) -> None:
+    async def exercise() -> None:
+        store = InMemorySessionStore()
+        provider = _completed_provider()
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            IdentityConfiguredEgressEnvironmentFactory(
+                generation=1,
+                allow_post=False,
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await _collect(
+            app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="fixed-control-collision-session",
+                    messages=[Message.text("user", "initial")],
+                )
+            )
+        )
+
+        assert EventType.SESSION_COMPLETED in {event.type for event in events}
+        assert len(provider.requests) == 1
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "secret",
+    ("version", "cayu.egress-authority", "http", "exact", "fresh_authority_path"),
+)
+def test_egress_authority_fixed_control_text_remains_untrusted_in_application_fields(
+    secret: str,
+) -> None:
+    async def exercise() -> None:
+        store = InMemorySessionStore()
+        adapter = _AdoptionHandoffAdapter()
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        provider = _completed_provider()
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            _adoption_handoff_factory(
+                adapter=adapter,
+                generation=1,
+                allow_post=False,
+                authority_source=secret,
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        with pytest.raises(ValueError, match="contains a workload secret"):
+            await _collect(
+                app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=f"egress-authority-untrusted-control-{len(secret)}",
+                        messages=[Message.text("user", "initial")],
+                    )
+                )
+            )
+
+        assert await store.query_events() == []
+        assert provider.requests == []
+        assert adapter.create_calls == 0
+
+    asyncio.run(exercise())
+
+
+def test_egress_authority_copy_rejects_mutated_values_without_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = "egress-authority-mutated-value-secret-canary"
+
+    class SecretBearingValue:
+        def __repr__(self) -> str:
+            return secret
+
+    async def exercise() -> tuple[Exception, list[warnings.WarningMessage]]:
+        session_id = "egress-mutated-authority-diagnostic-boundary"
+        store = InMemorySessionStore()
+        adapter = _AdoptionHandoffAdapter()
+        factory = _adoption_handoff_factory(
+            adapter=adapter,
+            generation=1,
+            allow_post=False,
+        )
+        object.__setattr__(
+            factory._egress_authority_identity,
+            "policy_version",
+            SecretBearingValue(),
+        )
+        provider = _completed_provider()
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        with (
+            warnings.catch_warnings(record=True) as emitted,
+            pytest.raises(ValidationError) as caught,
+        ):
+            warnings.simplefilter("always")
+            await _collect(
+                app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "initial")],
+                    )
+                )
+            )
+
+        assert await store.load(session_id) is None
+        assert await store.query_events() == []
+        assert provider.requests == []
+        assert adapter.create_calls == 0
+        return caught.value, emitted
+
+    with caplog.at_level(logging.WARNING):
+        caught, emitted = asyncio.run(exercise())
+    captured = capsys.readouterr()
+    diagnostic_output = "\n".join(
+        (
+            str(caught),
+            repr(caught),
+            caplog.text,
+            captured.out,
+            captured.err,
+            *(str(item.message) for item in emitted),
+        )
+    )
+    assert emitted == []
+    assert secret not in diagnostic_output
 
 
 @pytest.mark.parametrize(
@@ -4344,6 +5466,825 @@ def test_explicit_authorized_tool_profile_adoption_is_atomic_and_replayable() ->
             )
         )
         assert len(restarted_provider.requests) == 1
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("handler_factory", "message", "session_unchanged"),
+    (
+        (None, "cutover handler", True),
+        (lambda _store: NoopEgressAuthorityAdoptionHandler(), "environment handoff", True),
+        (
+            lambda store: RecordingEgressAuthorityAdoptionHandler(store),
+            "environment handoff",
+            False,
+        ),
+    ),
+)
+def test_egress_profile_adoption_waits_for_exact_active_cutover_before_work(
+    handler_factory: (Callable[[InMemorySessionStore], EgressAuthorityAdoptionHandler] | None),
+    message: str,
+    session_unchanged: bool,
+) -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-egress-cutover-gate"
+        store = InMemorySessionStore()
+        original_factory = IdentityConfiguredEgressEnvironmentFactory(
+            generation=1,
+            allow_post=False,
+        )
+        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app.register_provider(_completed_provider(), default=True)
+        original_app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            original_factory,
+            default=True,
+        )
+        original_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "initial")],
+                )
+            )
+        )
+        before = await store.load(session_id)
+        assert before is not None
+
+        policy = RecordingExecutionProfilePolicy(
+            ExecutionProfilePolicyResult(
+                action=ExecutionProfilePolicyAction.ADOPT,
+                reason="The application authorized the next egress generation.",
+                authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+            )
+        )
+        candidate_factory = IdentityConfiguredEgressEnvironmentFactory(
+            generation=2,
+            allow_post=True,
+        )
+        candidate_provider = _completed_provider()
+        handler = None if handler_factory is None else handler_factory(store)
+        if handler is not None:
+            _park_test_egress_allocation(handler, session_id=session_id)
+        candidate_app = CayuApp(
+            session_store=store,
+            execution_profile_policy=policy,
+            egress_authority_adoption_handler=handler,
+            enable_logging=False,
+        )
+        candidate_app.register_provider(candidate_provider, default=True)
+        candidate_app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            candidate_factory,
+            default=True,
+        )
+        candidate_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        intent = ExecutionProfileAdoptionIntent(
+            idempotency_key="egress-generation-2",
+            reason="Adopt the reviewed egress authority.",
+            requested_by=ResolutionActor(
+                subject="deployment-controller",
+                source=ResolutionActorSource.SYSTEM,
+            ),
+        )
+
+        with pytest.raises(EgressAuthorityTransitionConflict, match=message):
+            await _collect(
+                candidate_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "use the wider policy")],
+                        profile_adoption=intent,
+                    )
+                )
+            )
+
+        after = await store.load(session_id)
+        if session_unchanged:
+            assert after == before
+        else:
+            assert after is not None
+            assert after.status == before.status
+        assert candidate_provider.requests == []
+        assert candidate_factory.create_calls == 0
+        assert len(policy.requests) == 1
+        events = await store.load_events(session_id)
+        assert all(
+            event.type is not EventType.SESSION_EXECUTION_PROFILE_DECIDED
+            or event.payload.get("idempotency_identity") != intent.idempotency_key
+            for event in events
+        )
+
+    asyncio.run(exercise())
+
+
+def test_old_profile_cannot_resume_after_cutover_activated_without_admission() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-egress-active-before-admission"
+        store = InMemorySessionStore()
+        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_provider = _completed_provider()
+        original_app.register_provider(original_provider, default=True)
+        original_app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            IdentityConfiguredEgressEnvironmentFactory(generation=1, allow_post=False),
+            default=True,
+        )
+        original_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "initial")],
+                )
+            )
+        )
+
+        handler = RecordingEgressAuthorityAdoptionHandler(store)
+        _park_test_egress_allocation(handler, session_id=session_id)
+        candidate_app = CayuApp(
+            session_store=store,
+            execution_profile_policy=RecordingExecutionProfilePolicy(
+                ExecutionProfilePolicyResult(
+                    action=ExecutionProfilePolicyAction.ADOPT,
+                    reason="Authorize generation two.",
+                    authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+                )
+            ),
+            egress_authority_adoption_handler=handler,
+            enable_logging=False,
+        )
+        candidate_app.register_provider(_completed_provider(), default=True)
+        candidate_app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            IdentityConfiguredEgressEnvironmentFactory(generation=2, allow_post=True),
+            default=True,
+        )
+        candidate_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        with pytest.raises(EgressAuthorityTransitionConflict, match="environment handoff"):
+            await _collect(
+                candidate_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "activate generation two")],
+                        profile_adoption=ExecutionProfileAdoptionIntent(
+                            idempotency_key="egress-active-before-admission",
+                            reason="Adopt generation two.",
+                            requested_by=ResolutionActor(
+                                subject="deployment-controller",
+                                source=ResolutionActorSource.SYSTEM,
+                            ),
+                        ),
+                    )
+                )
+            )
+
+        with pytest.raises(
+            EgressAuthorityTransitionConflict,
+            match="does not match durable egress authority",
+        ):
+            await _collect(
+                original_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "continue under generation one")],
+                    )
+                )
+            )
+        assert len(original_provider.requests) == 1
+        session = await store.load(session_id)
+        assert session is not None
+        assert session.status is SessionStatus.COMPLETED
+
+    asyncio.run(exercise())
+
+
+def test_real_resume_rejects_active_receipt_for_different_invocation_environment() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-egress-cutover-runtime"
+        store = InMemorySessionStore()
+        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app.register_provider(_completed_provider(), default=True)
+        original_app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            IdentityConfiguredEgressEnvironmentFactory(generation=1, allow_post=False),
+            default=True,
+        )
+        original_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "initial")],
+                )
+            )
+        )
+
+        policy = RecordingExecutionProfilePolicy(
+            ExecutionProfilePolicyResult(
+                action=ExecutionProfilePolicyAction.ADOPT,
+                reason="The application authorized the next egress generation.",
+                authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+            )
+        )
+        handler = RuntimeVerifiedEgressAuthorityAdoptionHandler(store)
+        _park_test_egress_allocation(handler, session_id=session_id)
+        provider = _completed_provider(batches=2)
+        candidate_factory = IdentityConfiguredEgressEnvironmentFactory(
+            generation=2,
+            allow_post=True,
+        )
+        app = CayuApp(
+            session_store=store,
+            execution_profile_policy=policy,
+            egress_authority_adoption_handler=handler,
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            candidate_factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        with pytest.raises(EgressAuthorityTransitionConflict, match="non-managed"):
+            await _collect(
+                app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "use the wider policy")],
+                        profile_adoption=ExecutionProfileAdoptionIntent(
+                            idempotency_key="egress-runtime-generation-2",
+                            reason="Adopt the reviewed egress authority.",
+                            requested_by=ResolutionActor(
+                                subject="deployment-controller",
+                                source=ResolutionActorSource.SYSTEM,
+                            ),
+                        ),
+                    )
+                )
+            )
+
+        assert len(handler.decisions) == 1
+        assert provider.requests == []
+        assert candidate_factory.create_calls == 0
+        events = await store.load_events(session_id)
+        event_types = [event.type for event in events]
+        assert EventType.EGRESS_AUTHORITY_ACTIVATED in event_types
+        assert EventType.SESSION_FAILED not in event_types
+
+    asyncio.run(exercise())
+
+
+def test_real_resume_adopts_exact_cutover_environment_without_second_factory_call() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-egress-owned-environment-handoff"
+        store = InMemorySessionStore()
+        adapter = _AdoptionHandoffAdapter()
+        current_factory = _adoption_handoff_factory(
+            adapter=adapter,
+            generation=1,
+            allow_post=False,
+        )
+        target_factory = _adoption_handoff_factory(
+            adapter=adapter,
+            generation=2,
+            allow_post=True,
+        )
+        handler = _OwnedEnvironmentAdoptionHandler(target_factory=target_factory)
+
+        original_app = CayuApp(
+            session_store=store,
+            egress_authority_adoption_handler=handler,
+            enable_logging=False,
+        )
+        original_app.register_provider(_completed_provider(), default=True)
+        original_app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            current_factory,
+            default=True,
+        )
+        original_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "initial")],
+                )
+            )
+        )
+
+        create_calls_before_resume = adapter.create_calls
+        provider = _completed_provider(batches=2)
+        event_sink = InMemoryEventSink()
+        candidate_app = CayuApp(
+            session_store=store,
+            execution_profile_policy=RecordingExecutionProfilePolicy(
+                ExecutionProfilePolicyResult(
+                    action=ExecutionProfilePolicyAction.ADOPT,
+                    reason="Authorize the exact next egress generation.",
+                    authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+                )
+            ),
+            egress_authority_adoption_handler=handler,
+            event_sinks=(event_sink,),
+            enable_logging=False,
+        )
+        candidate_app.register_provider(provider, default=True)
+        candidate_app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            target_factory,
+            default=True,
+        )
+        candidate_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        emitted = await _collect(
+            candidate_app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "continue")],
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key="owned-environment-generation-2",
+                        reason="Adopt the exact retained allocation.",
+                        requested_by=ResolutionActor(
+                            subject="deployment-controller",
+                            source=ResolutionActorSource.SYSTEM,
+                        ),
+                    ),
+                )
+            )
+        )
+
+        exact_reuse_events = await _collect(
+            candidate_app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "continue once more")],
+                )
+            )
+        )
+
+        assert handler.calls == 1
+        assert adapter.cutover_calls == 1
+        assert adapter.renewal_calls == 1
+        assert adapter.credentialless_authority_renewed is True
+        assert adapter.create_calls == create_calls_before_resume
+        assert len(provider.requests) == 2
+        assert EventType.EGRESS_AUTHORITY_ACTIVATED in {
+            event.type for event in await store.load_events(session_id)
+        }
+        assert EventType.EGRESS_AUTHORITY_ACTIVATED in {event.type for event in event_sink.events}
+        assert EventType.SESSION_COMPLETED in {event.type for event in emitted}
+        assert EventType.SESSION_COMPLETED in {event.type for event in exact_reuse_events}
+
+    asyncio.run(exercise())
+
+
+def test_parking_transfers_exact_allocation_before_redelivering_cancellation() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-egress-parking-cancellation"
+        store = InMemorySessionStore()
+        park_started = asyncio.Event()
+        park_release = asyncio.Event()
+        adapter = _AdoptionHandoffAdapter(
+            park_started=park_started,
+            park_release=park_release,
+        )
+        current_factory = _adoption_handoff_factory(
+            adapter=adapter,
+            generation=1,
+            allow_post=False,
+        )
+        target_factory = _adoption_handoff_factory(
+            adapter=adapter,
+            generation=2,
+            allow_post=True,
+        )
+        handler = _OwnedEnvironmentAdoptionHandler(target_factory=target_factory)
+        source_app = CayuApp(
+            session_store=store,
+            egress_authority_adoption_handler=handler,
+            enable_logging=False,
+        )
+        source_app.register_provider(_completed_provider(), default=True)
+        source_app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            current_factory,
+            default=True,
+        )
+        source_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        source_task = asyncio.create_task(
+            _collect(
+                source_app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=session_id,
+                        messages=[Message.text("user", "initial")],
+                    )
+                )
+            )
+        )
+        await asyncio.wait_for(park_started.wait(), timeout=2)
+        source_task.cancel()
+        assert source_task.cancelling() == 1
+        park_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await source_task
+        assert source_task.cancelled()
+        assert source_task.cancelling() == 1
+
+        candidate_provider = _completed_provider()
+        candidate_app = CayuApp(
+            session_store=store,
+            execution_profile_policy=RecordingExecutionProfilePolicy(
+                ExecutionProfilePolicyResult(
+                    action=ExecutionProfilePolicyAction.ADOPT,
+                    reason="Authorize the exact retained allocation.",
+                    authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+                )
+            ),
+            egress_authority_adoption_handler=handler,
+            enable_logging=False,
+        )
+        candidate_app.register_provider(candidate_provider, default=True)
+        candidate_app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            target_factory,
+            default=True,
+        )
+        candidate_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        events = await _collect(
+            candidate_app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "continue")],
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key="parking-cancellation-generation-2",
+                        reason="Adopt the exact retained allocation.",
+                        requested_by=ResolutionActor(
+                            subject="deployment-controller",
+                            source=ResolutionActorSource.SYSTEM,
+                        ),
+                    ),
+                )
+            )
+        )
+
+        assert handler.calls == 1
+        assert adapter.create_calls == 1
+        assert adapter.cutover_calls == 1
+        assert len(candidate_provider.requests) == 1
+        assert EventType.SESSION_COMPLETED in {event.type for event in events}
+
+    asyncio.run(exercise())
+
+
+def test_real_resume_rejects_fresh_allocation_before_cutover_or_work() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-egress-fresh-allocation-rejected"
+        store = InMemorySessionStore()
+        retained_adapter = _AdoptionHandoffAdapter(fingerprint="a" * 64)
+        original_factory = _adoption_handoff_factory(
+            adapter=retained_adapter,
+            generation=1,
+            allow_post=False,
+        )
+        fresh_adapter = _AdoptionHandoffAdapter(fingerprint="b" * 64)
+        fresh_factory = _adoption_handoff_factory(
+            adapter=fresh_adapter,
+            generation=1,
+            allow_post=False,
+        )
+        target_factory = _adoption_handoff_factory(
+            adapter=fresh_adapter,
+            generation=2,
+            allow_post=True,
+        )
+        fresh_result = await fresh_factory.create(
+            EnvironmentFactoryRequest(
+                session_id=session_id,
+                agent_name="assistant",
+                environment_name="egress",
+            )
+        )
+        handler = _OwnedEnvironmentAdoptionHandler(
+            target_factory=target_factory,
+            factory_result_override=fresh_result,
+        )
+        original_app = CayuApp(
+            session_store=store,
+            egress_authority_adoption_handler=handler,
+            enable_logging=False,
+        )
+        original_app.register_provider(_completed_provider(), default=True)
+        original_app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            original_factory,
+            default=True,
+        )
+        original_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "initial")],
+                )
+            )
+        )
+
+        provider = _completed_provider()
+        candidate_app = CayuApp(
+            session_store=store,
+            execution_profile_policy=RecordingExecutionProfilePolicy(
+                ExecutionProfilePolicyResult(
+                    action=ExecutionProfilePolicyAction.ADOPT,
+                    reason="Authorize generation two on the retained allocation.",
+                    authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+                )
+            ),
+            egress_authority_adoption_handler=handler,
+            enable_logging=False,
+        )
+        candidate_app.register_provider(provider, default=True)
+        candidate_app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            target_factory,
+            default=True,
+        )
+        candidate_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        with pytest.raises(
+            EgressAuthorityTransitionConflict,
+            match="fresh backend allocation",
+        ):
+            await _collect(
+                candidate_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "continue")],
+                        profile_adoption=ExecutionProfileAdoptionIntent(
+                            idempotency_key="reject-fresh-environment-generation-2",
+                            reason="Adopt the next egress generation.",
+                            requested_by=ResolutionActor(
+                                subject="deployment-controller",
+                                source=ResolutionActorSource.SYSTEM,
+                            ),
+                        ),
+                    )
+                )
+            )
+
+        assert handler.calls == 1
+        assert fresh_adapter.cutover_calls == 0
+        assert provider.requests == []
+        transition_store = SessionCheckpointEgressAuthorityTransitionStore(store)
+        assert await transition_store.load(session_id) is None
+        events = await store.load_events(session_id)
+        assert all(
+            event.type
+            not in {
+                EventType.EGRESS_AUTHORITY_AUTHORIZED,
+                EventType.EGRESS_AUTHORITY_INSTALLING,
+                EventType.EGRESS_AUTHORITY_ACTIVATED,
+            }
+            for event in events
+        )
+        assert fresh_result.release is not None
+        await fresh_result.release(EnvironmentFactoryReleaseAction.DISCARD)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "secret_location",
+    ("reason", "actor_subject", "actor_claim", "policy_reason"),
+)
+def test_egress_adoption_sanitizes_audit_secrets_before_transition_publication(
+    secret_location: str,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def exercise() -> None:
+        secret = "egress-adoption-audit-secret-canary"
+        session_id = f"egress-secret-{secret_location}"
+        store = InMemorySessionStore()
+        adapter = _AdoptionHandoffAdapter()
+        current_factory = _adoption_handoff_factory(
+            adapter=adapter,
+            generation=1,
+            allow_post=False,
+        )
+        target_factory = _adoption_handoff_factory(
+            adapter=adapter,
+            generation=2,
+            allow_post=True,
+        )
+        handler = _OwnedEnvironmentAdoptionHandler(target_factory=target_factory)
+        original_app = CayuApp(
+            session_store=store,
+            egress_authority_adoption_handler=handler,
+            enable_logging=False,
+        )
+        original_app.register_provider(_completed_provider(), default=True)
+        original_app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            current_factory,
+            default=True,
+        )
+        original_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "initial")],
+                )
+            )
+        )
+
+        actor = ResolutionActor(
+            subject=(secret if secret_location == "actor_subject" else "controller"),
+            source=ResolutionActorSource.SYSTEM,
+            claims=({"token": secret} if secret_location == "actor_claim" else {}),
+        )
+        intent = ExecutionProfileAdoptionIntent(
+            idempotency_key=f"secret-{secret_location}",
+            reason=(secret if secret_location == "reason" else "Adopt generation two."),
+            requested_by=actor,
+        )
+        event_sink = InMemoryEventSink()
+        candidate_app = CayuApp(
+            session_store=store,
+            execution_profile_policy=RecordingExecutionProfilePolicy(
+                ExecutionProfilePolicyResult(
+                    action=ExecutionProfilePolicyAction.ADOPT,
+                    reason=(
+                        secret
+                        if secret_location == "policy_reason"
+                        else "Authorize generation two."
+                    ),
+                    authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+                )
+            ),
+            egress_authority_adoption_handler=handler,
+            event_sinks=(event_sink,),
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        candidate_app.register_provider(_completed_provider(), default=True)
+        candidate_app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            target_factory,
+            default=True,
+        )
+        candidate_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        with warnings.catch_warnings(record=True) as captured_warnings:
+            emitted = await _collect(
+                candidate_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "continue")],
+                        profile_adoption=intent,
+                    )
+                )
+            )
+
+        checkpoint = await store.load_checkpoint(session_id)
+        events = await store.load_events(session_id)
+        assert handler.calls == 1
+        assert len(handler.decisions) == 1
+        assert EventType.SESSION_COMPLETED in {event.type for event in emitted}
+        assert EventType.EGRESS_AUTHORITY_ACTIVATED in {event.type for event in events}
+        assert EventType.EGRESS_AUTHORITY_ACTIVATED in {event.type for event in event_sink.events}
+        captured_stdio = capsys.readouterr()
+        diagnostic_text = "\n".join(
+            [
+                caplog.text,
+                captured_stdio.out,
+                captured_stdio.err,
+                *(str(item.message) for item in captured_warnings),
+                json.dumps(
+                    handler.decisions[0].model_dump(mode="json"),
+                    sort_keys=True,
+                ),
+                json.dumps(checkpoint, sort_keys=True),
+                json.dumps([event.model_dump(mode="json") for event in events], sort_keys=True),
+                json.dumps(
+                    [event.model_dump(mode="json") for event in event_sink.events],
+                    sort_keys=True,
+                ),
+            ]
+        )
+        assert secret not in diagnostic_text
+
+    asyncio.run(exercise())
+
+
+def test_egress_profile_admission_rejects_transition_changed_after_backend_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def exercise() -> None:
+        async def accept_test_environment(**_kwargs) -> None:
+            return None
+
+        monkeypatch.setattr(
+            session_engine_module,
+            "require_active_egress_transition_environment",
+            accept_test_environment,
+        )
+        session_id = "execution-profile-egress-cutover-admission-race"
+        store = CompetingEgressTransitionAdmissionStore()
+        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app.register_provider(_completed_provider(), default=True)
+        original_app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            IdentityConfiguredEgressEnvironmentFactory(generation=1, allow_post=False),
+            default=True,
+        )
+        original_app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "initial")],
+                )
+            )
+        )
+
+        policy = RecordingExecutionProfilePolicy(
+            ExecutionProfilePolicyResult(
+                action=ExecutionProfilePolicyAction.ADOPT,
+                reason="The application authorized the next egress generation.",
+                authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+            )
+        )
+        handler = RuntimeVerifiedEgressAuthorityAdoptionHandler(store)
+        _park_test_egress_allocation(handler, session_id=session_id)
+        provider = _completed_provider()
+        candidate_factory = IdentityConfiguredEgressEnvironmentFactory(
+            generation=2,
+            allow_post=True,
+        )
+        app = CayuApp(
+            session_store=store,
+            execution_profile_policy=policy,
+            egress_authority_adoption_handler=handler,
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="egress"),
+            candidate_factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        store.competing_target = IdentityConfiguredEgressEnvironmentFactory(
+            generation=3,
+            allow_post=True,
+        ).egress_authority_identity
+
+        with pytest.raises(
+            EgressAuthorityTransitionConflict,
+            match="changed before invocation admission",
+        ):
+            await _collect(
+                app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "use generation two")],
+                        profile_adoption=ExecutionProfileAdoptionIntent(
+                            idempotency_key="egress-admission-race-generation-2",
+                            reason="Adopt the reviewed egress authority.",
+                            requested_by=ResolutionActor(
+                                subject="deployment-controller",
+                                source=ResolutionActorSource.SYSTEM,
+                            ),
+                        ),
+                    )
+                )
+            )
+
+        session = await store.load(session_id)
+        assert session is not None
+        assert session.status is SessionStatus.COMPLETED
+        assert len(handler.decisions) == 1
+        assert provider.requests == []
+        assert candidate_factory.create_calls == 0
+        transition = await SessionCheckpointEgressAuthorityTransitionStore(store).load(session_id)
+        assert transition is not None
+        assert transition.state is EgressAuthorityTransitionState.AUTHORIZED
+        assert transition.target_authority.generation == 3
 
     asyncio.run(exercise())
 

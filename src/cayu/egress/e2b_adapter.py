@@ -5,6 +5,7 @@ import importlib
 import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime
+from hashlib import sha256
 from ipaddress import ip_address
 from pathlib import Path
 from types import ModuleType
@@ -21,16 +22,30 @@ from cayu.egress._remote_adapter import (
 )
 from cayu.egress.adapter import (
     DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
+    EgressAuthorityCutoverRequest,
+    EgressAuthorityCutoverResult,
+    EgressAuthorityRenewalRequest,
     EgressBinding,
     RunnerFinalizationResult,
     SandboxEgressAdapter,
     VirtualEgressRunnerRequest,
     _virtual_egress_execution_capability_evidence,
+    retain_predecessor_binding_cleanup,
+)
+from cayu.egress.authority import (
+    EgressAuthorityCutoverReceipt,
+    EgressAuthorityCutoverStrategy,
+    _build_adapter_verified_egress_authority_cutover_receipt,
 )
 from cayu.egress.broker import TransparentEgressBroker
-from cayu.egress.errors import UnsupportedEgressCapabilityError, UnsupportedEgressError
+from cayu.egress.errors import (
+    EgressAuthorityCutoverNeedsAttention,
+    UnsupportedEgressCapabilityError,
+    UnsupportedEgressError,
+)
 from cayu.egress.grants import VirtualCredentialGrant
 from cayu.egress.proxy_exposure import ProxyExposure
+from cayu.egress.proxy_server import SessionCertificateAuthority
 from cayu.environments.admission import ExecutionCapabilityEvidence
 from cayu.runners.base import Runner
 from cayu.runners.e2b import (
@@ -53,6 +68,7 @@ _RESERVED_E2B_OPTIONS = {
     "guest_probe",
     "guest_setup",
     "guest_user",
+    "handoff_id",
     "handoff_timeout_s",
     "network",
     "sandbox_timeout_s",
@@ -72,6 +88,9 @@ class E2BEgressAdapter(SandboxEgressAdapter):
 
     runner_kind = "e2b"
     process_external_allocation = True
+    allocation_provider = "e2b"
+    allocation_adapter_generation = "virtual-egress-hardened-v1"
+    egress_authority_cutover_strategy = EgressAuthorityCutoverStrategy.FRESH_AUTHORITY_PATH
 
     def execution_capability_evidence(
         self,
@@ -145,6 +164,21 @@ class E2BEgressAdapter(SandboxEgressAdapter):
         grants: Sequence[VirtualCredentialGrant],
         broker: TransparentEgressBroker,
     ) -> EgressBinding:
+        return await self._prepare(
+            session_id=session_id,
+            grants=grants,
+            broker=broker,
+        )
+
+    async def _prepare(
+        self,
+        *,
+        session_id: str,
+        grants: Sequence[VirtualCredentialGrant],
+        broker: TransparentEgressBroker,
+        certificate_authority: SessionCertificateAuthority | None = None,
+        owns_certificate_authority: bool = True,
+    ) -> EgressBinding:
         return await prepare_exposed_proxy_binding(
             runner_kind=self.runner_kind,
             session_id=session_id,
@@ -154,9 +188,41 @@ class E2BEgressAdapter(SandboxEgressAdapter):
             bind_host=self._bind_host,
             loop=self._loop,
             proxy_server_factory=self._proxy_server_factory,
+            certificate_authority=certificate_authority,
+            owns_certificate_authority=owns_certificate_authority,
         )
 
     async def create_runner(self, request: VirtualEgressRunnerRequest) -> Runner:
+        return await self._materialize_runner(
+            request,
+            allow_create=True,
+            handoff_id=None,
+        )
+
+    async def create_or_recover_runner(
+        self,
+        request: VirtualEgressRunnerRequest,
+        *,
+        allow_create: bool,
+    ) -> Runner:
+        if type(allow_create) is not bool:
+            raise TypeError("E2B recoverable creation requires an exact create decision.")
+        handoff_id = request.allocation_id
+        if type(handoff_id) is not str:
+            raise TypeError("E2B recoverable creation requires a durable allocation id.")
+        return await self._materialize_runner(
+            request,
+            allow_create=allow_create,
+            handoff_id=handoff_id,
+        )
+
+    async def _materialize_runner(
+        self,
+        request: VirtualEgressRunnerRequest,
+        *,
+        allow_create: bool,
+        handoff_id: str | None,
+    ) -> Runner:
         if request.runner_kind != self.runner_kind:
             raise UnsupportedEgressError(
                 f"E2B adapter cannot create runner kind {request.runner_kind!r}."
@@ -209,14 +275,31 @@ class E2BEgressAdapter(SandboxEgressAdapter):
             + (len(request.setup_commands) * DEFAULT_REMOTE_SETUP_COMMAND_TIMEOUT_SECONDS)
         )
         try:
-            return await E2BRunner.create_hardened(
-                template=request.image,
+            if allow_create:
+                return await E2BRunner.create_hardened(
+                    template=request.image,
+                    sandbox_timeout_s=self._sandbox_timeout_s,
+                    close_action="kill",
+                    network={
+                        "allow_out": [proxy_ip],
+                        "deny_out": ["0.0.0.0/0"],
+                    },
+                    env_overlay=request.env_overlay,
+                    guest_user="user",
+                    handoff_timeout_s=handoff_timeout_s,
+                    cleanup_timeout_s=DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
+                    bootstrap=bootstrap,
+                    guest_setup=guest_setup,
+                    handoff_id=handoff_id,
+                    e2b_module=self._e2b_module(),
+                    **self._options,
+                )
+            if handoff_id is None:
+                raise TypeError("E2B recovery requires a durable handoff identity.")
+            return await E2BRunner.recover_hardened(
+                handoff_id,
                 sandbox_timeout_s=self._sandbox_timeout_s,
                 close_action="kill",
-                network={
-                    "allow_out": [proxy_ip],
-                    "deny_out": ["0.0.0.0/0"],
-                },
                 env_overlay=request.env_overlay,
                 guest_user="user",
                 handoff_timeout_s=handoff_timeout_s,
@@ -240,11 +323,291 @@ class E2BEgressAdapter(SandboxEgressAdapter):
         *,
         outcome: str | None,
     ) -> RunnerFinalizationResult:
-        del outcome
         if not isinstance(runner, E2BRunner):
             raise TypeError("E2B adapter received a different runner type.")
+        if outcome == "interrupted":
+            await runner.fence_guest_processes_for_egress_cutover()
+            await runner.detach_preserving_allocation()
+            return RunnerFinalizationResult(
+                workspace_mutations_quiescent=True,
+                allocation_preserved=True,
+            )
         await runner.close()
         return RunnerFinalizationResult(workspace_mutations_quiescent=True)
+
+    async def park_runner_for_authority_adoption(
+        self,
+        runner: Runner,
+    ) -> RunnerFinalizationResult:
+        if not isinstance(runner, E2BRunner):
+            raise TypeError("E2B adapter received a different runner type.")
+        await runner.fence_guest_processes_for_egress_cutover()
+        return RunnerFinalizationResult(
+            workspace_mutations_quiescent=True,
+            allocation_preserved=True,
+        )
+
+    async def finalize_runner_for_binding(
+        self,
+        runner: Runner,
+        *,
+        outcome: str | None,
+    ) -> RunnerFinalizationResult:
+        """Preserve interrupted E2B bindings after positively fencing guest work."""
+
+        return await self.finalize_runner(runner, outcome=outcome)
+
+    async def egress_environment_fingerprint(self, runner: Runner) -> str:
+        if not isinstance(runner, E2BRunner):
+            raise TypeError("E2B egress identity requires an E2BRunner.")
+        return _e2b_environment_fingerprint(runner.sandbox_id)
+
+    async def reconcile_authority_cutover(
+        self,
+        request: EgressAuthorityCutoverRequest,
+    ) -> EgressAuthorityCutoverReceipt | None:
+        if type(request) is not EgressAuthorityCutoverRequest:
+            raise TypeError("E2B egress reconciliation requires EgressAuthorityCutoverRequest.")
+        if not isinstance(request.runner, E2BRunner):
+            raise TypeError("E2B egress reconciliation requires an E2BRunner.")
+        observed_fingerprint = await self.egress_environment_fingerprint(request.runner)
+        if observed_fingerprint != request.environment_fingerprint:
+            return None
+        if (
+            request.current_binding.authority_fingerprint != request.target_authority.fingerprint
+            or request.current_binding.authority_generation != request.target_authority.generation
+        ):
+            return None
+        observed_at = await run_enforcement_preflight(
+            request.runner,
+            VirtualEgressRunnerRequest(
+                name=f"cayu-e2b-reconcile-{request.runner.sandbox_id}",
+                runner_kind=self.runner_kind,
+                image="e2b-existing-sandbox",
+                binding=request.current_binding,
+                env_overlay=dict(request.target_env_overlay),
+                env_overlay_secret_values_present=bool(request.target_grants),
+                ca_cert_host_path=request.ca_cert_host_path,
+                guest_ca_path=request.guest_ca_path,
+                setup_commands=(),
+                egress_destinations=request.target_egress_destinations,
+                session_id=request.session_id,
+                environment_name=request.environment_name,
+            ),
+            timeout_s=self._preflight_timeout_s,
+        )
+        self._runner_preflight_observations[request.runner] = observed_at
+        return _build_adapter_verified_egress_authority_cutover_receipt(
+            expected=request.expected_authority,
+            target=request.target_authority,
+            environment_fingerprint=observed_fingerprint,
+        )
+
+    async def cutover_authority(
+        self,
+        request: EgressAuthorityCutoverRequest,
+    ) -> EgressAuthorityCutoverResult:
+        """Rotate the Cayu exposure and broker while retaining one E2B sandbox."""
+
+        if type(request) is not EgressAuthorityCutoverRequest:
+            raise TypeError("E2B egress cutover requires EgressAuthorityCutoverRequest.")
+        if not isinstance(request.runner, E2BRunner):
+            raise TypeError("E2B egress cutover requires an E2BRunner.")
+        if request.target_authority.runner_kind != self.runner_kind:
+            raise UnsupportedEgressError("E2B egress cutover target has the wrong runner kind.")
+        if (
+            request.current_binding.authority_fingerprint != request.expected_authority.fingerprint
+            or request.current_binding.authority_generation != request.expected_authority.generation
+        ):
+            raise UnsupportedEgressError(
+                "E2B egress cutover expected authority is not the active binding."
+            )
+        authority = request.current_binding.certificate_authority
+        if not isinstance(authority, SessionCertificateAuthority):
+            raise UnsupportedEgressError(
+                "E2B egress cutover requires the active trusted session CA."
+            )
+        current_proxy_ip = _e2b_proxy_ip(request.current_binding)
+        sandbox_id = request.runner.sandbox_id
+        environment_fingerprint = _e2b_environment_fingerprint(sandbox_id)
+        if environment_fingerprint != request.environment_fingerprint:
+            raise UnsupportedEgressError(
+                "E2B egress cutover belongs to a different sandbox allocation."
+            )
+        replacement: EgressBinding | None = None
+        network_fenced = False
+        environment_mutation_dispatched = False
+        authority_transferred = False
+        revocation_cancellation: asyncio.CancelledError | None = None
+        try:
+            replacement = await self._prepare(
+                session_id=request.session_id,
+                grants=request.target_grants,
+                broker=request.target_broker,
+                certificate_authority=authority,
+                owns_certificate_authority=False,
+            )
+            replacement.bind_authority(request.target_authority)
+            target_proxy_ip = _e2b_proxy_ip(replacement)
+            environment_mutation_dispatched = True
+            await request.runner.update_egress_network({"allow_out": [], "deny_out": ["0.0.0.0/0"]})
+            network_fenced = True
+            await request.runner.fence_guest_processes_for_egress_cutover()
+            if await request.revoke_current_authority():
+                revocation_cancellation = asyncio.CancelledError()
+            request.current_binding.transfer_certificate_authority_to(replacement)
+            authority_transferred = True
+            await request.current_binding.close()
+            await request.runner.update_egress_network(
+                {
+                    "allow_out": [target_proxy_ip],
+                    "deny_out": ["0.0.0.0/0"],
+                }
+            )
+            target_env_overlay = {
+                **replacement.env,
+                **dict(request.target_env_overlay),
+            }
+            request.runner.env_overlay = target_env_overlay
+            target_runner_request = VirtualEgressRunnerRequest(
+                name=f"cayu-e2b-cutover-{sandbox_id}",
+                runner_kind=self.runner_kind,
+                image="e2b-existing-sandbox",
+                binding=replacement,
+                env_overlay=target_env_overlay,
+                env_overlay_secret_values_present=bool(request.target_grants),
+                ca_cert_host_path=request.ca_cert_host_path,
+                guest_ca_path=request.guest_ca_path,
+                setup_commands=(),
+                egress_destinations=request.target_egress_destinations,
+                session_id=request.session_id,
+                environment_name=request.environment_name,
+            )
+            observed_at = await run_enforcement_preflight(
+                request.runner,
+                target_runner_request,
+                timeout_s=self._preflight_timeout_s,
+            )
+            self._runner_preflight_observations[request.runner] = observed_at
+            if request.runner.sandbox_id != sandbox_id:
+                raise RuntimeError("E2B sandbox identity changed during egress cutover.")
+            receipt = _build_adapter_verified_egress_authority_cutover_receipt(
+                expected=request.expected_authority,
+                target=request.target_authority,
+                environment_fingerprint=environment_fingerprint,
+            )
+            return EgressAuthorityCutoverResult(
+                binding=replacement,
+                receipt=receipt,
+                cancellation=revocation_cancellation,
+                cancellation_requests_consumed=(1 if revocation_cancellation is not None else 0),
+            )
+        except BaseException as original:
+            if environment_mutation_dispatched:
+                cleanup_errors: list[BaseException] = []
+                try:
+                    await request.runner.update_egress_network(
+                        {"allow_out": [], "deny_out": ["0.0.0.0/0"]}
+                    )
+                    network_fenced = True
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                retained_binding = replacement
+                if not authority_transferred:
+                    if replacement is not None:
+                        try:
+                            await replacement.close()
+                        except BaseException as cleanup_error:
+                            cleanup_errors.append(cleanup_error)
+                    retained_binding = request.current_binding
+                elif replacement is not None:
+                    retain_predecessor_binding_cleanup(
+                        replacement,
+                        request.current_binding,
+                    )
+                attention = EgressAuthorityCutoverNeedsAttention(
+                    "E2B egress cutover dispatched a backend mutation but exact target "
+                    "activation could not be proven; the sandbox must remain network-fenced.",
+                    replacement_binding=retained_binding,
+                    environment_fingerprint=environment_fingerprint,
+                    target_authority_installed=authority_transferred,
+                    cancellation=revocation_cancellation,
+                    cancellation_requests_consumed=(
+                        1 if revocation_cancellation is not None else 0
+                    ),
+                )
+                failures = [original, *cleanup_errors]
+                cause: BaseException = (
+                    failures[0]
+                    if len(failures) == 1
+                    else BaseExceptionGroup(
+                        "E2B egress cutover and fail-closed settlement both failed.",
+                        failures,
+                    )
+                )
+                raise attention from cause
+            if replacement is not None:
+                cleanup_errors = []
+                try:
+                    await replacement.close()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if network_fenced:
+                try:
+                    await request.runner.update_egress_network(
+                        {
+                            "allow_out": [current_proxy_ip],
+                            "deny_out": ["0.0.0.0/0"],
+                        }
+                    )
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                raise BaseExceptionGroup(
+                    "E2B egress cutover failed before dispatch and cleanup also failed.",
+                    [original, *cleanup_errors],
+                ) from original
+            raise
+
+    async def renew_authority(self, request: EgressAuthorityRenewalRequest) -> str:
+        """Verify fresh grants on the unchanged sandbox and proxy route."""
+
+        if type(request) is not EgressAuthorityRenewalRequest:
+            raise TypeError("E2B egress renewal requires EgressAuthorityRenewalRequest.")
+        if not isinstance(request.runner, E2BRunner):
+            raise TypeError("E2B egress renewal requires an E2BRunner.")
+        environment_fingerprint = _e2b_environment_fingerprint(request.runner.sandbox_id)
+        if environment_fingerprint != request.environment_fingerprint:
+            raise UnsupportedEgressError(
+                "E2B egress renewal belongs to a different sandbox allocation."
+            )
+        target_env_overlay = {
+            **request.current_binding.env,
+            **dict(request.renewed_env_overlay),
+        }
+        request.runner.env_overlay = target_env_overlay
+        observed_at = await run_enforcement_preflight(
+            request.runner,
+            VirtualEgressRunnerRequest(
+                name=f"cayu-e2b-renew-{request.runner.sandbox_id}",
+                runner_kind=self.runner_kind,
+                image="e2b-existing-sandbox",
+                binding=request.current_binding,
+                env_overlay=target_env_overlay,
+                env_overlay_secret_values_present=bool(request.renewed_grants),
+                ca_cert_host_path=request.ca_cert_host_path,
+                guest_ca_path=request.guest_ca_path,
+                setup_commands=(),
+                egress_destinations=request.egress_destinations,
+                session_id=request.session_id,
+                environment_name=request.environment_name,
+            ),
+            timeout_s=self._preflight_timeout_s,
+        )
+        self._runner_preflight_observations[request.runner] = observed_at
+        if _e2b_environment_fingerprint(request.runner.sandbox_id) != environment_fingerprint:
+            raise RuntimeError("E2B sandbox identity changed during egress renewal.")
+        return environment_fingerprint
 
     def _e2b_module(self) -> ModuleType | Any:
         if self._module is not None:
@@ -283,3 +646,22 @@ def _copy_public_egress_failure(
             remediation=error.remediation,
         )
     return UnsupportedEgressError(str(error))
+
+
+def _e2b_proxy_ip(binding: EgressBinding) -> str:
+    endpoint = binding.proxy_endpoint
+    if endpoint is None:
+        raise UnsupportedEgressError("E2B egress binding omitted its proxy endpoint.")
+    try:
+        address = ip_address(endpoint.host)
+    except ValueError as exc:
+        raise UnsupportedEgressError(
+            "E2B egress cutover requires an IPv4-literal proxy exposure."
+        ) from exc
+    if address.version != 4:
+        raise UnsupportedEgressError("E2B egress cutover requires an IPv4-literal proxy exposure.")
+    return str(address)
+
+
+def _e2b_environment_fingerprint(sandbox_id: str) -> str:
+    return sha256(f"e2b\0{sandbox_id}".encode()).hexdigest()

@@ -971,6 +971,43 @@ def test_live_allocation_fingerprint_is_stable_across_exact_reconnect() -> None:
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("secret", ["allocation", "fingerprint"])
+def test_allocation_fingerprint_schema_key_survives_short_secret_collision(
+    secret: str,
+) -> None:
+    class AllocationFingerprintFactory(EnvironmentFactory):
+        async def create(
+            self,
+            request: EnvironmentFactoryRequest,
+        ) -> EnvironmentFactoryResult:
+            return EnvironmentFactoryResult(
+                environment=Environment(EnvironmentSpec(name=request.environment_name)),
+                reconnect_metadata={"allocation_fingerprint": "a" * 64},
+            )
+
+    async def run() -> None:
+        store = InMemorySessionStore()
+        session = await _create_session(store, session_id="fixed-reconnect-key-session")
+        resolution = await _resolve(
+            store,
+            session,
+            AllocationFingerprintFactory(),
+            operation=EnvironmentFactoryOperation.CREATE,
+            secret_redactor=SecretRedactor(secret),
+        )
+
+        assert resolution.error is None
+        assert resolution.registered_environment is not None
+        assert resolution.registered_environment.live_allocation_fingerprint == "a" * 64
+        checkpoint = await store.load_checkpoint(session.id)
+        assert checkpoint is not None
+        assert checkpoint[ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY][_ENVIRONMENT_NAME] == {
+            "allocation_fingerprint": "a" * 64
+        }
+
+    asyncio.run(run())
+
+
 def test_reconnect_cannot_change_a_published_allocation_receipt() -> None:
     class DriftingReconnectFactory(_FakeRemoteFactory):
         async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:

@@ -227,6 +227,10 @@ from cayu.runtime.dispatch import (
     copy_dispatch_request,
     redact_dispatch_request,
 )
+from cayu.runtime.egress_authority_transitions import (
+    EgressAuthorityAdoptionHandler,
+    _drain_parked_egress_authority_allocations,
+)
 from cayu.runtime.event_sinks import EventSink
 from cayu.runtime.event_watchers import (
     EVENT_WATCHER_QUERY_PAGE_LIMIT,
@@ -774,6 +778,7 @@ class CayuApp:
         mcp_manifest_policy: McpManifestPolicy | None = None,
         tool_result_projection_policy: ToolResultProjectionPolicy | None = None,
         execution_profile_policy: ExecutionProfilePolicy | None = None,
+        egress_authority_adoption_handler: EgressAuthorityAdoptionHandler | None = None,
         context_counting: ContextCountingConfig | None = None,
         request_footprint: RequestFootprintConfig | None = None,
         event_sinks: Iterable[EventSink] | None = None,
@@ -834,6 +839,14 @@ class CayuApp:
             ExecutionProfilePolicy,
         ):
             raise TypeError("execution_profile_policy must be an ExecutionProfilePolicy.")
+        if egress_authority_adoption_handler is not None and not isinstance(
+            egress_authority_adoption_handler,
+            EgressAuthorityAdoptionHandler,
+        ):
+            raise TypeError(
+                "egress_authority_adoption_handler must be an EgressAuthorityAdoptionHandler."
+            )
+        self._egress_authority_adoption_handler = egress_authority_adoption_handler
         if type(enable_logging) is not bool:
             raise TypeError("enable_logging must be a bool.")
         resolved_secret_redactor = (
@@ -1006,6 +1019,7 @@ class CayuApp:
             checkpoint_transform=_replace_checkpoint_preserving_runtime_state,
             secret_redactor=self._secret_redactor,
             max_environment_lifecycle_owners=self._max_environment_lifecycle_owners,
+            egress_authority_adoption_handler=egress_authority_adoption_handler,
         )
         self._run_limit_controller = RunLimitController(
             session_store=self._runtime_session_store,
@@ -1148,6 +1162,7 @@ class CayuApp:
             effective_retry_policy=self._effective_retry_policy,
             execution_profile_policy=execution_profile_policy,
             execution_profile_policy_identity=execution_profile_policy_identity,
+            egress_authority_adoption_handler=egress_authority_adoption_handler,
             execution_profile_process_identity=self._execution_profile_process_identity,
         )
         self._durable_subagent_coordinator = DurableSubagentCoordinator(
@@ -1624,7 +1639,41 @@ class CayuApp:
     async def drain_environment_cleanups(self, *, timeout_s: float = 10.0) -> bool:
         """Settle retained environment cleanup without cancelling live mutations."""
 
-        return await self._environment_lifecycle.drain_retained_cleanups(timeout_s=timeout_s)
+        if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be a finite positive number.")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + float(timeout_s)
+        handler = self._egress_authority_adoption_handler
+        parked_drained = True
+        if handler is not None:
+            parked_drained = await _drain_parked_egress_authority_allocations(
+                handler,
+                timeout_s=float(timeout_s),
+            )
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        retained_drained = await self._environment_lifecycle.drain_retained_cleanups(
+            timeout_s=remaining,
+        )
+        return retained_drained and parked_drained
+
+    async def discard_parked_egress_allocations(
+        self,
+        session_id: str,
+        *,
+        timeout_s: float = 10.0,
+    ) -> bool:
+        """Discard parked external allocations before abandoning one session."""
+
+        handler = self._egress_authority_adoption_handler
+        if handler is None:
+            return True
+        return await _drain_parked_egress_authority_allocations(
+            handler,
+            timeout_s=timeout_s,
+            session_id=require_durable_clean_nonblank(session_id, "session_id"),
+        )
 
     async def resume_pending_interruption_cascades(
         self,

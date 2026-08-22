@@ -14685,6 +14685,16 @@ def execution_profile_adoption_request_fingerprint(
     if copied.profile_adoption is None:
         raise ValueError("Execution-profile adoption request fingerprint requires adoption intent.")
     document = copied.model_dump(mode="json", warnings=False)
+    adoption_document = document.get("profile_adoption")
+    if type(adoption_document) is not dict:
+        raise ValueError("Execution-profile adoption intent is not a durable object.")
+    redactor.require_no_secret_keys(
+        adoption_document,
+        field_name="profile_adoption",
+        match_short_substrings=True,
+    )
+    if redactor.redact_json_values(adoption_document) != adoption_document:
+        raise ValueError("Execution-profile adoption audit fields contain a workload secret.")
     loop_policy_identities: list[dict[str, str]] = []
     for policy in copied.loop_policies:
         replay_identity = policy.adoption_replay_identity

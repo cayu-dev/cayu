@@ -6034,6 +6034,57 @@ def test_cayu_app_environment_factory_result_name_must_match_registration(tmp_pa
     assert release_actions == [EnvironmentFactoryReleaseAction.DISCARD]
 
 
+def test_cayu_app_rejects_invalid_allocation_fingerprint_before_checkpoint(tmp_path):
+    async def run():
+        store = InMemorySessionStore()
+        release_actions: list[EnvironmentFactoryReleaseAction] = []
+
+        async def release(action: EnvironmentFactoryReleaseAction) -> None:
+            release_actions.append(action)
+
+        workspace_root = tmp_path / "factory-invalid-allocation-fingerprint"
+        workspace_root.mkdir()
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=LocalWorkspace(workspace_root, workspace_id="factory-workspace"),
+            ),
+            reconnect_metadata={"allocation_fingerprint": "A" * 64},
+            release=release,
+        )
+        provider = FakeProvider([])
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_invalid_allocation_fingerprint",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        checkpoint = await store.load_checkpoint("sess_factory_invalid_allocation_fingerprint")
+        return events, checkpoint, release_actions, provider
+
+    events, checkpoint, release_actions, provider = asyncio.run(run())
+
+    assert [event.type for event in events] == [
+        EventType.ENVIRONMENT_FACTORY_STARTED,
+        EventType.ENVIRONMENT_FACTORY_FAILED,
+        EventType.SESSION_FAILED,
+    ]
+    assert "environment_factory_reconnect" not in (checkpoint or {})
+    assert release_actions == [EnvironmentFactoryReleaseAction.DISCARD]
+    assert provider.requests == []
+
+
 def test_environment_factory_result_release_is_bounded(tmp_path):
     async def run():
         store = InMemorySessionStore()

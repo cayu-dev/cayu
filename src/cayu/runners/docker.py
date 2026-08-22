@@ -69,6 +69,62 @@ DEFAULT_DOCKER_IMAGE = "debian:stable-slim"
 DEFAULT_DOCKER_CWD = "/workspace"
 DOCKER_COMMAND_STATE_DIR = "/tmp/cayu-docker-commands"
 _DOCKER_LIFECYCLE_DIAGNOSTIC_MAX_BYTES = 300
+_DOCKER_EGRESS_CUTOVER_FENCE_SCRIPT = r"""
+import os
+import signal
+import time
+
+main_candidates = []
+for entry in os.listdir("/proc"):
+    if not entry.isdigit():
+        continue
+    pid = int(entry)
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
+            stat_fields = handle.read().split()
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            command = handle.read()
+    except (FileNotFoundError, ProcessLookupError):
+        continue
+    if int(stat_fields[3]) == 1 and command in {
+        b"sleep\x00infinity\x00",
+        b"/bin/sleep\x00infinity\x00",
+        b"/usr/bin/sleep\x00infinity\x00",
+    }:
+        main_candidates.append(pid)
+if not main_candidates:
+    raise SystemExit(71)
+protected = {1, min(main_candidates), os.getpid(), os.getppid()}
+stable_empty_observations = 0
+for _ in range(100):
+    candidates = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid in protected:
+            continue
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
+                state = handle.read().split()[2]
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if state != "Z":
+            candidates.append(pid)
+    if not candidates:
+        stable_empty_observations += 1
+        if stable_empty_observations >= 3:
+            raise SystemExit(0)
+    else:
+        stable_empty_observations = 0
+        for pid in candidates:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    time.sleep(0.02)
+raise SystemExit(70)
+""".strip()
 
 DockerCloseAction = Literal["remove", "stop", "none"]
 
@@ -885,6 +941,27 @@ class DockerRunner(Runner):
         elif self.close_action == "stop":
             await self._stop_container()
         self._closed = True
+
+    async def fence_guest_processes_for_egress_cutover(self) -> None:
+        """Terminate detached guest work while retaining container/workspace identity."""
+
+        self._ensure_exec_open()
+        result = await _run_docker(
+            self.docker_path,
+            [
+                "exec",
+                "-u",
+                "root",
+                self.name,
+                "python3",
+                "-c",
+                _DOCKER_EGRESS_CUTOVER_FENCE_SCRIPT,
+            ],
+            docker_cli_env_allowlist=self.docker_cli_env_allowlist,
+            timeout_s=10,
+        )
+        if result.exit_code != 0 or result.timed_out:
+            raise RuntimeError("Docker guest processes could not be fenced for egress cutover.")
 
     async def kill(self) -> bool:
         """Remove the Docker container for shared runner cleanup diagnostics."""

@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from math import isfinite
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cayu._exception_groups import iter_exception_tree
 from cayu._exception_state import exception_state, set_exception_state
@@ -28,6 +28,9 @@ from cayu.environments.admission import (
 )
 from cayu.environments.base import Environment, copy_environment
 from cayu.runners.base import RunnerWorkloadAuthority
+
+if TYPE_CHECKING:
+    from cayu.egress.authority import EgressAuthorityIdentity
 
 DEFAULT_ENVIRONMENT_FACTORY_RELEASE_TIMEOUT_SECONDS = 15.0
 ENVIRONMENT_ALLOCATION_INTENT_SCHEMA_VERSION = 1
@@ -669,6 +672,12 @@ class EnvironmentFactory(ABC):
     @property
     def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
         """Return a stable application declaration, or ``None`` when non-portable."""
+
+        return None
+
+    @property
+    def egress_authority_identity(self) -> EgressAuthorityIdentity | None:
+        """Return the immutable egress authority proposed for future invocations."""
 
         return None
 

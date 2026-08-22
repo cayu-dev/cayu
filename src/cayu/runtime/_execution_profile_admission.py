@@ -14,6 +14,7 @@ from weakref import ReferenceType, ref
 
 from cayu._validation import canonical_durable_json_bytes
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.egress.authority import EgressAuthorityIdentity, _copy_egress_authority_identity
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
@@ -36,6 +37,61 @@ from cayu.vaults import SecretRedactor
 _MODEL_FINALIZATION_MATERIAL_KIND = "cayu:model-finalization:v2"
 _MODEL_COMPACTOR_MATERIAL_VERSION = 2
 _PROMPT_CACHE_COMPACTOR_MATERIAL_VERSION = 2
+_EGRESS_AUTHORITY_SCHEMA_KEYS = frozenset(
+    {
+        "allowed_destinations",
+        "authority_scope",
+        "authority_source",
+        "bindings",
+        "comparison_available",
+        "credential_authority_fingerprint",
+        "credential_kind",
+        "cutover_strategy",
+        "denied_path_prefixes",
+        "destination",
+        "fingerprint",
+        "generation",
+        "kind",
+        "match",
+        "method",
+        "name",
+        "operations",
+        "path",
+        "policies",
+        "policy_name",
+        "policy_version",
+        "record_type",
+        "runner_kind",
+        "schema_version",
+    }
+)
+
+
+def _egress_authority_application_text_values(
+    identity: EgressAuthorityIdentity,
+) -> tuple[str, ...]:
+    """Return only configurable text, excluding validated protocol controls."""
+
+    values = [
+        identity.authority_source,
+        identity.authority_scope,
+        identity.policy_version,
+        identity.runner_kind,
+    ]
+    for policy in identity.policies:
+        values.extend((policy.name, *policy.allowed_destinations))
+        for operation in policy.operations:
+            values.extend((operation.method, operation.path))
+        values.extend(policy.denied_path_prefixes)
+    for binding in identity.bindings:
+        values.extend(
+            (
+                binding.destination,
+                binding.policy_name,
+                binding.credential_kind,
+            )
+        )
+    return tuple(values)
 
 
 @dataclass(frozen=True)
@@ -330,6 +386,31 @@ def resolve_execution_profile_identity(
         redactor=redactor,
     )
     environment = None if registered_environment is None else registered_environment.environment
+    egress_authority: EgressAuthorityIdentity | None = None
+    if registered_environment is not None and registered_environment.factory is not None:
+        proposed_egress_authority = registered_environment.factory.egress_authority_identity
+        if proposed_egress_authority is not None:
+            if type(proposed_egress_authority) is not EgressAuthorityIdentity:
+                raise TypeError(
+                    "Environment factory egress_authority_identity must be an "
+                    "EgressAuthorityIdentity or None."
+                )
+            egress_authority = _copy_egress_authority_identity(proposed_egress_authority)
+            egress_authority_material = egress_authority.model_dump(mode="json")
+            redactor.require_no_secret_keys(
+                egress_authority_material,
+                field_name="environment factory egress authority identity",
+                preserve_keys=_EGRESS_AUTHORITY_SCHEMA_KEYS,
+                match_short_substrings=True,
+            )
+            if any(
+                redactor.redact_text(value) != value
+                for value in _egress_authority_application_text_values(egress_authority)
+            ):
+                raise ValueError(
+                    "Environment factory egress authority identity contains a workload "
+                    "secret and cannot be used as durable execution authority."
+                )
     credential_authority = (
         "factory_managed"
         if registered_environment is not None and registered_environment.factory_backed
@@ -474,6 +555,7 @@ def resolve_execution_profile_identity(
             ),
             "runner_authority": runner_authority,
         },
+        egress_authority=egress_authority,
         context_selection=context_components.selection,
         context_selection_process_local=context_components.selection_process_local,
         context_selection_application_versioned=(

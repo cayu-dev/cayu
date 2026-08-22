@@ -197,6 +197,7 @@ class TransparentEgressProxyServer:
         port: int = 0,
         max_workers: int = 16,
         transport_auth_token: bytes | None = None,
+        owns_authority: bool = True,
     ) -> None:
         listen_hosts = (host,) if isinstance(host, str) else tuple(host)
         if not listen_hosts or any(not item.strip() for item in listen_hosts):
@@ -208,9 +209,14 @@ class TransparentEgressProxyServer:
                 raise TypeError("Egress proxy transport authentication token must be bytes.")
             if not transport_auth_token:
                 raise ValueError("Egress proxy transport authentication token must be nonempty.")
+        if type(owns_authority) is not bool:
+            raise TypeError("owns_authority must be a bool.")
+        if authority is None and not owns_authority:
+            raise ValueError("A non-owning proxy server requires an existing authority.")
         self._broker = broker
         self._loop = loop
         self._authority = authority or SessionCertificateAuthority()
+        self._owns_authority = owns_authority
         self._hosts = listen_hosts
         self._port = port
         self._transport_auth_token = transport_auth_token
@@ -218,6 +224,8 @@ class TransparentEgressProxyServer:
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._accept_threads: list[threading.Thread] = []
         self._stop = threading.Event()
+        self._connections: set[socket.socket] = set()
+        self._connections_lock = threading.Lock()
 
     @property
     def authority(self) -> SessionCertificateAuthority:
@@ -257,13 +265,40 @@ class TransparentEgressProxyServer:
         for listener in self._sockets:
             listener.close()
         self._sockets = []
+        with self._connections_lock:
+            connections = tuple(self._connections)
+        for connection in connections:
+            with contextlib.suppress(OSError):
+                connection.shutdown(socket.SHUT_RDWR)
+            with contextlib.suppress(OSError):
+                connection.close()
         if self._accept_threads:
             await asyncio.gather(
                 *(asyncio.to_thread(thread.join, 5.0) for thread in self._accept_threads)
             )
             self._accept_threads = []
-        self._executor.shutdown(wait=True, cancel_futures=True)
-        self._authority.close()
+        await asyncio.to_thread(self._executor.shutdown, wait=True, cancel_futures=True)
+        if self._owns_authority:
+            self._authority.close()
+            self._owns_authority = False
+
+    def adopt_authority_ownership(self, authority: SessionCertificateAuthority) -> None:
+        """Take teardown ownership during an atomic fresh-path handoff."""
+
+        if authority is not self._authority:
+            raise ValueError("Proxy authority ownership can only transfer to the same CA.")
+        if self._owns_authority:
+            raise RuntimeError("Proxy server already owns its certificate authority.")
+        self._owns_authority = True
+
+    def relinquish_authority_ownership(self, authority: SessionCertificateAuthority) -> None:
+        """Relinquish teardown ownership after a replacement server takes it."""
+
+        if authority is not self._authority:
+            raise ValueError("Proxy authority ownership can only transfer for the same CA.")
+        if not self._owns_authority:
+            raise RuntimeError("Proxy server does not own its certificate authority.")
+        self._owns_authority = False
 
     @staticmethod
     def _open_listener(host: str, port: int) -> socket.socket:
@@ -297,6 +332,15 @@ class TransparentEgressProxyServer:
                 continue
             except OSError:
                 break
+            with self._connections_lock:
+                if self._stop.is_set():
+                    should_close = True
+                else:
+                    self._connections.add(conn)
+                    should_close = False
+            if should_close:
+                conn.close()
+                break
             self._executor.submit(self._safe_handle, conn)
 
     def _safe_handle(self, conn: socket.socket) -> None:
@@ -306,8 +350,32 @@ class TransparentEgressProxyServer:
             # A single malformed connection must never take down the proxy.
             pass
         finally:
+            with self._connections_lock:
+                self._connections.discard(conn)
             with contextlib.suppress(OSError):
                 conn.close()
+
+    def _replace_tracked_connection(
+        self,
+        previous: socket.socket,
+        replacement: socket.socket,
+    ) -> bool:
+        """Atomically transfer shutdown ownership after TLS consumes a raw socket."""
+
+        with self._connections_lock:
+            if self._stop.is_set() or previous not in self._connections:
+                accepted = False
+            else:
+                self._connections.remove(previous)
+                self._connections.add(replacement)
+                accepted = True
+        if not accepted:
+            _shutdown(replacement)
+        return accepted
+
+    def _discard_tracked_connection(self, connection: socket.socket) -> None:
+        with self._connections_lock:
+            self._connections.discard(connection)
 
     def _handle_connection(self, conn: socket.socket) -> None:
         conn.settimeout(30.0)
@@ -360,6 +428,8 @@ class TransparentEgressProxyServer:
         conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         context = self._authority.server_ssl_context(host)
         tls = context.wrap_socket(conn, server_side=True)
+        if not self._replace_tracked_connection(conn, tls):
+            return
         try:
             request_line, headers = _read_head(tls)
             if not request_line:
@@ -380,6 +450,7 @@ class TransparentEgressProxyServer:
             response = self._call_broker(captured)
             tls.sendall(_serialize_response(response))
         finally:
+            self._discard_tracked_connection(tls)
             _shutdown(tls)
 
     def _call_broker(self, request: CapturedRequest) -> CapturedResponse:

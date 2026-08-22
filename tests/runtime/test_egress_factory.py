@@ -34,6 +34,7 @@ from cayu.egress import (
     CapturedResponse,
     CredentialMode,
     EgressAdapterRegistry,
+    EgressAuthorityCutoverStrategy,
     EgressBinding,
     EgressCapabilityClaim,
     EgressCapabilityEvidence,
@@ -50,6 +51,9 @@ from cayu.egress import (
 from cayu.environments import (
     EFSAccessPointBinding,
     Environment,
+    EnvironmentAllocationContext,
+    EnvironmentAllocationIntent,
+    EnvironmentAllocationState,
     EnvironmentAllocationUnsupportedError,
     EnvironmentFactoryOperation,
     EnvironmentFactoryReleaseAction,
@@ -629,11 +633,17 @@ def test_finalize_evidence_persistence_ignores_handled_historical_cancellation()
 
 
 class _FakeDocker:
+    last_instance: _FakeDocker | None = None
+
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
+        self.container_id = "a" * 64
+        type(self).last_instance = self
 
     async def __call__(self, argv: Sequence[str]) -> tuple[int, str]:
         self.calls.append(list(argv))
+        if list(argv[:4]) == ["inspect", "--type", "container", "--format"]:
+            return 0, self.container_id
         return 0, ""
 
 
@@ -1011,7 +1021,12 @@ class _VirtualCredentialEchoingAdapter(_RecordingAdapter):
 def _factory(emitter: Any) -> VirtualEgressEnvironmentFactory:
     from cayu.egress.docker_adapter import DockerEgressAdapter
 
-    adapter = DockerEgressAdapter(docker_exec=_FakeDocker(), proxy_host="127.0.0.1")
+    docker = _FakeDocker()
+    adapter = DockerEgressAdapter(
+        docker_exec=docker,
+        docker_run=docker,
+        proxy_host="127.0.0.1",
+    )
     return _virtual_factory(
         adapter=adapter,
         event_emitter=emitter,
@@ -1090,6 +1105,16 @@ def test_factory_wires_runner_grants_and_events(monkeypatch: pytest.MonkeyPatch)
     assert runner is not None
     inner_runner = _FakeDockerRunner.last_instance
     assert inner_runner is not None
+    fake_docker = _FakeDocker.last_instance
+    assert fake_docker is not None
+    assert [
+        "inspect",
+        "--type",
+        "container",
+        "--format",
+        "{{.Id}}",
+        inner_runner.name,
+    ] in fake_docker.calls
     assert result.environment.vault is None  # real vault is broker-side only
     # Runner is created in virtual_egress mode, on the enforced network, with the
     # virtual credential + proxy overlay and the CA mounted.
@@ -1239,6 +1264,92 @@ def test_factory_rejects_unsupported_remote_allocation_before_adapter_mutation()
             await factory.create(request)
         assert adapter.prepare_calls == []
         assert "runner_request" not in adapter.captured
+
+    asyncio.run(run())
+
+
+def test_factory_uses_durable_allocation_context_for_external_runner_creation() -> None:
+    class RecoverableAdapter(_RecordingAdapter):
+        process_external_allocation = True
+        allocation_provider = "fake-remote"
+        allocation_adapter_generation = "v1"
+
+        async def create_or_recover_runner(
+            self,
+            request: VirtualEgressRunnerRequest,
+            *,
+            allow_create: bool,
+        ) -> Runner:
+            self.captured["allow_create"] = allow_create
+            return await self.create_runner(request)
+
+    class AllocationContext(EnvironmentAllocationContext):
+        def __init__(self) -> None:
+            self._state = EnvironmentAllocationState.UNPREPARED
+            self._intent = EnvironmentAllocationIntent(
+                allocation_id=f"ealloc_{'a' * 32}",
+                provider="fake-remote",
+                adapter_generation="v1",
+                session_id="recoverable-allocation",
+                environment_name="egress-env",
+                requested_operation=EnvironmentFactoryOperation.CREATE,
+            )
+            self._acknowledgement: dict[str, Any] | None = None
+
+        @property
+        def intent(self) -> EnvironmentAllocationIntent:
+            return self._intent
+
+        @property
+        def state(self) -> EnvironmentAllocationState:
+            return self._state
+
+        @property
+        def acknowledged_reconnect_metadata(self) -> dict[str, Any] | None:
+            return self._acknowledgement
+
+        async def prepare(self, provider_metadata: Mapping[str, Any]):
+            self._intent = self._intent.with_provider_metadata(provider_metadata)
+            self._state = EnvironmentAllocationState.PREPARED
+            return self._intent
+
+        async def mark_dispatched(self) -> None:
+            self._state = EnvironmentAllocationState.DISPATCHED
+
+        async def acknowledge(self, reconnect_metadata: Mapping[str, Any]) -> None:
+            self._acknowledgement = dict(reconnect_metadata)
+            self._state = EnvironmentAllocationState.ACKNOWLEDGED
+
+        async def mark_reaping(self) -> bool:
+            self._state = EnvironmentAllocationState.REAPING
+            return True
+
+        async def mark_reaped(self) -> None:
+            self._state = EnvironmentAllocationState.REAPED
+
+    async def run() -> None:
+        adapter = RecoverableAdapter("fake-remote")
+        factory = _virtual_factory(adapter=adapter)
+        request = EnvironmentFactoryRequest(
+            session_id="recoverable-allocation",
+            agent_name="agent",
+            environment_name="egress-env",
+        )
+        scope = factory.allocation_scope(request)
+        assert scope is not None
+        assert scope.provider == "fake-remote"
+        assert scope.adapter_generation == "v1"
+        allocation = AllocationContext()
+
+        result = await factory.create_recoverable(request, allocation)
+
+        assert allocation.state is EnvironmentAllocationState.ACKNOWLEDGED
+        assert adapter.captured["allow_create"] is True
+        runner_request = adapter.captured["runner_request"]
+        assert runner_request.allocation_id == f"ealloc_{'a' * 32}"
+        assert allocation.acknowledged_reconnect_metadata == result.reconnect_metadata
+        assert result.release is not None
+        await result.release(EnvironmentFactoryReleaseAction.DISCARD)
 
     asyncio.run(run())
 
@@ -2034,6 +2145,78 @@ def test_factory_rejects_invalid_reconnect_scope_before_adapter_prepare(
                     environment_name="egress-env",
                     operation=EnvironmentFactoryOperation.RECONNECT,
                     reconnect_metadata=metadata,
+                )
+            )
+
+    asyncio.run(run())
+
+    assert adapter.prepare_calls == []
+    assert "runner_request" not in adapter.captured
+
+
+@pytest.mark.parametrize(
+    "allocation_fingerprint",
+    (True, "a" * 63, "A" * 64),
+)
+def test_factory_rejects_invalid_reconnect_allocation_fingerprint(
+    allocation_fingerprint: Any,
+) -> None:
+    adapter = _LifecycleRecordingAdapter()
+
+    async def run() -> None:
+        with pytest.raises(
+            InvalidEgressReconnectMetadataError,
+            match="allocation fingerprint",
+        ):
+            await _virtual_factory(adapter=adapter).create(
+                EnvironmentFactoryRequest(
+                    session_id="sess_resume",
+                    agent_name="agent",
+                    environment_name="egress-env",
+                    operation=EnvironmentFactoryOperation.RECONNECT,
+                    reconnect_metadata={
+                        "version": 1,
+                        "runner_kind": "lambda-microvm",
+                        "session_id": "sess_resume",
+                        "environment_name": "egress-env",
+                        "capability": "supported",
+                        "identity": {"microvm_id": "mvm-old"},
+                        "allocation_fingerprint": allocation_fingerprint,
+                    },
+                )
+            )
+
+    asyncio.run(run())
+
+    assert adapter.prepare_calls == []
+    assert "runner_request" not in adapter.captured
+
+
+def test_fresh_path_factory_rejects_missing_reconnect_allocation_fingerprint() -> None:
+    class FreshPathLifecycleAdapter(_LifecycleRecordingAdapter):
+        egress_authority_cutover_strategy = EgressAuthorityCutoverStrategy.FRESH_AUTHORITY_PATH
+
+    adapter = FreshPathLifecycleAdapter()
+
+    async def run() -> None:
+        with pytest.raises(
+            InvalidEgressReconnectMetadataError,
+            match="requires an allocation fingerprint",
+        ):
+            await _virtual_factory(adapter=adapter).create(
+                EnvironmentFactoryRequest(
+                    session_id="sess_resume",
+                    agent_name="agent",
+                    environment_name="egress-env",
+                    operation=EnvironmentFactoryOperation.RECONNECT,
+                    reconnect_metadata={
+                        "version": 1,
+                        "runner_kind": "lambda-microvm",
+                        "session_id": "sess_resume",
+                        "environment_name": "egress-env",
+                        "capability": "supported",
+                        "identity": {"microvm_id": "mvm-old"},
+                    },
                 )
             )
 
@@ -4523,9 +4706,14 @@ def test_managed_factory_settlement_preserves_cancellation_during_attempt() -> N
         retry_started = asyncio.Event()
         attempts = 0
 
-        async def fail_after_cancellation(*, deadline: float) -> None:
+        async def fail_after_cancellation(
+            *,
+            deadline: float,
+            retained_cutover_failure: BaseException | None = None,
+        ) -> None:
             nonlocal attempts
             del deadline
+            assert retained_cutover_failure is None
             attempts += 1
             if attempts == 1:
                 attempt_started.set()
@@ -4584,8 +4772,13 @@ def test_managed_factory_settlement_preserves_concurrent_fatal_signal() -> None:
         allow_failure = asyncio.Event()
         fatal_signal = GeneratorExit("provider cleanup interrupted")
 
-        async def fail_after_cancellation(*, deadline: float) -> None:
+        async def fail_after_cancellation(
+            *,
+            deadline: float,
+            retained_cutover_failure: BaseException | None = None,
+        ) -> None:
             del deadline
+            assert retained_cutover_failure is None
             attempt_started.set()
             await allow_failure.wait()
             raise fatal_signal
@@ -4708,8 +4901,13 @@ def test_managed_factory_settlement_follows_grouped_prerequisite_handoff() -> No
             name="grouped-cleanup-prerequisite",
         )
 
-        async def complete_retry(*, deadline: float) -> None:
+        async def complete_retry(
+            *,
+            deadline: float,
+            retained_cutover_failure: BaseException | None = None,
+        ) -> None:
             del deadline
+            assert retained_cutover_failure is None
             retry_started.set()
             managed._closed = True
             managed._completed_runner_action = managed._requested_runner_action

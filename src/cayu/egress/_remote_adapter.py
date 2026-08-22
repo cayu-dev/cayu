@@ -18,7 +18,7 @@ from cayu.egress.broker import TransparentEgressBroker
 from cayu.egress.errors import UnsupportedEgressCapabilityError, UnsupportedEgressError
 from cayu.egress.grants import VirtualCredentialGrant
 from cayu.egress.proxy_exposure import ExposedProxy, HttpProxyEndpoint, ProxyExposure
-from cayu.egress.proxy_server import TransparentEgressProxyServer
+from cayu.egress.proxy_server import SessionCertificateAuthority, TransparentEgressProxyServer
 from cayu.runners.base import ExecCommand, Runner
 
 GUEST_CA_PATH = "/etc/cayu/ca.pem"
@@ -39,20 +39,26 @@ async def prepare_exposed_proxy_binding(
     loop: asyncio.AbstractEventLoop | None,
     proxy_server_factory: ProxyServerFactory,
     bind_port: int = 0,
+    certificate_authority: SessionCertificateAuthority | None = None,
+    owns_certificate_authority: bool = True,
 ) -> EgressBinding:
     if type(bind_port) is not int or not 0 <= bind_port <= 65535:
         raise ValueError("bind_port must be an integer between 0 and 65535.")
     validate_grant_scope(session_id=session_id, grants=grants)
     resolved_loop = loop or asyncio.get_running_loop()
-    if bind_port:
-        server = proxy_server_factory(
-            broker,
-            loop=resolved_loop,
-            host=bind_host,
-            port=bind_port,
+    server_kwargs: dict[str, object] = {
+        "loop": resolved_loop,
+        "host": bind_host,
+    }
+    if certificate_authority is not None or not owns_certificate_authority:
+        server_kwargs.update(
+            authority=certificate_authority,
+            owns_authority=owns_certificate_authority,
         )
+    if bind_port:
+        server = proxy_server_factory(broker, port=bind_port, **server_kwargs)
     else:
-        server = proxy_server_factory(broker, loop=resolved_loop, host=bind_host)
+        server = proxy_server_factory(broker, **server_kwargs)
     exposed: ExposedProxy | None = None
 
     async def cleanup() -> None:
@@ -142,6 +148,13 @@ async def prepare_exposed_proxy_binding(
             "guest_ca_path": GUEST_CA_PATH,
         },
         teardown=teardown,
+        certificate_authority=server.authority,
+        adopt_certificate_authority=getattr(server, "adopt_authority_ownership", None),
+        relinquish_certificate_authority=getattr(
+            server,
+            "relinquish_authority_ownership",
+            None,
+        ),
     )
 
 

@@ -83,8 +83,10 @@ from cayu.core.thinking import ThinkingConfig, thinking_config_payload
 from cayu.core.tools import (
     ToolResult,
 )
+from cayu.egress.authority import EgressAuthorityChangeKind, EgressAuthorityTransitionState
 from cayu.environments import (
     EnvironmentFactoryOperation,
+    EnvironmentFactoryResult,
     WorkspaceInstructions,
 )
 from cayu.providers import (
@@ -299,6 +301,24 @@ from cayu.runtime.costs import (
     SessionCostSummary,
 )
 from cayu.runtime.dispatch import DispatchRequest
+from cayu.runtime.egress import (
+    reactivate_parked_egress_environment,
+    require_active_egress_transition_environment,
+)
+from cayu.runtime.egress_authority_transitions import (
+    EgressAuthorityAdoptionHandler,
+    EgressAuthorityAdoptionResult,
+    EgressAuthorityTransitionConflict,
+    EgressAuthorityTransitionCoordinator,
+    EgressAuthorityTransitionRecord,
+    SessionCheckpointEgressAuthorityTransitionStore,
+    _claim_parked_egress_authority_allocation,
+    _find_parked_egress_authority_allocation,
+    _has_runtime_egress_authority_adoption_result,
+    _require_parked_egress_authority_allocation,
+    require_egress_authority_transition_compatible_with_profile,
+    require_exact_egress_authority_transition,
+)
 from cayu.runtime.errors import (
     TerminalEventPublicationUncertain,
     _is_runtime_interaction_lifecycle_publication_rejection,
@@ -323,6 +343,7 @@ from cayu.runtime.execution_profiles import (
     ExecutionProfilePolicyRequest,
     ExecutionProfilePolicyResult,
     _ExecutionProfileAdmissionRequestRejected,
+    _with_runtime_execution_profile_decision_authority,
     active_invocation_execution_profile_from_checkpoint,
     active_invocation_execution_profile_is_released,
     active_invocation_execution_profile_matches_session_epoch,
@@ -332,6 +353,7 @@ from cayu.runtime.execution_profiles import (
     event_with_execution_profile_authority,
     execution_profile_changes_authority,
     execution_profile_decision_payload,
+    execution_profile_egress_authority_change,
     execution_profile_from_session_metadata,
     execution_profile_session_metadata,
     execution_profile_with_component,
@@ -3145,6 +3167,13 @@ def _fork_group_initial_profile_actor() -> ResolutionActor:
     )
 
 
+def _execution_profile_policy_actor(policy_identity: str) -> ResolutionActor:
+    return ResolutionActor(
+        subject=f"cayu:execution-profile-policy:{policy_identity}",
+        source=ResolutionActorSource.SYSTEM,
+    )
+
+
 def _execution_profile_decision_event_id(
     *,
     session_id: str,
@@ -3212,6 +3241,13 @@ def _execution_profile_decision_event(
     )
     actor = intent.requested_by if intent is not None else fallback_actor
     reason = intent.reason if intent is not None else fallback_reason
+    egress_authority_change = execution_profile_egress_authority_change(
+        expected_profile,
+        candidate_profile,
+        changed_component_classes=changed_component_classes,
+    )
+    if kind is ExecutionProfileDecisionKind.REJECTED and egress_authority_change is not None:
+        egress_authority_change = EgressAuthorityChangeKind.REFUSED
     event = Event(
         id=event_id,
         type=(
@@ -3231,6 +3267,7 @@ def _execution_profile_decision_event(
             policy_identity=policy_identity,
             policy_reason=policy_reason,
             authority_decision=authority_decision,
+            egress_authority_change=egress_authority_change,
             idempotency_identity=idempotency_identity,
             adoption_request_fingerprint=adoption_request_fingerprint,
             actor=actor,
@@ -3245,6 +3282,8 @@ def _execution_profile_decision_event(
     ]
     if adoption_request_fingerprint is not None:
         authority_fields.append("adoption_request_fingerprint")
+    if egress_authority_change is not None:
+        authority_fields.append("egress_authority_change")
     event = event_with_runtime_payload_authority(
         event_with_runtime_envelope_authority(
             event_with_runtime_generated_id(event),
@@ -3252,19 +3291,22 @@ def _execution_profile_decision_event(
         ),
         *authority_fields,
     )
-    return ExecutionProfileDecision(
-        kind=kind,
-        expected_profile=expected_profile,
-        candidate_profile=candidate_profile,
-        changed_component_classes=changed_component_classes,
-        policy_identity=policy_identity,
-        policy_reason=policy_reason,
-        authority_decision=authority_decision,
-        idempotency_identity=idempotency_identity,
-        adoption_request_fingerprint=adoption_request_fingerprint,
-        actor=actor,
-        reason=reason,
-        event=event,
+    return _with_runtime_execution_profile_decision_authority(
+        ExecutionProfileDecision(
+            kind=kind,
+            expected_profile=expected_profile,
+            candidate_profile=candidate_profile,
+            changed_component_classes=changed_component_classes,
+            policy_identity=policy_identity,
+            policy_reason=policy_reason,
+            authority_decision=authority_decision,
+            egress_authority_change=egress_authority_change,
+            idempotency_identity=idempotency_identity,
+            adoption_request_fingerprint=adoption_request_fingerprint,
+            actor=actor,
+            reason=reason,
+            event=event,
+        )
     )
 
 
@@ -3955,6 +3997,25 @@ def _failure_carries_interaction_publication_rejection(
     )
 
 
+def _active_transition_matches_profile_decision(
+    *,
+    transition: EgressAuthorityTransitionRecord | None,
+    session: Session,
+    decision: ExecutionProfileDecision,
+) -> bool:
+    """Verify the complete durable activation tuple for profile admission."""
+
+    return bool(
+        transition is not None
+        and transition.state is EgressAuthorityTransitionState.ACTIVE
+        and transition.session_id == session.id
+        and transition.environment_name == session.environment_name
+        and transition.expected_authority == decision.expected_profile.egress_authority
+        and transition.target_authority == decision.candidate_profile.egress_authority
+        and transition.receipt is not None
+    )
+
+
 class SessionEngine:
     """Own durable session operations and one run's end-to-end orchestration."""
 
@@ -3996,6 +4057,7 @@ class SessionEngine:
         execution_profile_policy: ExecutionProfilePolicy | None,
         execution_profile_policy_identity: str | None,
         execution_profile_process_identity: str,
+        egress_authority_adoption_handler: EgressAuthorityAdoptionHandler | None = None,
     ) -> None:
         self.session_store = session_store
         self.task_store = task_store
@@ -4037,6 +4099,7 @@ class SessionEngine:
         self._effective_retry_policy = effective_retry_policy
         self._execution_profile_policy = execution_profile_policy
         self._execution_profile_policy_identity = execution_profile_policy_identity
+        self._egress_authority_adoption_handler = egress_authority_adoption_handler
         self._execution_profile_process_identity = require_clean_nonblank(
             execution_profile_process_identity,
             "execution_profile_process_identity",
@@ -4054,6 +4117,107 @@ class SessionEngine:
             self._invocation_loop_policy_identity_registry.identity_for(policy)
             for policy in policies
         )
+
+    async def _require_active_egress_profile_cutover(
+        self,
+        *,
+        session: Session,
+        decision: ExecutionProfileDecision | None,
+    ) -> EgressAuthorityAdoptionResult | None:
+        """Gate profile admission on exact durable backend activation proof."""
+
+        if (
+            decision is None
+            or decision.kind is not ExecutionProfileDecisionKind.ADOPTED
+            or ExecutionProfileComponentClass.EGRESS_AUTHORITY
+            not in decision.changed_component_classes
+        ):
+            return None
+        expected = decision.expected_profile.egress_authority
+        target = decision.candidate_profile.egress_authority
+        if expected is None or target is None:
+            raise EgressAuthorityTransitionConflict(
+                "Egress profile adoption omitted its exact authority identities."
+            )
+        transition_store = SessionCheckpointEgressAuthorityTransitionStore(
+            self.session_store,
+            event_writer=self._event_writer,
+        )
+        handler = self._egress_authority_adoption_handler
+        if handler is None:
+            raise EgressAuthorityTransitionConflict(
+                "Egress profile adoption requires an application-owned cutover handler."
+            )
+        environment_name = decision.event.environment_name
+        if environment_name is None:
+            raise EgressAuthorityTransitionConflict(
+                "Egress profile adoption omitted its invocation environment."
+            )
+        try:
+            expected_environment_fingerprint = (
+                await self._environment_lifecycle.require_live_allocation_fingerprint(
+                    session_id=session.id,
+                    environment_name=environment_name,
+                )
+            )
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise EgressAuthorityTransitionConflict(
+                "Egress profile adoption has no verified pre-cutover allocation identity."
+            ) from exc
+        coordinator = EgressAuthorityTransitionCoordinator(
+            transition_store,
+            expected_source_environment_fingerprint=expected_environment_fingerprint,
+        )
+        parked_factory_result = _require_parked_egress_authority_allocation(
+            handler,
+            session_id=session.id,
+            environment_name=environment_name,
+            expected_fingerprint=expected_environment_fingerprint,
+        )
+        adoption = await handler.adopt(
+            decision,
+            coordinator=coordinator,
+            expected_environment_fingerprint=expected_environment_fingerprint,
+            factory_result=parked_factory_result,
+        )
+        if not _has_runtime_egress_authority_adoption_result(
+            adoption,
+            coordinator=coordinator,
+        ):
+            raise EgressAuthorityTransitionConflict(
+                "Egress profile adoption did not return an environment handoff from the "
+                "runtime-owned transition coordinator."
+            )
+        activation = adoption.transition
+        if (
+            activation.source_environment_fingerprint != expected_environment_fingerprint
+            or activation.environment_fingerprint != expected_environment_fingerprint
+        ):
+            raise EgressAuthorityTransitionConflict(
+                "Egress profile adoption activated a substituted backend allocation."
+            )
+        transition = await transition_store.load(session.id)
+        if (
+            not _active_transition_matches_profile_decision(
+                transition=transition,
+                session=session,
+                decision=decision,
+            )
+            or transition != activation
+        ):
+            raise EgressAuthorityTransitionConflict(
+                "The exact egress authority cutover is not durably active; "
+                "profile admission remains parked."
+            )
+        await require_active_egress_transition_environment(
+            environment=adoption.environment,
+            transition=activation,
+        )
+        if adoption._factory_result is not parked_factory_result:
+            raise EgressAuthorityTransitionConflict(
+                "Egress adoption returned a substituted environment allocation."
+            )
+        return adoption
 
     def prepare_workflow_structured_output(self, session_id: str) -> None:
         """Opt one live workflow child into a process-local raw output handoff."""
@@ -4331,6 +4495,11 @@ class SessionEngine:
         tool_capability_ceiling_narrowed: bool = False,
     ) -> ExecutionProfileDecision:
         event_session = session if decision_session is None else decision_session
+        egress_authority_change = execution_profile_egress_authority_change(
+            expected_profile,
+            candidate_profile,
+            changed_component_classes=changed_component_classes,
+        )
         if not changed_component_classes and not force_authority_review:
             return _execution_profile_decision_event(
                 session=event_session,
@@ -4434,6 +4603,7 @@ class SessionEngine:
                     force_authority_review
                     or execution_profile_changes_authority(changed_component_classes)
                 ),
+                egress_authority_change=egress_authority_change,
                 source_provider_name=(
                     session.provider_name if source_provider_name is None else source_provider_name
                 ),
@@ -4475,12 +4645,37 @@ class SessionEngine:
             policy_reason = result.reason
             authority_decision = result.authority_decision
 
-        broadens_authority = force_authority_review or execution_profile_changes_authority(
-            changed_component_classes
+        non_egress_authority_change = execution_profile_changes_authority(
+            component
+            for component in changed_component_classes
+            if component is not ExecutionProfileComponentClass.EGRESS_AUTHORITY
         )
+        egress_broadens_or_is_ambiguous = egress_authority_change in {
+            EgressAuthorityChangeKind.WIDER,
+            EgressAuthorityChangeKind.INCOMPARABLE,
+            EgressAuthorityChangeKind.REFUSED,
+        }
+        broadens_authority = (
+            force_authority_review or non_egress_authority_change or egress_broadens_or_is_ambiguous
+        )
+        automatic_egress_narrowing = (
+            policy is not None
+            and intent is None
+            and action is ExecutionProfilePolicyAction.ADOPT
+            and authority_decision is not ExecutionProfileAuthorityDecision.DENIED
+            and changed_component_set
+            == frozenset({ExecutionProfileComponentClass.EGRESS_AUTHORITY})
+            and egress_authority_change is EgressAuthorityChangeKind.NARROWER
+        )
+        if automatic_egress_narrowing:
+            fallback_actor = _execution_profile_policy_actor(policy_identity)
+            fallback_reason = policy_reason
         if action is ExecutionProfilePolicyAction.COMPATIBLE_REUSE:
             changes_persistent_target = (
                 ExecutionProfileComponentClass.PROVIDER_TARGET in changed_component_classes
+            )
+            changes_egress_generation = (
+                ExecutionProfileComponentClass.EGRESS_AUTHORITY in changed_component_classes
             )
             kind = (
                 ExecutionProfileDecisionKind.REJECTED
@@ -4488,6 +4683,7 @@ class SessionEngine:
                     authority_decision is ExecutionProfileAuthorityDecision.DENIED
                     or broadens_authority
                     or changes_persistent_target
+                    or changes_egress_generation
                 )
                 else ExecutionProfileDecisionKind.COMPATIBLE_REUSE
             )
@@ -4506,12 +4702,21 @@ class SessionEngine:
                     "A provider-target change must be adopted because it changes the "
                     "session's persistent execution target."
                 )
+            elif (
+                authority_decision is not ExecutionProfileAuthorityDecision.DENIED
+                and changes_egress_generation
+            ):
+                policy_reason = (
+                    "An egress-authority generation change must be durably adopted even "
+                    "when its effective permissions are unchanged."
+                )
         elif action is ExecutionProfilePolicyAction.ADOPT:
-            has_explicit_adoption = (
+            has_adoption_authority = (
                 intent is not None
                 or model_target_only
                 or built_in_ceiling_narrowing
                 or built_in_model_target_and_ceiling_adoption
+                or automatic_egress_narrowing
             )
             authority_is_sufficient = (
                 authority_decision is not ExecutionProfileAuthorityDecision.DENIED
@@ -4522,10 +4727,10 @@ class SessionEngine:
             )
             kind = (
                 ExecutionProfileDecisionKind.ADOPTED
-                if has_explicit_adoption and authority_is_sufficient
+                if has_adoption_authority and authority_is_sufficient
                 else ExecutionProfileDecisionKind.REJECTED
             )
-            if not has_explicit_adoption:
+            if not has_adoption_authority:
                 policy_reason = "Explicit execution-profile adoption intent is required."
             elif (
                 not authority_is_sufficient
@@ -4591,6 +4796,11 @@ class SessionEngine:
                 for component in payload["changed_component_classes"]
             )
             authority_decision = ExecutionProfileAuthorityDecision(payload["authority_decision"])
+            persisted_egress_authority_change = (
+                None
+                if "egress_authority_change" not in payload
+                else EgressAuthorityChangeKind(payload["egress_authority_change"])
+            )
             persisted_actor = payload["actor"]
             policy_identity = payload["policy_identity"]
             policy_reason = payload["policy_reason"]
@@ -4628,6 +4838,7 @@ class SessionEngine:
             policy_identity=policy_identity,
             policy_reason=policy_reason,
             authority_decision=authority_decision,
+            egress_authority_change=persisted_egress_authority_change,
             idempotency_identity=idempotency_identity,
             adoption_request_fingerprint=persisted_request_fingerprint,
             actor=ResolutionActor.model_validate(persisted_actor),
@@ -11755,6 +11966,9 @@ class SessionEngine:
             else require_clean_nonblank(run_operation_id, "run_operation_id")
         )
         continuing_execution_profile_snapshot: ActiveInvocationExecutionProfile | None = None
+        egress_profile_activation: EgressAuthorityTransitionRecord | None = None
+        egress_environment_handoff: EgressAuthorityAdoptionResult | None = None
+        invocation_profile: ExecutionProfileIdentity | None = None
 
         def validate_resumable_checkpoint(
             current_session: Session,
@@ -11853,6 +12067,17 @@ class SessionEngine:
                 current_session,
                 current_checkpoint,
             )
+            if invocation_profile is None:
+                raise AssertionError("Session invocation admission lost its execution profile.")
+            require_egress_authority_transition_compatible_with_profile(
+                updated_checkpoint,
+                invocation_profile.egress_authority,
+            )
+            if egress_profile_activation is not None:
+                require_exact_egress_authority_transition(
+                    updated_checkpoint,
+                    egress_profile_activation,
+                )
             return _checkpoint_with_session_run_operation(
                 checkpoint=updated_checkpoint,
                 current_session=current_session,
@@ -12129,6 +12354,12 @@ class SessionEngine:
                     built_in_model_target_transition=(built_in_model_target_transition),
                     tool_capability_ceiling_narrowed=(tool_capability_ceiling_narrowed),
                 )
+            # The decision is both admission authority and durable audit evidence.
+            # Require the normal publication boundary to preserve it exactly before
+            # an application cutover handler or the atomic admission store can see it.
+            # This rejects workload secrets in policy/caller audit fields instead of
+            # letting a later serializer or transition record persist them raw.
+            self._event_writer.prepare_exact_replay(execution_profile_decision.event)
             if execution_profile_decision.kind in {
                 ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
                 ExecutionProfileDecisionKind.REJECTED,
@@ -12386,6 +12617,38 @@ class SessionEngine:
         )
         if invocation_profile is None:
             raise AssertionError("Session invocation admission produced no execution profile.")
+        egress_environment_handoff = await self._require_active_egress_profile_cutover(
+            session=loaded_session,
+            decision=execution_profile_decision,
+        )
+        parked_egress_factory_result = None
+        if (
+            egress_environment_handoff is None
+            and self._egress_authority_adoption_handler is not None
+            and invocation_profile.egress_authority is not None
+            and (environment_name := _environment_name(registered_environment)) is not None
+        ):
+            try:
+                retained_fingerprint = (
+                    await self._environment_lifecycle.require_live_allocation_fingerprint(
+                        session_id=loaded_session.id,
+                        environment_name=environment_name,
+                    )
+                )
+            except (TypeError, ValueError, RuntimeError):
+                # A session with no retained process-local allocation follows
+                # the ordinary durable reconnect path below.
+                retained_fingerprint = None
+            if retained_fingerprint is not None:
+                parked_egress_factory_result = _find_parked_egress_authority_allocation(
+                    self._egress_authority_adoption_handler,
+                    session_id=loaded_session.id,
+                    environment_name=environment_name,
+                    expected_fingerprint=retained_fingerprint,
+                )
+        egress_profile_activation = (
+            None if egress_environment_handoff is None else egress_environment_handoff.transition
+        )
         try:
             session = await self.session_store.admit_session_invocation(
                 loaded_session.id,
@@ -12722,6 +12985,8 @@ class SessionEngine:
                 else reconciled_pending_round.source_transcript_cursor
             ),
             previous_tool_exposure_profile_id=previous_tool_exposure_profile_id,
+            egress_environment_handoff=egress_environment_handoff,
+            parked_egress_factory_result=parked_egress_factory_result,
         )
         authoritative_failure: BaseExceptionGroup | None = None
         try:
@@ -14266,6 +14531,8 @@ class SessionEngine:
         initial_model_step_tool_exposure: ResolvedToolExposure | None = None,
         previous_tool_exposure_profile_id: str | None = None,
         preserve_failure_until_initial_provider_dispatch: bool = False,
+        egress_environment_handoff: EgressAuthorityAdoptionResult | None = None,
+        parked_egress_factory_result: EnvironmentFactoryResult | None = None,
     ) -> AsyncGenerator[Event, None]:
         # Deep defense for internal recovery callers. Public entry points
         # validate before claiming mutable session ownership.
@@ -14317,6 +14584,21 @@ class SessionEngine:
             raise ValueError(
                 "Initial provider-dispatch failure preservation requires an initial "
                 "model-step identity."
+            )
+        if egress_environment_handoff is not None and not (
+            _has_runtime_egress_authority_adoption_result(egress_environment_handoff)
+        ):
+            raise EgressAuthorityTransitionConflict(
+                "Invocation received an invalid egress environment handoff."
+            )
+        if (
+            parked_egress_factory_result is not None
+            and type(parked_egress_factory_result) is not EnvironmentFactoryResult
+        ):
+            raise TypeError("Parked egress handoff requires an EnvironmentFactoryResult.")
+        if parked_egress_factory_result is not None and egress_environment_handoff is not None:
+            raise EgressAuthorityTransitionConflict(
+                "Invocation received two owners for one parked egress environment."
             )
 
         async def materialize_deferred_messages() -> None:
@@ -14532,6 +14814,65 @@ class SessionEngine:
                 task_start_event = await start_linked_task_if_needed()
                 if task_start_event is not None:
                     yield task_start_event
+            adopted_factory_result = None
+            parked_egress_renewal = None
+            if egress_environment_handoff is not None:
+                handler = self._egress_authority_adoption_handler
+                if handler is None:
+                    raise EgressAuthorityTransitionConflict(
+                        "Egress environment handoff lost its adoption handler."
+                    )
+                activation = egress_environment_handoff.transition
+                parked_result = _claim_parked_egress_authority_allocation(
+                    handler,
+                    session_id=session.id,
+                    environment_name=activation.environment_name,
+                    expected_fingerprint=activation.source_environment_fingerprint,
+                    expected_factory_result=(egress_environment_handoff._factory_result),
+                )
+                adopted_factory_result = egress_environment_handoff._claim_factory_result()
+                if adopted_factory_result is not parked_result:
+                    raise EgressAuthorityTransitionConflict(
+                        "Egress environment handoff claimed a substituted allocation."
+                    )
+            elif parked_egress_factory_result is not None:
+                handler = self._egress_authority_adoption_handler
+                if handler is None or execution_profile is None or registered_environment is None:
+                    raise EgressAuthorityTransitionConflict(
+                        "Parked egress reuse lost its exact invocation authority."
+                    )
+                authority = execution_profile.egress_authority
+                environment_name = _environment_name(registered_environment)
+                if authority is None or environment_name is None:
+                    raise EgressAuthorityTransitionConflict(
+                        "Parked egress reuse lost its exact invocation authority."
+                    )
+                fingerprint = parked_egress_factory_result.reconnect_metadata.get(
+                    "allocation_fingerprint"
+                )
+                if type(fingerprint) is not str:
+                    raise EgressAuthorityTransitionConflict(
+                        "Parked egress reuse lost its allocation fingerprint."
+                    )
+                adopted_factory_result = _claim_parked_egress_authority_allocation(
+                    handler,
+                    session_id=session.id,
+                    environment_name=environment_name,
+                    expected_fingerprint=fingerprint,
+                    expected_factory_result=parked_egress_factory_result,
+                )
+                factory = registered_environment.factory
+                if factory is None:
+                    raise EgressAuthorityTransitionConflict(
+                        "Parked egress reuse lost its registered environment factory."
+                    )
+                parked_egress_renewal = (
+                    adopted_factory_result,
+                    factory,
+                    authority,
+                    environment_name,
+                    execution_profile.fingerprint,
+                )
             factory_resolution = await self._environment_lifecycle.resolve_factory(
                 session=session,
                 registered_agent=registered_agent,
@@ -14543,11 +14884,45 @@ class SessionEngine:
                     else EnvironmentFactoryOperation.RECONNECT
                 ),
                 execution_profile=execution_profile,
+                adopted_factory_result=adopted_factory_result,
             )
             registered_environment = factory_resolution.registered_environment
             environment_name = _environment_name(registered_environment)
             if active_run is not None:
                 active_run.turn_environment_name = environment_name
+            if factory_resolution.error is None:
+                if parked_egress_renewal is not None:
+                    (
+                        parked_result,
+                        parked_factory,
+                        parked_authority,
+                        parked_environment_name,
+                        parked_execution_profile_fingerprint,
+                    ) = parked_egress_renewal
+                    await reactivate_parked_egress_environment(
+                        factory_result=parked_result,
+                        factory=parked_factory,
+                        expected_authority=parked_authority,
+                        session_id=session.id,
+                        environment_name=parked_environment_name,
+                        agent_name=registered_agent.spec.name,
+                        execution_profile_fingerprint=(parked_execution_profile_fingerprint),
+                    )
+                active_egress_transition = await SessionCheckpointEgressAuthorityTransitionStore(
+                    self.session_store
+                ).load(session.id)
+                if (
+                    active_egress_transition is not None
+                    and active_egress_transition.state is EgressAuthorityTransitionState.ACTIVE
+                ):
+                    if registered_environment is None:
+                        raise EgressAuthorityTransitionConflict(
+                            "The active egress profile resolved no invocation environment."
+                        )
+                    await require_active_egress_transition_environment(
+                        environment=registered_environment.environment,
+                        transition=active_egress_transition,
+                    )
             for event in factory_resolution.events:
                 yield event
             if factory_resolution.error is not None:
@@ -18530,81 +18905,121 @@ class SessionEngine:
             registered_environment=registered_environment,
             execution_profile=execution_profile,
         )
-        for binding_event in finalize_result.events:
-            yield binding_event
-        prepared_terminal_event = self._event_writer.prepare(finalize_result.event)
-        try:
-            terminal_event = await self._event_writer.emit(prepared_terminal_event)
-        except Exception as publication_failure:
+
+        async def emit_finalized_terminal_boundary() -> AsyncGenerator[Event, None]:
+            for binding_event in finalize_result.events:
+                yield binding_event
+            prepared_terminal_event = self._event_writer.prepare(finalize_result.event)
             try:
-                reconciled_terminal_event = await self._reconcile_persisted_terminal_event(
-                    prepared_terminal_event
-                )
-            except Exception as reconciliation_failure:
-                uncertainty = TerminalEventPublicationUncertain(
-                    event=prepared_terminal_event,
-                    publication_failure=publication_failure,
-                    reconciliation_failure=reconciliation_failure,
-                )
-                raise uncertainty from uncertainty.failures
-            if reconciled_terminal_event is None:
-                raise
-            terminal_event = reconciled_terminal_event
-            logger.warning(
-                "Terminal event is durable but its publication acknowledgement or "
-                "side-effect delivery failed: session_id=%s event_id=%s error_type=%s",
-                session.id,
-                terminal_event.id,
-                type(publication_failure).__name__,
-            )
-        if terminal_event.model_dump(mode="json") != prepared_terminal_event.model_dump(
-            mode="json"
-        ):
-            raise RuntimeError("Terminal event publication returned different durable evidence.")
-        if event_id_is_runtime_generated(prepared_terminal_event):
-            terminal_event = event_with_runtime_generated_id(terminal_event)
-        run_operation_id = terminal_event.payload.get(_SESSION_RUN_OPERATION_ID_PAYLOAD_KEY)
-        if run_operation_id is not None:
-            try:
-                await self._clear_session_run_operation(
-                    session_id=session.id,
-                    operation_id=require_clean_nonblank(
-                        run_operation_id,
-                        "terminal event session_run_operation_id",
-                    ),
-                    terminal_evidence_durable=True,
-                )
-            except Exception as cleanup_failure:
+                terminal_event = await self._event_writer.emit(prepared_terminal_event)
+            except Exception as publication_failure:
+                try:
+                    reconciled_terminal_event = await self._reconcile_persisted_terminal_event(
+                        prepared_terminal_event
+                    )
+                except Exception as reconciliation_failure:
+                    uncertainty = TerminalEventPublicationUncertain(
+                        event=prepared_terminal_event,
+                        publication_failure=publication_failure,
+                        reconciliation_failure=reconciliation_failure,
+                    )
+                    raise uncertainty from uncertainty.failures
+                if reconciled_terminal_event is None:
+                    raise
+                terminal_event = reconciled_terminal_event
                 logger.warning(
-                    "Terminal evidence is durable but session run operation cleanup "
-                    "remains pending: session_id=%s event_id=%s error_type=%s",
+                    "Terminal event is durable but its publication acknowledgement or "
+                    "side-effect delivery failed: session_id=%s event_id=%s error_type=%s",
                     session.id,
                     terminal_event.id,
-                    type(cleanup_failure).__name__,
+                    type(publication_failure).__name__,
                 )
-        yield terminal_event
-        async for hook_event in self._run_runtime_hooks(
-            phase=phase,
-            session=session,
-            terminal_event=terminal_event,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            hooks=self._runtime_hooks,
-            scope="app",
-            execution_profile=execution_profile,
-        ):
-            yield hook_event
-        async for hook_event in self._run_runtime_hooks(
-            phase=phase,
-            session=session,
-            terminal_event=terminal_event,
-            registered_agent=registered_agent,
-            registered_environment=registered_environment,
-            hooks=registered_agent.runtime_hooks,
-            scope="agent",
-            execution_profile=execution_profile,
-        ):
-            yield hook_event
+            if terminal_event.model_dump(mode="json") != prepared_terminal_event.model_dump(
+                mode="json"
+            ):
+                raise RuntimeError(
+                    "Terminal event publication returned different durable evidence."
+                )
+            if event_id_is_runtime_generated(prepared_terminal_event):
+                terminal_event = event_with_runtime_generated_id(terminal_event)
+            run_operation_id = terminal_event.payload.get(_SESSION_RUN_OPERATION_ID_PAYLOAD_KEY)
+            if run_operation_id is not None:
+                try:
+                    await self._clear_session_run_operation(
+                        session_id=session.id,
+                        operation_id=require_clean_nonblank(
+                            run_operation_id,
+                            "terminal event session_run_operation_id",
+                        ),
+                        terminal_evidence_durable=True,
+                    )
+                except Exception as cleanup_failure:
+                    logger.warning(
+                        "Terminal evidence is durable but session run operation cleanup "
+                        "remains pending: session_id=%s event_id=%s error_type=%s",
+                        session.id,
+                        terminal_event.id,
+                        type(cleanup_failure).__name__,
+                    )
+            yield terminal_event
+            async for hook_event in self._run_runtime_hooks(
+                phase=phase,
+                session=session,
+                terminal_event=terminal_event,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                hooks=self._runtime_hooks,
+                scope="app",
+                execution_profile=execution_profile,
+            ):
+                yield hook_event
+            async for hook_event in self._run_runtime_hooks(
+                phase=phase,
+                session=session,
+                terminal_event=terminal_event,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                hooks=registered_agent.runtime_hooks,
+                scope="agent",
+                execution_profile=execution_profile,
+            ):
+                yield hook_event
+
+        try:
+            async for emitted_event in emit_finalized_terminal_boundary():
+                yield emitted_event
+        except BaseException as post_finalize_failure:
+            cancellation = finalize_result.cancellation
+            if cancellation is None or any(
+                candidate is cancellation
+                for candidate in iter_exception_tree(post_finalize_failure)
+            ):
+                raise
+            if isinstance(post_finalize_failure, Exception):
+                if finalize_result.cancellation_requests_consumed:
+                    retain_workspace_observation_pending_cancellation_requests(
+                        cancellation,
+                        finalize_result.cancellation_requests_consumed,
+                    )
+                raise cancellation from post_finalize_failure
+            concurrent_control = BaseExceptionGroup(
+                "Terminal finalization received concurrent control after egress parking.",
+                [post_finalize_failure, cancellation],
+            )
+            if finalize_result.cancellation_requests_consumed:
+                retain_workspace_observation_pending_cancellation_requests(
+                    concurrent_control,
+                    finalize_result.cancellation_requests_consumed,
+                )
+            raise concurrent_control from None
+
+        if finalize_result.cancellation is not None:
+            if finalize_result.cancellation_requests_consumed:
+                retain_workspace_observation_pending_cancellation_requests(
+                    finalize_result.cancellation,
+                    finalize_result.cancellation_requests_consumed,
+                )
+            raise finalize_result.cancellation
 
     async def _run_runtime_hooks(
         self,

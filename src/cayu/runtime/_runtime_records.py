@@ -129,6 +129,13 @@ class RegisteredEnvironment:
     binding_payload: dict[str, Any] | None = None
     execution_candidate: str | None = None
     unclaimed_factory_result: EnvironmentFactoryResult | None = None
+    # A successfully bound virtual-egress result remains the exact live owner
+    # that can be parked at an invocation boundary for governed adoption.
+    retained_factory_result: EnvironmentFactoryResult | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
     preserve_factory_allocation: bool = False
     # Opaque identity for one recoverable process-external allocation. This is
     # stable across a factory reconnect but absent for process-local/static

@@ -132,6 +132,9 @@ Notes:
   It must be versioned, JSON-safe, non-secret identity only. A fresh factory must
   either attach the exact resource named by that metadata or return a typed
   unsupported/invalid result; silently creating a replacement is not reconnect.
+  A reconnectable fresh-path virtual-egress adapter must also preserve Cayu's
+  backend allocation fingerprint in that metadata; a reconnect without that
+  positive identity proof fails closed before adapter preparation.
 - A result that owns live resources represented by `reconnect_metadata` should
   provide `EnvironmentFactoryResult.release`. The runtime calls it with
   `DISCARD` when a new allocation fails before the durable checkpoint and

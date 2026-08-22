@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from enum import StrEnum
@@ -26,6 +27,11 @@ from cayu._validation import (
     require_durable_nonblank,
 )
 from cayu.core.events import Event, copy_event, event_with_runtime_payload_authority
+from cayu.egress.authority import (
+    EgressAuthorityChangeKind,
+    EgressAuthorityIdentity,
+    compare_egress_authority,
+)
 from cayu.runtime.approvals import (
     ResolutionActor,
     copy_resolution_actor,
@@ -39,7 +45,7 @@ from cayu.runtime.tool_catalogue import (
     validate_tool_descriptor_version,
 )
 
-EXECUTION_PROFILE_SCHEMA_VERSION = 4
+EXECUTION_PROFILE_SCHEMA_VERSION = 5
 _EXECUTION_PROFILE_RECORD_SCHEMA_VERSION = 1
 _ACTIVE_INVOCATION_EXECUTION_PROFILE_SCHEMA_VERSION = 1
 EXECUTION_PROFILE_METADATA_KEY = "cayu:execution_profile"
@@ -64,6 +70,7 @@ class ExecutionProfileComponentClass(StrEnum):
     RUNTIME_HOOKS = "runtime_hooks"
     EXECUTION_ENVIRONMENT = "execution_environment"
     EFFECT_AUTHORITY = "effect_authority"
+    EGRESS_AUTHORITY = "egress_authority"
     CONTEXT_SELECTION = "context_selection"
     AUTOMATIC_RECALL = "automatic_recall"
     CONTEXT_COMPACTION = "context_compaction"
@@ -111,10 +118,17 @@ _SCHEMA_V4_COMPONENT_CLASSES = frozenset(
         ExecutionProfileComponentClass.FINALIZATION,
     }
 )
+_SCHEMA_V5_COMPONENT_CLASSES = frozenset(
+    {
+        *_SCHEMA_V4_COMPONENT_CLASSES,
+        ExecutionProfileComponentClass.EGRESS_AUTHORITY,
+    }
+)
 _SCHEMA_COMPONENT_CLASSES = {
     1: _SCHEMA_V1_COMPONENT_CLASSES,
     2: _SCHEMA_V2_COMPONENT_CLASSES,
     4: _SCHEMA_V4_COMPONENT_CLASSES,
+    5: _SCHEMA_V5_COMPONENT_CLASSES,
 }
 
 
@@ -137,6 +151,7 @@ _AUTHORITY_COMPONENT_CLASSES = frozenset(
         ExecutionProfileComponentClass.RUNTIME_HOOKS,
         ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT,
         ExecutionProfileComponentClass.EFFECT_AUTHORITY,
+        ExecutionProfileComponentClass.EGRESS_AUTHORITY,
         ExecutionProfileComponentClass.CONTEXT_SELECTION,
         ExecutionProfileComponentClass.AUTOMATIC_RECALL,
         ExecutionProfileComponentClass.CONTEXT_COMPACTION,
@@ -288,6 +303,7 @@ class ExecutionProfilePolicyRequest(BaseModel):
     changed_component_classes: tuple[ExecutionProfileComponentClass, ...]
     intent: ExecutionProfileAdoptionIntent | None = None
     authority_review_required: StrictBool = False
+    egress_authority_change: EgressAuthorityChangeKind | None = None
     source_provider_name: str
     source_model: str
     target_provider_name: str
@@ -332,6 +348,15 @@ class ExecutionProfilePolicyRequest(BaseModel):
             raise ValueError(
                 "Authority-changing components require execution-profile authority review."
             )
+        egress_change = execution_profile_egress_authority_change(
+            self.expected_profile,
+            self.candidate_profile,
+            changed_component_classes=expected,
+        )
+        if self.egress_authority_change is None:
+            object.__setattr__(self, "egress_authority_change", egress_change)
+        elif self.egress_authority_change is not egress_change:
+            raise ValueError("egress_authority_change does not match the supplied profiles.")
         return self
 
 
@@ -380,6 +405,7 @@ class ExecutionProfileDecision(BaseModel):
     policy_identity: str = Field(max_length=EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS)
     policy_reason: str = Field(max_length=EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS)
     authority_decision: ExecutionProfileAuthorityDecision
+    egress_authority_change: EgressAuthorityChangeKind | None = None
     idempotency_identity: str = Field(max_length=EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS)
     adoption_request_fingerprint: str | None = None
     actor: ResolutionActor | None = None
@@ -432,6 +458,18 @@ class ExecutionProfileDecision(BaseModel):
         )
         if changed != self.changed_component_classes:
             raise ValueError("Execution-profile decision changed components are inconsistent.")
+        egress_change = execution_profile_egress_authority_change(
+            self.expected_profile,
+            self.candidate_profile,
+            changed_component_classes=changed,
+        )
+        if self.egress_authority_change is None:
+            object.__setattr__(self, "egress_authority_change", egress_change)
+        elif self.egress_authority_change is EgressAuthorityChangeKind.REFUSED:
+            if self.kind is not ExecutionProfileDecisionKind.REJECTED or egress_change is None:
+                raise ValueError("Only a rejected egress proposal can be classified refused.")
+        elif self.egress_authority_change is not egress_change:
+            raise ValueError("Execution-profile decision egress comparison is inconsistent.")
         if self.kind is ExecutionProfileDecisionKind.EXACT_REUSE and changed:
             raise ValueError("Exact profile reuse cannot contain changed components.")
         unmodeled_authority_decision = self.kind in {
@@ -471,7 +509,19 @@ class ExecutionProfileDecision(BaseModel):
             )
         if (
             self.kind is ExecutionProfileDecisionKind.ADOPTED
-            and any(component in _AUTHORITY_COMPONENT_CLASSES for component in changed)
+            and (
+                any(
+                    component in _AUTHORITY_COMPONENT_CLASSES
+                    for component in changed
+                    if component is not ExecutionProfileComponentClass.EGRESS_AUTHORITY
+                )
+                or self.egress_authority_change
+                in {
+                    EgressAuthorityChangeKind.WIDER,
+                    EgressAuthorityChangeKind.INCOMPARABLE,
+                    EgressAuthorityChangeKind.REFUSED,
+                }
+            )
             and self.authority_decision is not ExecutionProfileAuthorityDecision.AUTHORIZED
         ):
             raise ValueError("Execution-authority adoption requires explicit authority.")
@@ -497,6 +547,7 @@ class ExecutionProfileDecision(BaseModel):
             policy_identity=self.policy_identity,
             policy_reason=self.policy_reason,
             authority_decision=self.authority_decision,
+            egress_authority_change=self.egress_authority_change,
             idempotency_identity=self.idempotency_identity,
             adoption_request_fingerprint=self.adoption_request_fingerprint,
             actor=self.actor,
@@ -504,6 +555,58 @@ class ExecutionProfileDecision(BaseModel):
         ):
             raise ValueError("Execution-profile decision event payload is inconsistent.")
         return self
+
+
+_RUNTIME_EXECUTION_PROFILE_DECISIONS: dict[
+    int,
+    tuple[weakref.ReferenceType[ExecutionProfileDecision], str],
+] = {}
+
+
+def _execution_profile_decision_authority_digest(
+    decision: ExecutionProfileDecision,
+) -> str:
+    material = decision.model_dump(mode="json", warnings="error")
+    return sha256(
+        canonical_durable_json_bytes(material, "runtime_execution_profile_decision")
+    ).hexdigest()
+
+
+def _with_runtime_execution_profile_decision_authority(
+    decision: ExecutionProfileDecision,
+) -> ExecutionProfileDecision:
+    """Attest one decision produced by the runtime policy boundary."""
+
+    if type(decision) is not ExecutionProfileDecision:
+        raise TypeError("decision must be an ExecutionProfileDecision.")
+    identity = id(decision)
+
+    def forget(reference: weakref.ReferenceType[ExecutionProfileDecision]) -> None:
+        current = _RUNTIME_EXECUTION_PROFILE_DECISIONS.get(identity)
+        if current is not None and current[0] is reference:
+            _RUNTIME_EXECUTION_PROFILE_DECISIONS.pop(identity, None)
+
+    reference = weakref.ref(decision, forget)
+    _RUNTIME_EXECUTION_PROFILE_DECISIONS[identity] = (
+        reference,
+        _execution_profile_decision_authority_digest(decision),
+    )
+    return decision
+
+
+def _has_runtime_execution_profile_decision_authority(
+    decision: ExecutionProfileDecision,
+) -> bool:
+    """Return authority that cannot be copied from the public model itself."""
+
+    attestation = _RUNTIME_EXECUTION_PROFILE_DECISIONS.get(id(decision))
+    if attestation is None or attestation[0]() is not decision:
+        return False
+    try:
+        observed_digest = _execution_profile_decision_authority_digest(decision)
+    except Exception:
+        return False
+    return observed_digest == attestation[1]
 
 
 class ExecutionProfileComponentIdentity(BaseModel):
@@ -540,9 +643,19 @@ class ExecutionProfileIdentity(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    schema_version: Literal[1, 2, 4] = EXECUTION_PROFILE_SCHEMA_VERSION
+    schema_version: Literal[1, 2, 4, 5] = EXECUTION_PROFILE_SCHEMA_VERSION
     fingerprint: str
     components: tuple[ExecutionProfileComponentIdentity, ...]
+    egress_authority: EgressAuthorityIdentity | None = None
+
+    @field_validator("egress_authority", mode="before")
+    @classmethod
+    def copy_egress_authority(cls, value: object) -> EgressAuthorityIdentity | None:
+        if value is None:
+            return None
+        if isinstance(value, EgressAuthorityIdentity):
+            value = value.model_dump(mode="json")
+        return EgressAuthorityIdentity.model_validate(value)
 
     @field_validator("fingerprint")
     @classmethod
@@ -560,6 +673,16 @@ class ExecutionProfileIdentity(BaseModel):
                 "Execution-profile components must contain every required class exactly once "
                 "in sorted order."
             )
+        if self.schema_version < 5 and self.egress_authority is not None:
+            raise ValueError("Legacy execution profiles cannot carry egress authority details.")
+        if self.schema_version >= 5:
+            expected_egress_component = _egress_authority_component(self.egress_authority)
+            if self.component(ExecutionProfileComponentClass.EGRESS_AUTHORITY) != (
+                expected_egress_component
+            ):
+                raise ValueError(
+                    "Execution-profile egress authority does not match its component identity."
+                )
         expected = _profile_fingerprint(
             self.components,
             schema_version=self.schema_version,
@@ -703,6 +826,7 @@ def copy_execution_profile_decision(
         policy_identity=decision.policy_identity,
         policy_reason=decision.policy_reason,
         authority_decision=decision.authority_decision,
+        egress_authority_change=decision.egress_authority_change,
         idempotency_identity=decision.idempotency_identity,
         adoption_request_fingerprint=decision.adoption_request_fingerprint,
         actor=decision.actor,
@@ -724,6 +848,7 @@ def execution_profile_decision_payload(
     adoption_request_fingerprint: str | None = None,
     actor: ResolutionActor | None,
     reason: str,
+    egress_authority_change: EgressAuthorityChangeKind | None = None,
 ) -> dict[str, Any]:
     """Build the complete bounded durable evidence payload for one decision."""
 
@@ -739,6 +864,8 @@ def execution_profile_decision_payload(
         "reason": reason,
         "idempotency_identity": idempotency_identity,
     }
+    if egress_authority_change is not None:
+        payload["egress_authority_change"] = egress_authority_change.value
     if adoption_request_fingerprint is not None:
         payload["adoption_request_fingerprint"] = adoption_request_fingerprint
     return payload
@@ -836,6 +963,7 @@ def build_execution_profile_identity(
     execution_environment_process_local: bool = False,
     execution_environment_application_versioned: bool = False,
     effect_authority: Mapping[str, Any] | None = None,
+    egress_authority: EgressAuthorityIdentity | None = None,
     context_selection: Mapping[str, Any] | None = None,
     context_selection_process_local: bool = False,
     context_selection_application_versioned: bool = False,
@@ -982,6 +1110,7 @@ def build_execution_profile_identity(
                 else effect_authority
             ),
         ),
+        _egress_authority_component(egress_authority),
         _available_component(
             ExecutionProfileComponentClass.CONTEXT_SELECTION,
             _aggregate_identity_strength(
@@ -1082,6 +1211,7 @@ def build_execution_profile_identity(
             schema_version=EXECUTION_PROFILE_SCHEMA_VERSION,
         ),
         components=sorted_components,
+        egress_authority=egress_authority,
     )
 
 
@@ -1099,12 +1229,38 @@ def changed_execution_profile_components(
         for component_class in classes
         if (
             expected_by_class.get(component_class) != candidate_by_class.get(component_class)
-            or expected_by_class[component_class].availability
-            is ExecutionProfileIdentityAvailability.UNAVAILABLE
-            or candidate_by_class[component_class].availability
-            is ExecutionProfileIdentityAvailability.UNAVAILABLE
+            or (
+                expected_by_class.get(component_class) is not None
+                and expected_by_class[component_class].availability
+                is ExecutionProfileIdentityAvailability.UNAVAILABLE
+            )
+            or (
+                candidate_by_class.get(component_class) is not None
+                and candidate_by_class[component_class].availability
+                is ExecutionProfileIdentityAvailability.UNAVAILABLE
+            )
         )
     )
+
+
+def execution_profile_egress_authority_change(
+    expected: ExecutionProfileIdentity,
+    candidate: ExecutionProfileIdentity,
+    *,
+    changed_component_classes: tuple[ExecutionProfileComponentClass, ...] | None = None,
+) -> EgressAuthorityChangeKind | None:
+    """Return the conservative semantic classification for an egress difference."""
+
+    changed = (
+        changed_execution_profile_components(expected, candidate)
+        if changed_component_classes is None
+        else changed_component_classes
+    )
+    if ExecutionProfileComponentClass.EGRESS_AUTHORITY not in changed:
+        return None
+    if expected.egress_authority is None or candidate.egress_authority is None:
+        return EgressAuthorityChangeKind.INCOMPARABLE
+    return compare_egress_authority(expected.egress_authority, candidate.egress_authority)
 
 
 def unavailable_execution_profile_components(
@@ -1128,6 +1284,12 @@ def execution_profile_with_component(
     by_class = {item.component_class: item for item in profile.components}
     by_class[component.component_class] = component
     components = tuple(sorted(by_class.values(), key=lambda item: item.component_class))
+    egress_authority = profile.egress_authority
+    if (
+        component.component_class is ExecutionProfileComponentClass.EGRESS_AUTHORITY
+        and component != _egress_authority_component(egress_authority)
+    ):
+        raise ValueError("Use execution_profile_with_egress_authority to replace egress authority.")
     return ExecutionProfileIdentity(
         schema_version=profile.schema_version,
         fingerprint=_profile_fingerprint(
@@ -1135,6 +1297,33 @@ def execution_profile_with_component(
             schema_version=profile.schema_version,
         ),
         components=components,
+        egress_authority=egress_authority,
+    )
+
+
+def execution_profile_with_egress_authority(
+    profile: ExecutionProfileIdentity,
+    authority: EgressAuthorityIdentity | None,
+) -> ExecutionProfileIdentity:
+    """Return a schema-v5 profile with one typed egress authority replacement."""
+
+    if profile.schema_version < 5:
+        raise ValueError("Legacy execution profiles cannot replace egress authority in place.")
+    authority = (
+        None
+        if authority is None
+        else EgressAuthorityIdentity.model_validate(authority.model_dump(mode="json"))
+    )
+    by_class = {item.component_class: item for item in profile.components}
+    by_class[ExecutionProfileComponentClass.EGRESS_AUTHORITY] = _egress_authority_component(
+        authority
+    )
+    components = tuple(sorted(by_class.values(), key=lambda item: item.component_class))
+    return ExecutionProfileIdentity(
+        schema_version=profile.schema_version,
+        fingerprint=_profile_fingerprint(components, schema_version=profile.schema_version),
+        components=components,
+        egress_authority=authority,
     )
 
 
@@ -1322,6 +1511,24 @@ def _available_component(
         strength=strength,
         availability=ExecutionProfileIdentityAvailability.AVAILABLE,
         fingerprint=fingerprint,
+    )
+
+
+def _egress_authority_component(
+    authority: EgressAuthorityIdentity | None,
+) -> ExecutionProfileComponentIdentity:
+    if authority is None:
+        return _available_component(
+            ExecutionProfileComponentClass.EGRESS_AUTHORITY,
+            ExecutionProfileIdentityStrength.STRUCTURAL,
+            {"kind": "none", "version": 1},
+        )
+    if not authority.comparison_available:
+        return _unavailable_component(ExecutionProfileComponentClass.EGRESS_AUTHORITY)
+    return _available_component(
+        ExecutionProfileComponentClass.EGRESS_AUTHORITY,
+        ExecutionProfileIdentityStrength.APPLICATION_VERSIONED,
+        authority.model_dump(mode="json"),
     )
 
 

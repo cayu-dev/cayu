@@ -91,6 +91,12 @@ class EventType(StrEnum):
     EGRESS_GRANT_REVOKED = "egress.grant.revoked"
     EGRESS_REQUEST_AUTHORIZED = "egress.request.authorized"
     EGRESS_REQUEST_DENIED = "egress.request.denied"
+    EGRESS_AUTHORITY_REQUESTED = "egress.authority.requested"
+    EGRESS_AUTHORITY_AUTHORIZED = "egress.authority.authorized"
+    EGRESS_AUTHORITY_INSTALLING = "egress.authority.installing"
+    EGRESS_AUTHORITY_ACTIVATED = "egress.authority.activated"
+    EGRESS_AUTHORITY_REFUSED = "egress.authority.refused"
+    EGRESS_AUTHORITY_AMBIGUOUS = "egress.authority.ambiguous"
 
     MCP_MANIFEST_CHECKED = "mcp.manifest.checked"
     MCP_MANIFEST_BLOCKED = "mcp.manifest.blocked"

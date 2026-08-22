@@ -619,6 +619,159 @@ constructs `_EgressManagedRunner`, accesses `_runner`, casts to
 Install both optional dependencies with
 `pip install 'cayu[egress,microsandbox]'`.
 
+### Governed authority changes between invocations
+
+An egress policy is now a versioned execution-profile component, not just a
+factory construction detail. The component is immutable and secret-free. It
+records the generation, trusted source and scope, policy version, bounded
+host/method/path semantics, credential *kind* and binding identity, runner kind,
+and adapter cutover strategy. It never records a virtual credential, resolved
+secret, proxy bearer token, CA private key, or provider payload.
+
+This separates a request from authority. Agent output may propose that later
+work needs another destination or operation, but it cannot authorize that
+change. Cayu compares the current and candidate components as:
+
+- `unchanged`: the effective permissions are the same, even if the generation advances;
+- `narrower`: the candidate removes permissions;
+- `wider`: the candidate adds a destination or operation;
+- `incomparable`: neither permission set contains the other, or semantic
+  comparison is unavailable; or
+- `refused`: trusted application policy rejected the proposal.
+
+Built-in HTTP and browser policies provide the bounded semantic projection used
+for comparison. A custom or unversioned policy is explicitly comparison-unavailable;
+it does not receive a strong semantic fingerprint. Wider and incomparable changes
+require an attributable `ExecutionProfileAuthorityDecision.AUTHORIZED` from trusted
+application policy. Tightening may be configured to proceed automatically, but it
+still uses the normal profile-adoption decision and produces durable evidence.
+
+The logical agent must be parked at an invocation boundary before installation.
+The transition store rejects a `running` or `interrupting` session, and the managed
+runner rejects active or uncertain command settlement, binding work, cleanup, or
+finalization. Existing execution-profile admission continues to reject adoption
+while invocation-owned effects, credential leases, hooks, verifiers, or cleanup
+remain active. No new exec is admitted while the cutover runs.
+
+The durable lifecycle is `authorized -> installing -> active`, with `refused` and
+`ambiguous` terminal/needs-attention outcomes. Every revision is compare-and-set,
+owner-fenced, replay-safe, and atomically published with its causal runtime events.
+The current record lives at `cayu:egress_authority_transition` in the session
+checkpoint, so the same contract works with in-memory, SQLite, and Postgres stores.
+The events are `egress.authority.requested`, `.authorized`, `.installing`,
+`.activated`, `.refused`, and `.ambiguous`; their projection includes only bounded
+from/to identities, comparison, actor and policy identity, monotonic revision,
+adapter strategy, environment fingerprint, and the final receipt.
+
+Each adapter declares one strategy:
+
+| Adapter | Governed authority change |
+| --- | --- |
+| Docker | `fresh_authority_path`: terminate detached guest work, pause the exact container, stage a fresh internal network/broker/sidecar, revoke and drain the old broker, disconnect and close the old path (including established sockets), update the runtime-owned exec overlay, verify positive and negative enforcement, and unpause the same container. |
+| E2B | `fresh_authority_path`: deny all network access, terminate guest-owned processes, stage a fresh Cayu exposure/broker, revoke and close the old path, apply the new proxy-only `update_network` policy, and verify the same sandbox. Cayu requires E2B 2.45.1 or newer stable 2.x. |
+| Microsandbox | `allocation_replacement`: its reconnect evidence remains useful, but it is not a hot-cutover tracer for this contract. |
+| Missing/custom declaration | `unsupported`: refuse before changing the active generation. |
+
+Neither Docker nor E2B claims that the provider invalidates established
+connections in place. Safety comes from rotating the complete Cayu-owned route,
+revoking its grants, closing every accepted proxy socket, and fencing guest work.
+Docker keeps the exact container ID; E2B keeps the exact sandbox ID. Both receipts
+claim workspace continuity only after rechecking that exact backend identity.
+Ordinary Docker remains a trusted-development/conformance substrate, not an
+untrusted-code sandbox.
+
+Applications provide an `EgressAuthorityAdoptionHandler` that owns the retained
+environment, stable transition identity, and private worker token. `CayuApp.resume()`
+passes that handler the exact runtime-sealed profile decision after policy approval
+and before invocation admission. The handler persists the authorization and asks the
+*target* factory to install its configuration on the retained environment:
+
+```python
+from cayu import (
+    EgressAuthorityAdoptionHandler,
+    authorized_egress_authority_transition,
+    egress_authority_owner_fingerprint,
+)
+
+class BillingEgressAdoption(EgressAuthorityAdoptionHandler):
+    async def adopt(
+        self,
+        decision,
+        *,
+        coordinator,
+        expected_environment_fingerprint,
+        factory_result,
+    ):
+        authorized = authorized_egress_authority_transition(
+            decision=decision,
+            transition_id=stable_transition_id,
+            environment_name="billing",
+            owner_fingerprint=egress_authority_owner_fingerprint(private_worker_token),
+            source_environment_fingerprint=expected_environment_fingerprint,
+        )
+        return await target_factory.adopt_authority(
+            factory_result=factory_result,
+            authorized=authorized,
+            coordinator=coordinator,
+            owner_token=private_worker_token,
+            agent_name="billing-agent",
+        )
+
+
+app = CayuApp(
+    session_store=session_store,
+    execution_profile_policy=profile_policy,
+    egress_authority_adoption_handler=BillingEgressAdoption(),
+)
+```
+
+The same handler instance must be registered before the source invocation ends and on
+the later adopting app. Cayu parks the exact quiescent factory result with that handler;
+the handler must use the `factory_result` and coordinator supplied to that exact call
+and return the target factory's single-use adoption result, containing both the exact
+activation record and the still-owned parked factory result. The runtime
+claims that owner only after durable invocation admission and uses it directly; it does
+not invoke the environment factory a second time. An exact-profile resume also claims
+that same parked owner instead of creating a replacement. Before reopening execution,
+Cayu mints fresh grants, re-enables credentialed and credentialless broker authority,
+and requires adapter readback of the unchanged allocation and enforcement path. If the
+process or handler owner is lost, profile adoption fails closed before invocation admission; a
+durable transition record never reconstructs a live process-local allocation handle.
+Schema-valid records or environment
+objects assembled by application code are not backend proof. The profile
+decision must be the runtime-owned result returned by profile-adoption
+policy evaluation; an identically shaped caller-constructed decision is not
+installation authority. After the handler returns, `resume()` reloads the exact durable
+transition and refuses profile admission unless it is `active`, backend-verified, and
+bound to the session, environment, and from/to authority tuple. After the invocation
+factory resolves, but before binding or model/tool work, Cayu also requires that the
+resolved managed runner carries that same session, environment, target authority, and
+backend allocation fingerprint, and repeats the adapter-owned allocation readback. A
+fresh or substituted environment is rejected even when it has the same runner kind or
+target policy. `adopt_authority` transfers the fresh binding, broker revoker, audit
+bridge, and secret redactor into the existing managed runner before reopening exec. A failure
+before the irreversible boundary records `refused` and leaves the old generation
+authoritative. Once revocation/old-path retirement begins, any unproven outcome
+records `ambiguous`, leaves the environment fenced, and raises
+`EgressAuthorityCutoverNeedsAttention`. Recovery may commit `active` only from the
+exact receipt for the expected from/to generations and backend/environment
+fingerprint; it never guesses. Replaying the handler through the target factory
+performs that backend readback for durable `installing`, `ambiguous`, and `active`
+records before admission. Backend mutation and durable acknowledgement are owned by
+bounded settlement tasks: caller cancellation is redelivered only after classification,
+and a completed late settlement is harvested by the next reconciliation attempt as well
+as by finalization. Cleanup can still finalize an ambiguous environment, but
+ordinary agent work cannot resume until exact reconciliation succeeds or an operator
+durably refuses the transition. Every invocation admission also atomically compares
+its profile with the durable transition revision, so an interrupted or concurrent
+cutover cannot be bypassed by an ordinary resume under another generation.
+
+Parked allocations remain owned until an exact resume claims them or an explicit cleanup
+settles provider deletion. `CayuApp.drain_environment_cleanups()` drains them during
+application shutdown, while `discard_parked_egress_allocations(session_id)` handles
+session abandonment. A cleanup timeout retains the exact owner for a later retry; it
+does not silently forget a potentially billable allocation.
+
 ### Durable reconnect
 
 `VirtualEgressEnvironmentFactory` returns a versioned, JSON-safe reconnect
@@ -702,15 +855,16 @@ Reconnect support is explicit by adapter:
 | Microsandbox | Supported; attested single-owner sandbox plus host-listener and guest-endpoint ports, fresh grants/broker/CA, full preflight. |
 | Lambda MicroVM | Unsupported until a durable external single-owner claim is available; lower-level runner reattach is not sufficient. |
 | Docker | Unsupported; raises `UnsupportedEgressReconnectError`. Rebuild explicitly. |
-| E2B | Unsupported; raises `UnsupportedEgressReconnectError`. Rebuild explicitly. |
+| E2B | Generic reconnect is unsupported; crash-safe creation/recovery instead uses the durable exact-sandbox handoff described below. |
 
 Reconnect capability is distinct from crash-safe creation. New remote
-virtual-egress allocation is currently unsupported for Microsandbox, E2B, and
-Lambda MicroVM; each fails with `EnvironmentAllocationUnsupportedError` before
-provider mutation. Docker creation remains available because it is
-process-local rather than a remote allocation boundary. Custom adapters must
-set `process_external_allocation` explicitly; leaving the classification
-undeclared also fails new creation before adapter preparation.
+virtual-egress allocation remains unsupported for Microsandbox and Lambda
+MicroVM; each fails with `EnvironmentAllocationUnsupportedError` before provider
+mutation. E2B implements durable exact-sandbox create-or-lookup, while Docker
+creation remains available because it is process-local rather than a remote
+allocation boundary. Custom adapters must set `process_external_allocation`
+explicitly; leaving the classification undeclared also fails new creation before
+adapter preparation.
 
 Unsupported adapters never interpret reconnect metadata as a request to create
 a replacement sandbox. Their initial factory result contains a versioned
@@ -731,12 +885,21 @@ hostname-aware filtering inspects the tunneled `CONNECT` destination, so a
 hostname allowlist cannot act as a transparent raw proxy relay. The adapter
 fails closed on hostname and IPv6 exposures and permits only the IPv4 endpoint.
 
-The E2B adapter currently has no runtime-owned exact-resource allocation
-protocol, so `VirtualEgressEnvironmentFactory` rejects new E2B sessions before
-opening the proxy exposure or calling E2B. The example below describes the
-intended adapter wiring, but attempts to run it fail with
-`EnvironmentAllocationUnsupportedError`; it is not a crash-recoverable
-`CayuApp` allocation path yet.
+The E2B adapter uses a durable handoff id as provider metadata and implements
+create-or-lookup recovery for that exact sandbox. A worker that loses the
+creation acknowledgement reconnects only when one sandbox matches the durable
+handoff, then replays protected bootstrap content-bound: missing assets are
+installed, exact root-owned assets are accepted, and any type, mode, owner, or
+content mismatch fails closed. Preservation detaches the local runner while
+keeping the provider sandbox fenced for exact recovery; discard and terminal
+cleanup kill it.
+
+Process-local same-allocation resume is supported while the application still
+owns the parked factory result. Parking revokes the invocation's grants and
+routes; resume mints fresh grants and verifies the unchanged sandbox and proxy
+path before reopening execution. Application/server cleanup drains abandoned
+parked allocations. A fresh process uses the durable create-or-lookup path,
+not the process-local parked handle.
 
 ```python
 from cayu import E2BWorkspace
@@ -940,7 +1103,7 @@ custom `EgressPolicy` when you need business-level limits such as spend caps.
 | --- | --- |
 | `docker` | Egress enforced (per-session internal network + sidecar-only broker authentication + TLS MITM), including credentialless routes; reconnect unsupported. Container isolation is not a secure sandbox boundary. |
 | `microsandbox` | Virtual credentials are enforced with a deny-by-default host policy allowing only the Cayu proxy port. Credentialless routes require a custom session-isolated exposure; reconnect supported. |
-| `e2b` | Enforced with a dedicated E2B-reachable, IPv4-literal raw TCP proxy exposure and fail-closed preflight. Credentialless routes additionally require `credentialless_isolated=True`; reconnect unsupported. |
+| `e2b` | Enforced with a dedicated E2B-reachable, IPv4-literal raw TCP proxy exposure and fail-closed preflight. Credentialless routes additionally require `credentialless_isolated=True`; durable exact-sandbox create/recovery and process-local parked resume are supported. |
 | `lambda-microvm` | Enforced in the integrated image: a VPC connector limits destinations, while a dedicated agent network namespace has no default route and can reach only a narrow relay to the Cayu proxy. Credentialless routes require a session-isolated exposure; virtual-egress factory reconnect unsupported. |
 | `local` | Unsupported by the virtual-egress factory. Direct runner construction may still set `credential_mode` for raw-secret checks, but that is not an egress boundary. |
 
@@ -1036,7 +1199,10 @@ a private Fargate receiver, and an exact host/method/path egress policy.
   proves that a direct host-broker client lacks the sidecar credential and an
   unrelated default-bridge container cannot reach the sidecar listener. This runs in the existing
   uncredentialed Docker live CI job and as `docker-live-virtual-egress` in the
-  nightly registry.
+  nightly registry. `tests/egress/test_authority_cutover_docker_e2e.py` also
+  proves same-container/workspace generation rotation, old grant/destination
+  denial, target permission, and termination of a TLS connection opened before
+  the cutover.
 - Microsandbox E2E (manual/nightly): set
   `CAYU_RUN_MICROSANDBOX_EGRESS_E2E=1`, then run
   `uv run python scripts/nightly_verification.py --check microsandbox-live-virtual-egress --strict`.
@@ -1045,6 +1211,11 @@ a private Fargate receiver, and an exact host/method/path egress policy.
   `{host}` and `{port}`), `CAYU_E2B_PROXY_URL`, and
   `CAYU_RUN_E2B_EGRESS_E2E=1`, then run
   `uv run python scripts/nightly_verification.py --check e2b-live-virtual-egress --strict`.
+  The same-sandbox authority-cutover case additionally requires a distinct
+  `CAYU_E2B_PROXY_EXPOSURE_COMMAND_NEXT` and `CAYU_E2B_PROXY_URL_NEXT` so the
+  target Cayu route can be staged before the old exposure is retired. The flag
+  is an explicit credential and spend authorization; the test never runs from
+  ambient `E2B_API_KEY` alone.
 - Lambda MicroVM metadata boundary (manual/nightly): deploy the integrated AWS
   example, set `CAYU_AWS_METADATA_ISOLATION_LIVE=1`,
   `CAYU_AWS_METADATA_ISOLATION_STACK`, and an AWS region, then run

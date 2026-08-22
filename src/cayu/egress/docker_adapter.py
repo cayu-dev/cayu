@@ -10,11 +10,16 @@ import tempfile
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from functools import partial
+from hashlib import sha256
 
 from cayu._exception_groups import add_exception_note_safely
 from cayu.credentials import CredentialMode
+from cayu.egress._remote_adapter import run_enforcement_preflight
 from cayu.egress.adapter import (
     DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
+    EgressAuthorityCutoverRequest,
+    EgressAuthorityCutoverResult,
+    EgressAuthorityRenewalRequest,
     EgressBinding,
     RunnerFinalizationResult,
     SandboxEgressAdapter,
@@ -22,12 +27,18 @@ from cayu.egress.adapter import (
     _await_bounded_cleanup_task,
     _consume_accounted_task_cancellation,
     _raise_primary_with_cleanup_cancellation,
+    retain_predecessor_binding_cleanup,
     validate_grant_scope,
 )
+from cayu.egress.authority import (
+    EgressAuthorityCutoverReceipt,
+    EgressAuthorityCutoverStrategy,
+    _build_adapter_verified_egress_authority_cutover_receipt,
+)
 from cayu.egress.broker import TransparentEgressBroker
-from cayu.egress.errors import UnsupportedEgressError
+from cayu.egress.errors import EgressAuthorityCutoverNeedsAttention, UnsupportedEgressError
 from cayu.egress.grants import VirtualCredentialGrant
-from cayu.egress.proxy_server import TransparentEgressProxyServer
+from cayu.egress.proxy_server import SessionCertificateAuthority, TransparentEgressProxyServer
 from cayu.environments.admission import (
     ExecutionCapabilityClaim,
     ExecutionCapabilityEvidence,
@@ -210,6 +221,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
 
     runner_kind = "docker"
     process_external_allocation = False
+    egress_authority_cutover_strategy = EgressAuthorityCutoverStrategy.FRESH_AUTHORITY_PATH
 
     def execution_capability_evidence(
         self,
@@ -273,6 +285,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         *,
         loop: asyncio.AbstractEventLoop | None = None,
         docker_exec: DockerExec | None = None,
+        docker_run: DockerRun | None = None,
         sidecar_image: str = _DEFAULT_SIDECAR_IMAGE,
         proxy_host: str | None = None,
         proxy_bind_host_resolver: Callable[[], Awaitable[str]] | None = None,
@@ -285,6 +298,10 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         self._loop = loop
         self._docker_exec = docker_exec or partial(
             _default_docker_exec,
+            docker_cli_env_allowlist=self._docker_cli_env_allowlist,
+        )
+        self._docker_run = docker_run or partial(
+            _run_docker_stdout,
             docker_cli_env_allowlist=self._docker_cli_env_allowlist,
         )
         self._sidecar_image = sidecar_image
@@ -309,6 +326,21 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         grants: Sequence[VirtualCredentialGrant],
         broker: TransparentEgressBroker,
     ) -> EgressBinding:
+        return await self._prepare(
+            session_id=session_id,
+            grants=grants,
+            broker=broker,
+        )
+
+    async def _prepare(
+        self,
+        *,
+        session_id: str,
+        grants: Sequence[VirtualCredentialGrant],
+        broker: TransparentEgressBroker,
+        certificate_authority: SessionCertificateAuthority | None = None,
+        owns_certificate_authority: bool = True,
+    ) -> EgressBinding:
         validate_grant_scope(session_id=session_id, grants=grants)
         loop = self._loop or asyncio.get_running_loop()
         bind_host = (
@@ -325,12 +357,22 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         label = f"{_SESSION_LABEL}={session_id}"
         transport_authorization = _create_sidecar_transport_authorization()
         try:
-            server = TransparentEgressProxyServer(
-                broker,
-                loop=loop,
-                host=bind_host,
-                transport_auth_token=transport_authorization.token,
-            )
+            if certificate_authority is not None or not owns_certificate_authority:
+                server = TransparentEgressProxyServer(
+                    broker,
+                    loop=loop,
+                    host=bind_host,
+                    transport_auth_token=transport_authorization.token,
+                    authority=certificate_authority,
+                    owns_authority=owns_certificate_authority,
+                )
+            else:
+                server = TransparentEgressProxyServer(
+                    broker,
+                    loop=loop,
+                    host=bind_host,
+                    transport_auth_token=transport_authorization.token,
+                )
         except BaseException:
             transport_authorization.close()
             raise
@@ -444,6 +486,13 @@ class DockerEgressAdapter(SandboxEgressAdapter):
                 "proxy_port": proxy_port,
             },
             teardown=teardown,
+            certificate_authority=server.authority,
+            adopt_certificate_authority=getattr(server, "adopt_authority_ownership", None),
+            relinquish_certificate_authority=getattr(
+                server,
+                "relinquish_authority_ownership",
+                None,
+            ),
         )
 
     async def create_runner(self, request: VirtualEgressRunnerRequest) -> Runner:
@@ -471,6 +520,293 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             docker_cli_env_allowlist=self._docker_cli_env_allowlist,
         )
 
+    async def egress_environment_fingerprint(self, runner: Runner) -> str:
+        if not isinstance(runner, DockerRunner):
+            raise TypeError("Docker egress identity requires a DockerRunner.")
+        return _docker_environment_fingerprint(await self._container_id(runner.name))
+
+    async def reconcile_authority_cutover(
+        self,
+        request: EgressAuthorityCutoverRequest,
+    ) -> EgressAuthorityCutoverReceipt | None:
+        if type(request) is not EgressAuthorityCutoverRequest:
+            raise TypeError("Docker egress reconciliation requires EgressAuthorityCutoverRequest.")
+        if not isinstance(request.runner, DockerRunner):
+            raise TypeError("Docker egress reconciliation requires a DockerRunner.")
+        observed_fingerprint = await self.egress_environment_fingerprint(request.runner)
+        if observed_fingerprint != request.environment_fingerprint:
+            return None
+        if (
+            request.current_binding.authority_fingerprint != request.target_authority.fingerprint
+            or request.current_binding.authority_generation != request.target_authority.generation
+        ):
+            return None
+        if request.runner.image is None:
+            return None
+        await run_enforcement_preflight(
+            request.runner,
+            VirtualEgressRunnerRequest(
+                name=request.runner.name,
+                runner_kind=self.runner_kind,
+                image=request.runner.image,
+                binding=request.current_binding,
+                env_overlay=dict(request.target_env_overlay),
+                env_overlay_secret_values_present=bool(request.target_grants),
+                ca_cert_host_path=request.ca_cert_host_path,
+                guest_ca_path=request.guest_ca_path,
+                setup_commands=(),
+                egress_destinations=request.target_egress_destinations,
+                session_id=request.session_id,
+                environment_name=request.environment_name,
+            ),
+            timeout_s=20,
+            probe_metadata=False,
+        )
+        return _build_adapter_verified_egress_authority_cutover_receipt(
+            expected=request.expected_authority,
+            target=request.target_authority,
+            environment_fingerprint=observed_fingerprint,
+        )
+
+    async def cutover_authority(
+        self,
+        request: EgressAuthorityCutoverRequest,
+    ) -> EgressAuthorityCutoverResult:
+        """Rotate broker, sidecar, and network while retaining one exact container."""
+
+        if type(request) is not EgressAuthorityCutoverRequest:
+            raise TypeError("Docker egress cutover requires EgressAuthorityCutoverRequest.")
+        if not isinstance(request.runner, DockerRunner):
+            raise TypeError("Docker egress cutover requires a DockerRunner.")
+        if request.target_authority.runner_kind != self.runner_kind:
+            raise UnsupportedEgressError("Docker egress cutover target has the wrong runner kind.")
+        if (
+            request.current_binding.authority_fingerprint != request.expected_authority.fingerprint
+            or request.current_binding.authority_generation != request.expected_authority.generation
+        ):
+            raise UnsupportedEgressError(
+                "Docker egress cutover expected authority is not the active binding."
+            )
+        current_network = request.current_binding.network
+        authority = request.current_binding.certificate_authority
+        if current_network is None or not isinstance(authority, SessionCertificateAuthority):
+            raise UnsupportedEgressError(
+                "Docker egress cutover requires the active network and trusted session CA."
+            )
+        container_id = await self._container_id(request.runner.name)
+        environment_fingerprint = _docker_environment_fingerprint(container_id)
+        if environment_fingerprint != request.environment_fingerprint:
+            raise UnsupportedEgressError(
+                "Docker egress cutover belongs to a different container allocation."
+            )
+        paused = False
+        environment_mutation_dispatched = False
+        replacement: EgressBinding | None = None
+        replacement_connected = False
+        old_network_disconnected = False
+        authority_transferred = False
+        revocation_cancellation: asyncio.CancelledError | None = None
+        try:
+            environment_mutation_dispatched = True
+            await request.runner.fence_guest_processes_for_egress_cutover()
+            await self._run(["pause", request.runner.name])
+            paused = True
+            replacement = await self._prepare(
+                session_id=request.session_id,
+                grants=request.target_grants,
+                broker=request.target_broker,
+                certificate_authority=authority,
+                owns_certificate_authority=False,
+            )
+            if replacement.network is None:
+                raise UnsupportedEgressError("Docker replacement binding omitted its network.")
+            replacement.bind_authority(request.target_authority)
+            await self._run(["network", "connect", replacement.network, request.runner.name])
+            replacement_connected = True
+            if await request.revoke_current_authority():
+                revocation_cancellation = asyncio.CancelledError()
+            await self._run(["network", "disconnect", current_network, request.runner.name])
+            old_network_disconnected = True
+            request.current_binding.transfer_certificate_authority_to(replacement)
+            authority_transferred = True
+            await request.current_binding.close()
+            target_env_overlay = {
+                **replacement.env,
+                **dict(request.target_env_overlay),
+            }
+            request.runner.env_overlay = target_env_overlay
+            request.runner._env_overlay_secret_values_present = bool(request.target_grants)
+            await self._run(["unpause", request.runner.name])
+            paused = False
+            if request.runner.image is None:
+                raise RuntimeError("Docker runner image identity is unavailable at cutover.")
+            target_runner_request = VirtualEgressRunnerRequest(
+                name=request.runner.name,
+                runner_kind=self.runner_kind,
+                image=request.runner.image,
+                binding=replacement,
+                env_overlay=target_env_overlay,
+                env_overlay_secret_values_present=bool(request.target_grants),
+                ca_cert_host_path=request.ca_cert_host_path,
+                guest_ca_path=request.guest_ca_path,
+                setup_commands=(),
+                egress_destinations=request.target_egress_destinations,
+                session_id=request.session_id,
+                environment_name=request.environment_name,
+            )
+            observed_at = await run_enforcement_preflight(
+                request.runner,
+                target_runner_request,
+                timeout_s=20,
+                probe_metadata=False,
+            )
+            del observed_at
+            if await self._container_id(request.runner.name) != container_id:
+                raise RuntimeError("Docker container identity changed during egress cutover.")
+            receipt = _build_adapter_verified_egress_authority_cutover_receipt(
+                expected=request.expected_authority,
+                target=request.target_authority,
+                environment_fingerprint=environment_fingerprint,
+            )
+            return EgressAuthorityCutoverResult(
+                binding=replacement,
+                receipt=receipt,
+                cancellation=revocation_cancellation,
+                cancellation_requests_consumed=(1 if revocation_cancellation is not None else 0),
+            )
+        except BaseException as original:
+            if environment_mutation_dispatched:
+                cleanup_errors: list[BaseException] = []
+                if not paused:
+                    try:
+                        await self._run(["pause", request.runner.name])
+                        paused = True
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(cleanup_error)
+                target_authority_installed = old_network_disconnected and authority_transferred
+                retained_binding = replacement
+                if not target_authority_installed:
+                    if (
+                        replacement_connected
+                        and replacement is not None
+                        and replacement.network is not None
+                    ):
+                        try:
+                            await self._run(
+                                [
+                                    "network",
+                                    "disconnect",
+                                    replacement.network,
+                                    request.runner.name,
+                                ]
+                            )
+                        except BaseException as cleanup_error:
+                            cleanup_errors.append(cleanup_error)
+                    if replacement is not None:
+                        try:
+                            await replacement.close()
+                        except BaseException as cleanup_error:
+                            cleanup_errors.append(cleanup_error)
+                    retained_binding = request.current_binding
+                elif replacement is not None:
+                    retain_predecessor_binding_cleanup(
+                        replacement,
+                        request.current_binding,
+                    )
+                attention = EgressAuthorityCutoverNeedsAttention(
+                    "Docker egress cutover dispatched a backend mutation but exact target "
+                    "activation could not be proven; the container must remain fenced.",
+                    replacement_binding=retained_binding,
+                    environment_fingerprint=environment_fingerprint,
+                    target_authority_installed=target_authority_installed,
+                    cancellation=revocation_cancellation,
+                    cancellation_requests_consumed=(
+                        1 if revocation_cancellation is not None else 0
+                    ),
+                )
+                failures = [original, *cleanup_errors]
+                cause: BaseException = (
+                    failures[0]
+                    if len(failures) == 1
+                    else BaseExceptionGroup(
+                        "Docker egress cutover and fail-closed settlement both failed.",
+                        failures,
+                    )
+                )
+                raise attention from cause
+            cleanup_errors = []
+            if (
+                replacement_connected
+                and replacement is not None
+                and replacement.network is not None
+            ):
+                try:
+                    await self._run(
+                        ["network", "disconnect", replacement.network, request.runner.name]
+                    )
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if replacement is not None:
+                try:
+                    await replacement.close()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if paused:
+                try:
+                    await self._run(["unpause", request.runner.name])
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                raise BaseExceptionGroup(
+                    "Docker egress cutover failed before dispatch and cleanup also failed.",
+                    [original, *cleanup_errors],
+                ) from original
+            raise
+
+    async def renew_authority(self, request: EgressAuthorityRenewalRequest) -> str:
+        """Verify fresh grants on the unchanged container and enforcement path."""
+
+        if type(request) is not EgressAuthorityRenewalRequest:
+            raise TypeError("Docker egress renewal requires EgressAuthorityRenewalRequest.")
+        if not isinstance(request.runner, DockerRunner):
+            raise TypeError("Docker egress renewal requires a DockerRunner.")
+        container_id = await self._container_id(request.runner.name)
+        environment_fingerprint = _docker_environment_fingerprint(container_id)
+        if environment_fingerprint != request.environment_fingerprint:
+            raise UnsupportedEgressError(
+                "Docker egress renewal belongs to a different container allocation."
+            )
+        target_env_overlay = {
+            **request.current_binding.env,
+            **dict(request.renewed_env_overlay),
+        }
+        request.runner.env_overlay = target_env_overlay
+        request.runner._env_overlay_secret_values_present = bool(request.renewed_grants)
+        if request.runner.image is None:
+            raise RuntimeError("Docker runner image identity is unavailable at renewal.")
+        await run_enforcement_preflight(
+            request.runner,
+            VirtualEgressRunnerRequest(
+                name=request.runner.name,
+                runner_kind=self.runner_kind,
+                image=request.runner.image,
+                binding=request.current_binding,
+                env_overlay=target_env_overlay,
+                env_overlay_secret_values_present=bool(request.renewed_grants),
+                ca_cert_host_path=request.ca_cert_host_path,
+                guest_ca_path=request.guest_ca_path,
+                setup_commands=(),
+                egress_destinations=request.egress_destinations,
+                session_id=request.session_id,
+                environment_name=request.environment_name,
+            ),
+            timeout_s=20,
+            probe_metadata=False,
+        )
+        if await self._container_id(request.runner.name) != container_id:
+            raise RuntimeError("Docker container identity changed during egress renewal.")
+        return environment_fingerprint
+
     async def finalize_runner(
         self,
         runner: Runner,
@@ -483,12 +819,37 @@ class DockerEgressAdapter(SandboxEgressAdapter):
         await runner.close()
         return RunnerFinalizationResult(workspace_mutations_quiescent=True)
 
+    async def park_runner_for_authority_adoption(
+        self,
+        runner: Runner,
+    ) -> RunnerFinalizationResult:
+        if not isinstance(runner, DockerRunner):
+            raise TypeError("Docker adapter received a different runner type.")
+        await runner.fence_guest_processes_for_egress_cutover()
+        return RunnerFinalizationResult(
+            workspace_mutations_quiescent=True,
+            allocation_preserved=True,
+        )
+
     async def _run(self, argv: Sequence[str]) -> None:
         exit_code, _stderr = await self._docker_exec(argv)
         if exit_code != 0:
             raise UnsupportedEgressError(
                 f"docker {argv[0]} failed while preparing egress (exit_code={exit_code})."
             )
+
+    async def _container_id(self, name: str) -> str:
+        exit_code, stdout = await self._docker_run(
+            ["inspect", "--type", "container", "--format", "{{.Id}}", name]
+        )
+        container_id = stdout.strip().lower()
+        if (
+            exit_code != 0
+            or len(container_id) != 64
+            or any(character not in "0123456789abcdef" for character in container_id)
+        ):
+            raise UnsupportedEgressError("Docker container identity could not be verified.")
+        return container_id
 
     async def _teardown(
         self,
@@ -528,3 +889,7 @@ def _docker_resource_is_absent(stderr: str) -> bool:
 
     normalized = stderr.lower()
     return "no such container" in normalized or "not found" in normalized
+
+
+def _docker_environment_fingerprint(container_id: str) -> str:
+    return sha256(f"docker\0{container_id}".encode("ascii")).hexdigest()

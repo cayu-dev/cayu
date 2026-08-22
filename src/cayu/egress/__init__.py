@@ -9,11 +9,28 @@ strength comes from the selected runner. See ``docs/virtual-egress.md``.
 from cayu.credentials import CredentialMode
 from cayu.egress.adapter import (
     EgressAdapterRegistry,
+    EgressAuthorityCutoverRequest,
+    EgressAuthorityCutoverResult,
+    EgressAuthorityRenewalRequest,
     EgressBinding,
     RunnerFinalizationResult,
     SandboxEgressAdapter,
     UnsupportedEgressAdapter,
     VirtualEgressRunnerRequest,
+)
+from cayu.egress.authority import (
+    EGRESS_AUTHORITY_SCHEMA_VERSION,
+    EgressAuthorityBindingIdentity,
+    EgressAuthorityChangeKind,
+    EgressAuthorityCutoverReceipt,
+    EgressAuthorityCutoverStrategy,
+    EgressAuthorityIdentity,
+    EgressAuthorityOperation,
+    EgressAuthorityPolicyIdentity,
+    EgressAuthorityTransitionState,
+    build_egress_authority_cutover_receipt,
+    build_egress_authority_identity,
+    compare_egress_authority,
 )
 from cayu.egress.broker import (
     CapturedRequest,
@@ -33,11 +50,14 @@ from cayu.egress.capabilities import (
 from cayu.egress.credential_kinds import CredentialKind
 from cayu.egress.destinations import ApprovedEgressDestination, EgressProtocol
 from cayu.egress.errors import (
+    EgressAuthorityCutoverError,
+    EgressAuthorityCutoverNeedsAttention,
     EgressError,
     EgressReconnectConflictError,
     EgressReconnectError,
     EgressReconnectNotFoundError,
     InvalidEgressReconnectMetadataError,
+    UnsupportedEgressAuthorityCutoverError,
     UnsupportedEgressCapabilityError,
     UnsupportedEgressError,
     UnsupportedEgressReconnectError,
@@ -57,6 +77,7 @@ from cayu.egress.policy import (
 from cayu.egress.proxy_exposure import VpcTaskProxyExposure
 
 __all__ = [
+    "EGRESS_AUTHORITY_SCHEMA_VERSION",
     "EGRESS_CAPABILITY_EVIDENCE_SCHEMA",
     "ApprovedEgressDestination",
     "BrowserEgressPolicy",
@@ -65,6 +86,19 @@ __all__ = [
     "CredentialKind",
     "CredentialMode",
     "EgressAdapterRegistry",
+    "EgressAuthorityBindingIdentity",
+    "EgressAuthorityChangeKind",
+    "EgressAuthorityCutoverError",
+    "EgressAuthorityCutoverNeedsAttention",
+    "EgressAuthorityCutoverReceipt",
+    "EgressAuthorityCutoverRequest",
+    "EgressAuthorityCutoverResult",
+    "EgressAuthorityCutoverStrategy",
+    "EgressAuthorityIdentity",
+    "EgressAuthorityOperation",
+    "EgressAuthorityPolicyIdentity",
+    "EgressAuthorityRenewalRequest",
+    "EgressAuthorityTransitionState",
     "EgressBinding",
     "EgressCapabilityClaim",
     "EgressCapabilityDetail",
@@ -86,6 +120,7 @@ __all__ = [
     "SandboxEgressAdapter",
     "TransparentEgressBroker",
     "UnsupportedEgressAdapter",
+    "UnsupportedEgressAuthorityCutoverError",
     "UnsupportedEgressCapabilityError",
     "UnsupportedEgressError",
     "UnsupportedEgressReconnectError",
@@ -95,4 +130,7 @@ __all__ = [
     "VirtualCredentialRegistry",
     "VirtualEgressRunnerRequest",
     "VpcTaskProxyExposure",
+    "build_egress_authority_cutover_receipt",
+    "build_egress_authority_identity",
+    "compare_egress_authority",
 ]
