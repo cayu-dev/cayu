@@ -406,8 +406,12 @@ Then open `http://127.0.0.1:8000/cayu/`. The explicit `--dev` flag enables
 unauthenticated trusted-local access only. It does not make the control plane
 the application's end-user UI or configure a production deployment.
 Project serving also derives Evals project/release identity and uses this
-project's durable `data/cayu.db` store automatically. Fresh Evals execution
-remains gated until a trusted eval target is available.
+project's durable `data/cayu.db` store automatically. With the normal live
+provider configured, open a completed or failed simple session, choose
+**Evaluate**, review its assertions, save or approve the captured result, and
+start one bounded fresh trial. The generated target reuses the registered agent
+and its ordinary runtime policy; no Evals-specific Python configuration is
+required.
 Never mount it with unauthenticated open access on a public listener;
 client-IP checks are not authentication. Public or deployed control-plane
 access requires an authenticated access policy.

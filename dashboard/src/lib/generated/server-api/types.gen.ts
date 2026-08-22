@@ -3598,6 +3598,17 @@ export type EvalCorpusDocument = {
 };
 
 /**
+ * EvalResultComparisonResponse
+ *
+ * Shared comparison projection with origin-neutral catalog identities.
+ */
+export type EvalResultComparisonResponse = {
+    baseline: EvalResultRecord;
+    comparison: CorpusExecutionComparison;
+    current: EvalResultRecord;
+};
+
+/**
  * EvalResultDetailResponse
  */
 export type EvalResultDetailResponse = {
@@ -3680,6 +3691,7 @@ export type EvalResultRecord = {
  * EvalResultResponse
  */
 export type EvalResultResponse = {
+    baseline?: EvalBaselineRecord | null;
     result: CorpusExecutionResult;
     run: EvalRunRecord;
 };
@@ -9083,6 +9095,63 @@ export type PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewP
 
 export type PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostResponse = PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostResponses[keyof PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostResponses];
 
+export type CompareCatalogEvalResultsApiEvalsResultComparisonsPostData = {
+    /**
+     * EvalResultComparisonRequest
+     *
+     * Compare two immutable captured or fresh results by content revision.
+     */
+    body: {
+        /**
+         * Baseline Result Revision
+         */
+        baseline_result_revision: string;
+        /**
+         * Current Result Revision
+         */
+        current_result_revision: string;
+        /**
+         * Score Tolerance
+         */
+        score_tolerance?: number;
+    };
+    path?: never;
+    query?: never;
+    url: '/api/evals/result-comparisons';
+};
+
+export type CompareCatalogEvalResultsApiEvalsResultComparisonsPostErrors = {
+    /**
+     * The edited captured evaluation is invalid or unsafe.
+     */
+    400: unknown;
+    /**
+     * The requested session or evaluation resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The captured evidence or compare-and-swap baseline changed.
+     */
+    409: unknown;
+    /**
+     * The bounded captured evidence or result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type CompareCatalogEvalResultsApiEvalsResultComparisonsPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalResultComparisonResponse;
+};
+
+export type CompareCatalogEvalResultsApiEvalsResultComparisonsPostResponse = CompareCatalogEvalResultsApiEvalsResultComparisonsPostResponses[keyof CompareCatalogEvalResultsApiEvalsResultComparisonsPostResponses];
+
 export type ListEvalResultsApiEvalsResultsGetData = {
     body?: never;
     path?: never;
@@ -9230,6 +9299,90 @@ export type SelectEvalBaselineApiEvalsResultsResultRevisionBaselinePostResponses
 };
 
 export type SelectEvalBaselineApiEvalsResultsResultRevisionBaselinePostResponse = SelectEvalBaselineApiEvalsResultsResultRevisionBaselinePostResponses[keyof SelectEvalBaselineApiEvalsResultsResultRevisionBaselinePostResponses];
+
+export type DownloadCatalogEvalHtmlReportApiEvalsResultsResultRevisionReportHtmlGetData = {
+    body?: never;
+    path: {
+        /**
+         * Result Revision
+         */
+        result_revision: string;
+    };
+    query?: never;
+    url: '/api/evals/results/{result_revision}/report.html';
+};
+
+export type DownloadCatalogEvalHtmlReportApiEvalsResultsResultRevisionReportHtmlGetErrors = {
+    /**
+     * The edited captured evaluation is invalid or unsafe.
+     */
+    400: unknown;
+    /**
+     * The requested session or evaluation resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The captured evidence or compare-and-swap baseline changed.
+     */
+    409: unknown;
+    /**
+     * The bounded captured evidence or result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type DownloadCatalogEvalHtmlReportApiEvalsResultsResultRevisionReportHtmlGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type DownloadCatalogEvalJsonReportApiEvalsResultsResultRevisionReportJsonGetData = {
+    body?: never;
+    path: {
+        /**
+         * Result Revision
+         */
+        result_revision: string;
+    };
+    query?: never;
+    url: '/api/evals/results/{result_revision}/report.json';
+};
+
+export type DownloadCatalogEvalJsonReportApiEvalsResultsResultRevisionReportJsonGetErrors = {
+    /**
+     * The edited captured evaluation is invalid or unsafe.
+     */
+    400: unknown;
+    /**
+     * The requested session or evaluation resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The captured evidence or compare-and-swap baseline changed.
+     */
+    409: unknown;
+    /**
+     * The bounded captured evidence or result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type DownloadCatalogEvalJsonReportApiEvalsResultsResultRevisionReportJsonGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
 
 export type ListEvalRunsApiEvalsRunsGetData = {
     body?: never;

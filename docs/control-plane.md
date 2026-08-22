@@ -115,8 +115,8 @@ The dashboard checks the server's exact control-plane contract before loading da
 upgrade that changes that contract produces a visible compatibility failure, and `npm run
 check:api` reports OpenAPI/client drift; neither mechanism silently modifies source.
 
-Evals remains present in navigation even when its catalog has not been assembled. Contract
-version 14 publishes independent readiness for captured evaluation, catalog reads and writes,
+Evals remains present in navigation even when its catalog has not been assembled. The current
+contract version 19 exposes independent readiness for captured evaluation, catalog reads and writes,
 captured-result persistence, scenario conversion, fresh execution, cancellation, comparison,
 and reports. An unready Evals page renders those states without requesting unavailable Evals
 endpoints. Readiness is explanatory metadata only; authenticated API routes continue to enforce

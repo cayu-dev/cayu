@@ -110,11 +110,13 @@ therefore browser-visible. Use it only for non-secret client configuration;
 server credentials belong in the auth dependency or another trusted server-side
 provider.
 
-## Eval promotion
+## Runnable-corpus promotion API
 
-Captured-session promotion is off by default. Enable it only on an authenticated
-server and name the registered source agent whose runtime-attested input may be
-promoted:
+`EvaluationPromotionConfig` enables a narrow, stateless API that converts
+runtime-attested terminal session evidence into a portable runnable corpus.
+This embedded-server adapter is off by default. Enable it only on an
+authenticated server and name the registered source agent whose evidence may be
+converted:
 
 ```python
 from cayu.server import BasicAuth, EvaluationPromotionConfig, ServerConfig
@@ -129,13 +131,12 @@ config = ServerConfig.protected(
 )
 ```
 
-The dashboard then shows **Promote to eval** on eligible completed and failed
-sessions. Preview reconstructs bounded terminal evidence, creates an editable
-suite and case, and scores its assertions without executing the application.
-Export is enabled only for the exact candidate most recently previewed; it
-downloads deterministic portable corpus JSON and does not include the source
-session ID. A changed durable snapshot, app manifest, source identity, pricing
-profile, or edited candidate requires another preview.
+Preview reconstructs bounded terminal evidence, creates an editable suite and
+case, and scores its assertions without executing the application. Export is
+enabled only for the exact candidate most recently previewed; it downloads
+deterministic portable corpus JSON and does not include the source session ID.
+A changed durable snapshot, app manifest, source identity, pricing profile, or
+edited candidate requires another preview.
 
 Preview returns only candidates that satisfy the complete export contract.
 Cost assertions therefore require a configured pricing profile containing the
@@ -162,23 +163,33 @@ exported eval. Configure the same nested fields through `ServerSettings` with
 `CAYU_SERVER_EVALUATION_PROMOTION__SOURCE_AGENT_NAME`, and
 `CAYU_SERVER_EVALUATION_PROMOTION__APPLICATION_RELEASE_ID`.
 
+This adapter is independent of the control plane's current **Evaluate** action.
+Configured projects started with `cayu serve` automatically publish their
+registered agents as eval targets and use durable project storage, so operators
+can evaluate a terminal session, save it, approve it as a baseline, launch a
+fresh trial, compare results, and download reports without adding Evals-specific
+Python configuration.
+
 ## Durable Evals execution
 
-Fresh Evals execution is also off by default and requires authenticated API
-access. Applications construct `EvalsConfig(target=..., store=...)` with the
-exact `CorpusTarget` whose `CayuApp` is supplied to `create_server(...)`, plus a
-durable `SQLiteEvalStore` or `PostgresEvalStore`, then pass it through
-`ServerConfig.protected(..., evals=...)`. The server authenticates and bounds
-the catalog/run/result/report routes, persists admission before dispatch, and
-runs one embedded coordinator using the eval store's lease and fencing
-contract. Cancellation and controlled shutdown stop fresh execution before the
-owned run is cancelled or released.
+Configured projects started with `cayu serve` do not construct Evals objects.
+Cayu derives the eval store from the project's declared SQLite or PostgreSQL
+storage, generates one bounded target for each registered agent, and uses the
+normal application provider, tools, environment, approvals, and runtime policy.
+`cayu serve --dev` grants only trusted loopback product access; an authenticated
+production control plane uses the same automatic assembly. Missing durable
+storage or ordinary runtime authority remains visible as an operation-level
+readiness reason rather than removing Evals from the dashboard.
 
-This wiring is intentionally programmatic. `ServerSettings` cannot construct an
+Low-level embedded `create_server(...)` integrations have no project authority
+from which to derive those decisions. They may explicitly construct
+`EvalsConfig(target=..., store=...)` with a trusted `CorpusTarget` and durable
+`SQLiteEvalStore` or `PostgresEvalStore`, then pass it through
+`ServerConfig.protected(..., evals=...)`. `ServerSettings` cannot manufacture an
 application, provider, PriceBook, database handle, or executable target from
-environment text. `EvalsConfig.target` and `.store` are excluded from model
+environment text. Explicit target and store objects are excluded from model
 serialization and safe summaries. See [runtime-native evals](evals.md#server-attached-durable-execution)
-for the complete API, authority, target-isolation, and recovery contract.
+for the complete automatic and embedded contracts.
 
 The resolved model is immutable, owns nested runtime JSON, and is evaluated
 once when the server is created. A non-secret effective summary is available

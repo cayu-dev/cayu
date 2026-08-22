@@ -7151,6 +7151,28 @@
         "title": "EvalCorpusDocument",
         "type": "object"
       },
+      "EvalResultComparisonResponse": {
+        "additionalProperties": false,
+        "description": "Shared comparison projection with origin-neutral catalog identities.",
+        "properties": {
+          "baseline": {
+            "$ref": "#/components/schemas/EvalResultRecord"
+          },
+          "comparison": {
+            "$ref": "#/components/schemas/CorpusExecutionComparison"
+          },
+          "current": {
+            "$ref": "#/components/schemas/EvalResultRecord"
+          }
+        },
+        "required": [
+          "baseline",
+          "current",
+          "comparison"
+        ],
+        "title": "EvalResultComparisonResponse",
+        "type": "object"
+      },
       "EvalResultDetailResponse": {
         "additionalProperties": false,
         "properties": {
@@ -7307,6 +7329,16 @@
       "EvalResultResponse": {
         "additionalProperties": false,
         "properties": {
+          "baseline": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalBaselineRecord"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "result": {
             "$ref": "#/components/schemas/CorpusExecutionResult"
           },
@@ -12175,7 +12207,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "18",
+            "default": "19",
             "title": "Contract Version",
             "type": "string"
           },
@@ -15851,7 +15883,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "18",
+            "default": "19",
             "title": "Contract Version",
             "type": "string"
           }
@@ -17219,6 +17251,79 @@
         "summary": "Preview Evaluation Promotion"
       }
     },
+    "/api/evals/result-comparisons": {
+      "post": {
+        "operationId": "compare_catalog_eval_results_api_evals_result_comparisons_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "Compare two immutable captured or fresh results by content revision.",
+                "properties": {
+                  "baseline_result_revision": {
+                    "maxLength": 71,
+                    "minLength": 71,
+                    "pattern": "^sha256:[0-9a-f]{64}$",
+                    "title": "Baseline Result Revision",
+                    "type": "string"
+                  },
+                  "current_result_revision": {
+                    "maxLength": 71,
+                    "minLength": 71,
+                    "pattern": "^sha256:[0-9a-f]{64}$",
+                    "title": "Current Result Revision",
+                    "type": "string"
+                  },
+                  "score_tolerance": {
+                    "default": 0.0,
+                    "maximum": 1.0,
+                    "minimum": 0.0,
+                    "title": "Score Tolerance",
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "baseline_result_revision",
+                  "current_result_revision"
+                ],
+                "title": "EvalResultComparisonRequest",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalResultComparisonResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The edited captured evaluation is invalid or unsafe."
+          },
+          "404": {
+            "description": "The requested session or evaluation resource does not exist."
+          },
+          "409": {
+            "description": "The captured evidence or compare-and-swap baseline changed."
+          },
+          "413": {
+            "description": "The bounded captured evidence or result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Compare Catalog Eval Results"
+      }
+    },
     "/api/evals/results": {
       "get": {
         "operationId": "list_eval_results_api_evals_results_get",
@@ -17417,6 +17522,80 @@
           }
         },
         "summary": "Select Eval Baseline"
+      }
+    },
+    "/api/evals/results/{result_revision}/report.html": {
+      "get": {
+        "operationId": "download_catalog_eval_html_report_api_evals_results__result_revision__report_html_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "result_revision",
+            "required": true,
+            "schema": {
+              "title": "Result Revision",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The edited captured evaluation is invalid or unsafe."
+          },
+          "404": {
+            "description": "The requested session or evaluation resource does not exist."
+          },
+          "409": {
+            "description": "The captured evidence or compare-and-swap baseline changed."
+          },
+          "413": {
+            "description": "The bounded captured evidence or result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Download Catalog Eval Html Report"
+      }
+    },
+    "/api/evals/results/{result_revision}/report.json": {
+      "get": {
+        "operationId": "download_catalog_eval_json_report_api_evals_results__result_revision__report_json_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "result_revision",
+            "required": true,
+            "schema": {
+              "title": "Result Revision",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The edited captured evaluation is invalid or unsafe."
+          },
+          "404": {
+            "description": "The requested session or evaluation resource does not exist."
+          },
+          "409": {
+            "description": "The captured evidence or compare-and-swap baseline changed."
+          },
+          "413": {
+            "description": "The bounded captured evidence or result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Download Catalog Eval Json Report"
       }
     },
     "/api/evals/runs": {

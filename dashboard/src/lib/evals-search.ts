@@ -63,7 +63,7 @@ export function validateEvalsSearch(search: Record<string, unknown>): EvalsSearc
   const suite = matchingSearchValue(search.suite, EVAL_PORTABLE_ID_RE)
   const run = matchingSearchValue(search.run, EVAL_RUN_ID_RE)
   const result = matchingSearchValue(search.result, EVAL_CORPUS_REVISION_RE)
-  const baseline = matchingSearchValue(search.baseline, EVAL_RUN_ID_RE)
+  const baseline = matchingSearchValue(search.baseline, EVAL_CORPUS_REVISION_RE)
   const corporaCursor = boundedCursorValue(search.corpora_cursor)
   const suitesCursor = boundedCursorValue(search.suites_cursor)
   const casesCursor = boundedCursorValue(search.cases_cursor)
@@ -88,6 +88,10 @@ export function validateEvalsSearch(search: Record<string, unknown>): EvalsSearc
 
 export function evalRunIdIsValid(value: string): boolean {
   return EVAL_RUN_ID_RE.test(value)
+}
+
+export function evalResultRevisionIsValid(value: string): boolean {
+  return EVAL_CORPUS_REVISION_RE.test(value)
 }
 
 export function evalsSearchWithout(

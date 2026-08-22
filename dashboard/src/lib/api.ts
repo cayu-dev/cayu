@@ -25,6 +25,7 @@ import type {
   CapturedEvaluationPreviewResponse,
   CapturedEvaluationSaveRequest,
   CapturedEvaluationSaveResponse,
+  CompareCatalogEvalResultsApiEvalsResultComparisonsPostData,
   CreateEvalRunApiEvalsRunsPostData,
   EnvironmentsResponse,
   EvalBaselineSelectionRequest,
@@ -34,8 +35,10 @@ import type {
   EvalCorpusCatalogEntry,
   EvalCorpusCatalogPage,
   EvalCorpusDocument,
+  EvalResultComparisonResponse,
   EvalResultDetailResponse,
   EvalResultPage,
+  EvalResultRecord,
   EvalResultResponse,
   EvalRunPage,
   EvalRunRecord,
@@ -195,6 +198,7 @@ export type CapturedEvaluationLaunched = CapturedEvaluationLaunchResponse
 export type EvalBaselineSelection = EvalBaselineSelectionRequest
 export type EvalBaselineSelected = EvalBaselineSelectionResponse
 export type EvalResultDetail = EvalResultDetailResponse
+export type EvalResultSummary = EvalResultRecord
 export type EvalResultsPage = EvalResultPage
 export type EvalCorpus = EvalCorpusDocument
 export type EvalCorpusEntry = EvalCorpusCatalogEntry
@@ -206,6 +210,7 @@ export type EvalRunsPage = EvalRunPage
 export type EvalStatus = EvalRunStatus
 export type EvalResult = EvalResultResponse
 export type EvalComparison = EvalComparisonResponse
+export type EvalResultComparison = EvalResultComparisonResponse
 export type EvalTarget = EvalTargetCatalogEntry
 export type EvalTargets = EvalTargetCatalogResponse
 export type EvalCorporaQuery = NonNullable<ListEvalCorporaApiEvalsCorporaGetData["query"]>
@@ -647,6 +652,24 @@ export async function compareEvalRuns(
   })
 }
 
+export async function compareEvalResults(
+  baselineResultRevision: string,
+  currentResultRevision: string,
+  scoreTolerance = 0,
+  signal?: AbortSignal,
+): Promise<EvalResultComparison> {
+  const body: CompareCatalogEvalResultsApiEvalsResultComparisonsPostData["body"] = {
+    baseline_result_revision: baselineResultRevision,
+    current_result_revision: currentResultRevision,
+    score_tolerance: scoreTolerance,
+  }
+  return requestJson<EvalResultComparison>("/evals/result-comparisons", {
+    method: "POST",
+    body: JSON.stringify(body),
+    signal,
+  })
+}
+
 export async function downloadEvalResultJson(
   runId: string,
   signal?: AbortSignal,
@@ -665,6 +688,28 @@ export async function downloadEvalResultHtml(
   return downloadFile(
     `/evals/runs/${encodeURIComponent(runId)}/report.html`,
     `${safeDownloadStem(runId)}.eval-report.html`,
+    signal,
+  )
+}
+
+export async function downloadCatalogEvalResultJson(
+  resultRevision: string,
+  signal?: AbortSignal,
+): Promise<DownloadedFile> {
+  return downloadFile(
+    `/evals/results/${encodeURIComponent(resultRevision)}/report.json`,
+    `${safeDownloadStem(resultRevision)}.eval-result.json`,
+    signal,
+  )
+}
+
+export async function downloadCatalogEvalResultHtml(
+  resultRevision: string,
+  signal?: AbortSignal,
+): Promise<DownloadedFile> {
+  return downloadFile(
+    `/evals/results/${encodeURIComponent(resultRevision)}/report.html`,
+    `${safeDownloadStem(resultRevision)}.eval-report.html`,
     signal,
   )
 }

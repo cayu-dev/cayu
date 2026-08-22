@@ -22,6 +22,7 @@ from cayu.evals.execution_comparison import (
     CorpusExecutionRegression,
     CorpusRegressionKind,
 )
+from cayu.evals.results import CapturedEvaluationResultV1
 
 CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES = 48 << 20
 CORPUS_EXECUTION_RESULT_MAX_HTML_BYTES = 48 << 20
@@ -57,6 +58,42 @@ def corpus_execution_result_to_json(result: CorpusExecutionResult) -> str:
             )
         chunks.append(chunk)
     return "".join(chunks) + "\n"
+
+
+def captured_evaluation_result_to_json(result: CapturedEvaluationResultV1) -> str:
+    """Return bounded deterministic JSON for one immutable captured result."""
+
+    if type(result) is not CapturedEvaluationResultV1:
+        raise TypeError("result must be an exact CapturedEvaluationResultV1.")
+    validated = CapturedEvaluationResultV1.model_validate(
+        result.model_dump(mode="python", round_trip=True, warnings="none")
+    )
+    document = copy_durable_json_object(
+        validated.model_dump(mode="json"),
+        "captured evaluation result",
+    )
+    encoder = json.JSONEncoder(ensure_ascii=False, indent=2, sort_keys=True)
+    chunks: list[str] = []
+    total_bytes = 1
+    for chunk in encoder.iterencode(document):
+        total_bytes += len(chunk.encode("utf-8"))
+        if total_bytes > CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES:
+            raise ValueError(
+                "Captured evaluation result JSON exceeds "
+                f"{CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES} bytes."
+            )
+        chunks.append(chunk)
+    return "".join(chunks) + "\n"
+
+
+def eval_result_to_json(result: CorpusExecutionResult | CapturedEvaluationResultV1) -> str:
+    """Serialize either immutable eval-result origin without changing its graph."""
+
+    if type(result) is CorpusExecutionResult:
+        return corpus_execution_result_to_json(result)
+    if type(result) is CapturedEvaluationResultV1:
+        return captured_evaluation_result_to_json(result)
+    raise TypeError("result must be an exact CorpusExecutionResult or CapturedEvaluationResultV1.")
 
 
 def corpus_execution_comparison_to_json(comparison: CorpusExecutionComparison) -> str:
@@ -245,6 +282,83 @@ def render_corpus_execution_html(result: CorpusExecutionResult) -> str:
             f"Corpus execution HTML report exceeds {CORPUS_EXECUTION_RESULT_MAX_HTML_BYTES} bytes."
         )
     return rendered
+
+
+def render_captured_evaluation_html(result: CapturedEvaluationResultV1) -> str:
+    """Render a standalone report from one public captured-result document."""
+
+    if type(result) is not CapturedEvaluationResultV1:
+        raise TypeError("result must be an exact CapturedEvaluationResultV1.")
+    result = CapturedEvaluationResultV1.model_validate(
+        result.model_dump(mode="python", round_trip=True, warnings="none")
+    )
+    score = result.score
+    assertion_rows = "\n".join(_assertion_row(assertion) for assertion in score.assertions)
+    rendered = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cayu Captured Eval Report — {_escape(result.suite_id)}</title>
+  <style>
+    :root {{ color-scheme:light; --ink:#18211d; --muted:#5d6864; --line:#d9dfdc; --paper:#fff; --canvas:#f7f7f4; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font:15px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:var(--canvas); }}
+    .page {{ max-width:1120px; margin:auto; padding:32px 24px 56px; }}
+    h1 {{ margin:0 0 6px; font-size:2rem; }} h2 {{ margin:30px 0 12px; }} p {{ color:var(--muted); }} code {{ overflow-wrap:anywhere; }}
+    .metrics {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin:24px 0; }}
+    .metric,.card {{ background:var(--paper); border:1px solid var(--line); border-radius:9px; }}
+    .metric {{ padding:14px; }} .metric strong {{ display:block; font-size:1.25rem; }} .card {{ padding:18px; }}
+    .assertion {{ display:grid; grid-template-columns:110px minmax(0,1fr); gap:12px; border-top:1px solid #e6ebe8; padding:10px 0; }}
+    .assertion:first-child {{ border-top:0; }} .assertion pre {{ margin:6px 0 0; white-space:pre-wrap; overflow:auto; background:#f0f4f3; padding:10px; border-radius:6px; }}
+    .badge {{ display:inline-block; padding:3px 8px; border-radius:999px; font-size:.78rem; font-weight:700; }}
+    .passed {{ color:#0f5132; background:#d9f2e3; }} .failed {{ color:#842029; background:#f8d7da; }}
+    .unavailable {{ color:#553c00; background:#fff0b3; }} .error {{ color:#664d03; background:#fff3cd; }}
+    @media (max-width:760px) {{ .metrics {{ grid-template-columns:1fr; }} .assertion {{ grid-template-columns:1fr; }} }}
+  </style>
+</head>
+<body>
+  <main class="page">
+    <h1>Cayu Captured Eval Report</h1>
+    <p>Suite <code>{_escape(result.suite_id)}</code> · target <code>{_escape(result.target.target_key)}</code></p>
+    <div class="metrics">
+      <div class="metric"><strong>{_badge(score.status)}</strong><span>Status</span></div>
+      <div class="metric"><strong>{_score(score.score)}</strong><span>Score</span></div>
+      <div class="metric"><strong>{len(score.assertions)}</strong><span>Assertions</span></div>
+    </div>
+    <section class="card" aria-labelledby="result-identity">
+      <h2 id="result-identity">Immutable result identity</h2>
+      <p>Result <code>{_escape(result.revision)}</code> · origin <code>captured_session</code></p>
+      <p>Application release <code>{_escape(result.target.application_release_id)}</code></p>
+      <p>AppManifest schema <code>{_escape(result.target.app_manifest_schema_version)}</code> · fingerprint <code>{_escape(result.target.app_manifest_fingerprint)}</code></p>
+      <p>Corpus <code>{_escape(result.corpus_revision)}</code> · suite <code>{_escape(result.suite_revision)}</code></p>
+      <p>Case <code>{_escape(score.case_id)}</code> · evidence <code>{_escape(score.evidence_revision)}</code> · evidence policy <code>{_escape(score.evidence_policy_revision)}</code></p>
+    </section>
+    <h2>Captured assertion evidence</h2>
+    <section class="card">{assertion_rows}</section>
+  </main>
+</body>
+</html>
+"""
+    rendered = require_durable_text(rendered, "captured evaluation HTML report")
+    if len(rendered.encode("utf-8")) > CORPUS_EXECUTION_RESULT_MAX_HTML_BYTES:
+        raise ValueError(
+            "Captured evaluation HTML report exceeds "
+            f"{CORPUS_EXECUTION_RESULT_MAX_HTML_BYTES} bytes."
+        )
+    return rendered
+
+
+def render_eval_result_html(
+    result: CorpusExecutionResult | CapturedEvaluationResultV1,
+) -> str:
+    """Render either immutable eval-result origin through its exact report shape."""
+
+    if type(result) is CorpusExecutionResult:
+        return render_corpus_execution_html(result)
+    if type(result) is CapturedEvaluationResultV1:
+        return render_captured_evaluation_html(result)
+    raise TypeError("result must be an exact CorpusExecutionResult or CapturedEvaluationResultV1.")
 
 
 def render_corpus_execution_comparison_html(

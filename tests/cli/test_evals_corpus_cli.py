@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from tests.evals.eval_store_conformance import captured_result_for_corpus
+
 from cayu import (
     AgentSpec,
     CorpusTarget,
@@ -22,6 +24,7 @@ from cayu import (
     RunRequest,
     ScriptedModelProvider,
     TrialRequestSpec,
+    captured_evaluation_result_to_json,
     eval_corpus_to_json,
     load_corpus_execution_result,
     load_eval_corpus,
@@ -317,6 +320,125 @@ def test_eval_report_and_compare_accept_dashboard_corpus_results_with_stable_exi
     ]
     assert "Cayu Eval Comparison" not in report_path.read_text(encoding="utf-8")
     assert "Cayu Eval Report" in report_path.read_text(encoding="utf-8")
+
+
+def test_eval_report_and_compare_round_trip_captured_and_fresh_results(
+    tmp_path: Path,
+) -> None:
+    corpus = _corpus()
+    corpus_path = tmp_path / "corpus.json"
+    fresh_path = tmp_path / "fresh.json"
+    captured_path = tmp_path / "captured.json"
+    captured_json_path = tmp_path / "captured-report.json"
+    captured_html_path = tmp_path / "captured-report.html"
+    comparison_json_path = tmp_path / "comparison.json"
+    comparison_html_path = tmp_path / "comparison.html"
+    reverse_comparison_json_path = tmp_path / "reverse-comparison.json"
+    corpus_path.write_text(eval_corpus_to_json(corpus), encoding="utf-8")
+
+    assert (
+        main(
+            [
+                "eval",
+                "run",
+                f"{__name__}:build_corpus_eval_plan",
+                "--corpus",
+                str(corpus_path),
+                "--output",
+                str(fresh_path),
+            ]
+        )
+        == 0
+    )
+    fresh = load_corpus_execution_result(fresh_path)
+    captured = captured_result_for_corpus(corpus, fresh)
+    captured_path.write_text(captured_evaluation_result_to_json(captured), encoding="utf-8")
+
+    assert (
+        main(
+            [
+                "eval",
+                "report",
+                str(captured_path),
+                "--json",
+                "--output",
+                str(captured_json_path),
+            ]
+        )
+        == 0
+    )
+    assert captured_json_path.read_text(encoding="utf-8") == captured_path.read_text(
+        encoding="utf-8"
+    )
+    assert (
+        main(
+            [
+                "eval",
+                "report",
+                str(captured_path),
+                "--output",
+                str(captured_html_path),
+            ]
+        )
+        == 0
+    )
+    assert "Cayu Captured Eval Report" in captured_html_path.read_text(encoding="utf-8")
+
+    assert (
+        main(
+            [
+                "eval",
+                "compare",
+                str(captured_path),
+                str(fresh_path),
+                "--json",
+                "--output",
+                str(comparison_json_path),
+            ]
+        )
+        == 0
+    )
+    comparison = json.loads(comparison_json_path.read_text(encoding="utf-8"))
+    assert comparison["compatibility"]["comparable"] is True
+    assert comparison["regressions"] == []
+    assert comparison["baseline"]["result_revision"] == captured.revision
+    assert comparison["current"]["result_revision"] == fresh.revision
+
+    assert (
+        main(
+            [
+                "eval",
+                "compare",
+                str(captured_path),
+                str(fresh_path),
+                "--html",
+                "--output",
+                str(comparison_html_path),
+            ]
+        )
+        == 0
+    )
+    assert "Cayu Eval Comparison" in comparison_html_path.read_text(encoding="utf-8")
+
+    assert (
+        main(
+            [
+                "eval",
+                "compare",
+                str(fresh_path),
+                str(captured_path),
+                "--json",
+                "--output",
+                str(reverse_comparison_json_path),
+            ]
+        )
+        == 0
+    )
+    reverse_comparison = json.loads(reverse_comparison_json_path.read_text(encoding="utf-8"))
+    assert reverse_comparison["compatibility"]["comparable"] is True
+    assert reverse_comparison["regressions"] == []
+    assert reverse_comparison["baseline"]["result_revision"] == fresh.revision
+    assert reverse_comparison["current"]["result_revision"] == captured.revision
 
 
 def test_eval_compare_returns_two_and_typed_reasons_for_incomparable_corpora(

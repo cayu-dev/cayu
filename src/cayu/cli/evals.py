@@ -7,13 +7,14 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from cayu.cli._output import add_output_options
 from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.cli.project import project_context, resolve_eval_project
 from cayu.evals import (
     CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES,
+    CapturedEvaluationResultV1,
     CorpusExecutionResult,
     CorpusTarget,
     EvalCorpusDocument,
@@ -21,12 +22,14 @@ from cayu.evals import (
     EvalRun,
     EvalStatus,
     EvalSuite,
-    compare_corpus_execution_results,
+    captured_evaluation_result_from_json,
+    compare_eval_results,
     compare_eval_runs,
     comparison_to_json,
     corpus_execution_comparison_to_json,
     corpus_execution_result_to_json,
     eval_corpus_inspection_to_json,
+    eval_result_to_json,
     eval_run_to_json,
     inspect_eval_corpus,
     load_corpus_execution_result,
@@ -36,6 +39,7 @@ from cayu.evals import (
     render_comparison_html,
     render_corpus_execution_comparison_html,
     render_corpus_execution_html,
+    render_eval_result_html,
     render_html_report,
     run_eval_plan,
 )
@@ -278,6 +282,14 @@ async def _load_eval_plan(target: str, *, label: str) -> EvalPlan:
 
 def _report(args: argparse.Namespace) -> int:
     result = _load_saved_eval_result(args.input)
+    if type(result) is CapturedEvaluationResultV1:
+        output = (
+            eval_result_to_json(result)
+            if args.output_format == "json"
+            else render_eval_result_html(result)
+        )
+        _write_or_print(output, args.output)
+        return 0
     if type(result) is CorpusExecutionResult:
         output = (
             corpus_execution_result_to_json(result)
@@ -298,12 +310,19 @@ def _report(args: argparse.Namespace) -> int:
 def _compare(args: argparse.Namespace) -> int:
     baseline = _load_saved_eval_result(args.baseline)
     current = _load_saved_eval_result(args.current)
-    if type(baseline) is not type(current):
-        raise ValueError("Cannot compare direct EvalRun and corpus execution result documents.")
-    if type(baseline) is CorpusExecutionResult and type(current) is CorpusExecutionResult:
-        comparison = compare_corpus_execution_results(
+    published_types = {CorpusExecutionResult, CapturedEvaluationResultV1}
+    if type(baseline) in published_types and type(current) in published_types:
+        baseline_result = cast(
+            "CorpusExecutionResult | CapturedEvaluationResultV1",
             baseline,
+        )
+        current_result = cast(
+            "CorpusExecutionResult | CapturedEvaluationResultV1",
             current,
+        )
+        comparison = compare_eval_results(
+            baseline_result,
+            current_result,
             score_tolerance=args.score_tolerance,
         )
         output = (
@@ -322,6 +341,11 @@ def _compare(args: argparse.Namespace) -> int:
         if current_exit == 1 or comparison.regressions:
             return 1
         return 0
+
+    if type(baseline) is not type(current):
+        raise ValueError(
+            "Cannot compare direct EvalRun and captured/fresh published result documents."
+        )
 
     if type(baseline) is not EvalRun or type(current) is not EvalRun:
         raise TypeError("Unsupported eval result document type.")
@@ -355,7 +379,9 @@ def _status_exit_code(status: EvalStatus | str) -> int:
     return 2
 
 
-def _load_saved_eval_result(path: str) -> EvalRun | CorpusExecutionResult:
+def _load_saved_eval_result(
+    path: str,
+) -> EvalRun | CorpusExecutionResult | CapturedEvaluationResultV1:
     result_path = Path(path)
     with result_path.open("rb") as handle:
         raw = handle.read(CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES + 1)
@@ -369,6 +395,8 @@ def _load_saved_eval_result(path: str) -> EvalRun | CorpusExecutionResult:
         raise ValueError("Eval result JSON must be UTF-8.") from exc
     if not isinstance(document, dict):
         raise ValueError("Eval result JSON must be an object.")
+    if document.get("origin") == "captured_session":
+        return captured_evaluation_result_from_json(raw.decode("utf-8"))
     if document.get("schema_version") == 1 or {"target", "run"} <= set(document):
         return load_corpus_execution_result(result_path)
     return load_eval_run(result_path)

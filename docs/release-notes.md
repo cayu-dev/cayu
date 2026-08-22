@@ -89,6 +89,33 @@ guard.
 
 ## Unreleased
 
+### Captured and fresh Evals share one release gate
+
+The Control Plane now compares immutable captured-session and fresh-execution
+results through one origin-aware server contract. An approved suite baseline is
+used by default; operators may override it with another immutable result
+revision. Compatibility remains contract-based, allows application release and
+manifest changes, and reports typed incompatibilities instead of manufacturing
+regressions. Both result origins can be downloaded as deterministic JSON or
+standalone HTML.
+
+`cayu eval report` now accepts captured result documents, and `cayu eval compare`
+accepts captured-to-fresh, fresh-to-captured, and same-origin published results
+with the existing stable `0`/`1`/`2` CI exits. The public SDK exports the shared
+result serializers and report renderers. Server contract version 19 adds the
+immutable result comparison and catalog report endpoints; independently
+deployed servers, generated clients, and dashboards must be upgraded together.
+
+Freshly generated projects document the complete simple-session path: configure
+the normal provider, start `cayu serve --dev`, evaluate a session, approve its
+captured baseline, and launch one bounded fresh trial without Evals-specific
+Python. The credential-gated release check now creates that scaffold and proves
+the Control Plane plus JSON, HTML, CLI, and CI round trip with one source run and
+one fresh trial. This slice adds no storage revision: existing SQLite and
+PostgreSQL deployments must already complete the documented revision-50
+migration before current workers start, and the shared restart suites continue
+to cover corpora, results, baselines, and run publication.
+
 ### Captured sessions can launch bounded fresh trials from the Control Plane
 
 Simple captured sessions with safely reconstructable input can now move directly

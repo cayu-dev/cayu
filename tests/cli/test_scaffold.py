@@ -120,6 +120,8 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "uv run cayu serve --dev" in readme
     assert "http://127.0.0.1:8000/cayu/" in readme
     assert "developer/operator control plane" in readme
+    assert "no Evals-specific Python configuration" in readme
+    assert "Fresh Evals execution remains gated" not in readme
     assert "Never mount it with unauthenticated open access on a public listener" in readme
     assert "client-IP checks are not authentication" in readme
     assert "uv run cayu auth openai login" in readme

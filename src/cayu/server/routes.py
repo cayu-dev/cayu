@@ -40,6 +40,7 @@ from cayu._exception_groups import exception_tree_contains
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     JsonUtf8SizeCounter,
+    compact_json_utf8_size,
     copy_durable_json_object,
     copy_json_value,
     copy_label_map,
@@ -68,15 +69,18 @@ from cayu.core.thinking import ThinkingConfig
 from cayu.evals.corpus import EvalCaseSpec, EvalCorpusDocument, EvalSuiteSpec, eval_corpus_to_json
 from cayu.evals.execution import (
     CompiledCorpusSuite,
+    CorpusExecutionResult,
     CorpusTarget,
     _validate_corpus_target_compatibility,
     compile_corpus_suite,
     evaluation_target_identity,
 )
-from cayu.evals.execution_comparison import compare_corpus_execution_results
+from cayu.evals.execution_comparison import compare_corpus_execution_results, compare_eval_results
 from cayu.evals.execution_reporting import (
     corpus_execution_result_to_json,
+    eval_result_to_json,
     render_corpus_execution_html,
+    render_eval_result_html,
 )
 from cayu.evals.models import Trajectory
 from cayu.evals.promotion import (
@@ -118,6 +122,7 @@ from cayu.evals.store import (
     EvalResultConflict,
     EvalResultPage,
     EvalResultQuery,
+    EvalResultRecord,
     EvalRunAdmissionConflict,
     EvalRunCostBudget,
     EvalRunInvocation,
@@ -321,6 +326,8 @@ from cayu.server.contracts import (
     EvalBaselineSelectionResponse,
     EvalComparisonRequest,
     EvalComparisonResponse,
+    EvalResultComparisonRequest,
+    EvalResultComparisonResponse,
     EvalResultDetailResponse,
     EvalResultResponse,
     EvalRunCreateRequest,
@@ -440,6 +447,47 @@ def _validated_model_json(value: BaseModel, model_type: type[BaseModel]) -> byte
 
 def _render_utf8(renderer: Callable[[Any], str], value: Any) -> bytes:
     return renderer(value).encode("utf-8")
+
+
+def _eval_result_record_matches_document(
+    record: EvalResultRecord,
+    result: CorpusExecutionResult | CapturedEvaluationResultV1,
+) -> bool:
+    """Fail closed when a custom store returns mismatched result metadata."""
+
+    if type(result) is CorpusExecutionResult:
+        origin = EvalResultOrigin.FRESH_EXECUTION
+        target = result.target
+        corpus_revision = result.run.corpus_revision
+        suite_id = result.run.suite_id
+        suite_revision = result.run.suite_revision
+        status = result.run.status
+        score = result.run.score
+    elif type(result) is CapturedEvaluationResultV1:
+        origin = EvalResultOrigin.CAPTURED_SESSION
+        target = result.target
+        corpus_revision = result.corpus_revision
+        suite_id = result.suite_id
+        suite_revision = result.suite_revision
+        status = result.score.status
+        score = result.score.score
+    else:
+        return False
+    document_bytes = compact_json_utf8_size(result.model_dump(mode="json"))
+    return (
+        record.revision == result.revision
+        and record.origin == origin
+        and record.target.target_key == target.target_key
+        and record.target.application_release_id == target.application_release_id
+        and record.target.app_manifest_schema_version == target.app_manifest_schema_version
+        and record.target.app_manifest_fingerprint == target.app_manifest_fingerprint
+        and record.corpus_revision == corpus_revision
+        and record.suite_id == suite_id
+        and record.suite_revision == suite_revision
+        and record.status == status
+        and record.score == score
+        and record.document_bytes == document_bytes
+    )
 
 
 async def _model_json_response(
@@ -4619,13 +4667,9 @@ def create_router(
             except (TypeError, ValueError) as exc:
                 raise HTTPException(status_code=422, detail="Invalid Evals query.") from exc
 
-        @bounded_captured_evaluation_router.get(
-            "/evals/results/{result_revision}",
-            response_model=EvalResultDetailResponse,
-            responses=CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
-            dependencies=protected,
-        )
-        async def get_eval_result(result_revision: str) -> EvalResultDetailResponse:
+        async def _load_catalog_eval_result(
+            result_revision: str,
+        ) -> tuple[EvalResultRecord, CorpusExecutionResult | CapturedEvaluationResultV1]:
             if captured_eval_store is None or not captured_eval_store.captured_results:
                 raise HTTPException(status_code=409, detail="Eval result catalog is unavailable.")
             try:
@@ -4641,19 +4685,106 @@ def create_router(
                 raise HTTPException(
                     status_code=422, detail="Invalid eval result revision."
                 ) from exc
-            if (
-                record is None
-                or result is None
-                or eval_registry.get(record.target.target_key) is None
-            ):
+            if record is None or result is None:
                 raise HTTPException(status_code=404, detail="Eval result not found.")
+            if not await asyncio.to_thread(
+                _eval_result_record_matches_document,
+                record,
+                result,
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Eval result catalog metadata does not match its stored document.",
+                )
+            if eval_registry.get(record.target.target_key) is None:
+                raise HTTPException(status_code=404, detail="Eval result not found.")
+            return record, result
+
+        @bounded_captured_evaluation_router.get(
+            "/evals/results/{result_revision}",
+            response_model=EvalResultDetailResponse,
+            responses=CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def get_eval_result(result_revision: str) -> EvalResultDetailResponse:
+            record, result = await _load_catalog_eval_result(result_revision)
+            store = captured_eval_store
+            if store is None:
+                raise RuntimeError("Loaded eval result has no captured-result store.")
             key = EvalBaselineKey(
                 target_key=record.target.target_key,
                 corpus_revision=record.corpus_revision,
                 suite_id=record.suite_id,
             )
-            baseline = await captured_eval_store.load_baseline(key)
+            baseline = await store.load_baseline(key)
             return EvalResultDetailResponse(record=record, result=result, baseline=baseline)
+
+        @bounded_captured_evaluation_router.get(
+            "/evals/results/{result_revision}/report.json",
+            response_class=Response,
+            responses=CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def download_catalog_eval_json_report(result_revision: str) -> Response:
+            record, result = await _load_catalog_eval_result(result_revision)
+            report = await asyncio.to_thread(_render_utf8, eval_result_to_json, result)
+            filename = f"{record.revision.removeprefix('sha256:')}.eval-result.json"
+            return Response(
+                content=report,
+                media_type="application/json",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
+
+        @bounded_captured_evaluation_router.get(
+            "/evals/results/{result_revision}/report.html",
+            response_class=Response,
+            responses=CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def download_catalog_eval_html_report(result_revision: str) -> Response:
+            record, result = await _load_catalog_eval_result(result_revision)
+            report = await asyncio.to_thread(_render_utf8, render_eval_result_html, result)
+            filename = f"{record.revision.removeprefix('sha256:')}.eval-report.html"
+            return Response(
+                content=report,
+                media_type="text/html",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
+
+        @bounded_captured_evaluation_router.post(
+            "/evals/result-comparisons",
+            response_model=EvalResultComparisonResponse,
+            responses=CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
+            dependencies=protected,
+            openapi_extra=_json_request_openapi(EvalResultComparisonRequest),
+        )
+        async def compare_catalog_eval_results(request: Request) -> Response:
+            body = await _validated_private_json_body(
+                request,
+                EvalResultComparisonRequest,
+                invalid_detail="Invalid Evals request.",
+            )
+            baseline_record, baseline = await _load_catalog_eval_result(
+                body.baseline_result_revision
+            )
+            if body.current_result_revision == body.baseline_result_revision:
+                current_record, current = baseline_record, baseline
+            else:
+                current_record, current = await _load_catalog_eval_result(
+                    body.current_result_revision
+                )
+            comparison = await asyncio.to_thread(
+                compare_eval_results,
+                baseline,
+                current,
+                score_tolerance=body.score_tolerance,
+            )
+            response = EvalResultComparisonResponse(
+                baseline=baseline_record,
+                current=current_record,
+                comparison=comparison,
+            )
+            return await _model_json_response(response, EvalResultComparisonResponse)
 
         @bounded_captured_evaluation_router.post(
             "/evals/results/{result_revision}/baseline",
@@ -5356,7 +5487,21 @@ def create_router(
         )
         async def get_eval_result(run_id: str) -> Response:
             run, result = await _load_eval_result(run_id)
-            response = await asyncio.to_thread(EvalResultResponse, run=run, result=result)
+            baseline = None
+            if captured_eval_store is not None and captured_eval_store.captured_results:
+                baseline = await captured_eval_store.load_baseline(
+                    EvalBaselineKey(
+                        target_key=run.spec.target_key,
+                        corpus_revision=run.spec.corpus_revision,
+                        suite_id=run.spec.suite_id,
+                    )
+                )
+            response = await asyncio.to_thread(
+                EvalResultResponse,
+                run=run,
+                result=result,
+                baseline=baseline,
+            )
             return await _model_json_response(response, EvalResultResponse)
 
         @bounded_evals_router.get(

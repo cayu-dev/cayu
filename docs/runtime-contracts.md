@@ -4396,9 +4396,10 @@ hosted-tool usage counters and hosted web-search pricing evidence to usage and
 cost projections. Server contract version 17 adds automatic project-owned Evals
 storage and target discovery. Server contract version 18 adds captured-session
 preview/save/export, the target-scoped immutable result catalog, actor-attributed
-baseline selection, and explicit captured-result store readiness. Clients
-generated against contract version 1 through 17 must
-regenerate from the current OpenAPI document.
+baseline selection, and explicit captured-result store readiness. Server contract
+version 19 adds immutable captured/fresh result comparison and JSON/HTML report
+endpoints. Clients generated against contract version 1 through 18 must regenerate
+from the current OpenAPI document.
 Version 1 and 2 clients must also treat all aggregate
 counter fields as strings. Independently hosted dashboards must not render
 control-plane routes against a server reporting a different contract version.
@@ -4442,9 +4443,12 @@ Its storage and target evidence are independent. Project serving may make
 durable storage and project/release identity available before it can resolve a
 trusted executable target. In that state catalog, launch, cancellation,
 comparison, and report operations remain gated by
-`eval_target_not_configured`; captured-result persistence remains a separately
-planned operation. A fully explicit `EvalsConfig` supplies all three pieces and
-preserves the existing ready projection.
+`eval_target_not_configured`, including captured-result persistence because a
+stored result must be scoped to a published target. When target and identity are
+available, a store that does not implement the captured-results contract reports
+`captured_result_persistence_not_available`. A fully explicit `EvalsConfig`
+supplies target, identity, and storage; its readiness projection still reflects
+the capabilities of the supplied store.
 
 The protected `GET /api/system/diagnostics` response is a separate, manually
 requested operator snapshot. It repeats the capability projection so the

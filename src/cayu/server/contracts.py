@@ -1100,9 +1100,42 @@ class EvalComparisonResponse(ApiBaseModel):
         return self
 
 
+class EvalResultComparisonRequest(ApiBaseModel):
+    """Compare two immutable captured or fresh results by content revision."""
+
+    baseline_result_revision: EvalRevision
+    current_result_revision: EvalRevision
+    score_tolerance: StrictFloat = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class EvalResultComparisonResponse(ApiBaseModel):
+    """Shared comparison projection with origin-neutral catalog identities."""
+
+    baseline: EvalResultRecord
+    current: EvalResultRecord
+    comparison: CorpusExecutionComparison
+
+    @model_validator(mode="after")
+    def validate_result_records(self) -> EvalResultComparisonResponse:
+        for label, record, summary in (
+            ("Baseline", self.baseline, self.comparison.baseline),
+            ("Current", self.current, self.comparison.current),
+        ):
+            if (
+                summary.result_revision != record.revision
+                or summary.status != record.status
+                or summary.score != record.score
+                or summary.application_release_id != record.target.application_release_id
+                or summary.app_manifest_fingerprint != record.target.app_manifest_fingerprint
+            ):
+                raise ValueError(f"{label} comparison summary does not match its result record.")
+        return self
+
+
 class EvalResultResponse(ApiBaseModel):
     run: EvalRunRecord
     result: CorpusExecutionResult
+    baseline: EvalBaselineRecord | None = None
 
     @model_validator(mode="after")
     def validate_run_result(self) -> EvalResultResponse:
@@ -1125,6 +1158,12 @@ class EvalResultResponse(ApiBaseModel):
             or summary.duration_ms != published.duration_ms
         ):
             raise ValueError("Eval result response does not match its run summary.")
+        if self.baseline is not None and (
+            self.baseline.key.target_key != spec.target_key
+            or self.baseline.key.corpus_revision != spec.corpus_revision
+            or self.baseline.key.suite_id != spec.suite_id
+        ):
+            raise ValueError("Eval result baseline does not match its run specification.")
         return self
 
 

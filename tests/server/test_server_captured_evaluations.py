@@ -21,9 +21,11 @@ from tests.server.test_server_evaluation_promotion import (
 
 from cayu.evals import (
     CapturedEvaluationCandidateV1,
+    CapturedEvaluationResultV1,
     EvalCaseSpec,
     ModelJudgeAssertionSpec,
 )
+from cayu.evals.store import EvalResultRecord
 from cayu.project_control_plane import (
     ProjectControlPlaneAccess,
     _create_project_control_plane_context,
@@ -32,6 +34,7 @@ from cayu.runtime import default_price_book
 from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.invocation import InvocationOriginTrust, SessionExecutionSource
 from cayu.server import DashboardConfig, ServerConfig, create_server
+from cayu.server.routes import _eval_result_record_matches_document
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 
 
@@ -227,6 +230,17 @@ def test_click_to_evaluate_saves_catalogs_baselines_and_exports_without_runnable
         result_revision = saved["record"]["revision"]
         corpus_revision = saved["record"]["corpus_revision"]
         target_key = saved["record"]["target"]["target_key"]
+        saved_record = EvalResultRecord.model_validate(saved["record"])
+        saved_result = CapturedEvaluationResultV1.model_validate(saved["result"])
+        assert _eval_result_record_matches_document(saved_record, saved_result)
+        assert not _eval_result_record_matches_document(
+            saved_record.model_copy(update={"suite_id": "different-suite"}),
+            saved_result,
+        )
+        assert not _eval_result_record_matches_document(
+            saved_record.model_copy(update={"document_bytes": saved_record.document_bytes + 1}),
+            saved_result,
+        )
 
         repeated_save = client.post(
             f"/api/evals/sessions/{_SESSION_ID}/evaluation/save",
@@ -270,6 +284,25 @@ def test_click_to_evaluate_saves_catalogs_baselines_and_exports_without_runnable
         assert detail.status_code == 200
         assert detail.json()["result"] == saved["result"]
         assert detail.json()["baseline"] is None
+
+        captured_json_report = client.get(
+            f"/api/evals/results/{result_revision}/report.json",
+            headers=_AUTH_HEADERS,
+        )
+        assert captured_json_report.status_code == 200
+        assert captured_json_report.content.endswith(b"\n")
+        assert captured_json_report.json() == saved["result"]
+        assert (
+            captured_json_report.headers["content-disposition"]
+            == f'attachment; filename="{result_revision.removeprefix("sha256:")}.eval-result.json"'
+        )
+        captured_html_report = client.get(
+            f"/api/evals/results/{result_revision}/report.html",
+            headers=_AUTH_HEADERS,
+        )
+        assert captured_html_report.status_code == 200
+        assert b"Cayu Captured Eval Report" in captured_html_report.content
+        assert _SESSION_ID.encode() not in captured_html_report.content
 
         spoofed_actor = client.post(
             f"/api/evals/results/{result_revision}/baseline",
@@ -455,6 +488,17 @@ def test_reviewed_simple_session_launches_one_fresh_trial_with_http_operator_pro
             },
             "cost_budget": None,
         }
+        captured_result_revision = body["captured"]["record"]["revision"]
+        selected_baseline = client.post(
+            f"/api/evals/results/{captured_result_revision}/baseline",
+            headers=_AUTH_HEADERS,
+            json={
+                "result_revision": captured_result_revision,
+                "expected_generation": 0,
+                "operation_id": "sha256:" + "3" * 64,
+            },
+        )
+        assert selected_baseline.status_code == 200
         replay = client.post(
             launch_url,
             headers={**_AUTH_HEADERS, "Idempotency-Key": "fresh-trial-one"},
@@ -472,6 +516,42 @@ def test_reviewed_simple_session_launches_one_fresh_trial_with_http_operator_pro
             time.sleep(0.01)
         assert run["status"] == "completed"
         assert run["result"]["status"] == "passed"
+        fresh_result_revision = run["result"]["revision"]
+        fresh_run_result = client.get(
+            f"/api/evals/runs/{run_id}/result",
+            headers=_AUTH_HEADERS,
+        )
+        assert fresh_run_result.status_code == 200
+        assert fresh_run_result.json()["baseline"]["result_revision"] == captured_result_revision
+
+        fresh_detail = client.get(
+            f"/api/evals/results/{fresh_result_revision}",
+            headers=_AUTH_HEADERS,
+        )
+        assert fresh_detail.status_code == 200
+        assert fresh_detail.json()["baseline"]["result_revision"] == captured_result_revision
+        comparison = client.post(
+            "/api/evals/result-comparisons",
+            headers=_AUTH_HEADERS,
+            json={
+                "baseline_result_revision": captured_result_revision,
+                "current_result_revision": fresh_result_revision,
+                "score_tolerance": 0,
+            },
+        )
+        assert comparison.status_code == 200
+        comparison_body = comparison.json()
+        assert comparison_body["baseline"]["origin"] == "captured_session"
+        assert comparison_body["current"]["origin"] == "fresh_execution"
+        assert comparison_body["comparison"]["compatibility"]["comparable"] is True
+        assert comparison_body["comparison"]["regressions"] == []
+
+        fresh_json_report = client.get(
+            f"/api/evals/results/{fresh_result_revision}/report.json",
+            headers=_AUTH_HEADERS,
+        )
+        assert fresh_json_report.status_code == 200
+        assert fresh_json_report.json()["revision"] == fresh_result_revision
 
         sessions = asyncio.run(app.session_store.list_sessions()).sessions
         fresh = next(session for session in sessions if session.id != _SESSION_ID)

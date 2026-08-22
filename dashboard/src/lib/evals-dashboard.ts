@@ -70,6 +70,14 @@ export function evalLaunchFailureIsDefinitive(status: number): boolean {
   )
 }
 
+export function retryEvalQuery(failureCount: number, error: Error): boolean {
+  const status =
+    "status" in error && typeof error.status === "number" && Number.isInteger(error.status)
+      ? error.status
+      : null
+  return !(status !== null && evalLaunchFailureIsDefinitive(status)) && failureCount < 3
+}
+
 type EvalLaunchStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">
 
 type EvalLaunchRegistryDocument = {

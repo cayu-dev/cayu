@@ -129,9 +129,12 @@ completed and produced a failed result or a compatible regression; `2` means
 the command could not make a conclusive pass/fail decision. Exit `2` covers
 invalid corpus or result input, unavailable/error/skipped evidence, incomparable
 contracts, target/configuration errors, and execution errors. Direct-suite runs
-use the same `0`/`1`/`2` status mapping. `eval report` and `eval compare` auto-detect
-direct `EvalRun` and portable `CorpusExecutionResult` documents, operate only on
-the supplied paths, and do not perform project discovery.
+use the same `0`/`1`/`2` status mapping. `eval report` and `eval compare`
+auto-detect direct `EvalRun`, captured `CapturedEvaluationResultV1`, and fresh
+`CorpusExecutionResult` documents. Captured and fresh published results can be
+compared with each other through the same compatibility projection and stable
+exit contract. These commands operate only on the supplied paths and do not
+perform project discovery.
 
 ## Portable corpus documents
 
@@ -970,7 +973,9 @@ mutation = await store.set_baseline(
 `compare_eval_results(...)` provide the common captured/fresh comparison path.
 Application releases may differ, but target, corpus, suite, case, assertion,
 evidence-policy, and applicable-pricing contracts must match. Cayu never picks
-a baseline automatically. Existing custom `EvalStore` implementations remain
+a baseline inside the comparison function. The Control Plane uses the suite's
+explicitly approved baseline pointer by default and permits a manual immutable
+result-revision override. Existing custom `EvalStore` implementations remain
 source-compatible and advertise this optional contract only when
 `captured_results` is true.
 
@@ -1163,21 +1168,25 @@ from the server's deterministic report endpoints. Only the actively viewed
 complete result graph is retained by the query cache; switching runs or leaving
 the result view evicts it immediately.
 
-Comparison also remains server-authoritative. The operator selects or pastes a
-completed baseline run ID; the dashboard displays the server's typed
-compatibility verdict and immutable summaries side by side. Different
+Comparison also remains server-authoritative. The dashboard uses the suite's
+approved captured or fresh result by default; the operator can instead select
+or paste another immutable `sha256:` result revision. The server returns both
+origin-aware catalog records, its typed compatibility verdict, and immutable
+summaries side by side. Different
 application releases are allowed, while changed corpus, suite, case, assertion,
 evidence-policy, target-key, or applicable-pricing contracts are explicitly
 incomparable. For compatible runs, status regressions and score drops beyond the
-selected tolerance are reported at run and case scope. The browser does not
-choose a baseline automatically or invent a universal regression score.
+selected tolerance are reported at run and case scope. The browser never invents
+a baseline or a universal regression score.
 
 The SDK, server, dashboard, JSON, HTML, and CLI share that same comparison
-projection. `compare_corpus_execution_results(...)` returns the immutable typed
-`CorpusExecutionComparison`; `corpus_execution_comparison_to_json(...)` and
-`render_corpus_execution_comparison_html(...)` render it without reading an
-application or recomputing eval assertions. An incompatible comparison contains
-only typed mismatch reasons and result summaries—never fabricated regressions.
+projection. `compare_eval_results(...)` accepts captured and fresh origins;
+`eval_result_to_json(...)` and `render_eval_result_html(...)` report either
+origin without reading an application or recomputing assertions.
+`corpus_execution_comparison_to_json(...)` and
+`render_corpus_execution_comparison_html(...)` render the shared comparison.
+An incompatible comparison contains only typed mismatch reasons and result
+summaries—never fabricated regressions.
 
 ### Release acceptance: dashboard to local CI
 
@@ -1195,14 +1204,15 @@ with `PYTHONPATH` and provider credentials removed. Its local rerun deliberately
 uses a different application release ID and must still compare cleanly against
 the downloaded dashboard result.
 
-The focused real-application check exercises the same user journey with an
-actual OpenAI or Anthropic model. It promotes one completed session, adds an
-output-content assertion in the dashboard, saves the corpus, executes two
-durable dashboard runs, inspects and downloads the result, compares the runs,
-and runs the exported corpus once more through the local CLI as a CI gate:
+The focused real-application check starts from a freshly generated project and
+an actual OpenAI or Anthropic model. It runs `cayu serve --dev`, creates a
+session in Control Plane, adds an output-content assertion, launches one fresh
+trial, approves the captured result as baseline, compares captured to fresh,
+downloads both result origins and their reports, and proves the stable CLI
+comparison exit. The generated project contains no Evals-specific changes:
 
 ```bash
-# Four agent executions: source capture, two dashboard runs, and one local rerun.
+# Two agent executions: source capture and one bounded fresh trial.
 CAYU_PROVIDER=openai OPENAI_API_KEY=... \
   uv run python examples/evals_release_acceptance_live.py
 
@@ -1212,8 +1222,9 @@ CAYU_PROVIDER=anthropic ANTHROPIC_API_KEY=... \
 
 Model overrides use `CAYU_OPENAI_MODEL` or `CAYU_ANTHROPIC_MODEL`. The check is
 credential-gated and never falls back to a scripted provider; a missing or
-mismatched selected credential exits before application execution. Nightly
-verification exposes it as `evals-release-acceptance-live`.
+mismatched selected credential exits before project creation or application
+execution. Nightly verification exposes it as
+`evals-release-acceptance-live`.
 
 `ToolsCalledInOrder([...])` requires an exact sequence: reordered, missing, or
 additional calls fail. It reads model-requested `ToolCallPart` values in durable

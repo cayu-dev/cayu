@@ -18,6 +18,7 @@ import {
   evalTrialCostSummary,
   MAX_EVAL_CORPUS_FILE_BYTES,
   preflightEvalCorpusFile,
+  retryEvalQuery,
   shortEvalIdentity,
 } from "../src/lib/evals-dashboard.ts"
 
@@ -90,6 +91,13 @@ test("eval launch notices describe the returned durable run instead of fabricati
     evalLaunchNotice(returned("cancelled")),
     "Opened eval run eval-1234567… (cancelled).",
   )
+})
+
+test("eval query retries stop for definitive API failures", () => {
+  assert.equal(retryEvalQuery(0, Object.assign(new Error("missing"), { status: 404 })), false)
+  assert.equal(retryEvalQuery(0, Object.assign(new Error("retry"), { status: 429 })), true)
+  assert.equal(retryEvalQuery(2, new Error("network")), true)
+  assert.equal(retryEvalQuery(3, new Error("network")), false)
 })
 
 test("inactive complete eval results are released from the browser cache immediately", async () => {

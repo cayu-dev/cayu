@@ -41,15 +41,18 @@ import {
 import {
   ApiClientError,
   cancelEvalRun,
-  compareEvalRuns,
+  compareEvalResults,
   createEvalRun,
+  downloadCatalogEvalResultHtml,
+  downloadCatalogEvalResultJson,
   downloadEvalCorpus,
   downloadEvalResultHtml,
   downloadEvalResultJson,
-  type EvalComparison,
   type EvalCorpusEntry,
   type EvalResult,
+  type EvalResultComparison,
   type EvalResultDetail,
+  type EvalResultSummary,
   type EvalRun,
   type EvalStatus,
   type EvalTarget,
@@ -81,6 +84,7 @@ import {
   evalRunIsActive,
   evalTrialCostSummary,
   preflightEvalCorpusFile,
+  retryEvalQuery,
   shortEvalIdentity,
 } from "@/lib/evals-dashboard"
 import {
@@ -88,7 +92,7 @@ import {
   evalsReadinessReasonText,
   evalsReadinessStateLabel,
 } from "@/lib/evals-readiness"
-import { type EvalsSearch, evalRunIdIsValid, evalsSearchWithout } from "@/lib/evals-search"
+import { type EvalsSearch, evalResultRevisionIsValid, evalsSearchWithout } from "@/lib/evals-search"
 import { formatBytes, formatCount, formatDateTime } from "@/lib/format"
 import type { EvalsReadiness } from "@/lib/generated/server-api"
 
@@ -1011,6 +1015,20 @@ function ResultsView({
     queryFn: ({ signal }) => fetchEvalResultDetail(search.result ?? "", signal),
     enabled: search.result !== undefined,
   })
+  const currentResultRevision = detail.data?.record.revision
+  const approvedBaselineRevision = detail.data?.baseline?.result_revision
+  const baselineResultRevision = search.baseline ?? approvedBaselineRevision
+  const comparison = useQuery({
+    queryKey: ["evals", "result-comparison", baselineResultRevision, currentResultRevision],
+    queryFn: ({ signal }) =>
+      compareEvalResults(baselineResultRevision ?? "", currentResultRevision ?? "", 0, signal),
+    enabled:
+      baselineResultRevision !== undefined &&
+      currentResultRevision !== undefined &&
+      baselineResultRevision !== currentResultRevision,
+    retry: retryEvalQuery,
+    staleTime: Number.POSITIVE_INFINITY,
+  })
 
   const approveBaseline = (selected: EvalResultDetail) => {
     if (pendingAction !== null || !mutateEnabled) return
@@ -1033,6 +1051,19 @@ function ResultsView({
         queryClient.invalidateQueries({ queryKey: ["evals", "results"] }),
       ])
       return `Approved result ${shortEvalIdentity(revision)} as the suite baseline.`
+    })
+  }
+
+  const downloadResult = (revision: string, format: "json" | "html") => {
+    if (pendingAction !== null) return
+    void runAction(`download-catalog-result-${format}`, async (signal) => {
+      const file =
+        format === "json"
+          ? await downloadCatalogEvalResultJson(revision, signal)
+          : await downloadCatalogEvalResultHtml(revision, signal)
+      if (signal.aborted) return
+      downloadBlob(file.blob, file.filename)
+      return `Downloaded the ${format.toUpperCase()} report for ${shortEvalIdentity(revision)}.`
     })
   }
 
@@ -1075,7 +1106,7 @@ function ResultsView({
                     title={result.revision}
                     onClick={() =>
                       updateSearch((current) => ({
-                        ...current,
+                        ...evalsSearchWithout(current, "baseline"),
                         tab: "results",
                         result: result.revision,
                         corpus: result.corpus_revision,
@@ -1125,11 +1156,13 @@ function ResultsView({
           nextCursor={results.data?.next_cursor}
           fetching={results.isFetching}
           first={() =>
-            updateSearch((current) => evalsSearchWithout(current, "results_cursor", "result"))
+            updateSearch((current) =>
+              evalsSearchWithout(current, "results_cursor", "result", "baseline"),
+            )
           }
           next={(cursor) =>
             updateSearch((current) => ({
-              ...evalsSearchWithout(current, "result"),
+              ...evalsSearchWithout(current, "result", "baseline"),
               tab: "results",
               results_cursor: cursor,
             }))
@@ -1155,20 +1188,41 @@ function ResultsView({
           The selected result does not belong to this eval target.
         </StateMessage>
       ) : detail.data ? (
-        <CapturedResultInspector
-          detail={detail.data}
-          approving={pendingAction === `baseline:${detail.data.record.revision}`}
-          canMutate={mutateEnabled}
-          approve={() => approveBaseline(detail.data)}
-          openCorpus={() =>
-            updateSearch((current) => ({
-              ...evalsSearchWithout(current, "result", "results_cursor"),
-              tab: "catalog",
-              target: detail.data.record.target.target_key,
-              corpus: detail.data.record.corpus_revision,
-            }))
-          }
-        />
+        <div className="min-w-0 space-y-6">
+          <CapturedResultInspector
+            detail={detail.data}
+            approving={pendingAction === `baseline:${detail.data.record.revision}`}
+            downloading={pendingAction?.startsWith("download-catalog-result-") === true}
+            canMutate={mutateEnabled}
+            approve={() => approveBaseline(detail.data)}
+            download={(format) => downloadResult(detail.data.record.revision, format)}
+            openCorpus={() =>
+              updateSearch((current) => ({
+                ...evalsSearchWithout(current, "result", "results_cursor", "baseline"),
+                tab: "catalog",
+                target: detail.data.record.target.target_key,
+                corpus: detail.data.record.corpus_revision,
+              }))
+            }
+          />
+          <ComparisonPanel
+            key={`${detail.data.record.revision}:${baselineResultRevision ?? ""}`}
+            currentResultRevision={detail.data.record.revision}
+            baselineResultRevision={baselineResultRevision}
+            approvedBaselineRevision={approvedBaselineRevision}
+            candidates={results.data?.items ?? []}
+            comparison={comparison.data}
+            loading={comparison.isLoading && comparison.fetchStatus === "fetching"}
+            error={comparison.error}
+            retry={() => void comparison.refetch()}
+            selectBaseline={(baseline) =>
+              updateSearch((current) => ({
+                ...evalsSearchWithout(current, "baseline"),
+                ...(baseline ? { baseline } : {}),
+              }))
+            }
+          />
+        </div>
       ) : null}
     </div>
   )
@@ -1177,14 +1231,18 @@ function ResultsView({
 function CapturedResultInspector({
   detail,
   approving,
+  downloading,
   canMutate,
   approve,
+  download,
   openCorpus,
 }: {
   detail: EvalResultDetail
   approving: boolean
+  downloading: boolean
   canMutate: boolean
   approve: () => void
+  download: (format: "json" | "html") => void
   openCorpus: () => void
 }) {
   const selectedAsBaseline = detail.baseline?.result_revision === detail.record.revision
@@ -1201,6 +1259,24 @@ function CapturedResultInspector({
         description={`${detail.record.origin === "captured_session" ? "Captured session" : "Fresh execution"} · release ${detail.record.target.application_release_id}`}
         actions={
           <>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={downloading}
+              onClick={() => download("json")}
+            >
+              <FileJson /> JSON
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={downloading}
+              onClick={() => download("html")}
+            >
+              <Download /> HTML
+            </Button>
             <Button type="button" size="sm" variant="outline" onClick={openCorpus}>
               <Database /> Open corpus
             </Button>
@@ -1286,24 +1362,28 @@ function RunsView({
     enabled: evalRunHasResult(selectedRun.data),
     ...EVAL_RESULT_QUERY_RETENTION,
   })
+  const currentResultRevision = result.data?.result.revision
+  const comparisonResults = useQuery({
+    queryKey: ["evals", "results", targetKey, { scope: "comparison-candidates" }],
+    queryFn: ({ signal }) => fetchEvalResults({ target_key: targetKey, limit: PAGE_LIMIT }, signal),
+    enabled: currentResultRevision !== undefined,
+  })
+  const approvedBaselineRevision = result.data?.baseline?.result_revision
+  const baselineResultRevision = search.baseline ?? approvedBaselineRevision
   const comparison = useQuery({
-    queryKey: ["evals", "comparison", search.baseline, search.run],
-    queryFn: ({ signal }) => compareEvalRuns(search.baseline ?? "", search.run ?? "", signal),
+    queryKey: ["evals", "result-comparison", baselineResultRevision, currentResultRevision],
+    queryFn: ({ signal }) =>
+      compareEvalResults(baselineResultRevision ?? "", currentResultRevision ?? "", 0, signal),
     enabled:
       result.data !== undefined &&
-      search.baseline !== undefined &&
-      search.run !== undefined &&
-      search.baseline !== search.run,
+      baselineResultRevision !== undefined &&
+      currentResultRevision !== undefined &&
+      baselineResultRevision !== currentResultRevision,
+    retry: retryEvalQuery,
     staleTime: Number.POSITIVE_INFINITY,
   })
   const comparisonCandidates =
-    runs.data?.items.filter(
-      (run) =>
-        run.spec.run_id !== search.run &&
-        run.status === "completed" &&
-        run.result !== null &&
-        run.result !== undefined,
-    ) ?? []
+    comparisonResults.data?.items.filter((item) => item.revision !== currentResultRevision) ?? []
   const selectedRunUpdatedAt = selectedRun.data?.updated_at
 
   useEffect(() => {
@@ -1508,9 +1588,10 @@ function RunsView({
                   download={downloadResult}
                 />
                 <ComparisonPanel
-                  key={`${search.run}:${search.baseline ?? ""}`}
-                  currentRunId={search.run ?? ""}
-                  baselineRunId={search.baseline}
+                  key={`${currentResultRevision}:${baselineResultRevision ?? ""}`}
+                  currentResultRevision={currentResultRevision ?? ""}
+                  baselineResultRevision={baselineResultRevision}
+                  approvedBaselineRevision={approvedBaselineRevision}
                   candidates={comparisonCandidates}
                   comparison={comparison.data}
                   loading={comparison.isLoading && comparison.fetchStatus === "fetching"}
@@ -1834,8 +1915,9 @@ function ResultInspector({
 }
 
 function ComparisonPanel({
-  currentRunId,
-  baselineRunId,
+  currentResultRevision,
+  baselineResultRevision,
+  approvedBaselineRevision,
   candidates,
   comparison,
   loading,
@@ -1843,24 +1925,28 @@ function ComparisonPanel({
   retry,
   selectBaseline,
 }: {
-  currentRunId: string
-  baselineRunId?: string
-  candidates: Array<EvalRun>
-  comparison?: EvalComparison
+  currentResultRevision: string
+  baselineResultRevision?: string
+  approvedBaselineRevision?: string
+  candidates: Array<EvalResultSummary>
+  comparison?: EvalResultComparison
   loading: boolean
   error: unknown
   retry: () => void
-  selectBaseline: (runId?: string) => void
+  selectBaseline: (resultRevision?: string) => void
 }) {
-  const [draft, setDraft] = useState(baselineRunId ?? "")
+  const [draft, setDraft] = useState(baselineResultRevision ?? "")
   const normalizedDraft = draft.trim()
-  const baselineIsSelf = baselineRunId === currentRunId
-  const draftIsValid = evalRunIdIsValid(normalizedDraft) && normalizedDraft !== currentRunId
+  const baselineIsSelf = baselineResultRevision === currentResultRevision
+  const draftIsValid =
+    evalResultRevisionIsValid(normalizedDraft) && normalizedDraft !== currentResultRevision
+  const usingApprovedBaseline =
+    baselineResultRevision !== undefined && baselineResultRevision === approvedBaselineRevision
 
   return (
     <DataCard
-      title="Compare runs"
-      description="The server decides whether two immutable results share a compatible eval contract."
+      title="Compare results"
+      description="The approved suite baseline is used by default; the server decides whether the immutable results share a compatible eval contract."
     >
       <form
         className="flex min-w-0 flex-wrap items-end gap-2 border-b border-border p-4"
@@ -1870,21 +1956,22 @@ function ComparisonPanel({
         }}
       >
         <label className="min-w-64 flex-1 text-xs font-medium text-muted-foreground">
-          Baseline run ID
+          Baseline result revision
           <input
             type="text"
             list="eval-baseline-candidates"
             value={draft}
-            maxLength={128}
+            maxLength={71}
             className="mt-1 h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground"
-            placeholder="Select or paste a completed run ID"
+            placeholder="Select or paste a sha256 result revision"
             aria-invalid={normalizedDraft.length > 0 && !draftIsValid}
             onChange={(event) => setDraft(event.target.value)}
           />
           <datalist id="eval-baseline-candidates">
-            {candidates.map((run) => (
-              <option key={run.spec.run_id} value={run.spec.run_id}>
-                {run.spec.suite_id} · {run.result?.status}
+            {candidates.map((result) => (
+              <option key={result.revision} value={result.revision}>
+                {result.suite_id} · {result.origin === "captured_session" ? "captured" : "fresh"} ·{" "}
+                {result.status}
               </option>
             ))}
           </datalist>
@@ -1893,31 +1980,37 @@ function ComparisonPanel({
           {loading ? <LoaderCircle className="animate-spin" /> : <FlaskConical />}
           Compare
         </Button>
-        {baselineRunId && (
+        {baselineResultRevision && !usingApprovedBaseline && (
           <Button
             type="button"
             size="sm"
             variant="outline"
             onClick={() => selectBaseline(undefined)}
           >
-            Clear
+            {approvedBaselineRevision ? "Use approved baseline" : "Clear"}
           </Button>
         )}
       </form>
 
-      {!baselineRunId ? (
+      {!baselineResultRevision ? (
         <StateMessage>
-          Choose another completed result. Different application releases are allowed when the
-          corpus, suite, cases, assertions, evidence policy, and applicable pricing contract match.
+          Approve a suite baseline or choose another immutable result. Different application
+          releases are allowed when the corpus, suite, cases, assertions, evidence policy, and
+          applicable pricing contract match.
+        </StateMessage>
+      ) : baselineIsSelf && usingApprovedBaseline ? (
+        <StateMessage>
+          This result is the approved suite baseline. Select a different current result to compare
+          against it.
         </StateMessage>
       ) : baselineIsSelf ? (
         <StateMessage tone="danger" role="alert">
-          Choose a different completed run as the comparison baseline.
+          Choose a different immutable result as the comparison baseline.
         </StateMessage>
       ) : loading ? (
         <LoadingState label="Checking comparison compatibility..." />
       ) : error ? (
-        <QueryError message="Could not compare the selected eval runs." retry={retry} />
+        <QueryError message="Could not compare the selected eval results." retry={retry} />
       ) : comparison ? (
         <ComparisonSummary comparison={comparison} />
       ) : null}
@@ -1925,7 +2018,7 @@ function ComparisonPanel({
   )
 }
 
-function ComparisonSummary({ comparison }: { comparison: EvalComparison }) {
+function ComparisonSummary({ comparison }: { comparison: EvalResultComparison }) {
   const { comparison: resultComparison, baseline, current } = comparison
   const { compatibility } = resultComparison
   const regressions = resultComparison.regressions ?? []
@@ -1942,8 +2035,8 @@ function ComparisonSummary({ comparison }: { comparison: EvalComparison }) {
       >
         <div className="font-medium">
           {compatibility.comparable
-            ? "These runs are comparable."
-            : "These runs are not comparable as one regression contract."}
+            ? "These results are comparable."
+            : "These results are not comparable as one regression contract."}
         </div>
         {!compatibility.comparable && reasons.length > 0 && (
           <ul className="mt-2 list-disc space-y-1 pl-5">
@@ -1955,8 +2048,16 @@ function ComparisonSummary({ comparison }: { comparison: EvalComparison }) {
       </div>
 
       <div className="grid gap-4 md:grid-cols-2">
-        <ComparisonRunSummary label="Baseline" run={baseline} result={resultComparison.baseline} />
-        <ComparisonRunSummary label="Current" run={current} result={resultComparison.current} />
+        <ComparisonResultSummary
+          label="Baseline"
+          record={baseline}
+          result={resultComparison.baseline}
+        />
+        <ComparisonResultSummary
+          label="Current"
+          record={current}
+          result={resultComparison.current}
+        />
       </div>
       {compatibility.comparable && (
         <div
@@ -2000,14 +2101,14 @@ function ComparisonSummary({ comparison }: { comparison: EvalComparison }) {
   )
 }
 
-function ComparisonRunSummary({
+function ComparisonResultSummary({
   label,
-  run,
+  record,
   result,
 }: {
   label: string
-  run: EvalRun
-  result: EvalComparison["comparison"]["baseline"]
+  record: EvalResultSummary
+  result: EvalResultComparison["comparison"]["baseline"]
 }) {
   return (
     <div className="rounded-lg border border-border p-3">
@@ -2016,15 +2117,16 @@ function ComparisonRunSummary({
         <OutcomeBadge outcome={result.status} />
       </div>
       <div className="grid gap-3 text-sm sm:grid-cols-2">
-        <RunFact label="Run" value={shortEvalIdentity(run.spec.run_id)} />
-        <RunFact label="Suite" value={run.spec.suite_id} />
+        <RunFact label="Result" value={shortEvalIdentity(record.revision)} />
+        <RunFact
+          label="Origin"
+          value={record.origin === "captured_session" ? "Captured session" : "Fresh execution"}
+        />
+        <RunFact label="Suite" value={record.suite_id} />
         <RunFact label="Release" value={result.application_release_id} />
         <RunFact label="App manifest" value={shortEvalIdentity(result.app_manifest_fingerprint)} />
         <RunFact label="Score" value={formatScore(result.score)} />
-        <RunFact
-          label="Duration"
-          value={run.result ? formatDuration(run.result.duration_ms) : "unavailable"}
-        />
+        <RunFact label="Created" value={formatDateTime(record.created_at)} />
       </div>
     </div>
   )

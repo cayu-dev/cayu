@@ -1568,6 +1568,8 @@ async def _exercise_captured_evaluation(
         json_result_path is not None,
         "the dashboard eval JSON download must produce a readable local file",
     )
+    baseline_result = json.loads(Path(json_result_path).read_text(encoding="utf-8"))
+    baseline_result_revision = baseline_result["revision"]
     async with page.expect_download() as html_download_info:
         await page.get_by_role("button", name="HTML", exact=True).click()
     html_download = await html_download_info.value
@@ -1584,9 +1586,9 @@ async def _exercise_captured_evaluation(
         current_run_id != baseline_run_id,
         "two explicit dashboard launches must create distinct durable runs",
     )
-    await page.get_by_label("Baseline run ID").fill(baseline_run_id)
+    await page.get_by_label("Baseline result revision").fill(baseline_result_revision)
     await page.get_by_role("button", name="Compare", exact=True).click()
-    await expect(page.get_by_text("These runs are comparable.", exact=True)).to_be_visible()
+    await expect(page.get_by_text("These results are comparable.", exact=True)).to_be_visible()
     await expect(page.get_by_text("No compatible-result regressions.", exact=True)).to_be_visible()
     await _exercise_local_eval_acceptance(
         corpus=corpus,

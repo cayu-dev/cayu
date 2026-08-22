@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import {
+  evalResultRevisionIsValid,
   evalRunIdIsValid,
   evalsSearchWithout,
   validateEvalsSearch,
@@ -17,7 +18,7 @@ test("eval search accepts only bounded known values", () => {
       corpus: ` ${CORPUS_REVISION} `,
       suite: "suite-1",
       run: "eval-1",
-      baseline: "eval-0",
+      baseline: CORPUS_REVISION,
       status: "completed",
       corpora_cursor: "next-corpus",
       result: CORPUS_REVISION,
@@ -30,7 +31,7 @@ test("eval search accepts only bounded known values", () => {
       corpus: CORPUS_REVISION,
       suite: "suite-1",
       run: "eval-1",
-      baseline: "eval-0",
+      baseline: CORPUS_REVISION,
       status: "completed",
       corpora_cursor: "next-corpus",
       result: CORPUS_REVISION,
@@ -65,6 +66,8 @@ test("eval search accepts only identifiers supported by the durable eval contrac
   )
   assert.equal(evalRunIdIsValid("eval-1234"), true)
   assert.equal(evalRunIdIsValid("eval/1234"), false)
+  assert.equal(evalResultRevisionIsValid(CORPUS_REVISION), true)
+  assert.equal(evalResultRevisionIsValid("eval-1234"), false)
 })
 
 test("eval search preserves the server's complete opaque cursor domain", () => {

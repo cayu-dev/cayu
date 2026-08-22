@@ -4,8 +4,11 @@ import test from "node:test"
 globalThis.window = { __CAYU_DASHBOARD_CONFIG__: { apiBaseUrl: "/api" } }
 
 const {
+  compareEvalResults,
   compareEvalRuns,
   createEvalRun,
+  downloadCatalogEvalResultHtml,
+  downloadCatalogEvalResultJson,
   downloadEvalResultJson,
   fetchEvalCases,
   fetchEvalCorpora,
@@ -109,6 +112,48 @@ test("eval downloads reject unsafe server filenames and use a sanitized fallback
   } finally {
     globalThis.fetch = originalFetch
   }
+})
+
+test("captured and fresh result adapters compare and download by immutable revision", async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  const baseline = `sha256:${"a".repeat(64)}`
+  const current = `sha256:${"b".repeat(64)}`
+  globalThis.fetch = async (input, init) => {
+    calls.push({ input: String(input), init })
+    if (String(input).endsWith("result-comparisons")) {
+      return new Response(
+        JSON.stringify({
+          baseline: { revision: baseline, origin: "captured_session" },
+          current: { revision: current, origin: "fresh_execution" },
+          comparison: { compatibility: { comparable: true }, regressions: [] },
+        }),
+        { headers: { "content-type": "application/json" } },
+      )
+    }
+    return new Response("report", {
+      headers: { "content-disposition": 'attachment; filename="unsafe/result"' },
+    })
+  }
+
+  try {
+    await compareEvalResults(baseline, current, 0.125)
+    const jsonReport = await downloadCatalogEvalResultJson(baseline)
+    const htmlReport = await downloadCatalogEvalResultHtml(current)
+    assert.equal(jsonReport.filename, `sha256-${"a".repeat(64)}.eval-result.json`)
+    assert.equal(htmlReport.filename, `sha256-${"b".repeat(64)}.eval-report.html`)
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.equal(calls[0].input, "/api/evals/result-comparisons")
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    baseline_result_revision: baseline,
+    current_result_revision: current,
+    score_tolerance: 0.125,
+  })
+  assert.equal(calls[1].input, `/api/evals/results/${encodeURIComponent(baseline)}/report.json`)
+  assert.equal(calls[2].input, `/api/evals/results/${encodeURIComponent(current)}/report.html`)
 })
 
 test("eval catalog adapters select only server-published target keys", async () => {
