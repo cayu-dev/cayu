@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import mimetypes
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable, Mapping
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -73,6 +73,7 @@ from cayu.environments import (
     copy_bound_workspace,
     copy_environment,
 )
+from cayu.mcp.tools import McpToolAdapter
 from cayu.providers import (
     ModelProvider,
     OpenAIWebSearch,
@@ -337,7 +338,6 @@ from cayu.runtime.stop_policy import (
     StopDecision,
 )
 from cayu.runtime.structured_output import (
-    STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputSpec,
     StructuredOutputStrategy,
 )
@@ -353,9 +353,17 @@ from cayu.runtime.tasks import (
     require_contract_bound_task_creation_snapshot,
     task_create_with_runtime_invocation,
 )
+from cayu.runtime.tool_catalogue import (
+    ToolCatalogSnapshot,
+    ToolDescriptor,
+    ToolDescriptorProvenance,
+    build_tool_catalog_snapshot,
+    build_tool_descriptor,
+    mcp_source_tool_fingerprint,
+    validate_application_tool_name,
+)
 from cayu.runtime.tool_exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
-    TOOL_EXPOSURE_MAX_REGISTERED_TOOLS,
     AllRegisteredToolsExposurePolicy,
     RegisteredToolCapability,
     ResolvedToolExposure,
@@ -1739,37 +1747,28 @@ class CayuApp:
             stored_hosted_tools = copied_hosted_tools
 
         registration_source, registration_symbol = _registration_site()
+        descriptors_by_name = {
+            tool.name: _registered_tool_descriptor(tool) for tool in tools_by_name.values()
+        }
+        tool_catalogue = build_tool_catalog_snapshot(descriptors_by_name.values())
         tool_capabilities = tuple(
-            RegisteredToolCapability(
-                name=tool.name,
-                description=tool.description,
-                input_schema=tool.schema,
-                parallel_safe=tool.parallel_safe,
-                effect=tool.effect,
-                publishes_arguments=tool.publish_arguments,
-                workspace_mutation=tool.workspace_mutation,
-            )
-            for tool in tools_by_name.values()
+            RegisteredToolCapability(**descriptors_by_name[name].exposure_capability_material())
+            for name in tools_by_name
         )
-        all_registered_tool_exposure: ResolvedToolExposure | None = None
-        if len(tool_capabilities) <= TOOL_EXPOSURE_MAX_REGISTERED_TOOLS:
-            # Registration historically permits oversized MCP manifests so the
-            # run boundary can reject them with bounded public evidence. Defer
-            # aggregate exposure-size failures to that same boundary.
-            with suppress(ValueError):
-                all_registered_tool_exposure = ResolvedToolExposure(
-                    profile_id=ALL_REGISTERED_TOOLS_PROFILE_ID,
-                    tools=tool_capabilities,
-                    registered_count=len(tool_capabilities),
-                    ceiling_count=len(tool_capabilities),
-                )
-        if all_registered_tool_exposure is not None:
-            # Keep one canonical descriptor graph: both registration/profile
-            # admission and the expose-all snapshot reference validated copies.
-            tool_capabilities = all_registered_tool_exposure.tools
+        all_registered_tool_exposure = ResolvedToolExposure(
+            profile_id=ALL_REGISTERED_TOOLS_PROFILE_ID,
+            catalogue_revision=tool_catalogue.revision,
+            tools=tool_capabilities,
+            registered_count=len(tool_capabilities),
+            ceiling_count=len(tool_capabilities),
+        )
+        # Keep one frozen exposure graph for registration/profile admission and
+        # the expose-all snapshot; the catalogue remains its canonical source.
+        tool_capabilities = all_registered_tool_exposure.tools
         self._agents[stored_spec.name] = runtime_records.RegisteredAgentState(
             spec=stored_spec,
             tools=MappingProxyType(tools_by_name),
+            tool_catalogue=tool_catalogue,
             tool_capabilities=tool_capabilities,
             all_registered_tool_exposure=all_registered_tool_exposure,
             tool_exposure_policy=stored_tool_exposure_policy,
@@ -1884,6 +1883,7 @@ class CayuApp:
                 )
             if (
                 existing.tools
+                or existing.tool_catalogue.descriptors
                 or existing.tool_capabilities
                 or existing.hosted_tools
                 or existing.spec.workflow_tool_names
@@ -1895,6 +1895,7 @@ class CayuApp:
                 )
             return existing, True
         evaluator_context_policy = DefaultContextPolicy()
+        empty_tool_catalogue = ToolCatalogSnapshot(descriptor_count=0)
         return (
             runtime_records.RegisteredAgentState(
                 spec=original.spec.model_copy(
@@ -1907,9 +1908,11 @@ class CayuApp:
                     deep=True,
                 ),
                 tools=MappingProxyType({}),
+                tool_catalogue=empty_tool_catalogue,
                 tool_capabilities=(),
                 all_registered_tool_exposure=ResolvedToolExposure(
                     profile_id=ALL_REGISTERED_TOOLS_PROFILE_ID,
+                    catalogue_revision=empty_tool_catalogue.revision,
                     tools=(),
                     registered_count=0,
                     ceiling_count=0,
@@ -4571,6 +4574,7 @@ class CayuApp:
             else resolved_tool_exposure_from_authority(
                 request.initial_model_step_tool_exposure,
                 request.registered_agent.tool_capabilities,
+                catalogue_revision=request.registered_agent.tool_catalogue.revision,
             )
         )
         stream = self._run_session(
@@ -5724,9 +5728,7 @@ def _validate_registered_tool(
     spec = getattr(tool, "spec", None)
     if type(spec) is not ToolSpec:
         raise TypeError("Agent tools must define ToolSpec instances.")
-    name = require_clean_nonblank(spec.name, "name")
-    if name == STRUCTURED_OUTPUT_TOOL_NAME:
-        raise ValueError(f"Tool name is reserved for structured output: {name}")
+    name = validate_application_tool_name(require_clean_nonblank(spec.name, "name"))
     if not inspect.iscoroutinefunction(tool.run):
         raise TypeError(
             f"{type(tool).__name__}.run must be declared with `async def` and return a ToolResult."
@@ -5773,6 +5775,34 @@ def _validate_registered_tool(
             tool if isinstance(tool, runtime_records.ChildSessionRecoveryMatcher) else None
         ),
         durable_tool_recovery=(tool if isinstance(tool, DurableToolRecovery) else None),
+    )
+
+
+def _registered_tool_descriptor(
+    tool: runtime_records.RegisteredTool,
+) -> ToolDescriptor:
+    """Derive one canonical callable-free descriptor from admitted registration state."""
+
+    registered_tool = tool.tool
+    if isinstance(registered_tool, McpToolAdapter):
+        binding = registered_tool._manifest_binding
+        provenance = ToolDescriptorProvenance(
+            kind="mcp",
+            source_id=registered_tool.toolset.manifest_identity,
+            source_tool_fingerprint=mcp_source_tool_fingerprint(binding.manifest_mcp_name),
+            source_contract_fingerprint=binding.manifest_contract_hash,
+        )
+    else:
+        provenance = ToolDescriptorProvenance()
+    return build_tool_descriptor(
+        name=tool.name,
+        description=tool.description,
+        input_schema=tool.schema,
+        parallel_safe=tool.parallel_safe,
+        effect=tool.effect,
+        publishes_arguments=tool.publish_arguments,
+        workspace_mutation=tool.workspace_mutation,
+        provenance=provenance,
     )
 
 

@@ -1785,6 +1785,7 @@ def _tool_exposure_event(
     event = _event_with_model_identity_authority(event, model_step_identity)
     event = event_with_runtime_payload_authority(
         event,
+        "catalogue_revision",
         "profile_id",
         "exposure_fingerprint",
     )
@@ -6436,6 +6437,7 @@ class ModelStepRun:
             model=self._session.model,
             step=step,
             transcript_cursor=transcript_cursor,
+            catalogue_revision=self._registered_agent.tool_catalogue.revision,
             registered_tools=self._registered_agent.tool_capabilities,
             capability_ceiling=self._tool_capability_ceiling.tool_names,
             previous_profile_id=self._previous_tool_exposure_profile_id,
@@ -9417,17 +9419,10 @@ def _require_frozen_tool_exposure(
 def _all_registered_tool_exposure(
     registered_agent: runtime_records.RegisteredAgentState,
 ) -> ResolvedToolExposure:
-    """Build the compatibility snapshot for non-step portability preflight."""
+    """Return the registration-time expose-all snapshot."""
 
-    cached = registered_agent.all_registered_tool_exposure
-    if cached is not None:
-        return _require_frozen_tool_exposure(cached)
-    capabilities = registered_agent.tool_capabilities
-    return ResolvedToolExposure(
-        profile_id=ALL_REGISTERED_TOOLS_PROFILE_ID,
-        tools=capabilities,
-        registered_count=len(capabilities),
-        ceiling_count=len(capabilities),
+    return _require_frozen_tool_exposure(
+        registered_agent.all_registered_tool_exposure,
     )
 
 
@@ -9449,6 +9444,7 @@ def _tool_capability_ceiling_exposure(
         raise ValueError("The durable tool capability ceiling conflicts with registration.")
     return ResolvedToolExposure(
         profile_id=ALL_REGISTERED_TOOLS_PROFILE_ID,
+        catalogue_revision=registered_agent.tool_catalogue.revision,
         tools=selected,
         registered_count=len(capabilities),
         ceiling_count=len(selected),

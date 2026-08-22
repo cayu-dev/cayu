@@ -4923,6 +4923,26 @@ def test_checkpoint_schema_keys_remain_valid_inside_typed_collections() -> None:
         redactor=SecretRedactor("model"),
     )
 
+    catalogue_revision = f"sha256:{'c' * 64}"
+    exposure_authority = {
+        "pending_tool_round": {
+            "tool_exposure": {
+                "schema_version": 2,
+                "profile_id": "review",
+                "catalogue_revision": catalogue_revision,
+                "tool_names": ["inspect"],
+                "registered_count": 1,
+                "ceiling_count": 1,
+                "fingerprint": "d" * 64,
+            }
+        }
+    }
+    for secret in ("catalogue_revision", catalogue_revision):
+        assert not durable_value_contains_secret(
+            exposure_authority,
+            redactor=SecretRedactor(secret),
+        )
+
     quarantined_message = {
         "pending_tool_round": {
             "quarantined_assistant_message": {

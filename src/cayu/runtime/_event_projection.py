@@ -166,11 +166,14 @@ _TOOL_LINKAGE_AUTHORITY_KEYS = frozenset(
 )
 _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS = frozenset({"execution_profile_fingerprint"})
 _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS = frozenset({"exposure_fingerprint", "profile_id"})
+_TOOL_EXPOSURE_RECORD_PUBLIC_AUTHORITY_KEYS = _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS | {
+    "catalogue_revision"
+}
 # Unlike caller-selected public linkage such as a server mutation id, these
 # fields assert which runtime authority governed an effect. They may survive a
 # first write or an untrusted projection only with exact in-process provenance.
 _PROVENANCE_REQUIRED_PUBLIC_AUTHORITY_KEYS = (
-    _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS | _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS
+    _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS | _TOOL_EXPOSURE_RECORD_PUBLIC_AUTHORITY_KEYS
 )
 _TOOL_EVENT_TYPES = frozenset(
     {
@@ -576,7 +579,7 @@ _DECLARED_FIXED_CONTROLS: Mapping[
         ("cache_breakpoints", "*", "ttl"): _REQUEST_CACHE_BREAKPOINT_TTL_VALUES,
     },
     EventType.TOOL_EXPOSURE_RECORDED: {
-        ("schema_version",): frozenset({1}),
+        ("schema_version",): frozenset({2}),
         ("profile_changed",): frozenset({True, False}),
     },
     **{
@@ -1628,11 +1631,14 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
     )
     policies[EventType.TOOL_EXPOSURE_RECORDED] = _observed_policy(
-        "ceiling_count execution_profile_fingerprint exposed_count exposure_fingerprint model "
-        "model_step_id profile_changed profile_id provider_name registered_count schema_version step",
-        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS,
+        "catalogue_revision ceiling_count execution_profile_fingerprint exposed_count "
+        "exposure_fingerprint model model_step_id profile_changed profile_id provider_name "
+        "registered_count schema_version step",
+        authority_keys=(
+            _MODEL_EXECUTION_AUTHORITY_KEYS | _TOOL_EXPOSURE_RECORD_PUBLIC_AUTHORITY_KEYS
+        ),
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS
-        | _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS,
+        | _TOOL_EXPOSURE_RECORD_PUBLIC_AUTHORITY_KEYS,
         aliased_authority_keys={"model_step_id"},
     )
     model_delta = _policy(
@@ -3904,6 +3910,7 @@ def _reject_secret_authority_values(
         # ordinary admission checks below.
         if field_name in {
             "observer",
+            "catalogue_revision",
             "execution_profile_fingerprint",
             "exposure_fingerprint",
         } and (
@@ -4026,6 +4033,13 @@ def _public_authority_is_trusted(
         type(value) is str
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
+    ):
+        return False
+    if field_name == "catalogue_revision" and not (
+        type(value) is str
+        and len(value) == 71
+        and value.startswith("sha256:")
+        and all(character in "0123456789abcdef" for character in value[7:])
     ):
         return False
     if field_name == "profile_id" and not (

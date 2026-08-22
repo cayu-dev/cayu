@@ -127,6 +127,37 @@ workers, back up each SQLite or PostgreSQL store, run `cayu storage migrate`,
 and confirm revision 48 before starting current workers. Mixed revision-47 and
 revision-48 workers are unsupported.
 
+### Canonical tool catalogues provide shared dynamic-tool identity
+
+Every admitted agent now owns one immutable `ToolCatalogSnapshot` derived from
+its registered tools. Frozen `ToolDescriptor` records bind canonical native or
+MCP identity, the exact callable schema and behavior declarations, and
+sanitized provenance into deterministic descriptor versions. Snapshot
+revisions are independent of registration order and JSON object-key order,
+while provider requests and exposure policies keep their existing registration
+order. MCP descriptors reuse authoritative manifest/contract evidence and
+retain only a fixed-size fingerprint of the original source tool name.
+
+The catalogue revision is bound into direct-tool execution profiles,
+schema-v2 exposure evidence, and compact model-completion recovery authority.
+Reconstruction accepts an equivalent catalogue and rejects changed or corrupt
+catalogue authority before recovered tool execution. Tool implementation
+identity remains independently governed by the existing
+`tool_implementations` execution-profile component. Memory, SQLite,
+PostgreSQL, and session export/import share the same durable evidence shape.
+The outer execution-profile schema remains v3 because its record and component
+set are unchanged; pre-catalogue v3 profiles conflict on the versioned
+`direct_tools` component and are not translated.
+Public builders require explicit grant material for nonempty compact catalogues
+because canonical MCP ids cannot recover model-visible registered names.
+
+`call_tool`, `search_tools`, and the structured-output submission name are now
+one reserved framework namespace and collide at registration instead of being
+shadowed. This slice adds no gateway, discovery, grant, routing, or
+provider-native dynamic-tool behavior, and it does not change default provider
+payloads. Persisted prerelease exposure authority without a catalogue revision
+is rejected rather than supported through a compatibility path.
+
 ### OpenAI Responses background work survives worker loss
 
 `OpenAIProvider(background=True)` now starts stored, streamed Responses API

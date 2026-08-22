@@ -1436,12 +1436,52 @@ Every `Workspace` implements `bounded_read_limit(max_bytes)`, returning a positi
 
 ## Tool exposure selection contracts
 
-Tool exposure is distinct from registration and authorization. A registered
-tool is an application-owned implementation available to the runtime; an
-exposed tool is a definition selected for one prepared model request; an
-authorized tool is an exact returned call that later passes `ToolPolicy` and
-the rest of the execution boundary. Selecting or hiding a definition never
-authorizes a call.
+Registration, cataloguing, exposure, and authorization are distinct. A
+registered tool is an application-owned implementation admitted to one agent;
+a catalogued tool is its immutable callable contract in that agent's canonical
+`ToolCatalogSnapshot`; an exposed tool is a definition selected for one
+prepared model request; and an authorized tool is an exact returned call that
+later passes `ToolPolicy` and the rest of the execution boundary. Catalogue
+membership and exposure never authorize a call.
+
+Registration derives one frozen `ToolDescriptor` without retaining the live
+`Tool`, runners, vaults, credentials, environments, hooks, or other mutable
+application objects. Its version binds the canonical tool id, registered name,
+description, exact input schema, effect and concurrency declarations,
+workspace-mutation and argument-publication behavior, and provenance. Native
+ids are scoped `cayu:` identities. MCP ids combine the authoritative manifest
+identity with a fixed-size fingerprint of the original MCP name; descriptors do
+not retain potentially sensitive or unbounded source names and reuse the
+authoritative sanitized MCP contract fingerprint.
+
+`ToolCatalogSnapshot` sorts descriptors by canonical tool id and binds their
+ids and versions into a `sha256:` revision. Equivalent admitted catalogues have
+the same revision regardless of registration order or JSON object-key order.
+Registration order remains authoritative for provider tool arrays and exposure
+policy input, so adding this canonical index does not reorder existing model
+requests. Duplicate ids or model-visible names, malformed or oversized
+descriptors, inconsistent fingerprints, and application or MCP tools named
+`call_tool`, `search_tools`, or `__cayu_submit_structured_output` fail during
+registration. Those names form Cayu's framework namespace; this substrate does
+not yet expose the planned gateway or search tools.
+
+The catalogue revision and descriptor versions join the existing direct-tools
+execution-profile component. Tool implementation behavior remains solely in
+the separate `tool_implementations` component; it is intentionally not copied
+into descriptor versions. Reconstruction therefore compares callable catalogue
+authority and implementation authority independently and fails closed when
+either one changes.
+
+This advances the versioned material inside the existing `direct_tools`
+component; it does not change the execution-profile record or component set, so
+the outer execution-profile schema remains version 3. Public profile builders
+accept only compact canonical `{tool_id, descriptor_version}` entries. When a
+caller omits implementation material, its structural fallback binds canonical
+tool ids rather than unavailable registered names. Compact identities cannot
+recover model-visible names for every provenance kind, so callers with nonempty
+direct tools must provide explicit grant material. The empty default remains
+the canonical direct-tool ceiling. Callers that need implementation-drift
+detection must continue to provide explicit implementation identity.
 
 The public planning substrate consists of:
 
@@ -1450,12 +1490,14 @@ The public planning substrate consists of:
   effect declarations, argument-publication behavior, and workspace-mutation
   classification;
 - `ToolExposurePolicyRequest`, a bounded immutable view of session, agent,
-  provider, model, step, transcript cursor, registered capabilities, effective
-  capability ceiling, previous profile, and application metadata;
+  provider, model, step, transcript cursor, catalogue revision, registered
+  capabilities, effective capability ceiling, previous profile, and
+  application metadata;
 - `ToolExposureDecision`, a named decision containing registered tool names
   and bounded JSON-safe metadata; and
-- `ResolvedToolExposure`, the canonical registration-ordered subset with exact
-  descriptor fingerprints and registered/ceiling counts.
+- `ResolvedToolExposure`, the canonical registration-ordered subset with its
+  catalogue revision, exact capability fingerprints, and registered/ceiling
+  counts.
 
 `resolve_tool_exposure(...)` defensively revalidates application policy output,
 rejects unknown and out-of-ceiling names, observes a declared policy identity
@@ -1466,14 +1508,15 @@ request authority or selected-capability state. Policy input contains no live
 tool, policy, runner, environment, credential, or secret handle. Capability
 summaries are derived once at agent registration and reused by execution-profile
 resolution rather than rehashed on every admission check.
-`AllRegisteredToolsExposurePolicy` preserves the compatibility behavior inside
-the effective ceiling. `StaticToolExposurePolicy` defines one stable named
+`AllRegisteredToolsExposurePolicy` exposes the registered tools inside the
+effective ceiling. `StaticToolExposurePolicy` defines one stable named
 allow-list and supports an empty tool-free profile.
 `ToolExposureDecision` is deliberately distinct from `ToolExposure`, the
 content-minimized public evidence record for definitions frozen into one
-prepared logical model step. `tool.exposure.recorded` carries the selected profile, resolved
-exposure fingerprint, registered/ceiling/exposed counts, provider/model/step
-identity, and whether the profile changed from the previous model step. It
+prepared logical model step. Schema-v2 `tool.exposure.recorded` carries the
+catalogue revision, selected profile, resolved exposure fingerprint,
+registered/ceiling/exposed counts, provider/model/step identity, and whether the
+profile changed from the previous model step. It
 contains no separate tool-name list, schemas, arguments, policy metadata, or
 free-form reasoning. The application-selected `profile_id` remains public
 evidence, so it must be an opaque or otherwise non-secret stable label.
@@ -1515,10 +1558,12 @@ strategy needs it.
 
 Every runtime-created session also persists a `ToolCapabilityCeiling`: the
 maximum direct-tool set from which step-level exposure may select. Omitting the
-request field freezes the complete registered catalog; supplying it freezes an
+request field freezes the complete registered catalogue; supplying it freezes an
 explicit registered subset. Resume and fork may narrow that ceiling but never
 widen it, and the store commits a narrowing with the matching execution-profile
-component. Later registration changes cannot silently grant more tools.
+component. A ceiling-filtered catalogue view retains canonical descriptor
+identities and cannot manufacture members absent from the full snapshot. Later
+registration changes cannot silently grant more tools.
 
 The snapshot is frozen for the logical model step: generic retries and the one
 context-overflow recovery reuse its exact definitions and order. A later model
@@ -1548,10 +1593,12 @@ retry counts, cache categories, provider usage, quality, and fixture-priced
 cost. It is an instrumentation example, not evidence that either strategy is
 universally cheaper.
 
-The compact snapshot authority is also stored in durable model-completion
-recovery context before provider dispatch. Offline output containing tool calls
-without that frozen authority fails closed; Cayu does not rebuild exposure from
-the current registration.
+The compact snapshot authority, including the catalogue revision, is also
+stored in durable model-completion recovery context before provider dispatch.
+Memory, SQLite, PostgreSQL, and export/import paths retain the same typed
+authority. Offline output containing tool calls without that frozen authority,
+or with a revision that differs from the reconstructed registration, fails
+closed; Cayu does not rebuild exposure from the current registration.
 
 Every returned application call is checked against the frozen snapshot before
 `ToolPolicy`. An exposed call still passes the normal policy, approval, taint,

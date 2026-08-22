@@ -4822,7 +4822,7 @@ def test_cayu_app_rejects_invalid_runtime_dependencies():
         async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
             return ToolResult(content="reserved")
 
-    with pytest.raises(ValueError, match="reserved for structured output"):
+    with pytest.raises(ValueError, match="reserved by the Cayu framework"):
         app.register_agent(
             AgentSpec(name="reserved_tool_agent", model="fake-model"),
             tools=[ReservedStructuredOutputTool()],

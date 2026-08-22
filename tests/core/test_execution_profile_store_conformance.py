@@ -43,13 +43,11 @@ def _profile(*, tool_name: str) -> ExecutionProfileIdentity:
         durable_system_prompt="durable instructions",
         direct_tools=[
             {
-                "name": tool_name,
-                "description": "Record execution.",
-                "schema": {"type": "object", "properties": {}},
-                "parallel_safe": True,
-                "effect": "external",
+                "tool_id": f"cayu:{tool_name}",
+                "descriptor_version": f"sha256:{'d' * 64}",
             }
         ],
+        tool_catalogue_revision=f"sha256:{'c' * 64}",
         tool_implementations=[{"implementation": "test:recording-tool:v1"}],
         tool_view_grants={
             "view_kind": "direct",

@@ -141,16 +141,13 @@ def resolve_execution_profile_identity(
     if not isinstance(redactor, SecretRedactor):
         raise TypeError("Execution-profile resolution requires a SecretRedactor.")
 
+    descriptors_by_name = {
+        descriptor.name: descriptor for descriptor in registered_agent.tool_catalogue.descriptors
+    }
+    if set(descriptors_by_name) != set(registered_agent.tools):
+        raise RuntimeError("Registered tool catalogue conflicts with admitted agent tools.")
     direct_tools = [
-        {
-            "name": tool.name,
-            "description": tool.description,
-            "schema": tool.input_schema,
-            "parallel_safe": tool.parallel_safe,
-            "effect": tool.effect.value,
-            **({"workspace_mutation": True} if tool.workspace_mutation else {}),
-        }
-        for tool in registered_agent.tool_capabilities
+        descriptors_by_name[name].execution_profile_material() for name in registered_agent.tools
     ]
     registered_tool_names = tuple(registered_agent.tools)
     if tool_capability_ceiling is None:
@@ -427,6 +424,7 @@ def resolve_execution_profile_identity(
         model=model,
         durable_system_prompt=durable_system_prompt,
         direct_tools=direct_tools,
+        tool_catalogue_revision=registered_agent.tool_catalogue.revision,
         tool_implementations=tool_implementations,
         tool_implementations_process_local=tool_implementations_process_local,
         tool_implementations_application_versioned=(tool_implementations_application_versioned),

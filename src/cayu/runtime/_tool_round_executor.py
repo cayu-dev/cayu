@@ -1844,6 +1844,7 @@ class ToolRoundExecutor:
             tool_exposure = validate_resolved_tool_exposure_authority(
                 tool_exposure,
                 registered_agent.tool_capabilities,
+                catalogue_revision=registered_agent.tool_catalogue.revision,
             )
             if tool_call.name not in registered_agent.tools:
                 raise RuntimeError("Unexposed tool call is not registered.")
@@ -4967,6 +4968,7 @@ class ToolRoundRun:
             tool_exposure = validate_resolved_tool_exposure_authority(
                 tool_exposure,
                 self._registered_agent.tool_capabilities,
+                catalogue_revision=self._registered_agent.tool_catalogue.revision,
             )
         try:
             await executor._session_control.raise_if_interrupted(session.id)

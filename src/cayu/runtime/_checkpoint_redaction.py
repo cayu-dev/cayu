@@ -22,6 +22,7 @@ _DURABLE_STRUCTURE_STRING_FIELDS = frozenset(
         "before_observation_id",
         "before_state",
         "binding_generation_id",
+        "catalogue_revision",
         "workspace_id",
         "observer",
         "observer_authority",
@@ -681,7 +682,7 @@ def _is_tool_exposure_authority_identity_path(path: tuple[str, ...]) -> bool:
         len(path) == 3
         and path[0] in {"pending_tool_round", "pending_user_input"}
         and path[1] == "tool_exposure"
-        and path[2] in {"profile_id", "tool_names"}
+        and path[2] in {"catalogue_revision", "profile_id", "tool_names"}
         and _path_has_typed_schema(path[:-1])
     )
 

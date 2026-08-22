@@ -30,6 +30,8 @@ from cayu import (
 )
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
 
+_CATALOGUE_REVISION = f"sha256:{'c' * 64}"
+
 
 def _capability(
     name: str,
@@ -58,6 +60,7 @@ def _request(
         model="model",
         step=1,
         transcript_cursor=3,
+        catalogue_revision=_CATALOGUE_REVISION,
         registered_tools=tools,
         capability_ceiling=(tuple(tool.name for tool in tools) if ceiling is None else ceiling),
         metadata={} if metadata is None else metadata,
@@ -144,6 +147,10 @@ def test_policy_request_is_bounded_owned_and_ceiling_ordered() -> None:
         _request(first, ceiling=("missing",))
     with pytest.raises(ValidationError, match="unique tool names"):
         _request(first, first)
+    invalid_revision = request.model_dump(mode="python")
+    invalid_revision["catalogue_revision"] = "sha256:not-a-digest"
+    with pytest.raises(ValidationError, match="SHA-256 catalogue revision"):
+        ToolExposurePolicyRequest.model_validate(invalid_revision)
 
 
 def test_tool_capability_ceiling_is_versioned_owned_and_fingerprint_bound() -> None:
@@ -292,6 +299,7 @@ def test_policy_request_stops_copying_after_catalog_byte_limit(
                 "provider_name": "provider",
                 "model": "model",
                 "step": 1,
+                "catalogue_revision": _CATALOGUE_REVISION,
                 "registered_tools": capabilities(),
                 "capability_ceiling": (),
             }
@@ -376,6 +384,7 @@ def test_policy_decision_and_exposure_evidence_have_distinct_public_names() -> N
     evidence = ToolExposure(
         execution_profile_fingerprint="b" * 64,
         profile_id="review",
+        catalogue_revision=_CATALOGUE_REVISION,
         exposure_fingerprint="a" * 64,
         registered_count=3,
         ceiling_count=2,
@@ -463,6 +472,37 @@ def test_resolved_exposure_fingerprint_binds_profile_and_definitions() -> None:
     restored = type(original).model_validate(original.model_dump(mode="json"))
     assert restored == original
     assert restored.fingerprint == original.fingerprint
+
+
+def test_resolved_exposure_binds_catalogue_revision_through_recovery_authority() -> None:
+    app = CayuApp(enable_logging=False)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=(SearchTextTool(),),
+    )
+    registered_agent = app._agents["assistant"]
+    exposure = registered_agent.all_registered_tool_exposure
+    authority = exposure_contracts.resolved_tool_exposure_authority(exposure)
+
+    reconstructed = exposure_contracts.resolved_tool_exposure_from_authority(
+        authority,
+        registered_agent.tool_capabilities,
+        catalogue_revision=registered_agent.tool_catalogue.revision,
+    )
+
+    assert authority.catalogue_revision == registered_agent.tool_catalogue.revision
+    assert reconstructed == exposure
+    with pytest.raises(ValueError, match="conflicts with the registered catalogue"):
+        exposure_contracts.validate_resolved_tool_exposure_authority(
+            authority,
+            registered_agent.tool_capabilities,
+            catalogue_revision=f"sha256:{'d' * 64}",
+        )
+
+    changed_payload = exposure.model_dump(mode="python")
+    changed_payload.update({"catalogue_revision": f"sha256:{'e' * 64}", "fingerprint": ""})
+    changed_revision = type(exposure).model_validate(changed_payload)
+    assert changed_revision.fingerprint != exposure.fingerprint
 
 
 class _ReturningPolicy(ToolExposurePolicy):

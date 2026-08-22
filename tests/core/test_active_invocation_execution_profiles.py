@@ -2045,6 +2045,7 @@ def test_fork_inheritance_preserves_unavailable_parent_profile_identity() -> Non
             model="fake-model",
             durable_system_prompt=None,
             direct_tools=(),
+            tool_catalogue_revision=f"sha256:{'c' * 64}",
         )
         source = await store.create(
             RunRequest(

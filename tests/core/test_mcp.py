@@ -248,6 +248,27 @@ def test_connect_mcp_toolset_returns_cayu_tool_adapters() -> None:
     assert result.is_error is False
 
 
+def test_agent_catalogue_reuses_authoritative_mcp_contract_identity() -> None:
+    toolset = _fake_toolset()
+    adapter = toolset.tools[0]
+    binding = adapter._manifest_binding
+    app = CayuApp(enable_logging=False)
+
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=(adapter,),
+    )
+
+    catalogue = app._agents["assistant"].tool_catalogue
+    descriptor = catalogue.descriptor_for_name(adapter.name)
+    assert descriptor.provenance.kind == "mcp"
+    assert descriptor.provenance.source_id == toolset.manifest_identity
+    assert descriptor.provenance.source_contract_fingerprint == binding.manifest_contract_hash
+    assert descriptor.provenance.source_tool_fingerprint is not None
+    assert descriptor.tool_id.startswith("mcp:")
+    assert binding.manifest_mcp_name not in descriptor.tool_id
+
+
 def test_mcp_tool_adapter_includes_structured_content_in_model_text() -> None:
     async def run():
         toolset = await connect_mcp_toolset(_fake_server_spec())
@@ -1237,37 +1258,22 @@ def test_runtime_recovers_after_malformed_authoritative_baseline_is_removed(
     assert accepted_after == accepted_before
 
 
-def test_runtime_fails_closed_with_bounded_evidence_for_oversized_manifest() -> None:
-    async def run():
-        store = InMemorySessionStore()
-        provider = FakeProvider([[ModelStreamEvent.completed({})]])
-        toolset = _fake_toolset(
-            definitions=_fake_tool_definitions(*(f"tool_{index:05d}" for index in range(10_001)))
-        )
-        app = CayuApp(session_store=store, enable_logging=False)
-        app.register_provider(provider, default=True)
+def test_registration_fails_closed_for_oversized_catalogue() -> None:
+    provider = FakeProvider([[ModelStreamEvent.completed({})]])
+    toolset = _fake_toolset(
+        definitions=_fake_tool_definitions(*(f"tool_{index:05d}" for index in range(10_001)))
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+
+    with pytest.raises(ValueError, match="descriptors cannot contain more than 10000 items"):
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             tools=toolset.tools,
         )
-        events = await _collect_events(
-            app.run(
-                RunRequest(
-                    session_id="mcp_manifest_oversized",
-                    agent_name="assistant",
-                    messages=[Message.text("user", "hello")],
-                )
-            )
-        )
-        return events, provider.requests
 
-    events, requests = asyncio.run(run())
-
-    assert requests == []
-    blocked = [event for event in events if event.type == EventType.MCP_MANIFEST_BLOCKED]
-    assert len(blocked) == 1
-    assert blocked[0].payload["reason"] == "manifest_tool_limit_exceeded"
-    assert len(json.dumps(blocked[0].payload)) < 1_000
+    assert provider.requests == []
+    assert "assistant" not in app._agents
 
 
 def test_runtime_requires_explicit_identity_then_tracks_display_renames() -> None:

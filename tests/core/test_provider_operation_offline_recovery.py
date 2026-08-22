@@ -1015,8 +1015,6 @@ async def _stage_offline_operation(
     )
     if typed_recovery_context.tool_exposure is None and include_tool_exposure:
         frozen_exposure = registered_agent.all_registered_tool_exposure
-        if frozen_exposure is None:
-            raise AssertionError("Test agent did not freeze its registered tool exposure.")
         typed_recovery_context = typed_recovery_context.model_copy(
             update={"tool_exposure": resolved_tool_exposure_authority(frozen_exposure)}
         )
@@ -3537,6 +3535,7 @@ def test_explicit_fallback_resolution_is_fenced_idempotent_and_dispatches_one_ne
         registered_agent = app._agents["assistant"]
         frozen_exposure = ResolvedToolExposure(
             profile_id="frozen-lookup",
+            catalogue_revision=registered_agent.tool_catalogue.revision,
             tools=registered_agent.tool_capabilities,
             registered_count=1,
             ceiling_count=1,
@@ -3703,6 +3702,7 @@ def test_fallback_retry_rejects_frozen_exposure_outside_durable_ceiling() -> Non
         )
         frozen_exposure = ResolvedToolExposure(
             profile_id="frozen-archive",
+            catalogue_revision=registered_agent.tool_catalogue.revision,
             tools=archive_capability,
             registered_count=2,
             ceiling_count=1,

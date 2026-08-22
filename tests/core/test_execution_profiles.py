@@ -169,6 +169,7 @@ def test_unknown_provider_retry_contract_is_an_explicit_finalization_migration()
         model="fake-model",
         durable_system_prompt=None,
         direct_tools=(),
+        tool_catalogue_revision=f"sha256:{'c' * 64}",
         finalization={
             "kind": "cayu:model-finalization:v1",
             "max_steps": 16,
@@ -188,6 +189,7 @@ def test_unknown_provider_retry_contract_is_an_explicit_finalization_migration()
         model="fake-model",
         durable_system_prompt=None,
         direct_tools=(),
+        tool_catalogue_revision=f"sha256:{'c' * 64}",
         finalization=current_material,
     )
 
@@ -2213,6 +2215,7 @@ def test_live_state_profile_component_records_explicit_absence_and_future_change
         model="fake-model",
         durable_system_prompt=None,
         direct_tools=[],
+        tool_catalogue_revision=f"sha256:{'c' * 64}",
     )
     projected = build_execution_profile_identity(
         runtime_name="cayu",
@@ -2221,6 +2224,7 @@ def test_live_state_profile_component_records_explicit_absence_and_future_change
         model="fake-model",
         durable_system_prompt=None,
         direct_tools=[],
+        tool_catalogue_revision=f"sha256:{'c' * 64}",
         live_state_projection={
             "kind": "runtime-state-snapshot",
             "version": 1,
@@ -2234,6 +2238,152 @@ def test_live_state_profile_component_records_explicit_absence_and_future_change
     )
     assert baseline.component(component_class) != projected.component(component_class)
     assert changed_execution_profile_components(baseline, projected) == (component_class,)
+
+
+def test_direct_tool_profile_requires_and_binds_catalogue_revision() -> None:
+    arguments = {
+        "runtime_name": "cayu",
+        "runtime_version": "1",
+        "provider_name": "fake",
+        "model": "fake-model",
+        "durable_system_prompt": None,
+        "direct_tools": [],
+    }
+    with pytest.raises(ValueError, match="SHA-256 catalogue revision"):
+        build_execution_profile_identity(
+            **arguments,
+            tool_catalogue_revision="sha256:not-a-digest",
+        )
+
+    first = build_execution_profile_identity(
+        **arguments,
+        tool_catalogue_revision=f"sha256:{'a' * 64}",
+    )
+    second = build_execution_profile_identity(
+        **arguments,
+        tool_catalogue_revision=f"sha256:{'b' * 64}",
+    )
+
+    assert changed_execution_profile_components(first, second) == (
+        ExecutionProfileComponentClass.DIRECT_TOOLS,
+    )
+
+
+def test_public_profile_builder_default_implementation_binds_compact_tool_identities() -> None:
+    arguments = {
+        "runtime_name": "cayu",
+        "runtime_version": "1",
+        "provider_name": "fake",
+        "model": "fake-model",
+        "durable_system_prompt": None,
+        "tool_catalogue_revision": f"sha256:{'a' * 64}",
+    }
+    first = build_execution_profile_identity(
+        **arguments,
+        direct_tools=[
+            {
+                "tool_id": "cayu:alpha",
+                "descriptor_version": f"sha256:{'1' * 64}",
+            },
+            {
+                "tool_id": "cayu:beta",
+                "descriptor_version": f"sha256:{'2' * 64}",
+            },
+        ],
+        tool_view_grants={
+            "view_kind": "direct",
+            "generation": 1,
+            "grant_baseline": ["alpha", "beta"],
+        },
+    )
+    second = build_execution_profile_identity(
+        **arguments,
+        direct_tools=[
+            {
+                "tool_id": "cayu:gamma",
+                "descriptor_version": f"sha256:{'3' * 64}",
+            },
+            {
+                "tool_id": "cayu:delta",
+                "descriptor_version": f"sha256:{'4' * 64}",
+            },
+        ],
+        tool_view_grants={
+            "view_kind": "direct",
+            "generation": 1,
+            "grant_baseline": ["gamma", "delta"],
+        },
+    )
+
+    assert first.component(ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS) != (
+        second.component(ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS)
+    )
+
+
+def test_public_profile_builder_requires_grants_for_nonempty_direct_tools() -> None:
+    with pytest.raises(ValueError, match="tool_view_grants must be provided"):
+        build_execution_profile_identity(
+            runtime_name="cayu",
+            runtime_version="1",
+            provider_name="fake",
+            model="fake-model",
+            durable_system_prompt=None,
+            direct_tools=[
+                {
+                    "tool_id": "cayu:alpha",
+                    "descriptor_version": f"sha256:{'1' * 64}",
+                }
+            ],
+            tool_catalogue_revision=f"sha256:{'a' * 64}",
+        )
+
+
+@pytest.mark.parametrize(
+    "direct_tools, match",
+    [
+        ([{"name": "legacy"}], "exactly tool_id and descriptor_version"),
+        (
+            [
+                {
+                    "tool_id": "not-canonical",
+                    "descriptor_version": f"sha256:{'1' * 64}",
+                }
+            ],
+            "canonical Cayu or MCP tool identity",
+        ),
+        (
+            [{"tool_id": "cayu:alpha", "descriptor_version": "not-a-version"}],
+            "SHA-256 descriptor version",
+        ),
+        (
+            [
+                {
+                    "tool_id": "cayu:alpha",
+                    "descriptor_version": f"sha256:{'1' * 64}",
+                },
+                {
+                    "tool_id": "cayu:alpha",
+                    "descriptor_version": f"sha256:{'2' * 64}",
+                },
+            ],
+            "unique tool_id",
+        ),
+    ],
+)
+def test_public_profile_builder_rejects_noncanonical_direct_tool_material(
+    direct_tools: list[dict[str, str]],
+    match: str,
+) -> None:
+    with pytest.raises((TypeError, ValueError), match=match):
+        build_execution_profile_identity(
+            runtime_name="cayu",
+            runtime_version="1",
+            provider_name="fake",
+            model="fake-model",
+            durable_system_prompt=None,
+            direct_tools=direct_tools,
+            tool_catalogue_revision=f"sha256:{'a' * 64}",
+        )
 
 
 def test_cayu_profile_material_extractors_require_exact_registered_types(tmp_path: Path) -> None:
@@ -3907,12 +4057,12 @@ def test_public_resume_rejects_changed_workspace_mutation_declaration_before_wor
     asyncio.run(exercise())
 
 
-def test_default_false_workspace_mutation_keeps_direct_tool_component_shape() -> None:
+def test_catalogued_direct_tool_profile_uses_compact_descriptor_identity() -> None:
     async def exercise() -> None:
         store = InMemorySessionStore()
         app = CayuApp(session_store=store, enable_logging=False)
         app.register_provider(_completed_provider(), default=True)
-        tool = RecordingTool("legacy_tool", parallel_safe=False)
+        tool = RecordingTool("catalogued_tool", parallel_safe=False)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             tools=[tool],
@@ -3921,35 +4071,37 @@ def test_default_false_workspace_mutation_keeps_direct_tool_component_shape() ->
             app.run(
                 RunRequest(
                     agent_name="assistant",
-                    session_id="execution-profile-legacy-workspace-mutation-false",
+                    session_id="execution-profile-compact-catalogued-tool",
                     messages=[Message.text("user", "first")],
                 )
             )
         )
-        session = await store.load("execution-profile-legacy-workspace-mutation-false")
+        session = await store.load("execution-profile-compact-catalogued-tool")
         assert session is not None
-        return session
+        return session, app._agents["assistant"].tool_catalogue
 
-    session = asyncio.run(exercise())
+    session, catalogue = asyncio.run(exercise())
     stored = execution_profile_from_session_metadata(session.metadata)
-    legacy = build_execution_profile_identity(
+    direct_tool_material = catalogue.descriptor_for_name(
+        "catalogued_tool"
+    ).execution_profile_material()
+    assert set(direct_tool_material) == {"descriptor_version", "tool_id"}
+    expected = build_execution_profile_identity(
         runtime_name="cayu",
         runtime_version=session.runtime_version,
         provider_name="fake",
         model="fake-model",
         durable_system_prompt=None,
-        direct_tools=[
-            {
-                "name": "legacy_tool",
-                "description": "Record execution.",
-                "schema": {"type": "object", "properties": {}},
-                "parallel_safe": False,
-                "effect": "external",
-            }
-        ],
+        direct_tools=[direct_tool_material],
+        tool_catalogue_revision=catalogue.revision,
+        tool_view_grants={
+            "view_kind": "direct",
+            "generation": 1,
+            "grant_baseline": ["catalogued_tool"],
+        },
     )
 
-    assert stored.component(ExecutionProfileComponentClass.DIRECT_TOOLS) == legacy.component(
+    assert stored.component(ExecutionProfileComponentClass.DIRECT_TOOLS) == expected.component(
         ExecutionProfileComponentClass.DIRECT_TOOLS
     )
 
@@ -4833,6 +4985,7 @@ def test_profile_metadata_rejects_a_malformed_immutable_baseline() -> None:
         model="fake-model",
         durable_system_prompt="durable instructions",
         direct_tools=[],
+        tool_catalogue_revision=f"sha256:{'c' * 64}",
     )
     metadata = {
         EXECUTION_PROFILE_METADATA_KEY: execution_profile_session_metadata(profile),
@@ -6458,6 +6611,7 @@ def test_unavailable_required_component_is_not_compatible_with_itself() -> None:
         model="fake-model",
         durable_system_prompt=None,
         direct_tools=[],
+        tool_catalogue_revision=f"sha256:{'c' * 64}",
     )
 
     assert (
@@ -6540,6 +6694,7 @@ def test_creation_profile_truthfully_identifies_rendered_workspace_system_projec
             model=session.model,
             durable_system_prompt=rendered_system_prompt,
             direct_tools=[],
+            tool_catalogue_revision=f"sha256:{'c' * 64}",
         )
         persisted = execution_profile_from_session_metadata(session.metadata)
         assert persisted.component(

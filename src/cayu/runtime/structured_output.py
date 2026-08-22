@@ -19,9 +19,9 @@ from cayu._validation import (
     require_durable_text,
 )
 from cayu.providers import ModelProvider
+from cayu.runtime.tool_catalogue import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.vaults.redaction import SecretRedactor
 
-STRUCTURED_OUTPUT_TOOL_NAME = "__cayu_submit_structured_output"
 _STRUCTURED_OUTPUT_TEXT_FIELD = "structured output"
 _INVALID_PORTABLE_JSON_MESSAGE = "Final assistant output is not valid portable JSON."
 

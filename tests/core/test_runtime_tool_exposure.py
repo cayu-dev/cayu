@@ -210,6 +210,7 @@ class _InterleavedCompletedExposureStore(InMemorySessionStore):
                         session_id=session_id,
                         payload=payload,
                     ),
+                    "catalogue_revision",
                     "execution_profile_fingerprint",
                     "exposure_fingerprint",
                     "model_step_id",

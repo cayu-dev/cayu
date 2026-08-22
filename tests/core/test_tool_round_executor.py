@@ -52,6 +52,8 @@ from cayu.tools._runner import sanitize_runner_failure_group
 from cayu.tools.web import WebFetchTool
 from cayu.vaults import SecretRedactor
 
+_CATALOGUE_REVISION = f"sha256:{'c' * 64}"
+
 
 class _FakeProvider(ModelProvider):
     name = "fake"
@@ -217,6 +219,7 @@ def test_staged_terminal_profile_authority_is_owned_by_the_active_round() -> Non
         model="fake-model",
         durable_system_prompt="",
         direct_tools=[],
+        tool_catalogue_revision=f"sha256:{'c' * 64}",
     )
     coordinator = _ToolRoundPublicationCoordinator(
         session_id="session-staged-profile-authority",
@@ -264,6 +267,7 @@ def test_staged_terminal_exposure_authority_is_owned_by_the_frozen_snapshot() ->
     identity = _tool_round_identity()
     exposure = ResolvedToolExposureAuthority(
         profile_id="tool-free",
+        catalogue_revision=_CATALOGUE_REVISION,
         tool_names=(),
         registered_count=1,
         ceiling_count=1,

@@ -19322,6 +19322,7 @@ def _persisted_event_authority_fields(event_type: EventType | str) -> tuple[str,
         return ("execution_profile_fingerprint",)
     if event_type == EventType.TOOL_EXPOSURE_RECORDED:
         return (
+            "catalogue_revision",
             "execution_profile_fingerprint",
             "exposure_fingerprint",
             "model_step_id",

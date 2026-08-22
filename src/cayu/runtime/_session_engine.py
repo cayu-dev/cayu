@@ -6271,14 +6271,8 @@ class SessionEngine:
         if registered_agent.spec.name != request.agent_name:
             raise ValueError("Initial-run agent override conflicts with the request agent.")
         if request.tool_capability_ceiling is None:
-            registered_exposure = registered_agent.all_registered_tool_exposure
-            # Registration reserves ``None`` for a catalog that cannot enter
-            # the bounded exposure contract. Persist a tool-free ceiling so the
-            # existing pre-dispatch MCP manifest boundary can publish its
-            # bounded rejection without creating an authority-incomplete
-            # session. Non-MCP catalogs still fail during model-step setup.
             effective_tool_capability_ceiling = ToolCapabilityCeiling(
-                tool_names=(() if registered_exposure is None else registered_exposure.tool_names)
+                tool_names=registered_agent.all_registered_tool_exposure.tool_names
             )
         else:
             effective_tool_capability_ceiling = resolve_tool_capability_ceiling(
@@ -14065,6 +14059,7 @@ class SessionEngine:
             tool_exposure = validate_resolved_tool_exposure_authority(
                 publication.tool_exposure,
                 registered_agent.tool_capabilities,
+                catalogue_revision=registered_agent.tool_catalogue.revision,
             )
             tool_redactor = self._tool_round_executor.redactor_for_tool_calls(
                 registered_agent=registered_agent,

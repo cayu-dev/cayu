@@ -44,6 +44,8 @@ from cayu.runtime.structured_output import (
     structured_output_tool_spec,
 )
 
+_CATALOGUE_REVISION = f"sha256:{'c' * 64}"
+
 
 def _request(*, tool_description: str = "Inspect the repository") -> ModelRequest:
     return ModelRequest(
@@ -213,6 +215,7 @@ def test_request_footprint_v3_binds_the_prepared_tool_exposure() -> None:
     exposure = ToolExposure(
         execution_profile_fingerprint=execution_profile_fingerprint,
         profile_id="review",
+        catalogue_revision=_CATALOGUE_REVISION,
         exposure_fingerprint="b" * 64,
         registered_count=2,
         ceiling_count=1,
@@ -284,6 +287,7 @@ def test_request_footprint_v3_rejects_mismatched_exposure_authority(
     exposure = ToolExposure(
         execution_profile_fingerprint=execution_profile_fingerprint,
         profile_id="review",
+        catalogue_revision=_CATALOGUE_REVISION,
         exposure_fingerprint="b" * 64,
         registered_count=1,
         ceiling_count=1,

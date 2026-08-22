@@ -310,13 +310,15 @@ def test_request_footprint_tool_exposure_requires_and_retains_runtime_provenance
 
 def test_runtime_exposure_digest_survives_an_exact_workload_secret_collision() -> None:
     exposure_fingerprint = "b" * 64
+    catalogue_revision = f"sha256:{'c' * 64}"
     event = Event(
         type=EventType.TOOL_EXPOSURE_RECORDED,
         session_id="tool-exposure-secret-collision",
         payload={
-            "schema_version": 1,
+            "schema_version": 2,
             "execution_profile_fingerprint": "a" * 64,
             "profile_id": "public-phase",
+            "catalogue_revision": catalogue_revision,
             "exposure_fingerprint": exposure_fingerprint,
             "registered_count": 2,
             "ceiling_count": 1,
@@ -330,18 +332,21 @@ def test_runtime_exposure_digest_survives_an_exact_workload_secret_collision() -
     )
     attested = event_with_runtime_payload_authority(
         event,
+        "catalogue_revision",
         "execution_profile_fingerprint",
         "exposure_fingerprint",
         "model_step_id",
         "profile_id",
     )
-    redactor = SecretRedactor(exposure_fingerprint)
+    for secret in (exposure_fingerprint, catalogue_revision):
+        redactor = SecretRedactor(secret)
+        prepared = prepare_new_runtime_event(attested, redactor=redactor)
+        public = project_runtime_event(prepared, sequence=1, redactor=redactor)
 
-    prepared = prepare_new_runtime_event(attested, redactor=redactor)
-    public = project_runtime_event(prepared, sequence=1, redactor=redactor)
-
-    assert prepared.payload["exposure_fingerprint"] == exposure_fingerprint
-    assert public.payload["exposure_fingerprint"] == exposure_fingerprint
+        assert prepared.payload["catalogue_revision"] == catalogue_revision
+        assert prepared.payload["exposure_fingerprint"] == exposure_fingerprint
+        assert public.payload["catalogue_revision"] == catalogue_revision
+        assert public.payload["exposure_fingerprint"] == exposure_fingerprint
 
 
 def test_pause_projection_schemas_track_the_typed_checkpoint_models() -> None:

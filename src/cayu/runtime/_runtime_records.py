@@ -28,6 +28,7 @@ from cayu.runtime.tool_policy import ToolPolicy, ToolPolicyResult
 
 if TYPE_CHECKING:
     from cayu.runtime.loop_policies import LoopPolicy
+    from cayu.runtime.tool_catalogue import ToolCatalogSnapshot
     from cayu.runtime.tool_exposure import (
         RegisteredToolCapability,
         ResolvedToolExposure,
@@ -46,8 +47,9 @@ class RegisteredAgent:
 class RegisteredAgentState:
     spec: AgentSpec
     tools: Mapping[str, RegisteredTool]
+    tool_catalogue: ToolCatalogSnapshot
     tool_capabilities: tuple[RegisteredToolCapability, ...]
-    all_registered_tool_exposure: ResolvedToolExposure | None
+    all_registered_tool_exposure: ResolvedToolExposure
     tool_exposure_policy: ToolExposurePolicy
     tool_exposure_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None
     hosted_tools: tuple[OpenAIWebSearch, ...]

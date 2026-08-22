@@ -1267,6 +1267,7 @@ def test_session_store_conformance_reconstructs_tool_exposure_evidence(
             assert (
                 reconstructed.execution_profile_fingerprint,
                 reconstructed.profile_id,
+                reconstructed.catalogue_revision,
                 reconstructed.exposure_fingerprint,
                 reconstructed.registered_count,
                 reconstructed.ceiling_count,
@@ -1278,6 +1279,7 @@ def test_session_store_conformance_reconstructs_tool_exposure_evidence(
             ) == (
                 public_evidence.execution_profile_fingerprint,
                 public_evidence.profile_id,
+                public_evidence.catalogue_revision,
                 public_evidence.exposure_fingerprint,
                 1,
                 1,
@@ -1289,6 +1291,7 @@ def test_session_store_conformance_reconstructs_tool_exposure_evidence(
             )
             assert set(after_reopen.event.payload) == {
                 "schema_version",
+                "catalogue_revision",
                 "execution_profile_fingerprint",
                 "profile_id",
                 "exposure_fingerprint",
@@ -1324,6 +1327,7 @@ def test_session_store_conformance_reconstructs_tool_exposure_evidence(
                 if event.type is EventType.REQUEST_FOOTPRINT_RECORDED
             ]
             for field_name in (
+                "catalogue_revision",
                 "execution_profile_fingerprint",
                 "exposure_fingerprint",
                 "model_step_id",
@@ -1366,6 +1370,7 @@ def test_session_store_conformance_reconstructs_tool_exposure_evidence(
                     value=restored_events[0].payload[field_name],
                 )
                 for field_name in (
+                    "catalogue_revision",
                     "execution_profile_fingerprint",
                     "exposure_fingerprint",
                     "model_step_id",
@@ -1454,6 +1459,7 @@ def test_session_store_conformance_reconstructs_tool_exposure_evidence(
                 )
             )
             assert "profile_id" not in untrusted_latest.event.payload
+            assert "catalogue_revision" not in untrusted_latest.event.payload
             with pytest.raises(
                 RuntimeError,
                 match="Latest durable tool-exposure evidence is malformed",

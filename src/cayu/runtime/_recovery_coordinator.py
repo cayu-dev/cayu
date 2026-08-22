@@ -1004,6 +1004,7 @@ def _retried_model_step_tool_exposure_authority(
         validated = validate_resolved_tool_exposure_authority(
             authority,
             registered_agent.tool_capabilities,
+            catalogue_revision=registered_agent.tool_catalogue.revision,
         )
         capability_ceiling = tool_capability_ceiling_from_session_metadata(session.metadata)
     except (TypeError, ValueError) as exc:
@@ -4690,6 +4691,7 @@ class RecoveryCoordinator:
             validate_resolved_tool_exposure_authority(
                 pending.tool_exposure,
                 registered_agent.tool_capabilities,
+                catalogue_revision=registered_agent.tool_catalogue.revision,
             )
         pending_cleared = False
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
@@ -5870,6 +5872,7 @@ class RecoveryCoordinator:
                 validate_resolved_tool_exposure_authority(
                     publication_round.tool_exposure,
                     registered_agent.tool_capabilities,
+                    catalogue_revision=registered_agent.tool_catalogue.revision,
                 )
             recorded_outcomes = approval_support.recorded_tool_outcomes(
                 events=approval_events,
@@ -9886,6 +9889,7 @@ class RecoveryCoordinator:
             validate_resolved_tool_exposure_authority(
                 pending_round.tool_exposure,
                 registered_agent.tool_capabilities,
+                catalogue_revision=registered_agent.tool_catalogue.revision,
             )
         registered_tool_names = frozenset(registered_agent.tools)
         durable_policy_decisions = frozenset(decision.value for decision in ToolPolicyDecision)

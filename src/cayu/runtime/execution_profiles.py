@@ -32,6 +32,12 @@ from cayu.runtime.approvals import (
     resolution_actor_payload,
 )
 from cayu.runtime.checkpoints import ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY
+from cayu.runtime.tool_catalogue import (
+    TOOL_CATALOGUE_MAX_TOOLS,
+    validate_canonical_tool_id,
+    validate_tool_catalogue_revision,
+    validate_tool_descriptor_version,
+)
 
 EXECUTION_PROFILE_SCHEMA_VERSION = 4
 _EXECUTION_PROFILE_RECORD_SCHEMA_VERSION = 1
@@ -769,6 +775,41 @@ def direct_tool_capability_ceiling_component(
     )
 
 
+def _canonical_direct_tool_material(
+    direct_tools: Iterable[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    if isinstance(direct_tools, str | bytes | bytearray | Mapping | BaseModel):
+        raise TypeError("direct_tools must be an iterable of canonical tool identities.")
+    material: list[dict[str, str]] = []
+    for index, item in enumerate(direct_tools):
+        if index >= TOOL_CATALOGUE_MAX_TOOLS:
+            raise ValueError(
+                f"direct_tools cannot contain more than {TOOL_CATALOGUE_MAX_TOOLS} items."
+            )
+        if not isinstance(item, Mapping):
+            raise TypeError(f"direct_tools[{index}] must be a mapping.")
+        if set(item) != {"tool_id", "descriptor_version"}:
+            raise ValueError(
+                f"direct_tools[{index}] must contain exactly tool_id and descriptor_version."
+            )
+        material.append(
+            {
+                "tool_id": validate_canonical_tool_id(
+                    item["tool_id"],
+                    f"direct_tools[{index}].tool_id",
+                ),
+                "descriptor_version": validate_tool_descriptor_version(
+                    item["descriptor_version"],
+                    f"direct_tools[{index}].descriptor_version",
+                ),
+            }
+        )
+    tool_ids = tuple(item["tool_id"] for item in material)
+    if len(tool_ids) != len(set(tool_ids)):
+        raise ValueError("direct_tools must contain unique tool_id values.")
+    return material
+
+
 def build_execution_profile_identity(
     *,
     runtime_name: str,
@@ -777,6 +818,7 @@ def build_execution_profile_identity(
     model: str,
     durable_system_prompt: str | None,
     direct_tools: Iterable[Mapping[str, Any]],
+    tool_catalogue_revision: str,
     tool_implementations: Iterable[Mapping[str, Any]] | None = None,
     tool_implementations_process_local: bool = False,
     tool_implementations_application_versioned: bool = False,
@@ -817,9 +859,21 @@ def build_execution_profile_identity(
 ) -> ExecutionProfileIdentity:
     """Build a profile without retaining raw prompts, schemas, or tool names."""
 
-    direct_tool_material = list(direct_tools)
+    direct_tool_material = _canonical_direct_tool_material(direct_tools)
+    tool_catalogue_revision = validate_tool_catalogue_revision(
+        tool_catalogue_revision,
+        "tool_catalogue_revision",
+    )
+    direct_tool_identity_material = {
+        "kind": "cayu:catalogued-direct-tools",
+        "version": 1,
+        "catalogue_revision": tool_catalogue_revision,
+        "tools": direct_tool_material,
+    }
+    if tool_view_grants is None and direct_tool_material:
+        raise ValueError("tool_view_grants must be provided when direct_tools is non-empty.")
     implementation_material = (
-        [{"tool": item.get("name")} for item in direct_tool_material]
+        [{"tool_id": item["tool_id"]} for item in direct_tool_material]
         if tool_implementations is None
         else list(tool_implementations)
     )
@@ -827,7 +881,7 @@ def build_execution_profile_identity(
         _available_component(
             ExecutionProfileComponentClass.DIRECT_TOOLS,
             ExecutionProfileIdentityStrength.STRUCTURAL,
-            direct_tool_material,
+            direct_tool_identity_material,
         ),
         _available_component(
             ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS,
@@ -844,7 +898,7 @@ def build_execution_profile_identity(
                 {
                     "view_kind": "direct",
                     "generation": 1,
-                    "grant_baseline": [item.get("name") for item in direct_tool_material],
+                    "grant_baseline": [],
                 }
                 if tool_view_grants is None
                 else tool_view_grants

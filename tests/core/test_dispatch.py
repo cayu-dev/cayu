@@ -372,6 +372,7 @@ def _test_dispatch_envelope(
         model="fake-model",
         durable_system_prompt=None,
         direct_tools=(),
+        tool_catalogue_revision=f"sha256:{'c' * 64}",
     )
     return _new_queued_dispatch_envelope(
         queue_task_id=queue_task_id,
@@ -525,6 +526,7 @@ def test_queued_dispatch_operation_identity_binds_source_and_governed_profiles()
         model="source-model",
         durable_system_prompt=None,
         direct_tools=(),
+        tool_catalogue_revision=f"sha256:{'c' * 64}",
     )
     required_profile = build_execution_profile_identity(
         runtime_name="test",
@@ -533,6 +535,7 @@ def test_queued_dispatch_operation_identity_binds_source_and_governed_profiles()
         model="governed-model",
         durable_system_prompt=None,
         direct_tools=(),
+        tool_catalogue_revision=f"sha256:{'c' * 64}",
     )
     envelope = _new_queued_dispatch_envelope(
         queue_task_id="queue-profile-tuple",
@@ -1964,6 +1967,7 @@ def test_queue_preparation_preserves_released_profile_for_pending_tool_recovery(
         model="fake-model",
         durable_system_prompt=None,
         direct_tools=(),
+        tool_catalogue_revision=f"sha256:{'c' * 64}",
     )
     pending_round = tool_round_recovery.PendingToolRound(
         model_step_id=f"mstep_{'1' * 32}",

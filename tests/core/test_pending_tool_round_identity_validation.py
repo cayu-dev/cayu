@@ -17,6 +17,8 @@ from cayu.runtime.tool_exposure import (
 from cayu.runtime.tool_policy import ToolPolicyDecision, ToolPolicyResult
 from cayu.runtime.user_input import PendingUserInput
 
+_CATALOGUE_REVISION = f"sha256:{'c' * 64}"
+
 
 def _identity() -> dict[str, str]:
     return {
@@ -46,6 +48,7 @@ def _exposure_authority(
 ) -> ResolvedToolExposureAuthority:
     return ResolvedToolExposureAuthority(
         profile_id=profile_id,
+        catalogue_revision=_CATALOGUE_REVISION,
         tool_names=tool_names,
         registered_count=2,
         ceiling_count=2,

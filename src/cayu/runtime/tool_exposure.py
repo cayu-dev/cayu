@@ -34,12 +34,18 @@ from cayu.core.execution_identity import (
     copy_execution_profile_behavior_identity,
 )
 from cayu.core.tools import ToolEffect, ToolResult
+from cayu.runtime.tool_catalogue import (
+    TOOL_CATALOGUE_MAX_BYTES,
+    TOOL_CATALOGUE_MAX_TOOLS,
+    validate_tool_catalogue_revision,
+)
 
-TOOL_EXPOSURE_SCHEMA_VERSION = 1
+TOOL_EXPOSURE_SCHEMA_VERSION = 2
+REGISTERED_TOOL_CAPABILITY_SCHEMA_VERSION = 1
 TOOL_CAPABILITY_CEILING_SCHEMA_VERSION = 1
 TOOL_EXPOSURE_PROFILE_ID_MAX_CHARS = 256
-TOOL_EXPOSURE_MAX_REGISTERED_TOOLS = 10_000
-TOOL_EXPOSURE_MAX_CATALOG_BYTES = 32 * 1024 * 1024
+TOOL_EXPOSURE_MAX_REGISTERED_TOOLS = TOOL_CATALOGUE_MAX_TOOLS
+TOOL_EXPOSURE_MAX_CATALOG_BYTES = TOOL_CATALOGUE_MAX_BYTES
 TOOL_EXPOSURE_METADATA_MAX_ENTRIES = 64
 TOOL_EXPOSURE_METADATA_MAX_BYTES = 4 * 1024
 ALL_REGISTERED_TOOLS_PROFILE_ID = "cayu:all-registered-tools:v1"
@@ -163,7 +169,7 @@ class RegisteredToolCapability(BaseModel):
         definition_fingerprint = _sha256_durable_json(
             {
                 "record_type": "cayu.registered-tool-capability",
-                "schema_version": TOOL_EXPOSURE_SCHEMA_VERSION,
+                "schema_version": REGISTERED_TOOL_CAPABILITY_SCHEMA_VERSION,
                 "name": self.name,
                 "description": self.description,
                 "schema_fingerprint": schema_fingerprint,
@@ -418,6 +424,7 @@ class ToolExposurePolicyRequest(BaseModel):
     model: str
     step: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
     transcript_cursor: StrictInt = Field(default=0, ge=0)
+    catalogue_revision: str
     registered_tools: tuple[RegisteredToolCapability, ...]
     capability_ceiling: tuple[str, ...]
     previous_profile_id: str | None = None
@@ -434,6 +441,11 @@ class ToolExposurePolicyRequest(BaseModel):
         if value is None:
             return None
         return _validate_profile_id(value, "previous_profile_id")
+
+    @field_validator("catalogue_revision")
+    @classmethod
+    def validate_catalogue_revision(cls, value: str) -> str:
+        return validate_tool_catalogue_revision(value)
 
     @field_validator("registered_tools", mode="before")
     @classmethod
@@ -563,8 +575,9 @@ class ResolvedToolExposure(BaseModel):
         revalidate_instances="always",
     )
 
-    schema_version: Literal[1] = TOOL_EXPOSURE_SCHEMA_VERSION
+    schema_version: Literal[2] = TOOL_EXPOSURE_SCHEMA_VERSION
     profile_id: str
+    catalogue_revision: str
     tools: tuple[RegisteredToolCapability, ...]
     registered_count: StrictInt = Field(ge=0, le=TOOL_EXPOSURE_MAX_REGISTERED_TOOLS)
     ceiling_count: StrictInt = Field(ge=0, le=TOOL_EXPOSURE_MAX_REGISTERED_TOOLS)
@@ -575,6 +588,11 @@ class ResolvedToolExposure(BaseModel):
     @classmethod
     def validate_profile_id(cls, value: str) -> str:
         return _validate_profile_id(value)
+
+    @field_validator("catalogue_revision")
+    @classmethod
+    def validate_catalogue_revision(cls, value: str) -> str:
+        return validate_tool_catalogue_revision(value)
 
     @field_validator("tools", mode="before")
     @classmethod
@@ -609,6 +627,7 @@ class ResolvedToolExposure(BaseModel):
                 "record_type": "cayu.resolved-tool-exposure",
                 "schema_version": self.schema_version,
                 "profile_id": self.profile_id,
+                "catalogue_revision": self.catalogue_revision,
                 "tool_definition_fingerprints": [
                     tool.definition_fingerprint for tool in self.tools
                 ],
@@ -641,13 +660,14 @@ class ToolExposure(BaseModel):
         revalidate_instances="always",
     )
 
-    schema_version: Literal[1] = TOOL_EXPOSURE_SCHEMA_VERSION
+    schema_version: Literal[2] = TOOL_EXPOSURE_SCHEMA_VERSION
     execution_profile_fingerprint: str = Field(
         min_length=64,
         max_length=64,
         pattern=r"^[0-9a-f]{64}$",
     )
     profile_id: str
+    catalogue_revision: str
     exposure_fingerprint: str = Field(
         min_length=64,
         max_length=64,
@@ -666,13 +686,18 @@ class ToolExposure(BaseModel):
     @classmethod
     def validate_schema_version(cls, value: object) -> object:
         if type(value) is not int or value != TOOL_EXPOSURE_SCHEMA_VERSION:
-            raise ValueError("Tool exposure schema_version must be the integer 1.")
+            raise ValueError("Tool exposure schema_version must be the integer 2.")
         return value
 
     @field_validator("profile_id")
     @classmethod
     def validate_profile_id(cls, value: str) -> str:
         return _validate_profile_id(value)
+
+    @field_validator("catalogue_revision")
+    @classmethod
+    def validate_catalogue_revision(cls, value: str) -> str:
+        return validate_tool_catalogue_revision(value)
 
     @field_validator("provider_name", "model")
     @classmethod
@@ -731,6 +756,7 @@ def tool_exposure_record(
     return ToolExposure(
         execution_profile_fingerprint=execution_profile_fingerprint,
         profile_id=exposure.profile_id,
+        catalogue_revision=exposure.catalogue_revision,
         exposure_fingerprint=exposure.fingerprint,
         registered_count=exposure.registered_count,
         ceiling_count=exposure.ceiling_count,
@@ -753,8 +779,9 @@ class ResolvedToolExposureAuthority(BaseModel):
         revalidate_instances="always",
     )
 
-    schema_version: Literal[1] = TOOL_EXPOSURE_SCHEMA_VERSION
+    schema_version: Literal[2] = TOOL_EXPOSURE_SCHEMA_VERSION
     profile_id: str
+    catalogue_revision: str
     tool_names: tuple[str, ...]
     registered_count: StrictInt = Field(ge=0, le=TOOL_EXPOSURE_MAX_REGISTERED_TOOLS)
     ceiling_count: StrictInt = Field(ge=0, le=TOOL_EXPOSURE_MAX_REGISTERED_TOOLS)
@@ -768,6 +795,11 @@ class ResolvedToolExposureAuthority(BaseModel):
     @classmethod
     def validate_profile_id(cls, value: str) -> str:
         return _validate_profile_id(value)
+
+    @field_validator("catalogue_revision")
+    @classmethod
+    def validate_catalogue_revision(cls, value: str) -> str:
+        return validate_tool_catalogue_revision(value)
 
     @field_validator("tool_names", mode="before")
     @classmethod
@@ -806,6 +838,7 @@ def resolved_tool_exposure_authority(
         raise TypeError("exposure must be a ResolvedToolExposure.")
     return ResolvedToolExposureAuthority(
         profile_id=exposure.profile_id,
+        catalogue_revision=exposure.catalogue_revision,
         tool_names=exposure.tool_names,
         registered_count=exposure.registered_count,
         ceiling_count=exposure.ceiling_count,
@@ -826,12 +859,15 @@ def copy_resolved_tool_exposure_authority(
 def validate_resolved_tool_exposure_authority(
     authority: ResolvedToolExposureAuthority,
     registered_tools: tuple[RegisteredToolCapability, ...],
+    *,
+    catalogue_revision: str,
 ) -> ResolvedToolExposureAuthority:
     """Bind compact durable authority back to the current registered catalog."""
 
     copied, _reconstructed = _bind_resolved_tool_exposure_authority(
         authority,
         registered_tools,
+        catalogue_revision=catalogue_revision,
     )
     return copied
 
@@ -839,12 +875,15 @@ def validate_resolved_tool_exposure_authority(
 def resolved_tool_exposure_from_authority(
     authority: ResolvedToolExposureAuthority,
     registered_tools: tuple[RegisteredToolCapability, ...],
+    *,
+    catalogue_revision: str,
 ) -> ResolvedToolExposure:
     """Reconstruct one validated frozen snapshot from compact durable authority."""
 
     _copied, reconstructed = _bind_resolved_tool_exposure_authority(
         authority,
         registered_tools,
+        catalogue_revision=catalogue_revision,
     )
     return reconstructed
 
@@ -852,10 +891,15 @@ def resolved_tool_exposure_from_authority(
 def _bind_resolved_tool_exposure_authority(
     authority: ResolvedToolExposureAuthority,
     registered_tools: tuple[RegisteredToolCapability, ...],
+    *,
+    catalogue_revision: str,
 ) -> tuple[ResolvedToolExposureAuthority, ResolvedToolExposure]:
     """Return detached authority and its catalog-bound descriptor snapshot."""
 
     copied = copy_resolved_tool_exposure_authority(authority)
+    catalogue_revision = validate_tool_catalogue_revision(catalogue_revision)
+    if copied.catalogue_revision != catalogue_revision:
+        raise ValueError("Tool exposure authority conflicts with the registered catalogue.")
     capabilities = _copy_capability_sequence(registered_tools, "registered_tools")
     if copied.registered_count != len(capabilities):
         raise ValueError("Tool exposure authority conflicts with the registered tool count.")
@@ -865,6 +909,7 @@ def _bind_resolved_tool_exposure_authority(
         raise ValueError("Tool exposure authority conflicts with registered tool order.")
     reconstructed = ResolvedToolExposure(
         profile_id=copied.profile_id,
+        catalogue_revision=copied.catalogue_revision,
         tools=selected_tools,
         registered_count=copied.registered_count,
         ceiling_count=copied.ceiling_count,
@@ -970,6 +1015,7 @@ def _copy_tool_exposure_policy_request(
         model=request.model,
         step=request.step,
         transcript_cursor=request.transcript_cursor,
+        catalogue_revision=request.catalogue_revision,
         registered_tools=request.registered_tools,
         capability_ceiling=request.capability_ceiling,
         previous_profile_id=request.previous_profile_id,
@@ -987,6 +1033,7 @@ def _policy_request_declared_state(request: ToolExposurePolicyRequest) -> tuple[
         request.model,
         request.step,
         request.transcript_cursor,
+        request.catalogue_revision,
         tuple((tool.name, tool.definition_fingerprint) for tool in request.registered_tools),
         request.capability_ceiling,
         request.previous_profile_id,
@@ -1056,6 +1103,7 @@ def resolve_tool_exposure(
     try:
         resolved = ResolvedToolExposure(
             profile_id=copied_decision.profile_id,
+            catalogue_revision=policy_request.catalogue_revision,
             tools=selected_tools,
             registered_count=len(registered_tools),
             ceiling_count=len(capability_ceiling),
