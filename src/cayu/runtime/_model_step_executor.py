@@ -13,7 +13,7 @@ import asyncio
 import contextlib
 import logging
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextvars import Context
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -72,6 +72,7 @@ from cayu.core.events import (
     EventType,
     copy_event,
     event_with_runtime_generated_id,
+    event_with_runtime_nested_payload_authority,
     event_with_runtime_payload_authority,
 )
 from cayu.core.messages import (
@@ -319,6 +320,7 @@ from cayu.runtime.structured_output import (
     structured_output_tool_instruction,
     structured_output_tool_spec,
 )
+from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
 from cayu.runtime.tool_exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
     TOOL_EXPOSURE_PROFILE_ID_MAX_CHARS,
@@ -332,6 +334,10 @@ from cayu.runtime.tool_exposure import (
     resolved_tool_exposure_authority,
     tool_capability_ceiling_from_session_metadata,
     tool_exposure_record,
+)
+from cayu.runtime.tool_gateway import (
+    TargetedToolGatewayProjection,
+    targeted_tool_gateway_projection,
 )
 from cayu.runtime.usage import (
     ModelCompletionPurpose,
@@ -362,14 +368,34 @@ def _provider_operation_progress_contains_secret(
     envelope: ProviderOperationProgressEnvelope,
     *,
     redactor: SecretRedactor,
+    targeted_tool_reference_grant_ids: Mapping[str, str] | None = None,
 ) -> bool:
     """Check adapter-owned continuation and output without scanning schema keys."""
 
     stream_event = envelope.stream_event
+    payload = copy_durable_json_object(stream_event.payload, "provider_operation_stream_payload")
+    if (
+        stream_event.type is ModelStreamEventType.TOOL_CALL
+        and payload.get("name") == CALL_TOOL_NAME
+    ):
+        arguments = payload.get("arguments")
+        if type(arguments) is dict:
+            tool_ref = arguments.get("tool_ref")
+            if (
+                type(tool_ref) is str
+                and targeted_tool_reference_grant_ids is not None
+                and tool_ref in targeted_tool_reference_grant_ids
+            ):
+                # This exact value was projected by the runtime for the model
+                # request. The surrounding model-authored envelope and all
+                # inner arguments remain untrusted and are still scanned.
+                arguments = copy_durable_json_object(arguments, "call_tool.arguments")
+                arguments.pop("tool_ref", None)
+                payload["arguments"] = arguments
     return (
         redactor.redact_text(stream_event.delta) != stream_event.delta
         or durable_value_contains_secret(
-            stream_event.payload,
+            payload,
             redactor=redactor,
             path=("provider_operation_stream_payload",),
         )
@@ -806,6 +832,10 @@ def _copy_assistant_step_result(result: AssistantStepResult) -> AssistantStepRes
                     call.arguments,
                     "tool_call_arguments",
                 ),
+                targeted_tool_grant_id=call.targeted_tool_grant_id,
+                model_tool_name=call.model_tool_name,
+                targeted_tool_invocation=call.targeted_tool_invocation,
+                targeted_tool_rejection=call.targeted_tool_rejection,
             )
             for call in result.tool_calls
         ],
@@ -821,6 +851,7 @@ def _durable_assistant_step_result(
     result: AssistantStepResult,
     *,
     redactor: SecretRedactor,
+    targeted_tool_reference_grant_ids: Mapping[str, str] | None = None,
 ) -> AssistantStepResult:
     """Project one assistant result across the durable publication boundary."""
 
@@ -837,14 +868,36 @@ def _durable_assistant_step_result(
         redactor=redactor,
         field_name="assistant_message",
     )
-    tool_calls = [
-        runtime_records.ToolCallRequest(
-            id=call.id,
-            name=call.name,
-            arguments=redactor.redact_json_values(call.arguments),
+    reference_grant_ids = (
+        {} if targeted_tool_reference_grant_ids is None else dict(targeted_tool_reference_grant_ids)
+    )
+    tool_calls: list[runtime_records.ToolCallRequest] = []
+    for call in copied.tool_calls:
+        projected_arguments = redactor.redact_json_values(call.arguments)
+        if type(projected_arguments) is not dict:
+            raise AssertionError("Tool-call argument redaction returned a non-object.")
+        tool_ref = call.arguments.get("tool_ref") if call.name == CALL_TOOL_NAME else None
+        targeted_tool_grant_id = (
+            reference_grant_ids.get(tool_ref) if type(tool_ref) is str else None
         )
-        for call in copied.tool_calls
-    ]
+        if targeted_tool_grant_id is not None:
+            # The exact reference was issued in this request by the runtime.
+            # Retain it only as private executable material paired with its
+            # grant id; transcript projection below replaces it with a
+            # non-authoritative placeholder.
+            projected_arguments["tool_ref"] = tool_ref
+        tool_calls.append(
+            runtime_records.ToolCallRequest(
+                id=call.id,
+                name=call.name,
+                arguments=projected_arguments,
+                targeted_tool_grant_id=targeted_tool_grant_id,
+            )
+        )
+    assistant_message = transcript_helpers.assistant_message_with_tool_call_arguments(
+        assistant_message,
+        tool_calls,
+    )
     text_content = assistant_text_content(assistant_message)
     return AssistantStepResult(
         session_id=copied.session_id,
@@ -859,6 +912,49 @@ def _durable_assistant_step_result(
         has_user_visible_content=bool(text_content.strip()),
         provider_state_count=provider_state_count(assistant_message),
         thinking_count=thinking_count(assistant_message),
+    )
+
+
+def _assistant_step_result_with_published_gateway_authority(
+    live_result: AssistantStepResult,
+    published_result: AssistantStepResult,
+) -> AssistantStepResult:
+    """Pair live validation values with the exact published gateway authority."""
+
+    live = _copy_assistant_step_result(live_result)
+    published = _copy_assistant_step_result(published_result)
+    if (
+        live.session_id != published.session_id
+        or live.step != published.step
+        or live.model_step_id != published.model_step_id
+        or live.model_attempt_id != published.model_attempt_id
+        or live.tool_round_identity != published.tool_round_identity
+        or len(live.tool_calls) != len(published.tool_calls)
+    ):
+        raise RuntimeError("Published model completion conflicts with its live result.")
+    merged_calls: list[runtime_records.ToolCallRequest] = []
+    for live_call, published_call in zip(live.tool_calls, published.tool_calls, strict=True):
+        if live_call.id != published_call.id or live_call.name != published_call.name:
+            raise RuntimeError("Published model tool calls conflict with their live result.")
+        merged_calls.append(
+            runtime_records.copy_tool_call_request(
+                published_call,
+                arguments=live_call.arguments,
+            )
+        )
+    return AssistantStepResult(
+        session_id=live.session_id,
+        step=live.step,
+        model_step_id=live.model_step_id,
+        model_attempt_id=live.model_attempt_id,
+        tool_round_identity=live.tool_round_identity,
+        assistant_message=published.assistant_message,
+        tool_calls=merged_calls,
+        completion=live.completion,
+        text_content=live.text_content,
+        has_user_visible_content=live.has_user_visible_content,
+        provider_state_count=live.provider_state_count,
+        thinking_count=live.thinking_count,
     )
 
 
@@ -2158,6 +2254,7 @@ class ModelStepExecutor:
         max_total_file_attachment_bytes: int,
         max_file_attachments_per_request: int,
         secret_redactor: SecretRedactor,
+        clock: Callable[[], datetime],
         checkpoint_transform: CheckpointTransformFactory,
         apply_budget_evaluation: BudgetEvaluationEventStream,
         apply_limit_evaluation: LimitEvaluationEventStream,
@@ -2173,6 +2270,7 @@ class ModelStepExecutor:
         self._max_total_file_attachment_bytes = max_total_file_attachment_bytes
         self._max_file_attachments_per_request = max_file_attachments_per_request
         self._secret_redactor = secret_redactor
+        self._clock = clock
         self._checkpoint_transform = checkpoint_transform
         self._apply_budget_evaluation = apply_budget_evaluation
         self._apply_limit_evaluation = apply_limit_evaluation
@@ -2693,6 +2791,7 @@ class ModelStepExecutor:
         attempt: int,
         max_attempts: int,
         model_attempt_identity: ModelAttemptIdentity,
+        targeted_tool_reference_grant_ids: Mapping[str, str] | None = None,
     ) -> Event:
         """Attach private reconnect state to its corresponding normalized event."""
 
@@ -2706,6 +2805,7 @@ class ModelStepExecutor:
         if _provider_operation_progress_contains_secret(
             progress_envelope,
             redactor=self._secret_redactor,
+            targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
         ):
             raise ProviderOperationEvidenceError(
                 "Provider-operation recovery metadata or normalized output contains a "
@@ -2760,6 +2860,24 @@ class ModelStepExecutor:
             event,
             (None if recovery_context is None else recovery_context.execution_profile_fingerprint),
         )
+        if (
+            stream_event.type is ModelStreamEventType.TOOL_CALL
+            and stream_event.payload.get("name") == CALL_TOOL_NAME
+            and targeted_tool_reference_grant_ids is not None
+        ):
+            arguments = stream_event.payload.get("arguments")
+            tool_ref = arguments.get("tool_ref") if type(arguments) is dict else None
+            if type(tool_ref) is str and tool_ref in targeted_tool_reference_grant_ids:
+                event = event_with_runtime_nested_payload_authority(
+                    event,
+                    (
+                        "provider_operation_progress",
+                        "stream_event",
+                        "payload",
+                        "arguments",
+                        "tool_ref",
+                    ),
+                )
         return event_with_runtime_generated_id(event)
 
     async def _commit_provider_operation_stream_event(
@@ -2778,6 +2896,7 @@ class ModelStepExecutor:
         attempt: int,
         max_attempts: int,
         model_attempt_identity: ModelAttemptIdentity,
+        targeted_tool_reference_grant_ids: Mapping[str, str] | None = None,
     ) -> tuple[ProviderOperationProgressCommit, Event | None]:
         event = self._provider_operation_progress_event(
             stage=stage,
@@ -2793,6 +2912,7 @@ class ModelStepExecutor:
             attempt=attempt,
             max_attempts=max_attempts,
             model_attempt_identity=model_attempt_identity,
+            targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
         )
         prepared = self._event_writer.prepare(event)
         commit = await commit_provider_operation_progress(
@@ -3116,6 +3236,13 @@ class ModelStepExecutor:
             raise ProviderOperationEvidenceError(
                 "Offline recovery of native structured output requires manual reconciliation."
             )
+        targeted_tool_reference_grant_ids = {
+            record.tool_ref: record.grant_id
+            for record in await self._session_store.list_targeted_tool_grants(
+                session.id,
+                interaction_id=operation.interaction_id,
+            )
+        }
         if durable_value_contains_secret(
             operation.state.recovery_metadata.opaque,
             redactor=self._secret_redactor,
@@ -3124,6 +3251,7 @@ class ModelStepExecutor:
             _provider_operation_progress_contains_secret(
                 provider_operation_progress_envelope(operation.state, accepted_event),
                 redactor=self._secret_redactor,
+                targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
             )
             for accepted_event in operation.accepted_stream_events
         ):
@@ -3418,6 +3546,7 @@ class ModelStepExecutor:
                     attempt=operation.attempt,
                     max_attempts=operation.max_attempts,
                     model_attempt_identity=operation.model_attempt_identity,
+                    targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
                 )
                 current_state = progress.state
                 if progress.replayed:
@@ -3491,6 +3620,7 @@ class ModelStepExecutor:
                     if _provider_operation_progress_contains_secret(
                         envelope,
                         redactor=self._secret_redactor,
+                        targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
                     ):
                         retain_post_completion_failure(
                             ProviderOperationEvidenceError(
@@ -3904,6 +4034,7 @@ class ModelStepExecutor:
                 attempt=operation.attempt,
                 max_attempts=operation.max_attempts,
                 model_attempt_identity=operation.model_attempt_identity,
+                targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
             )
         publication_cancellation = _take_model_completion_cancellation(
             post_completion_failure,
@@ -3925,6 +4056,7 @@ class ModelStepExecutor:
                 durable_step_result = _durable_assistant_step_result(
                     step_result,
                     redactor=self._secret_redactor,
+                    targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
                 )
             except (TypeError, ValueError):
                 durable_boundary_error = ModelProviderError(
@@ -4103,6 +4235,7 @@ class ModelStepExecutor:
         initial_tool_exposure: ResolvedToolExposure | None = None,
         previous_tool_exposure_profile_id: str | None = None,
         targeted_tool_grants: TargetedToolGrantFootprint | None = None,
+        interaction_id: str | None = None,
         model_completion_recovery_context_factory: (
             ModelCompletionRecoveryContextFactory | None
         ) = None,
@@ -4133,6 +4266,7 @@ class ModelStepExecutor:
             initial_tool_exposure=initial_tool_exposure,
             previous_tool_exposure_profile_id=previous_tool_exposure_profile_id,
             targeted_tool_grants=targeted_tool_grants,
+            interaction_id=interaction_id,
             model_completion_recovery_context_factory=(
                 model_completion_recovery_context_factory
                 or (
@@ -4155,6 +4289,7 @@ class ModelStepExecutor:
         thinking: ThinkingConfig | None,
         step: int,
         tool_exposure: ResolvedToolExposure | None = None,
+        targeted_tool_gateway: TargetedToolGatewayProjection | None = None,
     ) -> ModelRequest:
         resolved_tool_exposure = (
             _all_registered_tool_exposure(registered_agent)
@@ -4164,6 +4299,7 @@ class ModelStepExecutor:
         model_tools = _model_request_tools(
             tool_exposure=resolved_tool_exposure,
             structured_output=structured_output,
+            targeted_tool_gateway=targeted_tool_gateway,
         )
         model_messages = _model_request_messages(
             messages=context_messages,
@@ -4226,6 +4362,12 @@ class ModelStepExecutor:
             )
             for message in model_messages
         ]
+        if targeted_tool_gateway is not None:
+            redacted_messages = _with_targeted_tool_gateway_instruction(
+                redacted_messages,
+                targeted_tool_gateway=targeted_tool_gateway,
+                redactor=self._secret_redactor,
+            )
         if self._secret_redactor.redact_text(session.model) != session.model:
             raise ValueError(
                 "Model identity contains a workload secret and cannot be sent to a provider."
@@ -4358,6 +4500,7 @@ class ModelStepExecutor:
         tool_exposure: ResolvedToolExposure | None = None,
         tool_exposure_evidence: ToolExposure | None = None,
         targeted_tool_grants: TargetedToolGrantFootprint | None = None,
+        targeted_tool_gateway: TargetedToolGatewayProjection | None = None,
         memory_evidence_reference: MemoryEvidenceReference | None = None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         retry_policy = copy_retry_policy(retry_policy)
@@ -4374,6 +4517,13 @@ class ModelStepExecutor:
                 )
             targeted_tool_grants = TargetedToolGrantFootprint.model_validate(
                 targeted_tool_grants.model_dump(mode="python")
+            )
+        if (
+            targeted_tool_gateway is not None
+            and type(targeted_tool_gateway) is not TargetedToolGatewayProjection
+        ):
+            raise TypeError(
+                "targeted_tool_gateway must be a TargetedToolGatewayProjection or None."
             )
         if tool_exposure_evidence is not None:
             if type(tool_exposure_evidence) is not ToolExposure:
@@ -4611,6 +4761,7 @@ class ModelStepExecutor:
                 model_completion_publisher=model_completion_publisher,
                 execution_profile=execution_profile,
                 tool_exposure=resolved_tool_exposure,
+                targeted_tool_gateway=targeted_tool_gateway,
                 memory_evidence_reference=memory_evidence_reference,
                 prepared_model_completion_dispatch=pre_count_completion_dispatch,
             )
@@ -5039,10 +5190,14 @@ class ModelStepExecutor:
         model_completion_publisher: ModelCompletionPublisher | None,
         execution_profile: ExecutionProfileIdentity | None,
         tool_exposure: ResolvedToolExposure | None,
+        targeted_tool_gateway: TargetedToolGatewayProjection | None,
         memory_evidence_reference: MemoryEvidenceReference | None,
         prepared_model_completion_dispatch: ModelCompletionDispatch | None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         retry_policy = copy_retry_policy(retry_policy)
+        targeted_tool_reference_grant_ids = (
+            None if targeted_tool_gateway is None else targeted_tool_gateway.reference_grant_ids()
+        )
         if retry_policy.max_attempts != max_attempts:
             raise ValueError("Retry policy does not match the model-attempt ceiling.")
         assistant_parts: list[transcript_helpers.AssistantContentPart] = []
@@ -5712,6 +5867,7 @@ class ModelStepExecutor:
                             attempt=attempt,
                             max_attempts=max_attempts,
                             model_attempt_identity=model_attempt_identity,
+                            targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
                         )
                         provider_operation_state = progress.state
                         if progress.replayed:
@@ -5764,6 +5920,7 @@ class ModelStepExecutor:
                             attempt=attempt,
                             max_attempts=max_attempts,
                             model_attempt_identity=model_attempt_identity,
+                            targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
                         )
                         provider_operation_state = progress.state
                         if progress.replayed:
@@ -5832,6 +5989,7 @@ class ModelStepExecutor:
                             attempt=attempt,
                             max_attempts=max_attempts,
                             model_attempt_identity=model_attempt_identity,
+                            targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
                         )
                         provider_operation_state = progress.state
                         if progress.replayed:
@@ -5884,6 +6042,7 @@ class ModelStepExecutor:
                             attempt=attempt,
                             max_attempts=max_attempts,
                             model_attempt_identity=model_attempt_identity,
+                            targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
                         )
                         provider_operation_state = progress.state
                         if progress.replayed:
@@ -5911,6 +6070,7 @@ class ModelStepExecutor:
                         if _provider_operation_progress_contains_secret(
                             envelope,
                             redactor=self._secret_redactor,
+                            targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
                         ):
                             terminal_progress_failure = ProviderOperationEvidenceError(
                                 "Provider-operation terminal recovery state contains a workload "
@@ -6072,6 +6232,7 @@ class ModelStepExecutor:
                             attempt=attempt,
                             max_attempts=max_attempts,
                             model_attempt_identity=model_attempt_identity,
+                            targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
                         )
                     if model_completion_publisher is None:
                         completion_event = record_model_completion(completion_event)
@@ -6191,6 +6352,7 @@ class ModelStepExecutor:
                             attempt=attempt,
                             max_attempts=max_attempts,
                             model_attempt_identity=model_attempt_identity,
+                            targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
                         )
                         provider_operation_state = progress.state
                         if progress.replayed:
@@ -6591,12 +6753,22 @@ class ModelStepExecutor:
                 )
 
             durable_step_result = None
+            live_continuation_result = None
             structured_output_validation = None
             if step_result is not None:
                 try:
                     candidate_step_result = _durable_assistant_step_result(
                         step_result,
                         redactor=self._secret_redactor,
+                        targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
+                    )
+                    candidate_live_continuation = (
+                        None
+                        if targeted_tool_gateway is None
+                        else _assistant_step_result_with_published_gateway_authority(
+                            step_result,
+                            candidate_step_result,
+                        )
                     )
                     candidate_validation = None
                     if (
@@ -6616,6 +6788,7 @@ class ModelStepExecutor:
                             self._secret_redactor,
                         )
                     durable_step_result = candidate_step_result
+                    live_continuation_result = candidate_live_continuation
                     structured_output_validation = candidate_validation
                 except (TypeError, ValueError):
                     if terminal_failure is None:
@@ -6667,6 +6840,11 @@ class ModelStepExecutor:
                 terminal_failure=terminal_failure,
                 publication_cancellation=publication_cancellation,
             )
+            if live_continuation_result is not None:
+                # Structured-output validation still needs the live values,
+                # while subsequent gateway routing needs the exact private
+                # authority that crossed the atomic publication boundary.
+                step_result = live_continuation_result
             if terminal_failure is None or not exception_tree_contains(
                 terminal_failure,
                 GeneratorExit,
@@ -6786,6 +6964,7 @@ class ModelStepRun:
         initial_tool_exposure: ResolvedToolExposure | None,
         previous_tool_exposure_profile_id: str | None,
         targeted_tool_grants: TargetedToolGrantFootprint | None,
+        interaction_id: str | None,
         model_completion_recovery_context_factory: ModelCompletionRecoveryContextFactory,
         model_completion_publisher: ModelCompletionPublisher | None = None,
     ) -> None:
@@ -6860,6 +7039,23 @@ class ModelStepRun:
                 targeted_tool_grants.model_dump(mode="python")
             )
         self._targeted_tool_grants = targeted_tool_grants
+        self._targeted_tool_grant_ids = (
+            () if targeted_tool_grants is None else targeted_tool_grants.grant_ids
+        )
+        self._targeted_tool_generation_id = (
+            None if targeted_tool_grants is None else targeted_tool_grants.generation_id
+        )
+        if targeted_tool_grants is None:
+            if interaction_id is not None:
+                interaction_id = require_durable_clean_nonblank(
+                    interaction_id,
+                    "interaction_id",
+                )
+        else:
+            if interaction_id is None:
+                raise ValueError("Targeted tool grants require an active interaction identity.")
+            interaction_id = require_durable_clean_nonblank(interaction_id, "interaction_id")
+        self._interaction_id = interaction_id
         contextual_limits = (
             *budget_limits_for_session(
                 policy=self._budget_policy,
@@ -6922,6 +7118,54 @@ class ModelStepRun:
                 "provider or durable execution authority."
             )
         return exposure
+
+    async def _targeted_gateway_projection(
+        self,
+    ) -> TargetedToolGatewayProjection | None:
+        """Load the current callable subset of the invocation's exact grant batch."""
+
+        if not self._targeted_tool_grant_ids:
+            return None
+        if self._interaction_id is None:
+            raise RuntimeError("Targeted gateway projection lost its interaction identity.")
+        records = await self._executor._session_store.list_targeted_tool_grants(
+            self._session.id,
+            interaction_id=self._interaction_id,
+        )
+        records_by_id = {record.grant_id: record for record in records}
+        if len(records_by_id) != len(records):
+            raise RuntimeError("Targeted gateway durable state contains duplicate grants.")
+        expected_grant_ids = frozenset(self._targeted_tool_grant_ids)
+        if not expected_grant_ids <= records_by_id.keys():
+            raise RuntimeError("Targeted gateway grant batch conflicts with durable state.")
+        observed_at = self._executor._clock()
+        omitted_records = tuple(
+            record
+            for grant_id, record in records_by_id.items()
+            if grant_id not in expected_grant_ids
+        )
+        if any(observed_at < record.expires_at for record in omitted_records):
+            raise RuntimeError("Targeted gateway grant batch omitted a callable durable grant.")
+        ordered_records = tuple(
+            records_by_id[grant_id] for grant_id in self._targeted_tool_grant_ids
+        )
+        expected_generation = self._targeted_tool_generation_id
+        if expected_generation is None:
+            raise RuntimeError("Targeted gateway projection lost its generation identity.")
+        if any(
+            record.interaction_id != self._interaction_id
+            or record.generation_id != expected_generation
+            or record.catalogue_revision != self._registered_agent.tool_catalogue.revision
+            or record.tool_name not in self._tool_capability_ceiling.tool_names
+            for record in ordered_records
+        ):
+            raise RuntimeError("Targeted gateway grant scope conflicts with live authority.")
+        projection = targeted_tool_gateway_projection(
+            ordered_records,
+            catalogue=self._registered_agent.tool_catalogue,
+            observed_at=observed_at,
+        )
+        return projection
 
     async def _abandon_pre_dispatch_model_stage(
         self,
@@ -7060,6 +7304,7 @@ class ModelStepRun:
             step=step,
             transcript_cursor=source_transcript_cursor,
         )
+        targeted_tool_gateway = await self._targeted_gateway_projection()
         exposure_profile_changed = (
             previous_tool_exposure_profile_id is not None
             and previous_tool_exposure_profile_id != tool_exposure.profile_id
@@ -7163,14 +7408,17 @@ class ModelStepRun:
                     thinking=self._thinking,
                     step=step,
                     tool_exposure=tool_exposure,
+                    targeted_tool_gateway=targeted_tool_gateway,
                 ),
                 count_input_tokens=self._context_input_token_counter(
                     step=step,
                     tool_exposure=tool_exposure,
+                    targeted_tool_gateway=targeted_tool_gateway,
                 ),
                 build_cache_prefix_request=self._cache_prefix_request_builder(
                     step=step,
                     tool_exposure=tool_exposure,
+                    targeted_tool_gateway=targeted_tool_gateway,
                 ),
                 secret_redactor=self._executor._secret_redactor,
                 run_compaction=run_automatic_compaction,
@@ -7296,6 +7544,7 @@ class ModelStepRun:
             thinking=self._thinking,
             step=step,
             tool_exposure=tool_exposure,
+            targeted_tool_gateway=targeted_tool_gateway,
         )
         if self._execution_profile is None:
             raise RuntimeError("Tool exposure evidence requires an execution profile.")
@@ -7332,6 +7581,7 @@ class ModelStepRun:
             tool_exposure_evidence=tool_exposure_evidence,
             memory_evidence_reference=memory_evidence_reference,
             memory_evidence_key=evidence_key,
+            targeted_tool_gateway=targeted_tool_gateway,
         )
         try:
             async for event, outcome in request_events:
@@ -7352,6 +7602,7 @@ class ModelStepRun:
         tool_exposure_evidence: ToolExposure | None = None,
         memory_evidence_reference: MemoryEvidenceReference | None = None,
         memory_evidence_key: MemoryEvidenceKey | None = None,
+        targeted_tool_gateway: TargetedToolGatewayProjection | None = None,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
         if memory_evidence_reference is not None and self._model_completion_publisher is None:
@@ -7849,6 +8100,7 @@ class ModelStepRun:
             tool_exposure_evidence=tool_exposure_evidence,
             memory_evidence_reference=memory_evidence_reference,
             memory_evidence_key=memory_evidence_key,
+            targeted_tool_gateway=targeted_tool_gateway,
         )
         guarded_events = controller.model_step_events_with_heartbeat(
             model_step_events,
@@ -8037,6 +8289,7 @@ class ModelStepRun:
         tool_exposure_evidence: ToolExposure,
         memory_evidence_reference: MemoryEvidenceReference | None,
         memory_evidence_key: MemoryEvidenceKey | None,
+        targeted_tool_gateway: TargetedToolGatewayProjection | None,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
         request_variant = RequestVariant(request_variant)
@@ -8101,6 +8354,7 @@ class ModelStepRun:
                 tool_exposure=tool_exposure,
                 tool_exposure_evidence=tool_exposure_evidence,
                 targeted_tool_grants=self._targeted_tool_grants,
+                targeted_tool_gateway=targeted_tool_gateway,
                 memory_evidence_reference=evidence_reference,
             )
 
@@ -8227,14 +8481,17 @@ class ModelStepRun:
                     thinking=self._thinking,
                     step=step,
                     tool_exposure=tool_exposure,
+                    targeted_tool_gateway=targeted_tool_gateway,
                 ),
                 count_input_tokens=self._context_input_token_counter(
                     step=step,
                     tool_exposure=tool_exposure,
+                    targeted_tool_gateway=targeted_tool_gateway,
                 ),
                 build_cache_prefix_request=self._cache_prefix_request_builder(
                     step=step,
                     tool_exposure=tool_exposure,
+                    targeted_tool_gateway=targeted_tool_gateway,
                 ),
                 secret_redactor=self._executor._secret_redactor,
                 run_compaction=run_automatic_compaction,
@@ -8398,6 +8655,7 @@ class ModelStepRun:
             thinking=self._thinking,
             step=step,
             tool_exposure=tool_exposure,
+            targeted_tool_gateway=targeted_tool_gateway,
         )
         yield (
             await self._executor._event_writer.emit(
@@ -9545,6 +9803,7 @@ class ModelStepRun:
         *,
         step: int,
         tool_exposure: ResolvedToolExposure,
+        targeted_tool_gateway: TargetedToolGatewayProjection | None,
     ) -> Callable[[list[Message]], Awaitable[int | None]]:
         async def count_input_tokens(context_messages: list[Message]) -> int | None:
             request = await self._executor.build_request(
@@ -9556,6 +9815,7 @@ class ModelStepRun:
                 thinking=self._thinking,
                 step=step,
                 tool_exposure=tool_exposure,
+                targeted_tool_gateway=targeted_tool_gateway,
             )
             # Context-policy execution can await arbitrary application code.
             # Reject changed provider semantics at the final remote count seam.
@@ -9573,6 +9833,7 @@ class ModelStepRun:
         *,
         step: int,
         tool_exposure: ResolvedToolExposure,
+        targeted_tool_gateway: TargetedToolGatewayProjection | None,
     ) -> Callable[[list[Message]], Awaitable[ModelRequest]]:
         async def build_cache_prefix_request(context_messages: list[Message]) -> ModelRequest:
             return await self._executor.build_request(
@@ -9584,6 +9845,7 @@ class ModelStepRun:
                 thinking=self._thinking,
                 step=step,
                 tool_exposure=tool_exposure,
+                targeted_tool_gateway=targeted_tool_gateway,
             )
 
         return build_cache_prefix_request
@@ -9986,6 +10248,7 @@ def _model_request_tools(
     *,
     tool_exposure: ResolvedToolExposure,
     structured_output: StructuredOutputSpec | None,
+    targeted_tool_gateway: TargetedToolGatewayProjection | None = None,
 ) -> list[dict[str, Any]]:
     """Build detached tool declarations shared by preflight and model dispatch."""
 
@@ -10002,6 +10265,8 @@ def _model_request_tools(
         and structured_output.strategy == StructuredOutputStrategy.TOOL
     ):
         tools.append(structured_output_tool_spec(structured_output))
+    if targeted_tool_gateway is not None:
+        tools.append(targeted_tool_gateway.tool_spec())
     return tools
 
 
@@ -10054,15 +10319,43 @@ def _model_request_messages(
     *,
     messages: list[Message],
     structured_output: StructuredOutputSpec | None,
+    targeted_tool_gateway: TargetedToolGatewayProjection | None = None,
 ) -> list[Message]:
     """Return the complete statically determined message surface for one request."""
 
+    projected = messages
     if (
         structured_output is not None
         and structured_output.strategy == StructuredOutputStrategy.TOOL
     ):
-        return _with_structured_output_tool_instruction(messages, structured_output)
-    return messages
+        projected = _with_structured_output_tool_instruction(projected, structured_output)
+    if targeted_tool_gateway is None:
+        return projected
+    return _with_targeted_tool_gateway_instruction(
+        projected,
+        targeted_tool_gateway=targeted_tool_gateway,
+    )
+
+
+def _with_targeted_tool_gateway_instruction(
+    messages: list[Message],
+    *,
+    targeted_tool_gateway: TargetedToolGatewayProjection,
+    redactor: SecretRedactor | None = None,
+) -> list[Message]:
+    """Insert one detached runtime-authored gateway descriptor message."""
+
+    if type(targeted_tool_gateway) is not TargetedToolGatewayProjection:
+        raise TypeError("targeted_tool_gateway must be a TargetedToolGatewayProjection.")
+    copied = [detach_message(message) for message in messages]
+    insert_at = 0
+    while insert_at < len(copied) and copied[insert_at].role == MessageRole.SYSTEM:
+        insert_at += 1
+    copied.insert(
+        insert_at,
+        targeted_tool_gateway.instruction_message(redactor=redactor),
+    )
+    return copied
 
 
 def _context_pressure_overhead(
@@ -10074,6 +10367,7 @@ def _context_pressure_overhead(
     thinking: ThinkingConfig | None,
     step: int,
     tool_exposure: ResolvedToolExposure,
+    targeted_tool_gateway: TargetedToolGatewayProjection | None = None,
 ) -> ContextPressureOverhead:
     profile = copy_model_context_pressure_profile(
         registered_provider.provider.context_pressure_profile
@@ -10081,6 +10375,7 @@ def _context_pressure_overhead(
     tools = _model_request_tools(
         tool_exposure=tool_exposure,
         structured_output=structured_output,
+        targeted_tool_gateway=targeted_tool_gateway,
     )
     structured_output_instruction: str | None = None
     if (
@@ -10088,6 +10383,13 @@ def _context_pressure_overhead(
         and structured_output.strategy == StructuredOutputStrategy.TOOL
     ):
         structured_output_instruction = structured_output_tool_instruction(structured_output)
+    if targeted_tool_gateway is not None:
+        gateway_instruction = targeted_tool_gateway.instruction_text()
+        structured_output_instruction = (
+            gateway_instruction
+            if structured_output_instruction is None
+            else structured_output_instruction + "\n" + gateway_instruction
+        )
 
     request_options: dict[str, Any] = {
         **copy_json_value(

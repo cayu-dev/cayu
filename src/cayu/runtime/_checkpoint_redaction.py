@@ -10,6 +10,8 @@ from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
 )
 from cayu.runtime.structured_output import json_schema_contains_secret
+from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
+from cayu.runtime.tool_grants import ResolvedTargetedToolInvocation, validate_targeted_tool_digest
 from cayu.vaults import SecretRedactor
 
 _DURABLE_STRUCTURE_STRING_FIELDS = frozenset(
@@ -266,6 +268,19 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "registered_count",
     "ceiling_count",
     "tool_calls",
+    "targeted_tool_grant_id",
+    "targeted_tool_invocation",
+    "targeted_tool_rejection",
+    "tool_ref",
+    "grant_id",
+    "use_id",
+    "dispatch_kind",
+    "model_tool_name",
+    "effective_tool_name",
+    "outer_tool_call_id",
+    "arguments_sha256",
+    "invocation_id",
+    "rejection_event_id",
     "usage_triggered_context",
     "url",
     "version",
@@ -492,6 +507,7 @@ _WORKSPACE_OBSERVATION_IDENTITY_FIELDS = frozenset(
 )
 _PENDING_TOOL_ROUND_EXECUTION_IDENTITY_FIELDS = frozenset(
     {
+        "interaction_id",
         "model_attempt_id",
         "model_step_id",
         "source_model_step_id",
@@ -533,10 +549,15 @@ def durable_value_contains_secret(
     redactor: SecretRedactor,
     path: tuple[str, ...] = (),
     _trusted_web_control_paths: frozenset[tuple[str, ...]] = frozenset(),
+    _trusted_targeted_tool_references: frozenset[tuple[tuple[str, ...], str]] | None = None,
 ) -> bool:
     """Return whether a checkpoint tree contains secret text outside schema-owned keys."""
 
+    if _trusted_targeted_tool_references is None:
+        _trusted_targeted_tool_references = _targeted_tool_reference_authority(value, path=path)
     if type(value) is str:
+        if (path, value) in _trusted_targeted_tool_references:
+            return False
         if path in _trusted_web_control_paths:
             # Exact closed controls are runtime protocol, not copied workload
             # text. The complete persisted attestation was validated before
@@ -585,6 +606,7 @@ def durable_value_contains_secret(
                 redactor=redactor,
                 path=path,
                 _trusted_web_control_paths=_trusted_web_control_paths,
+                _trusted_targeted_tool_references=_trusted_targeted_tool_references,
             )
             for item in value
         )
@@ -634,10 +656,90 @@ def durable_value_contains_secret(
                 redactor=redactor,
                 path=(*path, key),
                 _trusted_web_control_paths=trusted_web_control_paths,
+                _trusted_targeted_tool_references=_trusted_targeted_tool_references,
             ):
                 return True
         return False
     raise AssertionError("Durable checkpoint contains non-JSON-compatible data.")
+
+
+def _targeted_tool_reference_authority(
+    value: Any,
+    *,
+    path: tuple[str, ...],
+) -> frozenset[tuple[tuple[str, ...], str]]:
+    """Recognize exact runtime-selected gateway references in typed checkpoints."""
+
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    if not path and type(value) is dict:
+        for root in ("pending_tool_round", "pending_tool_approval", "pending_user_input"):
+            candidate = value.get(root)
+            if type(candidate) is dict:
+                candidates.append((root, candidate))
+    elif (
+        len(path) == 1
+        and path[0]
+        in {
+            "pending_tool_round",
+            "pending_tool_approval",
+            "pending_user_input",
+        }
+        and type(value) is dict
+    ):
+        candidates.append((path[0], value))
+
+    trusted: set[tuple[tuple[str, ...], str]] = set()
+    for root, candidate in candidates:
+        calls = candidate.get("tool_calls")
+        if type(calls) is not list:
+            continue
+        for call in calls:
+            if type(call) is not dict:
+                continue
+            grant_id = call.get("targeted_tool_grant_id")
+            if type(grant_id) is not str:
+                continue
+            try:
+                validate_targeted_tool_digest(grant_id, "targeted_tool_grant_id")
+            except ValueError:
+                continue
+            if (
+                call.get("tool_name") != CALL_TOOL_NAME
+                and call.get("model_tool_name") != CALL_TOOL_NAME
+            ):
+                continue
+            trusted.add(((root, "tool_calls", "targeted_tool_grant_id"), grant_id))
+            arguments = call.get("arguments")
+            if type(arguments) is dict:
+                tool_ref = arguments.get("tool_ref")
+                if type(tool_ref) is str:
+                    trusted.add(((root, "tool_calls", "arguments", "tool_ref"), tool_ref))
+            invocation = call.get("targeted_tool_invocation")
+            if type(invocation) is not dict:
+                continue
+            try:
+                resolved = ResolvedTargetedToolInvocation.model_validate(invocation)
+            except ValueError:
+                continue
+            if resolved.grant_id != grant_id:
+                continue
+            for field_name in (
+                "arguments_sha256",
+                "catalogue_revision",
+                "descriptor_version",
+                "grant_id",
+                "invocation_id",
+                "schema_fingerprint",
+                "tool_ref",
+                "use_id",
+            ):
+                trusted.add(
+                    (
+                        (root, "tool_calls", "targeted_tool_invocation", field_name),
+                        getattr(resolved, field_name),
+                    )
+                )
+    return frozenset(trusted)
 
 
 def _is_active_invocation_profile_identity_path(path: tuple[str, ...]) -> bool:

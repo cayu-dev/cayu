@@ -10,6 +10,7 @@ from cayu.runtime import _approval_support as approval_support
 from cayu.runtime._assistant_tool_round_publication import StagedToolCallTerminal
 from cayu.runtime._tool_round_recovery import PendingToolRound
 from cayu.runtime.approvals import PendingToolCallApproval
+from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
 from cayu.runtime.tool_exposure import (
     ResolvedToolExposureAuthority,
     unexposed_tool_result,
@@ -195,6 +196,37 @@ def _user_input_with_unexposed_stage() -> PendingUserInput:
 def test_pending_tool_round_state_rejects_duplicate_call_identity(build) -> None:
     with pytest.raises(ValidationError, match="duplicate tool-call identities"):
         build([_call(), _call()])
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "interaction_id"),
+    (
+        (CALL_TOOL_NAME, None),
+        ("deploy", "interaction_1"),
+    ),
+)
+def test_pending_tool_round_pairs_gateway_calls_with_interaction_authority(
+    tool_name: str,
+    interaction_id: str | None,
+) -> None:
+    with pytest.raises(ValidationError, match="must be present together"):
+        PendingToolRound(
+            **_identity(),
+            agent_name="assistant",
+            interaction_id=interaction_id,
+            tool_calls=[_call(tool_name=tool_name)],
+        )
+
+
+def test_pending_gateway_round_retains_its_interaction_authority() -> None:
+    pending = PendingToolRound(
+        **_identity(),
+        agent_name="assistant",
+        interaction_id="interaction_1",
+        tool_calls=[_call(tool_name=CALL_TOOL_NAME)],
+    )
+
+    assert pending.interaction_id == "interaction_1"
 
 
 @pytest.mark.parametrize(

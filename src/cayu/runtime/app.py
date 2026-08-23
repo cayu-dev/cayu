@@ -1072,6 +1072,7 @@ class CayuApp:
             max_total_file_attachment_bytes=self._max_total_file_attachment_bytes,
             max_file_attachments_per_request=self._max_file_attachments_per_request,
             secret_redactor=self._secret_redactor,
+            clock=self._clock,
             checkpoint_transform=(
                 self._environment_lifecycle.checkpoint_transform_preserving_runtime_state
             ),

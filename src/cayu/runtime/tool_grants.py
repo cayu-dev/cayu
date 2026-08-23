@@ -29,6 +29,7 @@ from cayu.runtime.tool_catalogue import (
     validate_tool_descriptor_version,
 )
 from cayu.runtime.tool_exposure import ToolCapabilityCeiling
+from cayu.vaults.redaction import REDACTED_SECRET
 
 TARGETED_TOOL_GRANT_SCHEMA_VERSION = 1
 TARGETED_TOOL_GRANT_MAX_REQUESTS = 32
@@ -45,12 +46,24 @@ TARGETED_TOOL_GRANT_EXECUTION_ID_MAX_BYTES = 2048
 TARGETED_TOOL_REFERENCE_MAX_BYTES = 256
 TARGETED_TOOL_REFERENCE_FIELD_NAME = "tool_ref"
 TARGETED_TOOL_DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
+TARGETED_TOOL_TRANSCRIPT_REFERENCE = REDACTED_SECRET
 
 
 def _bounded_utf8_text(value: str, field_name: str, *, max_bytes: int) -> str:
     value = require_durable_clean_nonblank(value, field_name)
     if len(value.encode("utf-8")) > max_bytes:
         raise ValueError(f"{field_name} cannot exceed {max_bytes} UTF-8 bytes.")
+    return value
+
+
+def validate_targeted_tool_digest(value: str, field_name: str) -> str:
+    """Validate one canonical targeted-tool SHA-256 identity."""
+
+    value = require_durable_clean_nonblank(value, field_name)
+    prefix = "sha256:"
+    digest = value[len(prefix) :] if value.startswith(prefix) else ""
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError(f"{field_name} must be a canonical SHA-256 identity.")
     return value
 
 
@@ -979,6 +992,7 @@ class TargetedToolUseRejectionReason(StrEnum):
     OUT_OF_CEILING = "out_of_ceiling"
     CATALOGUE_DRIFT = "catalogue_drift"
     DESCRIPTOR_DRIFT = "descriptor_drift"
+    INVALID_ARGUMENTS = "invalid_arguments"
     ALTERED_REPLAY = "altered_replay"
 
 
@@ -1141,6 +1155,157 @@ class TargetedToolUseBinding(BaseModel):
         if self.use_id != expected_use_id:
             raise ValueError("use_id conflicts with immutable targeted tool use evidence.")
         return self
+
+
+class ResolvedTargetedToolInvocation(BaseModel):
+    """Durable dual identity for one accepted ``call_tool`` envelope.
+
+    The provider transcript retains the outer ``call_tool`` call and identifier.
+    Policy and execution use the canonical effective target recorded here.  The
+    opaque reference is private checkpoint material required to rejoin the
+    already-bound consumption after process loss; it is never public evidence.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    schema_version: Literal[1] = TARGETED_TOOL_GRANT_SCHEMA_VERSION
+    dispatch_kind: Literal["gateway"] = "gateway"
+    model_tool_name: Literal["call_tool"] = "call_tool"
+    tool_ref: str
+    grant_id: str = Field(pattern=TARGETED_TOOL_DIGEST_PATTERN)
+    use_id: str = Field(pattern=TARGETED_TOOL_DIGEST_PATTERN)
+    session_id: str
+    interaction_id: str
+    tool_id: str
+    effective_tool_name: str
+    catalogue_revision: str
+    descriptor_version: str
+    schema_fingerprint: str = Field(pattern=TARGETED_TOOL_DIGEST_PATTERN)
+    model_step_id: str
+    outer_tool_call_id: str
+    arguments_sha256: str = Field(pattern=TARGETED_TOOL_DIGEST_PATTERN)
+    invocation_id: str
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version(cls, value: object) -> object:
+        if type(value) is not int or value != TARGETED_TOOL_GRANT_SCHEMA_VERSION:
+            raise ValueError("Resolved targeted invocation schema_version must be 1.")
+        return value
+
+    @field_validator("tool_ref")
+    @classmethod
+    def validate_tool_ref(cls, value: str) -> str:
+        return _bounded_utf8_text(
+            value,
+            "tool_ref",
+            max_bytes=TARGETED_TOOL_REFERENCE_MAX_BYTES,
+        )
+
+    @field_validator("grant_id", "use_id")
+    @classmethod
+    def validate_digest_identity(cls, value: str, info) -> str:
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("session_id", "interaction_id")
+    @classmethod
+    def validate_scope_identity(cls, value: str, info) -> str:
+        return _bounded_utf8_text(
+            value,
+            info.field_name,
+            max_bytes=TARGETED_TOOL_GRANT_SCOPE_ID_MAX_BYTES,
+        )
+
+    @field_validator("tool_id")
+    @classmethod
+    def validate_tool_id(cls, value: str) -> str:
+        return validate_canonical_tool_id(value)
+
+    @field_validator("effective_tool_name")
+    @classmethod
+    def validate_effective_tool_name(cls, value: str) -> str:
+        return _bounded_utf8_text(
+            value,
+            "effective_tool_name",
+            max_bytes=TARGETED_TOOL_GRANT_SCOPE_ID_MAX_BYTES,
+        )
+
+    @field_validator("catalogue_revision")
+    @classmethod
+    def validate_catalogue_revision(cls, value: str) -> str:
+        return validate_tool_catalogue_revision(value)
+
+    @field_validator("descriptor_version")
+    @classmethod
+    def validate_descriptor_version(cls, value: str) -> str:
+        return validate_tool_descriptor_version(value)
+
+    @field_validator("model_step_id", "outer_tool_call_id", "invocation_id")
+    @classmethod
+    def validate_execution_identity(cls, value: str, info) -> str:
+        return _bounded_utf8_text(
+            value,
+            info.field_name,
+            max_bytes=TARGETED_TOOL_GRANT_EXECUTION_ID_MAX_BYTES,
+        )
+
+    @model_validator(mode="after")
+    def validate_use_id(self) -> ResolvedTargetedToolInvocation:
+        expected_use_id = _sha256_identity(
+            {
+                "record_type": "cayu.targeted-tool-use",
+                "schema_version": self.schema_version,
+                "grant_id": self.grant_id,
+                "session_id": self.session_id,
+                "interaction_id": self.interaction_id,
+                "model_step_id": self.model_step_id,
+                "outer_tool_call_id": self.outer_tool_call_id,
+                "arguments_sha256": self.arguments_sha256,
+                "invocation_id": self.invocation_id,
+            },
+            "targeted_tool_use",
+        )
+        if self.use_id != expected_use_id:
+            raise ValueError("use_id conflicts with resolved targeted tool authority.")
+        return self
+
+
+class RejectedTargetedToolInvocation(BaseModel):
+    """Durable fail-closed outcome for a rejected ``call_tool`` envelope."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    schema_version: Literal[1] = TARGETED_TOOL_GRANT_SCHEMA_VERSION
+    dispatch_kind: Literal["gateway"] = "gateway"
+    model_tool_name: Literal["call_tool"] = "call_tool"
+    reason: TargetedToolUseRejectionReason
+    rejection_event_id: str
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version(cls, value: object) -> object:
+        if type(value) is not int or value != TARGETED_TOOL_GRANT_SCHEMA_VERSION:
+            raise ValueError("Rejected targeted invocation schema_version must be 1.")
+        return value
+
+    @field_validator("rejection_event_id")
+    @classmethod
+    def validate_rejection_event_id(cls, value: str) -> str:
+        return _bounded_utf8_text(
+            value,
+            "rejection_event_id",
+            max_bytes=TARGETED_TOOL_GRANT_EXECUTION_ID_MAX_BYTES,
+        )
 
 
 def targeted_tool_use_binding(

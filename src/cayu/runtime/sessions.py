@@ -240,6 +240,7 @@ from cayu.runtime.structured_output import (
     copy_structured_output_spec,
 )
 from cayu.runtime.tasks import TaskInvocationSnapshot
+from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
 from cayu.runtime.tool_exposure import (
     TOOL_CAPABILITY_CEILING_METADATA_KEY,
     ToolCapabilityCeiling,
@@ -252,6 +253,7 @@ from cayu.runtime.tool_grants import (
     TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS,
     TARGETED_TOOL_GRANT_MAX_REQUESTS,
     TARGETED_TOOL_REFERENCE_FIELD_NAME,
+    TARGETED_TOOL_TRANSCRIPT_REFERENCE,
     TargetedToolGrant,
     TargetedToolGrantIssueOutcome,
     TargetedToolGrantIssueResult,
@@ -18657,7 +18659,11 @@ def _validate_tool_round_publication(
         ):
             raise ValueError("A tool-round transcript result has a conflicting execution identity.")
         terminal = terminal_by_call[part.tool_call_id]
-        if terminal.tool_name != part.tool_name:
+        terminal_is_gateway = (
+            terminal.payload.get("dispatch_kind") == "gateway"
+            and terminal.payload.get("model_tool_name") == part.tool_name
+        )
+        if terminal.tool_name != part.tool_name and not terminal_is_gateway:
             raise ValueError(
                 "A tool-round terminal event tool name conflicts with its transcript result."
             )
@@ -18665,11 +18671,18 @@ def _validate_tool_round_publication(
         if type(terminal_idempotency_key) is not str or not terminal_idempotency_key:
             raise ValueError("A tool-round terminal event requires a stable idempotency key.")
         started = started_by_call.get(part.tool_call_id)
-        if started is not None and (
-            started.tool_name != part.tool_name
-            or started.payload.get("idempotency_key") != terminal_idempotency_key
-        ):
-            raise ValueError("A tool-round started event conflicts with its terminal event.")
+        if started is not None:
+            started_is_gateway = (
+                started.payload.get("dispatch_kind") == "gateway"
+                and started.payload.get("model_tool_name") == part.tool_name
+            )
+            if (
+                (started.tool_name != part.tool_name and not started_is_gateway)
+                or started.tool_name != terminal.tool_name
+                or started.payload.get("idempotency_key") != terminal_idempotency_key
+                or started_is_gateway != terminal_is_gateway
+            ):
+                raise ValueError("A tool-round started event conflicts with its terminal event.")
         expected_result = {
             "content": part.content,
             "structured": part.structured,
@@ -18697,17 +18710,43 @@ def _validate_tool_round_publication(
         ):
             raise ValueError("A deferred assistant tool call has a conflicting execution identity.")
         terminal = terminal_by_call[part.tool_call_id]
-        if terminal.tool_name != part.tool_name:
+        terminal_is_gateway = (
+            terminal.payload.get("dispatch_kind") == "gateway"
+            and terminal.payload.get("model_tool_name") == part.tool_name
+        )
+        if terminal.tool_name != part.tool_name and not terminal_is_gateway:
             raise ValueError("A deferred assistant tool name conflicts with terminal evidence.")
         arguments_state = terminal.payload.get("arguments_state")
         expected_arguments = (
             terminal.payload.get("arguments") if arguments_state == "finalized" else {}
         )
-        if (
-            arguments_state not in {"finalized", "unavailable"}
-            or type(expected_arguments) is not dict
-            or not _runtime_publication_json_equal(part.arguments, expected_arguments)
-        ):
+        arguments_match = type(expected_arguments) is dict and _runtime_publication_json_equal(
+            part.arguments, expected_arguments
+        )
+        if terminal_is_gateway:
+            outer_arguments = part.arguments
+            inner_arguments = outer_arguments.get("arguments")
+            tool_ref = outer_arguments.get("tool_ref")
+            gateway_projection_matches = (
+                set(outer_arguments) == {"tool_ref", "arguments"}
+                and tool_ref == TARGETED_TOOL_TRANSCRIPT_REFERENCE
+                and type(inner_arguments) is dict
+            )
+            arguments_match = False
+            if gateway_projection_matches:
+                if arguments_state == "unavailable":
+                    arguments_match = not inner_arguments
+                elif arguments_state == "finalized":
+                    assert type(inner_arguments) is dict
+                    arguments_match = (
+                        terminal.payload.get("arguments_sha256")
+                        == f"sha256:{sha256(canonical_durable_json_bytes(inner_arguments, 'arguments')).hexdigest()}"
+                        and _runtime_publication_json_equal(
+                            inner_arguments,
+                            expected_arguments,
+                        )
+                    )
+        if arguments_state not in {"finalized", "unavailable"} or not arguments_match:
             raise ValueError(
                 "A deferred assistant argument projection conflicts with terminal evidence."
             )
@@ -19470,6 +19509,7 @@ def _validate_assistant_model_completion_publication(
         "model_step_id",
         "model_attempt_id",
         "agent_name",
+        "interaction_id",
         "environment_name",
         "task_id",
         "source_run_epoch",
@@ -19540,6 +19580,14 @@ def _validate_assistant_model_completion_publication(
         raise ValueError("The pending tool round has a conflicting source run epoch.")
     try:
         require_clean_nonblank(marker.get("agent_name"), "pending tool-round agent_name")
+        marker_interaction_id = marker.get("interaction_id")
+        if marker_interaction_id is not None:
+            require_clean_nonblank(
+                marker_interaction_id,
+                "pending tool-round interaction_id",
+            )
+            if marker_interaction_id != completed_event.interaction_id:
+                raise ValueError("pending tool-round interaction_id conflicts with the model step")
         for field_name in ("environment_name", "task_id"):
             value = marker.get(field_name)
             if value is not None:
@@ -19569,7 +19617,7 @@ def _validate_assistant_model_completion_publication(
             pending_call.tool_call_id != tool_call.tool_call_id
             or pending_call.tool_name != tool_call.tool_name
             or not _runtime_publication_json_equal(
-                pending_call.arguments,
+                pending_call.transcript_arguments,
                 tool_call.arguments,
             )
         ):
@@ -19582,6 +19630,11 @@ def _validate_assistant_model_completion_publication(
             or pending_call.active_taint_labels
         ):
             raise ValueError("A newly published pending tool round cannot contain policy outcomes.")
+    if (
+        any(tool_call.tool_name == CALL_TOOL_NAME for tool_call in tool_calls)
+        and marker.get("interaction_id") != completed_event.interaction_id
+    ):
+        raise ValueError("A pending call_tool round requires its interaction identity.")
 
     raw_structured_output = marker.get("structured_output")
     structured_output = None

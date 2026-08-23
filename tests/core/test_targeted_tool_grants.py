@@ -6,6 +6,7 @@ import io
 import json
 import secrets
 import sqlite3
+import urllib.request
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -28,6 +29,7 @@ from cayu import (
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
+    PostgresSessionStore,
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
     RecentTurnsContextPolicy,
@@ -35,6 +37,8 @@ from cayu import (
     RetryPolicy,
     RunRequest,
     SessionRunFenced,
+    StaticToolExposurePolicy,
+    StructuredOutputSpec,
     TargetedToolGrant,
     TargetedToolGrantInspection,
     TargetedToolGrantRecord,
@@ -48,11 +52,32 @@ from cayu import (
     ToolApprovalRequest,
     ToolContext,
     ToolEffect,
+    ToolPolicy,
+    ToolPolicyDecision,
+    ToolPolicyRequest,
+    ToolPolicyResult,
     ToolResult,
     ToolSpec,
 )
-from cayu.providers import ModelContextOverflowError, ModelProviderError
+from cayu.providers import (
+    ModelContextOverflowError,
+    ModelProviderError,
+    ProviderOperationAdapter,
+    ProviderOperationConnection,
+    ProviderOperationMode,
+    ProviderOperationSnapshot,
+    ProviderOperationStartRequest,
+    ProviderOperationState,
+    ProviderOperationStatus,
+)
+from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.runtime.tool_gateway import (
+    TargetedToolGatewayGrant,
+    TargetedToolGatewayProjection,
+    validate_effective_tool_arguments,
+)
 from cayu.runtime.tool_grants import (
+    TARGETED_TOOL_TRANSCRIPT_REFERENCE,
     PreparedTargetedToolGrant,
     build_targeted_tool_grant_record,
     copy_targeted_tool_grant_record,
@@ -66,6 +91,8 @@ from cayu.runtime.tool_grants import (
 )
 from cayu.storage import SQLiteSessionStore
 from cayu.storage.jsonl_export import export_sessions, import_sessions
+from cayu.storage.migrations import SchemaMode
+from cayu.vaults import SecretRedactor
 
 
 class _Provider(ModelProvider):
@@ -153,6 +180,369 @@ class _RememberTool(Tool):
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         del ctx, args
         raise AssertionError("Targeted grant tests must not execute the tool.")
+
+
+class _GatewayRememberTool(Tool):
+    spec = ToolSpec(
+        name="remember",
+        description="Remember one reviewed fact.",
+        input_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"fact": {"type": "string", "minLength": 1}},
+            "required": ["fact"],
+        },
+        effect=ToolEffect.NONE,
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:targeted-tool-grants:gateway-remember",
+            behavior_version="1",
+            implementation_version="1",
+        ),
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[dict] = []
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del ctx
+        self.calls.append(dict(args))
+        return ToolResult(content=f"remembered: {args['fact']}")
+
+
+class _PrivateArgumentsGatewayRememberTool(_GatewayRememberTool):
+    @property
+    def _publish_arguments(self) -> bool:
+        return False
+
+
+class _GatewayOtherTool(Tool):
+    spec = ToolSpec(
+        name="other",
+        description="Run another targeted operation.",
+        input_schema={
+            "type": "object",
+            "additionalProperties": False,
+        },
+        effect=ToolEffect.NONE,
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:targeted-tool-grants:gateway-other",
+            behavior_version="1",
+            implementation_version="1",
+        ),
+    )
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del ctx, args
+        return ToolResult(content="other")
+
+
+class _RemoteRefGatewayTool(_GatewayRememberTool):
+    spec = _GatewayRememberTool.spec.model_copy(
+        update={"input_schema": {"$ref": "https://schemas.example.invalid/remember.json"}}
+    )
+
+
+class _GatewayProvider(_Provider):
+    name = "gateway-fake"
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            assert [tool["name"] for tool in request.tools] == ["call_tool"]
+            gateway_message = next(
+                message
+                for message in request.messages
+                if message.role == "system"
+                and message.content[0].text.startswith("Cayu runtime targeted-tool context")
+            )
+            projection = json.loads(gateway_message.content[0].text.rsplit("\n", 1)[1])
+            [descriptor] = projection["tools"]
+            assert descriptor["tool_id"] == "cayu:remember"
+            assert descriptor["name"] == "remember"
+            assert descriptor["input_schema"] == _GatewayRememberTool.spec.input_schema
+            yield ModelStreamEvent.tool_call(
+                id="outer-call",
+                name="call_tool",
+                arguments={
+                    "tool_ref": descriptor["tool_ref"],
+                    "arguments": {"fact": "Keep the gateway identity stable."},
+                },
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        assistant_call = next(
+            part
+            for message in request.messages
+            if message.role == "assistant"
+            for part in message.content
+            if part.type == "tool_call"
+        )
+        tool_result = next(
+            part
+            for message in request.messages
+            if message.role == "tool"
+            for part in message.content
+            if part.type == "tool_result"
+        )
+        assert assistant_call.tool_call_id == tool_result.tool_call_id == "outer-call"
+        assert assistant_call.tool_name == tool_result.tool_name == "call_tool"
+        assert tool_result.content == "remembered: Keep the gateway identity stable."
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _MultiCallGatewayProvider(_Provider):
+    name = "multi-call-gateway-fake"
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            gateway_message = next(
+                message
+                for message in request.messages
+                if message.role == "system"
+                and message.content[0].text.startswith("Cayu runtime targeted-tool context")
+            )
+            projection = json.loads(gateway_message.content[0].text.rsplit("\n", 1)[1])
+            [descriptor] = projection["tools"]
+            for index in range(2):
+                yield ModelStreamEvent.tool_call(
+                    id=f"outer-call-{index}",
+                    name="call_tool",
+                    arguments={
+                        "tool_ref": descriptor["tool_ref"],
+                        "arguments": {"fact": f"Fact {index}."},
+                    },
+                )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        assistant_calls = [
+            part
+            for message in request.messages
+            if message.role == "assistant"
+            for part in message.content
+            if part.type == "tool_call"
+        ]
+        tool_results = [
+            part
+            for message in request.messages
+            if message.role == "tool"
+            for part in message.content
+            if part.type == "tool_result"
+        ]
+        assert [part.tool_call_id for part in assistant_calls] == [
+            "outer-call-0",
+            "outer-call-1",
+        ]
+        assert [part.tool_call_id for part in tool_results] == [
+            "outer-call-0",
+            "outer-call-1",
+        ]
+        assert all(part.tool_name == "call_tool" for part in (*assistant_calls, *tool_results))
+        assert all(
+            part.arguments
+            == {
+                "tool_ref": TARGETED_TOOL_TRANSCRIPT_REFERENCE,
+                "arguments": {},
+            }
+            for part in assistant_calls
+        )
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _MixedExpiryGatewayProvider(_Provider):
+    name = "mixed-expiry-gateway-fake"
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        gateway_message = next(
+            message
+            for message in request.messages
+            if message.role == "system"
+            and message.content[0].text.startswith("Cayu runtime targeted-tool context")
+        )
+        projection = json.loads(gateway_message.content[0].text.rsplit("\n", 1)[1])
+        descriptors_by_name = {descriptor["name"]: descriptor for descriptor in projection["tools"]}
+        if len(self.requests) == 1:
+            assert set(descriptors_by_name) == {"other", "remember"}
+            yield ModelStreamEvent.tool_call(
+                id="expiring-remember-call",
+                name="call_tool",
+                arguments={
+                    "tool_ref": descriptors_by_name["remember"]["tool_ref"],
+                    "arguments": {"fact": "Keep the remaining grant callable."},
+                },
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        assert set(descriptors_by_name) == {"other"}
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _BackgroundGatewayAdapter(ProviderOperationAdapter):
+    def __init__(self, provider: _GatewayProvider) -> None:
+        self.provider = provider
+        self.started = 0
+
+    async def start(self, request: ProviderOperationStartRequest) -> ProviderOperationConnection:
+        self.started += 1
+        state = ProviderOperationState(
+            operation_id=f"targeted-operation-{self.started}",
+            stream_protocol="targeted-test-v1",
+            recovery_metadata={"cursor": 0},
+        )
+
+        async def events() -> AsyncIterator[ModelStreamEvent]:
+            cursor = 0
+            async for event in self.provider.stream(request.request):
+                cursor += 1
+                yield ModelStreamEvent.model_validate(
+                    {
+                        **event.model_dump(mode="python"),
+                        "recovery_metadata": {"cursor": cursor},
+                    }
+                )
+
+        return ProviderOperationConnection(
+            state=state,
+            status=ProviderOperationStatus.IN_PROGRESS,
+            events=events(),
+        )
+
+    async def retrieve(self, state: ProviderOperationState) -> ProviderOperationSnapshot:
+        del state
+        raise AssertionError("Live targeted-tool test must not retrieve provider operations.")
+
+    async def reconnect(self, state: ProviderOperationState) -> ProviderOperationConnection:
+        del state
+        raise AssertionError("Live targeted-tool test must not reconnect provider operations.")
+
+
+class _BackgroundGatewayProvider(_GatewayProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.adapter = _BackgroundGatewayAdapter(self)
+
+    @property
+    def provider_operation_mode(self) -> ProviderOperationMode:
+        return ProviderOperationMode.BACKGROUND
+
+    @property
+    def provider_operations(self) -> ProviderOperationAdapter:
+        return self.adapter
+
+
+class _MixedStructuredOutputGatewayProvider(_Provider):
+    name = "mixed-structured-output-gateway-fake"
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            gateway_message = next(
+                message
+                for message in request.messages
+                if message.role == "system"
+                and message.content[0].text.startswith("Cayu runtime targeted-tool context")
+            )
+            projection = json.loads(gateway_message.content[0].text.rsplit("\n", 1)[1])
+            [descriptor] = projection["tools"]
+            yield ModelStreamEvent.tool_call(
+                id="mixed-targeted-call",
+                name="call_tool",
+                arguments={
+                    "tool_ref": descriptor["tool_ref"],
+                    "arguments": {"fact": "must not execute"},
+                },
+            )
+            yield ModelStreamEvent.tool_call(
+                id="mixed-structured-output-call",
+                name=STRUCTURED_OUTPUT_TOOL_NAME,
+                arguments={"output": {"answer": "too early"}},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        yield ModelStreamEvent.tool_call(
+            id="valid-structured-output-call",
+            name=STRUCTURED_OUTPUT_TOOL_NAME,
+            arguments={"output": {"answer": "fixed"}},
+        )
+        yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+
+
+class _RejectedGatewayProvider(_Provider):
+    name = "rejected-gateway-fake"
+
+    def __init__(self, case: str, *, unknown_ref: str | None = None) -> None:
+        super().__init__()
+        self.case = case
+        self.unknown_ref = unknown_ref
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            gateway_message = next(
+                message
+                for message in request.messages
+                if message.role == "system"
+                and message.content[0].text.startswith("Cayu runtime targeted-tool context")
+            )
+            projection = json.loads(gateway_message.content[0].text.rsplit("\n", 1)[1])
+            [descriptor] = projection["tools"]
+            arguments = {
+                "malformed": {"tool_ref": descriptor["tool_ref"]},
+                "unknown": {
+                    "tool_ref": self.unknown_ref or "unknown-reference",
+                    "arguments": {"fact": "not reachable"},
+                },
+                "unknown_secret_collision": {
+                    "tool_ref": self.unknown_ref or "unknown-reference",
+                    "arguments": {"fact": "not reachable"},
+                },
+                "invalid_arguments": {
+                    "tool_ref": descriptor["tool_ref"],
+                    "arguments": {"fact": 42},
+                },
+                "unresolvable_schema": {
+                    "tool_ref": descriptor["tool_ref"],
+                    "arguments": {"fact": "must fail locally"},
+                },
+            }[self.case]
+            yield ModelStreamEvent.tool_call(
+                id=f"{self.case}-outer-call",
+                name="call_tool",
+                arguments=arguments,
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        result = next(
+            part
+            for message in request.messages
+            if message.role == "tool"
+            for part in message.content
+            if part.type == "tool_result"
+        )
+        assert result.tool_name == "call_tool"
+        assert result.tool_call_id == f"{self.case}-outer-call"
+        assert result.is_error is True
+        expected_reason = {
+            "unknown_secret_collision": "malformed",
+            "unresolvable_schema": "invalid_arguments",
+        }.get(self.case, self.case)
+        assert result.structured == {"status": "rejected", "reason": expected_reason}
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _RecordingPolicy(ToolPolicy):
+    def __init__(self) -> None:
+        self.requests: list[ToolPolicyRequest] = []
+
+    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+        self.requests.append(request)
+        return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
 
 
 def _codec() -> PublicAuthorityAliasCodec:
@@ -542,6 +932,636 @@ def test_runtime_issues_before_provider_and_store_binds_exact_replay(
     asyncio.run(run())
 
 
+async def _assert_call_tool_routes_outer_identity(
+    targeted_store,
+    *,
+    session_id: str,
+    secret_redactor: SecretRedactor | None = None,
+    background: bool = False,
+) -> None:
+    provider = _BackgroundGatewayProvider() if background else _GatewayProvider()
+    tool = _GatewayRememberTool()
+    policy = _RecordingPolicy()
+    app = CayuApp(
+        session_store=targeted_store,
+        secret_redactor=secret_redactor,
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=(tool,),
+        tool_policy=policy,
+        tool_exposure_policy=StaticToolExposurePolicy(
+            profile_id="targeted-only",
+            tools=(),
+        ),
+    )
+
+    streamed = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "Review and remember one fact.")],
+                tool_grants=(
+                    TargetedToolGrant(
+                        request_id="remember-reviewed-fact",
+                        tool_id="cayu:remember",
+                        max_calls=1,
+                        lifetime_seconds=60,
+                    ),
+                ),
+            )
+        )
+    ]
+
+    assert streamed[-1].type is EventType.SESSION_COMPLETED
+    assert tool.calls == [{"fact": "Keep the gateway identity stable."}]
+    assert len(policy.requests) == 1
+    assert policy.requests[0].tool_name == "remember"
+    assert policy.requests[0].arguments == {"fact": "Keep the gateway identity stable."}
+    assert len(provider.requests) == 2
+    [record] = await targeted_store.list_targeted_tool_grants(session_id)
+    assert record.used_calls == 1
+    assert record.remaining_calls == 0
+    assert record.tool_ref not in json.dumps(
+        [event.model_dump(mode="json") for event in streamed],
+        sort_keys=True,
+    )
+    durable_events = await targeted_store.load_events(session_id)
+    [consumed] = [
+        event
+        for event in durable_events
+        if event.type is EventType.TARGETED_TOOL_REFERENCE_CONSUMED
+    ]
+    assert consumed.tool_name == "remember"
+    assert consumed.payload["outer_tool_call_id"] == "outer-call"
+    [started] = [event for event in durable_events if event.type is EventType.TOOL_CALL_STARTED]
+    [completed] = [event for event in durable_events if event.type is EventType.TOOL_CALL_COMPLETED]
+    for event in (started, completed):
+        assert event.tool_name == "remember"
+        assert event.payload["dispatch_kind"] == "gateway"
+        assert event.payload["model_tool_name"] == "call_tool"
+        assert event.payload["grant_id"] == record.grant_id
+        assert event.payload["use_id"] == consumed.payload["use_id"]
+    transcript = await targeted_store.load_transcript(session_id)
+    assistant_call = next(
+        part
+        for message in transcript
+        if message.role == "assistant"
+        for part in message.content
+        if part.type == "tool_call"
+    )
+    tool_result = next(
+        part
+        for message in transcript
+        if message.role == "tool"
+        for part in message.content
+        if part.type == "tool_result"
+    )
+    assert assistant_call.tool_call_id == tool_result.tool_call_id == "outer-call"
+    assert assistant_call.tool_name == tool_result.tool_name == "call_tool"
+    assert assistant_call.arguments == {
+        "tool_ref": TARGETED_TOOL_TRANSCRIPT_REFERENCE,
+        "arguments": {"fact": "Keep the gateway identity stable."},
+    }
+    assert record.tool_ref not in json.dumps(
+        [message.model_dump(mode="json") for message in transcript],
+        sort_keys=True,
+    )
+
+
+def test_call_tool_routes_outer_identity_through_the_effective_target(
+    targeted_store,
+) -> None:
+    asyncio.run(
+        _assert_call_tool_routes_outer_identity(
+            targeted_store,
+            session_id="targeted-call-tool",
+        )
+    )
+
+
+def test_call_tool_routes_through_postgres(postgres_dsn: str) -> None:
+    async def run() -> None:
+        store = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=4,
+            schema_mode=SchemaMode.CREATE,
+            public_authority_alias_codec=_codec(),
+        )
+        try:
+            await _assert_call_tool_routes_outer_identity(
+                store,
+                session_id="targeted-call-tool-postgres",
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "secret_collision",
+    ("cayu_authority_v1.", "sha256:"),
+    ids=("public-reference-prefix", "grant-identity-prefix"),
+)
+def test_call_tool_runtime_reference_survives_short_secret_collision(
+    targeted_store,
+    secret_collision: str,
+) -> None:
+    asyncio.run(
+        _assert_call_tool_routes_outer_identity(
+            targeted_store,
+            session_id=f"targeted-call-tool-secret-collision-{len(secret_collision)}",
+            secret_redactor=SecretRedactor(secret_collision),
+        )
+    )
+
+
+def test_background_call_tool_reference_survives_short_secret_collision(targeted_store) -> None:
+    asyncio.run(
+        _assert_call_tool_routes_outer_identity(
+            targeted_store,
+            session_id="targeted-background-call-tool-secret-collision",
+            secret_redactor=SecretRedactor("cayu_authority_v1."),
+            background=True,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "projection_case",
+    ("private_tool", "multi_call_round"),
+)
+def test_call_tool_preserves_unavailable_argument_projections(
+    targeted_store,
+    projection_case: str,
+) -> None:
+    async def run() -> None:
+        multi_call = projection_case == "multi_call_round"
+        session_id = f"targeted-call-tool-unavailable-{projection_case}"
+        provider = _MultiCallGatewayProvider() if multi_call else _GatewayProvider()
+        tool = _GatewayRememberTool() if multi_call else _PrivateArgumentsGatewayRememberTool()
+        app = CayuApp(session_store=targeted_store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(tool,),
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="targeted-only",
+                tools=(),
+            ),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "Remember the requested facts.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="remember-facts",
+                            tool_id="cayu:remember",
+                            max_calls=2 if multi_call else 1,
+                        ),
+                    ),
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert tool.calls == (
+            [{"fact": "Fact 0."}, {"fact": "Fact 1."}]
+            if multi_call
+            else [{"fact": "Keep the gateway identity stable."}]
+        )
+        terminals = [event for event in events if event.type is EventType.TOOL_CALL_COMPLETED]
+        assert len(terminals) == (2 if multi_call else 1)
+        assert all(event.payload["arguments_state"] == "unavailable" for event in terminals)
+        transcript = await targeted_store.load_transcript(session_id)
+        assistant_calls = [
+            part
+            for message in transcript
+            if message.role == "assistant"
+            for part in message.content
+            if part.type == "tool_call"
+        ]
+        assert len(assistant_calls) == len(terminals)
+        assert all(
+            part.arguments
+            == {
+                "tool_ref": TARGETED_TOOL_TRANSCRIPT_REFERENCE,
+                "arguments": {},
+            }
+            for part in assistant_calls
+        )
+
+    asyncio.run(run())
+
+
+def test_call_tool_schema_validation_supports_local_references() -> None:
+    schema = {
+        "$defs": {"fact": {"type": "string", "minLength": 1}},
+        "type": "object",
+        "properties": {"fact": {"$ref": "#/$defs/fact"}},
+        "required": ["fact"],
+    }
+
+    assert validate_effective_tool_arguments({"fact": "remember this"}, schema) is True
+    assert validate_effective_tool_arguments({"fact": ""}, schema) is False
+
+
+def test_gateway_descriptor_redaction_preserves_only_the_runtime_reference() -> None:
+    descriptor_secret = "descriptor-secret-value"
+    tool_ref = "cayu_authority_v1.runtime-issued-reference"
+    projection = TargetedToolGatewayProjection(
+        grants=(
+            TargetedToolGatewayGrant(
+                tool_ref=tool_ref,
+                grant_id=f"sha256:{'a' * 64}",
+                tool_id="cayu:remember",
+                name="remember",
+                description=descriptor_secret,
+                input_schema={
+                    "type": "object",
+                    "description": descriptor_secret,
+                    "properties": {"fact": {"const": descriptor_secret}},
+                },
+                remaining_calls=1,
+                expires_at=datetime.now(UTC) + timedelta(minutes=1),
+            ),
+        )
+    )
+
+    instruction = projection.instruction_text(
+        redactor=SecretRedactor(["cayu_authority_v1.", descriptor_secret]),
+    )
+    payload = json.loads(instruction.rsplit("\n", 1)[1])
+    [descriptor] = payload["tools"]
+
+    assert descriptor["tool_ref"] == tool_ref
+    assert descriptor["description"] == TARGETED_TOOL_TRANSCRIPT_REFERENCE
+    assert descriptor["input_schema"]["description"] == TARGETED_TOOL_TRANSCRIPT_REFERENCE
+    assert (
+        descriptor["input_schema"]["properties"]["fact"]["const"]
+        == TARGETED_TOOL_TRANSCRIPT_REFERENCE
+    )
+
+
+def test_mixed_structured_output_round_preserves_private_targeted_selection(
+    targeted_store,
+) -> None:
+    async def run() -> None:
+        session_id = "targeted-mixed-structured-output"
+        provider = _MixedStructuredOutputGatewayProvider()
+        tool = _GatewayRememberTool()
+        app = CayuApp(
+            session_store=targeted_store,
+            secret_redactor=SecretRedactor("cayu_authority_v1."),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(tool,),
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="targeted-only",
+                tools=(),
+            ),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "Use the grant, then answer.")],
+                    structured_output=StructuredOutputSpec(
+                        json_schema={
+                            "type": "object",
+                            "properties": {"answer": {"type": "string"}},
+                            "required": ["answer"],
+                            "additionalProperties": False,
+                        },
+                        max_retries=1,
+                    ),
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="remember-before-answer",
+                            tool_id="cayu:remember",
+                            max_calls=1,
+                            lifetime_seconds=60,
+                        ),
+                    ),
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert tool.calls == []
+        assert len(provider.requests) == 2
+        [record] = await targeted_store.list_targeted_tool_grants(session_id)
+        assert record.used_calls == 0
+        transcript = await targeted_store.load_transcript(session_id)
+        assert record.tool_ref not in json.dumps(
+            [message.model_dump(mode="json") for message in transcript],
+            sort_keys=True,
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "redactor_secret",
+    (None, "cayu_authority_v1.", "sha256:"),
+    ids=("ordinary", "runtime-reference-secret-collision", "grant-identity-secret-collision"),
+)
+def test_call_tool_approval_preserves_bound_gateway_identity(
+    targeted_store,
+    redactor_secret: str | None,
+) -> None:
+    async def run() -> None:
+        provider = _GatewayProvider()
+        tool = _GatewayRememberTool()
+        secret_redactor = SecretRedactor(redactor_secret)
+        app = CayuApp(
+            session_store=targeted_store,
+            secret_redactor=secret_redactor,
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(tool,),
+            tool_policy=AlwaysRequireApprovalToolPolicy(),
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="targeted-only",
+                tools=(),
+            ),
+        )
+        session_id = "targeted-call-tool-approval"
+
+        initial_events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "Review and remember one fact.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="remember-reviewed-fact",
+                            tool_id="cayu:remember",
+                            max_calls=1,
+                            lifetime_seconds=60,
+                        ),
+                    ),
+                )
+            )
+        ]
+        approval_event = next(
+            event
+            for event in initial_events
+            if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
+        )
+        assert approval_event.tool_name == "remember"
+        assert approval_event.payload["approval"]["tool_name"] == "remember"
+        assert "tool_ref" not in approval_event.model_dump_json()
+        assert "targeted_tool_grant_id" not in approval_event.model_dump_json()
+        assert "targeted_tool_invocation" not in approval_event.model_dump_json()
+        assert tool.calls == []
+        [bound] = await targeted_store.list_targeted_tool_grants(session_id)
+        assert bound.used_calls == 1
+
+        resumed_app = CayuApp(
+            session_store=targeted_store,
+            secret_redactor=secret_redactor,
+            enable_logging=False,
+        )
+        resumed_app.register_provider(provider, default=True)
+        resumed_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(tool,),
+            tool_policy=AlwaysRequireApprovalToolPolicy(),
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="targeted-only",
+                tools=(),
+            ),
+        )
+        resumed_events = [
+            event
+            async for event in resumed_app.resolve_tool_approval(
+                ToolApprovalRequest(
+                    session_id=session_id,
+                    approval_id=approval_event.payload["approval"]["approval_id"],
+                    tool_round_id=approval_event.payload["tool_round_id"],
+                    tool_call_id=approval_event.payload["tool_call_id"],
+                    decision=ToolApprovalDecision.APPROVE,
+                )
+            )
+        ]
+        assert resumed_events[-1].type is EventType.SESSION_COMPLETED
+        assert tool.calls == [{"fact": "Keep the gateway identity stable."}]
+        [consumed] = await targeted_store.list_targeted_tool_grants(session_id)
+        assert consumed.used_calls == 1
+        assert consumed.remaining_calls == 0
+        assert (
+            sum(
+                event.type is EventType.TARGETED_TOOL_REFERENCE_REJOINED for event in resumed_events
+            )
+            == 1
+        )
+        assert [tool["name"] for tool in provider.requests[1].tools] == []
+        transcript = await targeted_store.load_transcript(session_id)
+        result = next(
+            part
+            for message in transcript
+            if message.role == "tool"
+            for part in message.content
+            if part.type == "tool_result"
+        )
+        assert result.tool_name == "call_tool"
+        assert result.tool_call_id == "outer-call"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    (
+        ("malformed", TargetedToolUseRejectionReason.MALFORMED),
+        ("unknown", TargetedToolUseRejectionReason.UNKNOWN),
+        ("invalid_arguments", TargetedToolUseRejectionReason.INVALID_ARGUMENTS),
+        ("unresolvable_schema", TargetedToolUseRejectionReason.INVALID_ARGUMENTS),
+    ),
+)
+def test_call_tool_rejects_before_policy_or_execution(
+    targeted_store,
+    case: str,
+    reason: TargetedToolUseRejectionReason,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        session_id = f"targeted-call-tool-{case}"
+        codec = targeted_store.public_authority_alias_codec
+        assert codec is not None
+        provider = _RejectedGatewayProvider(
+            case,
+            unknown_ref=(
+                codec.encode(
+                    f"sha256:{'f' * 64}",
+                    field_name="tool_ref",
+                    session_id=session_id,
+                )
+                if case == "unknown"
+                else None
+            ),
+        )
+        tool = _RemoteRefGatewayTool() if case == "unresolvable_schema" else _GatewayRememberTool()
+        policy = _RecordingPolicy()
+        app = CayuApp(session_store=targeted_store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(tool,),
+            tool_policy=policy,
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="targeted-only",
+                tools=(),
+            ),
+        )
+        streamed = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "Try the targeted tool.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="remember-reviewed-fact",
+                            tool_id="cayu:remember",
+                            max_calls=1,
+                            lifetime_seconds=60,
+                        ),
+                    ),
+                )
+            )
+        ]
+
+        assert streamed[-1].type is EventType.SESSION_COMPLETED
+        assert tool.calls == []
+        assert policy.requests == []
+        [record] = await targeted_store.list_targeted_tool_grants(session_id)
+        assert record.used_calls == 0
+        assert record.remaining_calls == 1
+        durable_events = await targeted_store.load_events(session_id)
+        [rejected] = [
+            event
+            for event in durable_events
+            if event.type is EventType.TARGETED_TOOL_REFERENCE_REJECTED
+        ]
+        assert rejected.payload["rejection_reason"] == reason.value
+        assert "tool_ref" not in rejected.model_dump_json()
+        assert not any(event.type is EventType.TOOL_CALL_STARTED for event in durable_events)
+        [failed] = [event for event in durable_events if event.type is EventType.TOOL_CALL_FAILED]
+        assert failed.tool_name == "call_tool"
+        assert failed.payload["reason"] == reason.value
+        assert "tool_ref" not in failed.model_dump_json()
+
+    if case == "unresolvable_schema":
+
+        def fail_remote_retrieval(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError("JSON Schema validation attempted remote retrieval.")
+
+        monkeypatch.setattr(urllib.request, "urlopen", fail_remote_retrieval)
+    asyncio.run(run())
+
+
+def test_call_tool_does_not_trust_an_unissued_secret_bearing_reference(targeted_store) -> None:
+    async def run() -> None:
+        session_id = "targeted-call-tool-unissued-secret-reference"
+        attacker_reference = "cayu_authority_v1.attacker-controlled"
+        provider = _RejectedGatewayProvider(
+            "unknown_secret_collision",
+            unknown_ref=attacker_reference,
+        )
+        tool = _GatewayRememberTool()
+        policy = _RecordingPolicy()
+        app = CayuApp(
+            session_store=targeted_store,
+            secret_redactor=SecretRedactor("cayu_authority_v1."),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(tool,),
+            tool_policy=policy,
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="targeted-only",
+                tools=(),
+            ),
+        )
+
+        streamed = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "Try an unissued targeted reference.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="remember-reviewed-fact",
+                            tool_id="cayu:remember",
+                            max_calls=1,
+                            lifetime_seconds=60,
+                        ),
+                    ),
+                )
+            )
+        ]
+
+        assert streamed[-1].type is EventType.SESSION_FAILED
+        assert "redaction marker" in streamed[-1].payload["error"]
+        assert tool.calls == []
+        assert policy.requests == []
+        [record] = await targeted_store.list_targeted_tool_grants(session_id)
+        assert record.used_calls == 0
+        assert record.remaining_calls == 1
+        durable_events = await targeted_store.load_events(session_id)
+        assert not any(
+            event.type
+            in {
+                EventType.TARGETED_TOOL_REFERENCE_CONSUMED,
+                EventType.TARGETED_TOOL_REFERENCE_REJECTED,
+                EventType.TOOL_CALL_STARTED,
+            }
+            for event in durable_events
+        )
+        transcript = await targeted_store.load_transcript(session_id)
+        persisted = json.dumps(
+            {
+                "events": [event.model_dump(mode="json") for event in durable_events],
+                "transcript": [message.model_dump(mode="json") for message in transcript],
+            },
+            sort_keys=True,
+        )
+        assert attacker_reference not in persisted
+        assert "attacker-controlled" not in persisted
+
+    asyncio.run(run())
+
+
 def test_provider_retry_reuses_one_prepared_targeted_grant_snapshot(targeted_store) -> None:
     async def run() -> None:
         provider = _RetryProvider()
@@ -801,6 +1821,93 @@ def test_approval_continuation_omits_a_naturally_expired_targeted_grant(
             for event in durable_events
         )
         assert resumed_events[-1].type is EventType.SESSION_COMPLETED
+
+    asyncio.run(run())
+
+
+def test_approval_continuation_keeps_the_nonexpired_targeted_grant(
+    targeted_store,
+) -> None:
+    async def run() -> None:
+        now = [datetime(2026, 1, 1, tzinfo=UTC)]
+        provider = _MixedExpiryGatewayProvider()
+        remember = _GatewayRememberTool()
+        app = CayuApp(
+            session_store=targeted_store,
+            enable_logging=False,
+            clock=lambda: now[0],
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(remember, _GatewayOtherTool()),
+            tool_policy=AlwaysRequireApprovalToolPolicy(),
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="targeted-only",
+                tools=(),
+            ),
+        )
+
+        initial_events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="targeted-grant-partial-expiry-continuation",
+                    messages=[Message.text("user", "Review and remember this work.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="expiring-remember",
+                            tool_id="cayu:remember",
+                            lifetime_seconds=1,
+                        ),
+                        TargetedToolGrant(
+                            request_id="remaining-other",
+                            tool_id="cayu:other",
+                            lifetime_seconds=60,
+                        ),
+                    ),
+                )
+            )
+        ]
+        approval = next(
+            event
+            for event in initial_events
+            if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
+        )
+        records = await targeted_store.list_targeted_tool_grants(
+            "targeted-grant-partial-expiry-continuation"
+        )
+        records_by_name = {record.tool_name: record for record in records}
+        now[0] = records_by_name["remember"].expires_at
+
+        resumed_events = [
+            event
+            async for event in app.resolve_tool_approval(
+                ToolApprovalRequest(
+                    session_id="targeted-grant-partial-expiry-continuation",
+                    approval_id=approval.payload["approval"]["approval_id"],
+                    tool_round_id=approval.payload["tool_round_id"],
+                    tool_call_id=approval.payload["tool_call_id"],
+                    decision=ToolApprovalDecision.APPROVE,
+                )
+            )
+        ]
+
+        assert resumed_events[-1].type is EventType.SESSION_COMPLETED
+        assert remember.calls == [{"fact": "Keep the remaining grant callable."}]
+        assert len(provider.requests) == 2
+        footprint_events = [
+            event
+            for event in (*initial_events, *resumed_events)
+            if event.type is EventType.REQUEST_FOOTPRINT_RECORDED
+        ]
+        assert set(footprint_events[0].payload["targeted_tool_grants"]["grant_ids"]) == {
+            record.grant_id for record in records
+        }
+        assert footprint_events[1].payload["targeted_tool_grants"]["grant_ids"] == [
+            records_by_name["other"].grant_id
+        ]
 
     asyncio.run(run())
 

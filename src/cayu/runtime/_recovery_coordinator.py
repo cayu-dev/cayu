@@ -293,6 +293,7 @@ from cayu.runtime.structured_output import (
     _require_native_structured_output_support as _require_provider_native_output_support,
 )
 from cayu.runtime.tasks import Task, TaskStatus, TaskStore
+from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
 from cayu.runtime.tool_exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
     NOT_EXPOSED_IN_REQUEST_REASON,
@@ -301,6 +302,7 @@ from cayu.runtime.tool_exposure import (
     unexposed_tool_result,
     validate_resolved_tool_exposure_authority,
 )
+from cayu.runtime.tool_gateway import CallToolEnvelope, arguments_sha256
 from cayu.runtime.tool_policy import ToolPolicyDecision
 from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
 from cayu.runtime.usage import SessionUsageSummary, session_usage_summary
@@ -2480,9 +2482,23 @@ class RecoveryCoordinator:
                         if type(projected_call) is not dict:
                             raise ValueError("Projected pause tool calls conflict with the round.")
                         typed_projected_call = cast("dict[str, Any]", projected_call)
-                        if typed_projected_call.get("tool_name") != pending_call.tool_name:
+                        projected_tool_name = typed_projected_call.get("tool_name")
+                        gateway_transcript_alias = (
+                            pending_call.tool_name == CALL_TOOL_NAME
+                            and type(projected_tool_name) is str
+                            and projected_tool_name != CALL_TOOL_NAME
+                        )
+                        if (
+                            projected_tool_name != pending_call.tool_name
+                            and not gateway_transcript_alias
+                        ):
                             raise ValueError("Projected pause tool calls conflict with the round.")
                         typed_projected_call["tool_call_id"] = pending_call.tool_call_id
+                        if gateway_transcript_alias:
+                            typed_projected_call["tool_name"] = CALL_TOOL_NAME
+                    gating_pending_call = pending_by_call_id[resume_tool_call_id]
+                    if gating_pending_call.tool_name == CALL_TOOL_NAME:
+                        pause_checkpoint["tool_name"] = CALL_TOOL_NAME
                     pause_checkpoint.update(
                         {
                             "tool_round_id": identity.tool_round_id,
@@ -2595,7 +2611,21 @@ class RecoveryCoordinator:
                 raise RuntimeError(
                     "Durable tool lifecycle evidence conflicts with its assistant tool call."
                 )
+            gateway_outer_call = False
             if event.tool_name != pending_call.tool_name:
+                try:
+                    envelope = CallToolEnvelope.model_validate(pending_call.arguments)
+                except (TypeError, ValueError):
+                    envelope = None
+                gateway_outer_call = (
+                    pending_call.tool_name == CALL_TOOL_NAME
+                    and event.payload.get("dispatch_kind") == "gateway"
+                    and event.payload.get("model_tool_name") == CALL_TOOL_NAME
+                    and envelope is not None
+                    and event.payload.get("arguments_sha256")
+                    == arguments_sha256(envelope.arguments)
+                )
+            if event.tool_name != pending_call.tool_name and not gateway_outer_call:
                 raise RuntimeError(
                     "Durable tool lifecycle evidence conflicts with its assistant tool call."
                 )
@@ -2615,9 +2645,11 @@ class RecoveryCoordinator:
                     raise RuntimeError(
                         "Durable pause-continuation evidence contains duplicate started events."
                     )
-                if not tool_argument_publication.started_arguments_match_private_call(
-                    event.payload,
-                    private_arguments=pending_call.arguments,
+                if not gateway_outer_call and not (
+                    tool_argument_publication.started_arguments_match_private_call(
+                        event.payload,
+                        private_arguments=pending_call.arguments,
+                    )
                 ):
                     raise RuntimeError(
                         "Durable pause-continuation started arguments conflict with "
@@ -4878,11 +4910,7 @@ class RecoveryCoordinator:
                 raise binding_result.error
 
             round_tool_calls = [
-                runtime_records.ToolCallRequest(
-                    id=pending_call.tool_call_id,
-                    name=pending_call.tool_name,
-                    arguments=copy_json_value(pending_call.arguments, "arguments"),
-                )
+                approval_support.tool_call_request_from_pending(pending_call)
                 for pending_call in pending.tool_calls
             ]
             publish_arguments_as_unavailable = len(round_tool_calls) > 1
@@ -5309,6 +5337,7 @@ class RecoveryCoordinator:
                         None if publication_coordinator is None else record_round_redactor
                     ),
                     publication_snapshot_observer=record_round_publication_snapshot,
+                    rejoin_targeted_invocation=True,
                 ):
                     yield event
                     if outcome is not None:
@@ -6133,11 +6162,7 @@ class RecoveryCoordinator:
                 ):
                     if pending_tool_call.tool_call_id in recorded_outcomes:
                         continue
-                    tool_call = runtime_records.ToolCallRequest(
-                        id=pending_tool_call.tool_call_id,
-                        name=pending_tool_call.tool_name,
-                        arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
-                    )
+                    tool_call = approval_support.tool_call_request_from_pending(pending_tool_call)
                     pending_tool_calls.append(tool_call)
                     policy_evidence = approval_support.effective_tool_policy_evidence(
                         pending_tool_call
@@ -6202,11 +6227,7 @@ class RecoveryCoordinator:
             pending_round_tool_calls = approval_support.pending_round_tool_calls(pending_approval)
             publish_arguments_as_unavailable = len(pending_round_tool_calls) > 1
             round_tool_calls = [
-                runtime_records.ToolCallRequest(
-                    id=pending_tool_call.tool_call_id,
-                    name=pending_tool_call.tool_name,
-                    arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
-                )
+                approval_support.tool_call_request_from_pending(pending_tool_call)
                 for pending_tool_call in pending_round_tool_calls
             ]
             base_round_redactor = self._tool_round_executor.redactor_for_tool_calls(
@@ -6639,6 +6660,7 @@ class RecoveryCoordinator:
                         None if publication_coordinator is None else record_round_redactor
                     ),
                     publication_snapshot_observer=record_round_publication_snapshot,
+                    rejoin_targeted_invocation=True,
                 ):
                     yield event
                     if outcome is not None:
@@ -7398,9 +7420,8 @@ class RecoveryCoordinator:
             await self._event_writer.fan_out_persisted(emitted_recovery_events)
             for event in emitted_recovery_events:
                 yield event
-            tool_call = runtime_records.ToolCallRequest(
-                id=pending_tool_call.tool_call_id,
-                name=pending_tool_call.tool_name,
+            tool_call = approval_support.tool_call_request_from_pending(
+                pending_tool_call,
                 arguments={},
             )
             tool_event = emitted_recovery_events[-1]
@@ -7759,9 +7780,8 @@ class RecoveryCoordinator:
             await self._event_writer.fan_out_persisted(emitted_recovery_events)
             for event in emitted_recovery_events:
                 yield event
-            tool_call = runtime_records.ToolCallRequest(
-                id=pending_tool_call.tool_call_id,
-                name=pending_tool_call.tool_name,
+            tool_call = approval_support.tool_call_request_from_pending(
+                pending_tool_call,
                 arguments={},
             )
             tool_event = emitted_recovery_events[-1]
@@ -8870,9 +8890,8 @@ class RecoveryCoordinator:
             await self._event_writer.fan_out_persisted(emitted_recovery_events)
             for event in emitted_recovery_events:
                 yield event
-            tool_call = runtime_records.ToolCallRequest(
-                id=pending_tool_call.tool_call_id,
-                name=pending_tool_call.tool_name,
+            tool_call = approval_support.tool_call_request_from_pending(
+                pending_tool_call,
                 arguments={},
             )
             tool_event = emitted_recovery_events[-1]
@@ -9313,9 +9332,8 @@ class RecoveryCoordinator:
             strict=True,
         ):
             expected_public_outcome = runtime_records.ToolCallOutcome(
-                call=runtime_records.ToolCallRequest(
-                    id=interrupted_result.call.id,
-                    name=interrupted_result.call.name,
+                call=runtime_records.copy_tool_call_request(
+                    interrupted_result.call,
                     arguments={},
                 ),
                 result=interrupted_result.result,
@@ -9578,9 +9596,8 @@ class RecoveryCoordinator:
                     legacy_arguments=expected_outcome.call.arguments,
                 )
                 expected_recorded_outcome = runtime_records.ToolCallOutcome(
-                    call=runtime_records.ToolCallRequest(
-                        id=expected_outcome.call.id,
-                        name=expected_outcome.call.name,
+                    call=runtime_records.copy_tool_call_request(
+                        expected_outcome.call,
                         arguments=recorded_projection.transcript_arguments(),
                     ),
                     result=expected_outcome.result,
@@ -9967,6 +9984,20 @@ class RecoveryCoordinator:
                 registered_agent.tool_capabilities,
                 catalogue_revision=registered_agent.tool_catalogue.revision,
             )
+        (
+            pending_round,
+            _resolved_tool_calls,
+            targeted_resolution_events,
+        ) = await self._tool_round_executor.resolve_targeted_tool_calls(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            pending_round=pending_round,
+        )
+        for targeted_resolution_event in targeted_resolution_events:
+            yield targeted_resolution_event
+        if targeted_resolution_events:
+            checkpoint = await self._session_store.load_checkpoint(session.id)
         registered_tool_names = frozenset(registered_agent.tools)
         durable_policy_decisions = frozenset(decision.value for decision in ToolPolicyDecision)
         ambiguous_interrupt_close_intent = (
@@ -10079,11 +10110,7 @@ class RecoveryCoordinator:
                     "claimed run fence before recovering tool results."
                 )
             replanned_tool_calls = [
-                runtime_records.ToolCallRequest(
-                    id=call.tool_call_id,
-                    name=call.tool_name,
-                    arguments=copy_json_value(call.arguments, "arguments"),
-                )
+                approval_support.tool_call_request_from_pending(call)
                 for call in pending_round.tool_calls
             ]
             policy_plan = await self._tool_round_executor.fail_closed_recovery_policy_plan(
@@ -10194,11 +10221,7 @@ class RecoveryCoordinator:
             if recorded_outcome is not None:
                 continue
 
-            tool_call = runtime_records.ToolCallRequest(
-                id=pending_tool_call.tool_call_id,
-                name=pending_tool_call.tool_name,
-                arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
-            )
+            tool_call = approval_support.tool_call_request_from_pending(pending_tool_call)
             policy_evidence = approval_support.effective_tool_policy_evidence(pending_tool_call)
             if policy_evidence is ToolPolicyEvidence.UNEXPOSED:
                 exposure = pending_round.tool_exposure
@@ -10215,9 +10238,8 @@ class RecoveryCoordinator:
                     )
                 synthesized_outcomes.append(
                     runtime_records.ToolCallOutcome(
-                        call=runtime_records.ToolCallRequest(
-                            id=tool_call.id,
-                            name=tool_call.name,
+                        call=runtime_records.copy_tool_call_request(
+                            tool_call,
                             arguments={},
                         ),
                         result=unexposed_tool_result(),
@@ -10500,9 +10522,8 @@ class RecoveryCoordinator:
                     terminal_event
                 )
             expected_public_outcome = runtime_records.ToolCallOutcome(
-                call=runtime_records.ToolCallRequest(
-                    id=expected_outcome.call.id,
-                    name=expected_outcome.call.name,
+                call=runtime_records.copy_tool_call_request(
+                    expected_outcome.call,
                     arguments={},
                 ),
                 result=expected_outcome.result,

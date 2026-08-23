@@ -416,15 +416,20 @@ def public_pending_user_input_event_payload(
     # scope is finalized, never as part of a pending-input representation.
     payload.pop("staged_terminals", None)
     question, options = public_pending_user_input_prompt(pending)
+    tool_calls = payload.get("tool_calls")
+    if type(tool_calls) is not list:
+        raise TypeError("Pending user-input event payload must contain tool_calls.")
+    for pending_call in tool_calls:
+        if type(pending_call) is not dict:
+            raise TypeError("Pending user-input event tool calls must be objects.")
+        pending_call.pop("model_tool_name", None)
+        pending_call.pop("targeted_tool_grant_id", None)
+        pending_call.pop("targeted_tool_invocation", None)
+        pending_call.pop("targeted_tool_rejection", None)
     if question is None:
         payload.pop("question", None)
         payload.pop("options", None)
-        tool_calls = payload.get("tool_calls")
-        if type(tool_calls) is not list:
-            raise TypeError("Pending user-input event payload must contain tool_calls.")
         for pending_call in tool_calls:
-            if type(pending_call) is not dict:
-                raise TypeError("Pending user-input event tool calls must be objects.")
             pending_call.pop("reason", None)
             pending_call.pop("metadata", None)
     else:

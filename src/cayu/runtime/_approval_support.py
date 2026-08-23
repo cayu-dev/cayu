@@ -368,6 +368,10 @@ def bounded_pending_approval_event_payload(
         raw_call = tool_calls[index]
         if type(raw_call) is not dict:
             raise TypeError("Pending approval event tool calls must be objects.")
+        raw_call.pop("model_tool_name", None)
+        raw_call.pop("targeted_tool_grant_id", None)
+        raw_call.pop("targeted_tool_invocation", None)
+        raw_call.pop("targeted_tool_rejection", None)
         if not publish_arguments:
             raw_call.pop("arguments", None)
             raw_call[tool_argument_publication.ARGUMENTS_STATE_FIELD] = "quarantined"
@@ -1242,6 +1246,10 @@ def pending_tool_call_approvals(
                 tool_call_id=tool_call.id,
                 tool_name=tool_call.name,
                 arguments=copy_durable_json_value(tool_call.arguments, "arguments"),
+                targeted_tool_grant_id=tool_call.targeted_tool_grant_id,
+                model_tool_name=tool_call.model_tool_name,
+                targeted_tool_invocation=tool_call.targeted_tool_invocation,
+                targeted_tool_rejection=tool_call.targeted_tool_rejection,
                 policy_evidence=policy_evidence_by_id.get(
                     tool_call.id,
                     default_policy_evidence,
@@ -1273,6 +1281,29 @@ def pending_round_tool_calls(
     approval: PendingToolApproval,
 ) -> list[PendingToolCallApproval]:
     return [PendingToolCallApproval(**call.model_dump()) for call in approval.tool_calls]
+
+
+def tool_call_request_from_pending(
+    call: PendingToolCallApproval,
+    *,
+    arguments: dict[str, Any] | None = None,
+) -> runtime_records.ToolCallRequest:
+    """Restore one private pending call without dropping gateway authority."""
+
+    if type(call) is not PendingToolCallApproval:
+        raise TypeError("call must be a PendingToolCallApproval.")
+    return runtime_records.ToolCallRequest(
+        id=call.tool_call_id,
+        name=call.tool_name,
+        arguments=copy_durable_json_value(
+            call.arguments if arguments is None else arguments,
+            "arguments",
+        ),
+        targeted_tool_grant_id=call.targeted_tool_grant_id,
+        model_tool_name=call.model_tool_name,
+        targeted_tool_invocation=call.targeted_tool_invocation,
+        targeted_tool_rejection=call.targeted_tool_rejection,
+    )
 
 
 def policy_result_from_pending_tool_call(

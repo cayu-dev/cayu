@@ -11,6 +11,8 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime.approvals import PendingToolCallApproval
+from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
+from cayu.runtime.tool_gateway import CallToolEnvelope, arguments_sha256
 from cayu.runtime.tool_policy import ToolPolicyDecision, ToolPolicyResult
 from cayu.vaults import SecretRedactor
 
@@ -55,6 +57,28 @@ class ToolCallRecoveryState:
 _TerminalOutcome = TypeVar("_TerminalOutcome")
 
 
+def _event_matches_pending_tool_call(
+    event: Event,
+    pending_call: PendingToolCallApproval,
+) -> bool:
+    if type(event.tool_name) is not str:
+        return False
+    if event.tool_name == pending_call.tool_name:
+        return True
+    if (
+        pending_call.tool_name != CALL_TOOL_NAME
+        or pending_call.model_tool_name is not None
+        or event.payload.get("dispatch_kind") != "gateway"
+        or event.payload.get("model_tool_name") != CALL_TOOL_NAME
+    ):
+        return False
+    try:
+        envelope = CallToolEnvelope.model_validate(pending_call.arguments)
+    except (TypeError, ValueError):
+        return False
+    return event.payload.get("arguments_sha256") == arguments_sha256(envelope.arguments)
+
+
 @dataclass(frozen=True)
 class _ScannedToolCalls(Generic[_TerminalOutcome]):
     outcomes: dict[str, _TerminalOutcome]
@@ -97,15 +121,18 @@ def _scan_tool_call_events(
             last_conflict_index[tool_call_id] = index
             continue
         pending_call = pending_by_id[tool_call_id]
-        if type(event.tool_name) is not str or event.tool_name != pending_call.tool_name:
+        if not _event_matches_pending_tool_call(event, pending_call):
             started_ids.add(tool_call_id)
             last_conflict_index[tool_call_id] = index
             outcomes.pop(tool_call_id, None)
             continue
         if event.type == EventType.TOOL_CALL_STARTED:
-            if not tool_argument_publication.started_arguments_match_private_call(
-                event.payload,
-                private_arguments=pending_call.arguments,
+            gateway_outer_call = event.tool_name != pending_call.tool_name
+            if not gateway_outer_call and not (
+                tool_argument_publication.started_arguments_match_private_call(
+                    event.payload,
+                    private_arguments=pending_call.arguments,
+                )
             ):
                 started_ids.add(tool_call_id)
                 last_conflict_index[tool_call_id] = index
@@ -291,7 +318,7 @@ def tool_call_outcome_from_terminal_event(
     event: Event,
     pending_tool_call: PendingToolCallApproval,
 ) -> runtime_records.ToolCallOutcome:
-    if type(event.tool_name) is not str or event.tool_name != pending_tool_call.tool_name:
+    if not _event_matches_pending_tool_call(event, pending_tool_call):
         raise ValueError(
             "Terminal tool event names a different pending tool call: "
             f"{pending_tool_call.tool_call_id}"
@@ -302,19 +329,32 @@ def tool_call_outcome_from_terminal_event(
             f"Terminal tool event is missing result payload: {pending_tool_call.tool_call_id}"
         )
     result = tool_results.tool_result_from_payload(result_payload)
-    argument_projection = tool_argument_publication.terminal_argument_projection(
-        event.payload,
-        legacy_arguments=pending_tool_call.arguments,
+    gateway_outer_call = event.tool_name != pending_tool_call.tool_name
+    argument_projection = (
+        None
+        if gateway_outer_call
+        else tool_argument_publication.terminal_argument_projection(
+            event.payload,
+            legacy_arguments=pending_tool_call.arguments,
+        )
     )
     return runtime_records.ToolCallOutcome(
         call=runtime_records.ToolCallRequest(
             id=pending_tool_call.tool_call_id,
             name=pending_tool_call.tool_name,
             arguments=(
-                {}
-                if argument_projection.arguments is None
-                else copy_json_value(argument_projection.arguments, "arguments")
+                copy_json_value(pending_tool_call.arguments, "arguments")
+                if argument_projection is None
+                else (
+                    {}
+                    if argument_projection.arguments is None
+                    else copy_json_value(argument_projection.arguments, "arguments")
+                )
             ),
+            targeted_tool_grant_id=pending_tool_call.targeted_tool_grant_id,
+            model_tool_name=pending_tool_call.model_tool_name,
+            targeted_tool_invocation=pending_tool_call.targeted_tool_invocation,
+            targeted_tool_rejection=pending_tool_call.targeted_tool_rejection,
         ),
         result=result,
     )

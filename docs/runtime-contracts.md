@@ -1509,8 +1509,9 @@ policy input, so adding this canonical index does not reorder existing model
 requests. Duplicate ids or model-visible names, malformed or oversized
 descriptors, inconsistent fingerprints, and application or MCP tools named
 `call_tool`, `search_tools`, or `__cayu_submit_structured_output` fail during
-registration. Those names form Cayu's framework namespace; this substrate does
-not yet expose the planned gateway or search tools.
+registration. Those names form Cayu's framework namespace. Cayu projects
+`call_tool` only for active targeted grants; generalized `search_tools` remains
+reserved and is not yet exposed.
 
 The catalogue revision and descriptor versions join the existing direct-tools
 execution-profile component. Tool implementation behavior remains solely in
@@ -1716,11 +1717,47 @@ async for event in app.resume(request):
     handle(event)
 ```
 
-This slice deliberately does not add a model-visible `call_tool` gateway and
-does not put targeted descriptors in the provider's direct `tools` array. The
-request footprint records stable grant/catalogue identities and counts with
-`direct_tool_prefix_changed=false`; the existing direct-tool prefix is
-unchanged.
+While at least one issued grant remains callable, Cayu appends one
+framework-owned `call_tool` definition to the provider request and adds a
+bounded runtime-authored system message containing the active references,
+canonical tool ids and names, descriptions, input schemas, remaining-call
+counts, and expiries. The existing direct-tool prefix remains unchanged and the
+request footprint records `direct_tool_prefix_changed=false`. When no grant is
+callable, neither the gateway nor its descriptor message is projected.
+Descriptor and schema values cross the normal workload-secret boundary, while
+each exact runtime-issued reference is retained as separately attested
+authority. Model-authored lookalikes and unissued secret-bearing references do
+not receive that exemption.
+
+The provider-facing gateway accepts exactly an opaque reference and an inner
+argument object:
+
+```json
+{
+  "name": "call_tool",
+  "arguments": {
+    "tool_ref": "<opaque reference from Cayu's targeted-tool context>",
+    "arguments": {"fact": "Retries must retain the original call identity."}
+  }
+}
+```
+
+Cayu validates the envelope and the inner arguments against the current
+registered descriptor, resolving document-local JSON Schema references only;
+an external or otherwise unresolvable reference is invalid. It then atomically
+binds the grant use before policy planning. Policy, approval, effects,
+credentials, hooks, concurrency, idempotency, execution, receipts, and recovery
+all receive the effective registered target (`remember` in this example); there
+is no wrapper tool or second execution path. Provider transcript messages retain
+the outer `call_tool` name and call id but replace the exact reference with a
+fixed non-authoritative placeholder, and the effective result returns through
+that same outer result slot. Private recovery state retains the exact reference
+with its selected grant identity and revalidates that pair against the durable
+store before binding or rejoining. This lets an exact retry or approval
+continuation rejoin the original consumption instead of spending the call budget
+twice. General events never publish `tool_ref`; safe execution events link the
+outer call to the canonical target, grant, use, descriptor, arguments digest,
+and invocation identities.
 
 The stores provide atomic issue-or-reuse, bounded inspection,
 consume-or-rejoin, revocation, expiry evidence, and reconstruction. First use

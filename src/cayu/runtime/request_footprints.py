@@ -50,7 +50,7 @@ from cayu.runtime.context import (
     estimate_model_request_context_pressure,
 )
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
-from cayu.runtime.tool_catalogue import validate_canonical_tool_id
+from cayu.runtime.tool_catalogue import CALL_TOOL_NAME, validate_canonical_tool_id
 from cayu.runtime.tool_exposure import (
     TOOL_EXPOSURE_MAX_REGISTERED_TOOLS,
     TOOL_EXPOSURE_PROFILE_ID_MAX_CHARS,
@@ -1006,8 +1006,14 @@ def build_request_footprint(
     structured_output_tools = [
         tool for tool in model_request.tools if tool.get("name") == STRUCTURED_OUTPUT_TOOL_NAME
     ]
+    targeted_gateway_tools = [
+        tool for tool in model_request.tools if tool.get("name") == CALL_TOOL_NAME
+    ]
+    if len(targeted_gateway_tools) > 1 or (targeted_gateway_tools and targeted_tool_grants is None):
+        raise ValueError("call_tool requires one targeted-tool grant footprint.")
     if tool_exposure is not None and (
-        len(model_request.tools) - len(structured_output_tools) != tool_exposure.exposed_count
+        len(model_request.tools) - len(structured_output_tools) - len(targeted_gateway_tools)
+        != tool_exposure.exposed_count
     ):
         raise ValueError(
             "tool_exposure exposed_count must match the prepared application tool definitions."

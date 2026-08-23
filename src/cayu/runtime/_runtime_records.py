@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from cayu._validation import require_durable_clean_nonblank
+from cayu._validation import copy_durable_json_object, require_durable_clean_nonblank
 from cayu._workspace_mutation import WorkspaceMutationProcessFence
 from cayu.core.agents import AgentSpec
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
@@ -24,6 +24,13 @@ from cayu.runtime._child_session_identity import ChildSessionRecoveryMatcher
 from cayu.runtime._policy_evidence import ToolPolicyEvidence
 from cayu.runtime.context import ContextPolicy
 from cayu.runtime.hooks import RuntimeHook
+from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
+from cayu.runtime.tool_grants import (
+    TARGETED_TOOL_TRANSCRIPT_REFERENCE,
+    RejectedTargetedToolInvocation,
+    ResolvedTargetedToolInvocation,
+    validate_targeted_tool_digest,
+)
 from cayu.runtime.tool_policy import ToolPolicy, ToolPolicyResult
 
 if TYPE_CHECKING:
@@ -163,6 +170,98 @@ class ToolCallRequest:
     id: str
     name: str
     arguments: dict[str, Any]
+    targeted_tool_grant_id: str | None = None
+    model_tool_name: str | None = None
+    targeted_tool_invocation: ResolvedTargetedToolInvocation | None = None
+    targeted_tool_rejection: RejectedTargetedToolInvocation | None = None
+
+    def __post_init__(self) -> None:
+        if self.targeted_tool_grant_id is not None:
+            validate_targeted_tool_digest(
+                self.targeted_tool_grant_id,
+                "targeted_tool_grant_id",
+            )
+            if self.name != CALL_TOOL_NAME and self.model_tool_name != CALL_TOOL_NAME:
+                raise ValueError("Targeted grant selection requires a call_tool model call.")
+        if (self.targeted_tool_invocation is not None) and (
+            self.targeted_tool_rejection is not None
+        ):
+            raise ValueError("A tool call cannot be both resolved and rejected.")
+        if self.targeted_tool_invocation is not None:
+            invocation = self.targeted_tool_invocation
+            if (
+                self.model_tool_name != invocation.model_tool_name
+                or self.name != invocation.effective_tool_name
+                or self.id != invocation.outer_tool_call_id
+            ):
+                raise ValueError("Resolved targeted invocation conflicts with its tool call.")
+            if (
+                self.targeted_tool_grant_id is not None
+                and self.targeted_tool_grant_id != invocation.grant_id
+            ):
+                raise ValueError("Targeted grant selection conflicts with its resolved invocation.")
+        if self.targeted_tool_rejection is not None:
+            rejection = self.targeted_tool_rejection
+            if self.model_tool_name != rejection.model_tool_name or self.name != "call_tool":
+                raise ValueError("Rejected targeted invocation conflicts with its model call.")
+        if self.model_tool_name is not None and (
+            self.targeted_tool_invocation is None and self.targeted_tool_rejection is None
+        ):
+            raise ValueError("A model tool alias requires targeted invocation evidence.")
+
+    @property
+    def transcript_tool_name(self) -> str:
+        return self.model_tool_name or self.name
+
+    @property
+    def transcript_arguments(self) -> dict[str, Any]:
+        if self.targeted_tool_invocation is None:
+            projected = copy_durable_json_object(self.arguments, "tool_call.arguments")
+            if self.targeted_tool_grant_id is not None and "tool_ref" in projected:
+                projected["tool_ref"] = TARGETED_TOOL_TRANSCRIPT_REFERENCE
+            return projected
+        return {
+            "tool_ref": TARGETED_TOOL_TRANSCRIPT_REFERENCE,
+            "arguments": copy_durable_json_object(
+                self.arguments,
+                "tool_call.arguments",
+            ),
+        }
+
+
+def copy_tool_call_request(
+    value: ToolCallRequest,
+    *,
+    arguments: dict[str, Any] | None = None,
+) -> ToolCallRequest:
+    """Return a detached copy without losing gateway dual identity."""
+
+    if type(value) is not ToolCallRequest:
+        raise TypeError("value must be a ToolCallRequest.")
+    return ToolCallRequest(
+        id=value.id,
+        name=value.name,
+        arguments=copy_durable_json_object(
+            value.arguments if arguments is None else arguments,
+            "tool_call.arguments",
+        ),
+        targeted_tool_grant_id=value.targeted_tool_grant_id,
+        model_tool_name=value.model_tool_name,
+        targeted_tool_invocation=(
+            None
+            if value.targeted_tool_invocation is None
+            else ResolvedTargetedToolInvocation.model_validate(
+                value.targeted_tool_invocation.model_dump(mode="python")
+            )
+        ),
+        targeted_tool_rejection=(
+            None
+            if value.targeted_tool_rejection is None
+            else RejectedTargetedToolInvocation.model_validate(
+                value.targeted_tool_rejection.model_dump(mode="python")
+            )
+        ),
+    )
 
 
 @dataclass(frozen=True)

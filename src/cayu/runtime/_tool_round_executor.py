@@ -172,12 +172,33 @@ from cayu.runtime.structured_output import (
     StructuredOutputSpec,
     copy_structured_output_spec,
 )
+from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
 from cayu.runtime.tool_exposure import (
     NOT_EXPOSED_IN_REQUEST_REASON,
     ResolvedToolExposureAuthority,
     copy_resolved_tool_exposure_authority,
+    tool_capability_ceiling_from_session_metadata,
     unexposed_tool_result,
     validate_resolved_tool_exposure_authority,
+)
+from cayu.runtime.tool_gateway import (
+    CallToolEnvelope,
+    gateway_rejection_content,
+    rejected_targeted_tool_invocation,
+    resolved_targeted_tool_invocation,
+    unresolved_gateway_rejection_event,
+    validate_effective_tool_arguments,
+)
+from cayu.runtime.tool_gateway import (
+    arguments_sha256 as targeted_arguments_sha256,
+)
+from cayu.runtime.tool_grants import (
+    TargetedToolUseDisposition,
+    TargetedToolUseRejectionReason,
+    TargetedToolUseRequest,
+    targeted_tool_use_rejection_event,
+    targeted_tool_use_rejection_reason,
+    targeted_tool_view_generation_id,
 )
 from cayu.runtime.tool_policy import (
     TAINT_LABELS_METADATA_KEY,
@@ -426,6 +447,55 @@ _AMBIGUOUS_POLICY_RECOVERY_METADATA = {
     "recovered": True,
     "policy_evaluation": "ambiguous",
 }
+_TARGETED_TOOL_INVOCATION_PAYLOAD_FIELDS = (
+    "dispatch_kind",
+    "model_tool_name",
+    "grant_id",
+    "use_id",
+    "effective_tool_id",
+    "catalogue_revision",
+    "descriptor_version",
+    "schema_fingerprint",
+    "arguments_sha256",
+    "invocation_id",
+)
+
+
+def _targeted_tool_invocation_payload(
+    tool_call: runtime_records.ToolCallRequest,
+) -> dict[str, Any]:
+    invocation = tool_call.targeted_tool_invocation
+    if invocation is None:
+        return {}
+    payload = {
+        "dispatch_kind": invocation.dispatch_kind,
+        "model_tool_name": invocation.model_tool_name,
+        "grant_id": invocation.grant_id,
+        "use_id": invocation.use_id,
+        "effective_tool_id": invocation.tool_id,
+        "catalogue_revision": invocation.catalogue_revision,
+        "descriptor_version": invocation.descriptor_version,
+        "schema_fingerprint": invocation.schema_fingerprint,
+        "arguments_sha256": invocation.arguments_sha256,
+        "invocation_id": invocation.invocation_id,
+    }
+    if tuple(payload) != _TARGETED_TOOL_INVOCATION_PAYLOAD_FIELDS:
+        raise AssertionError("Targeted tool invocation payload fields drifted.")
+    return payload
+
+
+def _event_with_targeted_tool_invocation_authority(
+    event: Event,
+    tool_call: runtime_records.ToolCallRequest,
+) -> Event:
+    """Attest exact gateway linkage copied from one resolved invocation."""
+
+    if tool_call.targeted_tool_invocation is None:
+        return event
+    return event_with_runtime_payload_authority(
+        event,
+        *_TARGETED_TOOL_INVOCATION_PAYLOAD_FIELDS,
+    )
 
 
 def _require_matching_policy_round(
@@ -436,12 +506,8 @@ def _require_matching_policy_round(
 ) -> None:
     if tool_round_recovery.pending_tool_round_identity(pending_round) != tool_round_identity:
         raise RuntimeError("Pending tool round identity changed before policy publication.")
-    expected_calls = [
-        (tool_call.id, tool_call.name, tool_call.arguments) for tool_call in tool_calls
-    ]
-    pending_calls = [
-        (call.tool_call_id, call.tool_name, call.arguments) for call in pending_round.tool_calls
-    ]
+    expected_calls = [runtime_records.copy_tool_call_request(call) for call in tool_calls]
+    pending_calls = tool_round_recovery.pending_round_tool_calls(pending_round)
     if pending_calls != expected_calls:
         raise RuntimeError("Pending tool round calls changed before policy publication.")
 
@@ -866,6 +932,485 @@ class ToolRoundExecutor:
             execution_profile=execution_profile,
         )
 
+    def _targeted_tool_use_request(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        interaction_id: str,
+        task_id: str | None,
+        tool_ref: str,
+        tool_id: str,
+        tool_name: str,
+        descriptor_version: str,
+        schema_fingerprint: str,
+        model_step_id: str,
+        outer_tool_call_id: str,
+        arguments_digest: str,
+        invocation_id: str,
+    ) -> TargetedToolUseRequest:
+        return TargetedToolUseRequest(
+            tool_ref=tool_ref,
+            session_id=session.id,
+            interaction_id=interaction_id,
+            generation_id=targeted_tool_view_generation_id(
+                session_id=session.id,
+                root_invocation_id=session.invocation.root_invocation_id,
+            ),
+            agent_name=registered_agent.spec.name,
+            task_id=task_id,
+            environment_name=_environment_name(registered_environment),
+            principal=session.invocation.origin.subject,
+            tenant=session.invocation.origin.tenant,
+            catalogue_revision=registered_agent.tool_catalogue.revision,
+            descriptor_version=descriptor_version,
+            schema_fingerprint=schema_fingerprint,
+            tool_id=tool_id,
+            tool_name=tool_name,
+            model_step_id=model_step_id,
+            outer_tool_call_id=outer_tool_call_id,
+            arguments_sha256=arguments_digest,
+            invocation_id=invocation_id,
+            expected_run_epoch=session.run_epoch,
+        )
+
+    async def resolve_targeted_tool_calls(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        pending_round: tool_round_recovery.PendingToolRound,
+    ) -> tuple[
+        tool_round_recovery.PendingToolRound,
+        list[runtime_records.ToolCallRequest],
+        tuple[Event, ...],
+    ]:
+        """Resolve and durably bind gateway calls before any policy evaluation."""
+
+        source_calls = tool_round_recovery.pending_round_tool_calls(pending_round)
+        if not any(
+            call.name == CALL_TOOL_NAME
+            or call.targeted_tool_invocation is not None
+            or call.targeted_tool_rejection is not None
+            for call in source_calls
+        ):
+            return pending_round, source_calls, ()
+        interaction_id = pending_round.interaction_id
+        if interaction_id is None:
+            raise RuntimeError("A pending call_tool round has no interaction identity.")
+        if pending_round.policy_state != "unplanned" and any(
+            call.name == CALL_TOOL_NAME
+            and call.targeted_tool_invocation is None
+            and call.targeted_tool_rejection is None
+            for call in source_calls
+        ):
+            raise RuntimeError("An unresolved call_tool envelope cannot carry a policy plan.")
+
+        records = await self._session_store.list_targeted_tool_grants(
+            session.id,
+            interaction_id=interaction_id,
+        )
+        records_by_ref = {record.tool_ref: record for record in records}
+        records_by_id = {record.grant_id: record for record in records}
+        if len(records_by_ref) != len(records) or len(records_by_id) != len(records):
+            raise RuntimeError("Targeted grant state contains duplicate identities.")
+        resolved_calls: list[runtime_records.ToolCallRequest] = []
+        resolution_events: list[Event] = []
+        identity = tool_round_recovery.pending_tool_round_identity(pending_round)
+        observed_at = self._clock()
+        ceiling_names = frozenset(
+            tool_capability_ceiling_from_session_metadata(session.metadata).tool_names
+        )
+
+        async def publish_persisted(event: Event) -> None:
+            delivered = await self._event_writer.fan_out_persisted([event])
+            resolution_events.extend(delivered)
+
+        async def publish_new(event: Event) -> None:
+            resolution_events.append(await self._event_writer.emit(event))
+
+        async def record_for_reference(tool_ref: str):
+            record = records_by_ref.get(tool_ref)
+            if record is not None:
+                return record
+            grant_id = await self._session_store.resolve_public_authority_alias(
+                tool_ref,
+                field_name="tool_ref",
+                scope_session_id=session.id,
+            )
+            return None if grant_id is None else records_by_id.get(grant_id)
+
+        def invocation_id_for(call: runtime_records.ToolCallRequest) -> str:
+            material = (
+                f"{session.id}\x00{identity.tool_round_id}\x00{identity.model_step_id}\x00{call.id}"
+            ).encode()
+            return f"sha256:{hashlib.sha256(material).hexdigest()}"
+
+        def rejected_call(
+            call: runtime_records.ToolCallRequest,
+            *,
+            reason: TargetedToolUseRejectionReason,
+            event: Event,
+        ) -> runtime_records.ToolCallRequest:
+            return runtime_records.ToolCallRequest(
+                id=call.id,
+                name=CALL_TOOL_NAME,
+                arguments=copy_durable_json_value(call.transcript_arguments, "arguments"),
+                targeted_tool_grant_id=call.targeted_tool_grant_id,
+                model_tool_name=CALL_TOOL_NAME,
+                targeted_tool_rejection=rejected_targeted_tool_invocation(
+                    reason=reason,
+                    event=event,
+                ),
+            )
+
+        for call in source_calls:
+            if call.targeted_tool_rejection is not None:
+                resolved_calls.append(runtime_records.copy_tool_call_request(call))
+                continue
+
+            if call.targeted_tool_invocation is not None:
+                invocation = call.targeted_tool_invocation
+                record = await record_for_reference(invocation.tool_ref)
+                if (
+                    record is None
+                    or record.grant_id != invocation.grant_id
+                    or record.tool_id != invocation.tool_id
+                    or record.tool_name != invocation.effective_tool_name
+                    or record.catalogue_revision != invocation.catalogue_revision
+                    or record.descriptor_version != invocation.descriptor_version
+                    or record.schema_fingerprint != invocation.schema_fingerprint
+                    or invocation.session_id != session.id
+                    or invocation.interaction_id != interaction_id
+                    or invocation.model_step_id != identity.model_step_id
+                    or invocation.outer_tool_call_id != call.id
+                    or targeted_arguments_sha256(call.arguments) != invocation.arguments_sha256
+                ):
+                    raise RuntimeError("Resolved call_tool checkpoint conflicts with grant state.")
+                request = self._targeted_tool_use_request(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    interaction_id=interaction_id,
+                    task_id=pending_round.task_id,
+                    tool_ref=record.tool_ref,
+                    tool_id=record.tool_id,
+                    tool_name=record.tool_name,
+                    descriptor_version=record.descriptor_version,
+                    schema_fingerprint=record.schema_fingerprint,
+                    model_step_id=identity.model_step_id,
+                    outer_tool_call_id=call.id,
+                    arguments_digest=invocation.arguments_sha256,
+                    invocation_id=invocation.invocation_id,
+                )
+                result = await self._session_store.bind_targeted_tool_grant_use(
+                    request,
+                    observed_at=observed_at,
+                )
+                if result.event is None:
+                    raise RuntimeError("Targeted tool rejoin returned no event evidence.")
+                await publish_persisted(result.event)
+                if result.disposition is TargetedToolUseDisposition.REJECTED:
+                    if result.reason is None:
+                        raise RuntimeError("Targeted tool rejoin rejection lost its reason.")
+                    resolved_calls.append(
+                        rejected_call(call, reason=result.reason, event=result.event)
+                    )
+                    continue
+                if (
+                    result.disposition is not TargetedToolUseDisposition.REJOINED
+                    or result.binding is None
+                    or result.binding.use_id != invocation.use_id
+                ):
+                    raise RuntimeError("Resolved call_tool checkpoint did not rejoin its binding.")
+                resolved_calls.append(runtime_records.copy_tool_call_request(call))
+                continue
+
+            if call.name != CALL_TOOL_NAME:
+                resolved_calls.append(runtime_records.copy_tool_call_request(call))
+                continue
+
+            raw_digest = targeted_arguments_sha256(call.arguments)
+            invocation_id = invocation_id_for(call)
+            try:
+                envelope = CallToolEnvelope.model_validate(call.arguments)
+            except (TypeError, ValueError):
+                event = unresolved_gateway_rejection_event(
+                    session_id=session.id,
+                    interaction_id=interaction_id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=_environment_name(registered_environment),
+                    model_step_id=identity.model_step_id,
+                    outer_tool_call_id=call.id,
+                    arguments_digest=raw_digest,
+                    reason=TargetedToolUseRejectionReason.MALFORMED,
+                    timestamp=observed_at,
+                )
+                await publish_new(event)
+                resolved_calls.append(
+                    rejected_call(
+                        call,
+                        reason=TargetedToolUseRejectionReason.MALFORMED,
+                        event=event,
+                    )
+                )
+                continue
+
+            selected_grant_id = call.targeted_tool_grant_id
+            if selected_grant_id is None:
+                record = await record_for_reference(envelope.tool_ref)
+            else:
+                record = records_by_id.get(selected_grant_id)
+                resolved_grant_id = await self._session_store.resolve_public_authority_alias(
+                    envelope.tool_ref,
+                    field_name="tool_ref",
+                    scope_session_id=session.id,
+                )
+                if record is None or resolved_grant_id != selected_grant_id:
+                    raise RuntimeError(
+                        "Runtime-selected call_tool reference conflicts with durable grant state."
+                    )
+            if record is None:
+                request = self._targeted_tool_use_request(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    interaction_id=interaction_id,
+                    task_id=pending_round.task_id,
+                    tool_ref=envelope.tool_ref,
+                    tool_id="cayu:unresolved-targeted-reference",
+                    tool_name=CALL_TOOL_NAME,
+                    descriptor_version=f"sha256:{'0' * 64}",
+                    schema_fingerprint=f"sha256:{'0' * 64}",
+                    model_step_id=identity.model_step_id,
+                    outer_tool_call_id=call.id,
+                    arguments_digest=targeted_arguments_sha256(envelope.arguments),
+                    invocation_id=invocation_id,
+                )
+                result = await self._session_store.bind_targeted_tool_grant_use(
+                    request,
+                    observed_at=observed_at,
+                )
+                if (
+                    result.disposition is not TargetedToolUseDisposition.REJECTED
+                    or result.reason is None
+                    or result.event is None
+                ):
+                    raise RuntimeError("Unknown call_tool reference unexpectedly resolved.")
+                await publish_persisted(result.event)
+                resolved_calls.append(rejected_call(call, reason=result.reason, event=result.event))
+                continue
+
+            try:
+                descriptor = registered_agent.tool_catalogue.descriptor_for_id(record.tool_id)
+            except KeyError:
+                descriptor = None
+            arguments_digest = targeted_arguments_sha256(envelope.arguments)
+            request = self._targeted_tool_use_request(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                interaction_id=interaction_id,
+                task_id=pending_round.task_id,
+                tool_ref=record.tool_ref,
+                tool_id=(record.tool_id if descriptor is None else descriptor.tool_id),
+                tool_name=(record.tool_name if descriptor is None else descriptor.name),
+                descriptor_version=(
+                    record.descriptor_version if descriptor is None else descriptor.version
+                ),
+                schema_fingerprint=(
+                    record.schema_fingerprint
+                    if descriptor is None
+                    else descriptor.schema_fingerprint
+                ),
+                model_step_id=identity.model_step_id,
+                outer_tool_call_id=call.id,
+                arguments_digest=arguments_digest,
+                invocation_id=invocation_id,
+            )
+            preflight_reason = targeted_tool_use_rejection_reason(
+                record,
+                request,
+                observed_at=observed_at,
+            )
+            explicit_rejection = None
+            if record.tool_name not in ceiling_names:
+                explicit_rejection = TargetedToolUseRejectionReason.OUT_OF_CEILING
+            elif descriptor is None:
+                explicit_rejection = TargetedToolUseRejectionReason.CATALOGUE_DRIFT
+            if explicit_rejection is not None:
+                event = targeted_tool_use_rejection_event(
+                    record,
+                    request,
+                    reason=explicit_rejection,
+                    timestamp=observed_at,
+                )
+                await publish_new(event)
+                resolved_calls.append(rejected_call(call, reason=explicit_rejection, event=event))
+                continue
+            if preflight_reason is not None:
+                result = await self._session_store.bind_targeted_tool_grant_use(
+                    request,
+                    observed_at=observed_at,
+                )
+                if (
+                    result.disposition is not TargetedToolUseDisposition.REJECTED
+                    or result.reason is None
+                    or result.event is None
+                ):
+                    raise RuntimeError("Rejected call_tool preflight unexpectedly bound.")
+                await publish_persisted(result.event)
+                resolved_calls.append(rejected_call(call, reason=result.reason, event=result.event))
+                continue
+            if descriptor is None:  # pragma: no cover - explicit rejection above
+                raise AssertionError("Callable targeted grant lost its registered descriptor.")
+            if not validate_effective_tool_arguments(
+                envelope.arguments,
+                descriptor.input_schema_copy(),
+            ):
+                event = targeted_tool_use_rejection_event(
+                    record,
+                    request,
+                    reason=TargetedToolUseRejectionReason.INVALID_ARGUMENTS,
+                    timestamp=observed_at,
+                )
+                await publish_new(event)
+                resolved_calls.append(
+                    rejected_call(
+                        call,
+                        reason=TargetedToolUseRejectionReason.INVALID_ARGUMENTS,
+                        event=event,
+                    )
+                )
+                continue
+
+            result = await self._session_store.bind_targeted_tool_grant_use(
+                request,
+                observed_at=observed_at,
+            )
+            if result.event is None:
+                raise RuntimeError("Targeted tool binding returned no event evidence.")
+            await publish_persisted(result.event)
+            if result.disposition is TargetedToolUseDisposition.REJECTED:
+                if result.reason is None:
+                    raise RuntimeError("Targeted tool binding rejection lost its reason.")
+                resolved_calls.append(rejected_call(call, reason=result.reason, event=result.event))
+                continue
+            if result.grant is None or result.binding is None:
+                raise RuntimeError("Targeted tool binding returned incomplete authority.")
+            resolved_calls.append(
+                runtime_records.ToolCallRequest(
+                    id=call.id,
+                    name=result.grant.tool_name,
+                    arguments=copy_durable_json_value(envelope.arguments, "arguments"),
+                    targeted_tool_grant_id=call.targeted_tool_grant_id,
+                    model_tool_name=CALL_TOOL_NAME,
+                    targeted_tool_invocation=resolved_targeted_tool_invocation(
+                        record=result.grant,
+                        binding=result.binding,
+                        tool_ref=envelope.tool_ref,
+                    ),
+                )
+            )
+
+        if resolved_calls == source_calls:
+            return pending_round, resolved_calls, tuple(resolution_events)
+        redactor = _redactor_for_tool_calls(
+            self._secret_redactor,
+            registered_agent=registered_agent,
+            tool_calls=resolved_calls,
+        )
+        payload = pending_round.model_dump(mode="json")
+        payload["tool_calls"] = [
+            record.model_dump(mode="json")
+            for record in approval_support.pending_tool_call_approvals(
+                tool_calls=resolved_calls,
+                policy_outcomes=None,
+                default_policy_evidence=ToolPolicyEvidence.UNPLANNED,
+                redactor=redactor,
+            )
+        ]
+        resolved_round = tool_round_recovery.PendingToolRound.model_validate(payload)
+        source_payload = pending_round.model_dump(mode="json")
+        resolved_payload = _require_secret_free_durable_object(
+            resolved_round.model_dump(mode="json"),
+            redactor=redactor,
+            field_name="pending_tool_round",
+            schema_root=tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY,
+        )
+
+        def publish_resolution(
+            current_session: Session,
+            current_checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            if current_session.run_epoch != session.run_epoch:
+                raise RuntimeError("Gateway resolution lost its run fence.")
+            current = (
+                {}
+                if current_checkpoint is None
+                else copy_durable_json_object(current_checkpoint, "checkpoint")
+            )
+            if current.get(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY) != source_payload:
+                raise RuntimeError("Pending tool round changed before gateway resolution.")
+            current[tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = resolved_payload
+            return copy_durable_json_object(current, "checkpoint")
+
+        await self._session_store.transform_checkpoint(session.id, publish_resolution)
+        return resolved_round, resolved_calls, tuple(resolution_events)
+
+    async def rejoin_targeted_tool_call(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        tool_call: runtime_records.ToolCallRequest,
+        task_id: str | None,
+    ) -> tuple[Event, ...]:
+        """Rejoin a previously bound gateway use before paused execution resumes."""
+
+        invocation = tool_call.targeted_tool_invocation
+        if invocation is None:
+            return ()
+        if (
+            invocation.session_id != session.id
+            or invocation.effective_tool_name != tool_call.name
+            or invocation.outer_tool_call_id != tool_call.id
+            or targeted_arguments_sha256(tool_call.arguments) != invocation.arguments_sha256
+        ):
+            raise RuntimeError("Paused call_tool invocation conflicts with its binding.")
+        request = self._targeted_tool_use_request(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            interaction_id=invocation.interaction_id,
+            task_id=task_id,
+            tool_ref=invocation.tool_ref,
+            tool_id=invocation.tool_id,
+            tool_name=invocation.effective_tool_name,
+            descriptor_version=invocation.descriptor_version,
+            schema_fingerprint=invocation.schema_fingerprint,
+            model_step_id=invocation.model_step_id,
+            outer_tool_call_id=invocation.outer_tool_call_id,
+            arguments_digest=invocation.arguments_sha256,
+            invocation_id=invocation.invocation_id,
+        )
+        result = await self._session_store.bind_targeted_tool_grant_use(
+            request,
+            observed_at=self._clock(),
+        )
+        if (
+            result.disposition is not TargetedToolUseDisposition.REJOINED
+            or result.binding is None
+            or result.binding.use_id != invocation.use_id
+            or result.event is None
+        ):
+            raise RuntimeError("Paused call_tool invocation did not rejoin its binding.")
+        delivered = await self._event_writer.fan_out_persisted([result.event])
+        return tuple(delivered)
+
     async def policy_plan(
         self,
         *,
@@ -885,7 +1430,8 @@ class ToolRoundExecutor:
             else frozenset(tool_exposure.tool_names)
         )
         has_authorizable_call = any(
-            call.name in registered_agent.tools and call.name in exposed_names
+            call.name in registered_agent.tools
+            and (call.name in exposed_names or call.targeted_tool_invocation is not None)
             for call in tool_calls
         )
         taint_labels = (
@@ -909,7 +1455,7 @@ class ToolRoundExecutor:
                     )
                 )
                 continue
-            if tool_call.name not in exposed_names:
+            if tool_call.name not in exposed_names and tool_call.targeted_tool_invocation is None:
                 policy_outcomes.append(
                     runtime_records.ToolCallPolicyOutcome(
                         call=tool_call,
@@ -1007,7 +1553,8 @@ class ToolRoundExecutor:
             else frozenset(tool_exposure.tool_names)
         )
         has_authorizable_call = any(
-            call.name in registered_agent.tools and call.name in exposed_names
+            call.name in registered_agent.tools
+            and (call.name in exposed_names or call.targeted_tool_invocation is not None)
             for call in tool_calls
         )
         taint_labels = (
@@ -1031,7 +1578,7 @@ class ToolRoundExecutor:
                     )
                 )
                 continue
-            if tool_call.name not in exposed_names:
+            if tool_call.name not in exposed_names and tool_call.targeted_tool_invocation is None:
                 policy_outcomes.append(
                     runtime_records.ToolCallPolicyOutcome(
                         call=tool_call,
@@ -1833,11 +2380,85 @@ class ToolRoundExecutor:
             ]
             | None
         ) = None,
+        rejoin_targeted_invocation: bool = False,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         tool_round_identity = copy_tool_round_identity(tool_round_identity)
         identity_payload = tool_round_identity.payload()
         tool_round_id = tool_round_identity.tool_round_id
         environment_name = _environment_name(registered_environment)
+        if rejoin_targeted_invocation:
+            rejoined_events = await self.rejoin_targeted_tool_call(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=tool_call,
+                task_id=task_id,
+            )
+            for rejoined_event in rejoined_events:
+                yield rejoined_event, None
+        if tool_call.targeted_tool_rejection is not None:
+            rejection = tool_call.targeted_tool_rejection
+            result = ToolResult(
+                content=gateway_rejection_content(rejection.reason),
+                structured={
+                    "status": "rejected",
+                    "reason": rejection.reason.value,
+                },
+                is_error=True,
+            )
+            idempotency_key = tool_execution.tool_idempotency_key(
+                session_id=session.id,
+                tool_call_id=tool_call.id,
+                tool_round_id=tool_round_id,
+                approval_id=approval_id,
+                pause_id=input_id,
+            )
+            payload: dict[str, Any] = {
+                "tool_call_id": tool_call.id,
+                "idempotency_key": idempotency_key,
+                "blocked_by": "targeted_tool_gateway",
+                "reason": rejection.reason.value,
+                "rejection_event_id": rejection.rejection_event_id,
+                "model_tool_name": rejection.model_tool_name,
+                "result": result.model_dump(mode="json"),
+                **tool_argument_publication.unavailable_argument_projection().payload_fields(),
+                **identity_payload,
+            }
+            event = _event_with_tool_round_authority(
+                event_with_execution_profile_authority(
+                    Event(
+                        type=EventType.TOOL_CALL_FAILED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        tool_name=rejection.model_tool_name,
+                        payload=payload,
+                    ),
+                    execution_profile,
+                ),
+                tool_round_identity,
+            )
+            outcome = runtime_records.ToolCallOutcome(
+                call=replace(tool_call, arguments={}),
+                result=result,
+            )
+            publication_snapshot = invocation_secrets.InvocationPublicationSnapshot(
+                redactor=self._secret_redactor,
+                unsafe_output=False,
+            )
+            if publication_snapshot_observer is not None:
+                await publication_snapshot_observer(tool_call.id, publication_snapshot)
+            if deferred_terminal_stager is not None:
+                await deferred_terminal_stager(
+                    event,
+                    outcome,
+                    False,
+                    False,
+                    publication_snapshot,
+                )
+                return
+            yield await self._event_writer.emit(event), outcome
+            return
         if policy_evidence is ToolPolicyEvidence.UNEXPOSED:
             if tool_exposure is None:
                 raise RuntimeError("Unexposed tool call lost its frozen exposure snapshot.")
@@ -2033,6 +2654,7 @@ class ToolRoundExecutor:
             payload: dict[str, Any] = {
                 "tool_call_id": tool_call.id,
                 "idempotency_key": idempotency_key,
+                **_targeted_tool_invocation_payload(tool_call),
                 **tool_argument_publication.quarantined_argument_fields(),
                 **identity_payload,
             }
@@ -2053,6 +2675,7 @@ class ToolRoundExecutor:
                 ),
                 execution_profile,
             )
+            started = _event_with_targeted_tool_invocation_authority(started, tool_call)
             started_event = await self._event_writer.emit(
                 prepare_runtime_event(
                     _event_with_tool_round_authority(
@@ -4409,6 +5032,7 @@ class ToolRoundExecutor:
             arguments=resolved_argument_projection.transcript_arguments(),
         )
         event_payload = dict(event.payload)
+        event_payload.update(_targeted_tool_invocation_payload(tool_call))
         event_payload.pop(tool_argument_publication.ARGUMENTS_FIELD, None)
         event_payload.pop(tool_argument_publication.ARGUMENTS_STATE_FIELD, None)
         if resolved_argument_projection.state == "unavailable":
@@ -4453,6 +5077,16 @@ class ToolRoundExecutor:
                 result=result,
                 redactor=resolved_redactor,
             )
+        if tool_call.targeted_tool_invocation is not None:
+            event = event.model_copy(
+                update={
+                    "payload": {
+                        **event.payload,
+                        **_targeted_tool_invocation_payload(tool_call),
+                    }
+                }
+            )
+            event = _event_with_targeted_tool_invocation_authority(event, tool_call)
         if deferred_terminal_stager is not None:
             await deferred_terminal_stager(
                 event,
@@ -4963,6 +5597,18 @@ class ToolRoundRun:
             tool_round_identity=tool_round_identity,
             tool_calls=tool_calls,
         )
+        (
+            source_pending_round,
+            tool_calls,
+            targeted_resolution_events,
+        ) = await executor.resolve_targeted_tool_calls(
+            session=session,
+            registered_agent=self._registered_agent,
+            registered_environment=self._registered_environment,
+            pending_round=source_pending_round,
+        )
+        for targeted_resolution_event in targeted_resolution_events:
+            yield targeted_resolution_event
         tool_exposure = source_pending_round.tool_exposure
         if tool_exposure is not None:
             tool_exposure = validate_resolved_tool_exposure_authority(

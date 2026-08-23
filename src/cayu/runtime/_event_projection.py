@@ -189,6 +189,20 @@ _TARGETED_TOOL_GRANT_PUBLIC_AUTHORITY_KEYS = frozenset(
         "use_id",
     }
 )
+_TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS = frozenset(
+    {
+        "arguments_sha256",
+        "catalogue_revision",
+        "descriptor_version",
+        "dispatch_kind",
+        "effective_tool_id",
+        "grant_id",
+        "invocation_id",
+        "model_tool_name",
+        "schema_fingerprint",
+        "use_id",
+    }
+)
 # Unlike caller-selected public linkage such as a server mutation id, these
 # fields assert which runtime authority governed an effect. They may survive a
 # first write or an untrusted projection only with exact in-process provenance.
@@ -196,6 +210,7 @@ _PROVENANCE_REQUIRED_PUBLIC_AUTHORITY_KEYS = (
     _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS
     | _TOOL_EXPOSURE_RECORD_PUBLIC_AUTHORITY_KEYS
     | _TARGETED_TOOL_GRANT_PUBLIC_AUTHORITY_KEYS
+    | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
 )
 _TOOL_EVENT_TYPES = frozenset(
     {
@@ -2083,6 +2098,15 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         },
         internal_keys={"provider_operation_progress"},
         exact_internal_keys={"provider_operation_progress"},
+        nested_authority_paths={
+            (
+                "provider_operation_progress",
+                "stream_event",
+                "payload",
+                "arguments",
+                "tool_ref",
+            )
+        },
     )
     provider_operation_recovery_keys = (
         "attempt",
@@ -2209,16 +2233,24 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "approval_metadata_truncated",
         "arguments",
         "arguments_state",
+        "arguments_sha256",
+        "catalogue_revision",
+        "descriptor_version",
+        "dispatch_kind",
         "effect",
+        "effective_tool_id",
         "execution_profile_fingerprint",
         "effective_arguments",
         "expired",
         "idempotency_key",
         "input_id",
+        "invocation_id",
+        "grant_id",
         "metadata",
         "metadata_truncated",
         "model_attempt_id",
         "model_step_id",
+        "model_tool_name",
         "reason",
         "recovered",
         "requested_decision",
@@ -2227,12 +2259,14 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "resolved_by",
         "result",
         "short_circuited_by",
+        "schema_fingerprint",
         "structured_output_validation",
         "task_id",
         "tool_call_id",
         "tool_call_metadata_truncated",
         "tool_name",
         "tool_round_id",
+        "use_id",
         "workspace_mutation_capture_detail_code",
         "workspace_mutation_capture_status",
     }
@@ -2251,8 +2285,13 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     policies[EventType.TOOL_CALL_STARTED] = _policy(
         *tool_common,
         owned_nested_paths=_TOOL_RESULT_NESTED_PATHS | tool_actor_paths,
-        authority_keys=_TOOL_LINKAGE_AUTHORITY_KEYS,
-        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+        authority_keys=(
+            _TOOL_LINKAGE_AUTHORITY_KEYS | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
+        ),
+        public_authority_keys=(
+            _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS
+            | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
+        ),
         aliased_authority_keys={
             "approval_id",
             "input_id",
@@ -2283,10 +2322,14 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             owned_nested_paths=_TOOL_EVENT_NESTED_PATHS | tool_actor_paths,
             authority_keys={
                 *_TOOL_LINKAGE_AUTHORITY_KEYS,
+                *_TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS,
                 WEB_ACCESS_RESULT_AUTHORITY_FIELD,
             },
             internal_authority_keys={WEB_ACCESS_RESULT_AUTHORITY_FIELD},
-            public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+            public_authority_keys=(
+                _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS
+                | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
+            ),
             aliased_authority_keys={
                 "approval_id",
                 "input_id",
@@ -2545,9 +2588,15 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "reason",
         "tool_result_projection",
         owned_nested_paths=_TOOL_PROJECTED_DENIAL_RESULT_NESTED_PATHS | tool_actor_paths,
-        authority_keys=_TOOL_LINKAGE_AUTHORITY_KEYS | _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS,
+        authority_keys=(
+            _TOOL_LINKAGE_AUTHORITY_KEYS
+            | _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS
+            | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
+        ),
         public_authority_keys=(
-            _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS | _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS
+            _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS
+            | _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS
+            | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
         ),
         aliased_authority_keys={
             "approval_id",
@@ -2576,8 +2625,13 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         owned_nested_paths=(
             _TOOL_RESULT_NESTED_PATHS | _APPROVAL_NESTED_SCHEMA_PATHS | tool_actor_paths
         ),
-        authority_keys=_TOOL_LINKAGE_AUTHORITY_KEYS,
-        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+        authority_keys=(
+            _TOOL_LINKAGE_AUTHORITY_KEYS | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
+        ),
+        public_authority_keys=(
+            _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS
+            | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
+        ),
         aliased_authority_keys={
             "approval_id",
             "input_id",
@@ -2618,8 +2672,13 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "reason",
         "resolved_by",
         owned_nested_paths=_TOOL_DENIAL_RESULT_NESTED_PATHS | tool_actor_paths,
-        authority_keys=_TOOL_LINKAGE_AUTHORITY_KEYS,
-        public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
+        authority_keys=(
+            _TOOL_LINKAGE_AUTHORITY_KEYS | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
+        ),
+        public_authority_keys=(
+            _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS
+            | _TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS
+        ),
         aliased_authority_keys={
             "approval_id",
             "input_id",
@@ -3370,6 +3429,11 @@ def _prepare_runtime_event(
         redacted_payload=redacted_payload,
         reject_malformed=True,
     )
+    _restore_runtime_nested_payload_authority(
+        event,
+        policy=policy,
+        redacted_payload=redacted_payload,
+    )
     for key in policy.exact_internal_keys:
         if key in event.payload and redacted_payload.get(key) != event.payload[key]:
             raise ValueError(
@@ -3382,11 +3446,6 @@ def _prepare_runtime_event(
         redacted_payload=redacted_payload,
     )
     _restore_runtime_payload_authority(
-        event,
-        policy=policy,
-        redacted_payload=redacted_payload,
-    )
-    _restore_runtime_nested_payload_authority(
         event,
         policy=policy,
         redacted_payload=redacted_payload,
@@ -3467,6 +3526,12 @@ def _quarantine_pre_execution_tool_arguments(
         value.pop("assistant_message_state", None)
         value.pop("secret_resolution_scope", None)
         value.pop("publish_arguments", None)
+        # Gateway resolution authority remains private checkpoint material.
+        # Public pause events expose only the effective tool descriptor.
+        value.pop("model_tool_name", None)
+        value.pop("targeted_tool_grant_id", None)
+        value.pop("targeted_tool_invocation", None)
+        value.pop("targeted_tool_rejection", None)
         value.pop("arguments", None)
         value.pop("effective_arguments", None)
         if had_private_arguments or had_quarantine_marker:
@@ -4155,6 +4220,7 @@ def _reject_secret_authority_values(
             "catalogue_revision",
             "execution_profile_fingerprint",
             "exposure_fingerprint",
+            *_TARGETED_TOOL_INVOCATION_PUBLIC_AUTHORITY_KEYS,
         } and (
             event_payload_authority_is_runtime_generated(
                 event,
@@ -4292,6 +4358,7 @@ def _public_authority_is_trusted(
         "arguments_sha256",
         "generation_id",
         "grant_id",
+        "invocation_id",
         "rejection_id",
         "schema_fingerprint",
         "use_id",
@@ -4306,7 +4373,7 @@ def _public_authority_is_trusted(
         type(value) is str and bool(value.strip()) and len(value) <= 256
     ):
         return False
-    if field_name in {"descriptor_version", "tool_id"}:
+    if field_name in {"descriptor_version", "effective_tool_id", "tool_id"}:
         if type(value) is not str:
             return False
         try:
@@ -4315,12 +4382,16 @@ def _public_authority_is_trusted(
                 validate_tool_descriptor_version,
             )
 
-            if field_name == "tool_id":
+            if field_name in {"effective_tool_id", "tool_id"}:
                 validate_canonical_tool_id(value)
             else:
                 validate_tool_descriptor_version(value)
         except (TypeError, ValueError):
             return False
+    if field_name == "dispatch_kind" and value != "gateway":
+        return False
+    if field_name == "model_tool_name" and value != "call_tool":
+        return False
     if trust_persisted_projection:
         return True
     assert type(value) is str

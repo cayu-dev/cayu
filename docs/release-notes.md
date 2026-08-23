@@ -140,7 +140,7 @@ write this table, but scenario-aware `SQLiteEvalStore` and `PostgresEvalStore`
 instances require revision 53. This release establishes portable authoring and
 durable storage; target binding and execution remain separate launch-time work.
 
-### Targeted tool grants add durable interaction-scoped addressability
+### Targeted grants can execute through the portable `call_tool` gateway
 
 `RunRequest` and `ResumeRequest` can now carry strict `TargetedToolGrant`
 requests for one canonical tool already registered inside the session's durable
@@ -151,12 +151,27 @@ catalogue drift, task-boundary changes, and exhausted grants fail closed. Forks
 copy no targeted grant or consumption authority and record an explicit reset
 event.
 
-Targeted grants do not expose another provider tool definition and do not
-authorize or execute a target. This release intentionally contains no
-model-visible `call_tool` gateway; existing direct provider tools, policies,
-approvals, and execution behavior are unchanged. Authenticated application
-inspection can retrieve the opaque reference, while general events and request
-footprints retain only bounded identities and counts.
+While an interaction has a callable targeted grant, Cayu now projects one
+strict provider-independent `call_tool(tool_ref, arguments)` definition plus a
+bounded runtime-authored descriptor context. Resolving that outer call validates
+the current descriptor and inner arguments, then atomically consumes or rejoins
+the grant before the ordinary policy plan. The canonical target continues
+through the existing approval, hook, effect, secret, environment, concurrency,
+idempotency, execution, receipt, and recovery paths; no wrapper executor or
+parallel authority path was added.
+
+Provider transcripts retain the outer `call_tool` name and call id but use a
+fixed non-authoritative placeholder instead of the opaque reference. Private
+recovery state retains the exact runtime-issued reference with its selected
+grant identity and revalidates the pair against the durable store before binding
+or rejoining. Exact retry and approval continuation therefore rejoin one
+consumption even when the reference text collides with workload-secret
+redaction. Model-authored lookalikes remain untrusted. Invalid references, stale
+scope, exhausted grants, invalid inner arguments, and schemas requiring external
+reference retrieval fail before policy or target-side work. General events and
+request footprints never expose the opaque reference. Requests without active
+grants retain their existing tools, messages, direct-tool prefix, and execution
+behavior.
 
 Server contract version 20 adds the targeted-grant admission count and batch
 fingerprint to interaction summary evidence. Independently deployed servers,

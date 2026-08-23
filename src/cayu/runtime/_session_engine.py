@@ -577,6 +577,7 @@ from cayu.runtime.tasks import (
     _terminalize_claimed_task,
     copy_task,
 )
+from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
 from cayu.runtime.tool_exposure import (
     ResolvedToolExposure,
     ToolCapabilityCeiling,
@@ -15069,6 +15070,11 @@ class SessionEngine:
                 tool_round_recovery.checkpoint_with_pending_tool_round(
                     source_checkpoint,
                     agent_name=registered_agent.spec.name,
+                    interaction_id=(
+                        publication.completion_event.interaction_id
+                        if any(call.name == CALL_TOOL_NAME for call in tool_calls)
+                        else None
+                    ),
                     environment_name=_environment_name(registered_environment),
                     task_id=task_id,
                     source_run_epoch=publication.dispatch.stage.source_run_epoch,
@@ -16118,6 +16124,7 @@ class SessionEngine:
                 initial_tool_exposure=initial_model_step_tool_exposure,
                 previous_tool_exposure_profile_id=previous_tool_exposure_profile_id,
                 targeted_tool_grants=targeted_tool_grants,
+                interaction_id=_current_session_interaction_id(session.id),
                 model_completion_recovery_context_factory=(model_completion_recovery_context),
                 model_completion_publisher=publish_model_completion,
             )
@@ -16296,10 +16303,15 @@ class SessionEngine:
                                 raise AssertionError(
                                     "Structured-output arguments redacted as a non-object."
                                 )
+                            if (
+                                call.name == CALL_TOOL_NAME
+                                and call.targeted_tool_grant_id is not None
+                                and type(call.arguments.get("tool_ref")) is str
+                            ):
+                                arguments["tool_ref"] = call.arguments["tool_ref"]
                             expected_durable_tool_calls.append(
-                                runtime_records.ToolCallRequest(
-                                    id=call.id,
-                                    name=call.name,
+                                runtime_records.copy_tool_call_request(
+                                    call,
                                     arguments=arguments,
                                 )
                             )
@@ -18496,11 +18508,7 @@ class SessionEngine:
             # descriptor, not against terminal outcomes whose argument projection
             # can intentionally be unavailable.
             expected_tool_calls = [
-                runtime_records.ToolCallRequest(
-                    id=call.tool_call_id,
-                    name=call.tool_name,
-                    arguments=call.arguments,
-                )
+                approval_support.tool_call_request_from_pending(call)
                 for call in pending_approval_to_clear.tool_calls
             ]
             if await transcript_helpers.tool_round_has_result_messages(
@@ -18723,9 +18731,8 @@ class SessionEngine:
             )
         skipped_outcomes = [
             runtime_records.ToolCallOutcome(
-                call=runtime_records.ToolCallRequest(
-                    id=outcome.call.id,
-                    name=outcome.call.name,
+                call=runtime_records.copy_tool_call_request(
+                    outcome.call,
                     arguments={},
                 ),
                 result=outcome.result,

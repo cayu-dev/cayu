@@ -73,7 +73,10 @@ async def tool_round_has_result_messages(
     expected_by_id: dict[str, ToolCallRequest] = {}
     for tool_call in tool_calls:
         existing = expected_by_id.setdefault(tool_call.id, tool_call)
-        if existing.name != tool_call.name or existing.arguments != tool_call.arguments:
+        if (
+            existing.transcript_tool_name != tool_call.transcript_tool_name
+            or existing.transcript_arguments != tool_call.transcript_arguments
+        ):
             raise ValueError(
                 "Pending tool round reuses a tool-call identifier for different descriptors."
             )
@@ -146,7 +149,10 @@ def _validate_tool_round_call_parts(
         )
     for part in parts:
         expected_call = expected_by_id[part.tool_call_id]
-        if part.tool_name != expected_call.name or part.arguments != expected_call.arguments:
+        if (
+            part.tool_name != expected_call.transcript_tool_name
+            or part.arguments != expected_call.transcript_arguments
+        ):
             raise ValueError(
                 "Stored transcript tool-round call descriptor does not match the pending checkpoint."
             )
@@ -164,7 +170,7 @@ def _validate_tool_round_result_parts(
             "Stored transcript tool-round result message does not match the pending call set."
         )
     for part in parts:
-        if part.tool_name != expected_by_id[part.tool_call_id].name:
+        if part.tool_name != expected_by_id[part.tool_call_id].transcript_tool_name:
             raise ValueError(
                 "Stored transcript tool-round result descriptor does not match the pending checkpoint."
             )
@@ -421,9 +427,21 @@ def assistant_message_with_projected_tool_arguments(
 ) -> Message:
     """Overlay terminal tool arguments onto a durable safe assistant projection."""
 
-    projected_by_id = {outcome.call.id: outcome.call for outcome in outcomes}
-    if len(projected_by_id) != len(outcomes):
+    calls = [outcome.call for outcome in outcomes]
+    if len({call.id for call in calls}) != len(calls):
         raise ValueError("Projected tool outcomes cannot repeat tool-call identifiers.")
+    return assistant_message_with_tool_call_arguments(message, calls)
+
+
+def assistant_message_with_tool_call_arguments(
+    message: Message,
+    calls: list[ToolCallRequest] | tuple[ToolCallRequest, ...],
+) -> Message:
+    """Overlay one exact private tool-call projection onto an assistant message."""
+
+    projected_by_id = {call.id: call for call in calls}
+    if len(projected_by_id) != len(calls):
+        raise ValueError("Projected tool calls cannot repeat tool-call identifiers.")
     seen: set[str] = set()
     projected_openai_state_ids: set[str] = set()
     projected_content = []
@@ -441,7 +459,7 @@ def assistant_message_with_projected_tool_arguments(
             if type(call_id) is not str or type(tool_name) is not str:
                 raise ValueError("OpenAI function-call provider state is missing its identity.")
             projected_call = projected_by_id.get(call_id)
-            if projected_call is None or projected_call.name != tool_name:
+            if projected_call is None or projected_call.transcript_tool_name != tool_name:
                 raise ValueError(
                     "OpenAI function-call provider state conflicts with terminal tool evidence."
                 )
@@ -451,7 +469,7 @@ def assistant_message_with_projected_tool_arguments(
                 )
             projected_openai_state_ids.add(call_id)
             state["arguments"] = json.dumps(
-                projected_call.arguments,
+                projected_call.transcript_arguments,
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -461,7 +479,7 @@ def assistant_message_with_projected_tool_arguments(
             projected_content.append(copy_message_part(part))
             continue
         projected_call = projected_by_id.get(part.tool_call_id)
-        if projected_call is None or projected_call.name != part.tool_name:
+        if projected_call is None or projected_call.transcript_tool_name != part.tool_name:
             raise ValueError("Quarantined assistant message conflicts with terminal tool evidence.")
         if part.tool_call_id in seen:
             raise ValueError("Quarantined assistant message repeats a tool-call identifier.")
@@ -470,7 +488,7 @@ def assistant_message_with_projected_tool_arguments(
             ToolCallPart(
                 tool_call_id=part.tool_call_id,
                 tool_name=part.tool_name,
-                arguments=deepcopy(projected_call.arguments),
+                arguments=deepcopy(projected_call.transcript_arguments),
                 tool_round_id=part.tool_round_id,
                 model_step_id=part.model_step_id,
                 model_attempt_id=part.model_attempt_id,
@@ -581,7 +599,7 @@ def tool_result_messages(
             results=[
                 ToolResultPart(
                     tool_call_id=outcome.call.id,
-                    tool_name=outcome.call.name,
+                    tool_name=outcome.call.transcript_tool_name,
                     content=outcome.result.content,
                     structured=copy_json_value(outcome.result.structured, "structured"),
                     artifacts=copy_json_value(outcome.result.artifacts, "artifacts"),

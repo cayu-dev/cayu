@@ -141,6 +141,7 @@ dependencies = [
     { name = "httpx" },
     { name = "jsonschema" },
     { name = "pydantic" },
+    { name = "referencing" },
     { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
 
@@ -281,6 +282,7 @@ requires-dist = [
     { name = "pypdf", marker = "extra == 'all'", specifier = ">=4" },
     { name = "pypdf", marker = "extra == 'dev'", specifier = ">=4" },
     { name = "pypdf", marker = "extra == 'files'", specifier = ">=4" },
+    { name = "referencing", specifier = ">=0.35" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=7.1" },
     { name = "pytest-split", marker = "extra == 'dev'", specifier = ">=0.11,<1" },

@@ -608,6 +608,10 @@ def _approval_event_matches_checkpoint(
         for pending_call in tool_calls:
             if type(pending_call) is not dict:
                 raise TypeError("Pending approval tool calls must be objects.")
+            pending_call.pop("model_tool_name", None)
+            pending_call.pop("targeted_tool_grant_id", None)
+            pending_call.pop("targeted_tool_invocation", None)
+            pending_call.pop("targeted_tool_rejection", None)
             pending_call.pop("metadata", None)
             pending_call.pop("reason", None)
             pending_call.pop("arguments_state", None)

@@ -381,9 +381,57 @@ def test_runtime_exposure_digest_survives_an_exact_workload_secret_collision() -
         assert public.payload["exposure_fingerprint"] == exposure_fingerprint
 
 
+def test_targeted_tool_invocation_linkage_requires_runtime_provenance() -> None:
+    authority = {
+        "arguments_sha256": f"sha256:{'a' * 64}",
+        "catalogue_revision": f"sha256:{'b' * 64}",
+        "descriptor_version": f"sha256:{'c' * 64}",
+        "dispatch_kind": "gateway",
+        "effective_tool_id": "cayu:remember",
+        "grant_id": f"sha256:{'d' * 64}",
+        "invocation_id": f"sha256:{'e' * 64}",
+        "model_tool_name": "call_tool",
+        "schema_fingerprint": f"sha256:{'f' * 64}",
+        "use_id": f"sha256:{'0' * 64}",
+    }
+    event = Event(
+        type=EventType.TOOL_CALL_STARTED,
+        session_id="targeted-tool-provenance",
+        tool_name="remember",
+        payload=authority,
+    )
+
+    unattested = prepare_new_runtime_event(event, redactor=SecretRedactor())
+    assert not authority.keys() & unattested.payload.keys()
+
+    attested = event_with_runtime_payload_authority(event, *authority)
+    redactor = SecretRedactor("sha256:")
+    prepared = prepare_new_runtime_event(attested, redactor=redactor)
+    assert {key: prepared.payload[key] for key in authority} == authority
+    assert {
+        key: project_runtime_event(prepared, sequence=1, redactor=redactor).payload[key]
+        for key in authority
+    } == authority
+
+    reloaded = Event.model_validate(prepared.model_dump(mode="python"))
+    persisted = project_persisted_runtime_event(
+        reloaded,
+        sequence=1,
+        redactor=redactor,
+    )
+    assert {key: persisted.payload[key] for key in authority} == authority
+
+
 def test_pause_projection_schemas_track_the_typed_checkpoint_models() -> None:
     assert (
-        frozenset(PendingToolCallApproval.model_fields) | {"arguments_state"}
+        frozenset(PendingToolCallApproval.model_fields)
+        - {
+            "model_tool_name",
+            "targeted_tool_grant_id",
+            "targeted_tool_invocation",
+            "targeted_tool_rejection",
+        }
+        | {"arguments_state"}
         == event_projection_module._PENDING_TOOL_CALL_FIELD_NAMES
     )
     assert (frozenset(PendingToolApproval.model_fields) - {"run_limit_accounting"}) | {

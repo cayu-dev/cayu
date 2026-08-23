@@ -50,6 +50,7 @@ from cayu.runtime.structured_output import (
     StructuredOutputValidation,
     copy_structured_output_spec,
 )
+from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
 from cayu.runtime.tool_exposure import (
     ResolvedToolExposureAuthority,
     copy_resolved_tool_exposure_authority,
@@ -80,6 +81,7 @@ class PendingToolRound(BaseModel):
     model_step_id: str
     model_attempt_id: str
     agent_name: str
+    interaction_id: str | None = None
     environment_name: str | None = None
     task_id: str | None = None
     source_run_epoch: StrictInt | None = Field(
@@ -153,9 +155,17 @@ class PendingToolRound(BaseModel):
             self.budget_limits,
         ):
             raise ValueError("run_limit_accounting requires active run-scoped authority.")
+        has_gateway_call = any(
+            call.tool_name == CALL_TOOL_NAME or call.model_tool_name == CALL_TOOL_NAME
+            for call in self.tool_calls
+        )
+        if has_gateway_call != (self.interaction_id is not None):
+            raise ValueError(
+                "Pending gateway calls and interaction identity authority must be present together."
+            )
         return self
 
-    @field_validator("environment_name", "task_id", "source_model_step_id")
+    @field_validator("interaction_id", "environment_name", "task_id", "source_model_step_id")
     @classmethod
     def validate_optional_nonblank_fields(
         cls,
@@ -334,6 +344,7 @@ class PendingToolRound(BaseModel):
             if self.policy_state == "planned" and any(
                 call.policy_evidence is ToolPolicyEvidence.AUTHORITATIVE
                 and call.tool_name not in exposed_names
+                and call.targeted_tool_invocation is None
                 for call in self.tool_calls
             ):
                 raise ValueError(
@@ -769,6 +780,7 @@ def checkpoint_with_pending_tool_round(
     checkpoint: dict[str, Any] | None,
     *,
     agent_name: str,
+    interaction_id: str | None = None,
     environment_name: str | None,
     task_id: str | None,
     source_run_epoch: int | None = None,
@@ -840,6 +852,7 @@ def checkpoint_with_pending_tool_round(
         model_step_id=identity.model_step_id,
         model_attempt_id=identity.model_attempt_id,
         agent_name=agent_name,
+        interaction_id=interaction_id,
         environment_name=environment_name,
         task_id=task_id,
         source_run_epoch=source_run_epoch,
@@ -915,7 +928,8 @@ def checkpoint_with_pending_tool_round(
 
 def _require_executable_pending_tool_round(pending_round: PendingToolRound) -> None:
     has_redacted_arguments = any(
-        contains_redacted_secret(call.arguments) for call in pending_round.tool_calls
+        call.targeted_tool_rejection is None and contains_redacted_secret(call.arguments)
+        for call in pending_round.tool_calls
     )
     is_internal_structured_output_round = pending_round.structured_output is not None and any(
         call.tool_name == STRUCTURED_OUTPUT_TOOL_NAME for call in pending_round.tool_calls
@@ -957,6 +971,10 @@ def pending_tool_call_records(
                 tool_call_id=tool_call.id,
                 tool_name=tool_call.name,
                 arguments=copy_durable_json_value(tool_call.arguments, "arguments"),
+                targeted_tool_grant_id=tool_call.targeted_tool_grant_id,
+                model_tool_name=tool_call.model_tool_name,
+                targeted_tool_invocation=tool_call.targeted_tool_invocation,
+                targeted_tool_rejection=tool_call.targeted_tool_rejection,
                 policy_evidence=policy_evidence_by_id.get(
                     tool_call.id,
                     default_policy_evidence,
@@ -984,6 +1002,10 @@ def pending_round_tool_calls(
             id=call.tool_call_id,
             name=call.tool_name,
             arguments=copy_durable_json_value(call.arguments, "arguments"),
+            targeted_tool_grant_id=call.targeted_tool_grant_id,
+            model_tool_name=call.model_tool_name,
+            targeted_tool_invocation=call.targeted_tool_invocation,
+            targeted_tool_rejection=call.targeted_tool_rejection,
         )
         for call in pending_round.tool_calls
     ]

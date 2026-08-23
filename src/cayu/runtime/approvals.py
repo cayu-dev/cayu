@@ -34,6 +34,12 @@ from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import StructuredOutputSpec, copy_structured_output_spec
+from cayu.runtime.tool_grants import (
+    TARGETED_TOOL_DIGEST_PATTERN,
+    TARGETED_TOOL_TRANSCRIPT_REFERENCE,
+    RejectedTargetedToolInvocation,
+    ResolvedTargetedToolInvocation,
+)
 
 RESOLUTION_ACTOR_RESERVED_SUBJECT_PREFIX = "cayu:"
 EXPIRY_RESOLUTION_ACTOR_SUBJECT = "cayu:approval-expiry"
@@ -330,6 +336,20 @@ class PendingToolCallApproval(BaseModel):
     tool_call_id: str
     tool_name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+    targeted_tool_grant_id: str | None = Field(
+        default=None,
+        pattern=TARGETED_TOOL_DIGEST_PATTERN,
+        exclude_if=lambda value: value is None,
+    )
+    model_tool_name: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    targeted_tool_invocation: ResolvedTargetedToolInvocation | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    targeted_tool_rejection: RejectedTargetedToolInvocation | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     # ``None`` is accepted only as a legacy representation. Callers must use
     # ``effective_tool_policy_evidence`` before making an authority decision.
     policy_evidence: ToolPolicyEvidence | None = None
@@ -344,6 +364,27 @@ class PendingToolCallApproval(BaseModel):
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
         return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("model_tool_name")
+    @classmethod
+    def validate_model_tool_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, "model_tool_name")
+
+    @field_validator("targeted_tool_invocation", mode="before")
+    @classmethod
+    def copy_targeted_tool_invocation(cls, value: object) -> object:
+        if isinstance(value, ResolvedTargetedToolInvocation):
+            return value.model_dump(mode="python")
+        return value
+
+    @field_validator("targeted_tool_rejection", mode="before")
+    @classmethod
+    def copy_targeted_tool_rejection(cls, value: object) -> object:
+        if isinstance(value, RejectedTargetedToolInvocation):
+            return value.model_dump(mode="python")
+        return value
 
     @field_validator("active_taint_labels", mode="before")
     @classmethod
@@ -397,7 +438,48 @@ class PendingToolCallApproval(BaseModel):
             raise ValueError(
                 "Non-authoritative tool-policy evidence cannot carry a policy decision."
             )
+        if self.targeted_tool_invocation is not None and self.targeted_tool_rejection is not None:
+            raise ValueError("A pending call cannot be both gateway-resolved and rejected.")
+        if self.targeted_tool_grant_id is not None and (
+            self.tool_name != "call_tool" and self.model_tool_name != "call_tool"
+        ):
+            raise ValueError("Pending grant selection requires a call_tool model call.")
+        if self.targeted_tool_invocation is not None:
+            invocation = self.targeted_tool_invocation
+            if (
+                self.model_tool_name != invocation.model_tool_name
+                or self.tool_name != invocation.effective_tool_name
+                or self.tool_call_id != invocation.outer_tool_call_id
+            ):
+                raise ValueError("Pending gateway invocation conflicts with its effective call.")
+            if (
+                self.targeted_tool_grant_id is not None
+                and self.targeted_tool_grant_id != invocation.grant_id
+            ):
+                raise ValueError("Pending grant selection conflicts with its gateway invocation.")
+        if self.targeted_tool_rejection is not None:
+            rejection = self.targeted_tool_rejection
+            if self.model_tool_name != rejection.model_tool_name or self.tool_name != "call_tool":
+                raise ValueError("Pending gateway rejection conflicts with its model call.")
+        if self.model_tool_name is not None and (
+            self.targeted_tool_invocation is None and self.targeted_tool_rejection is None
+        ):
+            raise ValueError("Pending model tool alias requires gateway evidence.")
         return self
+
+    @property
+    def transcript_arguments(self) -> dict[str, Any]:
+        """Return the non-authoritative provider-history argument projection."""
+
+        if self.targeted_tool_invocation is not None:
+            return {
+                "tool_ref": TARGETED_TOOL_TRANSCRIPT_REFERENCE,
+                "arguments": copy_durable_json_value(self.arguments, "arguments"),
+            }
+        projected = copy_durable_json_value(self.arguments, "arguments")
+        if self.targeted_tool_grant_id is not None and "tool_ref" in projected:
+            projected["tool_ref"] = TARGETED_TOOL_TRANSCRIPT_REFERENCE
+        return projected
 
 
 class PendingToolApproval(BaseModel):
@@ -731,7 +813,15 @@ class PendingToolApprovalEventView(BaseModel):
         payload["arguments"] = None if arguments_quarantined else pending.arguments
         payload["tool_calls"] = [
             {
-                **call.model_dump(mode="python"),
+                **call.model_dump(
+                    mode="python",
+                    exclude={
+                        "model_tool_name",
+                        "targeted_tool_grant_id",
+                        "targeted_tool_invocation",
+                        "targeted_tool_rejection",
+                    },
+                ),
                 "arguments_state": state,
                 "arguments": None if arguments_quarantined else call.arguments,
             }
@@ -879,6 +969,10 @@ def copy_pending_tool_call_approval(
         tool_call_id=call.tool_call_id,
         tool_name=call.tool_name,
         arguments=copy_durable_json_value(call.arguments, "arguments"),
+        targeted_tool_grant_id=call.targeted_tool_grant_id,
+        model_tool_name=call.model_tool_name,
+        targeted_tool_invocation=call.targeted_tool_invocation,
+        targeted_tool_rejection=call.targeted_tool_rejection,
         policy_evidence=call.policy_evidence,
         policy_decision=call.policy_decision,
         reason=call.reason,
