@@ -356,6 +356,60 @@ def test_session_resolve_provider_operation_requires_https_outside_loopback(caps
     assert payload["error"]["message"] == "Cayu server URL must use HTTPS outside loopback."
 
 
+def test_session_fork_group_inspection_reads_bounded_server_projection(
+    monkeypatch,
+    capsys,
+) -> None:
+    payload = {
+        "schema_version": 1,
+        "group_id": "group/a",
+        "source_session_id": "source session",
+        "source_checkpoint_sha256": "a" * 64,
+        "causal_budget_id": "budget",
+        "execution_mode": "task-dispatch",
+        "state": "branches-running",
+        "terminal": False,
+        "recovery_status": "workers-active",
+        "replayed": True,
+        "attempts": [],
+        "failure_code": None,
+        "failure_branch_id": None,
+        "selected_branch_id": None,
+        "selected_attempt_id": None,
+    }
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.url.raw_path == (
+            b"/cayu/api/sessions/source%20session/fork-groups/group%2Fa"
+        )
+        assert request.headers["Authorization"] == "Bearer inspection-token"
+        return httpx.Response(200, json=payload)
+
+    transport = httpx.MockTransport(handle)
+    client_type = httpx.Client
+
+    def client(**kwargs):
+        return client_type(transport=transport, **kwargs)
+
+    monkeypatch.setattr("cayu.cli.session.httpx.Client", client)
+    monkeypatch.setenv("CAYU_API_AUTHORIZATION", "Bearer inspection-token")
+
+    assert (
+        main(
+            [
+                "session",
+                "fork-group",
+                "source session",
+                "group/a",
+                "--server-url",
+                "http://127.0.0.1:8000/cayu",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out) == payload
+
+
 def test_session_output_names_a_destination_and_format_is_independent(
     tmp_path: Path,
     capsys,

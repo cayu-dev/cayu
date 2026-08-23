@@ -12,12 +12,12 @@ import sys
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any, cast
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 from uuid import uuid4
 
 import httpx
 
-from cayu._validation import compact_json_utf8_size
+from cayu._validation import compact_json_utf8_size, require_clean_nonblank
 from cayu.cli._output import add_output_options, output_destination
 from cayu.cli.storage import _sanitize
 from cayu.cli.store_targets import (
@@ -61,6 +61,7 @@ _MAX_COLLECTED_EVENT_RECORDS = 100_000
 _MAX_TRANSCRIPT_CONTENT_BYTES = 1_048_576
 _MAX_SERVER_ERROR_BODY_BYTES = 8 * 1024
 _MAX_SERVER_ERROR_DETAIL_BYTES = 1024
+_MAX_SERVER_FORK_GROUP_BODY_BYTES = 512 * 1024
 _MAX_TRANSCRIPT_SUMMARY_PARTS = 100
 _EVENT_QUERY_PAGE_SIZE = 200
 _USAGE_INSPECTION_PRICING_STATE_KEY = "_cayu_pricing_state"
@@ -222,6 +223,29 @@ def add_session_parser(subparsers: Any) -> None:
     )
     add_output_options(transcript_parser, formats=FORMAT_CHOICES)
 
+    fork_group_parser = commands.add_parser(
+        "fork-group",
+        help="Inspect one durable fork group and its task attempts.",
+        description=(
+            "Read bounded group, attempt, task, lease, recovery, and terminal state "
+            "from a running Cayu server without claiming or advancing work."
+        ),
+    )
+    fork_group_parser.add_argument("session_id", help="Source session id.")
+    fork_group_parser.add_argument("group_id")
+    fork_group_parser.add_argument(
+        "--server-url",
+        required=True,
+        help="Cayu server root URL, including any mount prefix but excluding /api.",
+    )
+    fork_group_parser.add_argument(
+        "--authorization-env",
+        default="CAYU_API_AUTHORIZATION",
+        metavar="NAME",
+        help="Environment variable containing the complete Authorization header value.",
+    )
+    add_output_options(fork_group_parser, formats=("json", "table"))
+
     resolution_parser = commands.add_parser(
         "resolve-provider-operation",
         help="Explicitly retry or fail unavailable provider work.",
@@ -283,6 +307,12 @@ def _run_session(args: argparse.Namespace) -> int:
     if args.session_command == "resolve-provider-operation":
         try:
             return _resolve_provider_operation(args)
+        except (ValueError, OSError, RuntimeError) as exc:
+            _render_session_error(_safe_error(str(exc), None), args.output_format)
+            return 1
+    if args.session_command == "fork-group":
+        try:
+            return _inspect_fork_group(args)
         except (ValueError, OSError, RuntimeError) as exc:
             _render_session_error(_safe_error(str(exc), None), args.output_format)
             return 1
@@ -378,6 +408,82 @@ def _provider_operation_resolution_endpoint(server_url: str) -> str:
     if parsed.scheme == "http" and not _is_loopback_host(hostname):
         raise ValueError("Cayu server URL must use HTTPS outside loopback.")
     path = parsed.path.rstrip("/") + "/api/provider-operations/resolve"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def _inspect_fork_group(args: argparse.Namespace) -> int:
+    endpoint = _fork_group_inspection_endpoint(
+        args.server_url,
+        session_id=args.session_id,
+        group_id=args.group_id,
+    )
+    authorization = os.environ.get(args.authorization_env)
+    if authorization is not None and (
+        not authorization.strip()
+        or authorization != authorization.strip()
+        or "\r" in authorization
+        or "\n" in authorization
+    ):
+        raise ValueError(f"{args.authorization_env} contains an invalid Authorization value.")
+    headers = {"Accept": "application/json"}
+    if authorization is not None:
+        headers["Authorization"] = authorization
+    try:
+        with (
+            httpx.Client(follow_redirects=False, timeout=30.0) as client,
+            client.stream("GET", endpoint, headers=headers) as response,
+        ):
+            if not 200 <= response.status_code < 300:
+                detail = _safe_server_error_detail(
+                    response,
+                    authorization=authorization,
+                )
+                suffix = f": {detail}" if detail is not None else "."
+                raise RuntimeError(f"Cayu server returned HTTP {response.status_code}{suffix}")
+            body = bytearray()
+            for chunk in response.iter_bytes(chunk_size=8192):
+                if len(body) + len(chunk) > _MAX_SERVER_FORK_GROUP_BODY_BYTES:
+                    raise RuntimeError("Cayu server returned an oversized fork-group response.")
+                body.extend(chunk)
+    except httpx.RequestError:
+        raise RuntimeError("Cayu server is unavailable.") from None
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise RuntimeError("Cayu server returned malformed fork-group JSON.") from None
+    if type(payload) is not dict:
+        raise RuntimeError("Cayu server returned a non-object fork-group response.")
+    _render_detail(args.output_format, payload)
+    return 0
+
+
+def _fork_group_inspection_endpoint(
+    server_url: str,
+    *,
+    session_id: str,
+    group_id: str,
+) -> str:
+    parsed = urlsplit(server_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("A canonical HTTP(S) Cayu server URL is required.")
+    if parsed.scheme == "http" and not _is_loopback_host(parsed.hostname):
+        raise ValueError("Cayu server URL must use HTTPS outside loopback.")
+    session_id = require_clean_nonblank(session_id, "session_id")
+    group_id = require_clean_nonblank(group_id, "group_id")
+    path = (
+        parsed.path.rstrip("/")
+        + "/api/sessions/"
+        + quote(session_id, safe="")
+        + "/fork-groups/"
+        + quote(group_id, safe="")
+    )
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
 

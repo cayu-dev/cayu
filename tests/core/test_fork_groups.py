@@ -21,12 +21,14 @@ from cayu import (
     ExecutionProfileAdoptionIntent,
     ExecutionProfileMismatchError,
     ForkGroupArtifactReference,
+    ForkGroupAttemptKind,
     ForkGroupBranchSpec,
     ForkGroupBranchStatus,
     ForkGroupCheckpointSelector,
     ForkGroupConflict,
     ForkGroupDisposition,
     ForkGroupEvaluatorSpec,
+    ForkGroupExecutionMode,
     ForkGroupFailureCode,
     ForkGroupFailureMode,
     ForkGroupFailurePolicy,
@@ -46,6 +48,7 @@ from cayu import (
     IncompleteSessionRecoveryResult,
     InMemoryBudgetLedger,
     InMemorySessionStore,
+    InMemoryTaskStore,
     Message,
     ModelPrice,
     OpenAIWebSearch,
@@ -54,7 +57,11 @@ from cayu import (
     ResolutionActorSource,
     RunRequest,
     SQLiteSessionStore,
+    SQLiteTaskStore,
     StructuredOutputSpec,
+    TaskQuery,
+    TaskStatus,
+    TaskStoreDispatcher,
     Tool,
     ToolContext,
     ToolResult,
@@ -65,6 +72,7 @@ from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.messages import TextPart
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import EventQuery, SessionStatus, SessionUsageSummary
+from cayu.runtime import _session_control as session_control_runtime
 from cayu.runtime import fork_groups as fork_group_runtime
 from cayu.runtime.execution_profiles import execution_profile_baseline_from_session_metadata
 from cayu.vaults import SecretRedactor
@@ -527,6 +535,178 @@ def _app(provider: _ForkGroupProvider, *, session_store: Any | None = None) -> C
     return app
 
 
+def _task_app(
+    provider: _ForkGroupProvider,
+    *,
+    session_store: Any,
+    task_store: Any,
+) -> tuple[CayuApp, TaskStoreDispatcher]:
+    dispatcher = TaskStoreDispatcher(task_store)
+    app = CayuApp(
+        session_store=session_store,
+        task_store=task_store,
+        dispatcher=dispatcher,
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="source", model="fake-model"))
+    app.register_agent(AgentSpec(name="evaluator", model="fake-model"))
+    return app, dispatcher
+
+
+class _FailOnceLoadTaskStore(InMemoryTaskStore):
+    verified_work_mutations_are_cancellation_quiescent = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next_load = False
+
+    async def load_task(self, task_id: str) -> Any:
+        if self.fail_next_load:
+            self.fail_next_load = False
+            raise ConnectionError("transient task-store read")
+        return await super().load_task(task_id)
+
+
+class _FailOnceLoadSessionStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_session_id: str | None = None
+
+    async def load(self, session_id: str) -> Any:
+        if session_id == self.fail_session_id:
+            self.fail_session_id = None
+            raise ConnectionError("transient session-store read")
+        return await super().load(session_id)
+
+
+class _TerminalizingCancelTaskStore(InMemoryTaskStore):
+    verified_work_mutations_are_cancellation_quiescent = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.terminalize_before_cancel = False
+
+    async def cancel_task(
+        self,
+        task_id: str,
+        error: dict[str, Any] | None = None,
+    ) -> Any:
+        if self.terminalize_before_cancel:
+            self.terminalize_before_cancel = False
+            await self.fail_task(task_id, {"status": "failed"})
+        return await super().cancel_task(task_id, error)
+
+
+async def assert_task_backed_fork_group_store_conformance(
+    session_store: Any,
+    task_store: Any,
+) -> None:
+    """Exercise queue recovery and exact replay on one session/task store pair."""
+
+    provider = _ForkGroupProvider(fail_branch="beta")
+
+    def configured_app() -> tuple[CayuApp, TaskStoreDispatcher]:
+        app, dispatcher = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        gate = app.register_fork_group_gate("tests", _ConfiguredGate())
+        planner = app.register_fork_group_replacement_planner(
+            "tests",
+            _ConfiguredReplacementPlanner(),
+        )
+        assert gate == ForkGroupGateSelection(
+            gate_id="tests",
+            gate_identity="tests.configured-gate.v1",
+        )
+        assert planner == ForkGroupReplacementPlannerSelection(
+            planner_id="tests",
+            planner_identity="tests.configured-replacement-planner.v1",
+        )
+        return app, dispatcher
+
+    app, dispatcher = configured_app()
+    await _source(app)
+    request = _request(
+        group_id="group-task-store-conformance",
+        max_parallelism=1,
+        gates=(
+            ForkGroupGateSelection(
+                gate_id="tests",
+                gate_identity="tests.configured-gate.v1",
+            ),
+        ),
+    ).model_copy(
+        update={
+            "execution_mode": ForkGroupExecutionMode.TASK_DISPATCH,
+            "failure_policy": ForkGroupFailurePolicy(
+                mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                minimum_viable_branches=2,
+                max_replacement_attempts=1,
+                replacement_parallelism=1,
+                replacement_planner=ForkGroupReplacementPlannerSelection(
+                    planner_id="tests",
+                    planner_identity="tests.configured-replacement-planner.v1",
+                ),
+            ),
+        }
+    )
+    peer, _ = configured_app()
+    first, second = await asyncio.gather(
+        app.run_fork_group(request),
+        peer.run_fork_group(request),
+    )
+    assert len(await task_store.list_tasks()) == 1
+    result = first if first.dispatch_attempts else second
+    first_task_id = result.dispatch_attempts[0].queue_task_id
+    first_task = await task_store.load_task(first_task_id)
+    assert first_task is not None
+    assert first_task.type == dispatcher.fork_group_task_type
+    assert result.dispatch_attempts[0].queue_task_type == dispatcher.fork_group_task_type
+    assert (
+        await task_store.claim_task(
+            "pre-v3-worker",
+            TaskQuery(type=dispatcher.task_type),
+            lease_seconds=30,
+        )
+        is None
+    )
+    await task_store.pause_task(first_task_id, reason="conformance pause boundary")
+    paused = await peer.inspect_fork_group(request.source_session_id, request.group_id)
+    assert paused is not None
+    assert paused.dispatch_attempts[0].task_status is TaskStatus.PAUSED
+    assert len(await task_store.list_tasks()) == 1
+    await task_store.resume_task(first_task_id)
+
+    for worker_index in range(8):
+        if result.state in {ForkGroupState.COMPLETED, ForkGroupState.FAILED}:
+            break
+        handle = await dispatcher.process_next(
+            app,
+            worker_id=f"store-worker-{worker_index}",
+        )
+        assert handle is not None
+        result = await app.run_fork_group(request)
+    assert result.state is ForkGroupState.COMPLETED
+    assert [attempt.kind for attempt in result.dispatch_attempts] == [
+        ForkGroupAttemptKind.BRANCH,
+        ForkGroupAttemptKind.BRANCH,
+        ForkGroupAttemptKind.REPLACEMENT,
+        ForkGroupAttemptKind.EVALUATOR,
+    ]
+    assert provider.replacement_calls == 1
+    assert provider.evaluator_calls == 1
+    request_count = len(provider.requests)
+
+    fresh_app, fresh_dispatcher = configured_app()
+    replay = await fresh_app.run_fork_group(request)
+    assert replay.state is ForkGroupState.COMPLETED and replay.replayed is True
+    assert len(provider.requests) == request_count
+    assert await fresh_dispatcher.process_next(fresh_app, worker_id="store-idle") is None
+
+
 async def assert_viable_fork_group_store_conformance(session_store: Any) -> None:
     """Exercise replacement, exhaustion, concurrency, and replay on one store."""
 
@@ -640,6 +820,461 @@ def test_viable_fork_group_store_conformance(tmp_path, store_factory) -> None:
             close = getattr(store, "close", None)
             if close is not None:
                 await close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("store_kind", ["in-memory", "sqlite"])
+def test_task_backed_fork_group_store_conformance(tmp_path, store_kind: str) -> None:
+    async def run() -> None:
+        if store_kind == "in-memory":
+            session_store = InMemorySessionStore()
+            task_store = InMemoryTaskStore()
+        else:
+            session_store = SQLiteSessionStore(tmp_path / "fork-group-sessions.sqlite")
+            task_store = SQLiteTaskStore(tmp_path / "fork-group-tasks.sqlite")
+        try:
+            await assert_task_backed_fork_group_store_conformance(
+                session_store,
+                task_store,
+            )
+        finally:
+            for store in (task_store, session_store):
+                close = getattr(store, "close", None)
+                if close is not None:
+                    await close()
+
+    asyncio.run(run())
+
+
+def test_task_backed_transient_task_store_read_leaves_group_recoverable() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider()
+        session_store = InMemorySessionStore()
+        task_store = _FailOnceLoadTaskStore()
+        app, _ = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        await _source(app)
+        request = _request(group_id="group-task-transient-read").model_copy(
+            update={"execution_mode": ForkGroupExecutionMode.TASK_DISPATCH}
+        )
+
+        result = await app.run_fork_group(request)
+        assert result.state is ForkGroupState.BRANCHES_RUNNING
+        task_store.fail_next_load = True
+
+        with pytest.raises(ConnectionError, match="task store.*unavailable"):
+            await app.run_fork_group(request)
+
+        inspected = await app.inspect_fork_group(
+            request.source_session_id,
+            request.group_id,
+        )
+        assert inspected is not None
+        assert inspected.state is ForkGroupState.BRANCHES_RUNNING
+        assert inspected.failure is None
+        assert all(
+            attempt.task_status is TaskStatus.PENDING for attempt in inspected.dispatch_attempts
+        )
+
+    asyncio.run(run())
+
+
+def test_task_backed_transient_session_store_read_leaves_group_recoverable() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider()
+        session_store = _FailOnceLoadSessionStore()
+        task_store = InMemoryTaskStore()
+        app, dispatcher = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        await _source(app)
+        request = _request(
+            group_id="group-task-transient-session-read",
+            max_parallelism=1,
+        ).model_copy(update={"execution_mode": ForkGroupExecutionMode.TASK_DISPATCH})
+
+        result = await app.run_fork_group(request)
+        assert result.state is ForkGroupState.BRANCHES_RUNNING
+        assert len(result.dispatch_attempts) == 1
+        assert await dispatcher.process_next(app, worker_id="worker-alpha") is not None
+        session_store.fail_session_id = result.dispatch_attempts[0].session_id
+
+        with pytest.raises(ConnectionError, match="session store.*unavailable"):
+            await app.run_fork_group(request)
+
+        inspected = await app.inspect_fork_group(
+            request.source_session_id,
+            request.group_id,
+        )
+        assert inspected is not None
+        assert inspected.state is ForkGroupState.BRANCHES_RUNNING
+        assert inspected.failure is None
+        assert inspected.branches == ()
+
+        recovered = await app.run_fork_group(request)
+        assert recovered.state is ForkGroupState.BRANCHES_RUNNING
+        assert len(recovered.branches) == 1
+        assert recovered.branches[0].status is ForkGroupBranchStatus.COMPLETED
+        assert len(recovered.dispatch_attempts) == 2
+
+    asyncio.run(run())
+
+
+def test_task_backed_fork_group_authenticates_idempotency_linkage() -> None:
+    async def run() -> None:
+        session_store = InMemorySessionStore()
+        task_store = InMemoryTaskStore()
+        app, _ = _task_app(
+            _ForkGroupProvider(),
+            session_store=session_store,
+            task_store=task_store,
+        )
+        await _source(app)
+        request = _request(group_id="group-task-idempotency-link").model_copy(
+            update={"execution_mode": ForkGroupExecutionMode.TASK_DISPATCH}
+        )
+
+        await app.run_fork_group(request)
+        durable = await session_store.load_session_operation(
+            request.source_session_id,
+            fork_group_runtime._storage_key(request.group_id),
+        )
+        assert durable is not None
+        record = fork_group_runtime._ForkGroupRecord.model_validate(durable)
+        link = record.result.dispatch_attempts[0]
+        conflicting_link = link.model_copy(
+            update={"idempotency_key": "conflicting-idempotency-authority"}
+        )
+        conflicting_record = record.model_copy(
+            update={
+                "result": record.result.model_copy(
+                    update={
+                        "dispatch_attempts": (
+                            conflicting_link,
+                            *record.result.dispatch_attempts[1:],
+                        )
+                    },
+                    deep=True,
+                )
+            },
+            deep=True,
+        )
+
+        with pytest.raises(ValidationError, match="idempotency authority"):
+            fork_group_runtime._ForkGroupRecord.model_validate(
+                conflicting_record.model_dump(mode="json", warnings=False)
+            )
+
+        task = await task_store.load_task(link.queue_task_id)
+        assert task is not None
+        envelope = fork_group_runtime._existing_queued_dispatch_envelope(
+            task,
+            task_type=link.queue_task_type,
+        )
+        assert envelope is not None
+        assert not fork_group_runtime._envelope_matches_dispatch_link(
+            envelope,
+            conflicting_link,
+        )
+
+    asyncio.run(run())
+
+
+def test_terminal_task_cancellation_accepts_a_concurrent_terminal_winner() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider(fail_branch="alpha")
+        session_store = InMemorySessionStore()
+        task_store = _TerminalizingCancelTaskStore()
+        app, dispatcher = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        await _source(app)
+        request = _request(group_id="group-task-terminal-cancel-race").model_copy(
+            update={"execution_mode": ForkGroupExecutionMode.TASK_DISPATCH}
+        )
+
+        result = await app.run_fork_group(request)
+        assert result.state is ForkGroupState.BRANCHES_RUNNING
+        assert await dispatcher.process_next(app, worker_id="worker-alpha") is not None
+        task_store.terminalize_before_cancel = True
+
+        result = await app.run_fork_group(request)
+
+        assert result.state is ForkGroupState.FAILED
+        pending_sibling = next(
+            attempt for attempt in result.dispatch_attempts if attempt.branch_id == "beta"
+        )
+        assert pending_sibling.task_status is TaskStatus.FAILED
+
+    asyncio.run(run())
+
+
+def test_terminal_group_fences_pending_tasks_before_terminal_publication(monkeypatch) -> None:
+    class _SimulatedProcessLoss(BaseException):
+        pass
+
+    async def run() -> None:
+        session_store = InMemorySessionStore()
+        task_store = InMemoryTaskStore()
+        app, dispatcher = _task_app(
+            _ForkGroupProvider(fail_branch="alpha"),
+            session_store=session_store,
+            task_store=task_store,
+        )
+        await _source(app)
+        request = _request(group_id="group-task-terminal-claim-fence").model_copy(
+            update={"execution_mode": ForkGroupExecutionMode.TASK_DISPATCH}
+        )
+
+        scheduled = await app.run_fork_group(request)
+        beta_link = next(
+            attempt for attempt in scheduled.dispatch_attempts if attempt.branch_id == "beta"
+        )
+        assert await dispatcher.process_next(app, worker_id="worker-alpha") is not None
+
+        async def lose_process_after_terminal_publication(*args, **kwargs):
+            del args, kwargs
+            raise _SimulatedProcessLoss
+
+        monkeypatch.setattr(
+            fork_group_runtime,
+            "_public_group_result",
+            lose_process_after_terminal_publication,
+        )
+        with pytest.raises(_SimulatedProcessLoss):
+            await app.run_fork_group(request)
+
+        durable = await session_store.load_session_operation(
+            request.source_session_id,
+            fork_group_runtime._storage_key(request.group_id),
+        )
+        assert durable is not None
+        record = fork_group_runtime._ForkGroupRecord.model_validate(durable)
+        assert record.result.state is ForkGroupState.FAILED
+        beta_task = await task_store.load_task(beta_link.queue_task_id)
+        assert beta_task is not None
+        assert beta_task.status is TaskStatus.CANCELLED
+        assert (
+            await task_store.claim_task(
+                "post-terminal-worker",
+                TaskQuery(type=beta_link.queue_task_type),
+            )
+            is None
+        )
+
+    asyncio.run(run())
+
+
+def test_terminal_group_interrupts_a_live_task_backed_sibling_before_returning() -> None:
+    async def run() -> None:
+        branch_started = asyncio.Event()
+        release_branch = asyncio.Event()
+
+        async def block_alpha() -> None:
+            branch_started.set()
+            await release_branch.wait()
+
+        provider = _ForkGroupProvider(
+            fail_branch="beta",
+            branch_callback=block_alpha,
+        )
+        session_store = InMemorySessionStore()
+        task_store = InMemoryTaskStore()
+        app, dispatcher = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        await _source(app)
+        request = _request(group_id="group-task-live-sibling-cancellation").model_copy(
+            update={"execution_mode": ForkGroupExecutionMode.TASK_DISPATCH}
+        )
+
+        scheduled = await app.run_fork_group(request)
+        alpha_worker = asyncio.create_task(dispatcher.process_next(app, worker_id="worker-alpha"))
+        try:
+            await asyncio.wait_for(branch_started.wait(), timeout=5)
+            assert await dispatcher.process_next(app, worker_id="worker-beta") is not None
+
+            failed = await asyncio.wait_for(app.run_fork_group(request), timeout=5)
+            assert failed.state is ForkGroupState.FAILED
+            assert failed.failure is not None
+            assert failed.failure.code is ForkGroupFailureCode.BRANCH_FAILED
+
+            alpha_link = next(
+                attempt for attempt in scheduled.dispatch_attempts if attempt.branch_id == "alpha"
+            )
+            alpha_session = await session_store.load(alpha_link.session_id)
+            assert alpha_session is not None
+            assert alpha_session.status is SessionStatus.INTERRUPTED
+            assert not app._session_control.has_active_tasks(alpha_link.session_id)
+
+            alpha_handle = await asyncio.wait_for(alpha_worker, timeout=5)
+            assert alpha_handle is not None
+            alpha_task = await task_store.load_task(alpha_link.queue_task_id)
+            assert alpha_task is not None
+            assert alpha_task.status is TaskStatus.COMPLETED
+
+            release_branch.set()
+            await asyncio.sleep(0)
+            reloaded = await session_store.load(alpha_link.session_id)
+            assert reloaded is not None
+            assert reloaded.status is SessionStatus.INTERRUPTED
+        finally:
+            release_branch.set()
+            if not alpha_worker.done():
+                alpha_worker.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await alpha_worker
+
+    asyncio.run(run())
+
+
+def test_terminal_group_waits_for_remote_sibling_quiescence(monkeypatch) -> None:
+    async def run() -> None:
+        branch_started = asyncio.Event()
+        release_branch = asyncio.Event()
+
+        async def block_alpha() -> None:
+            branch_started.set()
+            await release_branch.wait()
+
+        provider = _ForkGroupProvider(
+            fail_branch="beta",
+            branch_callback=block_alpha,
+        )
+        session_store = InMemorySessionStore()
+        task_store = InMemoryTaskStore()
+        coordinator, coordinator_dispatcher = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        worker, worker_dispatcher = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        await _source(coordinator)
+        request = _request(group_id="group-task-remote-sibling-cancellation").model_copy(
+            update={"execution_mode": ForkGroupExecutionMode.TASK_DISPATCH}
+        )
+
+        scheduled = await coordinator.run_fork_group(request)
+        alpha_link = next(
+            attempt for attempt in scheduled.dispatch_attempts if attempt.branch_id == "alpha"
+        )
+        alpha_worker = asyncio.create_task(
+            worker_dispatcher.process_next(worker, worker_id="remote-alpha")
+        )
+        try:
+            await asyncio.wait_for(branch_started.wait(), timeout=5)
+            assert (
+                await coordinator_dispatcher.process_next(
+                    coordinator,
+                    worker_id="coordinator-beta",
+                )
+                is not None
+            )
+
+            pending = await asyncio.wait_for(coordinator.run_fork_group(request), timeout=5)
+            assert pending.state is ForkGroupState.BRANCHES_RUNNING
+            alpha_session = await session_store.load(alpha_link.session_id)
+            assert alpha_session is not None
+            assert alpha_session.status is SessionStatus.INTERRUPTING
+            alpha_task = await task_store.load_task(alpha_link.queue_task_id)
+            assert alpha_task is not None
+            assert alpha_task.status is TaskStatus.CLAIMED
+
+            release_branch.set()
+            alpha_handle = await asyncio.wait_for(alpha_worker, timeout=5)
+            assert alpha_handle is not None
+            assert alpha_handle.status.value == "interrupted"
+
+            failed = await asyncio.wait_for(coordinator.run_fork_group(request), timeout=5)
+            assert failed.state is ForkGroupState.FAILED
+            reloaded = await session_store.load(alpha_link.session_id)
+            assert reloaded is not None
+            assert reloaded.status is SessionStatus.INTERRUPTED
+            terminal_task = await task_store.load_task(alpha_link.queue_task_id)
+            assert terminal_task is not None
+            assert terminal_task.status is TaskStatus.COMPLETED
+        finally:
+            release_branch.set()
+            if not alpha_worker.done():
+                alpha_worker.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await alpha_worker
+
+    monkeypatch.setattr(
+        session_control_runtime,
+        "ACTIVE_INTERRUPTED_EVENT_WAIT_ATTEMPTS",
+        2,
+    )
+    monkeypatch.setattr(
+        session_control_runtime,
+        "ACTIVE_INTERRUPTED_EVENT_WAIT_INTERVAL_S",
+        0.001,
+    )
+    asyncio.run(run())
+
+
+def test_terminal_group_inspection_survives_child_session_deletion() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider()
+        session_store = InMemorySessionStore()
+        task_store = InMemoryTaskStore()
+        app, dispatcher = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        await _source(app)
+        request = _request(group_id="group-task-child-deleted").model_copy(
+            update={"execution_mode": ForkGroupExecutionMode.TASK_DISPATCH}
+        )
+
+        result = await app.run_fork_group(request)
+        for worker_index in range(8):
+            if result.state is ForkGroupState.COMPLETED:
+                break
+            assert (
+                await dispatcher.process_next(
+                    app,
+                    worker_id=f"worker-{worker_index}",
+                )
+                is not None
+            )
+            result = await app.run_fork_group(request)
+        assert result.state is ForkGroupState.COMPLETED
+
+        deleted_session_id = result.branches[0].session_id
+        await session_store.delete_session(deleted_session_id)
+
+        inspected = await app.inspect_fork_group(
+            request.source_session_id,
+            request.group_id,
+        )
+        assert inspected is not None
+        assert inspected.state is ForkGroupState.COMPLETED
+        deleted_attempt = next(
+            attempt
+            for attempt in inspected.dispatch_attempts
+            if attempt.session_id == deleted_session_id
+        )
+        assert deleted_attempt.task_status is TaskStatus.COMPLETED
+        assert deleted_attempt.run_epoch is None
+        replayed = await app.run_fork_group(request)
+        assert replayed.state is ForkGroupState.COMPLETED
+        assert replayed.replayed is True
 
     asyncio.run(run())
 
@@ -942,6 +1577,514 @@ def test_run_fork_group_replays_terminal_result_and_rejects_conflicts() -> None:
         old_schema["schema_version"] = 2
         with pytest.raises(ValidationError, match="Unsupported fork-group operation record"):
             fork_group_runtime._ForkGroupRecord.model_validate(old_schema)
+
+    asyncio.run(run())
+
+
+def test_task_backed_fork_group_queues_bounded_attempts_and_replays_once() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider()
+        session_store = InMemorySessionStore()
+        task_store = InMemoryTaskStore()
+        app, dispatcher = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        await _source(app)
+        request = _request(
+            group_id="group-task-dispatch",
+            max_parallelism=1,
+        ).model_copy(update={"execution_mode": ForkGroupExecutionMode.TASK_DISPATCH})
+        source_request_count = len(provider.requests)
+
+        first = await app.run_fork_group(request)
+
+        assert first.state is ForkGroupState.BRANCHES_RUNNING
+        assert len(first.dispatch_attempts) == 1
+        assert first.dispatch_attempts[0].kind is ForkGroupAttemptKind.BRANCH
+        assert first.dispatch_attempts[0].task_status is TaskStatus.PENDING
+        first_child = await session_store.load(first.dispatch_attempts[0].session_id)
+        assert first_child is not None and first_child.run_epoch == 0
+        assert len(provider.requests) == source_request_count
+        task_count = len(await task_store.list_tasks())
+        inspected = await app.inspect_fork_group(request.source_session_id, request.group_id)
+        assert inspected is not None
+        assert inspected.execution_mode is ForkGroupExecutionMode.TASK_DISPATCH
+        assert inspected.state is ForkGroupState.BRANCHES_RUNNING
+        assert inspected.replayed is True
+        assert inspected.dispatch_attempts == first.dispatch_attempts
+        assert len(await task_store.list_tasks()) == task_count
+        assert len(provider.requests) == source_request_count
+        assert await app.inspect_fork_group(request.source_session_id, "missing-group") is None
+
+        first_handle = await dispatcher.process_next(app, worker_id="worker-one")
+        assert first_handle is not None
+        second = await app.run_fork_group(request)
+        assert second.state is ForkGroupState.BRANCHES_RUNNING
+        assert len(second.dispatch_attempts) == 2
+        assert (
+            sum(attempt.task_status is TaskStatus.PENDING for attempt in second.dispatch_attempts)
+            == 1
+        )
+
+        second_handle = await dispatcher.process_next(app, worker_id="worker-two")
+        assert second_handle is not None
+        awaiting = await app.run_fork_group(request)
+        assert awaiting.state is ForkGroupState.AWAITING_EVALUATION
+        assert [attempt.kind for attempt in awaiting.dispatch_attempts] == [
+            ForkGroupAttemptKind.BRANCH,
+            ForkGroupAttemptKind.BRANCH,
+            ForkGroupAttemptKind.EVALUATOR,
+        ]
+        assert awaiting.dispatch_attempts[-1].task_status is TaskStatus.PENDING
+
+        evaluator_handle = await dispatcher.process_next(app, worker_id="worker-three")
+        assert evaluator_handle is not None
+        completed = await app.run_fork_group(request)
+        request_count = len(provider.requests)
+        replay = await app.run_fork_group(request)
+
+        assert completed.state is ForkGroupState.COMPLETED
+        assert replay.state is ForkGroupState.COMPLETED and replay.replayed is True
+        assert len(replay.dispatch_attempts) == 3
+        assert all(
+            attempt.task_status is TaskStatus.COMPLETED for attempt in replay.dispatch_attempts
+        )
+        assert len(provider.requests) == request_count
+        assert provider.evaluator_calls == 1
+        assert await dispatcher.process_next(app, worker_id="worker-four") is None
+
+    asyncio.run(run())
+
+
+def test_task_backed_fork_group_recovers_across_fresh_coordinators_and_workers() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider()
+        session_store = InMemorySessionStore()
+        task_store = InMemoryTaskStore()
+
+        producer, _ = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        await _source(producer)
+        request = _request(
+            group_id="group-task-restart",
+            max_parallelism=1,
+        ).model_copy(update={"execution_mode": ForkGroupExecutionMode.TASK_DISPATCH})
+        first = await producer.run_fork_group(request)
+        assert first.state is ForkGroupState.BRANCHES_RUNNING
+
+        branch_worker_one, branch_dispatcher_one = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        assert (
+            await branch_dispatcher_one.process_next(
+                branch_worker_one,
+                worker_id="fresh-branch-one",
+            )
+            is not None
+        )
+
+        coordinator_two, _ = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        second = await coordinator_two.run_fork_group(request)
+        assert len(second.dispatch_attempts) == 2
+
+        branch_worker_two, branch_dispatcher_two = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        assert (
+            await branch_dispatcher_two.process_next(
+                branch_worker_two,
+                worker_id="fresh-branch-two",
+            )
+            is not None
+        )
+
+        coordinator_three, _ = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        awaiting = await coordinator_three.run_fork_group(request)
+        assert awaiting.state is ForkGroupState.AWAITING_EVALUATION
+
+        evaluator_worker, evaluator_dispatcher = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        assert (
+            await evaluator_dispatcher.process_next(
+                evaluator_worker,
+                worker_id="fresh-evaluator",
+            )
+            is not None
+        )
+
+        final_coordinator, final_dispatcher = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        completed = await final_coordinator.run_fork_group(request)
+        assert completed.state is ForkGroupState.COMPLETED
+        assert len(completed.dispatch_attempts) == 3
+        assert provider.evaluator_calls == 1
+        assert len(provider.requests) == 4
+        assert (
+            await final_dispatcher.process_next(
+                final_coordinator,
+                worker_id="fresh-idle",
+            )
+            is None
+        )
+
+    asyncio.run(run())
+
+
+def test_terminal_task_group_reads_do_not_require_historical_evaluator_registration() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider()
+        session_store = InMemorySessionStore()
+        task_store = InMemoryTaskStore()
+        producer, dispatcher = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        await _source(producer)
+        request = _request(
+            group_id="group-task-terminal-without-evaluator",
+            max_parallelism=1,
+        ).model_copy(update={"execution_mode": ForkGroupExecutionMode.TASK_DISPATCH})
+
+        result = await producer.run_fork_group(request)
+        for worker_index in range(8):
+            if result.state is ForkGroupState.COMPLETED:
+                break
+            assert (
+                await dispatcher.process_next(
+                    producer,
+                    worker_id=f"terminal-worker-{worker_index}",
+                )
+                is not None
+            )
+            result = await producer.run_fork_group(request)
+        assert result.state is ForkGroupState.COMPLETED
+        request_count = len(provider.requests)
+
+        fresh_dispatcher = TaskStoreDispatcher(task_store)
+        fresh = CayuApp(
+            session_store=session_store,
+            task_store=task_store,
+            dispatcher=fresh_dispatcher,
+            enable_logging=False,
+        )
+        fresh.register_provider(provider, default=True)
+        fresh.register_agent(AgentSpec(name="source", model="fake-model"))
+
+        inspected = await fresh.inspect_fork_group(
+            request.source_session_id,
+            request.group_id,
+        )
+        replayed = await fresh.run_fork_group(request)
+
+        assert inspected is not None
+        assert inspected.state is ForkGroupState.COMPLETED
+        assert inspected.replayed is True
+        assert replayed.state is ForkGroupState.COMPLETED
+        assert replayed.replayed is True
+        assert len(provider.requests) == request_count
+
+    asyncio.run(run())
+
+
+def test_task_backed_fork_group_dispatches_replacement_and_evaluator_attempts() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider(fail_branch="beta")
+        session_store = InMemorySessionStore()
+        task_store = InMemoryTaskStore()
+        app, dispatcher = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        gate = app.register_fork_group_gate("tests", _ConfiguredGate())
+        planner = app.register_fork_group_replacement_planner(
+            "tests",
+            _ConfiguredReplacementPlanner(),
+        )
+        await _source(app)
+        request = _request(
+            group_id="group-task-replacement",
+            max_parallelism=2,
+            gates=(gate,),
+        ).model_copy(
+            update={
+                "execution_mode": ForkGroupExecutionMode.TASK_DISPATCH,
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=2,
+                    max_replacement_attempts=1,
+                    replacement_parallelism=1,
+                    replacement_planner=planner,
+                ),
+            }
+        )
+
+        result = await app.run_fork_group(request)
+        for worker_index in range(8):
+            if result.state in {ForkGroupState.COMPLETED, ForkGroupState.FAILED}:
+                break
+            handle = await dispatcher.process_next(
+                app,
+                worker_id=f"replacement-worker-{worker_index}",
+            )
+            assert handle is not None
+            result = await app.run_fork_group(request)
+
+        assert result.state is ForkGroupState.COMPLETED
+        assert [attempt.kind for attempt in result.dispatch_attempts] == [
+            ForkGroupAttemptKind.BRANCH,
+            ForkGroupAttemptKind.BRANCH,
+            ForkGroupAttemptKind.REPLACEMENT,
+            ForkGroupAttemptKind.EVALUATOR,
+        ]
+        assert len(result.branches) == 3
+        assert result.branches[1].superseded_by_attempt_id == result.branches[2].attempt_id
+        assert result.branches[2].eligible is True
+        assert provider.replacement_calls == 1
+        assert provider.evaluator_calls == 1
+
+    asyncio.run(run())
+
+
+def test_task_backed_fork_group_worker_fails_closed_on_profile_drift() -> None:
+    class DriftedProvider(_ForkGroupProvider):
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return ExecutionProfileBehaviorIdentity(
+                name="tests:fork-group-provider",
+                behavior_version="2",
+                implementation_version="2",
+            )
+
+    async def run() -> None:
+        producer_provider = _ForkGroupProvider()
+        session_store = InMemorySessionStore()
+        task_store = InMemoryTaskStore()
+        producer, _ = _task_app(
+            producer_provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        await _source(producer)
+        request = _request(
+            group_id="group-task-profile-drift",
+            max_parallelism=2,
+        ).model_copy(update={"execution_mode": ForkGroupExecutionMode.TASK_DISPATCH})
+        queued = await producer.run_fork_group(request)
+        assert queued.dispatch_attempts[0].task_status is TaskStatus.PENDING
+        assert len(queued.dispatch_attempts) == 2
+
+        worker_provider = DriftedProvider()
+        worker, worker_dispatcher = _task_app(
+            worker_provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        handle = await worker_dispatcher.process_next(
+            worker,
+            worker_id="profile-drift-worker",
+        )
+        assert handle is not None
+        assert worker_provider.requests == []
+
+        failed = await producer.run_fork_group(request)
+        assert failed.state is ForkGroupState.FAILED
+        assert failed.failure is not None
+        assert failed.failure.code is ForkGroupFailureCode.BRANCH_FAILED
+        assert [attempt.task_status for attempt in failed.dispatch_attempts] == [
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        ]
+        assert "profile" in failed.failure.message.lower()
+
+    asyncio.run(run())
+
+
+def test_task_backed_fork_group_persists_link_before_task_is_claimable() -> None:
+    class LinkObservingTaskStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self, session_store: InMemorySessionStore) -> None:
+            super().__init__()
+            self.session_store = session_store
+            self.linked_task_ids: list[str] = []
+
+        async def create_task(self, request):
+            raw = await self.session_store.load_session_operation(
+                "fork-group-source",
+                fork_group_runtime._storage_key("group-task-link-order"),
+            )
+            assert raw is not None
+            record = fork_group_runtime._ForkGroupRecord.model_validate(raw)
+            assert request.task_id is not None
+            assert request.task_id in {
+                attempt.queue_task_id for attempt in record.result.dispatch_attempts
+            }
+            self.linked_task_ids.append(request.task_id)
+            return await super().create_task(request)
+
+    async def run() -> None:
+        provider = _ForkGroupProvider()
+        session_store = InMemorySessionStore()
+        task_store = LinkObservingTaskStore(session_store)
+        app, _ = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        await _source(app)
+        request = _request(
+            group_id="group-task-link-order",
+            max_parallelism=1,
+        ).model_copy(update={"execution_mode": ForkGroupExecutionMode.TASK_DISPATCH})
+
+        queued = await app.run_fork_group(request)
+
+        assert queued.state is ForkGroupState.BRANCHES_RUNNING
+        assert task_store.linked_task_ids == [queued.dispatch_attempts[0].queue_task_id]
+        assert queued.dispatch_attempts[0].task_status is TaskStatus.PENDING
+
+    asyncio.run(run())
+
+
+def test_task_backed_fork_group_worker_rejects_missing_group_authority() -> None:
+    class AuthorityHidingSessionStore(InMemorySessionStore):
+        hide_group = False
+
+        async def load_session_operation(
+            self,
+            session_id: str,
+            idempotency_key: str,
+            **kwargs,
+        ):
+            if self.hide_group and idempotency_key == fork_group_runtime._storage_key(
+                "group-task-missing-authority"
+            ):
+                return None
+            return await super().load_session_operation(
+                session_id,
+                idempotency_key,
+                **kwargs,
+            )
+
+    async def run() -> None:
+        provider = _ForkGroupProvider()
+        session_store = AuthorityHidingSessionStore()
+        task_store = InMemoryTaskStore()
+        app, dispatcher = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        await _source(app)
+        request = _request(
+            group_id="group-task-missing-authority",
+            max_parallelism=1,
+        ).model_copy(update={"execution_mode": ForkGroupExecutionMode.TASK_DISPATCH})
+        queued = await app.run_fork_group(request)
+        source_request_count = len(provider.requests)
+
+        session_store.hide_group = True
+        handle = await dispatcher.process_next(app, worker_id="missing-authority-worker")
+        session_store.hide_group = False
+
+        assert handle is not None
+        assert len(provider.requests) == source_request_count
+        task = await task_store.load_task(queued.dispatch_attempts[0].queue_task_id)
+        assert task is not None and task.status is TaskStatus.FAILED
+
+    asyncio.run(run())
+
+
+def test_task_backed_fork_group_reclaim_fences_stale_worker_without_duplicate_run() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider()
+        session_store = InMemorySessionStore()
+        task_store = InMemoryTaskStore()
+        dispatcher = TaskStoreDispatcher(task_store, lease_seconds=1)
+        app = CayuApp(
+            session_store=session_store,
+            task_store=task_store,
+            dispatcher=dispatcher,
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="source", model="fake-model"))
+        app.register_agent(AgentSpec(name="evaluator", model="fake-model"))
+        await _source(app)
+        request = _request(
+            group_id="group-task-stale-lease",
+            max_parallelism=1,
+        ).model_copy(update={"execution_mode": ForkGroupExecutionMode.TASK_DISPATCH})
+        queued = await app.run_fork_group(request)
+        task_id = queued.dispatch_attempts[0].queue_task_id
+        stale_claim = await task_store.claim_task(
+            "stale-worker",
+            TaskQuery(type=dispatcher.fork_group_task_type),
+            lease_seconds=1,
+        )
+        assert stale_claim is not None and stale_claim.id == task_id
+
+        await asyncio.sleep(1.05)
+        reclaimed = await task_store.reclaim_expired(
+            query=TaskQuery(type=dispatcher.fork_group_task_type)
+        )
+        assert [task.id for task in reclaimed] == [task_id]
+        replacement_claim = await task_store.claim_task(
+            "replacement-worker",
+            TaskQuery(type=dispatcher.fork_group_task_type),
+            lease_seconds=1,
+        )
+        assert replacement_claim is not None and replacement_claim.id == task_id
+        with pytest.raises(ValueError, match="does not own"):
+            await task_store.complete_task(
+                task_id,
+                {"status": "completed"},
+                worker_id="stale-worker",
+            )
+        await task_store.release_task(task_id, "replacement-worker")
+
+        result = queued
+        for worker_index in range(6):
+            handle = await dispatcher.process_next(
+                app,
+                worker_id=f"settlement-worker-{worker_index}",
+            )
+            assert handle is not None
+            result = await app.run_fork_group(request)
+            if result.state is ForkGroupState.COMPLETED:
+                break
+
+        assert result.state is ForkGroupState.COMPLETED
+        assert provider.evaluator_calls == 1
+        assert len(provider.requests) == 4
+        assert all(
+            attempt.task_status is TaskStatus.COMPLETED for attempt in result.dispatch_attempts
+        )
 
     asyncio.run(run())
 
@@ -1697,6 +2840,176 @@ def test_rejected_replacement_profile_fails_before_attempt_admission() -> None:
         )
         assert durable is not None
         assert len(durable["result"]["branches"]) == 2
+
+    asyncio.run(run())
+
+
+def test_task_backed_rejected_replacement_profile_fails_before_attempt_admission() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider(fail_branch="beta")
+        session_store = InMemorySessionStore()
+        task_store = InMemoryTaskStore()
+        app, dispatcher = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        await _source(app)
+        gate_selection = app.register_fork_group_gate("tests", _ConfiguredGate())
+        planner_selection = app.register_fork_group_replacement_planner(
+            "missing-agent",
+            _MissingAgentReplacementPlanner(),
+        )
+        request = _request(
+            group_id="group-task-replacement-profile-rejected",
+            max_parallelism=2,
+            gates=(gate_selection,),
+        ).model_copy(
+            update={
+                "execution_mode": ForkGroupExecutionMode.TASK_DISPATCH,
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=2,
+                    max_replacement_attempts=1,
+                    replacement_parallelism=1,
+                    replacement_planner=planner_selection,
+                ),
+            }
+        )
+
+        result = await app.run_fork_group(request)
+        assert result.state is ForkGroupState.BRANCHES_RUNNING
+        assert await dispatcher.process_next(app, worker_id="worker-alpha") is not None
+        assert await dispatcher.process_next(app, worker_id="worker-beta") is not None
+
+        result = await app.run_fork_group(request)
+
+        assert result.state is ForkGroupState.FAILED
+        assert result.failure is not None
+        assert result.failure.code is ForkGroupFailureCode.REPLACEMENT_FAILED
+        assert result.failure.branch_id == "beta"
+        assert len(result.branches) == 2
+        assert all(branch.attempt_index == 0 for branch in result.branches)
+        inspected = await app.inspect_fork_group(
+            request.source_session_id,
+            request.group_id,
+        )
+        assert inspected is not None
+        assert inspected.state is ForkGroupState.FAILED
+        durable = await app.session_store.load_session_operation(
+            request.source_session_id,
+            fork_group_runtime._storage_key(request.group_id),
+        )
+        assert durable is not None
+        assert len(durable["result"]["branches"]) == 2
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("lose_owner_after_attempt_publication", [False, True])
+def test_task_backed_failed_replacement_fork_is_published_as_terminal_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    lose_owner_after_attempt_publication: bool,
+) -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider(fail_branch="beta")
+        session_store = InMemorySessionStore()
+        task_store = InMemoryTaskStore()
+        app, dispatcher = _task_app(
+            provider,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        await _source(app)
+        gate_selection = app.register_fork_group_gate("tests", _ConfiguredGate())
+        planner = _ConfiguredReplacementPlanner()
+        planner_selection = app.register_fork_group_replacement_planner("tests", planner)
+        request = _request(
+            group_id="group-task-replacement-fork-failure",
+            max_parallelism=2,
+            gates=(gate_selection,),
+        ).model_copy(
+            update={
+                "execution_mode": ForkGroupExecutionMode.TASK_DISPATCH,
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=2,
+                    max_replacement_attempts=1,
+                    replacement_parallelism=1,
+                    replacement_planner=planner_selection,
+                ),
+            }
+        )
+        original_fork_session = app.fork_session
+
+        async def fail_replacement_fork(
+            fork_request: ForkSessionRequest,
+        ) -> AsyncIterator[Event]:
+            if (fork_request.session_id or "").startswith("fork-replacement:"):
+                raise RuntimeError("replacement child creation failed")
+            async for event in original_fork_session(fork_request):
+                yield event
+
+        app.fork_session = fail_replacement_fork  # ty: ignore[invalid-assignment]
+        app._fork_group_coordinator._fork_session_callback = fail_replacement_fork
+
+        result = await app.run_fork_group(request)
+        assert result.state is ForkGroupState.BRANCHES_RUNNING
+        assert await dispatcher.process_next(app, worker_id="worker-alpha") is not None
+        assert await dispatcher.process_next(app, worker_id="worker-beta") is not None
+
+        if lose_owner_after_attempt_publication:
+            original_publish = fork_group_runtime._publish_task_backed_branches
+            owner_lost = False
+
+            async def publish_then_lose_owner(*args: Any, **kwargs: Any) -> Any:
+                nonlocal owner_lost
+                published = await original_publish(*args, **kwargs)
+                if not owner_lost and any(
+                    branch.attempt_index > 0 for branch in published.result.branches
+                ):
+                    owner_lost = True
+                    raise asyncio.CancelledError
+                return published
+
+            monkeypatch.setattr(
+                fork_group_runtime,
+                "_publish_task_backed_branches",
+                publish_then_lose_owner,
+            )
+            with pytest.raises(asyncio.CancelledError):
+                await app.run_fork_group(request)
+            durable = await session_store.load_session_operation(
+                request.source_session_id,
+                fork_group_runtime._storage_key(request.group_id),
+            )
+            assert durable is not None
+            assert durable["result"]["state"] == ForkGroupState.BRANCHES_RUNNING.value
+            assert len(durable["result"]["branches"]) == 3
+            assert len(planner.requests) == 1
+
+        result = await app.run_fork_group(request)
+
+        assert result.state is ForkGroupState.FAILED
+        assert result.failure is not None
+        assert result.failure.code is ForkGroupFailureCode.REPLACEMENT_FAILED
+        assert result.failure.branch_id == "beta"
+        assert len(result.branches) == 3
+        failed_beta, failed_replacement = result.branches[1:]
+        assert failed_beta.superseded_by_attempt_id == failed_replacement.attempt_id
+        assert failed_replacement.replaced_attempt_id == failed_beta.attempt_id
+        assert failed_replacement.status is ForkGroupBranchStatus.FAILED
+        assert failed_replacement.execution_profile_fingerprint == (
+            result.source.execution_profile_fingerprint
+        )
+        assert len(planner.requests) == 1
+        assert await session_store.load(failed_replacement.session_id) is None
+
+        replayed = await app.run_fork_group(request)
+        assert replayed.state is ForkGroupState.FAILED
+        assert replayed.replayed is True
+        assert len(planner.requests) == 1
+        assert provider.evaluator_calls == 0
 
     asyncio.run(run())
 
@@ -3253,6 +4566,103 @@ def test_run_fork_group_reports_shared_causal_budget_exhaustion() -> None:
         assert result.failure.branch_id == "beta"
         assert result.branches[0].status == "completed"
         assert result.branches[1].status == "interrupted"
+        assert result.branches[1].failure_code is ForkGroupFailureCode.BUDGET_EXHAUSTED
+        assert provider.replacement_calls == 0
+        assert provider.evaluator_calls == 0
+
+    asyncio.run(run())
+
+
+def test_task_backed_fork_group_reports_shared_causal_budget_exhaustion() -> None:
+    async def run() -> None:
+        provider = _ForkGroupProvider()
+        session_store = InMemorySessionStore()
+        task_store = InMemoryTaskStore()
+        dispatcher = TaskStoreDispatcher(task_store)
+        app = CayuApp(
+            session_store=session_store,
+            task_store=task_store,
+            dispatcher=dispatcher,
+            enable_logging=False,
+            budget_ledger=InMemoryBudgetLedger(),
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="source", model="fake-model"))
+        app.register_agent(AgentSpec(name="evaluator", model="fake-model"))
+        await _source(app)
+        gate_selection = app.register_fork_group_gate("tests", _ConfiguredGate())
+        planner_selection = app.register_fork_group_replacement_planner(
+            "tests",
+            _ConfiguredReplacementPlanner(),
+        )
+        limit = BudgetLimit(
+            scope="causal",
+            key="fork-group-budget",
+            max_estimated_cost=Decimal("0.00007"),
+            pricing=PriceBook(
+                prices=(
+                    ModelPrice.fixed(
+                        provider_name="fork-group-fake",
+                        model="fake-model",
+                        input_per_million=Decimal("1"),
+                        output_per_million=Decimal("10"),
+                    ),
+                )
+            ),
+            reservation=BudgetReservation(
+                max_input_tokens=1,
+                max_output_tokens=1,
+            ),
+        )
+        request = _request(
+            group_id="group-task-budget",
+            max_parallelism=1,
+            gates=(gate_selection,),
+        )
+        request = request.model_copy(
+            update={
+                "execution_mode": ForkGroupExecutionMode.TASK_DISPATCH,
+                "branches": tuple(
+                    branch.model_copy(
+                        update={
+                            "budget_limits": (limit,),
+                            "structured_output": None,
+                            "artifact_references": (
+                                ForkGroupArtifactReference(
+                                    artifact_id=f"artifact-{branch.branch_id}"
+                                ),
+                            ),
+                        },
+                        deep=True,
+                    )
+                    for branch in request.branches
+                ),
+                "failure_policy": ForkGroupFailurePolicy(
+                    mode=ForkGroupFailureMode.EVALUATE_VIABLE,
+                    minimum_viable_branches=2,
+                    max_replacement_attempts=1,
+                    replacement_parallelism=1,
+                    replacement_planner=planner_selection,
+                ),
+            },
+            deep=True,
+        )
+
+        result = await app.run_fork_group(request)
+        assert result.state is ForkGroupState.BRANCHES_RUNNING
+        assert await dispatcher.process_next(app, worker_id="worker-alpha") is not None
+        result = await app.run_fork_group(request)
+        assert result.state is ForkGroupState.BRANCHES_RUNNING
+        assert await dispatcher.process_next(app, worker_id="worker-beta") is not None
+
+        result = await app.run_fork_group(request)
+
+        assert result.state is ForkGroupState.FAILED
+        assert result.failure is not None
+        assert result.failure.code is ForkGroupFailureCode.BUDGET_EXHAUSTED
+        assert result.failure.branch_id == "beta"
+        assert result.branches[0].status is ForkGroupBranchStatus.COMPLETED
+        assert result.branches[1].status is ForkGroupBranchStatus.INTERRUPTED
         assert result.branches[1].failure_code is ForkGroupFailureCode.BUDGET_EXHAUSTED
         assert provider.replacement_calls == 0
         assert provider.evaluator_calls == 0

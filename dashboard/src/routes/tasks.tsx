@@ -23,6 +23,7 @@ import {
 } from "../components/ui/table"
 import {
   blockTask,
+  fetchForkGroup,
   fetchTask,
   fetchTasks,
   markTaskNeedsAttention,
@@ -98,6 +99,19 @@ function canResume(task: Task) {
 
 function taskTitle(task: Task) {
   return task.title || task.type
+}
+
+type ForkGroupTaskLink = {
+  sourceSessionId: string
+  groupId: string
+}
+
+function forkGroupTaskLink(task: TaskDetail | undefined): ForkGroupTaskLink | null {
+  if (!task?.fork_group) return null
+  return {
+    sourceSessionId: task.fork_group.source_session_id,
+    groupId: task.fork_group.group_id,
+  }
 }
 
 function actionLabel(action: TaskAction) {
@@ -195,6 +209,14 @@ export function TasksPage() {
     queryKey: ["task", taskDetailId],
     queryFn: () => fetchTask(taskDetailId ?? ""),
     enabled: taskDetailId != null,
+    refetchInterval: 5000,
+  })
+  const forkGroupLink = useMemo(() => forkGroupTaskLink(taskDetail.data), [taskDetail.data])
+  const forkGroup = useQuery({
+    queryKey: ["fork-group", forkGroupLink?.sourceSessionId, forkGroupLink?.groupId],
+    queryFn: () =>
+      fetchForkGroup(forkGroupLink?.sourceSessionId ?? "", forkGroupLink?.groupId ?? ""),
+    enabled: forkGroupLink != null,
     refetchInterval: 5000,
   })
   const selectedTask =
@@ -668,6 +690,68 @@ export function TasksPage() {
                 )}
                 {taskDetail.data && (
                   <div className="grid gap-3">
+                    {forkGroupLink && (
+                      <div className="rounded-md border border-border bg-muted/40 p-3">
+                        <div className="mb-2 flex items-center justify-between gap-3">
+                          <span className="text-xs font-medium text-muted-foreground">
+                            Fork group
+                          </span>
+                          {forkGroup.data && (
+                            <Badge variant={statusBadgeVariant(forkGroup.data.state)}>
+                              {forkGroup.data.state}
+                            </Badge>
+                          )}
+                        </div>
+                        {forkGroup.isLoading ? (
+                          <div className="text-xs text-muted-foreground">
+                            Loading durable group state...
+                          </div>
+                        ) : forkGroup.isError ? (
+                          <StateMessage tone="danger" className="py-2">
+                            {forkGroup.error instanceof Error
+                              ? forkGroup.error.message
+                              : "Failed to load durable group state."}
+                          </StateMessage>
+                        ) : forkGroup.data ? (
+                          <div className="grid gap-1.5 text-xs">
+                            <div className="flex justify-between gap-3">
+                              <span className="text-muted-foreground">Group</span>
+                              <span className="max-w-48 truncate font-mono">
+                                {forkGroup.data.group_id}
+                              </span>
+                            </div>
+                            <div className="flex justify-between gap-3">
+                              <span className="text-muted-foreground">Recovery</span>
+                              <Badge variant="outline">{forkGroup.data.recovery_status}</Badge>
+                            </div>
+                            <div className="flex justify-between gap-3">
+                              <span className="text-muted-foreground">Execution</span>
+                              <span>{forkGroup.data.execution_mode}</span>
+                            </div>
+                            <div className="flex justify-between gap-3">
+                              <span className="text-muted-foreground">Attempts</span>
+                              <span>{forkGroup.data.attempts.length}</span>
+                            </div>
+                            <div className="flex justify-between gap-3">
+                              <span className="text-muted-foreground">Source</span>
+                              <Link
+                                to="/sessions/$sessionId"
+                                params={{ sessionId: forkGroup.data.source_session_id }}
+                                className="max-w-48 truncate font-mono text-primary hover:underline"
+                              >
+                                {forkGroup.data.source_session_id}
+                              </Link>
+                            </div>
+                            {forkGroup.data.failure_code && (
+                              <div className="flex justify-between gap-3 text-destructive">
+                                <span>Failure</span>
+                                <span>{forkGroup.data.failure_code}</span>
+                              </div>
+                            )}
+                          </div>
+                        ) : null}
+                      </div>
+                    )}
                     <div>
                       <div className="mb-1 text-xs font-medium text-muted-foreground">Input</div>
                       <PayloadViewer value={taskDetail.data.input} />

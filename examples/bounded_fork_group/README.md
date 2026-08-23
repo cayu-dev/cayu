@@ -16,9 +16,11 @@ exact frozen checkpoint/profile relationship, one causal budget, gate and
 planner identities, immutable replacement lineage, retention of the rejected
 seed, structural removal of a deliberately registered evaluator tool, complete
 eligible dispositions with one winner, and token-usage evidence for every
-session. The application still owns mutation and promotion policy; the example
-does not add population scheduling, distributed dispatch, or workspace
-promotion to Cayu.
+session. The application still owns mutation and promotion policy. This example
+keeps the compatible in-process execution mode; applications that configure a
+shared `TaskStore` and `TaskStoreDispatcher` can instead select `task-dispatch`
+without changing the gate, replacement, evaluation, or promotion contracts.
+Workspace promotion remains application-owned.
 
 ```bash
 uv run python -m examples.bounded_fork_group.app

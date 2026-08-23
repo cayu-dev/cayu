@@ -237,6 +237,32 @@ retention, ZDR, latency, account, model, region, and project-policy tradeoffs ar
 documented in `cayu guide providers` and must be accepted explicitly by enabling
 the provider option.
 
+### Fork groups can execute through durable task dispatch
+
+Fork groups can now opt into `execution_mode="task-dispatch"`. Branch,
+replacement, and tool-free evaluator invocations are linked to deterministic
+`TaskStoreDispatcher` tasks before they become claimable, and ordinary workers
+provide leases, heartbeats, reclaim, cancellation, and terminal settlement.
+Fresh coordinators reconstruct the durable graph across in-memory, SQLite, and
+PostgreSQL stores. Workers reject missing links, changed envelopes, stale group
+authority, and execution-profile drift before provider or tool work.
+Task-backed attempts use the reserved `<task_type>.fork-group.v1` queue
+namespace. Workers from before this release do not claim that namespace, so a
+rolling deployment installs the new workers first and enables task-backed fork
+groups only after their worker pool is ready.
+Read-only SDK inspection, a protected bounded server route, `cayu session
+fork-group`, and the packaged task-detail view expose group recovery, attempt,
+task, lease, run-epoch, profile, and terminal state without prompt or output
+bodies.
+
+Fork-group operation records advance to schema version 3. This prerelease
+format intentionally rejects schema-v2 records rather than guessing missing
+task-dispatch authority. Drain or inspect existing fork groups before upgrade,
+or recreate the prerelease store. Mixed coordinator access to schema-v2 and
+schema-v3 records remains unsupported; the versioned worker namespace prevents
+that prerelease record boundary from granting old workers new execution
+authority.
+
 ### Bounded cross-source recall preserves exact evidence and authority
 
 `RecallEngine` now coordinates independently bounded knowledge and transcript

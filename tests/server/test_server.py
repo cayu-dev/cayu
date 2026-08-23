@@ -94,6 +94,12 @@ from cayu.runtime import (
     DispatchStatus,
     EventQuery,
     EventRecord,
+    ForkGroupAttemptKind,
+    ForkGroupDispatchAttempt,
+    ForkGroupExecutionMode,
+    ForkGroupResult,
+    ForkGroupSourceSnapshot,
+    ForkGroupState,
     ForkSessionRequest,
     IncompleteSessionsRecoveryPage,
     InMemoryEventSink,
@@ -2360,6 +2366,185 @@ def test_server_task_detail_reports_missing_store_and_task() -> None:
     missing_task_response = client.get("/api/tasks/missing_task")
     assert missing_task_response.status_code == 404
     assert missing_task_response.json()["detail"] == "Task not found: missing_task"
+
+
+def test_server_fork_group_inspection_exposes_bounded_recovery_status() -> None:
+    digest = "a" * 64
+    app = CayuApp(task_store=InMemoryTaskStore())
+    projected = ForkGroupResult(
+        group_id="durable-group",
+        execution_mode=ForkGroupExecutionMode.TASK_DISPATCH,
+        state=ForkGroupState.BRANCHES_RUNNING,
+        source=ForkGroupSourceSnapshot(
+            source_session_id="source-session",
+            status=SessionStatus.COMPLETED,
+            run_epoch=1,
+            transcript_cursor=4,
+            transcript_sha256=digest,
+            checkpoint_sha256=digest,
+            execution_profile_fingerprint=digest,
+            causal_budget_id="group-budget",
+        ),
+        dispatch_attempts=(
+            ForkGroupDispatchAttempt(
+                kind=ForkGroupAttemptKind.BRANCH,
+                branch_id="candidate-a",
+                attempt_id="attempt-a",
+                attempt_index=0,
+                attempt_request_sha256=digest,
+                session_id="candidate-session-a",
+                queue_task_id="task-a",
+                queue_task_type="session.dispatch",
+                dispatch_id="dispatch-a",
+                dispatch_operation_id=digest,
+                terminal_event_id="dispatch-terminal-a",
+                dispatch_request_sha256=digest,
+                idempotency_key="group-attempt-a",
+                source_checkpoint_sha256=digest,
+                causal_budget_id="group-budget",
+                execution_profile_fingerprint=digest,
+                task_status=TaskStatus.CLAIMED,
+                run_epoch=2,
+                lease_owner="worker-a",
+                lease_expires_at=datetime(2026, 8, 21, tzinfo=UTC),
+            ),
+        ),
+        replayed=True,
+    )
+
+    async def inspect_fork_group(source_session_id: str, group_id: str):
+        assert source_session_id == "source-session"
+        assert group_id == "durable-group"
+        return projected
+
+    app.inspect_fork_group = inspect_fork_group  # type: ignore[method-assign]
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    response = client.get("/api/sessions/source-session/fork-groups/durable-group")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["execution_mode"] == "task-dispatch"
+    assert body["state"] == "branches-running"
+    assert body["terminal"] is False
+    assert body["recovery_status"] == "workers-active"
+    assert body["attempts"][0] == {
+        "kind": "branch",
+        "branch_id": "candidate-a",
+        "attempt_id": "attempt-a",
+        "attempt_index": 0,
+        "replaced_attempt_id": None,
+        "attempt_request_sha256": digest,
+        "session_id": "candidate-session-a",
+        "task_id": "task-a",
+        "task_type": "session.dispatch",
+        "dispatch_id": "dispatch-a",
+        "dispatch_operation_id": digest,
+        "dispatch_request_sha256": digest,
+        "terminal_event_id": "dispatch-terminal-a",
+        "idempotency_key": "group-attempt-a",
+        "source_checkpoint_sha256": digest,
+        "causal_budget_id": "group-budget",
+        "execution_profile_fingerprint": digest,
+        "task_status": "claimed",
+        "dispatch_status": None,
+        "run_epoch": 2,
+        "lease_owner": "worker-a",
+        "lease_expires_at": "2026-08-21T00:00:00+00:00",
+    }
+
+
+def test_server_task_detail_exposes_routable_projected_fork_group_linkage() -> None:
+    private_source_session_id = "source-private-secret-canary"
+    secret = "private-secret-canary"
+    digest = "a" * 64
+    task_store = InMemoryTaskStore()
+    app = CayuApp(
+        task_store=task_store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+    public_source_session_id = app.project_session_id_for_exposure(private_source_session_id)
+    projected = ForkGroupResult(
+        group_id="durable-group",
+        execution_mode=ForkGroupExecutionMode.TASK_DISPATCH,
+        state=ForkGroupState.BRANCHES_RUNNING,
+        source=ForkGroupSourceSnapshot(
+            source_session_id=public_source_session_id,
+            status=SessionStatus.COMPLETED,
+            run_epoch=1,
+            transcript_cursor=4,
+            transcript_sha256=digest,
+            checkpoint_sha256=digest,
+            execution_profile_fingerprint=digest,
+            causal_budget_id="group-budget",
+        ),
+        replayed=True,
+    )
+
+    async def seed() -> None:
+        await task_store.create_task(
+            TaskCreate(
+                task_id="fork-group-task-link",
+                type="session.dispatch",
+                input={
+                    "dispatch": {
+                        "request": {
+                            "metadata": {
+                                "fork_group_dispatch": {
+                                    "record_type": "cayu.fork-group-dispatch",
+                                    "schema_version": 1,
+                                    "source_session_id": private_source_session_id,
+                                    "group_id": "durable-group",
+                                }
+                            }
+                        }
+                    }
+                },
+            )
+        )
+
+    async def inspect_fork_group(source_session_id: str, group_id: str):
+        assert source_session_id == public_source_session_id
+        assert group_id == "durable-group"
+        return projected
+
+    asyncio.run(seed())
+    app.inspect_fork_group = inspect_fork_group  # type: ignore[method-assign]
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    task_response = client.get("/api/tasks/fork-group-task-link")
+
+    assert task_response.status_code == 200
+    task_body = task_response.json()
+    assert task_body["fork_group"] == {
+        "source_session_id": public_source_session_id,
+        "group_id": "durable-group",
+    }
+    assert (
+        task_body["input"]["dispatch"]["request"]["metadata"]["fork_group_dispatch"][
+            "source_session_id"
+        ]
+        == f"source-{REDACTED_SECRET}"
+    )
+    assert private_source_session_id not in task_response.text
+
+    group_response = client.get(
+        f"/api/sessions/{public_source_session_id}/fork-groups/durable-group"
+    )
+
+    assert group_response.status_code == 200
+    assert group_response.json()["source_session_id"] == public_source_session_id
+
+
+def test_server_fork_group_inspection_returns_not_found_for_missing_source() -> None:
+    app = CayuApp(task_store=InMemoryTaskStore(), enable_logging=False)
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    response = client.get("/api/sessions/missing-source/fork-groups/missing-group")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Fork group not found: missing-group"}
 
 
 def test_server_task_lifecycle_endpoints_hold_and_resume_tasks() -> None:

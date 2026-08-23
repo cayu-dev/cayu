@@ -1894,6 +1894,7 @@ class ForkSessionRequest(BaseModel):
     _fork_group_initial_invocation: _ForkGroupInitialInvocationExpectation | None = PrivateAttr(
         default=None
     )
+    _fork_group_task_evaluator: bool = PrivateAttr(default=False)
     _execution_profile_fingerprint_capture: Callable[[str], None] | None = PrivateAttr(default=None)
 
     @field_validator("session_id")
@@ -14841,6 +14842,7 @@ def copy_fork_session_request(request: ForkSessionRequest) -> ForkSessionRequest
             request_sha256=initial_invocation.request_sha256,
         )
     )
+    copied._fork_group_task_evaluator = request._fork_group_task_evaluator
     copied._execution_profile_fingerprint_capture = request._execution_profile_fingerprint_capture
     return copied
 
@@ -14894,6 +14896,18 @@ def _bind_fork_group_initial_invocation(
         request=copied_invocation,
         request_sha256=_fork_group_initial_invocation_request_sha256(copied_invocation),
     )
+    return copied
+
+
+def _bind_fork_group_task_evaluator(request: ForkSessionRequest) -> ForkSessionRequest:
+    """Mark one coordinator-owned tool-free evaluator fork for built-in admission."""
+
+    if type(request) is not ForkSessionRequest:
+        raise TypeError("Fork-group evaluator requires a ForkSessionRequest.")
+    if request._fork_group_initial_invocation is None:
+        raise ValueError("Fork-group evaluator requires exact initial invocation authority.")
+    copied = copy_fork_session_request(request)
+    copied._fork_group_task_evaluator = True
     return copied
 
 

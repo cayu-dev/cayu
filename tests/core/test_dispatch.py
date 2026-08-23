@@ -3960,11 +3960,18 @@ def test_recover_stalled_sessions_after_seconds_must_be_non_negative() -> None:
         TaskStoreDispatcher(InMemoryTaskStore(), recover_stalled_sessions_after_seconds=-1)
 
 
-def test_prepared_subagent_task_type_suffix_is_reserved() -> None:
-    with pytest.raises(ValueError, match="reserved prepared-subagent task-type suffix"):
+@pytest.mark.parametrize(
+    "task_type",
+    [
+        "acme.dispatch.prepared-subagent.v1",
+        "acme.dispatch.fork-group.v1",
+    ],
+)
+def test_dispatch_protocol_task_type_suffixes_are_reserved(task_type: str) -> None:
+    with pytest.raises(ValueError, match="reserved dispatch protocol suffix"):
         TaskStoreDispatcher(
             InMemoryTaskStore(),
-            task_type="acme.dispatch.prepared-subagent.v1",
+            task_type=task_type,
         )
 
 

@@ -3131,6 +3131,7 @@ _MODEL_TARGET_AND_TOOL_CAPABILITY_CEILING_PROFILE_POLICY_ID = (
     "cayu:model-target-and-tool-capability-ceiling-adoption:v1"
 )
 _FORK_GROUP_INITIAL_PROFILE_POLICY_ID = "cayu:fork-group-initial-invocation:v1"
+_FORK_GROUP_TASK_EVALUATOR_PROFILE_POLICY_ID = "cayu:fork-group-task-evaluator:v1"
 _MODEL_TARGET_BUILT_IN_COMPONENTS = frozenset(
     {
         ExecutionProfileComponentClass.PROVIDER_ADAPTER,
@@ -4291,6 +4292,29 @@ class SessionEngine:
                 candidate,
                 source_profile.component(ExecutionProfileComponentClass.INVOCATION_POLICIES),
             )
+        relationship = session_fork_profile_relationship(session)
+        if (
+            session.run_epoch == 0
+            and relationship is not None
+            and relationship.initial_invocation_profile is not None
+        ):
+            initial_request = ResumeRequest(
+                session_id=request.session_id,
+                messages=request.messages,
+                target=request.target,
+                metadata=request.metadata,
+                max_steps=request.max_steps,
+                limits=request.limits,
+                budget_limits=request.budget_limits,
+                retry_policy=request.retry_policy,
+                structured_output=request.structured_output,
+                thinking=request.thinking,
+                loop_policies=request.loop_policies,
+            )
+            if relationship.initial_invocation_request_sha256 == (
+                _fork_group_initial_invocation_request_sha256(initial_request)
+            ):
+                return relationship.initial_invocation_profile
         return candidate
 
     async def validate_execution_profile_continuation(
@@ -13262,6 +13286,15 @@ class SessionEngine:
             != initial_invocation.request_sha256
         ):
             raise RuntimeError("Fork-group initial invocation authority is inconsistent.")
+        if request._fork_group_task_evaluator and (
+            initial_invocation is None
+            or request.execution_profile_selection
+            is not ForkExecutionProfileSelection.CURRENT_CHILD
+            or request.system_prompt_policy is not ForkSystemPromptPolicy.CURRENT_AGENT
+            or request.transcript_cursor != 0
+            or request.copy_checkpoint
+        ):
+            raise RuntimeError("Fork-group task evaluator authority is inconsistent.")
 
         def current_child_execution_profile() -> ExecutionProfileIdentity:
             candidate = _execution_profile_identity(
@@ -13353,24 +13386,44 @@ class SessionEngine:
                 source_execution_profile,
                 candidate_execution_profile,
             )
-            execution_profile_decision = await self._classify_execution_profile(
-                session=source_session,
-                decision_session=decision_session,
-                expected_profile=source_execution_profile,
-                candidate_profile=candidate_execution_profile,
-                changed_component_classes=changed_profile_components,
-                intent=request.profile_adoption,
-                adoption_request_fingerprint=fork_request_sha256,
-                target_changed=(
-                    registered_provider.name != source_session.provider_name
-                    or model != source_session.model
-                ),
-                target_provider_name=registered_provider.name,
-                target_model=model,
-                source_provider_name=source_session.provider_name,
-                source_model=source_session.model,
-                force_authority_review=True,
-            )
+            if request._fork_group_task_evaluator:
+                execution_profile_decision = _execution_profile_decision_event(
+                    session=decision_session,
+                    expected_profile=source_execution_profile,
+                    candidate_profile=candidate_execution_profile,
+                    changed_component_classes=changed_profile_components,
+                    kind=ExecutionProfileDecisionKind.ADOPTED,
+                    policy_identity=_FORK_GROUP_TASK_EVALUATOR_PROFILE_POLICY_ID,
+                    policy_reason=(
+                        "The durable fork group authorized this exact tool-free evaluator "
+                        "invocation before queue publication."
+                    ),
+                    authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+                    intent=request.profile_adoption,
+                    adoption_request_fingerprint=fork_request_sha256,
+                    fallback_actor=None,
+                    fallback_reason="Runtime-owned fork-group evaluator admission.",
+                    clock=self._clock,
+                )
+            else:
+                execution_profile_decision = await self._classify_execution_profile(
+                    session=source_session,
+                    decision_session=decision_session,
+                    expected_profile=source_execution_profile,
+                    candidate_profile=candidate_execution_profile,
+                    changed_component_classes=changed_profile_components,
+                    intent=request.profile_adoption,
+                    adoption_request_fingerprint=fork_request_sha256,
+                    target_changed=(
+                        registered_provider.name != source_session.provider_name
+                        or model != source_session.model
+                    ),
+                    target_provider_name=registered_provider.name,
+                    target_model=model,
+                    source_provider_name=source_session.provider_name,
+                    source_model=source_session.model,
+                    force_authority_review=True,
+                )
             if execution_profile_decision.kind in {
                 ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
                 ExecutionProfileDecisionKind.REJECTED,
@@ -13670,6 +13723,7 @@ class SessionEngine:
                 (expected_fork_transcript is None or messages == expected_fork_transcript)
                 and (
                     expected_source_snapshot is None
+                    or request._fork_group_task_evaluator
                     or session_input_messages_sha256(messages)
                     == expected_source_snapshot.transcript_sha256
                 )

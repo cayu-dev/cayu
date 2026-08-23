@@ -4,6 +4,7 @@ import type {
   ApiAgentSummary,
   ApiArtifactSummary,
   ApiEnvironmentSummary,
+  ApiForkGroupDetail,
   ApiKnowledgeChunk,
   ApiKnowledgeListItem,
   ApiPendingAction,
@@ -52,6 +53,7 @@ import type {
   GetArtifactApiArtifactsArtifactIdGetData,
   GetArtifactContentApiArtifactsArtifactIdContentGetData,
   GetContractApiContractGetResponse,
+  GetForkGroupApiSessionsSessionIdForkGroupsGroupIdGetResponse,
   GetOperationalSnapshotApiOperationsSnapshotPostResponse,
   GetSessionApiSessionsSessionIdGetResponse,
   GetSessionStateApiSessionsSessionIdStateGetResponse,
@@ -165,6 +167,7 @@ export type UsageRollupBody = UsageRollupRequest
 export type SystemDiagnostics = GetSystemDiagnosticsApiSystemDiagnosticsGetResponse
 export type Task = ApiTaskListItem
 export type TaskDetail = ApiTaskDetail
+export type ForkGroupDetail = ApiForkGroupDetail
 export type TaskHold = TaskHoldBody
 export type TaskListQuery = NonNullable<ListTasksApiTasksGetData["query"]>
 export type PendingAction = ApiPendingAction
@@ -808,6 +811,15 @@ export async function fetchTasks(query: TaskListQuery = {}): Promise<Task[]> {
 
 export async function fetchTask(taskId: string): Promise<TaskDetail> {
   return requestJson<GetTaskApiTasksTaskIdGetResponse>(`/tasks/${encodeURIComponent(taskId)}`)
+}
+
+export async function fetchForkGroup(
+  sourceSessionId: string,
+  groupId: string,
+): Promise<ForkGroupDetail> {
+  return requestJson<GetForkGroupApiSessionsSessionIdForkGroupsGroupIdGetResponse>(
+    `/sessions/${encodeURIComponent(sourceSessionId)}/fork-groups/${encodeURIComponent(groupId)}`,
+  )
 }
 
 export async function fetchPendingActions(

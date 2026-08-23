@@ -465,6 +465,7 @@ class InlineDispatcher(Dispatcher):
 
 DEFAULT_DISPATCH_TASK_TYPE = "cayu.dispatch"
 PREPARED_SUBAGENT_DISPATCH_TASK_TYPE_SUFFIX = ".prepared-subagent.v1"
+FORK_GROUP_DISPATCH_TASK_TYPE_SUFFIX = ".fork-group.v1"
 DISPATCH_CONFLICT_RECOVERY_REASON = "dispatch_conflict_worker_crash_recovery"
 
 _STALLED_RECOVERED_ACTIONS = {
@@ -518,13 +519,22 @@ class TaskStoreDispatcher(Dispatcher):
             )
         self._tasks = task_store
         self._task_type = require_clean_nonblank(task_type, "task_type")
-        if self._task_type.endswith(PREPARED_SUBAGENT_DISPATCH_TASK_TYPE_SUFFIX):
-            raise ValueError("task_type uses the reserved prepared-subagent task-type suffix.")
+        if self._task_type.endswith(
+            (
+                PREPARED_SUBAGENT_DISPATCH_TASK_TYPE_SUFFIX,
+                FORK_GROUP_DISPATCH_TASK_TYPE_SUFFIX,
+            )
+        ):
+            raise ValueError("task_type uses a reserved dispatch protocol suffix.")
         self._prepared_subagent_task_type = require_clean_nonblank(
             self._task_type + PREPARED_SUBAGENT_DISPATCH_TASK_TYPE_SUFFIX,
             "prepared_subagent_task_type",
         )
-        self._prefer_prepared_subagent_claim = True
+        self._fork_group_task_type = require_clean_nonblank(
+            self._task_type + FORK_GROUP_DISPATCH_TASK_TYPE_SUFFIX,
+            "fork_group_task_type",
+        )
+        self._next_claim_task_type_index = 0
         self._lease_seconds = lease_seconds
         # Horizon after which a conflicting live-status session is considered stranded
         # by a crashed worker (defaults to the task lease: a healthy run whose lease
@@ -553,10 +563,32 @@ class TaskStoreDispatcher(Dispatcher):
         return self._prepared_subagent_task_type
 
     @property
+    def fork_group_task_type(self) -> str:
+        """Return the versioned queue namespace reserved for fork-group attempts."""
+
+        return self._fork_group_task_type
+
+    @property
     def task_store(self) -> TaskStore:
         """Return the exact task store that owns this dispatcher's leases."""
 
         return self._tasks
+
+    def _claim_task_types(self) -> tuple[str, str, str]:
+        """Return independently claimable protocol namespaces in fair-poll order."""
+
+        return (
+            self._prepared_subagent_task_type,
+            self._fork_group_task_type,
+            self._task_type,
+        )
+
+    def _task_type_for_request(self, request: DispatchRequest) -> str:
+        """Keep fork-group work invisible to workers that predate its authority check."""
+
+        if "fork_group_dispatch" in request.metadata:
+            return self._fork_group_task_type
+        return self._task_type
 
     def _task_type_for_envelope(self, envelope: _QueuedDispatchEnvelope) -> str:
         """Bind each envelope protocol to the only namespace allowed to carry it."""
@@ -564,7 +596,7 @@ class TaskStoreDispatcher(Dispatcher):
         if type(envelope) is not _QueuedDispatchEnvelope:
             raise TypeError("Queued dispatch requires an exact envelope.")
         if envelope.operation_kind == "resume":
-            return self._task_type
+            return self._task_type_for_request(envelope.request)
         intent = envelope.prepared_subagent
         if intent is None or intent.queue_task_type != self._prepared_subagent_task_type:
             raise ValueError("Prepared subagent dispatch uses an unsupported queue namespace.")
@@ -586,12 +618,13 @@ class TaskStoreDispatcher(Dispatcher):
             )
         request = _runtime_redact_dispatch_request(durable_runtime, request)
         handle_request = request
-        queue_task_id = _queued_dispatch_task_id(request, task_type=self._task_type)
+        task_type = self._task_type_for_request(request)
+        queue_task_id = _queued_dispatch_task_id(request, task_type=task_type)
         existing = await self._tasks.load_task(queue_task_id)
         if existing is not None:
             envelope = _existing_queued_dispatch_envelope(
                 existing,
-                task_type=self._task_type,
+                task_type=task_type,
             )
             if envelope is None or not await durable_runtime._queued_dispatch_requests_match(
                 envelope.request,
@@ -609,7 +642,7 @@ class TaskStoreDispatcher(Dispatcher):
                 existing,
                 envelope=envelope,
                 session_binding=session_binding,
-                task_type=self._task_type,
+                task_type=task_type,
             )
             if existing.status in {
                 TaskStatus.COMPLETED,
@@ -643,7 +676,7 @@ class TaskStoreDispatcher(Dispatcher):
         create_request = task_create_with_runtime_invocation(
             TaskCreate(
                 task_id=queue_task_id,
-                type=self._task_type,
+                type=task_type,
                 parent_task_id=request.task_id,
                 input={"dispatch": _queued_dispatch_persisted_envelope(envelope)},
             ),
@@ -667,7 +700,7 @@ class TaskStoreDispatcher(Dispatcher):
                 if existing is None
                 else _existing_queued_dispatch_envelope(
                     existing,
-                    task_type=self._task_type,
+                    task_type=task_type,
                 )
             )
             if (
@@ -685,7 +718,7 @@ class TaskStoreDispatcher(Dispatcher):
             idempotent_submission = True
         if not _task_matches_queued_dispatch(
             task,
-            task_type=self._task_type,
+            task_type=task_type,
             parent_task_id=request.task_id,
             envelope=envelope,
         ):
@@ -698,7 +731,7 @@ class TaskStoreDispatcher(Dispatcher):
             task,
             envelope=envelope,
             session_binding=session_binding,
-            task_type=self._task_type,
+            task_type=task_type,
         )
         if idempotent_submission and task.status in {
             TaskStatus.COMPLETED,
@@ -820,19 +853,12 @@ class TaskStoreDispatcher(Dispatcher):
                     not reconciliation_complete
                     or reconciliation_generation != self._terminal_receipt_reconciliation_generation
                 )
-        preferred_task_type = (
-            self._prepared_subagent_task_type
-            if self._prefer_prepared_subagent_claim
-            else self._task_type
-        )
-        alternate_task_type = (
-            self._task_type
-            if self._prefer_prepared_subagent_claim
-            else self._prepared_subagent_task_type
-        )
+        claim_task_types = self._claim_task_types()
         task = None
-        claimed_task_type = preferred_task_type
-        for candidate_task_type in (preferred_task_type, alternate_task_type):
+        claimed_task_type = claim_task_types[self._next_claim_task_type_index]
+        for offset in range(len(claim_task_types)):
+            candidate_index = (self._next_claim_task_type_index + offset) % len(claim_task_types)
+            candidate_task_type = claim_task_types[candidate_index]
             task = await self._tasks.claim_task(
                 worker_id,
                 # Each namespace remains FIFO. Alternate successful claims so a
@@ -842,7 +868,7 @@ class TaskStoreDispatcher(Dispatcher):
             )
             if task is not None:
                 claimed_task_type = candidate_task_type
-                self._prefer_prepared_subagent_claim = candidate_task_type == self._task_type
+                self._next_claim_task_type_index = (candidate_index + 1) % len(claim_task_types)
                 break
         if task is None:
             return None
@@ -1480,10 +1506,7 @@ class TaskStoreDispatcher(Dispatcher):
                         type(exc).__name__,
                         _safe_runtime_text(durable_runtime, str(exc)),
                     )
-                for task_type in (
-                    self._prepared_subagent_task_type,
-                    self._task_type,
-                ):
+                for task_type in self._claim_task_types():
                     try:
                         await self._tasks.reclaim_expired(query=TaskQuery(type=task_type))
                     except Exception as exc:

@@ -137,6 +137,7 @@ MAX_EVALS_REQUEST_BYTES = EVAL_CORPUS_MAX_BYTES + (64 * 1024)
 MAX_EXECUTION_TOPOLOGY_EDGES = 1500
 MAX_EVAL_TARGETS = EVAL_STORE_MAX_CLAIM_TARGETS
 MAX_EVAL_TARGET_COMPONENT_CHARS = 256
+MAX_FORK_GROUP_CONTROL_PLANE_ATTEMPTS = 81
 
 SessionTopologyIdentifier = Annotated[
     str,
@@ -2125,13 +2126,106 @@ class ApiTaskInvocation(ApiBaseModel):
     source: TaskExecutionSource
 
 
+class ApiTaskForkGroupLink(ApiBaseModel):
+    """Public, routable linkage from a queue task to its durable fork group."""
+
+    source_session_id: str = Field(max_length=512)
+    group_id: str = Field(max_length=256)
+
+
 class ApiTaskDetail(ApiTaskListItem):
     invocation: ApiTaskInvocation
+    fork_group: ApiTaskForkGroupLink | None
     input: dict[str, Any]
     result: dict[str, Any] | None
     error: dict[str, Any] | None
     metadata: dict[str, Any]
     started_at: str | None
+
+
+class ApiForkGroupAttemptStatus(ApiBaseModel):
+    """Bounded queue and ownership projection for one durable group attempt."""
+
+    kind: Literal["branch", "replacement", "evaluator"]
+    branch_id: str | None = Field(default=None, max_length=256)
+    attempt_id: str = Field(max_length=256)
+    attempt_index: StrictInt = Field(ge=0, le=64)
+    replaced_attempt_id: str | None = Field(default=None, max_length=256)
+    attempt_request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    session_id: str = Field(max_length=512)
+    task_id: str = Field(max_length=512)
+    task_type: str = Field(max_length=256)
+    dispatch_id: str = Field(max_length=512)
+    dispatch_operation_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    dispatch_request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    terminal_event_id: str = Field(max_length=512)
+    idempotency_key: str = Field(max_length=256)
+    source_checkpoint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    causal_budget_id: str = Field(max_length=512)
+    execution_profile_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    task_status: (
+        Literal[
+            "pending",
+            "claimed",
+            "running",
+            "paused",
+            "blocked",
+            "needs_attention",
+            "completed",
+            "failed",
+            "cancelled",
+        ]
+        | None
+    )
+    dispatch_status: (
+        Literal[
+            "submitted",
+            "running",
+            "completed",
+            "failed",
+            "interrupted",
+            "cancelled",
+        ]
+        | None
+    )
+    run_epoch: StrictInt | None = Field(default=None, ge=0)
+    lease_owner: str | None = Field(default=None, max_length=512)
+    lease_expires_at: str | None = Field(default=None, max_length=64)
+
+
+class ApiForkGroupDetail(ApiBaseModel):
+    """Read-only group state without branch output or evaluator judgment bodies."""
+
+    schema_version: Literal[1]
+    group_id: str = Field(max_length=256)
+    source_session_id: str = Field(max_length=512)
+    source_checkpoint_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    causal_budget_id: str = Field(max_length=512)
+    execution_mode: Literal["in-process", "task-dispatch"]
+    state: Literal[
+        "created",
+        "branches-running",
+        "awaiting-evaluation",
+        "completed",
+        "failed",
+    ]
+    terminal: StrictBool
+    recovery_status: Literal[
+        "coordinator-required",
+        "workers-pending",
+        "workers-active",
+        "workers-held",
+        "attachment-required",
+        "terminal",
+    ]
+    replayed: StrictBool
+    attempts: list[ApiForkGroupAttemptStatus] = Field(
+        max_length=MAX_FORK_GROUP_CONTROL_PLANE_ATTEMPTS
+    )
+    failure_code: str | None = Field(default=None, max_length=64)
+    failure_branch_id: str | None = Field(default=None, max_length=256)
+    selected_branch_id: str | None = Field(default=None, max_length=256)
+    selected_attempt_id: str | None = Field(default=None, max_length=256)
 
 
 class ApiKnowledgeEntryBase(ApiBaseModel):

@@ -36,7 +36,18 @@ from cayu.core.thinking import ThinkingConfig
 from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime._diagnostics import exception_diagnostic
 from cayu.runtime._fork_source_snapshot import fork_source_checkpoint_sha256
+from cayu.runtime.approvals import ResolutionActor, ResolutionActorSource
 from cayu.runtime.budgets import BudgetLimit
+from cayu.runtime.dispatch import (
+    DispatchHandle,
+    DispatchRequest,
+    DispatchStatus,
+    TaskStoreDispatcher,
+    _copy_queued_dispatch_envelope,
+    _existing_queued_dispatch_envelope,
+    _queued_dispatch_task_id,
+    _QueuedDispatchEnvelope,
+)
 from cayu.runtime.execution_profiles import (
     ExecutionProfileAdoptionIntent,
     execution_profile_baseline_from_session_metadata,
@@ -46,9 +57,11 @@ from cayu.runtime.sessions import (
     FORK_GROUP_SOURCE_SNAPSHOT_METADATA_KEY,
     ForkExecutionProfileSelection,
     ForkSessionRequest,
+    ForkSystemPromptPolicy,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
+    InterruptSessionRequest,
     ResumeRequest,
     RunRequest,
     Session,
@@ -58,11 +71,13 @@ from cayu.runtime.sessions import (
     _bind_fork_execution_profile_fingerprint_capture,
     _bind_fork_expected_source_snapshot,
     _bind_fork_group_initial_invocation,
+    _bind_fork_group_task_evaluator,
     session_fork_profile_relationship,
     session_input_messages_sha256,
 )
 from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.structured_output import StructuredOutputSpec
+from cayu.runtime.tasks import Task, TaskStatus, TaskStore
 from cayu.runtime.usage import (
     SessionUsageSummary,
     aggregate_usage_metrics_from_durable_payload,
@@ -82,6 +97,7 @@ _FORK_GROUP_RECORD_TYPE = "cayu.fork-group"
 _FORK_GROUP_SCHEMA_VERSION = 3
 _FORK_GROUP_EXECUTION_CLAIM_SECONDS = 30
 _FORK_GROUP_EXECUTION_HEARTBEAT_SECONDS = 10
+_FORK_GROUP_TASK_EVALUATOR_ENVIRONMENT = "__cayu_fork_group_task_evaluator_environment_v1"
 _FORK_GROUP_TRANSITIONS: frozenset[tuple[ForkGroupState, ForkGroupState]]
 
 
@@ -91,6 +107,21 @@ class ForkGroupState(StrEnum):
     AWAITING_EVALUATION = "awaiting-evaluation"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class ForkGroupExecutionMode(StrEnum):
+    """Where fork-group candidate and evaluator invocations execute."""
+
+    IN_PROCESS = "in-process"
+    TASK_DISPATCH = "task-dispatch"
+
+
+class ForkGroupAttemptKind(StrEnum):
+    """The durable role of one task-backed fork-group attempt."""
+
+    BRANCH = "branch"
+    REPLACEMENT = "replacement"
+    EVALUATOR = "evaluator"
 
 
 class ForkGroupBranchStatus(StrEnum):
@@ -139,9 +170,11 @@ _TERMINAL_SESSION_STATUSES = frozenset(
 _FORK_GROUP_TRANSITIONS = frozenset(
     {
         (ForkGroupState.CREATED, ForkGroupState.BRANCHES_RUNNING),
+        (ForkGroupState.BRANCHES_RUNNING, ForkGroupState.BRANCHES_RUNNING),
         (ForkGroupState.BRANCHES_RUNNING, ForkGroupState.AWAITING_EVALUATION),
         (ForkGroupState.BRANCHES_RUNNING, ForkGroupState.FAILED),
         (ForkGroupState.AWAITING_EVALUATION, ForkGroupState.COMPLETED),
+        (ForkGroupState.AWAITING_EVALUATION, ForkGroupState.AWAITING_EVALUATION),
         (ForkGroupState.AWAITING_EVALUATION, ForkGroupState.FAILED),
     }
 )
@@ -153,6 +186,14 @@ class ForkGroupConflict(RuntimeError):
 
 class _ForkGroupPublicationSuperseded(RuntimeError):
     """Another coordinator already advanced this exact durable group."""
+
+
+class _ForkGroupTaskStoreUnavailable(ConnectionError):
+    """A retryable task-store operation could not be observed safely."""
+
+
+class _ForkGroupSessionStoreUnavailable(ConnectionError):
+    """A retryable session-store operation could not be observed safely."""
 
 
 class _ForkGroupPublicationFailure(RuntimeError):
@@ -453,6 +494,7 @@ class ForkGroupRequest(BaseModel):
         default_factory=ForkGroupCheckpointSelector
     )
     causal_budget_id: str = Field(max_length=512)
+    execution_mode: ForkGroupExecutionMode = ForkGroupExecutionMode.IN_PROCESS
     max_parallelism: StrictInt = Field(default=4, ge=1, le=FORK_GROUP_MAX_PARALLELISM)
     branches: tuple[ForkGroupBranchSpec, ...] = Field(
         min_length=FORK_GROUP_MIN_BRANCHES,
@@ -509,6 +551,103 @@ class ForkGroupSourceSnapshot(BaseModel):
     checkpoint_sha256: str
     execution_profile_fingerprint: str
     causal_budget_id: str
+
+
+class ForkGroupDispatchAttempt(BaseModel):
+    """Durable linkage and live queue projection for one task-backed attempt."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    kind: ForkGroupAttemptKind
+    branch_id: str | None = Field(default=None, max_length=256)
+    attempt_id: str = Field(max_length=256)
+    attempt_index: StrictInt = Field(ge=0, le=FORK_GROUP_MAX_REPLACEMENT_ATTEMPTS)
+    replaced_attempt_id: str | None = Field(default=None, max_length=256)
+    attempt_request_sha256: str = Field(min_length=64, max_length=64)
+    session_id: str = Field(max_length=512)
+    queue_task_id: str
+    queue_task_type: str
+    dispatch_id: str
+    dispatch_operation_id: str = Field(min_length=64, max_length=64)
+    terminal_event_id: str
+    dispatch_request_sha256: str = Field(min_length=64, max_length=64)
+    idempotency_key: str = Field(max_length=256)
+    source_checkpoint_sha256: str = Field(min_length=64, max_length=64)
+    causal_budget_id: str = Field(max_length=512)
+    execution_profile_fingerprint: str = Field(min_length=64, max_length=64)
+    task_status: TaskStatus | None = None
+    dispatch_status: DispatchStatus | None = None
+    run_epoch: StrictInt | None = Field(default=None, ge=0)
+    lease_owner: str | None = None
+    lease_expires_at: datetime | None = None
+
+    @field_validator(
+        "branch_id",
+        "attempt_id",
+        "replaced_attempt_id",
+        "session_id",
+        "queue_task_id",
+        "queue_task_type",
+        "dispatch_id",
+        "terminal_event_id",
+        "idempotency_key",
+        "causal_budget_id",
+        "lease_owner",
+    )
+    @classmethod
+    def validate_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator(
+        "attempt_request_sha256",
+        "dispatch_operation_id",
+        "dispatch_request_sha256",
+        "source_checkpoint_sha256",
+        "execution_profile_fingerprint",
+    )
+    @classmethod
+    def validate_digest(cls, value: str, info) -> str:
+        if any(character not in "0123456789abcdef" for character in value):
+            raise ValueError(f"{info.field_name} must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("lease_expires_at")
+    @classmethod
+    def normalize_lease_expiry(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("lease_expires_at must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_role(self) -> ForkGroupDispatchAttempt:
+        if self.kind is ForkGroupAttemptKind.EVALUATOR:
+            if self.branch_id is not None or self.replaced_attempt_id is not None:
+                raise ValueError("Evaluator attempts cannot carry branch lineage.")
+        elif self.branch_id is None:
+            raise ValueError("Branch and replacement attempts require branch_id.")
+        if self.kind is ForkGroupAttemptKind.BRANCH and (
+            self.attempt_index != 0 or self.replaced_attempt_id is not None
+        ):
+            raise ValueError("Initial branch attempts cannot carry replacement lineage.")
+        if self.kind is ForkGroupAttemptKind.REPLACEMENT and (
+            self.attempt_index == 0 or self.replaced_attempt_id is None
+        ):
+            raise ValueError("Replacement attempts require replacement lineage.")
+        if self.task_status is None and any(
+            value is not None
+            for value in (
+                self.dispatch_status,
+                self.run_epoch,
+                self.lease_owner,
+                self.lease_expires_at,
+            )
+        ):
+            raise ValueError("Live attempt state requires task_status evidence.")
+        return self
 
 
 class ForkGroupBranchResult(BaseModel):
@@ -662,6 +801,20 @@ class _ForkGroupAttemptIdentity:
     attempt_id: str
 
 
+class _ForkGroupPreparedReplacement(BaseModel):
+    """Application-owned replacement content frozen before queue publication."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    attempt_id: str = Field(max_length=256)
+    branch: ForkGroupBranchSpec
+
+    @field_validator("attempt_id")
+    @classmethod
+    def validate_attempt_id(cls, value: str) -> str:
+        return require_durable_clean_nonblank(value, "attempt_id")
+
+
 class ForkGroupCoordinator:
     """Own durable fork-group orchestration through narrow runtime callbacks."""
 
@@ -686,6 +839,13 @@ class ForkGroupCoordinator:
         preflight_fork_source: Callable[[str], Awaitable[None]],
         preflight_fork_source_state: Callable[[Session, dict[str, Any] | None], Awaitable[None]],
         admit_fork_source: Callable[[str], Awaitable[None]],
+        interrupt_session: Callable[..., AsyncIterator[Event]],
+        dispatcher: object,
+        task_store: TaskStore | None,
+        prepare_queued_dispatch: Callable[
+            [DispatchRequest, str], Awaitable[_QueuedDispatchEnvelope]
+        ],
+        dispatch_session: Callable[[DispatchRequest], Awaitable[DispatchHandle]],
     ) -> None:
         if not isinstance(secret_redactor, SecretRedactor):
             raise TypeError("ForkGroupCoordinator requires a SecretRedactor.")
@@ -703,6 +863,11 @@ class ForkGroupCoordinator:
         self._preflight_fork_source_callback = preflight_fork_source
         self._preflight_fork_source_state_callback = preflight_fork_source_state
         self._admit_fork_source_callback = admit_fork_source
+        self._interrupt_session_callback = interrupt_session
+        self._dispatcher = dispatcher
+        self._task_store = task_store
+        self._prepare_queued_dispatch_callback = prepare_queued_dispatch
+        self._dispatch_session_callback = dispatch_session
         self._locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._gates: dict[str, ForkGroupGate] = {}
         self._replacement_planners: dict[str, ForkGroupReplacementPlanner] = {}
@@ -788,6 +953,54 @@ class ForkGroupCoordinator:
 
     async def admit_fork_source(self, session_id: str) -> None:
         await self._admit_fork_source_callback(session_id)
+
+    async def interrupt_dispatch_session(
+        self,
+        request: InterruptSessionRequest,
+        *,
+        store_resolved_session_id: str,
+    ) -> None:
+        stream = self._interrupt_session_callback(
+            request,
+            store_resolved_session_id=store_resolved_session_id,
+        )
+        async for _event in stream:
+            pass
+
+    def task_dispatcher(self) -> TaskStoreDispatcher:
+        if not isinstance(self._dispatcher, TaskStoreDispatcher) or self._task_store is None:
+            raise RuntimeError("Task-backed fork groups require TaskStoreDispatcher(task_store).")
+        if self._dispatcher.task_store is not self._task_store:
+            raise RuntimeError(
+                "Task-backed fork groups require CayuApp and TaskStoreDispatcher to share "
+                "the exact TaskStore instance."
+            )
+        return self._dispatcher
+
+    @property
+    def task_store(self) -> TaskStore:
+        self.task_dispatcher()
+        assert self._task_store is not None
+        return self._task_store
+
+    async def prepare_queued_dispatch(
+        self,
+        request: DispatchRequest,
+        queue_task_id: str,
+    ) -> _QueuedDispatchEnvelope:
+        envelope = await self._prepare_queued_dispatch_callback(request, queue_task_id)
+        if type(envelope) is not _QueuedDispatchEnvelope:
+            raise TypeError("Fork-group dispatch preparation returned an invalid envelope.")
+        return _copy_queued_dispatch_envelope(envelope)
+
+    async def dispatch(self, request: DispatchRequest) -> DispatchHandle:
+        handle = await self._dispatch_session_callback(request)
+        if type(handle) is not DispatchHandle:
+            raise TypeError("Fork-group dispatch returned an invalid handle.")
+        return handle.model_copy(deep=True)
+
+    async def require_dispatch_authority(self, envelope: _QueuedDispatchEnvelope) -> bool:
+        return await require_fork_group_dispatch_authority(self, envelope)
 
     def _validate_extension_authority(
         self,
@@ -899,13 +1112,11 @@ class ForkGroupCoordinator:
                     record,
                 )
                 if claim_id is None:
-                    public_source = record.result.source.model_copy(
-                        update={"source_session_id": public_source_session_id},
-                        deep=True,
-                    )
-                    return record.result.model_copy(
-                        update={"source": public_source, "replayed": True},
-                        deep=True,
+                    return await _public_group_result(
+                        self,
+                        record.result,
+                        public_source_session_id=public_source_session_id,
+                        replayed=True,
                     )
                 try:
                     record = await _execute_with_claim(self, record, claim_id)
@@ -928,9 +1139,18 @@ class ForkGroupCoordinator:
                             "Superseded fork-group execution has no durable winner."
                         ) from None
                     record = latest
-                except ForkGroupConflict:
+                except (
+                    ForkGroupConflict,
+                    _ForkGroupSessionStoreUnavailable,
+                    _ForkGroupTaskStoreUnavailable,
+                ):
                     raise
                 except Exception as exc:
+                    if (
+                        copied.execution_mode is ForkGroupExecutionMode.TASK_DISPATCH
+                        and _store_failure_is_transient(exc)
+                    ):
+                        raise _session_store_unavailable(self, exc) from None
                     publication_failure = (
                         exc if isinstance(exc, _ForkGroupPublicationFailure) else None
                     )
@@ -1028,14 +1248,53 @@ class ForkGroupCoordinator:
                                 claim_id,
                                 release=True,
                             )
-            public_source = record.result.source.model_copy(
-                update={"source_session_id": public_source_session_id},
-                deep=True,
+            return await _public_group_result(
+                self,
+                record.result,
+                public_source_session_id=public_source_session_id,
+                replayed=replayed,
             )
-            return record.result.model_copy(
-                update={"source": public_source, "replayed": replayed},
-                deep=True,
+
+    async def inspect_group(
+        self,
+        source_session_id: str,
+        group_id: str,
+    ) -> ForkGroupResult | None:
+        """Project one durable fork group without claiming or advancing it."""
+
+        public_source_session_id = require_durable_clean_nonblank(
+            source_session_id,
+            "source_session_id",
+        )
+        group_id = require_durable_clean_nonblank(group_id, "group_id")
+        (
+            private_source_session_id,
+            store_resolved_source_session_id,
+        ) = await self.resolve_public_session_authority(public_source_session_id)
+        session_request_boundary.require_store_resolved_or_secret_free_session_authority(
+            private_source_session_id,
+            store_resolved_value=store_resolved_source_session_id,
+            field_name="source_session_id",
+            redactor=self.secret_redactor,
+        )
+        try:
+            record = await _load_record_by_group_id(
+                self,
+                private_source_session_id,
+                group_id,
             )
+        except KeyError:
+            return None
+        if record is None:
+            return None
+        return await _public_group_result(
+            self,
+            record.result,
+            public_source_session_id=public_source_session_id,
+            replayed=True,
+            cancel_terminal_tasks=False,
+            require_current_authority=False,
+        )
 
 
 class ForkGroupDispositionRecord(BaseModel):
@@ -1066,9 +1325,11 @@ class ForkGroupResult(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     group_id: str
+    execution_mode: ForkGroupExecutionMode = ForkGroupExecutionMode.IN_PROCESS
     state: ForkGroupState
     source: ForkGroupSourceSnapshot
     branches: tuple[ForkGroupBranchResult, ...] = ()
+    dispatch_attempts: tuple[ForkGroupDispatchAttempt, ...] = ()
     evaluator_session_id: str | None = None
     dispositions: tuple[ForkGroupDispositionRecord, ...] = ()
     failure: ForkGroupFailure | None = None
@@ -1084,6 +1345,7 @@ class _ForkGroupRecord(BaseModel):
     request_sha256: str
     request: ForkGroupRequest
     result: ForkGroupResult
+    prepared_replacements: tuple[_ForkGroupPreparedReplacement, ...] = ()
     evaluator_execution_profile_fingerprint: str | None = None
     execution_claim: _ForkGroupExecutionClaim | None = None
 
@@ -1097,6 +1359,8 @@ class _ForkGroupRecord(BaseModel):
             raise ValueError("Fork-group operation record request digest is invalid.")
         if self.result.group_id != self.request.group_id:
             raise ValueError("Fork-group operation record group identity is invalid.")
+        if self.result.execution_mode is not self.request.execution_mode:
+            raise ValueError("Fork-group result execution mode changed.")
         evaluator_fingerprint = self.evaluator_execution_profile_fingerprint
         if evaluator_fingerprint is not None and (
             len(evaluator_fingerprint) != 64
@@ -1119,6 +1383,7 @@ class _ForkGroupRecord(BaseModel):
         if self.revision < minimum_revision:
             raise ValueError("Fork-group operation record revision is inconsistent with state.")
         _validate_attempt_graph(self)
+        _validate_dispatch_graph(self)
         return self
 
 
@@ -1270,6 +1535,79 @@ def _validate_attempt_graph(record: _ForkGroupRecord) -> None:
         raise ValueError("Only completed fork groups may publish evaluator dispositions.")
 
 
+def _validate_dispatch_graph(record: _ForkGroupRecord) -> None:
+    """Reject task links that could widen one normalized fork-group request."""
+
+    links = record.result.dispatch_attempts
+    replacements = record.prepared_replacements
+    if record.request.execution_mode is ForkGroupExecutionMode.IN_PROCESS:
+        if links or replacements:
+            raise ValueError("In-process fork groups cannot carry task-dispatch authority.")
+        return
+    identities = [link.attempt_id for link in links]
+    task_ids = [link.queue_task_id for link in links]
+    dispatch_ids = [link.dispatch_id for link in links]
+    if (
+        len(identities) != len(set(identities))
+        or len(task_ids) != len(set(task_ids))
+        or len(dispatch_ids) != len(set(dispatch_ids))
+    ):
+        raise ValueError("Fork-group task attempts must have unique durable identities.")
+    replacement_by_id = {item.attempt_id: item.branch for item in replacements}
+    if len(replacement_by_id) != len(replacements):
+        raise ValueError("Fork-group prepared replacements must have unique identities.")
+    initial_by_id = {
+        _initial_attempt(record.request, branch).attempt_id: branch
+        for branch in record.request.branches
+    }
+    evaluator_links = 0
+    for link in links:
+        if (
+            link.source_checkpoint_sha256 != record.result.source.checkpoint_sha256
+            or link.causal_budget_id != record.request.causal_budget_id
+            or link.idempotency_key != _dispatch_idempotency_key(link.attempt_id)
+        ):
+            raise ValueError(
+                "Fork-group task attempt changed source, causal-budget, or idempotency authority."
+            )
+        if link.kind is ForkGroupAttemptKind.EVALUATOR:
+            evaluator_links += 1
+            if (
+                link.session_id != record.request.evaluator.session_id
+                or link.attempt_id != _evaluator_attempt_id(record)
+                or link.attempt_request_sha256 != _evaluator_attempt_request_sha256(record)
+                or record.evaluator_execution_profile_fingerprint is None
+                or link.execution_profile_fingerprint
+                != record.evaluator_execution_profile_fingerprint
+            ):
+                raise ValueError("Fork-group evaluator task changed session identity.")
+            continue
+        branch = initial_by_id.get(link.attempt_id)
+        if link.kind is ForkGroupAttemptKind.REPLACEMENT:
+            branch = replacement_by_id.get(link.attempt_id)
+        if (
+            branch is None
+            or link.branch_id != branch.branch_id
+            or link.session_id != branch.session_id
+        ):
+            raise ValueError("Fork-group task attempt conflicts with its prepared branch.")
+        attempt = _ForkGroupAttempt(
+            branch=branch,
+            attempt_id=link.attempt_id,
+            attempt_index=link.attempt_index,
+            replaced_attempt_id=link.replaced_attempt_id,
+        )
+        if _attempt_request_sha256(attempt) != link.attempt_request_sha256:
+            raise ValueError("Fork-group task attempt request authority changed.")
+    if evaluator_links > 1:
+        raise ValueError("Fork groups may publish only one evaluator task attempt.")
+    replacement_link_ids = {
+        link.attempt_id for link in links if link.kind is ForkGroupAttemptKind.REPLACEMENT
+    }
+    if replacement_link_ids != set(replacement_by_id):
+        raise ValueError("Prepared replacement content must match published task attempts.")
+
+
 def _coerce_attempt(
     request: ForkGroupRequest,
     attempt: _ForkGroupAttempt | ForkGroupBranchSpec,
@@ -1298,6 +1636,8 @@ def _branch_metadata(
 def _branch_fork_request(
     request: ForkGroupRequest,
     attempt: _ForkGroupAttempt | ForkGroupBranchSpec,
+    *,
+    initial_invocation: ResumeRequest | None = None,
 ) -> ForkSessionRequest:
     attempt = _coerce_attempt(request, attempt)
     branch = attempt.branch
@@ -1316,7 +1656,7 @@ def _branch_fork_request(
     )
     return _bind_fork_group_initial_invocation(
         fork_request,
-        _branch_resume_request(request, attempt),
+        initial_invocation or _branch_resume_request(request, attempt),
     )
 
 
@@ -1336,6 +1676,483 @@ def _branch_resume_request(
         structured_output=branch.structured_output,
         thinking=branch.thinking,
         metadata=_branch_metadata(request, attempt),
+    )
+
+
+def _dispatch_id(record: _ForkGroupRecord, attempt_id: str) -> str:
+    return (
+        "fork-group-dispatch:"
+        + sha256(
+            canonical_durable_json_bytes(
+                {
+                    "schema_version": 1,
+                    "request_sha256": record.request_sha256,
+                    "attempt_id": attempt_id,
+                },
+                "fork_group.dispatch_identity",
+            )
+        ).hexdigest()
+    )
+
+
+def _dispatch_idempotency_key(attempt_id: str) -> str:
+    return "fork-group:" + sha256(attempt_id.encode("utf-8")).hexdigest()
+
+
+def _branch_dispatch_request(
+    record: _ForkGroupRecord,
+    attempt: _ForkGroupAttempt,
+) -> DispatchRequest:
+    resume = _branch_resume_request(record.request, attempt)
+    return DispatchRequest(
+        session_id=attempt.branch.session_id,
+        messages=list(resume.messages),
+        dispatch_id=_dispatch_id(record, attempt.attempt_id),
+        metadata={
+            **resume.metadata,
+            "fork_group_dispatch": {
+                "record_type": "cayu.fork-group-dispatch",
+                "schema_version": 1,
+                "group_id": record.request.group_id,
+                "group_request_sha256": record.request_sha256,
+                "attempt_id": attempt.attempt_id,
+                "attempt_request_sha256": _attempt_request_sha256(attempt),
+                "source_session_id": record.result.source.source_session_id,
+                "source_checkpoint_sha256": record.result.source.checkpoint_sha256,
+                "causal_budget_id": record.request.causal_budget_id,
+            },
+        },
+        max_steps=resume.max_steps,
+        limits=resume.limits,
+        budget_limits=resume.budget_limits,
+        retry_policy=resume.retry_policy,
+        structured_output=resume.structured_output,
+        thinking=resume.thinking,
+    )
+
+
+def _resume_request_from_dispatch(request: DispatchRequest) -> ResumeRequest:
+    """Project the exact queue invocation bound to a prepared fork child."""
+
+    return ResumeRequest(
+        session_id=request.session_id,
+        messages=request.messages,
+        target=request.target,
+        metadata=request.metadata,
+        max_steps=request.max_steps,
+        limits=request.limits,
+        budget_limits=request.budget_limits,
+        retry_policy=request.retry_policy,
+        structured_output=request.structured_output,
+        thinking=request.thinking,
+        loop_policies=request.loop_policies,
+    )
+
+
+def _dispatch_link_from_envelope(
+    record: _ForkGroupRecord,
+    *,
+    attempt: _ForkGroupAttempt,
+    envelope: _QueuedDispatchEnvelope,
+    queue_task_type: str,
+) -> ForkGroupDispatchAttempt:
+    kind = (
+        ForkGroupAttemptKind.BRANCH
+        if attempt.attempt_index == 0
+        else ForkGroupAttemptKind.REPLACEMENT
+    )
+    return ForkGroupDispatchAttempt(
+        kind=kind,
+        branch_id=attempt.branch.branch_id,
+        attempt_id=attempt.attempt_id,
+        attempt_index=attempt.attempt_index,
+        replaced_attempt_id=attempt.replaced_attempt_id,
+        attempt_request_sha256=_attempt_request_sha256(attempt),
+        session_id=attempt.branch.session_id,
+        queue_task_id=envelope.queue_task_id,
+        queue_task_type=queue_task_type,
+        dispatch_id=envelope.request.dispatch_id,
+        dispatch_operation_id=envelope.dispatch_operation_id,
+        terminal_event_id=envelope.terminal_event_id,
+        dispatch_request_sha256=envelope.request_sha256,
+        idempotency_key=_dispatch_idempotency_key(attempt.attempt_id),
+        source_checkpoint_sha256=record.result.source.checkpoint_sha256,
+        causal_budget_id=record.request.causal_budget_id,
+        execution_profile_fingerprint=envelope.required_profile.fingerprint,
+    )
+
+
+def _evaluator_dispatch_link_from_envelope(
+    record: _ForkGroupRecord,
+    *,
+    envelope: _QueuedDispatchEnvelope,
+    queue_task_type: str,
+) -> ForkGroupDispatchAttempt:
+    attempt_id = _evaluator_attempt_id(record)
+    return ForkGroupDispatchAttempt(
+        kind=ForkGroupAttemptKind.EVALUATOR,
+        attempt_id=attempt_id,
+        attempt_index=0,
+        attempt_request_sha256=_evaluator_attempt_request_sha256(record),
+        session_id=record.request.evaluator.session_id,
+        queue_task_id=envelope.queue_task_id,
+        queue_task_type=queue_task_type,
+        dispatch_id=envelope.request.dispatch_id,
+        dispatch_operation_id=envelope.dispatch_operation_id,
+        terminal_event_id=envelope.terminal_event_id,
+        dispatch_request_sha256=envelope.request_sha256,
+        idempotency_key=_dispatch_idempotency_key(attempt_id),
+        source_checkpoint_sha256=record.result.source.checkpoint_sha256,
+        causal_budget_id=record.request.causal_budget_id,
+        execution_profile_fingerprint=envelope.required_profile.fingerprint,
+    )
+
+
+def _attempt_for_dispatch_link(
+    record: _ForkGroupRecord,
+    link: ForkGroupDispatchAttempt,
+) -> _ForkGroupAttempt:
+    if link.kind is ForkGroupAttemptKind.EVALUATOR:
+        raise ValueError("Evaluator links are not branch attempts.")
+    if link.kind is ForkGroupAttemptKind.BRANCH:
+        branch = next(
+            (
+                item
+                for item in record.request.branches
+                if _initial_attempt(record.request, item).attempt_id == link.attempt_id
+            ),
+            None,
+        )
+    else:
+        prepared = next(
+            (item for item in record.prepared_replacements if item.attempt_id == link.attempt_id),
+            None,
+        )
+        branch = None if prepared is None else prepared.branch
+    if branch is None:
+        raise ForkGroupConflict("Fork-group task link lost its prepared attempt request.")
+    attempt = _ForkGroupAttempt(
+        branch=branch,
+        attempt_id=link.attempt_id,
+        attempt_index=link.attempt_index,
+        replaced_attempt_id=link.replaced_attempt_id,
+    )
+    if _attempt_request_sha256(attempt) != link.attempt_request_sha256:
+        raise ForkGroupConflict("Fork-group task link changed its prepared attempt request.")
+    return attempt
+
+
+def _envelope_matches_dispatch_link(
+    envelope: _QueuedDispatchEnvelope,
+    link: ForkGroupDispatchAttempt,
+) -> bool:
+    return (
+        envelope.queue_task_id == link.queue_task_id
+        and envelope.request.session_id == link.session_id
+        and envelope.request.dispatch_id == link.dispatch_id
+        and envelope.dispatch_operation_id == link.dispatch_operation_id
+        and envelope.terminal_event_id == link.terminal_event_id
+        and envelope.request_sha256 == link.dispatch_request_sha256
+        and envelope.required_profile.fingerprint == link.execution_profile_fingerprint
+        and link.idempotency_key == _dispatch_idempotency_key(link.attempt_id)
+    )
+
+
+async def _load_dispatch_task(
+    coordinator: ForkGroupCoordinator,
+    link: ForkGroupDispatchAttempt,
+    *,
+    require_current_authority: bool = True,
+) -> Task | None:
+    try:
+        task = await coordinator.task_store.load_task(link.queue_task_id)
+    except Exception as exc:
+        if _store_failure_is_transient(exc):
+            raise _task_store_unavailable(coordinator, exc) from None
+        raise
+    if task is None:
+        return None
+    if task.id != link.queue_task_id or task.type != link.queue_task_type:
+        raise ForkGroupConflict("Fork-group task row conflicts with durable linkage.")
+    envelope = _existing_queued_dispatch_envelope(task, task_type=link.queue_task_type)
+    if envelope is None or not _envelope_matches_dispatch_link(envelope, link):
+        raise ForkGroupConflict("Fork-group task envelope conflicts with durable linkage.")
+    if require_current_authority:
+        await coordinator.require_dispatch_authority(envelope)
+    return task
+
+
+async def _dispatch_task_backed_request(
+    coordinator: ForkGroupCoordinator,
+    request: DispatchRequest,
+) -> DispatchHandle:
+    try:
+        return await coordinator.dispatch(request)
+    except Exception as exc:
+        if _store_failure_is_transient(exc):
+            raise _task_store_unavailable(coordinator, exc) from None
+        raise
+
+
+async def _cancel_terminal_dispatch_task(
+    coordinator: ForkGroupCoordinator,
+    link: ForkGroupDispatchAttempt,
+    *,
+    result: ForkGroupResult,
+) -> None:
+    task = await _load_dispatch_task(
+        coordinator,
+        link,
+        require_current_authority=False,
+    )
+    if task is None or task.status in {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }:
+        return
+    if task.status in {TaskStatus.CLAIMED, TaskStatus.RUNNING}:
+        # A live queue owner must retain its claim until the governed session has
+        # quiesced. Clearing the task lease here would let the stale worker keep
+        # publishing session/tool effects after the group became terminal.
+        try:
+            session = await coordinator.session_store.load(link.session_id)
+        except Exception as exc:
+            if _store_failure_is_transient(exc):
+                raise _session_store_unavailable(coordinator, exc) from None
+            raise
+        if session is None:
+            return
+        if session.status in {
+            SessionStatus.PENDING,
+            SessionStatus.RUNNING,
+            SessionStatus.INTERRUPTING,
+        }:
+            try:
+                await coordinator.interrupt_dispatch_session(
+                    InterruptSessionRequest(
+                        session_id=link.session_id,
+                        reason="fork_group_terminal",
+                        metadata={
+                            "group_id": result.group_id,
+                            "group_state": result.state.value,
+                            "queue_task_id": link.queue_task_id,
+                        },
+                        requested_by=ResolutionActor(
+                            subject="cayu:fork-group",
+                            source=ResolutionActorSource.SYSTEM,
+                        ),
+                    ),
+                    store_resolved_session_id=link.session_id,
+                )
+            except (KeyError, ValueError):
+                # The worker may have completed the exact session transition
+                # concurrently. Only a terminal reload proves that no live
+                # invocation remains; otherwise preserve the claim and surface
+                # the interruption failure.
+                reloaded = await coordinator.session_store.load(link.session_id)
+                if reloaded is None or reloaded.status not in _TERMINAL_SESSION_STATUSES:
+                    raise
+        # The worker still owns terminalization and acknowledgement after the
+        # interruption stream drains. Never revoke its lease from this peer.
+        return
+    try:
+        await coordinator.task_store.cancel_task(
+            link.queue_task_id,
+            error={
+                "code": "fork_group_terminal",
+                "group_id": result.group_id,
+                "state": result.state.value,
+            },
+        )
+    except Exception as exc:
+        try:
+            current = await coordinator.task_store.load_task(link.queue_task_id)
+        except Exception as load_exc:
+            if _store_failure_is_transient(load_exc):
+                raise _task_store_unavailable(coordinator, load_exc) from None
+            raise
+        if current is not None and current.status in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        }:
+            return
+        if _store_failure_is_transient(exc):
+            raise _task_store_unavailable(coordinator, exc) from None
+        raise
+
+
+async def _settle_terminal_dispatch_tasks(
+    coordinator: ForkGroupCoordinator,
+    result: ForkGroupResult,
+) -> bool:
+    """Fence every queue task before publishing terminal group authority."""
+
+    all_terminal = True
+    for link in result.dispatch_attempts:
+        task = await _load_dispatch_task(
+            coordinator,
+            link,
+            require_current_authority=False,
+        )
+        if task is None:
+            # Recovery will recreate the exact deterministic task while the
+            # group remains nonterminal; a later poll can then cancel it before
+            # the terminal lifecycle transition becomes visible.
+            all_terminal = False
+            continue
+        if task.status not in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        }:
+            try:
+                await _cancel_terminal_dispatch_task(
+                    coordinator,
+                    link,
+                    result=result,
+                )
+            except TimeoutError:
+                # A different CayuApp may own the active invocation. The
+                # interruption request is durable, but only that worker can
+                # publish its quiescence acknowledgement and terminal task.
+                session = await coordinator.session_store.load(link.session_id)
+                if session is None or session.status not in {
+                    SessionStatus.INTERRUPTING,
+                    *_TERMINAL_SESSION_STATUSES,
+                }:
+                    raise
+            # A process-local interruption can publish its terminal session
+            # event one scheduling turn before the dispatch worker writes the
+            # queue acknowledgement. Give that already-quiescent owner a small
+            # bounded drain without delaying a genuinely remote worker.
+            for _ in range(10):
+                task = await _load_dispatch_task(
+                    coordinator,
+                    link,
+                    require_current_authority=False,
+                )
+                if task is None or task.status in {
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                }:
+                    break
+                await asyncio.sleep(0)
+        if task is None or task.status not in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        }:
+            all_terminal = False
+    return all_terminal
+
+
+async def _project_dispatch_attempt(
+    coordinator: ForkGroupCoordinator,
+    link: ForkGroupDispatchAttempt,
+    *,
+    terminal_group: bool,
+    require_current_authority: bool,
+) -> ForkGroupDispatchAttempt:
+    task = await _load_dispatch_task(
+        coordinator,
+        link,
+        require_current_authority=require_current_authority,
+    )
+    session = await coordinator.session_store.load(link.session_id)
+    if session is None and not terminal_group:
+        raise ForkGroupConflict("Fork-group dispatch attempt lost its child session.")
+    if task is None:
+        return link
+    dispatch_status = None
+    status_payload = task.result if task.status is TaskStatus.COMPLETED else task.error
+    if type(status_payload) is dict:
+        raw_status = status_payload.get("status")
+        if type(raw_status) is str:
+            with suppress(ValueError):
+                dispatch_status = DispatchStatus(raw_status)
+    return link.model_copy(
+        update={
+            "task_status": task.status,
+            "dispatch_status": dispatch_status,
+            "run_epoch": None if session is None else session.run_epoch,
+            "lease_owner": task.worker_id,
+            "lease_expires_at": task.lease_expires_at,
+        },
+        deep=True,
+    )
+
+
+async def _project_task_backed_result(
+    coordinator: ForkGroupCoordinator,
+    result: ForkGroupResult,
+    *,
+    require_current_authority: bool,
+) -> ForkGroupResult:
+    if not result.dispatch_attempts:
+        return result.model_copy(deep=True)
+    terminal_group = result.state in {
+        ForkGroupState.COMPLETED,
+        ForkGroupState.FAILED,
+    }
+    projected = tuple(
+        [
+            await _project_dispatch_attempt(
+                coordinator,
+                link,
+                terminal_group=terminal_group,
+                require_current_authority=require_current_authority,
+            )
+            for link in result.dispatch_attempts
+        ]
+    )
+    return result.model_copy(update={"dispatch_attempts": projected}, deep=True)
+
+
+async def _public_group_result(
+    coordinator: ForkGroupCoordinator,
+    result: ForkGroupResult,
+    *,
+    public_source_session_id: str,
+    replayed: bool,
+    cancel_terminal_tasks: bool = True,
+    require_current_authority: bool = True,
+) -> ForkGroupResult:
+    terminal_group = result.state in {
+        ForkGroupState.COMPLETED,
+        ForkGroupState.FAILED,
+    }
+    if cancel_terminal_tasks and terminal_group:
+        for link in result.dispatch_attempts:
+            task = await _load_dispatch_task(
+                coordinator,
+                link,
+                require_current_authority=False,
+            )
+            if task is not None and task.status not in {
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            }:
+                await _cancel_terminal_dispatch_task(
+                    coordinator,
+                    link,
+                    result=result,
+                )
+    projected = await _project_task_backed_result(
+        coordinator,
+        result,
+        require_current_authority=require_current_authority and not terminal_group,
+    )
+    public_source = projected.source.model_copy(
+        update={"source_session_id": public_source_session_id},
+        deep=True,
+    )
+    return projected.model_copy(
+        update={"source": public_source, "replayed": replayed},
+        deep=True,
     )
 
 
@@ -1605,12 +2422,30 @@ def _event(group: _ForkGroupRecord, event_type: EventType) -> Event:
             "revision": group.revision,
             "group_id": result.group_id,
             "state": result.state.value,
+            "execution_mode": group.request.execution_mode.value,
             "request_sha256": group.request_sha256,
             "source_run_epoch": result.source.run_epoch,
             "source_transcript_cursor": result.source.transcript_cursor,
             "source_checkpoint_sha256": result.source.checkpoint_sha256,
             "source_execution_profile_fingerprint": (result.source.execution_profile_fingerprint),
             "branches": branch_payload,
+            "dispatch_attempts": [
+                {
+                    "kind": attempt.kind.value,
+                    "branch_id": attempt.branch_id,
+                    "attempt_id": attempt.attempt_id,
+                    "attempt_index": attempt.attempt_index,
+                    "session_id": attempt.session_id,
+                    "queue_task_id": attempt.queue_task_id,
+                    "queue_task_type": attempt.queue_task_type,
+                    "dispatch_id": attempt.dispatch_id,
+                    "dispatch_operation_id": attempt.dispatch_operation_id,
+                    "source_checkpoint_sha256": attempt.source_checkpoint_sha256,
+                    "causal_budget_id": attempt.causal_budget_id,
+                    "execution_profile_fingerprint": (attempt.execution_profile_fingerprint),
+                }
+                for attempt in result.dispatch_attempts
+            ],
             "evaluator_session_id": group.request.evaluator.session_id,
             "dispositions": dispositions,
             "selected_branch_id": selected,
@@ -1635,12 +2470,102 @@ async def _load_record(
     try:
         record = _ForkGroupRecord.model_validate(raw)
     except Exception as exc:
-        raise RuntimeError("Durable fork-group operation record is malformed.") from exc
+        raise ForkGroupConflict("Durable fork-group operation record is malformed.") from exc
     if record.request_sha256 != _request_sha256(request):
         raise ForkGroupConflict(
             f"Fork group {request.group_id!r} is already bound to a different request."
         )
     return record
+
+
+async def _load_record_by_group_id(
+    coordinator: ForkGroupCoordinator,
+    source_session_id: str,
+    group_id: str,
+) -> _ForkGroupRecord | None:
+    raw = await coordinator.session_store.load_session_operation(
+        source_session_id,
+        _storage_key(group_id),
+    )
+    if raw is None:
+        return None
+    try:
+        record = _ForkGroupRecord.model_validate(raw)
+    except Exception as exc:
+        raise ForkGroupConflict("Durable fork-group operation record is malformed.") from exc
+    if record.request.group_id != group_id:
+        raise ForkGroupConflict("Fork-group storage key conflicts with its durable identity.")
+    return record
+
+
+async def require_fork_group_dispatch_authority(
+    coordinator: ForkGroupCoordinator,
+    envelope: _QueuedDispatchEnvelope,
+) -> bool:
+    """Validate a queue envelope against its durable group; return terminal state."""
+
+    envelope = _copy_queued_dispatch_envelope(envelope)
+    metadata = envelope.request.metadata.get("fork_group_dispatch")
+    if metadata is None:
+        return False
+    if type(metadata) is not dict:
+        raise ForkGroupConflict("Fork-group dispatch metadata is malformed.")
+    try:
+        source_session_id = require_durable_clean_nonblank(
+            metadata["source_session_id"],
+            "source_session_id",
+        )
+        group_id = require_durable_clean_nonblank(metadata["group_id"], "group_id")
+        attempt_id = require_durable_clean_nonblank(metadata["attempt_id"], "attempt_id")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ForkGroupConflict("Fork-group dispatch metadata is incomplete.") from exc
+    record = await _load_record_by_group_id(coordinator, source_session_id, group_id)
+    if record is None:
+        raise ForkGroupConflict("Fork-group dispatch has no durable group authority.")
+    if record.request.execution_mode is not ForkGroupExecutionMode.TASK_DISPATCH:
+        raise ForkGroupConflict("Fork-group dispatch conflicts with in-process execution.")
+    link = next(
+        (item for item in record.result.dispatch_attempts if item.attempt_id == attempt_id),
+        None,
+    )
+    if link is None:
+        raise ForkGroupConflict("Fork-group dispatch attempt is not durably authorized.")
+    expected_metadata = {
+        "record_type": "cayu.fork-group-dispatch",
+        "schema_version": 1,
+        "group_id": record.request.group_id,
+        "group_request_sha256": record.request_sha256,
+        "attempt_id": link.attempt_id,
+        "attempt_request_sha256": link.attempt_request_sha256,
+        "source_session_id": record.result.source.source_session_id,
+        "source_checkpoint_sha256": record.result.source.checkpoint_sha256,
+        "causal_budget_id": record.request.causal_budget_id,
+    }
+    if (
+        metadata != expected_metadata
+        or envelope.queue_task_id != link.queue_task_id
+        or envelope.request.session_id != link.session_id
+        or envelope.request.dispatch_id != link.dispatch_id
+        or envelope.dispatch_operation_id != link.dispatch_operation_id
+        or envelope.terminal_event_id != link.terminal_event_id
+        or envelope.request_sha256 != link.dispatch_request_sha256
+        or envelope.required_profile.fingerprint != link.execution_profile_fingerprint
+    ):
+        raise ForkGroupConflict("Fork-group dispatch envelope conflicts with durable linkage.")
+    if link.kind is ForkGroupAttemptKind.EVALUATOR:
+        synthetic_name, profile_fingerprint = await _tool_free_evaluator_authority(
+            coordinator,
+            record,
+            branch_identities=_evaluator_branch_identities(record),
+        )
+        if (
+            synthetic_name != _synthetic_evaluator_name(record)
+            or profile_fingerprint != link.execution_profile_fingerprint
+        ):
+            raise ForkGroupConflict(
+                "Fork-group evaluator worker conflicts with frozen profile authority."
+            )
+    return record.result.state in {ForkGroupState.COMPLETED, ForkGroupState.FAILED}
 
 
 def _transition_material(record: _ForkGroupRecord) -> dict[str, Any]:
@@ -1827,6 +2752,24 @@ async def _publish_record(
     expected_transcript_cursor: int | None = None,
     expected_record: _ForkGroupRecord | None = None,
 ) -> _ForkGroupRecord:
+    try:
+        record = _ForkGroupRecord.model_validate(record.model_dump(mode="json", warnings=False))
+    except Exception as exc:
+        raise ForkGroupConflict(
+            "Proposed durable fork-group operation record is malformed."
+        ) from exc
+    if (
+        record.request.execution_mode is ForkGroupExecutionMode.TASK_DISPATCH
+        and record.result.state in {ForkGroupState.COMPLETED, ForkGroupState.FAILED}
+        and expected_record is not None
+        and expected_record.result.state not in {ForkGroupState.COMPLETED, ForkGroupState.FAILED}
+        and not await _settle_terminal_dispatch_tasks(coordinator, record.result)
+    ):
+        # A terminal group is claim authority. Keep the lifecycle explicitly
+        # nonterminal until every linked queue task is terminal, so process loss
+        # cannot expose FAILED/COMPLETED while an unfinished sibling is still
+        # claimable or owned by a worker that has not acknowledged quiescence.
+        return expected_record
     key = _storage_key(record.request.group_id)
 
     def transform(
@@ -2028,6 +2971,58 @@ def _exception_message(
     )
 
 
+def _store_failure_is_transient(exc: BaseException) -> bool:
+    if isinstance(
+        exc,
+        (_ForkGroupSessionStoreUnavailable, _ForkGroupTaskStoreUnavailable),
+    ):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return bool(exc.exceptions) and all(
+            _store_failure_is_transient(child) for child in exc.exceptions
+        )
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    for error_type in type(exc).__mro__:
+        module = error_type.__module__
+        name = error_type.__name__
+        if module == "sqlite3" and name == "OperationalError":
+            error_name = getattr(exc, "sqlite_errorname", None)
+            return isinstance(error_name, str) and (
+                error_name == "SQLITE_IOERR" or error_name.startswith("SQLITE_IOERR_")
+            )
+        if module.startswith("psycopg") and name == "OperationalError":
+            sqlstate = getattr(exc, "sqlstate", None)
+            return sqlstate is None or (isinstance(sqlstate, str) and sqlstate.startswith("08"))
+    return False
+
+
+def _task_store_unavailable(
+    coordinator: ForkGroupCoordinator,
+    exc: BaseException,
+) -> _ForkGroupTaskStoreUnavailable:
+    return _ForkGroupTaskStoreUnavailable(
+        _exception_message(
+            exc,
+            redactor=coordinator.secret_redactor,
+            prefix="Fork-group task store unavailable: ",
+        )
+    )
+
+
+def _session_store_unavailable(
+    coordinator: ForkGroupCoordinator,
+    exc: BaseException,
+) -> _ForkGroupSessionStoreUnavailable:
+    return _ForkGroupSessionStoreUnavailable(
+        _exception_message(
+            exc,
+            redactor=coordinator.secret_redactor,
+            prefix="Fork-group session store unavailable: ",
+        )
+    )
+
+
 async def _run_outcome(
     stream: AsyncIterator[Event],
     *,
@@ -2216,6 +3211,8 @@ async def _prepare_branch_fork(
     request: ForkGroupRequest,
     source: ForkGroupSourceSnapshot,
     attempt: _ForkGroupAttempt | ForkGroupBranchSpec,
+    *,
+    initial_invocation: ResumeRequest | None = None,
 ) -> ForkGroupBranchResult | None:
     attempt = _coerce_attempt(request, attempt)
     branch = attempt.branch
@@ -2243,7 +3240,11 @@ async def _prepare_branch_fork(
         prepared_profile_fingerprint,
     ) = await _fork_exact_source(
         coordinator,
-        _branch_fork_request(request, attempt),
+        _branch_fork_request(
+            request,
+            attempt,
+            initial_invocation=initial_invocation,
+        ),
         source=source,
     )
     if fork_error is not None:
@@ -2552,6 +3553,11 @@ def _evaluator_run_request(
     return RunRequest(
         session_id=evaluator.session_id,
         agent_name=synthetic_agent_name,
+        environment_name=(
+            _FORK_GROUP_TASK_EVALUATOR_ENVIRONMENT
+            if record.request.execution_mode is ForkGroupExecutionMode.TASK_DISPATCH
+            else None
+        ),
         causal_budget_id=record.request.causal_budget_id,
         **_evaluator_execution_material(record, branch_identities=branch_identities),
     )
@@ -2567,6 +3573,111 @@ def _evaluator_resume_request(
         session_id=evaluator.session_id,
         **_evaluator_execution_material(record, branch_identities=branch_identities),
     )
+
+
+def _evaluator_attempt_id(record: _ForkGroupRecord) -> str:
+    return (
+        "fork-evaluator:"
+        + sha256(
+            canonical_durable_json_bytes(
+                {
+                    "schema_version": 1,
+                    "request_sha256": record.request_sha256,
+                    "session_id": record.request.evaluator.session_id,
+                    "branch_identities": [
+                        {"branch_id": item.branch_id, "attempt_id": item.attempt_id}
+                        for item in _evaluator_branch_identities(record)
+                    ],
+                },
+                "fork_group.evaluator_attempt_identity",
+            )
+        ).hexdigest()
+    )
+
+
+def _evaluator_attempt_request_sha256(record: _ForkGroupRecord) -> str:
+    return sha256(
+        canonical_durable_json_bytes(
+            _evaluator_resume_request(
+                record,
+                branch_identities=_evaluator_branch_identities(record),
+            ).model_dump(mode="json", warnings=False),
+            "fork_group.evaluator_attempt_request",
+        )
+    ).hexdigest()
+
+
+def _evaluator_dispatch_metadata(record: _ForkGroupRecord) -> dict[str, Any]:
+    return {
+        "record_type": "cayu.fork-group-dispatch",
+        "schema_version": 1,
+        "group_id": record.request.group_id,
+        "group_request_sha256": record.request_sha256,
+        "attempt_id": _evaluator_attempt_id(record),
+        "attempt_request_sha256": _evaluator_attempt_request_sha256(record),
+        "source_session_id": record.result.source.source_session_id,
+        "source_checkpoint_sha256": record.result.source.checkpoint_sha256,
+        "causal_budget_id": record.request.causal_budget_id,
+    }
+
+
+def _evaluator_dispatch_request(record: _ForkGroupRecord) -> DispatchRequest:
+    resume = _evaluator_resume_request(
+        record,
+        branch_identities=_evaluator_branch_identities(record),
+    )
+    return DispatchRequest(
+        session_id=record.request.evaluator.session_id,
+        messages=list(resume.messages),
+        dispatch_id=_dispatch_id(record, _evaluator_attempt_id(record)),
+        metadata={
+            **resume.metadata,
+            "fork_group_dispatch": _evaluator_dispatch_metadata(record),
+        },
+        max_steps=resume.max_steps,
+        limits=resume.limits,
+        budget_limits=resume.budget_limits,
+        retry_policy=resume.retry_policy,
+        structured_output=resume.structured_output,
+        thinking=resume.thinking,
+    )
+
+
+def _evaluator_fork_request(
+    record: _ForkGroupRecord,
+    *,
+    synthetic_agent_name: str,
+    initial_invocation: ResumeRequest | None = None,
+) -> ForkSessionRequest:
+    invocation = initial_invocation or _evaluator_resume_request(
+        record,
+        branch_identities=_evaluator_branch_identities(record),
+    )
+    adoption = ExecutionProfileAdoptionIntent(
+        idempotency_key=_dispatch_idempotency_key(_evaluator_attempt_id(record)),
+        reason="Adopt the runtime-owned tool-free fork-group evaluator profile.",
+        requested_by=ResolutionActor(
+            subject="cayu:fork-group-evaluator",
+            source=ResolutionActorSource.SYSTEM,
+        ),
+    )
+    fork = ForkSessionRequest(
+        source_session_id=record.result.source.source_session_id,
+        session_id=record.request.evaluator.session_id,
+        agent_name=synthetic_agent_name,
+        environment_name=_FORK_GROUP_TASK_EVALUATOR_ENVIRONMENT,
+        transcript_cursor=0,
+        copy_checkpoint=False,
+        system_prompt_policy=ForkSystemPromptPolicy.CURRENT_AGENT,
+        execution_profile_selection=ForkExecutionProfileSelection.CURRENT_CHILD,
+        profile_adoption=adoption,
+        metadata={
+            **_evaluator_metadata(record),
+            "fork_group_attempt_id": _evaluator_attempt_id(record),
+            "fork_group_attempt_request_sha256": _evaluator_attempt_request_sha256(record),
+        },
+    )
+    return _bind_fork_group_task_evaluator(_bind_fork_group_initial_invocation(fork, invocation))
 
 
 def _synthetic_evaluator_name(record: _ForkGroupRecord) -> str:
@@ -2728,8 +3839,17 @@ async def _run_evaluator(
             "Evaluator completed without a durable session.",
         )
     child_profile = execution_profile_baseline_from_session_metadata(child.metadata)
+    task_backed_evaluator = record.request.execution_mode is ForkGroupExecutionMode.TASK_DISPATCH
+    evaluator_parent_matches = (
+        child.parent_session_id == record.result.source.source_session_id
+        and _branch_matches_frozen_source(child, record.result.source)
+        and child.metadata.get("fork_group_attempt_id") == _evaluator_attempt_id(record)
+        and child.metadata.get("fork_group_attempt_request_sha256")
+        == _evaluator_attempt_request_sha256(record)
+    )
     if (
-        child.parent_session_id is not None
+        (evaluator_parent_matches if task_backed_evaluator else child.parent_session_id is None)
+        is False
         or child.agent_name != synthetic_name
         or child_profile is None
         or child_profile.fingerprint != record.evaluator_execution_profile_fingerprint
@@ -3037,6 +4157,8 @@ async def _create_record(
     coordinator: ForkGroupCoordinator,
     request: ForkGroupRequest,
 ) -> _ForkGroupRecord:
+    if request.execution_mode is ForkGroupExecutionMode.TASK_DISPATCH:
+        coordinator.task_dispatcher()
     source = await coordinator.session_store.load(request.source_session_id)
     if source is None:
         raise KeyError("Fork-group source session was not found.")
@@ -3094,6 +4216,7 @@ async def _create_record(
         request=request,
         result=ForkGroupResult(
             group_id=request.group_id,
+            execution_mode=request.execution_mode,
             state=ForkGroupState.CREATED,
             source=source_snapshot,
         ),
@@ -3113,6 +4236,751 @@ async def _create_record(
         EventType.FORK_GROUP_CREATED,
         expected_run_epoch=source.run_epoch,
         expected_transcript_cursor=snapshot.cursor,
+    )
+
+
+def _record_with_dispatch_link(
+    record: _ForkGroupRecord,
+    link: ForkGroupDispatchAttempt,
+    *,
+    prepared_replacement: _ForkGroupPreparedReplacement | None = None,
+) -> _ForkGroupRecord:
+    if any(item.attempt_id == link.attempt_id for item in record.result.dispatch_attempts):
+        raise ForkGroupConflict("Fork-group dispatch attempt identity was reused.")
+    replacements = record.prepared_replacements
+    if prepared_replacement is not None:
+        replacements = (*replacements, prepared_replacement)
+    return record.model_copy(
+        update={
+            "revision": record.revision + 1,
+            "prepared_replacements": replacements,
+            "result": record.result.model_copy(
+                update={
+                    "dispatch_attempts": (*record.result.dispatch_attempts, link),
+                    "replayed": False,
+                },
+                deep=True,
+            ),
+        },
+        deep=True,
+    )
+
+
+def _require_dispatch_handle(
+    handle: DispatchHandle,
+    link: ForkGroupDispatchAttempt,
+) -> None:
+    metadata = handle.metadata
+    if (
+        handle.backend != TaskStoreDispatcher.backend
+        or handle.dispatch_id != link.dispatch_id
+        or handle.session_id != link.session_id
+        or metadata.get("queue_task_id") != link.queue_task_id
+        or metadata.get("dispatch_operation_id") != link.dispatch_operation_id
+        or metadata.get("required_execution_profile_fingerprint")
+        != link.execution_profile_fingerprint
+    ):
+        raise ForkGroupConflict("Fork-group dispatch handle conflicts with durable linkage.")
+
+
+async def _ensure_branch_dispatch_submission(
+    coordinator: ForkGroupCoordinator,
+    record: _ForkGroupRecord,
+    link: ForkGroupDispatchAttempt,
+) -> None:
+    attempt = _attempt_for_dispatch_link(record, link)
+    task = await _load_dispatch_task(coordinator, link)
+    if task is not None:
+        return
+    handle = await _dispatch_task_backed_request(
+        coordinator,
+        _branch_dispatch_request(record, attempt),
+    )
+    _require_dispatch_handle(handle, link)
+    task = await _load_dispatch_task(coordinator, link)
+    if task is None:
+        raise RuntimeError("Fork-group dispatch returned without a durable queue task.")
+
+
+async def _prepare_and_link_branch_dispatch(
+    coordinator: ForkGroupCoordinator,
+    record: _ForkGroupRecord,
+    attempt: _ForkGroupAttempt,
+) -> tuple[_ForkGroupRecord, ForkGroupBranchResult | None]:
+    existing_link = next(
+        (item for item in record.result.dispatch_attempts if item.attempt_id == attempt.attempt_id),
+        None,
+    )
+    if existing_link is not None:
+        await _ensure_branch_dispatch_submission(coordinator, record, existing_link)
+        return record, None
+    dispatch_request = _branch_dispatch_request(record, attempt)
+    preparation_failure = await _prepare_branch_fork(
+        coordinator,
+        record.request,
+        record.result.source,
+        attempt,
+        initial_invocation=_resume_request_from_dispatch(dispatch_request),
+    )
+    if preparation_failure is not None:
+        return record, preparation_failure
+    dispatcher = coordinator.task_dispatcher()
+    queue_task_id = _queued_dispatch_task_id(
+        dispatch_request,
+        task_type=dispatcher.fork_group_task_type,
+    )
+    envelope = await coordinator.prepare_queued_dispatch(dispatch_request, queue_task_id)
+    link = _dispatch_link_from_envelope(
+        record,
+        attempt=attempt,
+        envelope=envelope,
+        queue_task_type=dispatcher.fork_group_task_type,
+    )
+    prepared_replacement = (
+        None
+        if attempt.attempt_index == 0
+        else _ForkGroupPreparedReplacement(
+            attempt_id=attempt.attempt_id,
+            branch=attempt.branch,
+        )
+    )
+    proposed = _record_with_dispatch_link(
+        record,
+        link,
+        prepared_replacement=prepared_replacement,
+    )
+    record = await _publish_record(
+        coordinator,
+        record.result.source.source_session_id,
+        proposed,
+        EventType.FORK_GROUP_BRANCHES_RUNNING,
+        expected_record=record,
+    )
+    durable_link = next(
+        (item for item in record.result.dispatch_attempts if item.attempt_id == attempt.attempt_id),
+        None,
+    )
+    if durable_link is None:
+        raise _ForkGroupPublicationSuperseded
+    await _ensure_branch_dispatch_submission(coordinator, record, durable_link)
+    return record, None
+
+
+def _task_failure_text(
+    coordinator: ForkGroupCoordinator,
+    task: Task,
+    *,
+    fallback: str,
+) -> str:
+    payload = task.error if task.error is not None else task.status_payload
+    if type(payload) is dict:
+        for key in ("message", "error", "detail"):
+            value = payload.get(key)
+            if type(value) is str and value.strip():
+                return coordinator.secret_redactor.redact_text(value)[:2_048]
+    return fallback
+
+
+async def _task_backed_branch_result(
+    coordinator: ForkGroupCoordinator,
+    record: _ForkGroupRecord,
+    link: ForkGroupDispatchAttempt,
+) -> ForkGroupBranchResult | None:
+    task = await _load_dispatch_task(coordinator, link)
+    if task is None:
+        await _ensure_branch_dispatch_submission(coordinator, record, link)
+        return None
+    if task.status not in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+        return None
+    attempt = _attempt_for_dispatch_link(record, link)
+    child = await coordinator.session_store.load(link.session_id)
+    if child is None:
+        raise ForkGroupConflict("Terminal fork-group task lost its child session.")
+    _require_branch_authority(
+        child,
+        request=record.request,
+        source=record.result.source,
+        attempt=attempt,
+    )
+    if task.status is TaskStatus.COMPLETED:
+        if child.run_epoch == 0 or child.status not in _TERMINAL_SESSION_STATUSES:
+            raise ForkGroupConflict(
+                "Fork-group queue task completed without an admitted terminal child run."
+            )
+        return await _run_branch(
+            coordinator,
+            record.request,
+            record.result.source,
+            attempt,
+        )
+    profile = execution_profile_baseline_from_session_metadata(child.metadata)
+    cancelled = task.status is TaskStatus.CANCELLED
+    return ForkGroupBranchResult(
+        branch_id=attempt.branch.branch_id,
+        attempt_id=attempt.attempt_id,
+        attempt_request_sha256=_attempt_request_sha256(attempt),
+        attempt_index=attempt.attempt_index,
+        replaced_attempt_id=attempt.replaced_attempt_id,
+        session_id=attempt.branch.session_id,
+        status=(ForkGroupBranchStatus.INTERRUPTED if cancelled else ForkGroupBranchStatus.FAILED),
+        failure_code=ForkGroupFailureCode.BRANCH_FAILED,
+        source_checkpoint_sha256=record.result.source.checkpoint_sha256,
+        causal_budget_id=record.request.causal_budget_id,
+        execution_profile_fingerprint=(None if profile is None else profile.fingerprint),
+        artifact_references=attempt.branch.artifact_references,
+        usage=await coordinator.get_session_usage(attempt.branch.session_id),
+        error=_task_failure_text(
+            coordinator,
+            task,
+            fallback=(
+                "Fork-group dispatch task was cancelled."
+                if cancelled
+                else "Fork-group dispatch task failed before completion."
+            ),
+        ),
+    )
+
+
+async def _publish_task_backed_branches(
+    coordinator: ForkGroupCoordinator,
+    record: _ForkGroupRecord,
+    branches: tuple[ForkGroupBranchResult, ...],
+) -> _ForkGroupRecord:
+    if branches == record.result.branches:
+        return record
+    proposed = record.model_copy(
+        update={
+            "revision": record.revision + 1,
+            "result": record.result.model_copy(
+                update={"branches": branches, "replayed": False},
+                deep=True,
+            ),
+        },
+        deep=True,
+    )
+    return await _publish_record(
+        coordinator,
+        record.result.source.source_session_id,
+        proposed,
+        EventType.FORK_GROUP_BRANCHES_RUNNING,
+        expected_record=record,
+    )
+
+
+async def _reconcile_task_backed_branches(
+    coordinator: ForkGroupCoordinator,
+    record: _ForkGroupRecord,
+) -> _ForkGroupRecord:
+    results = list(record.result.branches)
+    attached_ids = {item.attempt_id for item in results}
+    changed = False
+    for link in record.result.dispatch_attempts:
+        if link.kind is ForkGroupAttemptKind.EVALUATOR or link.attempt_id in attached_ids:
+            continue
+        result = await _task_backed_branch_result(coordinator, record, link)
+        if result is None:
+            continue
+        gated, gate_failure = await _apply_gates(coordinator, record, (result,))
+        result = gated[0]
+        if gate_failure is not None:
+            result = result.model_copy(
+                update={
+                    "status": ForkGroupBranchStatus.FAILED,
+                    "failure_code": gate_failure.code,
+                    "eligible": False,
+                    "error": gate_failure.message,
+                },
+                deep=True,
+            )
+        if link.kind is ForkGroupAttemptKind.REPLACEMENT:
+            assert link.replaced_attempt_id is not None
+            _supersede_attempt(
+                results,
+                replaced_attempt_id=link.replaced_attempt_id,
+                replacement_attempt_id=link.attempt_id,
+            )
+        results.append(result)
+        attached_ids.add(result.attempt_id)
+        changed = True
+    if not changed:
+        return record
+    return await _publish_task_backed_branches(coordinator, record, tuple(results))
+
+
+def _unfinished_task_attempt_count(record: _ForkGroupRecord) -> int:
+    attached = {item.attempt_id for item in record.result.branches}
+    return sum(
+        link.kind is not ForkGroupAttemptKind.EVALUATOR and link.attempt_id not in attached
+        for link in record.result.dispatch_attempts
+    )
+
+
+async def _schedule_initial_task_attempts(
+    coordinator: ForkGroupCoordinator,
+    record: _ForkGroupRecord,
+) -> _ForkGroupRecord:
+    attached = {item.attempt_id for item in record.result.branches}
+    linked = {item.attempt_id for item in record.result.dispatch_attempts}
+    capacity = record.request.max_parallelism - _unfinished_task_attempt_count(record)
+    if capacity <= 0:
+        return record
+    preparation_failures: list[ForkGroupBranchResult] = []
+    for branch in record.request.branches:
+        attempt = _initial_attempt(record.request, branch)
+        if attempt.attempt_id in attached or attempt.attempt_id in linked:
+            continue
+        record, failure = await _prepare_and_link_branch_dispatch(
+            coordinator,
+            record,
+            attempt,
+        )
+        if failure is not None:
+            preparation_failures.append(failure)
+            attached.add(attempt.attempt_id)
+        else:
+            linked.add(attempt.attempt_id)
+        capacity -= 1
+        if capacity == 0:
+            break
+    if preparation_failures:
+        record = await _publish_task_backed_branches(
+            coordinator,
+            record,
+            (*record.result.branches, *preparation_failures),
+        )
+    return record
+
+
+def _initial_task_attempts_complete(record: _ForkGroupRecord) -> bool:
+    completed = {item.attempt_id for item in record.result.branches}
+    return all(
+        _initial_attempt(record.request, branch).attempt_id in completed
+        for branch in record.request.branches
+    )
+
+
+async def _schedule_replacement_task_attempts(
+    coordinator: ForkGroupCoordinator,
+    record: _ForkGroupRecord,
+) -> tuple[_ForkGroupRecord, ForkGroupFailure | None]:
+    policy = record.request.failure_policy
+    minimum = policy.minimum_viable_branches
+    if minimum is None:
+        raise AssertionError("Task-backed replacement policy lost its minimum.")
+    if sum(item.eligible for item in record.result.branches) >= minimum:
+        return record, None
+    if _unfinished_task_attempt_count(record):
+        return record, None
+    replacement_links = tuple(
+        item
+        for item in record.result.dispatch_attempts
+        if item.kind is ForkGroupAttemptKind.REPLACEMENT
+    )
+    replacement_link_ids = {item.attempt_id for item in replacement_links}
+    unlinked_replacement_failure = next(
+        (
+            item
+            for item in record.result.branches
+            if item.attempt_index > 0 and item.attempt_id not in replacement_link_ids
+        ),
+        None,
+    )
+    if unlinked_replacement_failure is not None:
+        return record, _failure(
+            ForkGroupFailureCode.REPLACEMENT_FAILED,
+            unlinked_replacement_failure.error
+            or "Fork-group replacement could not create a durable child session.",
+            branch_id=unlinked_replacement_failure.branch_id,
+        )
+    replacement_attempt_ids = replacement_link_ids | {
+        item.attempt_id for item in record.result.branches if item.attempt_index > 0
+    }
+    remaining = policy.max_replacement_attempts - len(replacement_attempt_ids)
+    if remaining <= 0:
+        return record, _failure(
+            ForkGroupFailureCode.REPLACEMENTS_EXHAUSTED,
+            "Fork-group replacement limits were exhausted before the minimum viable "
+            "candidate count was reached.",
+        )
+    latest_by_branch: dict[str, ForkGroupBranchResult] = {}
+    for result in record.result.branches:
+        latest_by_branch[result.branch_id] = result
+    candidates = [
+        latest_by_branch[branch.branch_id]
+        for branch in record.request.branches
+        if branch.branch_id in latest_by_branch and not latest_by_branch[branch.branch_id].eligible
+    ]
+    if not candidates:
+        return record, _failure(
+            ForkGroupFailureCode.REPLACEMENTS_EXHAUSTED,
+            "Fork-group replacement policy found no replaceable candidate slot.",
+        )
+    deficit = minimum - sum(item.eligible for item in record.result.branches)
+    limit = min(
+        deficit,
+        remaining,
+        policy.replacement_parallelism,
+        record.request.max_parallelism,
+    )
+    for candidate in candidates[:limit]:
+        try:
+            attempt = await _plan_replacement(coordinator, record, candidate)
+        except Exception as exc:
+            return record, _failure(
+                ForkGroupFailureCode.REPLACEMENT_FAILED,
+                _exception_message(
+                    exc,
+                    redactor=coordinator.secret_redactor,
+                    prefix="Fork-group replacement planning failed: ",
+                ),
+                branch_id=candidate.branch_id,
+            )
+        record, preparation_failure = await _prepare_and_link_branch_dispatch(
+            coordinator,
+            record,
+            attempt,
+        )
+        if preparation_failure is not None:
+            if preparation_failure.execution_profile_fingerprint is None:
+                return record, _failure(
+                    ForkGroupFailureCode.REPLACEMENT_FAILED,
+                    "Fork-group replacement execution-profile authority was not accepted.",
+                    branch_id=preparation_failure.branch_id,
+                )
+            gated, gate_failure = await _apply_gates(
+                coordinator,
+                record,
+                (preparation_failure,),
+            )
+            result = gated[0]
+            results = list(record.result.branches)
+            _supersede_attempt(
+                results,
+                replaced_attempt_id=candidate.attempt_id,
+                replacement_attempt_id=attempt.attempt_id,
+            )
+            results.append(result)
+            record = await _publish_task_backed_branches(
+                coordinator,
+                record,
+                tuple(results),
+            )
+            if gate_failure is not None:
+                return record, gate_failure
+            return record, _failure(
+                ForkGroupFailureCode.REPLACEMENT_FAILED,
+                result.error or "Fork-group replacement could not create a durable child session.",
+                branch_id=result.branch_id,
+            )
+    return record, None
+
+
+async def _advance_task_backed_branches(
+    coordinator: ForkGroupCoordinator,
+    record: _ForkGroupRecord,
+) -> _ForkGroupRecord:
+    record = await _reconcile_task_backed_branches(coordinator, record)
+    fatal = _fatal_viable_attempt_failure(record.result.branches)
+    if fatal is not None:
+        failed = _result_with(
+            record,
+            state=ForkGroupState.FAILED,
+            failure=fatal,
+        )
+        return await _publish_record(
+            coordinator,
+            record.result.source.source_session_id,
+            failed,
+            EventType.FORK_GROUP_FAILED,
+            expected_record=record,
+        )
+    if record.request.failure_policy.mode is ForkGroupFailureMode.FAIL_GROUP:
+        early_failure = _branch_failure(record.result.branches)
+        if early_failure is not None:
+            failed = _result_with(
+                record,
+                state=ForkGroupState.FAILED,
+                failure=early_failure,
+            )
+            return await _publish_record(
+                coordinator,
+                record.result.source.source_session_id,
+                failed,
+                EventType.FORK_GROUP_FAILED,
+                expected_record=record,
+            )
+    record = await _schedule_initial_task_attempts(coordinator, record)
+    record = await _reconcile_task_backed_branches(coordinator, record)
+    if not _initial_task_attempts_complete(record):
+        return record
+
+    if record.request.failure_policy.mode is ForkGroupFailureMode.FAIL_GROUP:
+        gated = record.result.branches
+        failure = _branch_failure(gated)
+        if failure is not None:
+            failed = _result_with(
+                record,
+                state=ForkGroupState.FAILED,
+                branches=gated,
+                failure=failure,
+            )
+            return await _publish_record(
+                coordinator,
+                record.result.source.source_session_id,
+                failed,
+                EventType.FORK_GROUP_FAILED,
+                expected_record=record,
+            )
+    else:
+        fatal = _fatal_viable_attempt_failure(record.result.branches)
+        if fatal is not None:
+            failed = _result_with(
+                record,
+                state=ForkGroupState.FAILED,
+                failure=fatal,
+            )
+            return await _publish_record(
+                coordinator,
+                record.result.source.source_session_id,
+                failed,
+                EventType.FORK_GROUP_FAILED,
+                expected_record=record,
+            )
+        record, replacement_failure = await _schedule_replacement_task_attempts(
+            coordinator,
+            record,
+        )
+        if replacement_failure is not None:
+            failed = _result_with(
+                record,
+                state=ForkGroupState.FAILED,
+                failure=replacement_failure,
+            )
+            return await _publish_record(
+                coordinator,
+                record.result.source.source_session_id,
+                failed,
+                EventType.FORK_GROUP_FAILED,
+                expected_record=record,
+            )
+        minimum = record.request.failure_policy.minimum_viable_branches
+        if minimum is None or sum(item.eligible for item in record.result.branches) < minimum:
+            return record
+
+    awaiting = _result_with(
+        record,
+        state=ForkGroupState.AWAITING_EVALUATION,
+        branches=record.result.branches,
+        evaluator_session_id=record.request.evaluator.session_id,
+    )
+    try:
+        awaiting = await _bind_tool_free_evaluator_authority(coordinator, awaiting)
+    except Exception as exc:
+        failed = _result_with(
+            record,
+            state=ForkGroupState.FAILED,
+            failure=_failure(
+                ForkGroupFailureCode.EVALUATOR_FAILED,
+                _exception_message(
+                    exc,
+                    redactor=coordinator.secret_redactor,
+                    prefix="Fork-group evaluator authority failed: ",
+                ),
+            ),
+        )
+        return await _publish_record(
+            coordinator,
+            record.result.source.source_session_id,
+            failed,
+            EventType.FORK_GROUP_FAILED,
+            expected_record=record,
+        )
+    return await _publish_record(
+        coordinator,
+        record.result.source.source_session_id,
+        awaiting,
+        EventType.FORK_GROUP_AWAITING_EVALUATION,
+        expected_record=record,
+    )
+
+
+async def _ensure_evaluator_dispatch_submission(
+    coordinator: ForkGroupCoordinator,
+    record: _ForkGroupRecord,
+    link: ForkGroupDispatchAttempt,
+) -> None:
+    task = await _load_dispatch_task(coordinator, link)
+    if task is not None:
+        return
+    handle = await _dispatch_task_backed_request(
+        coordinator,
+        _evaluator_dispatch_request(record),
+    )
+    _require_dispatch_handle(handle, link)
+    if await _load_dispatch_task(coordinator, link) is None:
+        raise RuntimeError("Fork-group evaluator dispatch lost its queue task.")
+
+
+async def _prepare_and_link_evaluator_dispatch(
+    coordinator: ForkGroupCoordinator,
+    record: _ForkGroupRecord,
+) -> _ForkGroupRecord:
+    existing = next(
+        (
+            item
+            for item in record.result.dispatch_attempts
+            if item.kind is ForkGroupAttemptKind.EVALUATOR
+        ),
+        None,
+    )
+    if existing is not None:
+        await _ensure_evaluator_dispatch_submission(coordinator, record, existing)
+        return record
+    synthetic_name, profile_fingerprint = await _tool_free_evaluator_authority(
+        coordinator,
+        record,
+        branch_identities=_evaluator_branch_identities(record),
+    )
+    if profile_fingerprint != record.evaluator_execution_profile_fingerprint:
+        raise ForkGroupConflict(
+            "Evaluator execution profile changed from the frozen fork-group authority."
+        )
+    dispatch_request = _evaluator_dispatch_request(record)
+    (
+        fork_status,
+        fork_error,
+        _fork_failure_code,
+        prepared_profile_fingerprint,
+    ) = await _fork_exact_source(
+        coordinator,
+        _evaluator_fork_request(
+            record,
+            synthetic_agent_name=synthetic_name,
+            initial_invocation=_resume_request_from_dispatch(dispatch_request),
+        ),
+        source=record.result.source,
+    )
+    if fork_error is not None:
+        raise RuntimeError(f"Fork-group evaluator preparation failed: {fork_error}")
+    child = await coordinator.session_store.load(record.request.evaluator.session_id)
+    child_profile = (
+        None if child is None else execution_profile_baseline_from_session_metadata(child.metadata)
+    )
+    if (
+        child is None
+        or child.run_epoch != 0
+        or fork_status not in _TERMINAL_SESSION_STATUSES
+        or child_profile is None
+        or child_profile.fingerprint != profile_fingerprint
+        or prepared_profile_fingerprint != profile_fingerprint
+    ):
+        raise ForkGroupConflict(
+            "Fork-group evaluator child conflicts with its frozen execution profile."
+        )
+    dispatcher = coordinator.task_dispatcher()
+    queue_task_id = _queued_dispatch_task_id(
+        dispatch_request,
+        task_type=dispatcher.fork_group_task_type,
+    )
+    envelope = await coordinator.prepare_queued_dispatch(dispatch_request, queue_task_id)
+    link = _evaluator_dispatch_link_from_envelope(
+        record,
+        envelope=envelope,
+        queue_task_type=dispatcher.fork_group_task_type,
+    )
+    proposed = _record_with_dispatch_link(record, link)
+    record = await _publish_record(
+        coordinator,
+        record.result.source.source_session_id,
+        proposed,
+        EventType.FORK_GROUP_AWAITING_EVALUATION,
+        expected_record=record,
+    )
+    durable_link = next(
+        (
+            item
+            for item in record.result.dispatch_attempts
+            if item.kind is ForkGroupAttemptKind.EVALUATOR
+        ),
+        None,
+    )
+    if durable_link is None:
+        raise _ForkGroupPublicationSuperseded
+    await _ensure_evaluator_dispatch_submission(coordinator, record, durable_link)
+    return record
+
+
+async def _advance_task_backed_evaluator(
+    coordinator: ForkGroupCoordinator,
+    record: _ForkGroupRecord,
+) -> _ForkGroupRecord:
+    record = await _prepare_and_link_evaluator_dispatch(coordinator, record)
+    link = next(
+        item
+        for item in record.result.dispatch_attempts
+        if item.kind is ForkGroupAttemptKind.EVALUATOR
+    )
+    task = await _load_dispatch_task(coordinator, link)
+    if task is None or task.status not in {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }:
+        return record
+    if task.status is not TaskStatus.COMPLETED:
+        failed = _result_with(
+            record,
+            state=ForkGroupState.FAILED,
+            evaluator_session_id=record.request.evaluator.session_id,
+            failure=_failure(
+                ForkGroupFailureCode.EVALUATOR_FAILED,
+                _task_failure_text(
+                    coordinator,
+                    task,
+                    fallback="Fork-group evaluator dispatch did not complete.",
+                ),
+            ),
+        )
+        return await _publish_record(
+            coordinator,
+            record.result.source.source_session_id,
+            failed,
+            EventType.FORK_GROUP_FAILED,
+            expected_record=record,
+        )
+    child = await coordinator.session_store.load(link.session_id)
+    if child is None or child.run_epoch == 0 or child.status not in _TERMINAL_SESSION_STATUSES:
+        raise ForkGroupConflict(
+            "Fork-group evaluator task completed without an admitted terminal session."
+        )
+    dispositions, failure = await _run_evaluator(coordinator, record)
+    if failure is not None or dispositions is None:
+        failed = _result_with(
+            record,
+            state=ForkGroupState.FAILED,
+            evaluator_session_id=record.request.evaluator.session_id,
+            failure=failure
+            or _failure(ForkGroupFailureCode.INTERNAL_ERROR, "Evaluator returned no result."),
+        )
+        return await _publish_record(
+            coordinator,
+            record.result.source.source_session_id,
+            failed,
+            EventType.FORK_GROUP_FAILED,
+            expected_record=record,
+        )
+    completed = _result_with(
+        record,
+        state=ForkGroupState.COMPLETED,
+        evaluator_session_id=record.request.evaluator.session_id,
+        dispositions=dispositions,
+    )
+    return await _publish_record(
+        coordinator,
+        record.result.source.source_session_id,
+        completed,
+        EventType.FORK_GROUP_COMPLETED,
+        expected_record=record,
     )
 
 
@@ -3234,6 +5102,12 @@ def _fatal_viable_attempt_failure(
             return _failure(
                 ForkGroupFailureCode.SOURCE_CHANGED,
                 branch.error or "Fork-group source authority changed.",
+                branch_id=branch.branch_id,
+            )
+        if branch.failure_code is ForkGroupFailureCode.GATE_FAILED:
+            return _failure(
+                ForkGroupFailureCode.GATE_FAILED,
+                branch.error or "Fork-group deterministic gate authority failed.",
                 branch_id=branch.branch_id,
             )
     return None
@@ -3416,6 +5290,13 @@ async def _execute(coordinator: ForkGroupCoordinator, record: _ForkGroupRecord) 
             EventType.FORK_GROUP_BRANCHES_RUNNING,
             expected_record=record,
         )
+    if record.request.execution_mode is ForkGroupExecutionMode.TASK_DISPATCH:
+        coordinator.task_dispatcher()
+        if record.result.state is ForkGroupState.BRANCHES_RUNNING:
+            record = await _advance_task_backed_branches(coordinator, record)
+        if record.result.state is ForkGroupState.AWAITING_EVALUATION:
+            record = await _advance_task_backed_evaluator(coordinator, record)
+        return record
     if record.result.state is ForkGroupState.BRANCHES_RUNNING:
         if record.request.failure_policy.mode is ForkGroupFailureMode.EVALUATE_VIABLE:
             try:
@@ -3664,14 +5545,17 @@ __all__ = [
     "FORK_GROUP_MAX_BRANCHES",
     "FORK_GROUP_MIN_BRANCHES",
     "ForkGroupArtifactReference",
+    "ForkGroupAttemptKind",
     "ForkGroupBranchResult",
     "ForkGroupBranchSpec",
     "ForkGroupBranchStatus",
     "ForkGroupCheckpointSelector",
     "ForkGroupConflict",
+    "ForkGroupDispatchAttempt",
     "ForkGroupDisposition",
     "ForkGroupDispositionRecord",
     "ForkGroupEvaluatorSpec",
+    "ForkGroupExecutionMode",
     "ForkGroupFailure",
     "ForkGroupFailureCode",
     "ForkGroupFailureMode",

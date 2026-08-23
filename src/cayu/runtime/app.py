@@ -1212,6 +1212,11 @@ class CayuApp:
                 self._session_engine.preflight_fork_source_checkpoint_state
             ),
             admit_fork_source=self._admit_ordinary_fork_source,
+            interrupt_session=self._interrupt_session_private,
+            dispatcher=self.dispatcher,
+            task_store=self.task_store,
+            prepare_queued_dispatch=self._prepare_fork_group_queued_dispatch,
+            dispatch_session=self.dispatch,
         )
 
     def redact_json(self, value: Any) -> Any:
@@ -2031,6 +2036,40 @@ class CayuApp:
         self._fork_group_evaluator_agents[synthetic_agent_name] = request_sha256
         return synthetic_agent_name
 
+    def _ensure_fork_group_task_evaluator_environment(self, request: RunRequest) -> None:
+        """Materialize the provider-only environment shared by task workers."""
+
+        from cayu.runtime.fork_groups import _FORK_GROUP_TASK_EVALUATOR_ENVIRONMENT
+
+        if request.environment_name != _FORK_GROUP_TASK_EVALUATOR_ENVIRONMENT:
+            return
+        expected_spec = EnvironmentSpec(
+            name=_FORK_GROUP_TASK_EVALUATOR_ENVIRONMENT,
+            execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                name="cayu:fork-group-task-evaluator-environment",
+                behavior_version="1",
+                implementation_version="1",
+            ),
+        )
+        registered = self._environments.get(_FORK_GROUP_TASK_EVALUATOR_ENVIRONMENT)
+        if registered is None:
+            self.register_environment(Environment(expected_spec))
+            return
+        environment = registered.environment
+        if (
+            registered.spec != expected_spec
+            or registered.factory is not None
+            or environment.workspace is not None
+            or environment.runner is not None
+            or environment.vault is not None
+            or environment.proxy is not None
+            or environment.mcp_servers
+            or environment.workspace_instructions is not None
+        ):
+            raise RuntimeError(
+                "Fork-group task evaluator environment conflicts with runtime authority."
+            )
+
     async def _preflight_fork_group_evaluator_agent(
         self,
         request: RunRequest,
@@ -2039,6 +2078,7 @@ class CayuApp:
     ) -> tuple[str, str]:
         """Validate evaluator authority without registration or ordinary admission."""
 
+        self._ensure_fork_group_task_evaluator_environment(request)
         evaluator_agent, _ = self._fork_group_evaluator_agent_state(
             source_agent_name=source_agent_name,
             synthetic_agent_name=request.agent_name,
@@ -2064,6 +2104,7 @@ class CayuApp:
     ) -> tuple[str, str]:
         """Freeze the exact tool-free evaluator profile before durable admission."""
 
+        self._ensure_fork_group_task_evaluator_environment(request)
         synthetic_name = self._register_fork_group_evaluator_agent(
             source_agent_name=source_agent_name,
             synthetic_agent_name=request.agent_name,
@@ -3232,6 +3273,18 @@ class CayuApp:
             required_profile=required_profile,
         )
 
+    async def _prepare_fork_group_queued_dispatch(
+        self,
+        request: DispatchRequest,
+        queue_task_id: str,
+    ) -> _QueuedDispatchEnvelope:
+        """Bind group linkage before the corresponding queue task is claimable."""
+
+        return await self._prepare_queued_dispatch(
+            request,
+            queue_task_id=queue_task_id,
+        )
+
     async def _queued_dispatch_requests_match(
         self,
         existing: DispatchRequest,
@@ -3406,6 +3459,21 @@ class CayuApp:
             )
         return session.run_epoch > terminal_run_epoch
 
+    async def _require_queued_fork_group_authority(
+        self,
+        envelope: _QueuedDispatchEnvelope,
+    ) -> bool:
+        """Translate a durable group contradiction into permanent queue rejection."""
+
+        from cayu.runtime.fork_groups import ForkGroupConflict
+
+        try:
+            return await self._fork_group_coordinator.require_dispatch_authority(envelope)
+        except ForkGroupConflict as exc:
+            raise _QueuedDispatchAuthorityRejected(
+                "Queued fork-group dispatch authority was rejected."
+            ) from exc
+
     async def _queued_dispatch_settlement_state(
         self,
         envelope: _QueuedDispatchEnvelope,
@@ -3417,6 +3485,7 @@ class CayuApp:
             await self._durable_subagent_coordinator.require_prepared_subagent_parent_authority(
                 envelope
             )
+        await self._require_queued_fork_group_authority(envelope)
         private_session_id, _ = await self._resolve_public_session_authority(
             envelope.request.session_id
         )
@@ -3524,6 +3593,7 @@ class CayuApp:
 
         envelope = _copy_queued_dispatch_envelope(envelope)
         request = envelope.request
+        fork_group_terminal = await self._require_queued_fork_group_authority(envelope)
         (
             private_session_id,
             store_resolved_session_id,
@@ -3559,6 +3629,10 @@ class CayuApp:
                 )
             yield await self._project_emitted_event_for_public_api(replay_event)
             return
+        if fork_group_terminal:
+            raise _QueuedDispatchAuthorityRejected(
+                "Fork-group terminalization revoked this unfinished dispatch attempt."
+            )
 
         try:
             self._get_registered_agent(session.agent_name)
@@ -4455,9 +4529,18 @@ class CayuApp:
             yield event
 
     async def run_fork_group(self, request: ForkGroupRequest) -> ForkGroupResult:
-        """Run or reconstruct one bounded, durable in-process fork group."""
+        """Run or reconstruct one bounded durable fork group."""
 
         return await self._fork_group_coordinator.run_group(request)
+
+    async def inspect_fork_group(
+        self,
+        source_session_id: str,
+        group_id: str,
+    ) -> ForkGroupResult | None:
+        """Inspect a durable fork group without claiming or advancing its work."""
+
+        return await self._fork_group_coordinator.inspect_group(source_session_id, group_id)
 
     async def _fork_session_from_runtime_context(
         self,
