@@ -2814,7 +2814,7 @@ def test_load_trajectory_rejects_unversioned_preview_export(tmp_path):
         load_trajectory(path)
 
 
-@pytest.mark.parametrize("schema_version", [0, 1, 2, 4, "3", True])
+@pytest.mark.parametrize("schema_version", [0, 1, 2, 3, 5, "4", True])
 def test_load_trajectory_rejects_unsupported_schema_version(tmp_path, schema_version):
     path = tmp_path / "unsupported-trajectory.json"
     path.write_text(

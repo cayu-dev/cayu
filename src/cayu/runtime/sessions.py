@@ -91,6 +91,7 @@ from cayu.core.runtime_authority import (
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.memory_evidence import (
+    MAX_RECALL_RECEIPT_ITEMS,
     ContextExposure,
     ContextExposurePage,
     ContextExposureTransitionRequest,
@@ -15667,6 +15668,8 @@ class InMemorySessionStore(SessionStore):
             exposure = self._context_exposures.get(exposure_id)
             if exposure is None or exposure.session_id != session_id:
                 return ()
+            if len(self._recall_item_exposures[exposure_id]) > MAX_RECALL_RECEIPT_ITEMS:
+                raise ValueError("Stored recall item exposures exceed their count bound.")
             return tuple(
                 copy_recall_item_exposure(item) for item in self._recall_item_exposures[exposure_id]
             )

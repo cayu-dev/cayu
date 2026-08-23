@@ -34,6 +34,7 @@ from cayu._validation import (
 from cayu.artifacts import ArtifactMetadata, ArtifactScope
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole, TextPart
+from cayu.memory_attribution import MemoryAttribution
 from cayu.runtime.costs import SessionCostSummary
 from cayu.runtime.sessions import Session, SessionStatus
 from cayu.runtime.usage import (
@@ -53,9 +54,9 @@ from cayu.runtime.usage import (
 EVAL_SCHEMA_VERSION = 7
 
 # Version of the standalone trajectory JSON document written by
-# write_trajectory_json. Version 3 includes immutable session invocation provenance;
+# write_trajectory_json. Version 4 adds bounded memory attribution;
 # load_trajectory intentionally does not guess or migrate older shapes.
-TRAJECTORY_SCHEMA_VERSION = 3
+TRAJECTORY_SCHEMA_VERSION = 4
 
 # Cap on the bytes copied out of a probed workspace file into the serialized trajectory. A file
 # larger than this is captured truncated — with its true size and a content hash still recorded —
@@ -1106,6 +1107,7 @@ class Trajectory(BaseModel):
     events: tuple[Event, ...] = Field(default_factory=tuple)
     transcript: tuple[Message, ...] = Field(default_factory=tuple)
     usage_summary: SessionUsageSummary | None = None
+    memory_attribution: MemoryAttribution | None = None
     final_output: str = ""
     probes: TrajectoryProbes = Field(default_factory=TrajectoryProbes)
     children: tuple[Trajectory, ...] = Field(default_factory=tuple)
@@ -1169,6 +1171,11 @@ class Trajectory(BaseModel):
     @classmethod
     def revalidate_usage_summary(cls, value):
         return _revalidate_session_usage_summary_input(value)
+
+    @field_validator("memory_attribution", mode="before")
+    @classmethod
+    def revalidate_memory_attribution(cls, value):
+        return _revalidate_model_instance(value, MemoryAttribution)
 
     @field_validator("probes", mode="before")
     @classmethod

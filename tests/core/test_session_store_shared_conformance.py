@@ -42,17 +42,20 @@ from cayu import (
     InMemoryKnowledgeStore,
     KnowledgeAccessScope,
     KnowledgeEntry,
+    MemoryAttributionStatus,
     RecallEvidenceConflict,
     RecallEvidenceQuery,
     RecallItemExposure,
     RecallReceipt,
     RecallReceiptItem,
     RecallSourceCoverage,
+    RuntimeEvidenceRequest,
     SessionWorkspaceBranchStore,
     SQLiteSessionStore,
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
     WeightedReciprocalRankFusionConfig,
+    runtime_evidence,
 )
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -4010,6 +4013,66 @@ def test_session_store_conformance_persists_fenced_recall_exposure_evidence(
             )
             assert await store.create_recall_receipt(first_receipt) == first_receipt
             assert await store.create_context_exposure(exposure, item_exposures) == exposure
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_projects_public_memory_attribution(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            store_kind = session_store_case[0]
+            session_id = f"memory-attribution-projection-{store_kind}"
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            receipt = _recall_receipt(
+                f"projection-{store_kind}",
+                session_id=session_id,
+            )
+            await store.create_recall_receipt(receipt)
+            exposure, item_exposures = _planned_context_exposure(
+                f"projection-{store_kind}",
+                receipt,
+            )
+            await store.create_context_exposure(exposure, item_exposures)
+
+            report = await runtime_evidence(
+                CayuApp(
+                    session_store=store,
+                    request_footprint=RequestFootprintConfig(
+                        fingerprint_key_id="memory-attribution-conformance",
+                        fingerprint_key=SecretStr("memory-attribution-conformance-key-material"),
+                    ),
+                    enable_logging=False,
+                ),
+                RuntimeEvidenceRequest(
+                    root_session_id=session_id,
+                    max_sessions=1,
+                    max_events=10,
+                ),
+            )
+            attribution = report.sessions[0].memory_attribution
+            assert attribution.status is MemoryAttributionStatus.COMPLETE
+            assert attribution.observed_receipt_count == 1
+            assert attribution.observed_exposure_count == 1
+            assert attribution.observed_item_count == 2
+            assert (
+                attribution.receipts[0].receipt_alias == attribution.exposures[0].receipt_aliases[0]
+            )
+            assert (
+                attribution.receipts[0].items[0].item_alias
+                == attribution.exposures[0].items[0].item_alias
+            )
         finally:
             await _close_store(store)
 

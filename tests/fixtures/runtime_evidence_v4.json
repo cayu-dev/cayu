@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "root_session_id": "golden-root",
   "scope": {
     "root_session_id": "golden-root",
@@ -82,6 +82,20 @@
         "manual_recovery_required_count": "0",
         "manual_reconciliation_count": "0",
         "source_refs": []
+      },
+      "memory_attribution": {
+        "schema_version": "cayu.memory_attribution.v1",
+        "status": "complete",
+        "truncated": false,
+        "reason": null,
+        "observed_receipt_count": 0,
+        "observed_exposure_count": 0,
+        "observed_item_count": 0,
+        "omitted_receipt_count_at_least": 0,
+        "omitted_exposure_count_at_least": 0,
+        "omitted_item_count_at_least": 0,
+        "receipts": [],
+        "exposures": []
       },
       "receipts": [],
       "workspace_mutations": [],

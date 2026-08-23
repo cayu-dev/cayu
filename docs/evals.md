@@ -578,7 +578,7 @@ control-plane route. Those product steps build on this storage guarantee. See
 resource-limit contract.
 
 For payload-free operational/accounting evidence rather than a transcript-based
-eval trajectory, use `runtime_evidence(app, request)`. That public v2 projection
+eval trajectory, use `runtime_evidence(app, request)`. That public v4 projection
 accepts a bounded nonterminal or terminal lineage, preserves attempts, retries,
 operation-specific usage, governing execution-profile fingerprints, tools,
 approvals, taint, recovery, receipts, and optional causal-budget totals, and
@@ -645,6 +645,14 @@ an equal trajectory. The retained-session limit does not count children excluded
 by the terminal boundary. Lineage discovery has a separate non-configurable
 hard ceiling of 500 unique child candidates across the capture, so extreme
 fan-out remains bounded before admission.
+
+Every promoted session also receives the same typed `MemoryAttribution` used by
+`runtime_evidence(...)`. Promotion queries only the dedicated bounded receipt/exposure
+surface and shares one `SessionTrajectoryBounds.memory_attribution_bounds` budget across the
+whole tree. Projection-level `unavailable`, `redacted`, `truncated`, and `contradictory`
+states remain distinct from exposure-level `indeterminate`; none is rewritten as complete
+empty memory use. This promotion is read-only and does not call providers, tools,
+environments, applications, or recovery.
 
 The built-in memory, SQLite, and PostgreSQL stores provide every required read.
 A custom store must implement and advertise exact terminal evidence and bounded
@@ -1431,15 +1439,16 @@ regenerate those baselines with the current Cayu version. No compatibility loade
 or migration is used.
 
 Standalone exports use a versioned document envelope. The current trajectory
-schema version is `3`; `load_trajectory(...)` rejects files without that version
+schema version is `4`; `load_trajectory(...)` rejects files without that version
 or with an unsupported version before validating the trajectory payload. This is an
 intentional clean break from Cayu's earlier unversioned preview exports: they
 are not migrated and must be regenerated. The trajectory schema version is
-independent from `EvalRun.schema_version`. Version 3 retains immutable session
-invocation provenance in session-backed trajectories while preserving Cayu's
+independent from `EvalRun.schema_version`. Version 4 retains immutable session
+invocation provenance and typed memory attribution in session-backed trajectories
+while preserving Cayu's
 durable-JSON contract: nonportable text or numbers, duplicate object keys, and
 excessive nesting are rejected before an existing export can be overwritten or
-an imported trajectory can be replayed. Version-2 exports must be regenerated;
+an imported trajectory can be replayed. Earlier exports must be regenerated;
 Cayu does not invent provenance while loading them.
 
 Replay is faithful for the assertions the run captured: event / transcript / usage / output /

@@ -17,6 +17,12 @@ from cayu.evals.models import (
     _trajectory_promotion_capture_sha256,
     _validate_trajectory_record_contract,
 )
+from cayu.memory_attribution import MemoryAttribution, MemoryAttributionBounds
+from cayu.runtime._memory_attribution import (
+    MemoryAttributionCaptureBudget,
+    project_memory_attribution,
+)
+from cayu.runtime._memory_evidence import memory_evidence_key
 from cayu.runtime.app import CayuApp
 from cayu.runtime.sessions import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
@@ -91,6 +97,9 @@ class SessionTrajectoryBounds(BaseModel):
         default=TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES,
         ge=1,
         le=TERMINAL_SESSION_EVIDENCE_HARD_MAX_TOTAL_BYTES,
+    )
+    memory_attribution_bounds: MemoryAttributionBounds = Field(
+        default_factory=MemoryAttributionBounds
     )
 
 
@@ -597,8 +606,88 @@ async def trajectory_from_session(
         root_evidence,
         children=children,
     )
+    trajectory = await _promote_memory_attribution(
+        app,
+        trajectory,
+        bounds=selected_bounds.memory_attribution_bounds,
+    )
     await _revalidate_strict_capture(app, state)
+    revalidated_trajectory = await _promote_memory_attribution(
+        app,
+        trajectory,
+        bounds=selected_bounds.memory_attribution_bounds,
+    )
+    expected_memory = _memory_attribution_snapshot(trajectory)
+    observed_memory = _memory_attribution_snapshot(revalidated_trajectory)
+    if observed_memory != expected_memory:
+        changed_session_id = (
+            next(
+                (
+                    observed_session_id or expected_session_id
+                    for (expected_session_id, expected), (observed_session_id, observed) in zip(
+                        expected_memory,
+                        observed_memory,
+                        strict=True,
+                    )
+                    if (observed_session_id, observed) != (expected_session_id, expected)
+                ),
+                None,
+            )
+            or session_id
+        )
+        raise SessionTrajectoryError(
+            SessionTrajectoryErrorCode.CLOSURE_CHANGED,
+            session_id=changed_session_id,
+        )
+    trajectory = revalidated_trajectory
+    if trajectory.initial_input_message_count is not None:
+        trajectory._promotion_capture_sha256 = _trajectory_promotion_capture_sha256(trajectory)
     return trajectory
+
+
+async def _promote_memory_attribution(
+    app: CayuApp,
+    trajectory: Trajectory,
+    *,
+    bounds: MemoryAttributionBounds,
+) -> Trajectory:
+    budget = MemoryAttributionCaptureBudget(bounds)
+    key = memory_evidence_key(app._request_footprint)
+
+    async def promote(node: Trajectory) -> Trajectory:
+        attribution = (
+            None
+            if node.session is None
+            else await project_memory_attribution(
+                app.session_store,
+                node.session.id,
+                key=key,
+                budget=budget,
+            )
+        )
+        children = tuple([await promote(child) for child in node.children])
+        return node.model_copy(
+            update={
+                "memory_attribution": attribution,
+                "children": children,
+            }
+        )
+
+    return await promote(trajectory)
+
+
+def _memory_attribution_snapshot(
+    trajectory: Trajectory,
+) -> tuple[tuple[str | None, MemoryAttribution | None], ...]:
+    current = (
+        (
+            None if trajectory.session is None else trajectory.session.id,
+            trajectory.memory_attribution,
+        ),
+    )
+    return current + tuple(
+        item for child in trajectory.children for item in _memory_attribution_snapshot(child)
+    )
 
 
 def _copy_session_trajectory_bounds(

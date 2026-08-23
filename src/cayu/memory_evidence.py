@@ -77,6 +77,17 @@ class RecallItemAdmission(StrEnum):
     ADMITTED = "admitted"
     OFFERED = "offered"
 
+    def matches_selection_reason(self, reason: RecallItemSelectionReason) -> bool:
+        """Return whether a selection reason proves this admission outcome."""
+
+        admitted_reasons = {
+            RecallItemSelectionReason.CALIBRATED_STRONG_MATCH,
+            RecallItemSelectionReason.EXPLICIT_APPLICATION_SELECTION,
+        }
+        return isinstance(reason, RecallItemSelectionReason) and (
+            (reason in admitted_reasons) is (self is RecallItemAdmission.ADMITTED)
+        )
+
 
 class RecallItemSelectionReason(StrEnum):
     CALIBRATED_STRONG_MATCH = "calibrated_strong_match"
@@ -105,6 +116,18 @@ class ContextExposureState(StrEnum):
             ContextExposureState.CANCELLED,
             ContextExposureState.INDETERMINATE,
         }
+
+    def accepts_evidence_kind(self, kind: ContextExposureEvidenceKind) -> bool:
+        """Return whether one structural evidence kind proves this lifecycle state."""
+
+        return isinstance(kind, ContextExposureEvidenceKind) and kind in _STATE_EVIDENCE_KINDS[self]
+
+    def permits_transition_to(self, state: ContextExposureState) -> bool:
+        """Return whether the lifecycle permits one direct state transition."""
+
+        return (
+            isinstance(state, ContextExposureState) and state in _ALLOWED_EXPOSURE_TRANSITIONS[self]
+        )
 
 
 class ContextExposureEvidenceKind(StrEnum):
@@ -703,7 +726,7 @@ class ContextExposureTransition(BaseModel):
 
     @model_validator(mode="after")
     def validate_evidence_kind(self) -> Self:
-        if self.evidence_kind not in _STATE_EVIDENCE_KINDS[self.state]:
+        if not self.state.accepts_evidence_kind(self.evidence_kind):
             raise ValueError("Context exposure evidence kind does not prove its state.")
         supports_provider_request_id = self.state in {
             ContextExposureState.ACKNOWLEDGED,
@@ -855,7 +878,7 @@ class ContextExposure(BaseModel):
         for previous, current in zip(self.transitions, self.transitions[1:], strict=False):
             if current.revision != previous.revision + 1:
                 raise ValueError("Context exposure transition revisions must be contiguous.")
-            if current.state not in _ALLOWED_EXPOSURE_TRANSITIONS[previous.state]:
+            if not previous.state.permits_transition_to(current.state):
                 raise ValueError("Context exposure lifecycle contains an invalid transition.")
             if current.occurred_at < previous.occurred_at:
                 raise ValueError("Context exposure transition timestamps must be monotonic.")
@@ -990,7 +1013,7 @@ class ContextExposureTransitionRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_requested_transition(self) -> Self:
-        if self.state not in _ALLOWED_EXPOSURE_TRANSITIONS[self.expected_state]:
+        if not self.expected_state.permits_transition_to(self.state):
             raise ValueError("Requested context exposure lifecycle transition is invalid.")
         ContextExposureTransition(
             transition_id=self.transition_id,
@@ -1294,6 +1317,8 @@ def validate_new_context_exposure(
 ) -> None:
     """Validate one exact, revision-zero exposure bundle before persistence."""
 
+    if len(item_exposures) > MAX_RECALL_RECEIPT_ITEMS:
+        raise ValueError("Recall item exposures exceed their count bound.")
     if (
         exposure.state is not ContextExposureState.PLANNED
         or exposure.state_revision != 0
@@ -1596,11 +1621,7 @@ def _validate_admission_reason(
     admission: RecallItemAdmission,
     selection_reason: RecallItemSelectionReason,
 ) -> None:
-    admitted_reasons = {
-        RecallItemSelectionReason.CALIBRATED_STRONG_MATCH,
-        RecallItemSelectionReason.EXPLICIT_APPLICATION_SELECTION,
-    }
-    if (selection_reason in admitted_reasons) is not (admission is RecallItemAdmission.ADMITTED):
+    if not admission.matches_selection_reason(selection_reason):
         raise ValueError("Recall item selection reason does not match its admission.")
 
 

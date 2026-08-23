@@ -62,6 +62,7 @@ from cayu.embeddings import (
     copy_text_embedding_result,
 )
 from cayu.memory_evidence import (
+    MAX_RECALL_RECEIPT_ITEMS,
     ContextExposure,
     ContextExposurePage,
     ContextExposureTransitionConflict,
@@ -15602,10 +15603,16 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             FROM cayu_recall_item_exposures
                             WHERE exposure_id = %s
                             ORDER BY ordinal
+                            LIMIT %s
                             """,
-                            (copied.exposure_id,),
+                            (copied.exposure_id, MAX_RECALL_RECEIPT_ITEMS + 1),
                         )
-                        current_items = _postgres_recall_item_exposures(await cur.fetchall())
+                        current_item_rows = await cur.fetchall()
+                        if len(current_item_rows) > MAX_RECALL_RECEIPT_ITEMS:
+                            raise ValueError(
+                                "Stored recall item exposures exceed their count bound."
+                            )
+                        current_items = _postgres_recall_item_exposures(current_item_rows)
                         if (
                             not context_exposure_creation_matches(current, copied)
                             or tuple(
@@ -15775,10 +15782,14 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                   ON exposure.exposure_id = item.exposure_id
                 WHERE exposure.session_id = %s AND exposure.exposure_id = %s
                 ORDER BY item.ordinal
+                LIMIT %s
                 """,
-                (session_id, exposure_id),
+                (session_id, exposure_id, MAX_RECALL_RECEIPT_ITEMS + 1),
             )
-            return _postgres_recall_item_exposures(await cur.fetchall())
+            rows = await cur.fetchall()
+            if len(rows) > MAX_RECALL_RECEIPT_ITEMS:
+                raise ValueError("Stored recall item exposures exceed their count bound.")
+            return _postgres_recall_item_exposures(rows)
 
     async def list_context_exposures(
         self,

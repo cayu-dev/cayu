@@ -27,6 +27,12 @@ from cayu._validation import (
     require_clean_nonblank,
 )
 from cayu.core.events import EventType
+from cayu.memory_attribution import MemoryAttribution, MemoryAttributionBounds
+from cayu.runtime._memory_attribution import (
+    MemoryAttributionCaptureBudget,
+    project_memory_attribution,
+)
+from cayu.runtime._memory_evidence import memory_evidence_key
 from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import PriceBook, estimate_model_step_cost
 from cayu.runtime.sessions import (
@@ -48,7 +54,7 @@ from cayu.runtime.workspace_observation_recovery import (
     workspace_observation_terminal_from_delta_status,
 )
 
-RUNTIME_EVIDENCE_SCHEMA_VERSION = 3
+RUNTIME_EVIDENCE_SCHEMA_VERSION = 4
 
 _HARD_MAX_SESSIONS = 500
 _HARD_MAX_EVENTS = 100_000
@@ -300,6 +306,9 @@ class RuntimeEvidenceRequest(BaseModel):
     root_session_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
     max_sessions: StrictInt = Field(ge=1, le=_HARD_MAX_SESSIONS)
     max_events: StrictInt = Field(ge=1, le=_HARD_MAX_EVENTS)
+    memory_attribution_bounds: MemoryAttributionBounds = Field(
+        default_factory=MemoryAttributionBounds
+    )
     include_causal_budget: StrictBool = False
     max_causal_budget_sessions: StrictInt = Field(
         default=_DEFAULT_MAX_CAUSAL_BUDGET_SESSIONS,
@@ -307,6 +316,13 @@ class RuntimeEvidenceRequest(BaseModel):
         le=_HARD_MAX_SESSIONS,
     )
     pricing: PriceBook | None = None
+
+    @field_validator("memory_attribution_bounds", mode="before")
+    @classmethod
+    def copy_memory_attribution_bounds(cls, value: object) -> MemoryAttributionBounds:
+        if isinstance(value, MemoryAttributionBounds):
+            value = value.model_dump(mode="python")
+        return MemoryAttributionBounds.model_validate(value)
 
     @field_validator("root_session_id")
     @classmethod
@@ -961,6 +977,7 @@ class RuntimeEvidenceSession(BaseModel):
     effective_taint_labels: tuple[str, ...] = ()
     policy_decisions: tuple[RuntimeEvidencePolicyDecision, ...] = ()
     recovery: RuntimeEvidenceRecoverySummary
+    memory_attribution: MemoryAttribution
     receipts: tuple[RuntimeEvidenceReceipt, ...] = ()
     workspace_mutations: tuple[RuntimeEvidenceWorkspaceMutation, ...] = ()
     workspace_finalization: RuntimeEvidenceWorkspaceFinalization | None = None
@@ -996,7 +1013,7 @@ class RuntimeEvidenceReport(BaseModel):
 
     model_config = _MODEL_CONFIG
 
-    schema_version: Literal[3] = RUNTIME_EVIDENCE_SCHEMA_VERSION
+    schema_version: Literal[4] = RUNTIME_EVIDENCE_SCHEMA_VERSION
     root_session_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
     scope: RuntimeEvidenceScope
     sessions: tuple[RuntimeEvidenceSession, ...] = Field(max_length=_HARD_MAX_SESSIONS)
@@ -1141,11 +1158,23 @@ async def runtime_evidence(
         capture.records[session.id] = await _load_event_records(app, session.id, capture)
     await _capture_tasks(app, ordered_sessions, capture)
 
+    memory_budget = MemoryAttributionCaptureBudget(selected.memory_attribution_bounds)
+    attribution_key = memory_evidence_key(app._request_footprint)
+    memory_attribution_by_session: dict[str, MemoryAttribution] = {}
+    for session in ordered_sessions:
+        memory_attribution_by_session[session.id] = await project_memory_attribution(
+            store,
+            session.id,
+            key=attribution_key,
+            budget=memory_budget,
+        )
+
     projected_sessions = tuple(
         _project_session(
             session,
             capture.records[session.id],
             capture,
+            memory_attribution=memory_attribution_by_session[session.id],
             pricing=selected.pricing,
         )
         for session in ordered_sessions
@@ -1558,6 +1587,7 @@ def _project_session(
     records: tuple[EventRecord, ...],
     capture: _Capture,
     *,
+    memory_attribution: MemoryAttribution,
     pricing: PriceBook | None,
 ) -> RuntimeEvidenceSession:
     attempts = _project_attempts(session, records, capture.warnings, pricing=pricing)
@@ -1646,6 +1676,7 @@ def _project_session(
             manual_reconciliation_count=reconciliations,
             source_refs=recovery_refs,
         ),
+        memory_attribution=memory_attribution,
         receipts=receipts,
         workspace_mutations=workspace_mutations,
         workspace_finalization=workspace_finalization,

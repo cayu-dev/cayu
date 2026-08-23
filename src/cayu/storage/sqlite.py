@@ -35,6 +35,7 @@ from cayu.core.messages import Message, MessageRole
 from cayu.core.runtime_authority import CheckpointValueAuthority
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.memory_evidence import (
+    MAX_RECALL_RECEIPT_ITEMS,
     ContextExposure,
     ContextExposurePage,
     ContextExposureTransitionConflict,
@@ -3796,17 +3797,19 @@ class SQLiteSessionStore(SessionStore):
                 ).fetchone()
                 if row is not None:
                     current = _sqlite_context_exposure(row)
-                    current_items = _sqlite_recall_item_exposures(
-                        connection.execute(
-                            """
-                            SELECT item.*
-                            FROM cayu_recall_item_exposures AS item
-                            WHERE item.exposure_id = ?
-                            ORDER BY item.ordinal
-                            """,
-                            (copied.exposure_id,),
-                        ).fetchall()
-                    )
+                    current_item_rows = connection.execute(
+                        """
+                        SELECT item.*
+                        FROM cayu_recall_item_exposures AS item
+                        WHERE item.exposure_id = ?
+                        ORDER BY item.ordinal
+                        LIMIT ?
+                        """,
+                        (copied.exposure_id, MAX_RECALL_RECEIPT_ITEMS + 1),
+                    ).fetchall()
+                    if len(current_item_rows) > MAX_RECALL_RECEIPT_ITEMS:
+                        raise ValueError("Stored recall item exposures exceed their count bound.")
+                    current_items = _sqlite_recall_item_exposures(current_item_rows)
                     if (
                         not context_exposure_creation_matches(current, copied)
                         or tuple(
@@ -3962,9 +3965,12 @@ class SQLiteSessionStore(SessionStore):
                   ON exposure.exposure_id = item.exposure_id
                 WHERE exposure.session_id = ? AND exposure.exposure_id = ?
                 ORDER BY item.ordinal
+                LIMIT ?
                 """,
-                (session_id, exposure_id),
+                (session_id, exposure_id, MAX_RECALL_RECEIPT_ITEMS + 1),
             ).fetchall()
+            if len(rows) > MAX_RECALL_RECEIPT_ITEMS:
+                raise ValueError("Stored recall item exposures exceed their count bound.")
             return _sqlite_recall_item_exposures(rows)
 
         return tuple(copy_recall_item_exposure(item) for item in await self._run_read(query))

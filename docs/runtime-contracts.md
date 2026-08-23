@@ -4211,7 +4211,7 @@ separate `max_causal_budget_sessions` expansion; it never turns an omitted
 scope into a whole-store scan.
 
 ```python
-from cayu import RuntimeEvidenceRequest, runtime_evidence
+from cayu import MemoryAttributionBounds, RuntimeEvidenceRequest, runtime_evidence
 
 report = await runtime_evidence(
     app,
@@ -4221,15 +4221,22 @@ report = await runtime_evidence(
         max_events=20_000,
         include_causal_budget=True,
         max_causal_budget_sessions=64,
+        memory_attribution_bounds=MemoryAttributionBounds(
+            max_receipts=100,
+            max_exposures=100,
+            max_items=1_000,
+            max_source_bytes=16 * 1024 * 1024,
+            max_projection_bytes=4 * 1024 * 1024,
+        ),
         pricing=my_price_book,  # optional
     ),
 )
 ```
 
 `RuntimeEvidenceReport.schema_version` is
-`RUNTIME_EVIDENCE_SCHEMA_VERSION == 3`. Version 2 added the optional governing
-execution-profile fingerprint to each model attempt. Version 3 adds safe workspace
-mutation-window and finalization summaries. Sessions are ordered parent before child,
+`RUNTIME_EVIDENCE_SCHEMA_VERSION == 4`. Version 4 adds the versioned
+`MemoryAttribution` section to each session; older report shapes are not inferred or
+migrated. Sessions are ordered parent before child,
 then by durable creation time and session id. The scope records the exact
 descendant ids and, when requested, causal-budget ids. Session records retain
 only structural identity, terminal state, last durable event cursor, origin
@@ -4264,6 +4271,39 @@ enums, counts, digests, or identifiers produce
 `RuntimeEvidenceWorkspaceAttribution`, `RuntimeEvidenceWorkspaceTerminal`, and
 `RuntimeEvidenceWorkspaceArtifact`. `workspace_finalization` is an optional
 `RuntimeEvidenceWorkspaceFinalization`.
+
+Memory attribution is read from the dedicated receipt/exposure store surface, not
+reconstructed from events and not left for consumers to discover through store scans.
+One `MemoryAttributionBounds` budget is shared by the complete report, so a 500-session
+lineage cannot multiply the configured receipt, exposure, item, source-byte, or
+projection-byte ceilings. Defaults retain at most 100 receipts, 100 exposures, 1,000
+receipt/exposure item facts, 16 MiB of source documents, and 4 MiB of projected record
+documents. The hard ceilings are 1,000 receipts, 1,000 exposures, 10,000 items, 64 MiB
+of source documents, and 16 MiB of projected records. Store pages remain independently
+limited to 100 records and 4 MiB.
+
+`MemoryAttribution.status` distinguishes `complete`, `truncated`, `unavailable`,
+`redacted`, and `contradictory`. A source or global bound always produces `truncated`,
+including when it prevents Cayu from proving that a later session has no rows. Omitted
+fields are named `*_count_at_least`: the exact number is retained when observed rows
+were omitted, while evidence hidden before lookahead retains a truthful lower bound of
+zero instead of triggering an unbounded count scan. Unsupported stores and failed
+reads carry stable unavailable reasons. Existing rows without configured alias authority
+produce `redacted`; receipt/exposure/item linkage disagreement produces
+`contradictory` and releases no projected records. None of those states is represented
+as a successful empty result.
+
+Receipt, exposure, interaction, and item identities are emitted only as
+domain-separated, session-scoped HMAC-SHA-256 aliases derived from Cayu's existing
+purpose-separated memory-evidence key. Item aliases bind the exact receipt occurrence,
+ordinal, canonical identity, representation, and content hash without publishing any of
+those private inputs. The section contains structural counts, safe runtime attempt IDs,
+typed selection reasons, and the exposure transition state/kind/timestamp. It excludes
+memory text, queries, prompts, transcripts, provider bodies and request IDs,
+credentials, embeddings, arbitrary source/contributor names and metadata, locators,
+content hashes, and transition evidence references. The exposure lifecycle remains a
+separate truth: `indeterminate` means provider exposure could not be concluded even when
+the projection itself is complete.
 
 Attempts preserve their logical model-step and attempt ids, ordinal, terminal
 state, provider/model identity, usage availability, typed operation, source

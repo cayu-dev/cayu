@@ -5,6 +5,7 @@ import asyncio
 import pytest
 from tests.core._execution_profile_fixtures import profiled_session_identity
 from tests.core.postgres_contention_support import drop_cayu_tables
+from tests.core.test_memory_attribution import _receipt as _memory_receipt
 
 from cayu import (
     AgentSpec,
@@ -14,6 +15,7 @@ from cayu import (
     EventType,
     ForkSessionRequest,
     InMemorySessionStore,
+    MemoryAttributionStatus,
     Message,
     ModelStreamEvent,
     PostgresSessionStore,
@@ -318,6 +320,10 @@ def test_trajectory_from_session_admits_preterminal_tree_and_excludes_later_fork
     assert first.children_incomplete is False
     assert first.probes.workspace_available is False
     assert first.probes.artifacts_available is False
+    assert first.memory_attribution is not None
+    assert first.memory_attribution.status is MemoryAttributionStatus.COMPLETE
+    assert first.children[0].memory_attribution is not None
+    assert first.children[0].memory_attribution.status is MemoryAttributionStatus.COMPLETE
 
 
 def test_trajectory_from_session_reopens_sqlite_without_runtime_registrations(tmp_path):
@@ -1127,6 +1133,34 @@ def test_trajectory_from_session_accepts_an_authoritative_fork_origin(
     assert [child.session.id for child in trajectory.children if child.session is not None] == [
         "child"
     ]
+
+
+def test_trajectory_from_session_revalidates_promoted_memory_evidence():
+    class MemoryChangingStore(InMemorySessionStore):
+        def __init__(self):
+            super().__init__()
+            self.terminal_evidence_reads = 0
+
+        async def load_terminal_session_evidence(self, session_id, *, limits=None):
+            evidence = await super().load_terminal_session_evidence(session_id, limits=limits)
+            self.terminal_evidence_reads += 1
+            if self.terminal_evidence_reads == 2:
+                await self.create_recall_receipt(_memory_receipt("late", session_id=session_id))
+            return evidence
+
+    async def scenario():
+        store = MemoryChangingStore()
+        interaction_id = await _create_running_session(store, "root")
+        await _finish_session(store, "root", interaction_id)
+        return await trajectory_from_session(
+            CayuApp(session_store=store, enable_logging=False),
+            "root",
+        )
+
+    with pytest.raises(SessionTrajectoryError) as captured:
+        asyncio.run(scenario())
+    assert captured.value.code is SessionTrajectoryErrorCode.CLOSURE_CHANGED
+    assert captured.value.session_id == "root"
 
 
 def test_runtime_child_start_persists_authoritative_parent_lineage():
