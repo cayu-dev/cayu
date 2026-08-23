@@ -94,9 +94,10 @@ def test_every_ref_uses_balanced_shards_behind_the_stable_test_gate() -> None:
     assert "uses: actions/upload-artifact@" in specialists
 
     assert "name: Test (Python 3.14)" in test_gate
-    assert "needs: [test_shards, test_specialists]" in test_gate
+    assert "needs: [test_shards, test_specialists, memory-evidence-performance]" in test_gate
     assert 'test "$SHARD_RESULT" = "success"' in test_gate
     assert 'test "$SPECIALIST_RESULT" = "success"' in test_gate
+    assert 'test "$PERFORMANCE_RESULT" = "success"' in test_gate
 
 
 def test_stable_test_gate_combines_coverage_from_every_lane() -> None:

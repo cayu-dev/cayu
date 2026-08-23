@@ -1,0 +1,99 @@
+{
+  "ceiling_findings": [],
+  "ceilings": {
+    "memory_persistence_p95_ms": 15.0,
+    "memory_zero_record_runtime_evidence_p95_ms": 5.0,
+    "preparation_p95_ms": 10.0,
+    "projection_bytes_per_pair": 6000,
+    "projection_overhead_p95_ms_per_pair": 10.0,
+    "sqlite_persistence_p95_ms": 25.0,
+    "sqlite_storage_bytes_per_pair": 32768,
+    "sqlite_zero_record_runtime_evidence_p95_ms": 10.0
+  },
+  "control": {
+    "historical_pre_feature": false,
+    "kind": "current_runtime_zero_memory_records",
+    "receipt_exposure_pairs": 0
+  },
+  "environment": {
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "results": [
+    {
+      "backend": "memory",
+      "incremental_projection_bytes": 125304,
+      "incremental_projection_latency": {
+        "p50_ms": 163.461958,
+        "p95_ms": 188.544958
+      },
+      "persistence_latency": {
+        "p50_ms": 1.425584,
+        "p95_ms": 2.305625
+      },
+      "populated_p95_ratio_to_zero_record": 419.875543,
+      "populated_report_bytes": 132080,
+      "populated_runtime_evidence_latency": {
+        "p50_ms": 163.832583,
+        "p95_ms": 188.873875
+      },
+      "populated_storage_bytes": null,
+      "preparation_latency": {
+        "p50_ms": 0.890937,
+        "p95_ms": 1.122208
+      },
+      "projection_bytes_per_pair": 2506.08,
+      "projection_iteration_count": 30,
+      "sample_count": 50,
+      "storage_byte_overhead": null,
+      "storage_bytes_per_pair": null,
+      "zero_record_report_bytes": 6776,
+      "zero_record_runtime_evidence_latency": {
+        "p50_ms": 0.343875,
+        "p95_ms": 0.449833
+      },
+      "zero_record_storage_bytes": null
+    },
+    {
+      "backend": "sqlite",
+      "incremental_projection_bytes": 125304,
+      "incremental_projection_latency": {
+        "p50_ms": 238.326437,
+        "p95_ms": 271.703083
+      },
+      "persistence_latency": {
+        "p50_ms": 3.092271,
+        "p95_ms": 5.332333
+      },
+      "populated_p95_ratio_to_zero_record": 182.616472,
+      "populated_report_bytes": 132080,
+      "populated_runtime_evidence_latency": {
+        "p50_ms": 239.631604,
+        "p95_ms": 272.882333
+      },
+      "populated_storage_bytes": 1662976,
+      "preparation_latency": {
+        "p50_ms": 0.864979,
+        "p95_ms": 1.119625
+      },
+      "projection_bytes_per_pair": 2506.08,
+      "projection_iteration_count": 30,
+      "sample_count": 50,
+      "storage_byte_overhead": 507904,
+      "storage_bytes_per_pair": 10158.08,
+      "zero_record_report_bytes": 6776,
+      "zero_record_runtime_evidence_latency": {
+        "p50_ms": 1.221542,
+        "p95_ms": 1.494292
+      },
+      "zero_record_storage_bytes": 1155072
+    }
+  ],
+  "schema_version": "cayu.memory_evidence_performance.v1",
+  "within_ceilings": true,
+  "workload": {
+    "items_per_pair": 1,
+    "provider_calls": 0,
+    "receipt_exposure_pairs": 50
+  }
+}

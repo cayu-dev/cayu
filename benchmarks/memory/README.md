@@ -59,3 +59,25 @@ empty results are complete.
 `--corpus` accepts the same bounded public/private origin contract and
 `--output` retains a report. Keep private production-shaped corpora and reports
 outside this repository.
+
+## Memory evidence overhead
+
+`memory-evidence-performance-v1.json` is the hermetic 50-pair baseline for the durable
+receipt/exposure and public attribution path. Regenerate it, or check the documented
+regression ceilings without making provider calls, with:
+
+```bash
+PYTHONPATH=src python scripts/run_memory_evidence_performance.py \
+  --output benchmarks/memory/memory-evidence-performance-v1.json \
+  --check
+```
+
+The runner measures evidence-document preparation, in-memory/SQLite persistence,
+steady-state SQLite bytes after close, a current-runtime zero-record control,
+memory-bearing projection, and serialized report bytes. The zero-record control includes
+the always-on attribution path and is explicitly not labeled as historical pre-feature
+code. A dedicated required CI lane reruns the workload without coverage instrumentation,
+so an unchanged artifact cannot conceal a regression and timing is not distorted by the
+ordinary test harness. Provider latency is deliberately absent. See
+[Memory foundation contracts](../../docs/memory-foundation.md#bounded-public-memory-attribution)
+for the fixed ceilings and interpretation.

@@ -264,6 +264,17 @@ Required evidence persistence fails closed before provider network I/O; retries,
 overflow rebuilding, typed provider outcomes, cancellation, and durable
 background recovery advance the original attempt lifecycles conservatively.
 
+`runtime_evidence(...)` schema 4 and standalone trajectory schema 4 now expose
+the same bounded `cayu.memory_attribution.v1` read model. It correlates receipts,
+exposures, item links, and lifecycle truth through session-scoped HMAC aliases
+without publishing raw memory identity or content. Global count and byte bounds,
+lower-bound omission counts, and distinct unavailable, redacted, truncated,
+contradictory, and exposure-level indeterminate states keep incomplete evidence
+honest across complete session trees. Historical trajectory promotion remains
+read-only. A checked hermetic baseline and dedicated no-coverage current-code regression
+lane record preparation, persistence, zero-record and populated public projection
+latency, SQLite storage, and serialized-size ceilings without provider calls.
+
 ### OpenAI subscription retries are bounded with migration-explicit authority
 
 OpenAI subscription HTTP and SSE errors now preserve bounded typed retry

@@ -219,6 +219,56 @@ scan runtime history, synthesize receipts for past recall, or carry a legacy
 reader/writer path. Existing sessions remain unchanged; evidence exists only
 for operations that explicitly publish it through this contract.
 
+## Bounded public memory attribution
+
+`runtime_evidence(...)` projects receipts, context exposures, item links, and exposure
+lifecycle into the versioned `cayu.memory_attribution.v1` contract. Consumers do not
+scan raw events or the private store. `trajectory_from_session(...)` promotes the same
+typed section through a read-only path; it does not run application, provider, tool,
+environment, hook, or recovery behavior.
+
+Projection completeness and provider exposure are deliberately separate. The section
+reports `complete`, `truncated`, `unavailable`, `redacted`, or `contradictory`, while
+each exposure retains its own lifecycle, including `indeterminate`. A missing row that
+was bounded away is never reported as complete empty success. Count, source-byte, and
+projection-byte bounds are global to the report or trajectory rather than multiplied by
+session count, and `*_count_at_least` fields state what is known without an unbounded
+count query.
+
+Portable receipt, exposure, interaction, and item identities are session-scoped,
+domain-separated HMAC aliases. The projection never emits memory or prompt text,
+queries, transcript/provider bodies, credentials, embeddings, arbitrary metadata or
+source names, raw locators, raw content hashes, or hidden reasoning. If alias key
+authority is unavailable while rows exist, the result is explicitly `redacted` and the
+private rows are not released. A broken receipt/exposure/item relationship is
+`contradictory` and likewise releases no projected records.
+
+The hermetic performance runner separates document preparation, evidence persistence,
+steady-state SQLite storage, empty-report projection, memory-bearing projection, and
+serialized projection size. It makes no provider calls:
+
+```bash
+PYTHONPATH=src python scripts/run_memory_evidence_performance.py --check
+```
+
+The checked 50-pair baseline is
+[`benchmarks/memory/memory-evidence-performance-v1.json`](../benchmarks/memory/memory-evidence-performance-v1.json).
+The zero-record `runtime_evidence(...)` run is a same-process current-runtime control,
+not a historical pre-feature measurement. It exposes the always-on cost paid by a
+session with no receipt or exposure rows; the populated-minus-control measurement then
+isolates the incremental cost of projecting 50 pairs. Regression checks require
+zero-record p95 at or below 5 ms in memory and 10 ms on SQLite, preparation p95 at or
+below 10 ms, in-memory and SQLite persistence p95 at or below 15 ms and 25 ms
+respectively, p95 incremental projection overhead at or below 10 ms per pair,
+projected size at or below 6,000 bytes per pair, and steady-state SQLite storage at or
+below 32 KiB per pair. A dedicated no-coverage CI lane executes the current workload,
+while the normal test suite validates the checked artifact and every regression lane;
+later code therefore cannot retain stale green numbers or distort timing with coverage.
+The absolute ceilings include headroom for shared-runner scheduling variance while still
+bounding the complete 50-pair workload. Latency is environment-sensitive; the artifact
+records its Python/platform identity, p50/p95 observations, zero-record control, and
+absolute overhead without mixing provider latency into the result.
+
 ## Storage-enforced access
 
 Every built-in knowledge operation requires a `KnowledgeAccessScope`. A store
