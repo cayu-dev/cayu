@@ -21,6 +21,7 @@ from cayu.runtime import (
     InMemoryBudgetLedger,
     InMemorySessionStore,
     ModelCompactor,
+    ModelCompletionStageDisposition,
     RunRequest,
 )
 from cayu.runtime._event_projection import public_event_sequence
@@ -165,9 +166,23 @@ class _LoseFirstReconciliationAcknowledgement(InMemoryBudgetLedger):
 
 
 class _LoseEveryDispatchFenceAcknowledgement(InMemoryBudgetLedger):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lose_acknowledgements = True
+        self.release_acknowledgements = 0
+
     async def mark_dispatched(self, **kwargs):
-        await super().mark_dispatched(**kwargs)
-        raise RuntimeError("dispatch fence acknowledgement remains unavailable")
+        records = await super().mark_dispatched(**kwargs)
+        if self.lose_acknowledgements:
+            raise RuntimeError("dispatch fence acknowledgement remains unavailable")
+        return records
+
+    async def release_pre_provider_dispatch(self, **kwargs):
+        reconciliations = await super().release_pre_provider_dispatch(**kwargs)
+        self.release_acknowledgements += 1
+        if self.release_acknowledgements == 1:
+            raise RuntimeError("pre-provider release acknowledgement lost after commit")
+        return reconciliations
 
 
 class _LoseFirstSettlementEventAcknowledgementStore(InMemorySessionStore):
@@ -181,6 +196,37 @@ class _LoseFirstSettlementEventAcknowledgementStore(InMemorySessionStore):
             await super().append_event(session_id, event)
             raise RuntimeError("session event acknowledgement lost after commit")
         await super().append_event(session_id, event)
+
+
+class _RejectFirstModelStageDispatchReceipt(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reject_dispatch_receipt = True
+
+    async def mark_model_completion_stage_dispatched(self, session_id, *, stage):
+        if self.reject_dispatch_receipt:
+            raise RuntimeError("model-stage dispatch receipt rejected before commit")
+        return await super().mark_model_completion_stage_dispatched(
+            session_id,
+            stage=stage,
+        )
+
+
+class _RewritePreProviderReleaseLedger(InMemoryBudgetLedger):
+    def __init__(self) -> None:
+        super().__init__(reservation_ttl_seconds=None)
+        self.original_reserved_amount: Decimal | None = None
+
+    async def release_pre_provider_dispatch(self, **kwargs):
+        for reservation_id in kwargs["reservation_ids"]:
+            original = self._records[reservation_id]
+            if self.original_reserved_amount is None:
+                self.original_reserved_amount = original.reserved_amount
+            self._records[reservation_id] = original.model_copy(
+                update={"reserved_amount": Decimal("0")},
+                deep=True,
+            )
+        return await super().release_pre_provider_dispatch(**kwargs)
 
 
 class _MutatedSettlementLoadLedger(InMemoryBudgetLedger):
@@ -1259,7 +1305,7 @@ def test_shared_ledger_routes_pending_outbox_to_its_session_store_owner() -> Non
     asyncio.run(scenario())
 
 
-def test_unresolved_dispatch_fence_acknowledgement_retains_recovery_stage() -> None:
+def test_unresolved_dispatch_fence_acknowledgement_releases_budget() -> None:
     async def scenario() -> None:
         session_id = "sess_model_budget_dispatch_fence_unresolved"
         store = InMemorySessionStore()
@@ -1278,22 +1324,122 @@ def test_unresolved_dispatch_fence_acknowledgement_retains_recovery_stage() -> N
 
         assert len(provider.requests) == 0
         active = await store.load_active_model_completion_stage(session_id)
-        assert active is not None
+        assert active is None
         record = next(iter(ledger._records.values()))
-        assert record.status == "active"
-        assert record.dispatch_id == active.stage.stage_id
-        assert ledger._settlements == {}
+        assert record.status == "released"
+        assert record.dispatch_id is not None
+        assert (
+            await store.load_model_completion_stage_dispatch(
+                session_id,
+                record.dispatch_id,
+            )
+            is None
+        )
+        settlement = await store.load_model_completion_stage_settlement(
+            session_id,
+            record.dispatch_id,
+        )
+        assert settlement is not None
+        assert (
+            settlement.disposition is ModelCompletionStageDisposition.FAILED_BEFORE_PROVIDER_EFFECT
+        )
+        assert settlement.reason_code == "model_attempt_failed"
+        budget_settlement = next(iter(ledger._settlements.values()))
+        assert budget_settlement.reservation_id == record.reservation_id
+        assert budget_settlement.reconciliation.status == "released"
+        assert budget_settlement.event_published is True
+        assert ledger.release_acknowledgements == 2
+
+        ledger.lose_acknowledgements = False
+        async for _event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_model_budget_released_after_unresolved_fence",
+                messages=[Message.text("user", "capacity is available again")],
+            )
+        ):
+            pass
+        assert len(provider.requests) == 1
+        assert await store.load_active_model_completion_stage(session_id) is None
+        assert (
+            await store.load_model_completion_stage_settlement(
+                session_id,
+                record.dispatch_id,
+            )
+            == settlement
+        )
+
+    asyncio.run(scenario())
+
+
+def test_rejected_model_stage_dispatch_receipt_releases_budget() -> None:
+    async def scenario() -> None:
+        store = _RejectFirstModelStageDispatchReceipt()
+        ledger = InMemoryBudgetLedger(reservation_ttl_seconds=None)
+        provider = _CompletedProvider()
+        app = _app(store, ledger, provider)
 
         async for _event in app.run(
             RunRequest(
                 agent_name="assistant",
-                session_id="sess_model_budget_blocked_by_unresolved_fence",
-                messages=[Message.text("user", "must remain blocked")],
+                session_id="sess_model_stage_dispatch_receipt_rejected",
+                messages=[Message.text("user", "fail before provider dispatch")],
             )
         ):
             pass
-        assert len(provider.requests) == 0
-        assert await store.load_active_model_completion_stage(session_id) == active
+
+        assert provider.requests == []
+        first_record = next(iter(ledger._records.values()))
+        assert first_record.status == "released"
+        assert first_record.dispatch_id is not None
+        assert (
+            await store.load_active_model_completion_stage(
+                "sess_model_stage_dispatch_receipt_rejected"
+            )
+            is None
+        )
+
+        store.reject_dispatch_receipt = False
+        async for _event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_model_stage_dispatch_receipt_recovered",
+                messages=[Message.text("user", "use the released capacity")],
+            )
+        ):
+            pass
+        assert len(provider.requests) == 1
+
+    asyncio.run(scenario())
+
+
+def test_pre_provider_release_rejects_rewritten_reservation_authority() -> None:
+    async def scenario() -> None:
+        session_id = "sess_model_stage_hostile_budget_release"
+        store = _RejectFirstModelStageDispatchReceipt()
+        ledger = _RewritePreProviderReleaseLedger()
+        provider = _CompletedProvider()
+        app = _app(store, ledger, provider)
+
+        with pytest.raises(
+            RuntimeError,
+            match="Budget ledger changed its reservation authority",
+        ):
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "reject rewritten accounting")],
+                )
+            ):
+                pass
+
+        assert provider.requests == []
+        assert ledger.original_reserved_amount == Decimal("1")
+        stored = next(iter(ledger._records.values()))
+        assert stored.reserved_amount == Decimal("0")
+        assert await _budget_events(store, session_id) == []
+        assert await store.load_active_model_completion_stage(session_id) is not None
 
     asyncio.run(scenario())
 

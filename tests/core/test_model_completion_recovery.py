@@ -3,26 +3,34 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from tests.core._execution_profile_fixtures import versioned_test_provider_identity
 
-from cayu import SQLiteSessionStore
+from cayu import SQLiteBudgetLedger, SQLiteSessionStore
 from cayu.core import AgentSpec, Event, EventType, ExecutionProfileBehaviorIdentity, Message
 from cayu.core.messages import ToolCallPart, ToolResultPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
+    BudgetLimit,
+    BudgetReservation,
     CayuApp,
     EventQuery,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
+    InMemoryBudgetLedger,
     InMemorySessionStore,
     InteractionStatus,
     InteractionSummaryEvidence,
+    ModelCompletionManualRecoveryRequest,
     ModelCompletionManualRecoveryRequired,
+    ModelCompletionStageDisposition,
+    ModelPrice,
+    PriceBook,
     ResumeRequest,
     RunLimits,
     RunRequest,
@@ -49,7 +57,12 @@ from cayu.runtime.approvals import (
     ToolApprovalDecision,
     ToolApprovalRequest,
 )
-from cayu.runtime.budgets import InMemoryBudgetStore
+from cayu.runtime.budgets import (
+    BudgetReservationRecoveryContext,
+    InMemoryBudgetStore,
+    budget_reservation_authority_sha256,
+    budget_settlement_id,
+)
 from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -710,6 +723,9 @@ async def _stage_in_flight_model_boundary(
     *,
     session_id: str,
     provider_name: str,
+    dispatched: bool = True,
+    reservation_ids: tuple[str, ...] = ("reservation:ambiguous-dispatch",),
+    budget_reservations: tuple[BudgetReservationRecoveryContext, ...] = (),
 ) -> tuple[Session, Message, ModelCompletionStage]:
     user_message = Message.text("user", "do not dispatch twice")
     interaction_id = f"interaction-{session_id}"
@@ -765,6 +781,7 @@ async def _stage_in_flight_model_boundary(
         interaction_id=interaction_id,
     )
     logical_step_id = f"mstep_{'4' * 32}"
+    model_attempt_id = f"matt_{'5' * 32}"
     prepared = await store.prepare_model_completion_stage(
         session_id,
         request=ModelCompletionStageRequest(
@@ -775,20 +792,29 @@ async def _stage_in_flight_model_boundary(
                 "schema_version": 1,
                 "purpose": "assistant-turn",
                 "logical_step_id": logical_step_id,
+                "model_attempt_id": model_attempt_id,
+                "interaction_id": interaction_id,
                 "provider_name": provider_name,
                 "requested_model": "fake-model",
                 "source_transcript_cursor": 1,
                 "request_fingerprint": "1" * 64,
                 "recovery_context": ModelCompletionRecoveryContext(
+                    interaction_id=interaction_id,
                     execution_profile_fingerprint=execution_profile.fingerprint,
+                    budget_reservations=budget_reservations,
                 ).model_dump(mode="json"),
             },
-            reservation_ids=("reservation:ambiguous-dispatch",),
+            reservation_ids=reservation_ids,
         ),
         expected_statuses={SessionStatus.RUNNING},
         expected_run_epoch=running.run_epoch,
         expected_transcript_cursor=1,
     )
+    if dispatched:
+        await store.mark_model_completion_stage_dispatched(
+            session_id,
+            stage=prepared.stage,
+        )
     return running, user_message, prepared.stage
 
 
@@ -1079,6 +1105,337 @@ def test_resume_rejects_in_flight_model_boundary_before_status_change() -> None:
     assert active.stage.reservation_ids == ("reservation:ambiguous-dispatch",)
     assert asyncio.run(store.load_transcript(interrupted.id)) == [user_message]
     assert provider.requests == []
+
+
+def test_incomplete_recovery_abandons_prepared_stage_before_provider_dispatch() -> None:
+    async def run():
+        store = InMemorySessionStore()
+        ledger = InMemoryBudgetLedger(reservation_ttl_seconds=None)
+        provider = _RecordingProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("continued once"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            ]
+        )
+        limit = BudgetLimit(
+            scope="app",
+            max_estimated_cost=Decimal("1"),
+            pricing=PriceBook(
+                prices=(
+                    ModelPrice.fixed(
+                        provider_name=provider.name,
+                        model="fake-model",
+                        input_per_million=Decimal("1"),
+                        output_per_million=Decimal("0"),
+                    ),
+                )
+            ),
+            reservation=BudgetReservation(
+                max_input_tokens=1_000_000,
+                max_output_tokens=0,
+            ),
+        )
+        attempt_identity = ModelAttemptIdentity(
+            model_step_id=f"mstep_{'4' * 32}",
+            model_attempt_id=f"matt_{'5' * 32}",
+        )
+        reserved = await ledger.reserve(
+            limit=limit,
+            session_id="model-recovery-prepared-before-dispatch",
+            agent_name="assistant",
+            provider_name=provider.name,
+            model="fake-model",
+            model_attempt_identity=attempt_identity,
+            settlement_event_payload={
+                "interaction_id": "interaction-model-recovery-prepared-before-dispatch"
+            },
+        )
+        assert reserved.record is not None
+        running, user_message, stage = await _stage_in_flight_model_boundary(
+            store,
+            session_id="model-recovery-prepared-before-dispatch",
+            provider_name=provider.name,
+            dispatched=False,
+            reservation_ids=(reserved.record.reservation_id,),
+            budget_reservations=(
+                BudgetReservationRecoveryContext(
+                    reservation_id=reserved.record.reservation_id,
+                    budget_limit_id=reserved.record.budget_limit_id,
+                    reservation_authority_sha256=budget_reservation_authority_sha256(
+                        reserved.record
+                    ),
+                ),
+            ),
+        )
+        await ledger.mark_dispatched(
+            reservation_ids=(reserved.record.reservation_id,),
+            dispatch_id=stage.stage_id,
+        )
+        app = CayuApp(
+            session_store=store,
+            budget_ledger=ledger,
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        recovery = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=running.id,
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+        assert provider.requests == []
+        assert await store.load_active_model_completion_stage(running.id) is None
+        assert await store.load_model_completion_stage_dispatch(running.id, stage.stage_id) is None
+        assert await store.load_model_completion_stage(running.id, stage.stage_id) is None
+        released = await ledger.load_reservation(reserved.record.reservation_id)
+        assert released is not None
+        assert released.status == "released"
+        assert released.dispatch_id == stage.stage_id
+        settlement = await ledger.load_settlement(
+            budget_settlement_id(reserved.record.reservation_id)
+        )
+        assert settlement is not None and settlement.event_published is True
+        replacement = await ledger.reserve(
+            limit=limit,
+            session_id="model-recovery-replacement-budget",
+            agent_name="assistant",
+            provider_name=provider.name,
+            model="fake-model",
+            model_attempt_identity=ModelAttemptIdentity(
+                model_step_id=f"mstep_{'6' * 32}",
+                model_attempt_id=f"matt_{'7' * 32}",
+            ),
+        )
+        assert replacement.accepted is True
+
+        resume_events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=running.id,
+                    messages=[Message.text("user", "continue safely")],
+                )
+            )
+        ]
+        return store, provider, running, user_message, recovery, resume_events
+
+    store, provider, running, user_message, recovery, resume_events = asyncio.run(run())
+    persisted = asyncio.run(store.load(running.id))
+
+    assert recovery.status is SessionStatus.INTERRUPTED
+    assert persisted is not None and persisted.status is SessionStatus.COMPLETED
+    assert len(provider.requests) == 1
+    assert asyncio.run(store.load_transcript(running.id))[0] == user_message
+    assert resume_events[-1].type is EventType.SESSION_COMPLETED
+
+
+@pytest.mark.parametrize("ledger_backend", ["memory", "sqlite"])
+def test_manual_model_recovery_settles_budget_before_clearing_stage(
+    ledger_backend: str,
+    tmp_path: Path,
+) -> None:
+    class FailSecondManualReconciliationLedger(InMemoryBudgetLedger):
+        def __init__(self) -> None:
+            super().__init__(reservation_ttl_seconds=None)
+            self.reconcile_calls = 0
+
+        async def reconcile(self, **kwargs):
+            self.reconcile_calls += 1
+            if self.reconcile_calls == 2:
+                raise RuntimeError("simulated partial manual reconciliation failure")
+            return await super().reconcile(**kwargs)
+
+    async def run():
+        store = InMemorySessionStore()
+        ledger = (
+            FailSecondManualReconciliationLedger()
+            if ledger_backend == "memory"
+            else SQLiteBudgetLedger(
+                tmp_path / "manual-model-recovery-budget.sqlite",
+                reservation_ttl_seconds=None,
+            )
+        )
+        provider = _RecordingProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("continued after manual settlement"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            ]
+        )
+        limit = BudgetLimit(
+            scope="app",
+            max_estimated_cost=Decimal("1"),
+            pricing=PriceBook(
+                prices=(
+                    ModelPrice.fixed(
+                        provider_name=provider.name,
+                        model="fake-model",
+                        input_per_million=Decimal("1"),
+                        output_per_million=Decimal("0"),
+                    ),
+                )
+            ),
+            reservation=BudgetReservation(
+                max_input_tokens=1_000_000,
+                max_output_tokens=0,
+            ),
+        )
+        attempt_identity = ModelAttemptIdentity(
+            model_step_id=f"mstep_{'4' * 32}",
+            model_attempt_id=f"matt_{'5' * 32}",
+        )
+        reserved = await ledger.reserve(
+            limit=limit,
+            session_id="model-recovery-explicit-terminal-settlement",
+            agent_name="assistant",
+            provider_name=provider.name,
+            model="fake-model",
+            model_attempt_identity=attempt_identity,
+            settlement_event_payload={
+                "interaction_id": ("interaction-model-recovery-explicit-terminal-settlement")
+            },
+        )
+        assert reserved.record is not None
+        second_reserved = await ledger.reserve(
+            limit=BudgetLimit(
+                scope="agent",
+                key="assistant",
+                max_estimated_cost=Decimal("1"),
+                pricing=limit.pricing,
+                reservation=limit.reservation,
+            ),
+            session_id="model-recovery-explicit-terminal-settlement",
+            agent_name="assistant",
+            provider_name=provider.name,
+            model="fake-model",
+            model_attempt_identity=attempt_identity,
+            settlement_event_payload={
+                "interaction_id": ("interaction-model-recovery-explicit-terminal-settlement")
+            },
+        )
+        assert second_reserved.record is not None
+        reservation_records = (reserved.record, second_reserved.record)
+        reservation_ids = tuple(record.reservation_id for record in reservation_records)
+        running, _user_message, stage = await _stage_in_flight_model_boundary(
+            store,
+            session_id="model-recovery-explicit-terminal-settlement",
+            provider_name=provider.name,
+            reservation_ids=reservation_ids,
+            budget_reservations=tuple(
+                BudgetReservationRecoveryContext(
+                    reservation_id=record.reservation_id,
+                    budget_limit_id=record.budget_limit_id,
+                    reservation_authority_sha256=budget_reservation_authority_sha256(record),
+                )
+                for record in reservation_records
+            ),
+        )
+        await ledger.mark_dispatched(
+            reservation_ids=reservation_ids,
+            dispatch_id=stage.stage_id,
+        )
+        app = CayuApp(
+            session_store=store,
+            budget_ledger=ledger,
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        with pytest.raises(ModelCompletionManualRecoveryRequired):
+            await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(
+                    session_id=running.id,
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+        recovered_owner = await store.load(running.id)
+        assert recovered_owner is not None
+        assert recovered_owner.run_epoch > stage.source_run_epoch
+        manual_request = ModelCompletionManualRecoveryRequest(
+            session_id=running.id,
+            stage_id=stage.stage_id,
+            expected_run_epoch=recovered_owner.run_epoch,
+            terminal_status=SessionStatus.FAILED,
+        )
+        if ledger_backend == "memory":
+            with pytest.raises(
+                RuntimeError,
+                match="simulated partial manual reconciliation failure",
+            ):
+                await app.recover_model_completion_stage(manual_request)
+            retained = await store.load_active_model_completion_stage(running.id)
+            assert retained is not None and retained.stage == stage
+            retained_session = await store.load(running.id)
+            assert retained_session is not None
+            assert retained_session.status is SessionStatus.RUNNING
+            first_partial = await ledger.load_reservation(reservation_ids[0])
+            second_partial = await ledger.load_reservation(reservation_ids[1])
+            assert first_partial is not None and first_partial.status == "reconciled"
+            assert second_partial is not None and second_partial.status == "active"
+            assert (
+                await store.load_model_completion_stage_settlement(
+                    running.id,
+                    stage.stage_id,
+                )
+                is None
+            )
+        result = await app.recover_model_completion_stage(manual_request)
+        assert result.session.status is SessionStatus.FAILED
+        assert result.settlement.disposition is (
+            ModelCompletionStageDisposition.PROVIDER_EFFECT_OUTCOME_UNKNOWN
+        )
+        assert result.settlement.settled_reservation_ids == reservation_ids
+        assert [event.type for event in result.budget_events] == [
+            EventType.BUDGET_RECONCILED,
+            EventType.BUDGET_RECONCILED,
+        ]
+        assert await store.load_active_model_completion_stage(running.id) is None
+        for reservation_id in reservation_ids:
+            reconciled = await ledger.load_reservation(reservation_id)
+            assert reconciled is not None and reconciled.status == "reconciled"
+            budget_settlement = await ledger.load_settlement(budget_settlement_id(reservation_id))
+            assert budget_settlement is not None
+            assert budget_settlement.settlement_kind == "conservative"
+            assert budget_settlement.reconciliation.actual_amount == reconciled.reserved_amount
+            assert budget_settlement.event_published is True
+
+        replay = await app.recover_model_completion_stage(manual_request)
+        assert replay.replayed is True
+        assert replay.settlement == result.settlement
+
+        recovery = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id=running.id,
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+        resumed = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=running.id,
+                    messages=[Message.text("user", "continue after explicit recovery")],
+                )
+            )
+        ]
+        if isinstance(ledger, SQLiteBudgetLedger):
+            await ledger.close()
+        return store, provider, result, stage, recovery, resumed
+
+    store, provider, result, stage, recovery, resumed = asyncio.run(run())
+    settlement = asyncio.run(
+        store.load_model_completion_stage_settlement(result.session.id, stage.stage_id)
+    )
+
+    assert settlement == result.settlement
+    assert recovery.status is SessionStatus.FAILED
+    assert len(provider.requests) == 1
+    assert resumed[-1].type is EventType.SESSION_COMPLETED
 
 
 def test_resume_promotes_tool_completion_and_recovers_round_before_next_provider_call(

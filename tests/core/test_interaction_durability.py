@@ -1096,6 +1096,7 @@ class CommitThenLoseInteractionTransitionAcknowledgementStore(InMemorySessionSto
         self.remaining_lost_acknowledgements = lost_acknowledgements
         self.failure_factory = failure_factory
         self.attempted_events: list[Event] = []
+        self.attempted_model_completion_stage_settlements = []
 
     async def publish_interaction_transition(
         self,
@@ -1105,14 +1106,17 @@ class CommitThenLoseInteractionTransitionAcknowledgementStore(InMemorySessionSto
         from_statuses,
         to_status,
         only_if_no_queued_messages=False,
+        model_completion_stage_settlement=None,
     ):
         self.attempted_events.append(event.model_copy(deep=True))
+        self.attempted_model_completion_stage_settlements.append(model_completion_stage_settlement)
         result = await super().publish_interaction_transition(
             session_id,
             event=event,
             from_statuses=from_statuses,
             to_status=to_status,
             only_if_no_queued_messages=only_if_no_queued_messages,
+            model_completion_stage_settlement=model_completion_stage_settlement,
         )
         if self.remaining_lost_acknowledgements > 0:
             self.remaining_lost_acknowledgements -= 1
@@ -1739,6 +1743,26 @@ def test_runtime_reconstructs_interaction_transition_after_commit_acknowledgemen
         assert sum(event.type == expected_event_type for event in durable) == 1
         assert sum(event.type == expected_event_type for event in events) == 1
         assert len(provider.requests) == 1
+        attempted_settlements = store.attempted_model_completion_stage_settlements
+        assert len(attempted_settlements) == lost_acknowledgements + 1
+        if provider_type is FailingProvider:
+            settlement_request = attempted_settlements[0]
+            assert settlement_request is not None
+            assert all(attempted == settlement_request for attempted in attempted_settlements)
+            assert (
+                settlement_request.disposition
+                is sessions_module.ModelCompletionStageDisposition.PROVIDER_EFFECT_OUTCOME_UNKNOWN
+            )
+            assert await store.load_active_model_completion_stage(session.id) is None
+            settlement = await store.load_model_completion_stage_settlement(
+                session.id,
+                settlement_request.stage_id,
+            )
+            assert settlement is not None
+            assert settlement.stage_id == settlement_request.stage_id
+            assert settlement.reason_code == "model_attempt_failed"
+        else:
+            assert all(attempted is None for attempted in attempted_settlements)
 
     asyncio.run(run())
 

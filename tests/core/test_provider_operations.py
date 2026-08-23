@@ -1128,6 +1128,8 @@ def test_background_dispatch_rejects_unrecoverable_secret_semantics_before_start
 
 
 def test_offline_recovery_context_is_bounded_before_stage_storage() -> None:
+    with pytest.raises(ValidationError, match="interaction_id.*cannot be blank"):
+        ModelCompletionRecoveryContext(interaction_id=" ")
     with pytest.raises(ValidationError, match="less than or equal to 256"):
         ModelCompletionRecoveryContext(max_steps=257)
     with pytest.raises(ValidationError, match="request_metadata cannot contain more than"):

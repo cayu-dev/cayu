@@ -18,6 +18,7 @@ from tests.core._budget_ledger_contract import (
     assert_portable_text_boundaries,
     assert_prepriced_reservation_stores_only_durable_billing_identity,
     assert_reservation_identity_collision_is_rejected,
+    assert_runtime_manual_model_recovery_settles_dispatched_reservation,
     assert_runtime_publishes_cross_session_ttl_release,
     assert_runtime_reconstructs_dispatch_fence_acknowledgement,
 )
@@ -223,6 +224,18 @@ def test_postgres_budget_ledger_terminal_settlements_are_idempotent(postgres_dsn
         )
 
     _run(postgres_dsn, ops, clock=clock)
+
+
+def test_postgres_budget_ledger_supports_runtime_manual_model_recovery(
+    postgres_dsn,
+) -> None:
+    async def ops(ledger):
+        await assert_runtime_manual_model_recovery_settles_dispatched_reservation(
+            ledger,
+            _reservation_budget_limit(max_cost="1"),
+        )
+
+    _run(postgres_dsn, ops, reservation_ttl_seconds=None)
 
 
 def test_postgres_budget_ledger_reconstructs_reservations_by_identity(postgres_dsn) -> None:

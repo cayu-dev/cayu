@@ -58,6 +58,7 @@ from cayu.runtime import (
     InMemoryEventSink,
     InMemorySessionStore,
     InvocationOriginTrust,
+    ModelCompletionStageDisposition,
     ModelPrice,
     ModelTarget,
     PriceBook,
@@ -1827,21 +1828,31 @@ def test_step_cancellation_finalizes_started_child_before_replay():
             attempt_id=ctx.attempt_id,
         )
         assert child_session_id is not None
+        prepared_stage = await app.session_store.load_active_model_completion_stage(
+            child_session_id
+        )
+        assert prepared_stage is not None
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
         child = await app.session_store.load(child_session_id)
         active_stage = await app.session_store.load_active_model_completion_stage(child_session_id)
+        settlement = await app.session_store.load_model_completion_stage_settlement(
+            child_session_id,
+            prepared_stage.stage.stage_id,
+        )
         events = await app.session_store.load_events(child_session_id)
-        return child_session_id, child, active_stage, events
+        return child_session_id, child, active_stage, settlement, events
 
-    child_session_id, child, active_stage, events = asyncio.run(cancel_running_step())
+    child_session_id, child, active_stage, settlement, events = asyncio.run(cancel_running_step())
 
     assert provider.closed is True
     assert child is not None
     assert child.status == SessionStatus.INTERRUPTED
-    assert active_stage is not None
-    assert active_stage.stage.state == "in_flight"
+    assert active_stage is None
+    assert settlement is not None
+    assert settlement.disposition is ModelCompletionStageDisposition.PROVIDER_EFFECT_OUTCOME_UNKNOWN
+    assert settlement.reason_code == "model_attempt_interrupted"
     interrupted = [event for event in events if event.type == EventType.SESSION_INTERRUPTED]
     assert len(interrupted) == 1
     assert interrupted[0].payload["abandoned"] is True

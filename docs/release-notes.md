@@ -201,6 +201,58 @@ from schema v2 to v3. Readers accept only the current versions; discard
 pre-change records and recreate disposable prerelease state. No compatibility
 migration is provided.
 
+### Terminal sessions settle exact model-completion attempts
+
+Failed and interrupted interactions now commit their terminal lifecycle event,
+session status, exact model-attempt disposition, and active-stage release in one
+session-store transaction. Definite authentication rejection before any valid
+provider output is recorded as `failed_before_provider_effect`; late or mixed
+authentication failures and other failures after dispatch may have begun are
+recorded conservatively as `provider_effect_outcome_unknown`. Live retries
+atomically mark the prior attempt `superseded`, and a stale worker cannot later
+complete that attempt. Completed attempts retain the existing immutable
+completion and publication receipts. Exact acknowledgement replay, settlement
+inspection, and typed manual recovery use the same identities in memory,
+SQLite, and PostgreSQL. A separate exact dispatch receipt now marks the last
+local boundary before provider-controlled code and occupies a reserved runtime
+operation namespace that public operation APIs reject. Exact active-stage
+validation and receipt insertion share one backend lock or transaction, so a
+live retry cannot supersede the attempt between them. Incomplete recovery
+automatically releases the exact linked budget batch and abandons a receipt-less
+preparation without a provider call, including when the budget dispatch fence
+committed before its acknowledgement was lost,
+while a receipt-bearing synchronous attempt remains conservatively
+outcome-unknown unless provider recovery evidence can reconcile it.
+Terminal stage settlement now also requires a durable terminal settlement and
+audit outbox row for every linked reservation. An accounting failure therefore
+retains the active stage and original provider or cancellation failure for exact
+recovery instead of orphaning shared budget capacity behind a terminal session.
+`CayuApp.recover_model_completion_stage(...)` is the operator boundary for that
+ambiguous synchronous case: it validates frozen reservation authority,
+conservatively charges and publishes every linked settlement, verifies the
+complete reservation set, and only then atomically terminalizes the interaction
+and clears the stage. Exact retries replay the durable result. Direct
+`SessionStore.publish_interaction_transition(...)` settlement is a backend seam,
+not an operator recovery shortcut.
+
+Custom `SessionStore` implementations must accept the optional
+`model_completion_stage_settlement` argument to
+`publish_interaction_transition(...)` and atomically persist its settlement,
+interaction event, transition receipt, session status, and active-marker
+deletion. The request's `settled_reservation_ids` must exactly equal the active
+stage's ordered reservation set. They must also implement the protected exact
+dispatch and settlement lookups plus the atomic dispatch hook using the reserved
+runtime namespace.
+These hooks deliberately have no lossy compatibility fallback; custom stores
+must provide equivalent transaction and fail-closed validation semantics before
+running this release.
+
+Custom `BudgetLedger` implementations must also implement the atomic
+`release_pre_provider_dispatch(...)` transition. It releases a complete batch
+only when every reservation is unfenced or bound to the supplied exact dispatch
+identity, retains idempotent release settlement outbox rows, and rejects a
+conflicting dispatch or terminal outcome without partially freeing capacity.
+
 ### Captured sessions become durable evaluations from the Control Plane
 
 Completed and failed retained sessions now expose an **Evaluate** workflow that

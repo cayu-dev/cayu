@@ -329,6 +329,60 @@ class SQLiteBudgetLedger(BudgetLedger):
                 self._connection.rollback()
                 raise
 
+    async def release_pre_provider_dispatch(
+        self,
+        *,
+        reservation_ids: tuple[str, ...],
+        dispatch_id: str,
+        reason: str,
+        occurred_at: datetime | None = None,
+    ) -> tuple[BudgetReconciliation, ...]:
+        reservation_ids = _validate_reservation_id_batch(reservation_ids)
+        dispatch_id = require_clean_nonblank(dispatch_id, "dispatch_id")
+        reason = require_clean_nonblank(reason, "reason")
+        released_at = (
+            _utc_datetime(occurred_at, "occurred_at") if occurred_at is not None else self._clock()
+        )
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                records = tuple(
+                    self._load_record_unlocked(reservation_id) for reservation_id in reservation_ids
+                )
+                for record in records:
+                    if record.dispatch_id not in {None, dispatch_id}:
+                        raise ValueError(
+                            "Budget reservation has a conflicting dispatch: "
+                            f"{record.reservation_id}"
+                        )
+                    if record.status not in {"active", "released"}:
+                        raise ValueError(
+                            f"Budget reservation is not active: {record.reservation_id}"
+                        )
+                released_records = tuple(
+                    _released_record(record, reason=reason, updated_at=released_at)
+                    for record in records
+                )
+                reconciliations = tuple(
+                    _reconciliation_from_record(record, settlement_kind="released")
+                    for record in released_records
+                )
+                for original, released, reconciliation in zip(
+                    records,
+                    released_records,
+                    reconciliations,
+                    strict=True,
+                ):
+                    self._insert_or_validate_settlement_unlocked(
+                        _budget_settlement_record(original, reconciliation)
+                    )
+                    self._update_record_unlocked(released)
+                self._connection.commit()
+                return reconciliations
+            except BaseException:
+                self._connection.rollback()
+                raise
+
     async def heartbeat(self, *, reservation_id: str) -> bool:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
         async with self._lock:

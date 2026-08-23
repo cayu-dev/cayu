@@ -94,6 +94,7 @@ from cayu.providers import (
     CachePolicy,
     HostedToolCapabilityError,
     ModelProvider,
+    ModelProviderError,
     ModelRequest,
     NativeStructuredOutputSchemaInvalid,
     ProviderOperationMode,
@@ -167,6 +168,7 @@ from cayu.runtime._model_errors import (
     detach_billing_identity_cancellation_group,
 )
 from cayu.runtime._model_step_executor import (
+    ModelAttemptFailed,
     ModelCompletionPublicationRequest,
     ModelCompletionPublicationResult,
     ModelCompletionRecoveryContext,
@@ -206,6 +208,7 @@ from cayu.runtime._run_limits import (
     BudgetReservationLeaseLostBeforeModelDispatch,
     BudgetStepReservation,
     LimitEvaluation,
+    ModelCompletionBudgetSettlementPending,
     RunLimitController,
     RunLimitGate,
     SessionUsageTracker,
@@ -263,6 +266,7 @@ from cayu.runtime.budgets import (
     _effective_budget_limit_id,
     budget_check_payload,
     budget_limits_for_session,
+    budget_reservation_authority_sha256,
     budget_reservation_payload,
     copy_budget_policy,
     has_deferred_contextual_price,
@@ -408,6 +412,7 @@ from cayu.runtime.provider_operations import (
     ProviderOperationEvidenceError,
     ProviderOperationInspectionStatus,
     inspect_provider_operation,
+    load_recoverable_provider_operation,
     pending_provider_operation_disposition_from_checkpoint,
     provider_operation_resolution_outcome_event_id,
     validate_provider_operation_resolution_outcome_event,
@@ -453,6 +458,11 @@ from cayu.runtime.sessions import (
     InteractionTransitionResult,
     InteractionTransitionSpec,
     InterruptSessionRequest,
+    ModelCompletionManualRecoveryRequest,
+    ModelCompletionManualRecoveryResult,
+    ModelCompletionStageDisposition,
+    ModelCompletionStageSettlement,
+    ModelCompletionStageSettlementRequest,
     ModelTarget,
     ProfiledSessionForkResult,
     PromptAnatomyTransitionReceipt,
@@ -466,6 +476,7 @@ from cayu.runtime.sessions import (
     SessionIdentity,
     SessionInvocationAdmission,
     SessionMessageDeliveryBatch,
+    SessionModelCompletionStageConflict,
     SessionModelTransition,
     SessionOperationPublication,
     SessionOrder,
@@ -508,11 +519,13 @@ from cayu.runtime.sessions import (
     copy_incomplete_session_recovery_request,
     copy_incomplete_sessions_recovery_request,
     copy_interaction_transition_spec,
+    copy_model_completion_manual_recovery_request,
     copy_profiled_session_fork_result,
     copy_resume_request,
     copy_run_request,
     execution_profile_adoption_request_fingerprint,
     fork_session_invocation,
+    model_completion_stage_settlement_request,
     run_request_authority_is_runtime_generated,
     run_request_with_task_invocation,
     runtime_prepared_session_authority,
@@ -3998,6 +4011,36 @@ def _failure_carries_interaction_publication_rejection(
     )
 
 
+def _provider_failure_proves_no_model_effect(failure: BaseException) -> bool:
+    """Return whether typed provider evidence proves dispatch was rejected pre-effect."""
+
+    authentication_rejection_observed = False
+    for candidate in iter_exception_tree(failure):
+        if isinstance(candidate, BaseExceptionGroup):
+            continue
+        attempt_failure = (
+            candidate if isinstance(candidate, ModelAttemptFailed) else exception_cause(candidate)
+        )
+        if isinstance(attempt_failure, ModelAttemptFailed):
+            if attempt_failure.provider_effect_observed:
+                return False
+            provider_failure = (
+                attempt_failure.cause if isinstance(candidate, ModelAttemptFailed) else candidate
+            )
+        else:
+            provider_failure = candidate
+        if not isinstance(provider_failure, ModelProviderError):
+            return False
+        if not (
+            provider_failure.status_code == 401
+            or provider_failure.error_type == "authentication_error"
+            or provider_failure.error_code in {"authentication_error", "invalid_api_key"}
+        ):
+            return False
+        authentication_rejection_observed = True
+    return authentication_rejection_observed
+
+
 def _active_transition_matches_profile_decision(
     *,
     transition: EgressAuthorityTransitionRecord | None,
@@ -5257,6 +5300,227 @@ class SessionEngine:
             if interaction_id is not None:
                 _deactivate_session_interaction(request.session_id)
 
+    async def recover_model_completion_stage(
+        self,
+        request: ModelCompletionManualRecoveryRequest,
+    ) -> ModelCompletionManualRecoveryResult:
+        """Conservatively settle one ambiguous model dispatch before clearing it."""
+
+        request = copy_model_completion_manual_recovery_request(request)
+        session = await self.session_store.load(request.session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {request.session_id}")
+        stage = await self.session_store.load_model_completion_stage(
+            request.session_id,
+            request.stage_id,
+        )
+        if stage is None or stage.state != "in_flight":
+            raise SessionModelCompletionStageConflict(
+                "Manual model recovery requires one exact in-flight stage."
+            )
+        recovery_context = model_completion_recovery_context_from_stage(stage)
+        if recovery_context is None:
+            raise SessionModelCompletionStageConflict(
+                "Manual model recovery requires durable accounting and profile authority."
+            )
+        interaction_id = stage.intent.get("interaction_id")
+        provider_name = stage.intent.get("provider_name")
+        model_attempt_id = stage.intent.get("model_attempt_id")
+        if not all(
+            type(value) is str for value in (interaction_id, provider_name, model_attempt_id)
+        ):
+            raise SessionModelCompletionStageConflict(
+                "Manual model recovery lost its interaction, provider, or attempt identity."
+            )
+        assert isinstance(interaction_id, str)
+        assert isinstance(provider_name, str)
+        assert isinstance(model_attempt_id, str)
+        model_attempt_identity = ModelAttemptIdentity(
+            model_step_id=stage.logical_step_id,
+            model_attempt_id=model_attempt_id,
+        )
+
+        expected_settlement = model_completion_stage_settlement_request(
+            stage,
+            interaction_id=interaction_id,
+            disposition=ModelCompletionStageDisposition.PROVIDER_EFFECT_OUTCOME_UNKNOWN,
+            reason_code="operator_outcome_unknown",
+            execution_profile_fingerprint=(recovery_context.execution_profile_fingerprint),
+            settlement_run_epoch=request.expected_run_epoch,
+            settled_reservation_ids=stage.reservation_ids,
+        )
+
+        def validate_replay(
+            settlement: ModelCompletionStageSettlement,
+        ) -> ModelCompletionStageSettlement:
+            replay_request = ModelCompletionStageSettlementRequest.model_validate(
+                settlement.model_dump(
+                    mode="python",
+                    include=set(ModelCompletionStageSettlementRequest.model_fields),
+                )
+            )
+            if replay_request != expected_settlement:
+                raise SessionModelCompletionStageConflict(
+                    "Manual model recovery conflicts with the durable stage settlement."
+                )
+            return settlement
+
+        prior = await self.session_store.load_model_completion_stage_settlement(
+            request.session_id,
+            request.stage_id,
+        )
+        if prior is not None:
+            budget_events = await self._run_limit_controller.recover_pending_budget_settlements(
+                session_id=request.session_id
+            )
+            await self._run_limit_controller.require_model_completion_reservation_settlements(
+                reservation_ids=stage.reservation_ids,
+                recovery_contexts=recovery_context.budget_reservations,
+                dispatch_id=stage.stage_id,
+            )
+            current = await self.session_store.load(request.session_id)
+            if current is None:
+                raise KeyError(f"Session not found: {request.session_id}")
+            if current.status is not request.terminal_status:
+                raise SessionStatusConflict(
+                    "Manual model recovery replay conflicts with the terminal session status."
+                )
+            return ModelCompletionManualRecoveryResult(
+                session=current,
+                settlement=validate_replay(prior),
+                budget_events=tuple(budget_events),
+                replayed=True,
+            )
+
+        if session.run_epoch != request.expected_run_epoch:
+            raise SessionRunFenced(
+                "Manual model recovery run epoch is stale: expected "
+                f"{request.expected_run_epoch}, current {session.run_epoch}."
+            )
+        if session.status not in {
+            SessionStatus.RUNNING,
+            SessionStatus.INTERRUPTING,
+            request.terminal_status,
+        }:
+            raise SessionStatusConflict(
+                "Manual model recovery cannot replace a different terminal session outcome."
+            )
+        active = await self.session_store.load_active_model_completion_stage(request.session_id)
+        if active is None or active.stage != stage:
+            raise SessionModelCompletionStageConflict(
+                "Manual model recovery no longer owns the exact active stage."
+            )
+        if stage.intent.get("provider_operation_start") is not None:
+            raise ModelCompletionManualRecoveryRequired(
+                "Background provider work must use provider-operation resolution."
+            )
+        dispatch = await self.session_store.load_model_completion_stage_dispatch(
+            request.session_id,
+            request.stage_id,
+        )
+        if dispatch is None:
+            raise SessionModelCompletionStageConflict(
+                "Receipt-less model completion must use automatic pre-provider recovery."
+            )
+
+        budget_events = (
+            await self._run_limit_controller.reconcile_manual_model_completion_reservations(
+                reservation_ids=stage.reservation_ids,
+                recovery_contexts=recovery_context.budget_reservations,
+                session=session,
+                provider_name=provider_name,
+                model_attempt_identity=model_attempt_identity,
+                dispatch_id=stage.stage_id,
+            )
+        )
+        await self._run_limit_controller.require_model_completion_reservation_settlements(
+            reservation_ids=stage.reservation_ids,
+            recovery_contexts=recovery_context.budget_reservations,
+            dispatch_id=stage.stage_id,
+        )
+
+        current = await self.session_store.load(request.session_id)
+        current_active = await self.session_store.load_active_model_completion_stage(
+            request.session_id
+        )
+        if current is None:
+            raise KeyError(f"Session not found: {request.session_id}")
+        if current.run_epoch != request.expected_run_epoch:
+            raise SessionRunFenced(
+                "Manual model recovery lost its exact run epoch after budget settlement."
+            )
+        if current_active is None or current_active.stage != stage:
+            raise SessionModelCompletionStageConflict(
+                "Manual model recovery lost its active stage after budget settlement."
+            )
+
+        recovery_event = Event(
+            id="evt_model_completion_manual_"
+            + hashlib.sha256(
+                canonical_durable_json_bytes(
+                    request.model_dump(mode="json"),
+                    "model_completion_manual_recovery",
+                )
+            ).hexdigest(),
+            type=(
+                EventType.INTERACTION_FAILED
+                if request.terminal_status is SessionStatus.FAILED
+                else EventType.INTERACTION_INTERRUPTED
+            ),
+            session_id=request.session_id,
+            interaction_id=interaction_id,
+            agent_name=current.agent_name,
+            environment_name=current.environment_name,
+        )
+        recovery_event = self._event_writer.prepare(recovery_event)
+        try:
+            transition = await self.session_store.publish_interaction_transition(
+                request.session_id,
+                event=recovery_event,
+                from_statuses={current.status},
+                to_status=request.terminal_status,
+                model_completion_stage_settlement=expected_settlement,
+            )
+        except Exception:
+            reconciled = await self.session_store.load_model_completion_stage_settlement(
+                request.session_id,
+                request.stage_id,
+            )
+            if reconciled is None:
+                raise
+            validate_replay(reconciled)
+            transitioned = await self.session_store.load(request.session_id)
+            if transitioned is None:
+                raise KeyError(f"Session not found: {request.session_id}") from None
+            if transitioned.status is not request.terminal_status:
+                raise SessionStatusConflict(
+                    "Manual model recovery replay conflicts with the terminal session status."
+                ) from None
+            return ModelCompletionManualRecoveryResult(
+                session=transitioned,
+                settlement=reconciled,
+                budget_events=tuple(budget_events),
+                replayed=True,
+            )
+
+        await self._event_writer.fan_out_persisted([transition.event])
+        settlement = await self.session_store.load_model_completion_stage_settlement(
+            request.session_id,
+            request.stage_id,
+        )
+        if settlement is None:
+            raise RuntimeError("Manual model recovery committed without stage settlement.")
+        if transition.session.status is not request.terminal_status:
+            raise SessionStatusConflict(
+                "Manual model recovery committed an unexpected terminal session status."
+            )
+        return ModelCompletionManualRecoveryResult(
+            session=transition.session,
+            settlement=validate_replay(settlement),
+            budget_events=tuple(budget_events),
+            replayed=transition.replayed,
+        )
+
     async def recover_incomplete_sessions(
         self,
         request: IncompleteSessionsRecoveryRequest,
@@ -5853,8 +6117,100 @@ class SessionEngine:
         recovered_active_through: datetime | None = None,
         observed_at: datetime | None = None,
         event_id: str | None = None,
+        execution_profile: ExecutionProfileIdentity | None = None,
+        model_completion_failure: BaseException | None = None,
     ) -> tuple[Session, Event | None, bool]:
         interaction_id = _current_session_interaction_id(session.id)
+        active_model_completion = await self.session_store.load_active_model_completion_stage(
+            session.id
+        )
+        model_completion_settlement: ModelCompletionStageSettlementRequest | None = None
+        active_provider_operation = (
+            None
+            if active_model_completion is None
+            else active_model_completion.stage.intent.get("provider_operation_start")
+        )
+        provider_operation_owned = type(active_provider_operation) is dict
+        model_completion_dispatched = False
+        if active_model_completion is not None and not provider_operation_owned:
+            try:
+                provider_operation_owned = (
+                    await load_recoverable_provider_operation(
+                        self.session_store,
+                        active_model_completion.stage,
+                    )
+                    is not None
+                )
+            except ProviderOperationEvidenceError:
+                provider_operation_owned = True
+        if active_model_completion is not None and not provider_operation_owned:
+            model_completion_dispatched = (
+                await self.session_store.load_model_completion_stage_dispatch(
+                    session.id,
+                    active_model_completion.stage.stage_id,
+                )
+                is not None
+            )
+        if active_model_completion is not None and not provider_operation_owned:
+            recovery_context = model_completion_recovery_context_from_stage(
+                active_model_completion.stage
+            )
+            budget_recovery_contexts = (
+                () if recovery_context is None else recovery_context.budget_reservations
+            )
+            if interaction_id is None:
+                raise SessionModelCompletionStageConflict(
+                    "An active model-completion stage has no active interaction identity."
+                )
+            if to_status is SessionStatus.COMPLETED:
+                raise SessionModelCompletionStageConflict(
+                    "A session cannot complete while a model-completion stage is active."
+                )
+            if to_status not in {SessionStatus.FAILED, SessionStatus.INTERRUPTED}:
+                raise SessionModelCompletionStageConflict(
+                    "An active model-completion stage requires a terminal disposition."
+                )
+            provider_rejected_before_effect = (
+                model_completion_failure is not None
+                and _provider_failure_proves_no_model_effect(model_completion_failure)
+            )
+            failed_before_effect = (
+                not model_completion_dispatched or provider_rejected_before_effect
+            )
+            if not model_completion_dispatched:
+                await self._run_limit_controller.release_pre_provider_dispatch_reservations(
+                    reservation_ids=active_model_completion.stage.reservation_ids,
+                    recovery_contexts=budget_recovery_contexts,
+                    dispatch_id=active_model_completion.stage.stage_id,
+                )
+            await self._run_limit_controller.require_model_completion_reservation_settlements(
+                reservation_ids=active_model_completion.stage.reservation_ids,
+                recovery_contexts=budget_recovery_contexts,
+                dispatch_id=active_model_completion.stage.stage_id,
+            )
+            model_completion_settlement = model_completion_stage_settlement_request(
+                active_model_completion.stage,
+                interaction_id=interaction_id,
+                disposition=(
+                    ModelCompletionStageDisposition.FAILED_BEFORE_PROVIDER_EFFECT
+                    if failed_before_effect
+                    else ModelCompletionStageDisposition.PROVIDER_EFFECT_OUTCOME_UNKNOWN
+                ),
+                reason_code=(
+                    "provider_authentication_failed"
+                    if provider_rejected_before_effect
+                    else (
+                        "model_attempt_failed"
+                        if to_status is SessionStatus.FAILED
+                        else "model_attempt_interrupted"
+                    )
+                ),
+                execution_profile_fingerprint=(
+                    None if execution_profile is None else execution_profile.fingerprint
+                ),
+                settlement_run_epoch=session.run_epoch,
+                settled_reservation_ids=active_model_completion.stage.reservation_ids,
+            )
         if interaction_id is None:
             transitioned = (
                 await self.session_store.transition_status_if_no_queued_messages(
@@ -5954,6 +6310,7 @@ class SessionEngine:
             from_statuses=tuple(replay_from_statuses),
             to_status=to_status,
             only_if_no_queued_messages=only_if_no_queued_messages,
+            model_completion_stage_settlement=model_completion_settlement,
         )
         result: InteractionTransitionResult | None = None
         pending_cancellation: asyncio.CancelledError | None = None
@@ -5961,15 +6318,26 @@ class SessionEngine:
         replay_deadline: float | None = None
         loop = asyncio.get_running_loop()
         for attempt in range(_INTERACTION_TRANSITION_REPLAY_MAX_ATTEMPTS):
-            transition_task = asyncio.create_task(
-                self.session_store.publish_interaction_transition(
+            if replay_transition.model_completion_stage_settlement is None:
+                transition_awaitable = self.session_store.publish_interaction_transition(
                     session.id,
                     event=copy_event(replay_transition.event),
                     from_statuses=set(replay_transition.from_statuses),
                     to_status=replay_transition.to_status,
                     only_if_no_queued_messages=(replay_transition.only_if_no_queued_messages),
                 )
-            )
+            else:
+                transition_awaitable = self.session_store.publish_interaction_transition(
+                    session.id,
+                    event=copy_event(replay_transition.event),
+                    from_statuses=set(replay_transition.from_statuses),
+                    to_status=replay_transition.to_status,
+                    only_if_no_queued_messages=(replay_transition.only_if_no_queued_messages),
+                    model_completion_stage_settlement=(
+                        replay_transition.model_completion_stage_settlement
+                    ),
+                )
+            transition_task = asyncio.create_task(transition_awaitable)
             outcome = await await_shielded_task_outcome(transition_task)
             attempt_failure = _normalize_interaction_transition_child_cancellation(outcome.error)
             attempt_result: InteractionTransitionResult | None = None
@@ -6198,6 +6566,7 @@ class SessionEngine:
         observed_at: datetime | None = None,
         event_id: str | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        model_completion_failure: BaseException | None = None,
         finalize_unsettled_cancellation: bool = True,
     ) -> tuple[Session, Event | None, bool]:
         """Publish from a caller not enclosed by ``_run_session`` cleanup."""
@@ -6213,6 +6582,8 @@ class SessionEngine:
                 recovered_active_through=recovered_active_through,
                 observed_at=observed_at,
                 event_id=event_id,
+                execution_profile=execution_profile,
+                model_completion_failure=model_completion_failure,
             )
         except asyncio.CancelledError as cancellation:
             await self._reconcile_sibling_interaction_transition_cancellation(
@@ -15272,14 +15643,34 @@ class SessionEngine:
                 execution_profile_fingerprint = (
                     None if execution_profile is None else execution_profile.fingerprint
                 )
-                if (
+                interaction_id = _current_session_interaction_id(session.id)
+                if interaction_id is None:
+                    raise RuntimeError(
+                        "Model-completion recovery context requires an active interaction."
+                    )
+                background_provider_operation = (
                     registered_provider.provider.provider_operation_mode
-                    is not ProviderOperationMode.BACKGROUND
-                ):
+                    is ProviderOperationMode.BACKGROUND
+                )
+                budget_reservation_contexts = tuple(
+                    BudgetReservationRecoveryContext(
+                        reservation_id=reservation.record.reservation_id,
+                        budget_limit_id=reservation.record.budget_limit_id,
+                        limit=(reservation.limit if background_provider_operation else None),
+                        reservation_authority_sha256=(
+                            budget_reservation_authority_sha256(reservation.record)
+                        ),
+                    )
+                    for reservation in reservations
+                )
+                if not background_provider_operation:
                     return ModelCompletionRecoveryContext(
-                        execution_profile_fingerprint=execution_profile_fingerprint
+                        interaction_id=interaction_id,
+                        execution_profile_fingerprint=execution_profile_fingerprint,
+                        budget_reservations=budget_reservation_contexts,
                     )
                 context = ModelCompletionRecoveryContext(
+                    interaction_id=interaction_id,
                     execution_profile_fingerprint=execution_profile_fingerprint,
                     task_id=task_id,
                     request_metadata=request_metadata,
@@ -15289,14 +15680,7 @@ class SessionEngine:
                     limits=limits,
                     run_limit_accounting=run_limit_accounting,
                     budget_limits=budget_limits,
-                    budget_reservations=tuple(
-                        BudgetReservationRecoveryContext(
-                            reservation_id=reservation.record.reservation_id,
-                            budget_limit_id=reservation.record.budget_limit_id,
-                            limit=reservation.limit,
-                        )
-                        for reservation in reservations
-                    ),
+                    budget_reservations=budget_reservation_contexts,
                     retry_policy=retry_policy,
                     structured_output_attempt=(
                         structured_output_retries + 1
@@ -15311,9 +15695,8 @@ class SessionEngine:
                 payload = context.model_dump(mode="json")
                 if self._secret_redactor.redact_json(payload) != payload:
                     raise ValueError(
-                        "Background provider-operation recovery semantics contain a workload "
-                        "secret and cannot be persisted exactly; the provider operation was "
-                        "not started."
+                        "Model-completion recovery semantics contain a workload secret and "
+                        "cannot be persisted exactly; the provider operation was not started."
                     )
                 return context
 
@@ -16139,6 +16522,7 @@ class SessionEngine:
                                 agent_name=registered_agent.spec.name,
                                 environment_name=environment_name,
                                 to_status=SessionStatus.INTERRUPTED,
+                                execution_profile=execution_profile,
                             )
                             if interaction_interrupted_event is not None:
                                 yield interaction_interrupted_event
@@ -16790,19 +17174,23 @@ class SessionEngine:
                     )
                 except Exception as task_exc:
                     task_failure_error = task_exc
-            (
-                session,
-                interaction_failed_event,
-                _,
-            ) = await self._publish_sibling_interaction_transition(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                environment_name=environment_name,
-                to_status=SessionStatus.FAILED,
-                observed_at=failure_interaction_observed_at,
-                execution_profile=execution_profile,
-            )
+            try:
+                (
+                    session,
+                    interaction_failed_event,
+                    _,
+                ) = await self._publish_sibling_interaction_transition(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
+                    to_status=SessionStatus.FAILED,
+                    observed_at=failure_interaction_observed_at,
+                    execution_profile=execution_profile,
+                    model_completion_failure=exc,
+                )
+            except ModelCompletionBudgetSettlementPending as accounting_pending:
+                raise exc from accounting_pending
             if interaction_failed_event is not None:
                 yield interaction_failed_event
             payload = exception_failure_payload(
@@ -17571,6 +17959,7 @@ class SessionEngine:
                 agent_name=registered_agent.spec.name,
                 environment_name=environment_name,
                 to_status=SessionStatus.INTERRUPTED,
+                execution_profile=execution_profile,
             )
         if interaction_interrupted_event is not None:
             yield interaction_interrupted_event

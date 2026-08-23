@@ -32,6 +32,7 @@ from cayu.runtime._model_step_executor import (
     ModelCompletionDispatchNotAuthorized,
     ModelCompletionPublicationRequest,
     ModelCompletionPublicationResult,
+    ModelCompletionRecoveryContext,
     ModelStepRun,
 )
 from cayu.runtime._run_limits import RunLimitGate
@@ -526,6 +527,15 @@ async def _create_model_run(
         active_run=None,
         execution_profile=admitted.active_invocation_profile.profile,
         validate_live_model_semantics=lambda: None,
+        model_completion_recovery_context_factory=(
+            lambda billing_identity, _reservations: ModelCompletionRecoveryContext(
+                interaction_id=admitted.active_invocation_profile.interaction_id,
+                billing_identity=billing_identity,
+                execution_profile_fingerprint=(
+                    admitted.active_invocation_profile.profile.fingerprint
+                ),
+            )
+        ),
         model_completion_publisher=publisher,
     )
     return run, request, session, user_message

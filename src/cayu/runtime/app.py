@@ -317,6 +317,8 @@ from cayu.runtime.sessions import (
     IncompleteSessionsRecoveryRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
+    ModelCompletionManualRecoveryRequest,
+    ModelCompletionManualRecoveryResult,
     ModelCompletionStage,
     ModelTarget,
     PendingActionQuery,
@@ -340,6 +342,7 @@ from cayu.runtime.sessions import (
     copy_incomplete_session_recovery_request,
     copy_incomplete_sessions_recovery_request,
     copy_interrupt_session_request,
+    copy_model_completion_manual_recovery_request,
     copy_resume_request,
     system_prompt_messages_sha256,
 )
@@ -2889,6 +2892,38 @@ class CayuApp:
         del request
         result = await recovery
         return await self._project_incomplete_recovery_result_for_public_api(result)
+
+    async def recover_model_completion_stage(
+        self,
+        request: ModelCompletionManualRecoveryRequest,
+    ) -> ModelCompletionManualRecoveryResult:
+        """Settle ambiguous provider work and linked budgets under runtime ownership."""
+
+        if type(request) is not ModelCompletionManualRecoveryRequest:
+            raise TypeError(
+                "Runtime model-completion recovery requires a ModelCompletionManualRecoveryRequest."
+            )
+        session_id = await self._resolve_public_session_id(request.session_id)
+        request = copy_model_completion_manual_recovery_request(
+            request,
+            session_id=session_id,
+        )
+        (
+            requires_completion_decision,
+            admission_failure,
+        ) = await self._verifier_aware_recovery_execution_outcome(
+            session_id=request.session_id,
+            admit_session=False,
+        )
+        if admission_failure is not None:
+            del request
+            raise_task_store_operation_failure(admission_failure)
+        if requires_completion_decision:
+            del request
+            raise TaskCompletionDecisionRequired(
+                "Contracted tasks require the verifier-aware execution entrance."
+            ) from None
+        return await self._session_engine.recover_model_completion_stage(request)
 
     async def _recover_incomplete_session_private(
         self,

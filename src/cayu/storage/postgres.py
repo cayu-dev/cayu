@@ -183,8 +183,11 @@ from cayu.runtime.sessions import (
     McpManifestBaseline,
     McpManifestBaselineLoadResult,
     McpManifestPublicationResult,
+    ModelCompletionStage,
     ModelCompletionStageAbandonmentResult,
+    ModelCompletionStageDispatch,
     ModelCompletionStageResult,
+    ModelCompletionStageSettlementRequest,
     PendingActionIssue,
     PendingActionKind,
     PendingActionListResult,
@@ -284,8 +287,13 @@ from cayu.runtime.sessions import (
     _interaction_transition_receipt_record,
     _interaction_transition_spec_from_receipt,
     _interaction_transition_storage_key,
+    _model_completion_retry_settlement_request,
     _model_completion_stage_abandonment_record,
+    _model_completion_stage_dispatch_record,
+    _model_completion_stage_dispatch_storage_key,
     _model_completion_stage_preparation_record,
+    _model_completion_stage_settlement_record,
+    _model_completion_stage_settlement_storage_key,
     _model_completion_stage_storage_identity,
     _model_completion_stage_terminal_record,
     _model_completion_stage_winner_record,
@@ -312,8 +320,10 @@ from cayu.runtime.sessions import (
     _reconstruct_interaction_transition_receipt,
     _reconstruct_model_completion_stage,
     _reconstruct_model_completion_stage_abandonment,
+    _reconstruct_model_completion_stage_dispatch,
     _reconstruct_runtime_publication_receipt,
     _reject_reserved_runtime_publication_key,
+    _reject_settled_model_completion_stage,
     _replay_model_completion_stage_abandonment,
     _replay_promoted_model_completion_stage,
     _run_session_commit_guard_owned,
@@ -339,7 +349,10 @@ from cayu.runtime.sessions import (
     _validate_model_completion_active_marker_for_promotion,
     _validate_model_completion_preparation_replay_state,
     _validate_model_completion_promotion_replay_active_marker,
+    _validate_model_completion_stage_dispatch,
     _validate_model_completion_stage_for_abandonment,
+    _validate_model_completion_stage_for_dispatch,
+    _validate_model_completion_stage_for_settlement,
     _validate_model_completion_stage_preparation_replay,
     _validate_model_completion_stage_publication,
     _validate_model_completion_stage_release,
@@ -6954,6 +6967,64 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                 await conn.rollback()
                 raise
         return dispatched_records
+
+    async def release_pre_provider_dispatch(
+        self,
+        *,
+        reservation_ids: tuple[str, ...],
+        dispatch_id: str,
+        reason: str,
+        occurred_at: datetime | None = None,
+    ) -> tuple[BudgetReconciliation, ...]:
+        reservation_ids = _validate_reservation_id_batch(reservation_ids)
+        dispatch_id = require_clean_nonblank(dispatch_id, "dispatch_id")
+        reason = require_clean_nonblank(reason, "reason")
+        released_at = pg_support.to_utc(occurred_at) if occurred_at is not None else self._clock()
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    records_by_id = {
+                        reservation_id: await self._load_record(cur, reservation_id)
+                        for reservation_id in sorted(reservation_ids)
+                    }
+                    records = tuple(
+                        records_by_id[reservation_id] for reservation_id in reservation_ids
+                    )
+                    for record in records:
+                        if record.dispatch_id not in {None, dispatch_id}:
+                            raise ValueError(
+                                "Budget reservation has a conflicting dispatch: "
+                                f"{record.reservation_id}"
+                            )
+                        if record.status not in {"active", "released"}:
+                            raise ValueError(
+                                f"Budget reservation is not active: {record.reservation_id}"
+                            )
+                    released_records = tuple(
+                        _released_record(record, reason=reason, updated_at=released_at)
+                        for record in records
+                    )
+                    reconciliations = tuple(
+                        _reconciliation_from_record(record, settlement_kind="released")
+                        for record in released_records
+                    )
+                    for original, released, reconciliation in zip(
+                        records,
+                        released_records,
+                        reconciliations,
+                        strict=True,
+                    ):
+                        await self._insert_or_validate_settlement(
+                            cur,
+                            _budget_settlement_record(original, reconciliation),
+                        )
+                        await self._update_record(cur, released)
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+        return reconciliations
 
     async def heartbeat(self, *, reservation_id: str) -> bool:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
@@ -14984,6 +15055,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
         only_if_no_queued_messages: bool = False,
+        model_completion_stage_settlement: ModelCompletionStageSettlementRequest | None = None,
     ) -> InteractionTransitionResult:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -14993,11 +15065,13 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             from_statuses=from_statuses,
             to_status=to_status,
             only_if_no_queued_messages=only_if_no_queued_messages,
+            model_completion_stage_settlement=model_completion_stage_settlement,
         )
         copied_event = transition.event
         allowed_statuses = set(transition.from_statuses)
         target_status = transition.to_status
         conditional = transition.only_if_no_queued_messages
+        settlement_request = transition.model_completion_stage_settlement
         receipt_storage_key = _interaction_transition_storage_key(copied_event.id)
         await self._ensure_ready()
         async with self._connection() as conn:
@@ -15055,6 +15129,82 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         )
                         queued = await cur.fetchone() is not None
                     updated_at = datetime.now(UTC)
+                    settlement_record = None
+                    settlement_storage_key = None
+                    if settlement_request is not None:
+                        await cur.execute(
+                            "SELECT record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = %s",
+                            (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                        )
+                        active_row = await cur.fetchone()
+                        if active_row is None:
+                            raise SessionModelCompletionStageConflict(
+                                "The interaction transition has no active model-completion "
+                                "stage to settle."
+                            )
+                        active_record = _decode_model_completion_stage_record(active_row[0])
+                        marker = _reconstruct_active_model_completion_stage_record(
+                            active_record,
+                            session_id=session_id,
+                        )
+                        _, _, preparation_key, terminal_key = (
+                            _model_completion_stage_storage_identity(
+                                session_id,
+                                marker.stage_id,
+                            )
+                        )
+                        await cur.execute(
+                            "SELECT idempotency_key, record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                            (session_id, [preparation_key, terminal_key]),
+                        )
+                        stage_records = {
+                            row[0]: _decode_model_completion_stage_record(row[1])
+                            for row in await cur.fetchall()
+                        }
+                        active = _reconstruct_active_model_completion_stage(
+                            active_record,
+                            stage_records.get(preparation_key),
+                            stage_records.get(terminal_key),
+                            session_id=session_id,
+                        )
+                        if active is None:
+                            raise SessionModelCompletionStageConflict(
+                                "The active model-completion stage disappeared during settlement."
+                            )
+                        stage = active.stage
+                        settlement_storage_key = _model_completion_stage_settlement_storage_key(
+                            stage.stage_id
+                        )
+                        related_keys = [
+                            settlement_storage_key,
+                            _model_completion_stage_winner_storage_key(stage.logical_step_id),
+                            _runtime_publication_storage_key(stage.logical_step_id),
+                        ]
+                        await cur.execute(
+                            "SELECT idempotency_key, record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                            (session_id, related_keys),
+                        )
+                        related_records = {
+                            row[0]: _decode_model_completion_stage_record(row[1])
+                            for row in await cur.fetchall()
+                        }
+                        _validate_model_completion_stage_for_settlement(
+                            session=loaded,
+                            stage=stage,
+                            active=active,
+                            request=settlement_request,
+                            settlement_record=related_records.get(settlement_storage_key),
+                            winner_exists=related_keys[1] in related_records,
+                            receipt_exists=related_keys[2] in related_records,
+                        )
+                        settlement_record = _model_completion_stage_settlement_record(
+                            stage,
+                            request=settlement_request,
+                            settled_at=updated_at,
+                        )
                     await cur.execute(
                         """
                         UPDATE cayu_sessions
@@ -15077,6 +15227,27 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     order_row = await cur.fetchone()
                     if order_row is None:
                         raise KeyError(f"Session not found: {session_id}")
+                    if settlement_record is not None and settlement_storage_key is not None:
+                        await cur.execute(
+                            "INSERT INTO cayu_session_operations "
+                            "(session_id, idempotency_key, record, updated_at) "
+                            "VALUES (%s, %s, %s, %s)",
+                            (
+                                session_id,
+                                settlement_storage_key,
+                                _dumps(settlement_record),
+                                updated_at,
+                            ),
+                        )
+                        await cur.execute(
+                            "DELETE FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = %s",
+                            (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                        )
+                        if cur.rowcount != 1:
+                            raise SessionModelCompletionStageConflict(
+                                "The active model-completion stage changed during settlement."
+                            )
                     lookup_key, projection, projection_bytes = pending_action_event_storage_values(
                         copied_event
                     )
@@ -15131,6 +15302,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         from_statuses=allowed_statuses,
                         to_status=target_status,
                         only_if_no_queued_messages=conditional,
+                        model_completion_stage_settlement=settlement_request,
                         status_changed=not queued,
                     )
                     await cur.execute(
@@ -16962,6 +17134,46 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 raise KeyError(f"Session not found: {session_id}")
             return None, None
 
+    async def _load_model_completion_stage_settlement_record(
+        self,
+        session_id: str,
+        settlement_storage_key: str,
+    ) -> dict[str, Any] | None:
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT record FROM cayu_session_operations "
+                "WHERE session_id = %s AND idempotency_key = %s",
+                (session_id, settlement_storage_key),
+            )
+            row = await cur.fetchone()
+            if row is not None:
+                return _decode_model_completion_stage_record(row[0])
+            await cur.execute("SELECT 1 FROM cayu_sessions WHERE id = %s", (session_id,))
+            if await cur.fetchone() is None:
+                raise KeyError(f"Session not found: {session_id}")
+            return None
+
+    async def _load_model_completion_stage_dispatch_record(
+        self,
+        session_id: str,
+        dispatch_storage_key: str,
+    ) -> dict[str, Any] | None:
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT record FROM cayu_session_operations "
+                "WHERE session_id = %s AND idempotency_key = %s",
+                (session_id, dispatch_storage_key),
+            )
+            row = await cur.fetchone()
+            if row is not None:
+                return _decode_model_completion_stage_record(row[0])
+            await cur.execute("SELECT 1 FROM cayu_sessions WHERE id = %s", (session_id,))
+            if await cur.fetchone() is None:
+                raise KeyError(f"Session not found: {session_id}")
+            return None
+
     async def _load_active_model_completion_stage_records(
         self,
         session_id: str,
@@ -17006,6 +17218,90 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 records.get(preparation_key),
                 records.get(terminal_key),
             )
+
+    async def _mark_model_completion_stage_dispatched_atomic(
+        self,
+        session_id: str,
+        *,
+        stage: ModelCompletionStage,
+    ) -> ModelCompletionStageDispatch:
+        _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
+            session_id,
+            stage.stage_id,
+        )
+        settlement_key = _model_completion_stage_settlement_storage_key(stage.stage_id)
+        dispatch_key = _model_completion_stage_dispatch_storage_key(stage.stage_id)
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    loaded = await self._load_for_update(cur, session_id)
+                    if loaded is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    await cur.execute(
+                        "SELECT idempotency_key, record FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = ANY(%s)",
+                        (
+                            session_id,
+                            [
+                                MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                                preparation_key,
+                                terminal_key,
+                                settlement_key,
+                                dispatch_key,
+                            ],
+                        ),
+                    )
+                    records = {
+                        row[0]: _decode_model_completion_stage_record(row[1])
+                        for row in await cur.fetchall()
+                    }
+                    _validate_model_completion_stage_for_dispatch(
+                        session=loaded,
+                        current_transcript_cursor=await _transcript_cursor(cur, session_id),
+                        stage=stage,
+                        active_record=records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                        preparation_record=records.get(preparation_key),
+                        terminal_record=records.get(terminal_key),
+                        settlement_record=records.get(settlement_key),
+                    )
+                    published_at = _next_runtime_publication_timestamp(loaded)
+                    dispatch_record = records.get(dispatch_key)
+                    if dispatch_record is None:
+                        dispatch_record = _model_completion_stage_dispatch_record(
+                            stage,
+                            dispatched_at=published_at,
+                        )
+                        await cur.execute(
+                            "INSERT INTO cayu_session_operations "
+                            "(session_id, idempotency_key, record, updated_at) "
+                            "VALUES (%s, %s, %s, %s)",
+                            (
+                                session_id,
+                                dispatch_key,
+                                _dumps(dispatch_record),
+                                published_at,
+                            ),
+                        )
+                    dispatch = _reconstruct_model_completion_stage_dispatch(
+                        dispatch_record,
+                        session_id=session_id,
+                        stage_id=stage.stage_id,
+                        storage_key=dispatch_key,
+                    )
+                    _validate_model_completion_stage_dispatch(dispatch, stage)
+                    await cur.execute(
+                        "UPDATE cayu_sessions SET updated_at = %s, last_activity_at = %s "
+                        "WHERE id = %s",
+                        (published_at, published_at, session_id),
+                    )
+                    if cur.rowcount != 1:
+                        raise KeyError(f"Session not found: {session_id}")
+                await conn.commit()
+                return dispatch
+            except BaseException:
+                await conn.rollback()
+                raise
 
     async def _prepare_model_completion_stage_atomic(
         self,
@@ -17120,6 +17416,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         prepared,
                         source_status=loaded.status,
                     )
+                    retry_settlement_request = _model_completion_retry_settlement_request(
+                        active,
+                        prepared,
+                    )
                     if winner_exists or receipt_exists:
                         raise SessionModelCompletionStageConflict(
                             "The logical model step already has durable publication state."
@@ -17173,6 +17473,46 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         stage,
                         activated_at=prepared_at,
                     )
+                    if retry_settlement_request is not None:
+                        assert active is not None
+                        retry_settlement_storage_key = (
+                            _model_completion_stage_settlement_storage_key(active.stage.stage_id)
+                        )
+                        await cur.execute(
+                            "SELECT record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = %s",
+                            (session_id, retry_settlement_storage_key),
+                        )
+                        settlement_row = await cur.fetchone()
+                        _validate_model_completion_stage_for_settlement(
+                            session=loaded,
+                            stage=active.stage,
+                            active=active,
+                            request=retry_settlement_request,
+                            settlement_record=(
+                                None
+                                if settlement_row is None
+                                else _decode_model_completion_stage_record(settlement_row[0])
+                            ),
+                            winner_exists=winner_exists,
+                            receipt_exists=receipt_exists,
+                        )
+                        retry_settlement_record = _model_completion_stage_settlement_record(
+                            active.stage,
+                            request=retry_settlement_request,
+                            settled_at=prepared_at,
+                        )
+                        await cur.execute(
+                            "INSERT INTO cayu_session_operations "
+                            "(session_id, idempotency_key, record, updated_at) "
+                            "VALUES (%s, %s, %s, %s)",
+                            (
+                                session_id,
+                                retry_settlement_storage_key,
+                                _dumps(retry_settlement_record),
+                                prepared_at,
+                            ),
+                        )
                     await cur.execute(
                         "INSERT INTO cayu_session_operations "
                         "(session_id, idempotency_key, record, updated_at) "
@@ -17221,6 +17561,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             [
                                 prepared.preparation_storage_key,
                                 prepared.terminal_storage_key,
+                                prepared.settlement_storage_key,
                             ],
                         ),
                     )
@@ -17238,6 +17579,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     )
                     if stage is None:
                         raise KeyError(f"Model-completion stage not found: {prepared.stage_id}")
+                    _reject_settled_model_completion_stage(
+                        records.get(prepared.settlement_storage_key),
+                        session_id=session_id,
+                        stage_id=prepared.stage_id,
+                        settlement_storage_key=prepared.settlement_storage_key,
+                    )
                     if stage.state == "completed":
                         _validate_model_completion_stage_terminal_replay(stage, prepared)
                         await conn.rollback()
@@ -17416,12 +17763,15 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     publication_storage_key = _runtime_publication_storage_key(
                         stage.logical_step_id
                     )
+                    dispatch_storage_key = _model_completion_stage_dispatch_storage_key(
+                        stage.stage_id
+                    )
                     await cur.execute(
                         "SELECT idempotency_key FROM cayu_session_operations "
                         "WHERE session_id = %s AND idempotency_key = ANY(%s)",
                         (
                             session_id,
-                            [winner_storage_key, publication_storage_key],
+                            [winner_storage_key, publication_storage_key, dispatch_storage_key],
                         ),
                     )
                     publication_keys = {row[0] for row in await cur.fetchall()}
@@ -17431,6 +17781,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         active=active,
                         prepared=prepared,
                         abandonment_record=records.get(prepared.abandonment_storage_key),
+                        dispatch_exists=dispatch_storage_key in publication_keys,
                         winner_exists=winner_storage_key in publication_keys,
                         receipt_exists=publication_storage_key in publication_keys,
                     )

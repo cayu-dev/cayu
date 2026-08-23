@@ -1438,6 +1438,39 @@ class BudgetReservationRecord(BaseModel):
         return self
 
 
+def budget_reservation_authority_sha256(record: BudgetReservationRecord) -> str:
+    """Fingerprint the immutable request authority of one reservation record."""
+
+    if type(record) is not BudgetReservationRecord:
+        raise TypeError("record must be a BudgetReservationRecord.")
+    material = record.model_dump(
+        mode="json",
+        include={
+            "reservation_id",
+            "budget_limit_id",
+            "model_step_id",
+            "model_attempt_id",
+            "scope",
+            "key",
+            "window",
+            "currency",
+            "session_id",
+            "agent_name",
+            "environment_name",
+            "provider_name",
+            "model",
+            "billing_identity",
+            "settlement_event_payload",
+            "settlement_fallback",
+            "reserved_amount",
+            "created_at",
+        },
+    )
+    return sha256(
+        canonical_durable_json_bytes(material, "budget_reservation_authority")
+    ).hexdigest()
+
+
 class BudgetReservationRecoveryContext(BaseModel):
     """Frozen pricing authority for one provider-operation reservation."""
 
@@ -1445,7 +1478,8 @@ class BudgetReservationRecoveryContext(BaseModel):
 
     reservation_id: str
     budget_limit_id: str
-    limit: BudgetLimit
+    limit: BudgetLimit | None = None
+    reservation_authority_sha256: str
 
     @field_validator("reservation_id")
     @classmethod
@@ -1459,16 +1493,26 @@ class BudgetReservationRecoveryContext(BaseModel):
 
     @field_validator("limit", mode="before")
     @classmethod
-    def copy_limit(cls, value: object) -> BudgetLimit:
+    def copy_limit(cls, value: object) -> BudgetLimit | None:
+        if value is None:
+            return None
         if isinstance(value, BudgetLimit):
             value = {
                 field_name: getattr(value, field_name) for field_name in BudgetLimit.model_fields
             }
         return BudgetLimit.model_validate(value)
 
+    @field_validator("reservation_authority_sha256")
+    @classmethod
+    def validate_reservation_authority_sha256(cls, value: str) -> str:
+        value = require_clean_nonblank(value, "reservation_authority_sha256")
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("reservation_authority_sha256 must be a lowercase SHA-256 digest.")
+        return value
+
     @model_validator(mode="after")
     def require_reservation_pricing(self) -> BudgetReservationRecoveryContext:
-        if self.limit.reservation is None:
+        if self.limit is not None and self.limit.reservation is None:
             raise ValueError("Recovered provider-operation budget limits must reserve capacity.")
         return self
 
@@ -1885,6 +1929,25 @@ class BudgetLedger(ABC):
         """
 
     @abstractmethod
+    async def release_pre_provider_dispatch(
+        self,
+        *,
+        reservation_ids: tuple[str, ...],
+        dispatch_id: str,
+        reason: str,
+        occurred_at: datetime | None = None,
+    ) -> tuple[BudgetReconciliation, ...]:
+        """Atomically release one attempt proven not to have reached provider code.
+
+        Every reservation must either have no dispatch fence or carry the exact
+        supplied dispatch identity. An identical retry is idempotent, while a
+        conflicting dispatch or terminal outcome must fail the complete batch.
+        This narrow transition is reserved for a runtime-owned provider barrier;
+        ordinary callers must continue to use :meth:`release`, which rejects
+        dispatch-fenced reservations.
+        """
+
+    @abstractmethod
     async def reserve(
         self,
         *,
@@ -2286,6 +2349,52 @@ class InMemoryBudgetLedger(BudgetLedger):
             for record in dispatched_records:
                 self._records[record.reservation_id] = record
             return tuple(record.model_copy(deep=True) for record in dispatched_records)
+
+    async def release_pre_provider_dispatch(
+        self,
+        *,
+        reservation_ids: tuple[str, ...],
+        dispatch_id: str,
+        reason: str,
+        occurred_at: datetime | None = None,
+    ) -> tuple[BudgetReconciliation, ...]:
+        reservation_ids = _validate_reservation_id_batch(reservation_ids)
+        dispatch_id = require_clean_nonblank(dispatch_id, "dispatch_id")
+        reason = require_clean_nonblank(reason, "reason")
+        released_at = (
+            _utc_datetime(occurred_at, "occurred_at") if occurred_at is not None else self._clock()
+        )
+        async with self._lock:
+            records = tuple(self._records.get(reservation_id) for reservation_id in reservation_ids)
+            for reservation_id, record in zip(reservation_ids, records, strict=True):
+                if record is None:
+                    raise KeyError(f"Budget reservation not found: {reservation_id}")
+                if record.dispatch_id not in {None, dispatch_id}:
+                    raise ValueError(
+                        f"Budget reservation has a conflicting dispatch: {reservation_id}"
+                    )
+                if record.status not in {"active", "released"}:
+                    raise ValueError(f"Budget reservation is not active: {reservation_id}")
+            released_records = tuple(
+                _released_record(record, reason=reason, updated_at=released_at)
+                for record in records
+                if record is not None
+            )
+            reconciliations = tuple(
+                _reconciliation_from_record(record, settlement_kind="released")
+                for record in released_records
+            )
+            for original, released, reconciliation in zip(
+                records,
+                released_records,
+                reconciliations,
+                strict=True,
+            ):
+                if original is None:  # pragma: no cover - validated above
+                    raise RuntimeError("Budget reservation disappeared during release.")
+                self._store_settlement_unlocked(_budget_settlement_record(original, reconciliation))
+                self._records[released.reservation_id] = released
+            return tuple(item.model_copy(deep=True) for item in reconciliations)
 
     async def heartbeat(self, *, reservation_id: str) -> bool:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")

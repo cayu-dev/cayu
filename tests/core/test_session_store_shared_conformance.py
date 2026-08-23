@@ -145,6 +145,7 @@ from cayu.runtime import (
     McpManifestBaseline,
     MessageWindowContextPolicy,
     ModelCompactor,
+    ModelCompletionStageDisposition,
     ModelCompletionStageRequest,
     ModelTarget,
     PendingToolApproval,
@@ -13660,6 +13661,325 @@ def test_session_store_conformance_model_completion_stage_allows_trusted_live_re
     asyncio.run(run())
 
 
+def test_session_store_conformance_records_exact_model_stage_dispatch(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = "sess_model_completion_exact_dispatch"
+            interaction_id = "interaction-model-completion-exact-dispatch"
+            logical_step_id = "mstep_33333333333333333333333333333333"
+            stage_id = f"{logical_step_id}:dispatch:0"
+            await store.create(
+                RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+                identity=_identity(),
+            )
+            running = await store.transition_status(
+                session_id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            prepared = await store.prepare_model_completion_stage(
+                session_id,
+                request=ModelCompletionStageRequest(
+                    stage_id=stage_id,
+                    logical_step_id=logical_step_id,
+                    dispatch_ordinal=0,
+                    intent={
+                        "interaction_id": interaction_id,
+                        "model_step_id": logical_step_id,
+                        "model_attempt_id": "matt_33333333333333333333333333333333",
+                        "request_fingerprint": "3" * 64,
+                    },
+                ),
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=running.run_epoch,
+                expected_transcript_cursor=0,
+            )
+
+            dispatch_key = sessions_module._model_completion_stage_dispatch_storage_key(stage_id)
+            with pytest.raises(ValueError, match="reserved model-completion stage namespace"):
+                await store.load_session_operation(session_id, dispatch_key)
+            with pytest.raises(ValueError, match="reserved model-completion stage namespace"):
+                await store.publish_session_operation(
+                    session_id,
+                    idempotency_key="caller-owned-dispatch-collision",
+                    operation_transform=lambda _session, checkpoint, _record: (
+                        SessionOperationPublication(
+                            checkpoint={} if checkpoint is None else checkpoint,
+                            operation_records={dispatch_key: {"owner": "caller"}},
+                        )
+                    ),
+                    events=[],
+                )
+
+            dispatch = await store.mark_model_completion_stage_dispatched(
+                session_id,
+                stage=prepared.stage,
+            )
+            assert dispatch.stage_id == stage_id
+            assert dispatch.logical_step_id == logical_step_id
+            assert dispatch.interaction_id == interaction_id
+            assert dispatch.model_attempt_id == "matt_33333333333333333333333333333333"
+            assert dispatch.request_fingerprint == "3" * 64
+            assert dispatch.provider_effect_id == f"request:{'3' * 64}"
+            assert dispatch.preparation_digest == prepared.stage.preparation_digest
+            assert dispatch.source_run_epoch == running.run_epoch
+
+            with pytest.raises(
+                SessionModelCompletionStageConflict,
+                match="dispatched model-completion stage cannot be abandoned",
+            ):
+                await store.abandon_model_completion_stage(
+                    session_id,
+                    stage_id=stage_id,
+                    preparation_digest=prepared.stage.preparation_digest,
+                    expected_run_epoch=running.run_epoch,
+                )
+            active = await store.load_active_model_completion_stage(session_id)
+            assert active is not None and active.stage == prepared.stage
+
+            store = await _reopen_store(session_store_case, store)
+            assert (
+                await store.load_model_completion_stage_dispatch(session_id, stage_id) == dispatch
+            )
+            assert (
+                await store.mark_model_completion_stage_dispatched(
+                    session_id,
+                    stage=prepared.stage,
+                )
+                == dispatch
+            )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_dispatch_fence_is_atomic_with_retry(
+    session_store_case,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = "sess_model_completion_dispatch_retry_race"
+            interaction_id = "interaction-model-completion-dispatch-retry-race"
+            logical_step_id = "mstep_44444444444444444444444444444444"
+            first_stage_id = f"{logical_step_id}:dispatch:0"
+            retry_stage_id = f"{logical_step_id}:dispatch:1"
+            await store.create(
+                RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+                identity=_identity(),
+            )
+            running = await store.transition_status(
+                session_id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            first = await store.prepare_model_completion_stage(
+                session_id,
+                request=ModelCompletionStageRequest(
+                    stage_id=first_stage_id,
+                    logical_step_id=logical_step_id,
+                    dispatch_ordinal=0,
+                    intent={
+                        "interaction_id": interaction_id,
+                        "model_step_id": logical_step_id,
+                        "model_attempt_id": "matt_44444444444444444444444444444444",
+                        "request_fingerprint": "4" * 64,
+                    },
+                ),
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=running.run_epoch,
+                expected_transcript_cursor=0,
+            )
+            original_load_active = store.load_active_model_completion_stage
+            retry_prepared = False
+
+            async def load_active_with_retry(stage_session_id: str):
+                nonlocal retry_prepared
+                active = await original_load_active(stage_session_id)
+                if not retry_prepared:
+                    retry_prepared = True
+                    await store.prepare_model_completion_stage(
+                        session_id,
+                        request=ModelCompletionStageRequest(
+                            stage_id=retry_stage_id,
+                            logical_step_id=logical_step_id,
+                            dispatch_ordinal=1,
+                            intent={
+                                "interaction_id": interaction_id,
+                                "model_step_id": logical_step_id,
+                                "model_attempt_id": "matt_55555555555555555555555555555555",
+                                "request_fingerprint": "5" * 64,
+                            },
+                        ),
+                        expected_statuses={SessionStatus.RUNNING},
+                        expected_run_epoch=running.run_epoch,
+                        expected_transcript_cursor=0,
+                    )
+                return active
+
+            monkeypatch.setattr(
+                store,
+                "load_active_model_completion_stage",
+                load_active_with_retry,
+            )
+            dispatch = await store.mark_model_completion_stage_dispatched(
+                session_id,
+                stage=first.stage,
+            )
+            if not retry_prepared:
+                await store.load_active_model_completion_stage(session_id)
+
+            settlement = await store.load_model_completion_stage_settlement(
+                session_id,
+                first_stage_id,
+            )
+            assert retry_prepared is True
+            assert settlement is not None
+            assert settlement.disposition is ModelCompletionStageDisposition.SUPERSEDED
+            assert settlement.superseding_stage_id == retry_stage_id
+            assert dispatch.dispatched_at < settlement.settled_at
+            active = await original_load_active(session_id)
+            assert active is not None and active.stage.stage_id == retry_stage_id
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_exact_retry_supersedes_prior_model_stage(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = "sess_model_completion_exact_retry_settlement"
+            interaction_id = "interaction-model-completion-exact-retry"
+            logical_step_id = "mstep_11111111111111111111111111111111"
+            first_stage_id = f"{logical_step_id}:dispatch:0"
+            retry_stage_id = f"{logical_step_id}:dispatch:1"
+            await store.create(
+                RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+                identity=_identity(),
+            )
+            running = await store.transition_status(
+                session_id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            first_intent = {
+                "interaction_id": interaction_id,
+                "model_step_id": logical_step_id,
+                "model_attempt_id": "matt_11111111111111111111111111111111",
+                "request_fingerprint": "1" * 64,
+            }
+            retry_intent = {
+                "interaction_id": interaction_id,
+                "model_step_id": logical_step_id,
+                "model_attempt_id": "matt_22222222222222222222222222222222",
+                "request_fingerprint": "2" * 64,
+            }
+            first = await store.prepare_model_completion_stage(
+                session_id,
+                request=ModelCompletionStageRequest(
+                    stage_id=first_stage_id,
+                    logical_step_id=logical_step_id,
+                    dispatch_ordinal=0,
+                    intent=first_intent,
+                ),
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=running.run_epoch,
+                expected_transcript_cursor=0,
+            )
+            retry = await store.prepare_model_completion_stage(
+                session_id,
+                request=ModelCompletionStageRequest(
+                    stage_id=retry_stage_id,
+                    logical_step_id=logical_step_id,
+                    dispatch_ordinal=1,
+                    intent=retry_intent,
+                ),
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=running.run_epoch,
+                expected_transcript_cursor=0,
+            )
+
+            settlement = await store.load_model_completion_stage_settlement(
+                session_id,
+                first_stage_id,
+            )
+            assert settlement is not None
+            assert settlement.disposition is ModelCompletionStageDisposition.SUPERSEDED
+            assert settlement.superseding_stage_id == retry_stage_id
+            assert settlement.model_attempt_id == first_intent["model_attempt_id"]
+            active = await store.load_active_model_completion_stage(session_id)
+            assert active is not None and active.stage == retry.stage
+
+            with pytest.raises(
+                SessionModelCompletionStageConflict,
+                match="already terminally settled as superseded",
+            ):
+                await store.complete_model_completion_stage(
+                    session_id,
+                    stage_id=first_stage_id,
+                    publication=_assistant_model_completion_publication(
+                        session_id=session_id,
+                        stage_id=first_stage_id,
+                        logical_step_id=logical_step_id,
+                        intent=first_intent,
+                        completion_event_id="superseded-model-completed",
+                        source_transcript_cursor=0,
+                        assistant_message=Message.text("assistant", "stale"),
+                        event_payload={
+                            "model_step_id": first_intent["model_step_id"],
+                            "model_attempt_id": first_intent["model_attempt_id"],
+                        },
+                    ),
+                )
+            assert (
+                await store.load_model_completion_stage(
+                    session_id,
+                    first_stage_id,
+                )
+                == first.stage
+            )
+            assert await store.load_active_model_completion_stage(session_id) == active
+
+            retry_publication = _assistant_model_completion_publication(
+                session_id=session_id,
+                stage_id=retry_stage_id,
+                logical_step_id=logical_step_id,
+                intent=retry_intent,
+                completion_event_id="retry-model-completed",
+                source_transcript_cursor=0,
+                assistant_message=Message.text("assistant", "winner"),
+                event_payload={
+                    "model_step_id": retry_intent["model_step_id"],
+                    "model_attempt_id": retry_intent["model_attempt_id"],
+                },
+            )
+            await store.complete_model_completion_stage(
+                session_id,
+                stage_id=retry_stage_id,
+                publication=retry_publication,
+            )
+            promoted = await store.promote_model_completion_stage(
+                session_id,
+                stage_id=retry_stage_id,
+                expected_run_epoch=running.run_epoch,
+            )
+            assert promoted.replayed is False
+            assert await store.load_active_model_completion_stage(session_id) is None
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 def test_session_store_conformance_model_completion_stage_concurrent_replay(
     session_store_case,
 ) -> None:
@@ -18288,6 +18608,162 @@ def test_session_store_conformance_interaction_transition_is_atomic_and_reconstr
                     from_statuses={SessionStatus.RUNNING},
                     to_status=SessionStatus.FAILED,
                 )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_interaction_failure_atomically_settles_model_stage(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = "sess_interaction_model_stage_settlement"
+            interaction_id = "interaction-model-stage-settlement"
+            stage_id = "model-step:settlement:attempt-1"
+            started = Event(
+                id="evt_interaction_model_stage_started",
+                type=EventType.INTERACTION_STARTED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            )
+            running = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "start")],
+                ),
+                identity=_identity(),
+                interaction_started_event=started,
+                interaction_source_messages=[Message.text("user", "start")],
+            )
+            staged = await store.prepare_model_completion_stage(
+                session_id,
+                request=ModelCompletionStageRequest(
+                    stage_id=stage_id,
+                    logical_step_id="model-step:settlement",
+                    dispatch_ordinal=0,
+                    intent={
+                        "interaction_id": interaction_id,
+                        "model_attempt_id": "model-attempt:settlement:1",
+                        "request_fingerprint": "a" * 64,
+                    },
+                    reservation_ids=("budget-reservation:settlement",),
+                ),
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=running.run_epoch,
+                expected_transcript_cursor=0,
+            )
+            settlement_request = sessions_module.model_completion_stage_settlement_request(
+                staged.stage,
+                interaction_id=interaction_id,
+                disposition=(ModelCompletionStageDisposition.PROVIDER_EFFECT_OUTCOME_UNKNOWN),
+                reason_code="provider_stream_failed",
+                execution_profile_fingerprint=None,
+                settlement_run_epoch=running.run_epoch,
+                settled_reservation_ids=("budget-reservation:settlement",),
+            )
+            failed = Event(
+                id="evt_interaction_model_stage_failed",
+                type=EventType.INTERACTION_FAILED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            )
+
+            with pytest.raises(SessionModelCompletionStageConflict):
+                await store.publish_interaction_transition(
+                    session_id,
+                    event=failed,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.FAILED,
+                    model_completion_stage_settlement=settlement_request.model_copy(
+                        update={"stage_id": "different-stage"}
+                    ),
+                )
+            with pytest.raises(SessionModelCompletionStageConflict):
+                await store.publish_interaction_transition(
+                    session_id,
+                    event=failed,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.FAILED,
+                    model_completion_stage_settlement=settlement_request.model_copy(
+                        update={"settled_reservation_ids": ()}
+                    ),
+                )
+            unchanged = await store.load(session_id)
+            assert unchanged is not None and unchanged.status is SessionStatus.RUNNING
+            assert await store.load_active_model_completion_stage(session_id) is not None
+            assert (
+                await store.query_events(EventQuery(session_id=session_id, event_id=failed.id))
+                == []
+            )
+
+            await store.release_run_fence(session_id)
+            recovered_owner = await store.load(session_id)
+            assert recovered_owner is not None
+            assert recovered_owner.run_epoch > staged.stage.source_run_epoch
+            settlement_request = sessions_module.model_completion_stage_settlement_request(
+                staged.stage,
+                interaction_id=interaction_id,
+                disposition=(ModelCompletionStageDisposition.PROVIDER_EFFECT_OUTCOME_UNKNOWN),
+                reason_code="provider_stream_failed",
+                execution_profile_fingerprint=None,
+                settlement_run_epoch=recovered_owner.run_epoch,
+                settled_reservation_ids=("budget-reservation:settlement",),
+            )
+
+            published = await store.publish_interaction_transition(
+                session_id,
+                event=failed,
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.FAILED,
+                model_completion_stage_settlement=settlement_request,
+            )
+            transition = InteractionTransitionSpec(
+                event=failed,
+                from_statuses=(SessionStatus.RUNNING,),
+                to_status=SessionStatus.FAILED,
+                model_completion_stage_settlement=settlement_request,
+            )
+            assert published.session.status is SessionStatus.FAILED
+            assert await store.load_active_model_completion_stage(session_id) is None
+            settlement = await store.load_model_completion_stage_settlement(
+                session_id,
+                stage_id,
+            )
+            assert settlement is not None
+            assert settlement.disposition is (
+                ModelCompletionStageDisposition.PROVIDER_EFFECT_OUTCOME_UNKNOWN
+            )
+            assert settlement.model_attempt_id == "model-attempt:settlement:1"
+            assert settlement.interaction_id == interaction_id
+            assert settlement.source_run_epoch == running.run_epoch
+            assert settlement.settlement_run_epoch == recovered_owner.run_epoch
+            assert settlement.settled_reservation_ids == ("budget-reservation:settlement",)
+
+            store = await _reopen_store(session_store_case, store)
+            receipt = await store.load_interaction_transition_receipt(
+                session_id,
+                transition=transition,
+            )
+            assert receipt is not None and receipt.transition == transition
+            replayed = await store.publish_interaction_transition(
+                session_id,
+                event=failed,
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.FAILED,
+                model_completion_stage_settlement=settlement_request,
+            )
+            assert replayed.replayed is True
+            assert (
+                await store.load_model_completion_stage_settlement(
+                    session_id,
+                    stage_id,
+                )
+                == settlement
+            )
         finally:
             await _close_store(store)
 

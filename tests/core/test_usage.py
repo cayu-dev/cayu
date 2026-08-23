@@ -13,6 +13,7 @@ from tests.core._budget_ledger_contract import (
     assert_portable_text_boundaries,
     assert_prepriced_reservation_stores_only_durable_billing_identity,
     assert_reservation_identity_collision_is_rejected,
+    assert_runtime_manual_model_recovery_settles_dispatched_reservation,
     assert_runtime_publishes_cross_session_ttl_release,
     assert_runtime_reconstructs_dispatch_fence_acknowledgement,
 )
@@ -1482,6 +1483,15 @@ def test_in_memory_budget_ledger_terminal_settlements_are_idempotent() -> None:
     )
 
 
+def test_in_memory_budget_ledger_supports_runtime_manual_model_recovery() -> None:
+    asyncio.run(
+        assert_runtime_manual_model_recovery_settles_dispatched_reservation(
+            InMemoryBudgetLedger(reservation_ttl_seconds=None),
+            _reservation_budget_limit(max_cost="1"),
+        )
+    )
+
+
 def test_in_memory_budget_ledger_reconstructs_reservations_by_identity() -> None:
     asyncio.run(
         assert_load_reservation_reconstructs_exact_record(
@@ -1829,6 +1839,23 @@ def test_sqlite_budget_ledger_terminal_settlements_are_idempotent(tmp_path) -> N
                     window=BudgetWindow.rolling(seconds=60),
                 ),
                 clock=clock,
+            )
+        finally:
+            await ledger.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_budget_ledger_supports_runtime_manual_model_recovery(tmp_path) -> None:
+    async def run() -> None:
+        ledger = SQLiteBudgetLedger(
+            tmp_path / "budget-manual-model-recovery.sqlite",
+            reservation_ttl_seconds=None,
+        )
+        try:
+            await assert_runtime_manual_model_recovery_settles_dispatched_reservation(
+                ledger,
+                _reservation_budget_limit(max_cost="1"),
             )
         finally:
             await ledger.close()

@@ -264,6 +264,7 @@ from cayu.runtime._model_errors import (
     detach_billing_identity_cancellation_group,
 )
 from cayu.runtime._session_engine import _require_native_structured_output_support
+from cayu.runtime.budgets import budget_settlement_id
 from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -329,6 +330,27 @@ class FakeProvider(ModelProvider):
         if batch_index >= len(self.event_batches):
             raise AssertionError(f"No fake provider event batch for request {batch_index}")
         for event in self.event_batches[batch_index]:
+            yield event
+
+
+class StageRecordingFakeProvider(FakeProvider):
+    def __init__(
+        self,
+        events: list[ModelStreamEvent] | list[list[ModelStreamEvent]],
+        *,
+        store: InMemorySessionStore,
+        session_id: str,
+    ) -> None:
+        super().__init__(events)
+        self.store = store
+        self.session_id = session_id
+        self.stage_ids: list[str] = []
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        active = await self.store.load_active_model_completion_stage(self.session_id)
+        assert active is not None
+        self.stage_ids.append(active.stage.stage_id)
+        async for event in super().stream(request):
             yield event
 
 
@@ -12069,8 +12091,12 @@ def test_cayu_app_retry_accounting_failure_does_not_mask_provider_failure(
             raise TimeoutError("authoritative provider timeout")
             yield  # pragma: no cover
 
+    session_id = f"sess_budget_retry_{failed_operation}_failed"
+    store = InMemorySessionStore()
+    ledger = FailingRetryPreparationLedger()
     provider = RetriedBudgetProvider()
     app = CayuApp(
+        session_store=store,
         retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
         budget_policy=BudgetPolicy(
             limits=(
@@ -12085,27 +12111,51 @@ def test_cayu_app_retry_accounting_failure_does_not_mask_provider_failure(
                 ),
             )
         ),
-        budget_ledger=FailingRetryPreparationLedger(),
+        budget_ledger=ledger,
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    events = asyncio.run(
-        collect_events(
-            app,
-            RunRequest(
-                agent_name="assistant",
-                session_id=f"sess_budget_retry_{failed_operation}_failed",
-                messages=[Message.text("user", "hello")],
-            ),
+    async def run():
+        events = []
+        request = RunRequest(
+            agent_name="assistant",
+            session_id=session_id,
+            messages=[Message.text("user", "hello")],
         )
-    )
+        if failed_operation == "reconcile":
+            with pytest.raises(TimeoutError, match="authoritative provider timeout"):
+                async for event in app.run(request):
+                    events.append(event)
+        else:
+            events = await collect_events(app, request)
+        return (
+            events,
+            await store.load(session_id),
+            await store.load_active_model_completion_stage(session_id),
+        )
+
+    events, session, active_stage = asyncio.run(run())
 
     assert len(provider.requests) == 1
     assert [event.type for event in events].count(EventType.MODEL_STARTED) == 1
-    assert events[-1].type == EventType.SESSION_FAILED
-    assert events[-1].payload["error"] == "authoritative provider timeout"
-    assert events[-1].payload["error_type"] == "TimeoutError"
+    assert session is not None
+    if failed_operation == "reconcile":
+        assert session.status == SessionStatus.RUNNING
+        assert active_stage is not None
+        record = next(iter(ledger._records.values()))
+        assert active_stage.stage.reservation_ids == (record.reservation_id,)
+        assert record.status == "active"
+        assert (
+            asyncio.run(ledger.load_settlement(budget_settlement_id(record.reservation_id))) is None
+        )
+        assert EventType.SESSION_FAILED not in [event.type for event in events]
+    else:
+        assert session.status == SessionStatus.FAILED
+        assert active_stage is None
+        assert events[-1].type == EventType.SESSION_FAILED
+        assert events[-1].payload["error"] == "authoritative provider timeout"
+        assert events[-1].payload["error_type"] == "TimeoutError"
 
 
 def test_cayu_app_releases_partial_retry_reservations_when_later_reserve_raises() -> None:
@@ -14248,7 +14298,7 @@ def test_cayu_app_releases_pending_budget_when_run_stream_is_abandoned() -> None
     assert released.payload["reservation_id"] == records[0].reservation_id
 
 
-def test_cayu_app_abandonment_finalizes_when_budget_settlement_fails() -> None:
+def test_cayu_app_abandonment_retains_recovery_authority_when_budget_settlement_fails() -> None:
     class FailingReconciliationLedger(InMemoryBudgetLedger):
         async def reconcile(self, **_kwargs):
             raise RuntimeError("budget ledger unavailable")
@@ -14256,7 +14306,7 @@ def test_cayu_app_abandonment_finalizes_when_budget_settlement_fails() -> None:
     async def run():
         session_id = "sess_budget_abandoned_settlement_failed"
         store = InMemorySessionStore()
-        ledger = FailingReconciliationLedger()
+        ledger = FailingReconciliationLedger(reservation_ttl_seconds=None)
         app = CayuApp(
             session_store=store,
             budget_policy=BudgetPolicy(
@@ -14291,14 +14341,24 @@ def test_cayu_app_abandonment_finalizes_when_budget_settlement_fails() -> None:
             if event.type == EventType.MODEL_ERROR:
                 await stream.aclose()
                 break
-        return await store.load(session_id), await store.load_events(session_id)
+        record = next(iter(ledger._records.values()))
+        return (
+            await store.load(session_id),
+            await store.load_events(session_id),
+            await store.load_active_model_completion_stage(session_id),
+            record,
+            await ledger.load_settlement(budget_settlement_id(record.reservation_id)),
+        )
 
-    session, stored_events = asyncio.run(run())
+    session, stored_events, active_stage, record, settlement = asyncio.run(run())
 
     assert session is not None
-    assert session.status == SessionStatus.INTERRUPTED
-    assert stored_events[-1].type == EventType.SESSION_INTERRUPTED
-    assert stored_events[-1].payload["abandoned"] is True
+    assert session.status == SessionStatus.RUNNING
+    assert active_stage is not None
+    assert active_stage.stage.reservation_ids == (record.reservation_id,)
+    assert record.status == "active"
+    assert settlement is None
+    assert EventType.SESSION_INTERRUPTED not in [event.type for event in stored_events]
 
 
 def test_cayu_app_persists_successful_reconciliation_before_later_limit_fails() -> None:
@@ -14346,27 +14406,34 @@ def test_cayu_app_persists_successful_reconciliation_before_later_limit_fails() 
         )
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-        events = await collect_events(
-            app,
-            RunRequest(
-                agent_name="assistant",
-                session_id=session_id,
-                messages=[Message.text("user", "hello")],
-            ),
-        )
+        events = []
+        with pytest.raises(RuntimeError, match="authoritative provider failure"):
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                )
+            ):
+                events.append(event)
         return (
             events,
+            await store.load(session_id),
+            await store.load_active_model_completion_stage(session_id),
             await store.query_events(EventQuery(session_id=session_id, limit=100)),
             tuple(ledger._records.values()),
         )
 
-    events, stored_records, records = asyncio.run(run())
+    events, session, active_stage, stored_records, records = asyncio.run(run())
     stored_events = [record.event for record in stored_records]
 
     reconciliations = [
         event for event in stored_events if event.type == EventType.BUDGET_RECONCILED
     ]
     assert [record.status for record in records] == ["reconciled", "active"]
+    assert session is not None and session.status == SessionStatus.RUNNING
+    assert active_stage is not None
+    assert active_stage.stage.reservation_ids == tuple(record.reservation_id for record in records)
     assert len(reconciliations) == 1
     assert reconciliations[0].payload["reservation_id"] == records[0].reservation_id
     streamed_reconciliations = [
@@ -14376,8 +14443,7 @@ def test_cayu_app_persists_successful_reconciliation_before_later_limit_fails() 
         _private_record_for_public_event(stored_records, event).event.id
         for event in streamed_reconciliations
     ] == [reconciliations[0].id]
-    assert events[-1].type == EventType.SESSION_FAILED
-    assert events[-1].payload["error"] == "authoritative provider failure"
+    assert EventType.SESSION_FAILED not in [event.type for event in events]
 
 
 def test_cayu_app_retries_only_unsettled_limit_after_partial_reconciliation() -> None:
@@ -14608,13 +14674,17 @@ def test_cayu_app_pauses_budget_heartbeat_during_retry_reconciliation() -> None:
     assert len([event for event in events if event.type == EventType.BUDGET_RECONCILED]) == 2
 
 
-def test_cayu_app_budget_settlement_failure_does_not_mask_provider_failure() -> None:
+def test_cayu_app_budget_settlement_failure_retains_model_recovery_authority() -> None:
     class FailingReconciliationLedger(InMemoryBudgetLedger):
         async def reconcile(self, **_kwargs):
             raise RuntimeError("budget ledger unavailable")
 
+    session_id = "sess_budget_settlement_failed"
+    store = InMemorySessionStore()
+    ledger = FailingReconciliationLedger(reservation_ttl_seconds=None)
     provider = FakeProvider([ModelStreamEvent.error("authoritative provider failure")])
     app = CayuApp(
+        session_store=store,
         budget_policy=BudgetPolicy(
             limits=(
                 BudgetLimit(
@@ -14628,25 +14698,42 @@ def test_cayu_app_budget_settlement_failure_does_not_mask_provider_failure() -> 
                 ),
             )
         ),
-        budget_ledger=FailingReconciliationLedger(),
+        budget_ledger=ledger,
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    events = asyncio.run(
-        collect_events(
-            app,
-            RunRequest(
-                agent_name="assistant",
-                session_id="sess_budget_settlement_failed",
-                messages=[Message.text("user", "hello")],
-            ),
+    async def run():
+        events = []
+        with pytest.raises(RuntimeError, match="authoritative provider failure") as exc_info:
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                )
+            ):
+                events.append(event)
+        return (
+            events,
+            exc_info.value,
+            await store.load(session_id),
+            await store.load_active_model_completion_stage(session_id),
         )
-    )
 
-    assert events[-1].type == EventType.SESSION_FAILED
-    assert events[-1].payload["error"] == "authoritative provider failure"
-    assert events[-1].payload["error_type"] == "RuntimeError"
+    events, failure, session, active_stage = asyncio.run(run())
+
+    assert EventType.SESSION_FAILED not in [event.type for event in events]
+    assert session is not None and session.status == SessionStatus.RUNNING
+    assert active_stage is not None
+    record = next(iter(ledger._records.values()))
+    assert active_stage.stage.reservation_ids == (record.reservation_id,)
+    assert record.status == "active"
+    assert record.dispatch_id == active_stage.stage.stage_id
+    assert asyncio.run(ledger.load_settlement(budget_settlement_id(record.reservation_id))) is None
+    assert failure.__notes__ == [
+        "Budget settlement also failed: RuntimeError: budget ledger unavailable"
+    ]
 
 
 def test_cayu_app_budget_settlement_failure_does_not_mask_cancellation() -> None:
@@ -14655,8 +14742,12 @@ def test_cayu_app_budget_settlement_failure_does_not_mask_cancellation() -> None
             raise RuntimeError("budget ledger unavailable")
 
     async def run() -> None:
+        session_id = "sess_budget_cancel_settlement_failed"
+        store = InMemorySessionStore()
+        ledger = FailingReconciliationLedger(reservation_ttl_seconds=None)
         provider = BlockingBudgetProvider()
         app = CayuApp(
+            session_store=store,
             budget_policy=BudgetPolicy(
                 limits=(
                     BudgetLimit(
@@ -14670,7 +14761,7 @@ def test_cayu_app_budget_settlement_failure_does_not_mask_cancellation() -> None
                     ),
                 )
             ),
-            budget_ledger=FailingReconciliationLedger(),
+            budget_ledger=ledger,
         )
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -14680,7 +14771,7 @@ def test_cayu_app_budget_settlement_failure_does_not_mask_cancellation() -> None
                 app,
                 RunRequest(
                     agent_name="assistant",
-                    session_id="sess_budget_cancel_settlement_failed",
+                    session_id=session_id,
                     messages=[Message.text("user", "hello")],
                 ),
             )
@@ -14692,8 +14783,19 @@ def test_cayu_app_budget_settlement_failure_does_not_mask_cancellation() -> None
 
         assert provider.cancelled.is_set()
         assert exc_info.value.__notes__ == [
-            "Budget settlement also failed: RuntimeError: budget ledger unavailable"
+            "Budget settlement also failed: RuntimeError: budget ledger unavailable",
+            "Continuation recovery cleanup failed during cancelled session finalization: "
+            "ModelCompletionBudgetSettlementPending. The original failure remains "
+            "authoritative.",
         ]
+        session = await store.load(session_id)
+        active_stage = await store.load_active_model_completion_stage(session_id)
+        assert session is not None and session.status == SessionStatus.RUNNING
+        assert active_stage is not None
+        record = next(iter(ledger._records.values()))
+        assert active_stage.stage.reservation_ids == (record.reservation_id,)
+        assert record.status == "active"
+        assert await ledger.load_settlement(budget_settlement_id(record.reservation_id)) is None
 
     asyncio.run(run())
 
@@ -24200,16 +24302,20 @@ def test_cayu_app_retries_using_typed_provider_status_code_without_http_text():
         provider="fake",
         status_code=529,
     )
-    provider = FakeProvider(
+    session_id = "sess_typed_status_retry"
+    store = InMemorySessionStore()
+    provider = StageRecordingFakeProvider(
         [
             [ModelStreamEvent.error("provider overloaded", cause=typed_error)],
             [
                 ModelStreamEvent.text_delta("recovered"),
                 ModelStreamEvent.completed({"finish_reason": "stop"}),
             ],
-        ]
+        ],
+        store=store,
+        session_id=session_id,
     )
-    app = CayuApp()
+    app = CayuApp(session_store=store)
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -24218,7 +24324,7 @@ def test_cayu_app_retries_using_typed_provider_status_code_without_http_text():
             app,
             RunRequest(
                 agent_name="assistant",
-                session_id="sess_typed_status_retry",
+                session_id=session_id,
                 messages=[Message.text("user", "hi")],
                 retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
             ),
@@ -24234,6 +24340,14 @@ def test_cayu_app_retries_using_typed_provider_status_code_without_http_text():
     retry_event = next(e for e in events if e.type == EventType.MODEL_RETRY)
     assert retry_event.payload["status_code"] == 529
     assert retry_event.payload["reason"] == "http_status"
+    assert len(provider.stage_ids) == 2
+    superseded = asyncio.run(
+        store.load_model_completion_stage_settlement(session_id, provider.stage_ids[0])
+    )
+    assert superseded is not None
+    assert superseded.disposition is sessions_module.ModelCompletionStageDisposition.SUPERSEDED
+    assert superseded.superseding_stage_id == provider.stage_ids[1]
+    assert asyncio.run(store.load_active_model_completion_stage(session_id)) is None
 
 
 def test_cayu_app_does_not_retry_when_provider_marks_error_non_retryable():
@@ -52109,6 +52223,7 @@ def test_cayu_app_records_failed_session_for_provider_error_event():
         )
     )
     session = asyncio.run(store.load("sess_provider_error"))
+    active_stage = asyncio.run(store.load_active_model_completion_stage("sess_provider_error"))
 
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
@@ -52120,6 +52235,128 @@ def test_cayu_app_records_failed_session_for_provider_error_event():
     assert events[-1].payload["error"] == "provider failed"
     assert session is not None
     assert session.status == SessionStatus.FAILED
+    assert active_stage is None
+
+
+def test_cayu_app_settles_authentication_failure_before_provider_effect():
+    session_id = "sess_provider_authentication_error"
+    store = InMemorySessionStore()
+    auth_failure = ModelProviderError(
+        "authentication failed",
+        provider="fake",
+        status_code=401,
+        error_type="authentication_error",
+        retryable=False,
+    )
+    provider = StageRecordingFakeProvider(
+        [ModelStreamEvent.error("authentication failed", cause=auth_failure)],
+        store=store,
+        session_id=session_id,
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "fail")],
+            ),
+        )
+    )
+
+    assert events[-1].type is EventType.SESSION_FAILED
+    assert provider.stage_ids and len(provider.stage_ids) == 1
+    assert asyncio.run(store.load_active_model_completion_stage(session_id)) is None
+    settlement = asyncio.run(
+        store.load_model_completion_stage_settlement(session_id, provider.stage_ids[0])
+    )
+    assert settlement is not None
+    assert settlement.disposition is (
+        sessions_module.ModelCompletionStageDisposition.FAILED_BEFORE_PROVIDER_EFFECT
+    )
+    assert settlement.reason_code == "provider_authentication_failed"
+    assert settlement.interaction_id == events[0].interaction_id
+    session = asyncio.run(store.load(session_id))
+    checkpoint = asyncio.run(store.load_checkpoint(session_id))
+    assert session is not None
+    active_profile = execution_profiles_module.active_invocation_execution_profile_from_checkpoint(
+        checkpoint
+    )
+    assert active_profile is not None
+    assert execution_profiles_module.active_invocation_execution_profile_is_released(
+        active_profile,
+        session_id=session_id,
+        run_epoch=session.run_epoch,
+    )
+
+
+def test_cayu_app_settles_late_authentication_failure_as_effect_unknown():
+    session_id = "sess_provider_late_authentication_error"
+    store = InMemorySessionStore()
+    auth_failure = ModelProviderError(
+        "authentication failed",
+        provider="fake",
+        status_code=401,
+        error_type="authentication_error",
+        retryable=False,
+    )
+    provider = StageRecordingFakeProvider(
+        [
+            ModelStreamEvent.text_delta("partial output"),
+            ModelStreamEvent.error("authentication failed", cause=auth_failure),
+        ],
+        store=store,
+        session_id=session_id,
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "fail after output")],
+            ),
+        )
+    )
+
+    assert EventType.MODEL_TEXT_DELTA in [event.type for event in events]
+    assert events[-1].type is EventType.SESSION_FAILED
+    assert provider.stage_ids and len(provider.stage_ids) == 1
+    assert asyncio.run(store.load_active_model_completion_stage(session_id)) is None
+    settlement = asyncio.run(
+        store.load_model_completion_stage_settlement(session_id, provider.stage_ids[0])
+    )
+    assert settlement is not None
+    assert settlement.disposition is (
+        sessions_module.ModelCompletionStageDisposition.PROVIDER_EFFECT_OUTCOME_UNKNOWN
+    )
+    assert settlement.reason_code == "model_attempt_failed"
+
+
+def test_provider_authentication_failure_requires_unmixed_pre_effect_evidence():
+    auth_failure = ModelProviderError(
+        "authentication failed",
+        provider="fake",
+        status_code=401,
+        error_type="authentication_error",
+        retryable=False,
+    )
+
+    assert session_engine_module._provider_failure_proves_no_model_effect(auth_failure)
+    assert not session_engine_module._provider_failure_proves_no_model_effect(
+        ExceptionGroup(
+            "mixed provider failure",
+            [auth_failure, RuntimeError("cleanup failed")],
+        )
+    )
 
 
 def test_cayu_app_does_not_execute_tool_when_provider_errors_after_tool_call():

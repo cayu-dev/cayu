@@ -367,6 +367,7 @@ class ModelCompletionRecoveryContext(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     schema_version: Literal[1] = 1
+    interaction_id: str | None = Field(default=None, min_length=1, max_length=256)
     execution_profile_fingerprint: str | None = Field(
         default=None,
         min_length=64,
@@ -387,12 +388,12 @@ class ModelCompletionRecoveryContext(BaseModel):
     structured_output_attempt: StrictInt | None = Field(default=None, ge=1)
     billing_identity: BillingIdentity | None = None
 
-    @field_validator("task_id")
+    @field_validator("interaction_id", "task_id")
     @classmethod
-    def validate_task_id(cls, value: str | None) -> str | None:
+    def validate_recovery_identity(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        return require_durable_clean_nonblank(value, "task_id")
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("request_metadata", mode="before")
     @classmethod
@@ -457,7 +458,11 @@ class ModelCompletionRecoveryContext(BaseModel):
             raise ValueError("run_limit_accounting requires active run-scoped authority.")
         for limit in (
             *self.budget_limits,
-            *(reservation.limit for reservation in self.budget_reservations),
+            *(
+                reservation.limit
+                for reservation in self.budget_reservations
+                if reservation.limit is not None
+            ),
         ):
             price_book = limit.pricing
             if (
@@ -661,6 +666,9 @@ class ModelAttemptFailed(Exception):
     ``completion_observed`` is set only by the durable publication path. Once a
     valid completed frame has crossed that boundary, a later transport/control
     error is terminal and cannot authorize another provider dispatch.
+    ``provider_effect_observed`` records whether any valid non-error provider
+    frame was observed, so terminal classification cannot treat a late auth
+    error as proof that the provider rejected the request before all effects.
     """
 
     def __init__(
@@ -671,14 +679,18 @@ class ModelAttemptFailed(Exception):
         emitted_error_event: bool,
         cause: Exception | None = None,
         completion_observed: bool = False,
+        provider_effect_observed: bool = False,
         automatic_retry_disabled: bool = False,
         retry_decision: RetryDecision | None = None,
     ) -> None:
+        if type(provider_effect_observed) is not bool:
+            raise TypeError("provider_effect_observed must be a bool.")
         self.message = require_nonblank(message, "message")
         self.payload = copy_json_value(payload, "payload")
         self.emitted_error_event = emitted_error_event
         self.cause = cause
         self.completion_observed = completion_observed
+        self.provider_effect_observed = provider_effect_observed
         self.automatic_retry_disabled = automatic_retry_disabled
         if retry_decision is not None and type(retry_decision) is not RetryDecision:
             raise TypeError("retry_decision must be a RetryDecision or None.")
@@ -1043,6 +1055,8 @@ def _model_completion_stage_intent(
     }
     if recovery_context is not None:
         intent["recovery_context"] = recovery_context.model_dump(mode="json")
+        if recovery_context.interaction_id is not None:
+            intent["interaction_id"] = recovery_context.interaction_id
     if provider_operation_start is not None:
         intent["provider_operation_start"] = copy_durable_json_object(
             provider_operation_start,
@@ -4890,6 +4904,7 @@ class ModelStepExecutor:
         durable_stream_failure: ModelAttemptFailed | None = None
         provider_control_failure: ModelProviderError | None = None
         provider_control_error_emitted = False
+        provider_effect_observed = False
         post_completion_failure: BaseException | None = None
 
         async def reconcile_completion_that_won_cancellation(
@@ -5343,6 +5358,8 @@ class ModelStepExecutor:
                     generated_tool_call_id=generated_tool_call_id,
                 )
                 stream_event = assistant_boundary.event
+                if stream_event.type is not ModelStreamEventType.ERROR:
+                    provider_effect_observed = True
                 await interrupt_poll.raise_if_interrupted()
                 if model_completed:
                     if (
@@ -5358,6 +5375,7 @@ class ModelStepExecutor:
                         emitted_error_event=False,
                         cause=RuntimeError(message),
                         completion_observed=model_completion_publisher is not None,
+                        provider_effect_observed=provider_effect_observed,
                     )
 
                 progress_emitted_event: Event | None = None
@@ -5899,6 +5917,7 @@ class ModelStepExecutor:
                         emitted_error_event=True,
                         cause=provider_error or RuntimeError(message),
                         retry_decision=stream_retry_decision,
+                        provider_effect_observed=provider_effect_observed,
                     )
                 yield emitted_event, None
             else:
@@ -5975,6 +5994,7 @@ class ModelStepExecutor:
                         emitted_error_event=exc.emitted_error_event,
                         cause=exc.cause,
                         completion_observed=exc.completion_observed,
+                        provider_effect_observed=exc.provider_effect_observed,
                         automatic_retry_disabled=True,
                     ) from exc
                 raise
@@ -6004,6 +6024,7 @@ class ModelStepExecutor:
                         completion_observed=(
                             model_completion_publisher is not None and model_completed
                         ),
+                        provider_effect_observed=provider_effect_observed,
                     )
             elif durable_error is not None:
                 if invalid_provider_error:
@@ -6043,6 +6064,7 @@ class ModelStepExecutor:
                     completion_observed=(
                         model_completion_publisher is not None and model_completed
                     ),
+                    provider_effect_observed=provider_effect_observed,
                 )
                 if model_completion_publisher is None or not model_completed:
                     yield (
@@ -6240,6 +6262,7 @@ class ModelStepExecutor:
                 },
                 emitted_error_event=provider_control_error_emitted,
                 cause=post_dispatch_failure,
+                provider_effect_observed=provider_effect_observed,
                 automatic_retry_disabled=True,
             ) from post_dispatch_failure
         if type(provider_control_failure) is ModelContextOverflowError:
@@ -6271,6 +6294,7 @@ class ModelStepExecutor:
                     emitted_error_event=durable_stream_failure.emitted_error_event,
                     cause=durable_stream_failure.cause,
                     completion_observed=durable_stream_failure.completion_observed,
+                    provider_effect_observed=(durable_stream_failure.provider_effect_observed),
                     automatic_retry_disabled=True,
                 )
             raise durable_stream_failure from None
@@ -6283,6 +6307,7 @@ class ModelStepExecutor:
                 payload={"error": message, "error_type": "RuntimeError"},
                 emitted_error_event=False,
                 cause=RuntimeError(message),
+                provider_effect_observed=provider_effect_observed,
                 automatic_retry_disabled=background_dispatch_invoked,
             )
         await self._session_control.raise_if_interrupted(session.id)
@@ -6463,6 +6488,32 @@ class ModelStepRun:
         authoritative_failure: BaseException,
     ) -> None:
         """Clear one provably undispatched stage without losing its root failure."""
+
+        try:
+            dispatch = await self._executor._session_store.load_model_completion_stage_dispatch(
+                self._session.id,
+                stage.stage_id,
+            )
+            if dispatch is not None:
+                authoritative_failure.add_note(
+                    "The prepared model-completion stage was retained because its exact "
+                    "dispatch receipt is durable."
+                )
+                return
+            recovery_context = model_completion_recovery_context_from_stage(stage)
+            await self._executor._run_limit_controller.release_pre_provider_dispatch_reservations(
+                reservation_ids=stage.reservation_ids,
+                recovery_contexts=(
+                    () if recovery_context is None else recovery_context.budget_reservations
+                ),
+                dispatch_id=stage.stage_id,
+            )
+        except BaseException as release_error:
+            authoritative_failure.add_note(
+                "Pre-dispatch model-completion budget release also failed: "
+                f"{type(release_error).__name__}: {release_error}"
+            )
+            return
 
         async def abandon_once() -> ModelCompletionStageAbandonmentResult:
             return await self._executor._session_store.abandon_model_completion_stage(
@@ -7205,6 +7256,10 @@ class ModelStepRun:
                         dispatch_id=prepared.stage.stage_id,
                     )
                     dispatch_fence_committed = True
+                    await self._executor._session_store.mark_model_completion_stage_dispatched(
+                        self._session.id,
+                        stage=prepared.stage,
+                    )
                     dispatch = ModelCompletionDispatch(
                         stage=prepared.stage,
                         request_fingerprint=request_fingerprint,

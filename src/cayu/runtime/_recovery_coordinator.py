@@ -1143,6 +1143,7 @@ class ModelCompletionBoundaryReconciliation:
 
     state: Literal[
         "none",
+        "prepared_abandoned",
         "promoted",
         "already_promoted",
         "provider_operation_pending",
@@ -1460,10 +1461,19 @@ class RecoveryCoordinator:
                 is not None
             ):
                 return True
+            if (
+                await self._session_store.load_model_completion_stage_dispatch(
+                    session.id,
+                    stage.stage_id,
+                )
+                is None
+            ):
+                return True
             raise ModelCompletionManualRecoveryRequired(
                 "The active model-completion dispatch has no durable terminal response. "
-                "Its provider outcome and linked budget reservations require manual "
-                f"reconciliation before retrying: {stage.stage_id}"
+                "Its provider outcome and linked budget reservations require "
+                "CayuApp.recover_model_completion_stage(...) before retrying: "
+                f"{stage.stage_id}"
             )
         return True
 
@@ -1796,6 +1806,7 @@ class RecoveryCoordinator:
         active = await self._session_store.load_active_model_completion_stage(session.id)
         state: Literal[
             "none",
+            "prepared_abandoned",
             "promoted",
             "already_promoted",
             "provider_operation_pending",
@@ -1806,14 +1817,50 @@ class RecoveryCoordinator:
         if active is not None:
             stage = active.stage
             self._validate_active_model_completion_stage(session, stage)
+            if (
+                stage.state == "in_flight"
+                and await self._recoverable_provider_operation(
+                    stage,
+                    registered_provider=registered_provider,
+                )
+                is None
+                and await self._session_store.load_model_completion_stage_dispatch(
+                    session.id,
+                    stage.stage_id,
+                )
+                is None
+            ):
+                recovery_context = model_completion_recovery_context_from_stage(stage)
+                release_events = await (
+                    self._run_limit_controller.release_pre_provider_dispatch_reservations(
+                        reservation_ids=stage.reservation_ids,
+                        recovery_contexts=(
+                            () if recovery_context is None else recovery_context.budget_reservations
+                        ),
+                        dispatch_id=stage.stage_id,
+                    )
+                )
+                await self._session_store.abandon_model_completion_stage(
+                    session.id,
+                    stage_id=stage.stage_id,
+                    preparation_digest=stage.preparation_digest,
+                    expected_run_epoch=session.run_epoch,
+                    stage_source_run_epoch=stage.source_run_epoch,
+                )
+                active = None
+                state = "prepared_abandoned"
+                recovery_events = tuple(release_events)
+        if active is not None:
+            stage = active.stage
             if session.status in {
                 SessionStatus.COMPLETED,
                 SessionStatus.INTERRUPTED,
             }:
                 raise ModelCompletionManualRecoveryRequired(
                     "A terminal session retains an active model-completion stage. "
-                    "Provider output and linked reservations require explicit manual "
-                    f"reconciliation before the stage can be cleared: {stage.stage_id}"
+                    "Provider output and linked reservations require the runtime-owned "
+                    "CayuApp.recover_model_completion_stage(...) operation before the "
+                    f"stage can be cleared: {stage.stage_id}"
                 )
             if stage.state == "in_flight":
                 recoverable = await self._recoverable_provider_operation(
@@ -1823,8 +1870,9 @@ class RecoveryCoordinator:
                 if recoverable is None:
                     raise ModelCompletionManualRecoveryRequired(
                         "The active model-completion dispatch has no durable terminal response. "
-                        "Its provider outcome and linked budget reservations require manual "
-                        f"reconciliation before retrying: {stage.stage_id}"
+                        "Its provider outcome and linked budget reservations require "
+                        "CayuApp.recover_model_completion_stage(...) before retrying: "
+                        f"{stage.stage_id}"
                     )
                 operation, recovered_provider = recoverable
                 if registered_agent is None or registered_provider is None:
@@ -10532,7 +10580,20 @@ class RecoveryCoordinator:
             )
         except InteractionLifecyclePublicationRejected:
             raise
-        except BaseException:
+        except BaseException as transition_failure:
+            try:
+                active_model_completion = (
+                    await self._session_store.load_active_model_completion_stage(request.session.id)
+                )
+            except BaseException as inspection_failure:
+                add_exception_note_safely(
+                    transition_failure,
+                    "Active model-completion recovery authority inspection also failed: "
+                    f"{type(inspection_failure).__name__}.",
+                )
+                raise transition_failure from inspection_failure
+            if active_model_completion is not None:
+                raise
             try:
                 finalized = await self._session_store.transition_status(
                     request.session.id,

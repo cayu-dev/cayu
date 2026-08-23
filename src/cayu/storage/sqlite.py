@@ -110,8 +110,11 @@ from cayu.runtime.sessions import (
     McpManifestBaseline,
     McpManifestBaselineLoadResult,
     McpManifestPublicationResult,
+    ModelCompletionStage,
     ModelCompletionStageAbandonmentResult,
+    ModelCompletionStageDispatch,
     ModelCompletionStageResult,
+    ModelCompletionStageSettlementRequest,
     PendingActionIssue,
     PendingActionKind,
     PendingActionListResult,
@@ -212,8 +215,13 @@ from cayu.runtime.sessions import (
     _interaction_transition_receipt_record,
     _interaction_transition_spec_from_receipt,
     _interaction_transition_storage_key,
+    _model_completion_retry_settlement_request,
     _model_completion_stage_abandonment_record,
+    _model_completion_stage_dispatch_record,
+    _model_completion_stage_dispatch_storage_key,
     _model_completion_stage_preparation_record,
+    _model_completion_stage_settlement_record,
+    _model_completion_stage_settlement_storage_key,
     _model_completion_stage_storage_identity,
     _model_completion_stage_terminal_record,
     _model_completion_stage_winner_record,
@@ -240,8 +248,10 @@ from cayu.runtime.sessions import (
     _reconstruct_interaction_transition_receipt,
     _reconstruct_model_completion_stage,
     _reconstruct_model_completion_stage_abandonment,
+    _reconstruct_model_completion_stage_dispatch,
     _reconstruct_runtime_publication_receipt,
     _reject_reserved_runtime_publication_key,
+    _reject_settled_model_completion_stage,
     _replay_model_completion_stage_abandonment,
     _replay_promoted_model_completion_stage,
     _runtime_publication_json_equal,
@@ -266,7 +276,10 @@ from cayu.runtime.sessions import (
     _validate_model_completion_active_marker_for_promotion,
     _validate_model_completion_preparation_replay_state,
     _validate_model_completion_promotion_replay_active_marker,
+    _validate_model_completion_stage_dispatch,
     _validate_model_completion_stage_for_abandonment,
+    _validate_model_completion_stage_for_dispatch,
+    _validate_model_completion_stage_for_settlement,
     _validate_model_completion_stage_preparation_replay,
     _validate_model_completion_stage_publication,
     _validate_model_completion_stage_release,
@@ -3856,6 +3869,7 @@ class SQLiteSessionStore(SessionStore):
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
         only_if_no_queued_messages: bool = False,
+        model_completion_stage_settlement: ModelCompletionStageSettlementRequest | None = None,
     ) -> InteractionTransitionResult:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -3865,11 +3879,13 @@ class SQLiteSessionStore(SessionStore):
             from_statuses=from_statuses,
             to_status=to_status,
             only_if_no_queued_messages=only_if_no_queued_messages,
+            model_completion_stage_settlement=model_completion_stage_settlement,
         )
         copied_event = transition.event
         allowed_statuses = set(transition.from_statuses)
         target_status = transition.to_status
         conditional = transition.only_if_no_queued_messages
+        settlement_request = transition.model_completion_stage_settlement
         receipt_storage_key = _interaction_transition_storage_key(copied_event.id)
 
         def statement(connection: sqlite3.Connection) -> InteractionTransitionResult:
@@ -3928,6 +3944,82 @@ class SQLiteSessionStore(SessionStore):
                     )
                 updated_at = datetime.now(UTC)
                 formatted_updated_at = sqlite_support.format_datetime(updated_at)
+                settlement_record = None
+                settlement_storage_key = None
+                if settlement_request is not None:
+                    active_row = connection.execute(
+                        "SELECT record_json FROM cayu_session_operations "
+                        "WHERE session_id = ? AND idempotency_key = ?",
+                        (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                    ).fetchone()
+                    if active_row is None:
+                        raise SessionModelCompletionStageConflict(
+                            "The interaction transition has no active model-completion "
+                            "stage to settle."
+                        )
+                    active_record = _decode_model_completion_stage_record(active_row["record_json"])
+                    marker = _reconstruct_active_model_completion_stage_record(
+                        active_record,
+                        session_id=session_id,
+                    )
+                    _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
+                        session_id, marker.stage_id
+                    )
+                    stage_rows = connection.execute(
+                        "SELECT idempotency_key, record_json FROM cayu_session_operations "
+                        "WHERE session_id = ? AND idempotency_key IN (?, ?)",
+                        (session_id, preparation_key, terminal_key),
+                    ).fetchall()
+                    stage_records = {
+                        row["idempotency_key"]: _decode_model_completion_stage_record(
+                            row["record_json"]
+                        )
+                        for row in stage_rows
+                    }
+                    active = _reconstruct_active_model_completion_stage(
+                        active_record,
+                        stage_records.get(preparation_key),
+                        stage_records.get(terminal_key),
+                        session_id=session_id,
+                    )
+                    if active is None:
+                        raise SessionModelCompletionStageConflict(
+                            "The active model-completion stage disappeared during settlement."
+                        )
+                    stage = active.stage
+                    settlement_storage_key = _model_completion_stage_settlement_storage_key(
+                        stage.stage_id
+                    )
+                    related_keys = (
+                        settlement_storage_key,
+                        _model_completion_stage_winner_storage_key(stage.logical_step_id),
+                        _runtime_publication_storage_key(stage.logical_step_id),
+                    )
+                    related_rows = connection.execute(
+                        "SELECT idempotency_key, record_json FROM cayu_session_operations "
+                        "WHERE session_id = ? AND idempotency_key IN (?, ?, ?)",
+                        (session_id, *related_keys),
+                    ).fetchall()
+                    related_records = {
+                        row["idempotency_key"]: _decode_model_completion_stage_record(
+                            row["record_json"]
+                        )
+                        for row in related_rows
+                    }
+                    _validate_model_completion_stage_for_settlement(
+                        session=loaded,
+                        stage=stage,
+                        active=active,
+                        request=settlement_request,
+                        settlement_record=related_records.get(settlement_storage_key),
+                        winner_exists=related_keys[1] in related_records,
+                        receipt_exists=related_keys[2] in related_records,
+                    )
+                    settlement_record = _model_completion_stage_settlement_record(
+                        stage,
+                        request=settlement_request,
+                        settled_at=updated_at,
+                    )
                 if queued:
                     _touch_session_activity(connection, session_id, updated_at)
                 else:
@@ -3941,6 +4033,27 @@ class SQLiteSessionStore(SessionStore):
                             session_id,
                         ),
                     )
+                if settlement_record is not None and settlement_storage_key is not None:
+                    connection.execute(
+                        "INSERT INTO cayu_session_operations "
+                        "(session_id, idempotency_key, record_json, updated_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (
+                            session_id,
+                            settlement_storage_key,
+                            sqlite_support.json_dumps(settlement_record),
+                            formatted_updated_at,
+                        ),
+                    )
+                    deleted = connection.execute(
+                        "DELETE FROM cayu_session_operations "
+                        "WHERE session_id = ? AND idempotency_key = ?",
+                        (session_id, MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                    )
+                    if deleted.rowcount != 1:
+                        raise SessionModelCompletionStageConflict(
+                            "The active model-completion stage changed during settlement."
+                        )
                 lookup_key, projection, projection_bytes = pending_action_event_storage_values(
                     copied_event
                 )
@@ -3984,6 +4097,7 @@ class SQLiteSessionStore(SessionStore):
                     from_statuses=allowed_statuses,
                     to_status=target_status,
                     only_if_no_queued_messages=conditional,
+                    model_completion_stage_settlement=settlement_request,
                     status_changed=not queued,
                 )
                 connection.execute(
@@ -5420,6 +5534,44 @@ class SQLiteSessionStore(SessionStore):
 
         return await self._run_read(query)
 
+    async def _load_model_completion_stage_settlement_record(
+        self,
+        session_id: str,
+        settlement_storage_key: str,
+    ) -> dict[str, Any] | None:
+        def query(connection: sqlite3.Connection) -> dict[str, Any] | None:
+            if not _session_exists(connection, session_id):
+                raise KeyError(f"Session not found: {session_id}")
+            row = connection.execute(
+                "SELECT record_json FROM cayu_session_operations "
+                "WHERE session_id = ? AND idempotency_key = ?",
+                (session_id, settlement_storage_key),
+            ).fetchone()
+            return (
+                None if row is None else _decode_model_completion_stage_record(row["record_json"])
+            )
+
+        return await self._run_read(query)
+
+    async def _load_model_completion_stage_dispatch_record(
+        self,
+        session_id: str,
+        dispatch_storage_key: str,
+    ) -> dict[str, Any] | None:
+        def query(connection: sqlite3.Connection) -> dict[str, Any] | None:
+            if not _session_exists(connection, session_id):
+                raise KeyError(f"Session not found: {session_id}")
+            row = connection.execute(
+                "SELECT record_json FROM cayu_session_operations "
+                "WHERE session_id = ? AND idempotency_key = ?",
+                (session_id, dispatch_storage_key),
+            ).fetchone()
+            return (
+                None if row is None else _decode_model_completion_stage_record(row["record_json"])
+            )
+
+        return await self._run_read(query)
+
     async def _load_active_model_completion_stage_records(
         self,
         session_id: str,
@@ -5469,6 +5621,92 @@ class SQLiteSessionStore(SessionStore):
                 raise
 
         return await self._run_read(query)
+
+    async def _mark_model_completion_stage_dispatched_atomic(
+        self,
+        session_id: str,
+        *,
+        stage: ModelCompletionStage,
+    ) -> ModelCompletionStageDispatch:
+        _, _, preparation_key, terminal_key = _model_completion_stage_storage_identity(
+            session_id,
+            stage.stage_id,
+        )
+        settlement_key = _model_completion_stage_settlement_storage_key(stage.stage_id)
+        dispatch_key = _model_completion_stage_dispatch_storage_key(stage.stage_id)
+
+        def statement(connection: sqlite3.Connection) -> ModelCompletionStageDispatch:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                loaded = self._load_unlocked(session_id)
+                if loaded is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                rows = connection.execute(
+                    "SELECT idempotency_key, record_json FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key IN (?, ?, ?, ?, ?)",
+                    (
+                        session_id,
+                        MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+                        preparation_key,
+                        terminal_key,
+                        settlement_key,
+                        dispatch_key,
+                    ),
+                ).fetchall()
+                records = {
+                    row["idempotency_key"]: _decode_model_completion_stage_record(
+                        row["record_json"]
+                    )
+                    for row in rows
+                }
+                _validate_model_completion_stage_for_dispatch(
+                    session=loaded,
+                    current_transcript_cursor=_transcript_cursor(connection, session_id),
+                    stage=stage,
+                    active_record=records.get(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY),
+                    preparation_record=records.get(preparation_key),
+                    terminal_record=records.get(terminal_key),
+                    settlement_record=records.get(settlement_key),
+                )
+                published_at = _next_runtime_publication_timestamp(loaded)
+                dispatch_record = records.get(dispatch_key)
+                if dispatch_record is None:
+                    dispatch_record = _model_completion_stage_dispatch_record(
+                        stage,
+                        dispatched_at=published_at,
+                    )
+                    connection.execute(
+                        "INSERT INTO cayu_session_operations "
+                        "(session_id, idempotency_key, record_json, updated_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (
+                            session_id,
+                            dispatch_key,
+                            sqlite_support.json_dumps(dispatch_record),
+                            sqlite_support.format_datetime(published_at),
+                        ),
+                    )
+                dispatch = _reconstruct_model_completion_stage_dispatch(
+                    dispatch_record,
+                    session_id=session_id,
+                    stage_id=stage.stage_id,
+                    storage_key=dispatch_key,
+                )
+                _validate_model_completion_stage_dispatch(dispatch, stage)
+                formatted_at = sqlite_support.format_datetime(published_at)
+                cursor = connection.execute(
+                    "UPDATE cayu_sessions SET updated_at = ?, last_activity_at = ? WHERE id = ?",
+                    (formatted_at, formatted_at, session_id),
+                )
+                if cursor.rowcount != 1:
+                    raise KeyError(f"Session not found: {session_id}")
+                connection.commit()
+                return dispatch
+            except BaseException:
+                connection.rollback()
+                raise
+
+        return await self._run_write(statement)
 
     async def _prepare_model_completion_stage_atomic(
         self,
@@ -5579,6 +5817,10 @@ class SQLiteSessionStore(SessionStore):
                     prepared,
                     source_status=loaded.status,
                 )
+                retry_settlement_request = _model_completion_retry_settlement_request(
+                    active,
+                    prepared,
+                )
                 if winner_exists or receipt_exists:
                     raise SessionModelCompletionStageConflict(
                         "The logical model step already has durable publication state."
@@ -5633,6 +5875,47 @@ class SQLiteSessionStore(SessionStore):
                     stage,
                     activated_at=prepared_at,
                 )
+                if retry_settlement_request is not None:
+                    assert active is not None
+                    retry_settlement_storage_key = _model_completion_stage_settlement_storage_key(
+                        active.stage.stage_id
+                    )
+                    settlement_row = connection.execute(
+                        "SELECT record_json FROM cayu_session_operations "
+                        "WHERE session_id = ? AND idempotency_key = ?",
+                        (session_id, retry_settlement_storage_key),
+                    ).fetchone()
+                    _validate_model_completion_stage_for_settlement(
+                        session=loaded,
+                        stage=active.stage,
+                        active=active,
+                        request=retry_settlement_request,
+                        settlement_record=(
+                            None
+                            if settlement_row is None
+                            else _decode_model_completion_stage_record(
+                                settlement_row["record_json"]
+                            )
+                        ),
+                        winner_exists=winner_exists,
+                        receipt_exists=receipt_exists,
+                    )
+                    retry_settlement_record = _model_completion_stage_settlement_record(
+                        active.stage,
+                        request=retry_settlement_request,
+                        settled_at=prepared_at,
+                    )
+                    connection.execute(
+                        "INSERT INTO cayu_session_operations "
+                        "(session_id, idempotency_key, record_json, updated_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (
+                            session_id,
+                            retry_settlement_storage_key,
+                            sqlite_support.json_dumps(retry_settlement_record),
+                            formatted_at,
+                        ),
+                    )
                 connection.execute(
                     "INSERT INTO cayu_session_operations "
                     "(session_id, idempotency_key, record_json, updated_at) "
@@ -5678,11 +5961,12 @@ class SQLiteSessionStore(SessionStore):
                     raise KeyError(f"Session not found: {session_id}")
                 rows = connection.execute(
                     "SELECT idempotency_key, record_json FROM cayu_session_operations "
-                    "WHERE session_id = ? AND idempotency_key IN (?, ?)",
+                    "WHERE session_id = ? AND idempotency_key IN (?, ?, ?)",
                     (
                         session_id,
                         prepared.preparation_storage_key,
                         prepared.terminal_storage_key,
+                        prepared.settlement_storage_key,
                     ),
                 ).fetchall()
                 records = {
@@ -5701,6 +5985,12 @@ class SQLiteSessionStore(SessionStore):
                 )
                 if stage is None:
                     raise KeyError(f"Model-completion stage not found: {prepared.stage_id}")
+                _reject_settled_model_completion_stage(
+                    records.get(prepared.settlement_storage_key),
+                    session_id=session_id,
+                    stage_id=prepared.stage_id,
+                    settlement_storage_key=prepared.settlement_storage_key,
+                )
                 if stage.state == "completed":
                     _validate_model_completion_stage_terminal_replay(stage, prepared)
                     connection.rollback()
@@ -5875,10 +6165,16 @@ class SQLiteSessionStore(SessionStore):
                     stage.logical_step_id
                 )
                 publication_storage_key = _runtime_publication_storage_key(stage.logical_step_id)
+                dispatch_storage_key = _model_completion_stage_dispatch_storage_key(stage.stage_id)
                 publication_rows = connection.execute(
                     "SELECT idempotency_key FROM cayu_session_operations "
-                    "WHERE session_id = ? AND idempotency_key IN (?, ?)",
-                    (session_id, winner_storage_key, publication_storage_key),
+                    "WHERE session_id = ? AND idempotency_key IN (?, ?, ?)",
+                    (
+                        session_id,
+                        winner_storage_key,
+                        publication_storage_key,
+                        dispatch_storage_key,
+                    ),
                 ).fetchall()
                 publication_keys = {row["idempotency_key"] for row in publication_rows}
                 _validate_model_completion_stage_for_abandonment(
@@ -5887,6 +6183,7 @@ class SQLiteSessionStore(SessionStore):
                     active=active,
                     prepared=prepared,
                     abandonment_record=records.get(prepared.abandonment_storage_key),
+                    dispatch_exists=dispatch_storage_key in publication_keys,
                     winner_exists=winner_storage_key in publication_keys,
                     receipt_exists=publication_storage_key in publication_keys,
                 )
