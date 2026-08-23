@@ -323,6 +323,14 @@ from cayu.evals.scenario import (
     load_eval_scenario,
     scenario_from_corpus_case,
 )
+from cayu.evals.scenario_capture import (
+    SCENARIO_CAPTURE_ARTIFACT_READ_CONCURRENCY,
+    SCENARIO_CAPTURE_MAX_DIAGNOSTICS,
+    ScenarioCaptureDiagnosticCode,
+    ScenarioCaptureDiagnosticV2,
+    ScenarioCaptureResultV2,
+    capture_eval_scenario_from_session,
+)
 from cayu.evals.store import (
     EVAL_RUN_INVOCATION_MAX_BYTES,
     EVAL_STORE_DEFAULT_PAGE_BYTES,
@@ -454,6 +462,8 @@ __all__ = [
     "PUBLISHED_EVAL_SCHEMA_VERSION",
     "RECALL_BASELINE_CORPUS_SCHEMA_VERSION",
     "RECALL_BASELINE_RESULT_SCHEMA_VERSION",
+    "SCENARIO_CAPTURE_ARTIFACT_READ_CONCURRENCY",
+    "SCENARIO_CAPTURE_MAX_DIAGNOSTICS",
     "TERMINAL_EVAL_RUN_STATUSES",
     "TRAJECTORY_SCHEMA_VERSION",
     "WORKSPACE_PROBE_MAX_BYTES",
@@ -621,6 +631,9 @@ __all__ = [
     "RunInputSpec",
     "ScenarioApprovalCheckpointEventV2",
     "ScenarioArtifactRequirementV2",
+    "ScenarioCaptureDiagnosticCode",
+    "ScenarioCaptureDiagnosticV2",
+    "ScenarioCaptureResultV2",
     "ScenarioEventV2",
     "ScenarioFilePartV2",
     "ScenarioInitialInputEventV2",
@@ -661,6 +674,7 @@ __all__ = [
     "assertion_spec_revision",
     "build_captured_evaluation_candidate",
     "build_promotion_candidate",
+    "capture_eval_scenario_from_session",
     "captured_evaluation_result_from_json",
     "captured_evaluation_result_to_json",
     "compare_corpus_execution_results",

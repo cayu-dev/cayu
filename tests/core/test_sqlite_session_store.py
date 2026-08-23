@@ -2224,6 +2224,14 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
             "FROM pragma_table_info('cayu_events') "
             "WHERE name = 'input_contract_runtime_owned'"
         ).fetchone()
+        file_attestation_proof_revision = connection.execute(
+            "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 54"
+        ).fetchone()
+        file_attestation_proof_column = connection.execute(
+            'SELECT name, type, "notnull", dflt_value '
+            "FROM pragma_table_info('cayu_events') "
+            "WHERE name = 'file_attachment_attestations_runtime_owned'"
+        ).fetchone()
         delayed_task_revision = connection.execute(
             "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 34"
         ).fetchone()
@@ -2269,6 +2277,13 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     assert input_contract_proof_revision == ("breaking", 31)
     assert input_contract_proof_column == (
         "input_contract_runtime_owned",
+        "INTEGER",
+        1,
+        "0",
+    )
+    assert file_attestation_proof_revision == ("breaking", 54)
+    assert file_attestation_proof_column == (
+        "file_attachment_attestations_runtime_owned",
         "INTEGER",
         1,
         "0",
@@ -3157,6 +3172,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (51, 50),
         (52, 52),
         (53, 52),
+        (54, 54),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
@@ -3166,7 +3182,7 @@ def test_sqlite_revision_forty_one_rejects_populated_knowledge_receipt_database(
     monkeypatch,
 ) -> None:
     # This test intentionally boots historical revision-40/41 binaries. The
-    # The current SessionStore requires revision 52 for targeted tool grant state.
+    # This historical test narrows the requirement to its revision-40 boundary.
     monkeypatch.setattr(sqlite_storage, "_SQLITE_SESSION_MIN_REQUIRED_REVISION", 40)
     db_path = tmp_path / "pre-knowledge-access-snapshot.sqlite"
     revisions = schema_migrations.REVISIONS

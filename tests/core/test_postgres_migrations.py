@@ -1571,6 +1571,20 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
             assert proof_column[:2] == ("boolean", "NO")
             assert proof_column[2] in {"false", "false::boolean"}
             await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 54"
+            )
+            assert await cur.fetchone() == ("breaking", 54)
+            await cur.execute(
+                "SELECT data_type, is_nullable, column_default "
+                "FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'cayu_events' "
+                "AND column_name = 'file_attachment_attestations_runtime_owned'"
+            )
+            file_attestation_proof_column = await cur.fetchone()
+            assert file_attestation_proof_column[:2] == ("boolean", "NO")
+            assert file_attestation_proof_column[2] in {"false", "false::boolean"}
+            await cur.execute(
                 "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 34"
             )
             assert await cur.fetchone() == ("breaking", 34)

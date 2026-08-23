@@ -1282,7 +1282,16 @@ wait for the next safe boundary instead of extending the current batch forever.
 
 Delivery is one store transaction: append the user message to the durable
 transcript, mark its queue row delivered, and append
-`session.message.delivered`. The runtime's transition from `running` to
+`session.message.delivered`. Queue acceptance carries a private, runtime-owned
+contract for the prepared message and records whether workload-secret redaction
+changed it. Delivery carries a second private contract that binds the same
+canonical digest to its exact transcript index. A reconstruction must match
+both contracts; the queue row itself is not input provenance. SQLite and
+PostgreSQL persist an independent authority bit before restoring either private
+marker, so an old or caller-authored payload value cannot become reconstruction
+evidence. Ordinary resume admission records the same contract for its exact
+appended message batch, including its redaction fact. The runtime's transition
+from `running` to
 `completed` uses the same store write boundary and fails while queued messages
 remain, so enqueue either wins and forces another model step or observes the
 terminal session and records nothing. A terminal-session enqueue raises the
@@ -4605,6 +4614,35 @@ Compilation produces a validated launch template but resolves no executable
 objects. Built-in stores persist immutable scenarios only after the configured
 credential-redaction boundary accepts the complete document; additive storage
 revision 53 owns the independent scenario table and catalog indexes.
+
+Production-session scenario capture consumes bounded terminal evidence and
+these runtime-owned input contracts. It accepts only exact initial, delivered
+queue, and ordinary resume boundaries whose transcript positions and digests
+agree; all other caller-role transcript material must be accounted for.
+An `ask_user` continuation is not silently omitted: until scenario execution has
+a typed user-input checkpoint, capture returns a closed unavailable diagnostic.
+Approval-request history is reduced to a named fresh-decision checkpoint, so
+approval ids, actors, decisions, and historical grants remain outside the
+portable document. File references are resolved through the source
+environment's currently registered artifact store with bounded concurrent
+reads, exact metadata/scope checks, and a digest matched against private
+runtime-owned proof of the bytes resolved at the source model boundary. Capture
+reloads the terminal snapshot after those reads and rejects a changed source. It
+invokes no provider, tool, environment lifecycle, hook, recovery, or mutation
+path.
+
+Breaking storage revision 54 extends the private `input_contract` payload to
+resume and queued-input events and adds a separate runtime-owned file-attestation
+proof column. It does not backfill historical events. Its compatibility floor
+prevents pre-54 readers—which would expose new markers or lose their provenance—
+from sharing a migrated session store.
+
+Failure is reported as a closed factual diagnostic—such as redacted or
+unattested source input, a missing/inaccessible artifact, contradictory
+evidence, a bound violation, or a changed source—rather than a partial
+scenario. This conversion result is independent of the captured evaluation:
+scoring, persistence, export, and comparison remain available when scenario
+reconstruction cannot complete.
 
 Its storage and target evidence are independent. Project serving may make
 durable storage and project/release identity available before it can resolve a

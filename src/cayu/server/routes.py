@@ -103,6 +103,7 @@ from cayu.evals.results import (
     EvalResultOrigin,
     EvalResultTargetIdentityV1,
 )
+from cayu.evals.scenario_capture import capture_eval_scenario_from_session
 from cayu.evals.store import (
     EVAL_STORE_DEFAULT_PAGE_BYTES,
     EVAL_STORE_DEFAULT_PAGE_SIZE,
@@ -4789,11 +4790,24 @@ def create_router(
                 registration,
                 candidate,
             )
+            source_session = trajectory.session
+            if source_session is None:
+                raise HTTPException(status_code=409, detail="Captured session evidence is absent.")
+            scenario_conversion = await capture_eval_scenario_from_session(
+                cayu_app,
+                source_session.id,
+                target_key=registration.target.key,
+                source_agent_name=registration.target.request_base.agent_name,
+                source=baseline.source.case_source(),
+                name=candidate.case.name,
+                description=candidate.case.description,
+            )
             return CapturedEvaluationPreviewResponse(
                 baseline_revision=baseline.revision,
                 candidate=candidate,
                 captured_score=captured_score,
                 runnable_conversion=_runnable_conversion(trajectory, registration),
+                scenario_conversion=scenario_conversion,
             )
 
         @bounded_captured_evaluation_router.post(

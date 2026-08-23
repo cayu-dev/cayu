@@ -61,6 +61,7 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_nonblank as require_nonblank,
 )
+from cayu.artifacts.attachments import MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY
 from cayu.core.events import (
     EVENT_ID_MAX_CHARS,
     Event,
@@ -1368,25 +1369,48 @@ def system_prompt_messages_sha256(messages: Sequence[Message]) -> str:
 
 
 def session_input_contract_evidence(
-    request: RunRequest,
+    request: RunRequest | ResumeRequest,
     *,
     message_start_index: int,
 ) -> str:
     """Return the canonical runtime-owned fresh-input contract for one request."""
 
-    if type(request) is not RunRequest:
-        raise TypeError("request must be an exact RunRequest.")
+    if type(request) not in {RunRequest, ResumeRequest}:
+        raise TypeError("request must be an exact RunRequest or ResumeRequest.")
+    return session_messages_input_contract_evidence(
+        request.messages,
+        message_start_index=message_start_index,
+        redactions_applied=request._input_redactions_applied,
+        structured_output_requested=request.structured_output is not None,
+    )
+
+
+def session_messages_input_contract_evidence(
+    messages: Sequence[Message],
+    *,
+    message_start_index: int,
+    redactions_applied: bool,
+    structured_output_requested: bool,
+) -> str:
+    """Bind one runtime-owned input batch to its exact transcript position."""
+
+    if type(messages) not in {list, tuple}:
+        raise TypeError("messages must be a list or tuple.")
     if type(message_start_index) is not int:
         raise TypeError("message_start_index must be an integer.")
     if not 0 <= message_start_index <= MAX_DURABLE_JSON_INTEGER:
         raise ValueError("message_start_index exceeds the durable integer limit.")
-    if len(request.messages) > MAX_DURABLE_JSON_INTEGER:
+    if len(messages) > MAX_DURABLE_JSON_INTEGER:
         raise ValueError("messages exceeds the durable message-count limit.")
-    redaction_mode = "redacted" if request._input_redactions_applied else "original"
-    output_mode = "structured" if request.structured_output is not None else "text"
-    messages_sha256 = session_input_messages_sha256(request.messages)
+    if type(redactions_applied) is not bool:
+        raise TypeError("redactions_applied must be a bool.")
+    if type(structured_output_requested) is not bool:
+        raise TypeError("structured_output_requested must be a bool.")
+    redaction_mode = "redacted" if redactions_applied else "original"
+    output_mode = "structured" if structured_output_requested else "text"
+    messages_sha256 = session_input_messages_sha256(messages)
     return (
-        f"v1:{message_start_index}:{len(request.messages)}:{redaction_mode}:"
+        f"v1:{message_start_index}:{len(messages)}:{redaction_mode}:"
         f"{output_mode}:sha256:{messages_sha256}"
     )
 
@@ -1428,6 +1452,7 @@ class ResumeRequest(BaseModel):
         exclude=True,
     )
     _runtime_transport_metadata_authority: object | None = PrivateAttr(default=None)
+    _input_redactions_applied: bool = PrivateAttr(default=False)
 
     @field_validator("messages")
     @classmethod
@@ -1568,6 +1593,7 @@ class EnqueueSessionMessageRequest(BaseModel):
     content: str = Field(max_length=SESSION_MESSAGE_CONTENT_MAX_BYTES)
     delivery_mode: SessionMessageDeliveryMode
     requested_by: ResolutionActor | None = None
+    _input_redactions_applied: bool = PrivateAttr(default=False)
 
     @field_validator("session_id", "idempotency_key")
     @classmethod
@@ -12790,20 +12816,35 @@ class InMemorySessionStore(SessionStore):
             accepted_at = datetime.now(UTC)
             queue_id = str(uuid4())
             ordering_key = self._next_session_message_ordering_key
-            accepted_event = Event(
-                type=EventType.SESSION_MESSAGE_QUEUED,
-                session_id=session.id,
-                agent_name=session.agent_name,
-                environment_name=session.environment_name,
-                timestamp=accepted_at,
-                payload=_queued_session_message_event_payload(
-                    queue_id=queue_id,
-                    delivery_mode=request.delivery_mode,
-                    ordering_key=ordering_key,
-                    actor=request.requested_by,
-                    run_epoch=session.run_epoch,
-                    transcript_cursor=len(self._transcripts.get(session.id, [])),
+            accepted_transcript_cursor = len(self._transcripts.get(session.id, []))
+            accepted_message = Message.text(MessageRole.USER, request.content)
+            accepted_event = event_with_runtime_payload_authority(
+                Event(
+                    type=EventType.SESSION_MESSAGE_QUEUED,
+                    session_id=session.id,
+                    agent_name=session.agent_name,
+                    environment_name=session.environment_name,
+                    timestamp=accepted_at,
+                    payload={
+                        **_queued_session_message_event_payload(
+                            queue_id=queue_id,
+                            delivery_mode=request.delivery_mode,
+                            ordering_key=ordering_key,
+                            actor=request.requested_by,
+                            run_epoch=session.run_epoch,
+                            transcript_cursor=accepted_transcript_cursor,
+                        ),
+                        SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: (
+                            session_messages_input_contract_evidence(
+                                (accepted_message,),
+                                message_start_index=accepted_transcript_cursor,
+                                redactions_applied=request._input_redactions_applied,
+                                structured_output_requested=False,
+                            )
+                        ),
+                    },
                 ),
+                SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
             )
             queued_message = SessionQueuedMessage(
                 queue_id=queue_id,
@@ -12814,7 +12855,7 @@ class InMemorySessionStore(SessionStore):
                 status=SessionMessageQueueStatus.QUEUED,
                 ordering_key=ordering_key,
                 accepted_run_epoch=session.run_epoch,
-                accepted_transcript_cursor=len(self._transcripts.get(session.id, [])),
+                accepted_transcript_cursor=accepted_transcript_cursor,
                 accepted_event_id=accepted_event.id,
                 accepted_at=accepted_at,
                 requested_by=_audit_resolution_actor(request.requested_by),
@@ -12940,25 +12981,41 @@ class InMemorySessionStore(SessionStore):
             transcript_messages: list[Message] = []
             for offset, queued_message in enumerate(selected, start=1):
                 delivered_cursor = transcript_cursor + offset
-                delivery_event = Event(
-                    type=EventType.SESSION_MESSAGE_DELIVERED,
-                    session_id=session.id,
-                    interaction_id=interaction_id,
-                    agent_name=session.agent_name,
-                    environment_name=session.environment_name,
-                    timestamp=delivered_at,
-                    payload={
-                        **_queued_session_message_event_payload(
-                            queue_id=queued_message.queue_id,
-                            delivery_mode=queued_message.delivery_mode,
-                            ordering_key=queued_message.ordering_key,
-                            actor=queued_message.requested_by,
-                            run_epoch=session.run_epoch,
-                            transcript_cursor=delivered_cursor,
-                        ),
-                        "accepted_run_epoch": queued_message.accepted_run_epoch,
-                        "accepted_transcript_cursor": (queued_message.accepted_transcript_cursor),
-                    },
+                delivered_message = detach_message(
+                    Message.text(MessageRole.USER, queued_message.content)
+                )
+                delivery_event = event_with_runtime_payload_authority(
+                    Event(
+                        type=EventType.SESSION_MESSAGE_DELIVERED,
+                        session_id=session.id,
+                        interaction_id=interaction_id,
+                        agent_name=session.agent_name,
+                        environment_name=session.environment_name,
+                        timestamp=delivered_at,
+                        payload={
+                            **_queued_session_message_event_payload(
+                                queue_id=queued_message.queue_id,
+                                delivery_mode=queued_message.delivery_mode,
+                                ordering_key=queued_message.ordering_key,
+                                actor=queued_message.requested_by,
+                                run_epoch=session.run_epoch,
+                                transcript_cursor=delivered_cursor,
+                            ),
+                            "accepted_run_epoch": queued_message.accepted_run_epoch,
+                            "accepted_transcript_cursor": (
+                                queued_message.accepted_transcript_cursor
+                            ),
+                            SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: (
+                                session_messages_input_contract_evidence(
+                                    (delivered_message,),
+                                    message_start_index=delivered_cursor - 1,
+                                    redactions_applied=False,
+                                    structured_output_requested=False,
+                                )
+                            ),
+                        },
+                    ),
+                    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
                 )
                 updated_messages.append(
                     queued_message.model_copy(
@@ -12973,9 +13030,7 @@ class InMemorySessionStore(SessionStore):
                     )
                 )
                 delivery_events.append(delivery_event)
-                transcript_messages.append(
-                    detach_message(Message.text(MessageRole.USER, queued_message.content))
-                )
+                transcript_messages.append(delivered_message)
 
             persisted_events = [
                 *([interaction_started_event] if interaction_started_event is not None else []),
@@ -16746,6 +16801,7 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
         and authority.token is _RUNTIME_RESUME_TRANSPORT_METADATA_TOKEN
     ):
         copied._runtime_transport_metadata_authority = authority
+    copied._input_redactions_applied = request._input_redactions_applied
     return copied
 
 
@@ -16877,13 +16933,15 @@ def copy_enqueue_session_message_request(
 ) -> EnqueueSessionMessageRequest:
     if type(request) is not EnqueueSessionMessageRequest:
         raise TypeError("Queued input requires an EnqueueSessionMessageRequest.")
-    return EnqueueSessionMessageRequest(
+    copied = EnqueueSessionMessageRequest(
         session_id=request.session_id,
         idempotency_key=request.idempotency_key,
         content=request.content,
         delivery_mode=request.delivery_mode,
         requested_by=copy_resolution_actor(request.requested_by),
     )
+    copied._input_redactions_applied = request._input_redactions_applied
+    return copied
 
 
 def copy_interrupt_session_request(request: InterruptSessionRequest) -> InterruptSessionRequest:
@@ -21918,6 +21976,12 @@ def _persisted_event_authority_fields(event_type: EventType | str) -> tuple[str,
         )
     if event_type == EventType.SESSION_FORKED:
         return ("parent_session_id", "source_session_id")
+    if event_type in {
+        EventType.SESSION_RESUMED,
+        EventType.SESSION_MESSAGE_QUEUED,
+        EventType.SESSION_MESSAGE_DELIVERED,
+    }:
+        return (SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,)
     if event_type == EventType.PROVIDER_OPERATION_RECOVERY_REQUIRED:
         return (
             "model_attempt_id",
@@ -21945,6 +22009,8 @@ def _persisted_event_authority_fields(event_type: EventType | str) -> tuple[str,
             "model_step_id",
             "profile_id",
         )
+    if event_type == EventType.MODEL_STARTED:
+        return (MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY,)
     return ()
 
 
@@ -21976,7 +22042,12 @@ def _event_input_contract_is_runtime_owned(event: Event) -> bool:
 
     if type(event) is not Event:
         raise TypeError("event must be an exact Event.")
-    if event.type != EventType.SESSION_STARTED:
+    if event.type not in {
+        EventType.SESSION_STARTED,
+        EventType.SESSION_RESUMED,
+        EventType.SESSION_MESSAGE_QUEUED,
+        EventType.SESSION_MESSAGE_DELIVERED,
+    }:
         return False
     marker = event.payload.get(SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY)
     return type(marker) is str and event_payload_authority_is_runtime_generated(
@@ -21986,10 +22057,26 @@ def _event_input_contract_is_runtime_owned(event: Event) -> bool:
     )
 
 
+def _event_file_attachment_attestations_are_runtime_owned(event: Event) -> bool:
+    """Return whether a model boundary carries exact runtime-resolved file proof."""
+
+    if type(event) is not Event:
+        raise TypeError("event must be an exact Event.")
+    if event.type != EventType.MODEL_STARTED:
+        return False
+    marker = event.payload.get(MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY)
+    return type(marker) is str and event_payload_authority_is_runtime_generated(
+        event,
+        field_name=MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY,
+        value=marker,
+    )
+
+
 def restore_persisted_event_authority(
     event: Event,
     *,
     input_contract_runtime_owned: bool = False,
+    file_attachment_attestations_runtime_owned: bool = False,
 ) -> Event:
     """Restore private authority proven by the built-in store ingestion boundary.
 
@@ -22007,12 +22094,18 @@ def restore_persisted_event_authority(
     copied = copy_event(event)
     if type(input_contract_runtime_owned) is not bool:
         raise TypeError("input_contract_runtime_owned must be a bool.")
+    if type(file_attachment_attestations_runtime_owned) is not bool:
+        raise TypeError("file_attachment_attestations_runtime_owned must be a bool.")
     fields = tuple(
         field_name
         for field_name in _persisted_event_authority_fields(copied.type)
         if type(copied.payload.get(field_name)) is str
         and (
             field_name != SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY or input_contract_runtime_owned
+        )
+        and (
+            field_name != MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY
+            or file_attachment_attestations_runtime_owned
         )
     )
     return event_with_runtime_payload_authority(copied, *fields) if fields else copied

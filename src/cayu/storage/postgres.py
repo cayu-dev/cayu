@@ -47,7 +47,12 @@ from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
 from cayu.core.billing import BillingIdentity, copy_billing_identity
-from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
+from cayu.core.events import (
+    EVENT_ID_MAX_CHARS,
+    Event,
+    EventType,
+    event_with_runtime_payload_authority,
+)
 from cayu.core.messages import Message, MessageRole
 from cayu.core.runtime_authority import CheckpointValueAuthority
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
@@ -166,6 +171,7 @@ from cayu.runtime.sessions import (
     SESSION_LINEAGE_MAX_IDENTIFIER_BYTES,
     SESSION_LINEAGE_MAX_ORIGIN_EVENTS,
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     TRANSCRIPT_SEARCH_TOKENIZER_VERSION,
     BudgetReservationIdentityConflict,
     CheckpointRootFieldGuard,
@@ -285,6 +291,7 @@ from cayu.runtime.sessions import (
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
     _durable_subagent_parent_delete_block_reason,
+    _event_file_attachment_attestations_are_runtime_owned,
     _event_input_contract_is_runtime_owned,
     _execution_profile_rejection_events_equivalent,
     _initial_transcript_pending_checkpoint,
@@ -404,6 +411,7 @@ from cayu.runtime.sessions import (
     resolve_interaction_attribution,
     restore_persisted_event_authority,
     session_invocation_for_run_request,
+    session_messages_input_contract_evidence,
     session_metadata_for_creation,
     session_next_cursor,
     session_outcome,
@@ -648,7 +656,7 @@ from cayu.storage.memory import (
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 52
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 54
 _POSTGRES_TASK_MIN_REQUIRED_REVISION = 49
 
 
@@ -1487,6 +1495,10 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     31: (
         "ALTER TABLE cayu_events ADD COLUMN IF NOT EXISTS "
         "input_contract_runtime_owned BOOLEAN NOT NULL DEFAULT FALSE",
+    ),
+    54: (
+        "ALTER TABLE cayu_events ADD COLUMN IF NOT EXISTS "
+        "file_attachment_attestations_runtime_owned BOOLEAN NOT NULL DEFAULT FALSE",
     ),
     32: (
         """
@@ -17827,10 +17839,13 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             return
         event_ids: list[str] = []
         runtime_owned_input_contract_event_ids: list[str] = []
+        runtime_owned_file_attestation_event_ids: list[str] = []
         for event in events:
             event_ids.append(event.id)
             if _event_input_contract_is_runtime_owned(event):
                 runtime_owned_input_contract_event_ids.append(event.id)
+            if _event_file_attachment_attestations_are_runtime_owned(event):
+                runtime_owned_file_attestation_event_ids.append(event.id)
         # Presence alone is not authority: rows predating revision 31 may contain
         # caller-authored payload text but cannot carry this proof bit.
         if runtime_owned_input_contract_event_ids:
@@ -17840,10 +17855,27 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 SET input_contract_runtime_owned = TRUE
                 WHERE session_id = %s
                   AND event_id = ANY(%s)
-                  AND event_type = 'session.started'
+                  AND event_type IN (
+                      'session.started',
+                      'session.resumed',
+                      'session.message.queued',
+                      'session.message.delivered'
+                  )
                   AND jsonb_typeof(payload -> 'input_contract') = 'string'
                 """,
                 (session_id, runtime_owned_input_contract_event_ids),
+            )
+        if runtime_owned_file_attestation_event_ids:
+            await cur.execute(
+                """
+                UPDATE cayu_events
+                SET file_attachment_attestations_runtime_owned = TRUE
+                WHERE session_id = %s
+                  AND event_id = ANY(%s)
+                  AND event_type = 'model.started'
+                  AND jsonb_typeof(payload -> 'file_attachment_attestations') = 'string'
+                """,
+                (session_id, runtime_owned_file_attestation_event_ids),
             )
         await cur.execute(
             """
@@ -18211,21 +18243,35 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     if ordering_row is None:
                         raise RuntimeError("Postgres queue insert did not return an ordering key.")
                     ordering_key = ordering_row[0]
-                    accepted_event = Event(
-                        id=accepted_event_id,
-                        type=EventType.SESSION_MESSAGE_QUEUED,
-                        session_id=request.session_id,
-                        agent_name=loaded.agent_name,
-                        environment_name=loaded.environment_name,
-                        timestamp=accepted_at,
-                        payload=_queued_session_message_event_payload(
-                            queue_id=queue_id,
-                            delivery_mode=request.delivery_mode,
-                            ordering_key=ordering_key,
-                            actor=request.requested_by,
-                            run_epoch=loaded.run_epoch,
-                            transcript_cursor=transcript_cursor,
+                    accepted_message = Message.text(MessageRole.USER, request.content)
+                    accepted_event = event_with_runtime_payload_authority(
+                        Event(
+                            id=accepted_event_id,
+                            type=EventType.SESSION_MESSAGE_QUEUED,
+                            session_id=request.session_id,
+                            agent_name=loaded.agent_name,
+                            environment_name=loaded.environment_name,
+                            timestamp=accepted_at,
+                            payload={
+                                **_queued_session_message_event_payload(
+                                    queue_id=queue_id,
+                                    delivery_mode=request.delivery_mode,
+                                    ordering_key=ordering_key,
+                                    actor=request.requested_by,
+                                    run_epoch=loaded.run_epoch,
+                                    transcript_cursor=transcript_cursor,
+                                ),
+                                SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: (
+                                    session_messages_input_contract_evidence(
+                                        (accepted_message,),
+                                        message_start_index=transcript_cursor,
+                                        redactions_applied=request._input_redactions_applied,
+                                        structured_output_requested=False,
+                                    )
+                                ),
+                            },
                         ),
+                        SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
                     )
                     await cur.execute(
                         "UPDATE cayu_sessions SET event_seq = event_seq + 1, "
@@ -18470,27 +18516,42 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     for offset, row in enumerate(rows, start=1):
                         queued_message = _queued_session_message_from_row(row)
                         delivered_cursor = transcript_cursor + offset
-                        delivery_event = Event(
-                            type=EventType.SESSION_MESSAGE_DELIVERED,
-                            session_id=session_id,
-                            interaction_id=interaction_id,
-                            agent_name=loaded.agent_name,
-                            environment_name=loaded.environment_name,
-                            timestamp=delivered_at,
-                            payload={
-                                **_queued_session_message_event_payload(
-                                    queue_id=queued_message.queue_id,
-                                    delivery_mode=queued_message.delivery_mode,
-                                    ordering_key=queued_message.ordering_key,
-                                    actor=queued_message.requested_by,
-                                    run_epoch=loaded.run_epoch,
-                                    transcript_cursor=delivered_cursor,
-                                ),
-                                "accepted_run_epoch": queued_message.accepted_run_epoch,
-                                "accepted_transcript_cursor": (
-                                    queued_message.accepted_transcript_cursor
-                                ),
-                            },
+                        delivered_message = Message.text(
+                            MessageRole.USER,
+                            queued_message.content,
+                        )
+                        delivery_event = event_with_runtime_payload_authority(
+                            Event(
+                                type=EventType.SESSION_MESSAGE_DELIVERED,
+                                session_id=session_id,
+                                interaction_id=interaction_id,
+                                agent_name=loaded.agent_name,
+                                environment_name=loaded.environment_name,
+                                timestamp=delivered_at,
+                                payload={
+                                    **_queued_session_message_event_payload(
+                                        queue_id=queued_message.queue_id,
+                                        delivery_mode=queued_message.delivery_mode,
+                                        ordering_key=queued_message.ordering_key,
+                                        actor=queued_message.requested_by,
+                                        run_epoch=loaded.run_epoch,
+                                        transcript_cursor=delivered_cursor,
+                                    ),
+                                    "accepted_run_epoch": queued_message.accepted_run_epoch,
+                                    "accepted_transcript_cursor": (
+                                        queued_message.accepted_transcript_cursor
+                                    ),
+                                    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: (
+                                        session_messages_input_contract_evidence(
+                                            (delivered_message,),
+                                            message_start_index=delivered_cursor - 1,
+                                            redactions_applied=False,
+                                            structured_output_requested=False,
+                                        )
+                                    ),
+                                },
+                            ),
+                            SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
                         )
                         updated_messages.append(
                             queued_message.model_copy(
@@ -18505,9 +18566,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             )
                         )
                         delivery_events.append(delivery_event)
-                        transcript_messages.append(
-                            Message.text(MessageRole.USER, queued_message.content)
-                        )
+                        transcript_messages.append(delivered_message)
                     await cur.executemany(
                         "INSERT INTO cayu_transcript_messages "
                         "(session_id, interaction_id, message, "
@@ -21148,7 +21207,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         )
                     await cur.execute(
                         """
-                        SELECT sequence, event, input_contract_runtime_owned
+                        SELECT sequence, event, input_contract_runtime_owned,
+                               file_attachment_attestations_runtime_owned
                         FROM cayu_events
                         WHERE session_id = %s AND sequence <= %s
                         ORDER BY sequence ASC
@@ -21176,6 +21236,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             event=restore_persisted_event_authority(
                                 Event(**_json_obj(row[1])),
                                 input_contract_runtime_owned=row[2],
+                                file_attachment_attestations_runtime_owned=row[3],
                             ),
                         )
                         for row in event_rows
@@ -21279,7 +21340,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 f"""
                 SELECT cayu_events.sequence,
                        cayu_events.event,
-                       cayu_events.input_contract_runtime_owned
+                       cayu_events.input_contract_runtime_owned,
+                       cayu_events.file_attachment_attestations_runtime_owned
                 FROM cayu_events
                 JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
                 {plan.where_sql}
@@ -21296,6 +21358,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 event=restore_persisted_event_authority(
                     Event(**_json_obj(row[1])),
                     input_contract_runtime_owned=row[2],
+                    file_attachment_attestations_runtime_owned=row[3],
                 ),
             )
             for row in rows

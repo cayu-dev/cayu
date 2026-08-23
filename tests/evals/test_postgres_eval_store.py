@@ -250,7 +250,7 @@ def test_postgres_revision_fifty_three_adds_scenarios_without_rewriting_corpora(
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
                 await cur.execute("DROP TABLE cayu_eval_scenarios")
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 53")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 53")
             await conn.commit()
 
         migrated = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
@@ -285,7 +285,7 @@ def test_postgres_revision_fifty_three_rejects_missing_scenario_constraint(
                     "ALTER TABLE cayu_eval_scenarios DROP CONSTRAINT "
                     "cayu_eval_scenarios_document_size_check"
                 )
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 53")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 53")
             await conn.commit()
 
         conflicting = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
@@ -328,7 +328,7 @@ def test_postgres_revision_fifty_three_rejects_unique_scenario_catalog_index(
                     "CREATE UNIQUE INDEX idx_cayu_eval_scenarios_catalog "
                     "ON cayu_eval_scenarios(created_at DESC, revision ASC)"
                 )
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 53")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 53")
             await conn.commit()
 
         conflicting = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)

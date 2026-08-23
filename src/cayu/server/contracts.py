@@ -47,6 +47,7 @@ from cayu.evals.promotion import (
     PromotionCandidateV1,
 )
 from cayu.evals.results import CapturedEvaluationResultV1
+from cayu.evals.scenario_capture import ScenarioCaptureResultV2
 from cayu.evals.store import (
     EVAL_STORE_MAX_CLAIM_TARGETS,
     EvalBaselineMutationRecord,
@@ -1293,6 +1294,7 @@ class CapturedEvaluationPreviewResponse(ApiBaseModel):
     candidate: CapturedEvaluationCandidateV1
     captured_score: CapturedRunScoreV1
     runnable_conversion: CapturedEvaluationConversion
+    scenario_conversion: ScenarioCaptureResultV2
 
 
 class CapturedEvaluationSaveRequest(ApiBaseModel):

@@ -202,6 +202,22 @@ def test_revision_fifty_three_adds_compatible_portable_eval_scenarios() -> None:
         )
 
 
+def test_revision_fifty_four_rejects_readers_that_expose_private_input_attestations() -> None:
+    state = m.SchemaState(revision=54, compatible_from=54)
+
+    # Pre-54 readers do not hide input_contract on resume and queue events, so
+    # they cannot share a database once new session writers persist those facts.
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 54"):
+        m.validate(state, app_latest=53, app_min_supported=52)
+    m.validate(state, app_latest=54, app_min_supported=54)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 54"):
+        m.validate(
+            m.SchemaState(revision=53, compatible_from=52),
+            app_latest=54,
+            app_min_supported=54,
+        )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

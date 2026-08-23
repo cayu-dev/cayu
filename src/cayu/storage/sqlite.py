@@ -25,7 +25,12 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
-from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
+from cayu.core.events import (
+    EVENT_ID_MAX_CHARS,
+    Event,
+    EventType,
+    event_with_runtime_payload_authority,
+)
 from cayu.core.messages import Message, MessageRole
 from cayu.core.runtime_authority import CheckpointValueAuthority
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
@@ -93,6 +98,7 @@ from cayu.runtime.sessions import (
     SESSION_LINEAGE_MAX_ORIGIN_EVENTS,
     SESSION_LINEAGE_MAX_TIMESTAMP_BYTES,
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES,
     BudgetReservationIdentityConflict,
     CheckpointRootFieldGuard,
@@ -213,6 +219,7 @@ from cayu.runtime.sessions import (
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
     _durable_subagent_parent_delete_block_reason,
+    _event_file_attachment_attestations_are_runtime_owned,
     _event_input_contract_is_runtime_owned,
     _execution_profile_rejection_events_equivalent,
     _initial_transcript_pending_checkpoint,
@@ -330,6 +337,7 @@ from cayu.runtime.sessions import (
     replace_session_user_metadata,
     resolve_interaction_attribution,
     restore_persisted_event_authority,
+    session_messages_input_contract_evidence,
     session_next_cursor,
     session_outcome,
     session_query_from_aggregate_filter,
@@ -483,7 +491,7 @@ from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 52
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 54
 _SQLITE_TASK_MIN_REQUIRED_REVISION = 49
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
@@ -1098,6 +1106,7 @@ _EVENT_COLUMN_NAMES: tuple[str, ...] = (
     "tool_name",
     "payload_json",
     "input_contract_runtime_owned",
+    "file_attachment_attestations_runtime_owned",
 )
 
 # Keep this predicate text aligned with the revision-17 partial index. SQLite
@@ -1126,6 +1135,11 @@ def _event_from_row(row: sqlite3.Row) -> Event:
         1,
     }:
         raise ValueError("Stored input-contract authority proof is malformed.")
+    file_attachment_attestations_runtime_owned = row["file_attachment_attestations_runtime_owned"]
+    if type(
+        file_attachment_attestations_runtime_owned
+    ) is not int or file_attachment_attestations_runtime_owned not in {0, 1}:
+        raise ValueError("Stored file-attachment attestation proof is malformed.")
     return restore_persisted_event_authority(
         Event(
             type=row["event_type"],
@@ -1140,6 +1154,9 @@ def _event_from_row(row: sqlite3.Row) -> Event:
             payload=json.loads(row["payload_json"]),
         ),
         input_contract_runtime_owned=input_contract_runtime_owned == 1,
+        file_attachment_attestations_runtime_owned=(
+            file_attachment_attestations_runtime_owned == 1
+        ),
     )
 
 
@@ -1266,10 +1283,13 @@ def _enqueue_persisted_event_side_effects(
         return
     event_ids: list[str] = []
     runtime_owned_input_contract_event_ids: list[str] = []
+    runtime_owned_file_attestation_event_ids: list[str] = []
     for event in events:
         event_ids.append(event.id)
         if _event_input_contract_is_runtime_owned(event):
             runtime_owned_input_contract_event_ids.append(event.id)
+        if _event_file_attachment_attestations_are_runtime_owned(event):
+            runtime_owned_file_attestation_event_ids.append(event.id)
     # Rows predating revision 31 may contain caller-authored payload text but
     # cannot carry the proof bit, so that text remains untrusted after migration.
     if runtime_owned_input_contract_event_ids:
@@ -1279,10 +1299,27 @@ def _enqueue_persisted_event_side_effects(
             SET input_contract_runtime_owned = 1
             WHERE session_id = ?
               AND event_id = ?
-              AND event_type = 'session.started'
+              AND event_type IN (
+                  'session.started',
+                  'session.resumed',
+                  'session.message.queued',
+                  'session.message.delivered'
+              )
               AND json_type(payload_json, '$.input_contract') = 'text'
             """,
             [(session_id, event_id) for event_id in runtime_owned_input_contract_event_ids],
+        )
+    if runtime_owned_file_attestation_event_ids:
+        connection.executemany(
+            """
+            UPDATE cayu_events
+            SET file_attachment_attestations_runtime_owned = 1
+            WHERE session_id = ?
+              AND event_id = ?
+              AND event_type = 'model.started'
+              AND json_type(payload_json, '$.file_attachment_attestations') = 'text'
+            """,
+            [(session_id, event_id) for event_id in runtime_owned_file_attestation_event_ids],
         )
     connection.executemany(
         """
@@ -6073,21 +6110,35 @@ class SQLiteSessionStore(SessionStore):
                 ordering_key = cursor.lastrowid
                 if type(ordering_key) is not int:
                     raise RuntimeError("SQLite queue insert did not return an ordering key.")
-                accepted_event = Event(
-                    id=accepted_event_id,
-                    type=EventType.SESSION_MESSAGE_QUEUED,
-                    session_id=request.session_id,
-                    agent_name=loaded.agent_name,
-                    environment_name=loaded.environment_name,
-                    timestamp=accepted_at,
-                    payload=_queued_session_message_event_payload(
-                        queue_id=queue_id,
-                        delivery_mode=request.delivery_mode,
-                        ordering_key=ordering_key,
-                        actor=request.requested_by,
-                        run_epoch=loaded.run_epoch,
-                        transcript_cursor=transcript_cursor,
+                accepted_message = Message.text(MessageRole.USER, request.content)
+                accepted_event = event_with_runtime_payload_authority(
+                    Event(
+                        id=accepted_event_id,
+                        type=EventType.SESSION_MESSAGE_QUEUED,
+                        session_id=request.session_id,
+                        agent_name=loaded.agent_name,
+                        environment_name=loaded.environment_name,
+                        timestamp=accepted_at,
+                        payload={
+                            **_queued_session_message_event_payload(
+                                queue_id=queue_id,
+                                delivery_mode=request.delivery_mode,
+                                ordering_key=ordering_key,
+                                actor=request.requested_by,
+                                run_epoch=loaded.run_epoch,
+                                transcript_cursor=transcript_cursor,
+                            ),
+                            SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: (
+                                session_messages_input_contract_evidence(
+                                    (accepted_message,),
+                                    message_start_index=transcript_cursor,
+                                    redactions_applied=request._input_redactions_applied,
+                                    structured_output_requested=False,
+                                )
+                            ),
+                        },
                     ),
+                    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
                 )
                 lookup_key, projection, projection_bytes = pending_action_event_storage_values(
                     accepted_event
@@ -6302,27 +6353,42 @@ class SQLiteSessionStore(SessionStore):
                 for offset, row in enumerate(rows, start=1):
                     queued_message = _queued_session_message_from_row(row)
                     delivered_cursor = transcript_cursor + offset
-                    delivery_event = Event(
-                        type=EventType.SESSION_MESSAGE_DELIVERED,
-                        session_id=session_id,
-                        interaction_id=interaction_id,
-                        agent_name=loaded.agent_name,
-                        environment_name=loaded.environment_name,
-                        timestamp=delivered_at,
-                        payload={
-                            **_queued_session_message_event_payload(
-                                queue_id=queued_message.queue_id,
-                                delivery_mode=queued_message.delivery_mode,
-                                ordering_key=queued_message.ordering_key,
-                                actor=queued_message.requested_by,
-                                run_epoch=loaded.run_epoch,
-                                transcript_cursor=delivered_cursor,
-                            ),
-                            "accepted_run_epoch": queued_message.accepted_run_epoch,
-                            "accepted_transcript_cursor": (
-                                queued_message.accepted_transcript_cursor
-                            ),
-                        },
+                    delivered_message = Message.text(
+                        MessageRole.USER,
+                        queued_message.content,
+                    )
+                    delivery_event = event_with_runtime_payload_authority(
+                        Event(
+                            type=EventType.SESSION_MESSAGE_DELIVERED,
+                            session_id=session_id,
+                            interaction_id=interaction_id,
+                            agent_name=loaded.agent_name,
+                            environment_name=loaded.environment_name,
+                            timestamp=delivered_at,
+                            payload={
+                                **_queued_session_message_event_payload(
+                                    queue_id=queued_message.queue_id,
+                                    delivery_mode=queued_message.delivery_mode,
+                                    ordering_key=queued_message.ordering_key,
+                                    actor=queued_message.requested_by,
+                                    run_epoch=loaded.run_epoch,
+                                    transcript_cursor=delivered_cursor,
+                                ),
+                                "accepted_run_epoch": queued_message.accepted_run_epoch,
+                                "accepted_transcript_cursor": (
+                                    queued_message.accepted_transcript_cursor
+                                ),
+                                SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: (
+                                    session_messages_input_contract_evidence(
+                                        (delivered_message,),
+                                        message_start_index=delivered_cursor - 1,
+                                        redactions_applied=False,
+                                        structured_output_requested=False,
+                                    )
+                                ),
+                            },
+                        ),
+                        SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
                     )
                     updated = queued_message.model_copy(
                         update={
@@ -6336,9 +6402,7 @@ class SQLiteSessionStore(SessionStore):
                     )
                     updated_messages.append(updated)
                     delivery_events.append(delivery_event)
-                    transcript_messages.append(
-                        Message.text(MessageRole.USER, queued_message.content)
-                    )
+                    transcript_messages.append(delivered_message)
                 connection.executemany(
                     "INSERT INTO cayu_transcript_messages "
                     "(session_id, role, interaction_id, message_json, "

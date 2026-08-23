@@ -60,6 +60,7 @@ from cayu.artifacts import (
     file_attachment_from_payload,
     resolved_file_attachment,
 )
+from cayu.artifacts.attachments import MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY
 from cayu.core.agents import AgentSpec
 from cayu.core.billing import (
     BillingIdentity,
@@ -4293,6 +4294,7 @@ class ModelStepExecutor:
                 "filename",
                 "content_type",
                 "data_base64",
+                "content_sha256",
                 "metadata",
             },
             untrusted_container_keys={"metadata"},
@@ -4419,6 +4421,7 @@ class ModelStepExecutor:
             if self._request_footprint.enabled
             else None
         )
+        file_attachment_attestations = _model_file_attachment_attestations(model_request)
         while True:
             model_attempt_identity = (
                 model_step_identity.new_attempt()
@@ -4545,26 +4548,41 @@ class ModelStepExecutor:
             )
             if context_count_event is not None:
                 yield context_count_event, None
+            model_started = _event_with_model_identity_authority(
+                Event(
+                    type=EventType.MODEL_STARTED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    payload={
+                        "model": session.model,
+                        "provider": registered_provider.name,
+                        "step": step,
+                        "attempt": attempt,
+                        "max_attempts": retry_policy.max_attempts,
+                        **(
+                            {
+                                MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY: (
+                                    file_attachment_attestations
+                                )
+                            }
+                            if file_attachment_attestations
+                            else {}
+                        ),
+                        **model_attempt_identity.payload(),
+                    },
+                    environment_name=environment_name,
+                ),
+                model_attempt_identity,
+            )
+            if file_attachment_attestations:
+                model_started = event_with_runtime_payload_authority(
+                    model_started,
+                    MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY,
+                )
             yield (
                 await self._event_writer.emit(
                     event_with_execution_profile_authority(
-                        _event_with_model_identity_authority(
-                            Event(
-                                type=EventType.MODEL_STARTED,
-                                session_id=session.id,
-                                agent_name=registered_agent.spec.name,
-                                payload={
-                                    "model": session.model,
-                                    "provider": registered_provider.name,
-                                    "step": step,
-                                    "attempt": attempt,
-                                    "max_attempts": retry_policy.max_attempts,
-                                    **model_attempt_identity.payload(),
-                                },
-                                environment_name=environment_name,
-                            ),
-                            model_attempt_identity,
-                        ),
+                        model_started,
                         execution_profile,
                     )
                 ),
@@ -10414,6 +10432,42 @@ def _model_context_overflow_error_event(
 
 class _FileAttachmentUnavailable(RuntimeError):
     """An attachment reference cannot be resolved in its declared scope."""
+
+
+def _model_file_attachment_attestations(
+    request: ModelRequest,
+) -> str | None:
+    """Hash the exact runtime-resolved bytes without materializing them twice."""
+
+    raw_attachments = request.options.get(RESOLVED_FILE_ATTACHMENTS_OPTION)
+    if raw_attachments is None:
+        return None
+    if type(raw_attachments) is not dict:
+        raise RuntimeError("Resolved file attachment request material must be an object.")
+    attestations: list[dict[str, str]] = []
+    for artifact_id in sorted(raw_attachments):
+        attachment = raw_attachments[artifact_id]
+        if type(artifact_id) is not str or not artifact_id or type(attachment) is not dict:
+            raise RuntimeError("Resolved file attachment request material is malformed.")
+        if attachment.get("artifact_id") != artifact_id:
+            raise RuntimeError("Resolved file attachment request identity is inconsistent.")
+        digest = attachment.get("content_sha256")
+        if (
+            type(digest) is not str
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise RuntimeError("Resolved file attachment request digest is unavailable.")
+        attestations.append(
+            {
+                "artifact_id": artifact_id,
+                "content_sha256": digest,
+            }
+        )
+    return "v1:" + canonical_durable_json_bytes(
+        attestations,
+        "model file attachment attestations",
+    ).decode("utf-8")
 
 
 async def _resolved_file_attachments(

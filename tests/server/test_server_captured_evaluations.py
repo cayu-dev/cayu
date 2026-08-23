@@ -92,6 +92,10 @@ def test_click_to_evaluate_saves_catalogs_baselines_and_exports_without_runnable
             "state": "ready",
             "reason_code": None,
         }
+        assert readiness["scenario_conversion"] == {
+            "state": "ready",
+            "reason_code": None,
+        }
 
         preview = client.post(preview_url, headers=_AUTH_HEADERS, json={})
         assert preview.status_code == 200
@@ -102,6 +106,15 @@ def test_click_to_evaluate_saves_catalogs_baselines_and_exports_without_runnable
             "available": True,
             "reason_code": None,
         }
+        assert initial["scenario_conversion"]["available"] is True
+        assert initial["scenario_conversion"]["diagnostics"] == []
+        scenario = initial["scenario_conversion"]["scenario"]
+        assert scenario["schema_version"] == 2
+        assert scenario["target_key"] == initial["candidate"]["target_key"]
+        assert [event["kind"] for event in scenario["events"]] == ["initial"]
+        assert scenario["events"][0]["input"]["messages"][0]["content"] == [
+            {"type": "text", "text": "promote this completed run"}
+        ]
 
         target_key = initial["candidate"]["target_key"]
         assert (
@@ -352,6 +365,50 @@ def test_click_to_evaluate_saves_catalogs_baselines_and_exports_without_runnable
         )
         assert rejected_run.status_code == 409
         assert "no runnable input" in rejected_run.json()["detail"]
+
+    asyncio.run(context.close())
+
+
+def test_captured_preview_remains_usable_when_scenario_source_was_redacted(tmp_path) -> None:
+    app = asyncio.run(_seed_app(secret="promote this completed run"))
+    context = _create_project_control_plane_context(
+        project_root=Path(__file__).resolve().parents[2],
+        project_id="captured-redacted-scenario",
+        configured_release_id="release-current",
+        eval_store=SQLiteEvalStore(tmp_path / "cayu.db"),
+        store_backend="sqlite",
+        store_source="project",
+        access=ProjectControlPlaneAccess.AUTHENTICATED_PRODUCTION,
+    )
+    server = create_server(
+        app,
+        config=ServerConfig.protected(
+            _authenticate,
+            dashboard=DashboardConfig(enabled=False),
+        ),
+        project_context=context,
+    )
+
+    with TestClient(server) as client:
+        preview = client.post(
+            f"/api/evals/sessions/{_SESSION_ID}/evaluation/preview",
+            headers=_AUTH_HEADERS,
+            json={},
+        )
+
+        assert preview.status_code == 200
+        body = preview.json()
+        assert body["captured_score"]["status"] == "passed"
+        assert body["candidate"]["case"]["input"] is None
+        assert body["runnable_conversion"] == {
+            "available": True,
+            "reason_code": None,
+        }
+        assert body["scenario_conversion"]["available"] is False
+        assert body["scenario_conversion"]["scenario"] is None
+        assert {
+            diagnostic["code"] for diagnostic in body["scenario_conversion"]["diagnostics"]
+        } == {"source_payload_redacted"}
 
     asyncio.run(context.close())
 

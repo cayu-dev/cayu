@@ -3,6 +3,7 @@ from __future__ import annotations
 from base64 import standard_b64encode
 from collections.abc import Mapping
 from enum import StrEnum
+from hashlib import sha256
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -22,6 +23,7 @@ DEFAULT_MAX_FILE_ATTACHMENT_BYTES = 8 * 1024 * 1024
 DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST = 20
 DEFAULT_MAX_TOTAL_FILE_ATTACHMENT_BYTES = 32 * 1024 * 1024
 RESOLVED_FILE_ATTACHMENTS_OPTION = "cayu_file_attachments"
+MODEL_FILE_ATTACHMENT_ATTESTATIONS_PAYLOAD_KEY = "file_attachment_attestations"
 FILE_ATTACHMENT_IMAGE_CONTENT_TYPES = frozenset(
     {
         "image/jpeg",
@@ -120,6 +122,7 @@ class ResolvedFileAttachment(BaseModel):
     filename: str
     content_type: str
     data_base64: str
+    content_sha256: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("artifact_id", "content_type")
@@ -137,6 +140,19 @@ class ResolvedFileAttachment(BaseModel):
             require_durable_text(value, info.field_name),
             info.field_name,
         )
+
+    @field_validator("content_sha256")
+    @classmethod
+    def validate_content_sha256(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = require_clean_nonblank(
+            require_durable_text(value, "content_sha256"),
+            "content_sha256",
+        )
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("content_sha256 must be a lowercase SHA-256 hex digest.")
+        return value
 
     @field_validator("metadata", mode="before")
     @classmethod
@@ -192,8 +208,9 @@ def resolved_file_attachment(
         filename=attachment.filename,
         content_type=attachment.content_type,
         data_base64=standard_b64encode(result.content).decode("ascii"),
+        content_sha256=sha256(result.content).hexdigest(),
         metadata=attachment.metadata,
-    ).model_dump(mode="json")
+    ).model_dump(mode="json", exclude_none=True)
 
 
 def resolved_file_attachments_from_options(options: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -210,7 +227,7 @@ def resolved_file_attachments_from_options(options: dict[str, Any]) -> dict[str,
         attachment = ResolvedFileAttachment.model_validate(value)
         if attachment.artifact_id != artifact_id:
             raise ValueError("Resolved file attachment id must match its map key.")
-        resolved[artifact_id] = attachment.model_dump(mode="json")
+        resolved[artifact_id] = attachment.model_dump(mode="json", exclude_none=True)
     return resolved
 
 

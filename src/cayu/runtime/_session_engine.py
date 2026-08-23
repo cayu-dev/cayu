@@ -13595,6 +13595,18 @@ class SessionEngine:
             start_event_payload={
                 "agent_name": registered_agent.spec.name,
                 "appended_messages": len(request.messages),
+                **(
+                    {
+                        SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: (
+                            session_input_contract_evidence(
+                                request,
+                                message_start_index=len(transcript) - len(request.messages),
+                            )
+                        )
+                    }
+                    if not continuing_recovery_boundary and request.messages
+                    else {}
+                ),
                 **copy_json_value(start_event_payload_extra, "start_event_payload_extra"),
             },
             start_task_on_enter=start_task_on_enter,
@@ -15696,7 +15708,7 @@ class SessionEngine:
                     if expected is not None and start_event.payload.get(field_name) == expected
                 )
                 if (
-                    start_event_type is EventType.SESSION_STARTED
+                    start_event_type in {EventType.SESSION_STARTED, EventType.SESSION_RESUMED}
                     and type(start_event.payload.get(SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY))
                     is str
                 ):

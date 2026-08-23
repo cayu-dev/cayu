@@ -306,6 +306,12 @@ REVISIONS: tuple[Revision, ...] = (
     # remain safe while scenario-aware EvalStore implementations require the
     # new additive object.
     Revision(revision=53, kind=RevisionKind.ADDITIVE, compatible_from=52),
+    # Runtime-attested resume and queued-input markers extend the private
+    # input_contract payload to event types that pre-54 readers would expose as
+    # ordinary public payload. Exact model-facing file digests also gain an
+    # independent durable provenance bit. Mixed-version readers and session
+    # writers are therefore unsafe.
+    Revision(revision=54, kind=RevisionKind.BREAKING, compatible_from=54),
 )
 
 #: The revision an empty database is initialized to.

@@ -231,6 +231,8 @@ _BASELINE_DDL = """
         payload_json TEXT NOT NULL,
         input_contract_runtime_owned INTEGER NOT NULL DEFAULT 0
             CHECK (input_contract_runtime_owned IN (0, 1)),
+        file_attachment_attestations_runtime_owned INTEGER NOT NULL DEFAULT 0
+            CHECK (file_attachment_attestations_runtime_owned IN (0, 1)),
         pending_action_lookup_key TEXT,
         pending_action_projection_json TEXT,
         pending_action_projection_bytes INTEGER,
@@ -2686,6 +2688,14 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
             "TEXT NOT NULL DEFAULT "
             '\'{"schema_version":1,"source":"sdk_run","origin":null,'
             '"max_steps":null,"limits":null,"cost_budget":null}\'',
+        ),
+    ),
+    54: (
+        (
+            "cayu_events",
+            "file_attachment_attestations_runtime_owned",
+            "INTEGER NOT NULL DEFAULT 0 CHECK "
+            "(file_attachment_attestations_runtime_owned IN (0, 1))",
         ),
     ),
 }

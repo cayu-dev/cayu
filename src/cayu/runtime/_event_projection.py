@@ -1792,10 +1792,11 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
 
     model_started = _observed_policy(
         "actor attempt attempt_id compactor execution_profile_fingerprint instruction_digest instruction_present max_attempts "
-        "mode model model_attempt_id model_step_id operation_id provider purpose reason request_id "
+        "file_attachment_attestations mode model model_attempt_id model_step_id operation_id provider purpose reason request_id "
         "source_run_epoch source_transcript_cursor step",
         owned_nested_paths=_resolution_actor_nested_paths("actor"),
-        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS,
+        authority_keys=(_MODEL_EXECUTION_AUTHORITY_KEYS | {"file_attachment_attestations"}),
+        internal_authority_keys={"file_attachment_attestations"},
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
     )
     policies[EventType.MODEL_STARTED] = model_started
@@ -2703,11 +2704,12 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         internal_authority_keys={"input_contract"},
     )
     policies[EventType.SESSION_RESUMED] = _observed_policy(
-        "agent_name appended_messages approval_id decision dispatch_id execution_profile_fingerprint expired input_id "
+        "agent_name appended_messages approval_id decision dispatch_id execution_profile_fingerprint expired input_contract input_id "
         "interruption_type model_attempt_id model_step_id parent_session_id resolved_by "
         "task_id tool_call_id tool_round_id traceparent tracestate",
         owned_nested_paths=_resolution_actor_nested_paths("resolved_by"),
-        authority_keys={"execution_profile_fingerprint"},
+        authority_keys={"execution_profile_fingerprint", "input_contract"},
+        internal_authority_keys={"input_contract"},
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
     )
     policies[EventType.SESSION_COMPLETED] = _observed_policy(
@@ -2852,8 +2854,10 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     message_policy = _observed_policy(
         "accepted_run_epoch accepted_transcript_cursor actor delivery_mode ordering_key "
-        "queue_id run_epoch transcript_cursor",
+        "input_contract queue_id run_epoch transcript_cursor",
         owned_nested_paths=_resolution_actor_nested_paths("actor"),
+        authority_keys={"input_contract"},
+        internal_authority_keys={"input_contract"},
     )
     policies[EventType.SESSION_MESSAGE_QUEUED] = message_policy
     policies[EventType.SESSION_MESSAGE_DELIVERED] = message_policy

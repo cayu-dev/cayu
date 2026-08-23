@@ -276,13 +276,14 @@ def prepare_resume_request(
         redactor=redactor,
         field_name="ResumeRequest.tool_grants",
     )
-    return request.model_copy(
+    redacted_messages = redact_messages(
+        request.messages,
+        redactor=redactor,
+        field_name="messages",
+    )
+    prepared = request.model_copy(
         update={
-            "messages": redact_messages(
-                request.messages,
-                redactor=redactor,
-                field_name="messages",
-            ),
+            "messages": redacted_messages,
             "metadata": redact_json_object(
                 request.metadata,
                 field_name="metadata",
@@ -291,6 +292,11 @@ def prepare_resume_request(
             "profile_adoption": profile_adoption,
         },
     )
+    prepared._input_redactions_applied = request._input_redactions_applied or any(
+        original != redacted
+        for original, redacted in zip(request.messages, redacted_messages, strict=True)
+    )
+    return prepared
 
 
 def _require_secret_free_targeted_tool_grants(
@@ -769,10 +775,11 @@ def prepare_enqueue_message_request(
             redactor=redactor,
             authority_kind="durable queued-message authority",
         )
-    return EnqueueSessionMessageRequest(
+    redacted_content = redactor.redact_text(request.content)
+    prepared = EnqueueSessionMessageRequest(
         session_id=request.session_id,
         idempotency_key=request.idempotency_key,
-        content=redactor.redact_text(request.content),
+        content=redacted_content,
         delivery_mode=request.delivery_mode,
         requested_by=redact_resolution_actor(
             request.requested_by,
@@ -780,6 +787,10 @@ def prepare_enqueue_message_request(
             redactor=redactor,
         ),
     )
+    prepared._input_redactions_applied = (
+        request._input_redactions_applied or redacted_content != request.content
+    )
+    return prepared
 
 
 def require_secret_free_session_authority(

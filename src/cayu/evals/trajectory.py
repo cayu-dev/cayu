@@ -433,10 +433,7 @@ def _project_terminal_evidence(
 def _trajectory_event(event: Event) -> Event:
     """Remove runtime-only promotion facts from the serializable trajectory."""
 
-    if (
-        event.type != EventType.SESSION_STARTED
-        or SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY not in event.payload
-    ):
+    if SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY not in event.payload:
         return event
     payload = {
         key: value

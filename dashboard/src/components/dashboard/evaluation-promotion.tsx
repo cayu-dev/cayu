@@ -651,6 +651,7 @@ function PromotionEvidenceSummary({
 }) {
   const { candidate } = preview
   const evidence = candidate.evidence
+  const scenarioDiagnostics = preview.scenario_conversion.diagnostics ?? []
   return (
     <Card size="sm">
       <CardHeader className="grid-cols-[1fr_auto]">
@@ -690,6 +691,33 @@ function PromotionEvidenceSummary({
         {preview.runnable_conversion.available
           ? "This captured session can also be converted into runnable input for a fresh evaluation."
           : `Captured scoring and saving are available. Fresh execution needs authored runnable input${preview.runnable_conversion.reason_code ? ` (${preview.runnable_conversion.reason_code.replaceAll("_", " ")})` : ""}.`}
+      </div>
+      <div
+        className="mx-3 mt-3 rounded-lg border border-border bg-muted/20 p-2.5 text-xs text-muted-foreground"
+        data-testid="scenario-conversion-status"
+      >
+        {preview.scenario_conversion.available && preview.scenario_conversion.scenario ? (
+          <>
+            <CheckCircle2 className="mr-1.5 inline h-3.5 w-3.5 text-emerald-600" />
+            Production scenario captured with {preview.scenario_conversion.scenario.events.length}{" "}
+            ordered
+            {preview.scenario_conversion.scenario.events.length === 1 ? " stage" : " stages"}.
+          </>
+        ) : (
+          <div className="space-y-1.5">
+            <div className="font-medium text-foreground">Scenario conversion needs attention</div>
+            {scenarioDiagnostics.slice(0, 3).map((diagnostic) => (
+              <div
+                key={`${diagnostic.code}:${diagnostic.event_sequence ?? "none"}:${diagnostic.transcript_index ?? "none"}:${diagnostic.artifact_requirement_id ?? "none"}`}
+              >
+                {diagnostic.message} {diagnostic.remediation}
+              </div>
+            ))}
+            {scenarioDiagnostics.length > 3 && (
+              <div>{scenarioDiagnostics.length - 3} more findings.</div>
+            )}
+          </div>
+        )}
       </div>
     </Card>
   )

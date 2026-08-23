@@ -338,10 +338,7 @@ def _evals_readiness(snapshot: ControlPlaneCapabilitySnapshot) -> EvalsReadiness
         catalog_read=catalog,
         catalog_write=catalog.model_copy(),
         captured_result_persistence=captured_result_persistence,
-        scenario_conversion=EvalsOperationReadiness(
-            state="unsupported",
-            reason_code="scenario_v2_not_available",
-        ),
+        scenario_conversion=captured_evaluation.model_copy(),
         fresh_launch=fresh_launch,
         cancellation=stored_result_operation,
         comparison=stored_result_operation.model_copy(),

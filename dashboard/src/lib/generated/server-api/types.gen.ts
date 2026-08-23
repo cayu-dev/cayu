@@ -2587,6 +2587,7 @@ export type CapturedEvaluationPreviewResponse = {
     candidate: CapturedEvaluationCandidateV1;
     captured_score: CapturedRunScoreV1;
     runnable_conversion: CapturedEvaluationConversion;
+    scenario_conversion: ScenarioCaptureResultV2;
 };
 
 /**
@@ -4101,6 +4102,51 @@ export type EvalRunSpec = {
  * EvalRunStatus
  */
 export type EvalRunStatus = 'queued' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
+
+/**
+ * EvalScenarioDocumentV2
+ *
+ * One canonical external-stimulus sequence with no executable authority.
+ */
+export type EvalScenarioDocumentV2 = {
+    /**
+     * Artifact Requirements
+     */
+    artifact_requirements?: Array<ScenarioArtifactRequirementV2>;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Events
+     */
+    events: Array<ScenarioInitialInputEventV2 | ScenarioQueuedInputEventV2 | ScenarioResumedInputEventV2 | ScenarioApprovalCheckpointEventV2>;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 2;
+    /**
+     * Secret Requirements
+     */
+    secret_requirements?: Array<ScenarioSecretRequirementV2>;
+    source?: EvaluationSourceIdentityV1 | null;
+    /**
+     * Target Key
+     */
+    target_key: string;
+};
 
 /**
  * EvalSuiteCatalogEntry
@@ -6454,6 +6500,293 @@ export type RuntimeManifest = {
      * Tool Timeout Seconds
      */
     tool_timeout_seconds: number | null;
+};
+
+/**
+ * ScenarioApprovalCheckpointEventV2
+ *
+ * Require a new approval decision for a matching current tool call.
+ *
+ * The checkpoint identifies an expected pause but contains no approve/deny
+ * choice, approval id, actor, or reusable authorization from the source run.
+ */
+export type ScenarioApprovalCheckpointEventV2 = {
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'approval_checkpoint';
+    /**
+     * Occurrence
+     */
+    occurrence?: number;
+    /**
+     * Resolution
+     */
+    resolution?: 'fresh_decision';
+    /**
+     * Sequence
+     */
+    sequence: number;
+    /**
+     * Tool Name
+     */
+    tool_name: string;
+};
+
+/**
+ * ScenarioArtifactRequirementV2
+ *
+ * An immutable file requirement resolved and authorized only at launch.
+ */
+export type ScenarioArtifactRequirementV2 = {
+    /**
+     * Content Sha256
+     */
+    content_sha256: string;
+    /**
+     * Content Type
+     */
+    content_type: string;
+    /**
+     * Filename
+     */
+    filename: string;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Reference
+     */
+    reference?: string | null;
+    /**
+     * Size Bytes
+     */
+    size_bytes: number;
+    /**
+     * Source
+     */
+    source: 'fixture_digest' | 'artifact_reference';
+};
+
+/**
+ * ScenarioCaptureDiagnosticCode
+ *
+ * Stable factual reason why retained stimuli cannot become one scenario.
+ */
+export type ScenarioCaptureDiagnosticCode = 'terminal_evidence_not_supported' | 'session_not_found' | 'session_not_terminal' | 'captured_evidence_incomplete' | 'captured_evidence_contradictory' | 'capture_limit_exceeded' | 'source_agent_mismatch' | 'source_payload_unavailable' | 'source_payload_redacted' | 'source_payload_inconsistent' | 'source_input_role_unsupported' | 'source_input_part_unsupported' | 'artifact_not_retained' | 'artifact_access_denied' | 'artifact_store_unavailable' | 'artifact_content_inconsistent' | 'scenario_limit_exceeded' | 'source_changed';
+
+/**
+ * ScenarioCaptureDiagnosticV2
+ */
+export type ScenarioCaptureDiagnosticV2 = {
+    /**
+     * Artifact Requirement Id
+     */
+    artifact_requirement_id?: string | null;
+    code: ScenarioCaptureDiagnosticCode;
+    /**
+     * Event Sequence
+     */
+    event_sequence?: number | null;
+    /**
+     * Message
+     */
+    message: string;
+    /**
+     * Remediation
+     */
+    remediation: string;
+    /**
+     * Transcript Index
+     */
+    transcript_index?: number | null;
+};
+
+/**
+ * ScenarioCaptureResultV2
+ */
+export type ScenarioCaptureResultV2 = {
+    /**
+     * Available
+     */
+    available: boolean;
+    /**
+     * Diagnostics
+     */
+    diagnostics?: Array<ScenarioCaptureDiagnosticV2>;
+    scenario?: EvalScenarioDocumentV2 | null;
+};
+
+/**
+ * ScenarioFilePartV2
+ *
+ * A file input by immutable requirement id; it never carries file bytes.
+ */
+export type ScenarioFilePartV2 = {
+    /**
+     * Artifact Requirement Id
+     */
+    artifact_requirement_id: string;
+    /**
+     * Type
+     */
+    type?: 'file';
+};
+
+/**
+ * ScenarioInitialInputEventV2
+ *
+ * Input used to create the fresh scenario session.
+ */
+export type ScenarioInitialInputEventV2 = {
+    /**
+     * Id
+     */
+    id: string;
+    input: ScenarioInputV2;
+    /**
+     * Kind
+     */
+    kind?: 'initial';
+    /**
+     * Sequence
+     */
+    sequence: number;
+};
+
+/**
+ * ScenarioInputV2
+ *
+ * One bounded batch of caller messages delivered at an explicit lifecycle point.
+ */
+export type ScenarioInputV2 = {
+    /**
+     * Messages
+     */
+    messages: Array<ScenarioUserMessageV2>;
+};
+
+/**
+ * ScenarioJsonPartV2
+ *
+ * One structured caller input preserved as durable JSON.
+ */
+export type ScenarioJsonPartV2 = {
+    /**
+     * Type
+     */
+    type?: 'json';
+    /**
+     * Value
+     */
+    value: unknown;
+};
+
+/**
+ * ScenarioQueuedInputEventV2
+ *
+ * Input queued while the scenario session is active.
+ */
+export type ScenarioQueuedInputEventV2 = {
+    /**
+     * Delivery Mode
+     */
+    delivery_mode: 'next_turn' | 'on_idle';
+    /**
+     * Id
+     */
+    id: string;
+    input: ScenarioInputV2;
+    /**
+     * Kind
+     */
+    kind?: 'queued';
+    /**
+     * Sequence
+     */
+    sequence: number;
+};
+
+/**
+ * ScenarioResumedInputEventV2
+ *
+ * Fresh caller input supplied when a scenario session is paused.
+ */
+export type ScenarioResumedInputEventV2 = {
+    /**
+     * Id
+     */
+    id: string;
+    input: ScenarioInputV2;
+    /**
+     * Kind
+     */
+    kind?: 'resumed';
+    /**
+     * Resume Kind
+     */
+    resume_kind?: 'user_input' | 'manual_recovery';
+    /**
+     * Sequence
+     */
+    sequence: number;
+};
+
+/**
+ * ScenarioSecretRequirementV2
+ *
+ * A named server-side dependency; no secret value or vault handle is portable.
+ */
+export type ScenarioSecretRequirementV2 = {
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Purpose
+     */
+    purpose: string;
+    /**
+     * Usage
+     */
+    usage: 'provider' | 'tool' | 'environment' | 'artifact' | 'other';
+};
+
+/**
+ * ScenarioTextPartV2
+ *
+ * One literal caller-authored text part.
+ */
+export type ScenarioTextPartV2 = {
+    /**
+     * Text
+     */
+    text: string;
+    /**
+     * Type
+     */
+    type?: 'text';
+};
+
+/**
+ * ScenarioUserMessageV2
+ *
+ * One external user message with ordered text, JSON, or file-reference parts.
+ */
+export type ScenarioUserMessageV2 = {
+    /**
+     * Content
+     */
+    content: Array<ScenarioTextPartV2 | ScenarioJsonPartV2 | ScenarioFilePartV2>;
+    /**
+     * Role
+     */
+    role?: 'user';
 };
 
 /**

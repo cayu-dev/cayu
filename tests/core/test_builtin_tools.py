@@ -5749,6 +5749,7 @@ def test_runtime_resolves_file_attachments_only_for_provider_request(tmp_path):
         "filename": "invoice.png",
         "content_type": "image/png",
         "data_base64": "aW1hZ2UtYnl0ZXM=",
+        "content_sha256": hashlib.sha256(b"image-bytes").hexdigest(),
         "metadata": {},
     }
 

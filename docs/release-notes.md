@@ -89,6 +89,39 @@ guard.
 
 ## Unreleased
 
+### Production sessions can be captured as scenario-v2 stimuli
+
+Authenticated captured-evaluation previews now independently reconstruct an
+authority-free scenario when retained production evidence is sufficient.
+Runtime-owned transcript attestations preserve exact initial, resumed, and
+delivered queued inputs across the in-memory, SQLite, and PostgreSQL session
+stores. Approval history becomes a fresh-decision checkpoint. Retained file
+inputs become digest-bound artifact requirements after current scope, metadata,
+access, and content checks; neither file bytes, queue ids, approval ids, actors,
+nor historical authorization enter the scenario.
+
+Conversion is side-effect-free and fail-closed. Redacted or older unattested
+input, missing/inaccessible artifacts, contradictory evidence, limit failures,
+and a source that changes during capture produce stable factual diagnostics.
+They do not disable captured scoring, saving, export, or baseline comparison.
+The Control Plane reports the scenario result beside runnable corpus-v1
+conversion; scenario editing and controlled multi-stage execution remain later
+workflow layers.
+
+Server contract version 21 adds the required `scenario_conversion` result to
+captured-evaluation preview responses and marks scenario conversion ready when
+captured session evidence is ready. Upgrade independently deployed servers,
+generated clients, and dashboards together.
+
+Storage revision 54 is a breaking reader-safety boundary for the private
+resume, queued-input, and source-time file attestations used by capture. It adds
+an independent file-attestation proof column and fabricates no historical proof.
+Stop revision-53 session workers, run
+`cayu storage migrate`, confirm revision 54, and then start this build. Older
+sessions remain evaluable as captured results; file-bearing sessions without the
+new source-time proof return an exact scenario-conversion diagnostic. Do not run
+mixed revision-53/revision-54 session fleets.
+
 ### Portable multi-stage eval scenarios
 
 Cayu now defines an immutable scenario-v2 document for ordered initial,
@@ -161,9 +194,10 @@ captured baseline, and launch one bounded fresh trial without Evals-specific
 Python. The credential-gated release check now creates that scaffold and proves
 the Control Plane plus JSON, HTML, CLI, and CI round trip with one source run and
 one fresh trial. The fresh-launch slice itself adds no storage revision. Current
-scenario-aware builds additionally require the additive revision-53 migration
-documented above; the shared restart suites cover scenarios as well as corpora,
-results, baselines, and run publication.
+scenario-aware eval stores require the additive revision-53 migration, while
+session stores that capture new resume and queued-input proof require the
+breaking revision-54 boundary documented above. The shared restart suites cover
+scenarios as well as corpora, results, baselines, and run publication.
 
 ### Captured sessions can launch bounded fresh trials from the Control Plane
 
@@ -481,12 +515,12 @@ workers together. The server contract advances from version 10 to version 16,
 and the public application manifest and generator plan advance from schema 7
 to schema 9.
 
-The storage schema advances from revision 36 to revision 53. Follow the
-revision-specific migration boundaries below: revisions 39 through 52 contain
+The storage schema advances from revision 36 to revision 54. Follow the
+revision-specific migration boundaries below: revisions 39 through 54 include
 breaking durable contracts, and populated legacy knowledge or task stores may
 require the explicitly documented rebuild or drain procedure. Run `cayu storage
 status` followed by `cayu storage migrate` against every configured SQLite or
-PostgreSQL store, and confirm revision 53 with no pending migrations before
+PostgreSQL store, and confirm revision 54 with no pending migrations before
 starting `v0.3.0` workers. Mixed-version deployment and application-only
 rollback across these boundaries are unsupported.
 

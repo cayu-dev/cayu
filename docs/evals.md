@@ -768,12 +768,13 @@ valid and useful for review, baselining, release comparison, and future scenario
 authoring even when runnable corpus-v1 conversion is unavailable. **Export eval
 JSON** returns the same deterministic captured-only corpus without writing.
 
-Runnable conversion remains an independent capability. Simple fresh invocations
-may also satisfy `build_promotion_candidate(...)`; multi-turn, resumed,
-approval-driven, file/structured-input, and structured-output sessions normally
-need an authored runnable input or scenario. Fresh-run admission rejects a
-captured-only case with that precise explanation. This is an honest boundary of
-reconstructing execution, not a reason to block captured scoring or persistence.
+Runnable corpus-v1 conversion and scenario-v2 capture are independent
+capabilities. Simple fresh invocations may satisfy
+`build_promotion_candidate(...)`. Multi-stage sessions can instead produce an
+ordered scenario preview from their retained initial, queued, resumed,
+approval-checkpoint, and file-backed stimuli. Neither conversion controls
+captured scoring or persistence: when exact source material is missing, the
+captured evaluation remains usable and only the affected conversion reports why.
 
 When that conversion is available, the same review sheet exposes **Run fresh
 trial**. The default is one trial at concurrency one. Operators can contract the
@@ -806,9 +807,9 @@ authority.
 Generated project targets deliberately permit only one trial at concurrency one.
 Increasing repetition or parallelism, substituting fixtures, bypassing normal
 approvals, or selecting different tool/environment authority requires an
-explicit application-owned target profile. A simple session that cannot be
+explicit application-owned target profile. A session that cannot be
 reconstructed is not partially replayed; captured scoring remains usable while
-portable multi-stage scenarios are a separate versioned capability.
+conversion returns a factual diagnostic.
 
 Saved results appear in the target-scoped **Evals → Results** catalog alongside
 fresh results. Selecting a result exposes its immutable public-safe score and
@@ -870,10 +871,39 @@ artifact-byte limits are validated before persistence. Built-in stores expose
 configured credential-redaction boundary before it writes. SQLite and
 PostgreSQL scenario persistence requires additive storage revision 53.
 
-This is the portable authoring and persistence foundation. It does not yet add
-Control Plane scenario authoring, captured-session reconstruction, target
-binding, or scenario execution; those layers consume this contract rather than
-placing runtime authority into the document.
+`capture_eval_scenario_from_session(...)` reconstructs one bounded terminal
+session without executing application work. Initial, ordinary resume, and
+delivered queue boundaries are accepted only when runtime-owned transcript
+attestations bind their exact message positions and digests. Approval history is
+projected as a fresh-decision checkpoint, never as reusable authorization. File
+parts are read from the source environment's current artifact store, checked
+against retained attachment metadata and scope, and matched to a private
+runtime-owned digest of the exact bytes resolved for the source model request.
+They are represented only by a content digest plus artifact reference; file
+bytes do not enter the scenario.
+Caller-supplied file-attachment metadata has no scenario-v2 representation and
+therefore returns an unsupported-part diagnostic instead of being silently
+dropped.
+SQLite and PostgreSQL session stores require breaking storage revision 54 before
+writing these private attestations. The revision adds an independent
+file-attachment proof column but performs no historical backfill; older sessions
+that contain files but lack source-time proof fail conversion closed, and older
+readers cannot share the migrated store.
+
+Capture is fail-closed and diagnostic rather than all-or-nothing for the
+surrounding evaluation workflow. Redacted input, historical evidence that
+predates the required attestation, missing or inaccessible artifacts,
+contradictory boundaries, and bounded-size failures return stable messages and
+remediation while the captured score remains available. The operation reloads
+terminal evidence after artifact reads so a changing source cannot be published
+as one coherent scenario. The authenticated Control Plane preview exposes this
+result and never invokes providers, tools, environments, hooks, recovery, or
+mutation paths.
+
+Scenario editing, launch-time target/secret/environment binding, fresh approval
+handling, and multi-stage execution remain separate follow-up layers. They
+consume this authority-free capture contract rather than placing runtime
+authority into the document.
 
 ### Durable eval catalog and run state
 
@@ -883,10 +913,11 @@ for one embedded database; `PostgresEvalStore` supports shared multi-worker
 claims; `InMemoryEvalStore` is intentionally process-local and is suitable for
 tests and transient SDK workflows only. SQLite and PostgreSQL require storage
 schema revision 50 for corpora and run state, and revision 53 for scenario
-persistence. Corpus and scenario saves, run admission, and result publication
-require the active application's complete JSON redaction boundary. A configured workload
-secret or redaction failure rejects before any write; the store never retains
-the redaction function or secret registry.
+persistence. Session-backed production capture additionally requires revision
+54. Corpus and scenario saves, run admission, and result publication require
+the active application's complete JSON redaction boundary. A configured
+workload secret or redaction failure rejects before any write; the store never
+retains the redaction function or secret registry.
 
 ```python
 from cayu import EvalRunFailureCode, EvalRunRequest, EvalRunStatus, SQLiteEvalStore

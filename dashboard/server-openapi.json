@@ -5248,13 +5248,17 @@
           },
           "runnable_conversion": {
             "$ref": "#/components/schemas/CapturedEvaluationConversion"
+          },
+          "scenario_conversion": {
+            "$ref": "#/components/schemas/ScenarioCaptureResultV2"
           }
         },
         "required": [
           "baseline_revision",
           "candidate",
           "captured_score",
-          "runnable_conversion"
+          "runnable_conversion",
+          "scenario_conversion"
         ],
         "title": "CapturedEvaluationPreviewResponse",
         "type": "object"
@@ -8180,6 +8184,111 @@
         ],
         "title": "EvalRunStatus",
         "type": "string"
+      },
+      "EvalScenarioDocumentV2": {
+        "additionalProperties": false,
+        "description": "One canonical external-stimulus sequence with no executable authority.",
+        "properties": {
+          "artifact_requirements": {
+            "items": {
+              "$ref": "#/components/schemas/ScenarioArtifactRequirementV2"
+            },
+            "maxItems": 128,
+            "title": "Artifact Requirements",
+            "type": "array"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "events": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "approval_checkpoint": "#/components/schemas/ScenarioApprovalCheckpointEventV2",
+                  "initial": "#/components/schemas/ScenarioInitialInputEventV2",
+                  "queued": "#/components/schemas/ScenarioQueuedInputEventV2",
+                  "resumed": "#/components/schemas/ScenarioResumedInputEventV2"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/ScenarioInitialInputEventV2"
+                },
+                {
+                  "$ref": "#/components/schemas/ScenarioQueuedInputEventV2"
+                },
+                {
+                  "$ref": "#/components/schemas/ScenarioResumedInputEventV2"
+                },
+                {
+                  "$ref": "#/components/schemas/ScenarioApprovalCheckpointEventV2"
+                }
+              ]
+            },
+            "maxItems": 1024,
+            "minItems": 1,
+            "title": "Events",
+            "type": "array"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 2,
+            "default": 2,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "secret_requirements": {
+            "items": {
+              "$ref": "#/components/schemas/ScenarioSecretRequirementV2"
+            },
+            "maxItems": 128,
+            "title": "Secret Requirements",
+            "type": "array"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvaluationSourceIdentityV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision",
+          "id",
+          "target_key",
+          "name",
+          "events"
+        ],
+        "title": "EvalScenarioDocumentV2",
+        "type": "object"
       },
       "EvalSuiteCatalogEntry": {
         "additionalProperties": false,
@@ -12571,6 +12680,501 @@
         "title": "RuntimeManifest",
         "type": "object"
       },
+      "ScenarioApprovalCheckpointEventV2": {
+        "additionalProperties": false,
+        "description": "Require a new approval decision for a matching current tool call.\n\nThe checkpoint identifies an expected pause but contains no approve/deny\nchoice, approval id, actor, or reusable authorization from the source run.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "approval_checkpoint",
+            "default": "approval_checkpoint",
+            "title": "Kind",
+            "type": "string"
+          },
+          "occurrence": {
+            "default": 1,
+            "maximum": 1024.0,
+            "minimum": 1.0,
+            "title": "Occurrence",
+            "type": "integer"
+          },
+          "resolution": {
+            "const": "fresh_decision",
+            "default": "fresh_decision",
+            "title": "Resolution",
+            "type": "string"
+          },
+          "sequence": {
+            "maximum": 1023.0,
+            "minimum": 0.0,
+            "title": "Sequence",
+            "type": "integer"
+          },
+          "tool_name": {
+            "title": "Tool Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sequence",
+          "id",
+          "tool_name"
+        ],
+        "title": "ScenarioApprovalCheckpointEventV2",
+        "type": "object"
+      },
+      "ScenarioArtifactRequirementV2": {
+        "additionalProperties": false,
+        "description": "An immutable file requirement resolved and authorized only at launch.",
+        "properties": {
+          "content_sha256": {
+            "title": "Content Sha256",
+            "type": "string"
+          },
+          "content_type": {
+            "title": "Content Type",
+            "type": "string"
+          },
+          "filename": {
+            "title": "Filename",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "reference": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference"
+          },
+          "size_bytes": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          },
+          "source": {
+            "enum": [
+              "fixture_digest",
+              "artifact_reference"
+            ],
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "source",
+          "content_sha256",
+          "filename",
+          "content_type",
+          "size_bytes"
+        ],
+        "title": "ScenarioArtifactRequirementV2",
+        "type": "object"
+      },
+      "ScenarioCaptureDiagnosticCode": {
+        "description": "Stable factual reason why retained stimuli cannot become one scenario.",
+        "enum": [
+          "terminal_evidence_not_supported",
+          "session_not_found",
+          "session_not_terminal",
+          "captured_evidence_incomplete",
+          "captured_evidence_contradictory",
+          "capture_limit_exceeded",
+          "source_agent_mismatch",
+          "source_payload_unavailable",
+          "source_payload_redacted",
+          "source_payload_inconsistent",
+          "source_input_role_unsupported",
+          "source_input_part_unsupported",
+          "artifact_not_retained",
+          "artifact_access_denied",
+          "artifact_store_unavailable",
+          "artifact_content_inconsistent",
+          "scenario_limit_exceeded",
+          "source_changed"
+        ],
+        "title": "ScenarioCaptureDiagnosticCode",
+        "type": "string"
+      },
+      "ScenarioCaptureDiagnosticV2": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_requirement_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Artifact Requirement Id"
+          },
+          "code": {
+            "$ref": "#/components/schemas/ScenarioCaptureDiagnosticCode"
+          },
+          "event_sequence": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event Sequence"
+          },
+          "message": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          },
+          "remediation": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Remediation",
+            "type": "string"
+          },
+          "transcript_index": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transcript Index"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "remediation"
+        ],
+        "title": "ScenarioCaptureDiagnosticV2",
+        "type": "object"
+      },
+      "ScenarioCaptureResultV2": {
+        "additionalProperties": false,
+        "properties": {
+          "available": {
+            "title": "Available",
+            "type": "boolean"
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/ScenarioCaptureDiagnosticV2"
+            },
+            "maxItems": 1024,
+            "title": "Diagnostics",
+            "type": "array"
+          },
+          "scenario": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalScenarioDocumentV2"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "available"
+        ],
+        "title": "ScenarioCaptureResultV2",
+        "type": "object"
+      },
+      "ScenarioFilePartV2": {
+        "additionalProperties": false,
+        "description": "A file input by immutable requirement id; it never carries file bytes.",
+        "properties": {
+          "artifact_requirement_id": {
+            "title": "Artifact Requirement Id",
+            "type": "string"
+          },
+          "type": {
+            "const": "file",
+            "default": "file",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifact_requirement_id"
+        ],
+        "title": "ScenarioFilePartV2",
+        "type": "object"
+      },
+      "ScenarioInitialInputEventV2": {
+        "additionalProperties": false,
+        "description": "Input used to create the fresh scenario session.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "input": {
+            "$ref": "#/components/schemas/ScenarioInputV2"
+          },
+          "kind": {
+            "const": "initial",
+            "default": "initial",
+            "title": "Kind",
+            "type": "string"
+          },
+          "sequence": {
+            "maximum": 1023.0,
+            "minimum": 0.0,
+            "title": "Sequence",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sequence",
+          "id",
+          "input"
+        ],
+        "title": "ScenarioInitialInputEventV2",
+        "type": "object"
+      },
+      "ScenarioInputV2": {
+        "additionalProperties": false,
+        "description": "One bounded batch of caller messages delivered at an explicit lifecycle point.",
+        "properties": {
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/ScenarioUserMessageV2"
+            },
+            "maxItems": 32,
+            "minItems": 1,
+            "title": "Messages",
+            "type": "array"
+          }
+        },
+        "required": [
+          "messages"
+        ],
+        "title": "ScenarioInputV2",
+        "type": "object"
+      },
+      "ScenarioJsonPartV2": {
+        "additionalProperties": false,
+        "description": "One structured caller input preserved as durable JSON.",
+        "properties": {
+          "type": {
+            "const": "json",
+            "default": "json",
+            "title": "Type",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "title": "ScenarioJsonPartV2",
+        "type": "object"
+      },
+      "ScenarioQueuedInputEventV2": {
+        "additionalProperties": false,
+        "description": "Input queued while the scenario session is active.",
+        "properties": {
+          "delivery_mode": {
+            "enum": [
+              "next_turn",
+              "on_idle"
+            ],
+            "title": "Delivery Mode",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "input": {
+            "$ref": "#/components/schemas/ScenarioInputV2"
+          },
+          "kind": {
+            "const": "queued",
+            "default": "queued",
+            "title": "Kind",
+            "type": "string"
+          },
+          "sequence": {
+            "maximum": 1023.0,
+            "minimum": 0.0,
+            "title": "Sequence",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sequence",
+          "id",
+          "delivery_mode",
+          "input"
+        ],
+        "title": "ScenarioQueuedInputEventV2",
+        "type": "object"
+      },
+      "ScenarioResumedInputEventV2": {
+        "additionalProperties": false,
+        "description": "Fresh caller input supplied when a scenario session is paused.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "input": {
+            "$ref": "#/components/schemas/ScenarioInputV2"
+          },
+          "kind": {
+            "const": "resumed",
+            "default": "resumed",
+            "title": "Kind",
+            "type": "string"
+          },
+          "resume_kind": {
+            "default": "user_input",
+            "enum": [
+              "user_input",
+              "manual_recovery"
+            ],
+            "title": "Resume Kind",
+            "type": "string"
+          },
+          "sequence": {
+            "maximum": 1023.0,
+            "minimum": 0.0,
+            "title": "Sequence",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sequence",
+          "id",
+          "input"
+        ],
+        "title": "ScenarioResumedInputEventV2",
+        "type": "object"
+      },
+      "ScenarioSecretRequirementV2": {
+        "additionalProperties": false,
+        "description": "A named server-side dependency; no secret value or vault handle is portable.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "purpose": {
+            "title": "Purpose",
+            "type": "string"
+          },
+          "usage": {
+            "enum": [
+              "provider",
+              "tool",
+              "environment",
+              "artifact",
+              "other"
+            ],
+            "title": "Usage",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "usage",
+          "purpose"
+        ],
+        "title": "ScenarioSecretRequirementV2",
+        "type": "object"
+      },
+      "ScenarioTextPartV2": {
+        "additionalProperties": false,
+        "description": "One literal caller-authored text part.",
+        "properties": {
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "type": {
+            "const": "text",
+            "default": "text",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "ScenarioTextPartV2",
+        "type": "object"
+      },
+      "ScenarioUserMessageV2": {
+        "additionalProperties": false,
+        "description": "One external user message with ordered text, JSON, or file-reference parts.",
+        "properties": {
+          "content": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "file": "#/components/schemas/ScenarioFilePartV2",
+                  "json": "#/components/schemas/ScenarioJsonPartV2",
+                  "text": "#/components/schemas/ScenarioTextPartV2"
+                },
+                "propertyName": "type"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/ScenarioTextPartV2"
+                },
+                {
+                  "$ref": "#/components/schemas/ScenarioJsonPartV2"
+                },
+                {
+                  "$ref": "#/components/schemas/ScenarioFilePartV2"
+                }
+              ]
+            },
+            "maxItems": 32,
+            "minItems": 1,
+            "title": "Content",
+            "type": "array"
+          },
+          "role": {
+            "const": "user",
+            "default": "user",
+            "title": "Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "title": "ScenarioUserMessageV2",
+        "type": "object"
+      },
       "ServerContractActor": {
         "additionalProperties": false,
         "description": "Bounded actor projection that deliberately excludes arbitrary claims.",
@@ -12614,7 +13218,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "20",
+            "default": "21",
             "title": "Contract Version",
             "type": "string"
           },
@@ -16290,7 +16894,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "20",
+            "default": "21",
             "title": "Contract Version",
             "type": "string"
           }

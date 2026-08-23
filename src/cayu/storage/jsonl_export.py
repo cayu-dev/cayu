@@ -308,6 +308,7 @@ def import_sessions(lines: Iterable[str]) -> Iterator[ImportedSession]:
             restore_persisted_event_authority(
                 Event.model_validate(event),
                 input_contract_runtime_owned=True,
+                file_attachment_attestations_runtime_owned=True,
             )
             for event in obj["events"]
         ]

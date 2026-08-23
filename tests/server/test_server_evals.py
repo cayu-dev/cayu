@@ -595,8 +595,8 @@ def test_evals_api_imports_executes_compares_and_exports_deterministically(tmp_p
                     "reason_code": None,
                 },
                 "scenario_conversion": {
-                    "state": "unsupported",
-                    "reason_code": "scenario_v2_not_available",
+                    "state": "ready",
+                    "reason_code": None,
                 },
                 "fresh_launch": {"state": "ready", "reason_code": None},
                 "cancellation": {"state": "ready", "reason_code": None},

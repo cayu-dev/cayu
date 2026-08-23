@@ -191,7 +191,7 @@ def test_sqlite_revision_fifty_three_adds_scenarios_without_rewriting_corpora(
         connection.executescript(
             """
             DROP TABLE cayu_eval_scenarios;
-            DELETE FROM cayu_schema_migrations WHERE revision = 53;
+            DELETE FROM cayu_schema_migrations WHERE revision >= 53;
             PRAGMA user_version = 52;
             """
         )
@@ -240,7 +240,7 @@ def test_sqlite_revision_fifty_three_rejects_conflicting_scenario_table(tmp_path
                 document_bytes INTEGER NOT NULL,
                 created_at TEXT NOT NULL
             );
-            DELETE FROM cayu_schema_migrations WHERE revision = 53;
+            DELETE FROM cayu_schema_migrations WHERE revision >= 53;
             PRAGMA user_version = 52;
             """
         )
@@ -277,7 +277,7 @@ def test_sqlite_revision_fifty_three_rejects_unique_scenario_catalog_index(tmp_p
             DROP INDEX idx_cayu_eval_scenarios_catalog;
             CREATE UNIQUE INDEX idx_cayu_eval_scenarios_catalog
                 ON cayu_eval_scenarios(created_at DESC, revision ASC);
-            DELETE FROM cayu_schema_migrations WHERE revision = 53;
+            DELETE FROM cayu_schema_migrations WHERE revision >= 53;
             PRAGMA user_version = 52;
             """
         )
