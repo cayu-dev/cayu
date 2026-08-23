@@ -439,6 +439,58 @@ def test_live_credential_policy_contains_aws_inputs() -> None:
     assert expected <= set(nightly._LIVE_CREDENTIAL_ENV)
 
 
+def test_openrouter_contract_is_credential_and_explicit_model_gated() -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "openrouter-contract")
+
+    assert check.lane == "chat-completions"
+    assert check.command == (
+        "uv",
+        "run",
+        "python",
+        "examples/chat_completions_contract_live.py",
+    )
+    assert check.env == {"CAYU_PROVIDER": "openrouter"}
+    assert check.required_env == ("OPENROUTER_API_KEY", "CAYU_OPENROUTER_MODEL")
+    assert check.requires_provider_api_key is True
+    assert nightly._missing_prerequisites(check, {}) == [
+        "OPENROUTER_API_KEY is not set",
+        "CAYU_OPENROUTER_MODEL is not set",
+    ]
+    assert (
+        nightly._missing_prerequisites(
+            check,
+            {
+                "OPENROUTER_API_KEY": "set",
+                "CAYU_OPENROUTER_MODEL": "vendor/reasoning-model",
+            },
+        )
+        == []
+    )
+
+
+def test_chat_completions_contract_pins_gemini_over_ambient_provider() -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "chat-completions-contract")
+    observed_env: dict[str, str] = {}
+
+    def runner(command, env):
+        del command
+        observed_env.update(env)
+        return nightly.CommandOutcome(returncode=0)
+
+    [result] = nightly.run_checks(
+        [check],
+        environ={
+            "GEMINI_API_KEY": "live-key",
+            "CAYU_PROVIDER": "openrouter",
+        },
+        runner=runner,
+    )
+
+    assert check.env == {"CAYU_PROVIDER": "gemini"}
+    assert observed_env["CAYU_PROVIDER"] == "gemini"
+    assert result.status == nightly.STATUS_VERIFIED
+
+
 def test_bedrock_live_check_defers_credential_discovery_to_boto3(tmp_path: Path) -> None:
     check = next(check for check in nightly.CHECKS if check.id == "bedrock-provider-live")
     environ = {

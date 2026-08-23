@@ -17,10 +17,19 @@ from cayu import (
     ChatCompletionsProvider,
     Event,
     EventType,
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfilePolicy,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
     FileAttachmentKind,
     InMemorySessionStore,
     Message,
     RecentTurnsContextPolicy,
+    ResolutionActor,
+    ResolutionActorSource,
+    ResumeRequest,
     RetryPolicy,
     RunRequest,
     file_attachment,
@@ -114,6 +123,23 @@ class EchoTool(Tool):
         )
 
 
+class _AdoptExecutionProfilePolicy(ExecutionProfilePolicy):
+    @property
+    def identity(self) -> str:
+        return "tests:chat-completions-target-adoption:v1"
+
+    async def decide(
+        self,
+        request: ExecutionProfilePolicyRequest,
+    ) -> ExecutionProfilePolicyResult:
+        del request
+        return ExecutionProfilePolicyResult(
+            action=ExecutionProfilePolicyAction.ADOPT,
+            reason="Test-authorized exact Chat Completions target adoption.",
+            authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+        )
+
+
 def _text_chunk(content: str) -> dict[str, Any]:
     return {
         "id": "chatcmpl-1",
@@ -121,6 +147,20 @@ def _text_chunk(content: str) -> dict[str, Any]:
         "model": "gemini-test",
         "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
     }
+
+
+def _provider_state_target(
+    *,
+    provider_name: str = "openrouter",
+    endpoint_url: str = "https://openrouter.ai/api/v1/chat/completions",
+    model: str = "vendor/reasoning-model",
+) -> tuple[str, dict[str, Any]]:
+    digest = chat_completions_module._chat_completions_state_target_sha256(
+        provider_name=provider_name,
+        endpoint_url=endpoint_url,
+        model=model,
+    )
+    return digest, chat_completions_module._provider_state_target(digest)
 
 
 def _finish_chunk(finish_reason: str) -> dict[str, Any]:
@@ -235,6 +275,11 @@ def test_build_chat_completions_payload_translates_cayu_messages() -> None:
 
 
 def test_build_chat_completions_payload_round_trips_tool_call_extra_content() -> None:
+    target_sha256, target = _provider_state_target(
+        provider_name="openai_chat",
+        endpoint_url="https://api.openai.com/v1/chat/completions",
+        model="gemini-test",
+    )
     request = ModelRequest(
         model="gemini-test",
         messages=[
@@ -250,6 +295,8 @@ def test_build_chat_completions_payload_round_trips_tool_call_extra_content() ->
                         provider="chat_completions",
                         state={
                             "type": "tool_call_extra_content",
+                            "version": 1,
+                            "target": target,
                             "tool_call_id": "call_1",
                             "extra_content": {
                                 "google": {"thought_signature": "signature-1"},
@@ -261,7 +308,10 @@ def test_build_chat_completions_payload_round_trips_tool_call_extra_content() ->
         ],
     )
 
-    payload = build_chat_completions_payload(request)
+    payload = build_chat_completions_payload(
+        request,
+        provider_state_target_sha256=target_sha256,
+    )
 
     assert payload["messages"] == [
         {
@@ -279,6 +329,62 @@ def test_build_chat_completions_payload_round_trips_tool_call_extra_content() ->
             ],
         }
     ]
+
+
+def test_build_chat_completions_payload_round_trips_opaque_reasoning_details() -> None:
+    target_sha256, target = _provider_state_target()
+    details = [
+        {
+            "type": "reasoning.encrypted",
+            "data": "opaque-encrypted-state",
+            "format": "future-provider-v9",
+            "unknown": {"signature": "signed-value", "sequence": [2, 1]},
+        },
+        {"type": "future.reasoning", "opaque": [None, True, 7]},
+    ]
+    request = ModelRequest(
+        model="vendor/reasoning-model",
+        messages=[
+            Message(
+                role=MessageRole.ASSISTANT,
+                content=[
+                    ToolCallPart(
+                        tool_call_id="call_1",
+                        tool_name="read_file",
+                        arguments={"path": "README.md"},
+                    ),
+                    ProviderStatePart(
+                        provider="chat_completions",
+                        state={
+                            "type": "reasoning_details",
+                            "version": 1,
+                            "target": target,
+                            "details": details,
+                        },
+                    ),
+                ],
+            )
+        ],
+    )
+
+    payload = build_chat_completions_payload(
+        request,
+        options_key="openrouter",
+        provider_state_target_sha256=target_sha256,
+    )
+
+    assert payload["messages"][0]["reasoning_details"] == details
+    assert payload["messages"][0]["reasoning_details"] is not details
+
+    different_target_sha256, _ = _provider_state_target(
+        endpoint_url="https://different.example.test/v1/chat/completions",
+    )
+    mismatched = build_chat_completions_payload(
+        request,
+        options_key="openrouter",
+        provider_state_target_sha256=different_target_sha256,
+    )
+    assert "reasoning_details" not in mismatched["messages"][0]
 
 
 def test_build_chat_completions_payload_nests_and_cleans_tool_schemas() -> None:
@@ -836,6 +942,66 @@ async def test_provider_emits_text_and_completed_events() -> None:
 
 
 @pytest.mark.anyio
+async def test_openrouter_provider_configuration_emits_attribution_and_metadata_headers() -> None:
+    referer = "https://example.test/cayu"
+    title = "Cayu test"
+    transport = RecordingTransport(stream_events=[[_finish_chunk("stop")]])
+    provider = ChatCompletionsProvider(
+        api_key="test-key",
+        name="openrouter",
+        api_key_env="OPENROUTER_API_KEY",
+        base_url="https://openrouter.ai/api/v1",
+        openrouter_http_referer=referer,
+        openrouter_app_title=title,
+        openrouter_router_metadata=True,
+        transport=transport,
+    )
+
+    events = [
+        event
+        async for event in provider.stream(
+            ModelRequest(
+                model="vendor/model",
+                messages=[Message.text("user", "Hi.")],
+                options={
+                    "openrouter": {
+                        "provider": {
+                            "order": ["anthropic"],
+                            "allow_fallbacks": False,
+                            "require_parameters": True,
+                            "zdr": True,
+                        }
+                    }
+                },
+            )
+        )
+    ]
+
+    assert events[-1].type == ModelStreamEventType.COMPLETED
+    headers = transport.calls[0]["headers"]
+    assert headers["HTTP-Referer"] == referer
+    assert headers["X-OpenRouter-Title"] == title
+    assert headers["X-OpenRouter-Metadata"] == "enabled"
+    assert referer not in repr(events)
+    assert title not in repr(events)
+    assert transport.calls[0]["payload"]["provider"] == {
+        "order": ["anthropic"],
+        "allow_fallbacks": False,
+        "require_parameters": True,
+        "zdr": True,
+    }
+    default_headers = ChatCompletionsProvider(
+        api_key="test-key",
+        name="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        transport=RecordingTransport(),
+    )._headers()
+    assert "HTTP-Referer" not in default_headers
+    assert "X-OpenRouter-Title" not in default_headers
+    assert "X-OpenRouter-Metadata" not in default_headers
+
+
+@pytest.mark.anyio
 async def test_provider_emits_tool_call_events() -> None:
     transport = RecordingTransport(
         stream_events=[
@@ -1076,6 +1242,399 @@ async def test_provider_round_trips_runtime_tool_results() -> None:
         },
         {"role": "tool", "tool_call_id": "call_1", "content": "hello from gemini"},
     ]
+
+
+@pytest.mark.anyio
+async def test_openrouter_runtime_replays_reasoning_and_persists_safe_route_evidence() -> None:
+    reasoning_details = [
+        {
+            "type": "reasoning.summary",
+            "summary": "Need to use the echo tool.",
+            "format": "anthropic-claude-v1",
+            "index": 0,
+        },
+        {
+            "type": "reasoning.encrypted",
+            "data": "opaque-openrouter-state",
+            "format": "future-provider-v9",
+            "signature": "signed-state",
+            "unknown_future_field": {"preserve": [3, 2, 1]},
+        },
+    ]
+    route_metadata = {
+        "requested": "openrouter/auto",
+        "strategy": "fallback",
+        "region": "iad",
+        "attempt": 2,
+        "is_byok": False,
+        "endpoints": {
+            "total": 2,
+            "available": [
+                {
+                    "provider": "Anthropic",
+                    "model": "anthropic/claude-sonnet-4.6",
+                    "selected": True,
+                }
+            ],
+        },
+        "pipeline": [{"data": {"prompt": "must-not-persist"}}],
+    }
+    usage = {
+        "prompt_tokens": 100,
+        "prompt_tokens_details": {"cached_tokens": 40, "cache_write_tokens": 10},
+        "completion_tokens": 20,
+        "completion_tokens_details": {"reasoning_tokens": 7},
+        "total_tokens": 120,
+        "cost": 0.0123,
+        "cost_details": {"upstream_inference_cost": 0.01},
+    }
+    transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "id": "gen-openrouter-tool",
+                    "model": "anthropic/claude-sonnet-4.6",
+                    "provider": "Anthropic",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"reasoning_details": [reasoning_details[0]]},
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+                {
+                    "id": "gen-openrouter-tool",
+                    "model": "anthropic/claude-sonnet-4.6",
+                    "provider": "Anthropic",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "reasoning_details": [reasoning_details[1]],
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "echo",
+                                            "arguments": '{"text":"hello from openrouter"}',
+                                        },
+                                    }
+                                ],
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+                {
+                    "id": "gen-openrouter-tool",
+                    "model": "anthropic/claude-sonnet-4.6",
+                    "provider": "Anthropic",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                    "usage": usage,
+                    "openrouter_metadata": route_metadata,
+                },
+            ],
+            [
+                {
+                    "id": "gen-openrouter-retry",
+                    "model": "anthropic/claude-sonnet-4.6",
+                    "provider": "Anthropic",
+                    "error": {
+                        "code": 429,
+                        "message": "rate limited",
+                        "metadata": {"error_type": "rate_limit_exceeded"},
+                    },
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": ""},
+                            "finish_reason": "error",
+                        }
+                    ],
+                }
+            ],
+            [
+                {
+                    "id": "gen-openrouter-final",
+                    "model": "anthropic/claude-sonnet-4.6",
+                    "provider": "Anthropic",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "final answer"},
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+                {
+                    "id": "gen-openrouter-final",
+                    "model": "anthropic/claude-sonnet-4.6",
+                    "provider": "Anthropic",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": 120,
+                        "completion_tokens": 3,
+                        "total_tokens": 123,
+                    },
+                    "openrouter_metadata": {
+                        **route_metadata,
+                        "attempt": 1,
+                    },
+                },
+            ],
+        ]
+    )
+    provider = ChatCompletionsProvider(
+        api_key="test-key",
+        name="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        transport=transport,
+    )
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(
+            name="assistant",
+            model="openrouter/auto",
+            system_prompt="Use tools when needed.",
+            provider_options={
+                "openrouter": {
+                    "provider": {
+                        "order": ["anthropic"],
+                        "allow_fallbacks": True,
+                        "require_parameters": True,
+                        "data_collection": "deny",
+                        "zdr": True,
+                    }
+                }
+            },
+        ),
+        tools=[EchoTool()],
+    )
+
+    session_id = "openrouter-reasoning-tool-round"
+    events = await _collect_events(
+        app,
+        RunRequest(
+            agent_name="assistant",
+            session_id=session_id,
+            messages=[Message.text("user", "Echo this.")],
+            retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        ),
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert len(transport.calls) == 3
+    assert any(event.type == EventType.MODEL_RETRY for event in events)
+    assert transport.calls[0]["payload"]["provider"] == {
+        "order": ["anthropic"],
+        "allow_fallbacks": True,
+        "require_parameters": True,
+        "data_collection": "deny",
+        "zdr": True,
+    }
+    assert transport.calls[1]["payload"] == transport.calls[2]["payload"]
+    assert transport.calls[2]["payload"]["messages"] == [
+        {"role": "system", "content": "Use tools when needed."},
+        {"role": "user", "content": "Echo this."},
+        {
+            "role": "assistant",
+            "content": None,
+            "reasoning_details": reasoning_details,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "echo",
+                        "arguments": '{"text":"hello from openrouter"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "hello from openrouter"},
+    ]
+    transcript = await store.load_transcript(session_id)
+    provider_states = [
+        part
+        for message in transcript
+        for part in message.content
+        if type(part) is ProviderStatePart and part.state.get("type") == "reasoning_details"
+    ]
+    assert len(provider_states) == 1
+    assert provider_states[0].state["details"] == reasoning_details
+    _, expected_target = _provider_state_target(model="openrouter/auto")
+    assert provider_states[0].state["target"] == expected_target
+    completed = [event for event in events if event.type == EventType.MODEL_COMPLETED]
+    first_completion = completed[0].payload
+    assert first_completion["model"] == "anthropic/claude-sonnet-4.6"
+    assert first_completion["requested_model"] == "openrouter/auto"
+    assert first_completion["upstream_provider"] == "Anthropic"
+    assert first_completion["openrouter_metadata"] == {
+        "requested": "openrouter/auto",
+        "strategy": "fallback",
+        "attempt": 2,
+        "is_byok": False,
+        "endpoint_total": 2,
+        "selected_endpoint": {
+            "provider": "Anthropic",
+            "model": "anthropic/claude-sonnet-4.6",
+        },
+    }
+    assert "pipeline" not in first_completion["openrouter_metadata"]
+    assert first_completion["usage"]["cost"] == 0.0123
+    assert first_completion["usage"]["cost_details"] == {"upstream_inference_cost": 0.01}
+    assert first_completion["usage_metrics"]["model"] == "anthropic/claude-sonnet-4.6"
+    assert first_completion["usage_metrics"]["requested_model"] == "openrouter/auto"
+    assert first_completion["usage_metrics"]["reasoning_output_tokens"] == 7
+    assert first_completion["usage_metrics"]["cache"] == {
+        "read_tokens": 40,
+        "write_tokens": 10,
+        "write_unknown_ttl_tokens": 10,
+        "cached_input_tokens": 40,
+        "uncached_input_tokens": 50,
+    }
+    assert all("provider_state" not in event.payload for event in events)
+
+
+@pytest.mark.anyio
+async def test_same_name_endpoint_adoption_omits_prior_opaque_reasoning_state() -> None:
+    model = "vendor/reasoning-model"
+    reasoning_details = [{"type": "reasoning.encrypted", "data": "source-endpoint-only-state"}]
+    source_transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "id": "source-tool",
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "reasoning_details": reasoning_details,
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "echo",
+                                            "arguments": '{"text":"source"}',
+                                        },
+                                    }
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                }
+            ],
+            [
+                {
+                    "id": "source-final",
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "source complete"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            ],
+        ]
+    )
+    store = InMemorySessionStore()
+    source_app = CayuApp(session_store=store, enable_logging=False)
+    source_app.register_provider(
+        ChatCompletionsProvider(
+            api_key="source-key",
+            name="shared-chat",
+            base_url="https://source.example.test/v1",
+            transport=source_transport,
+        ),
+        default=True,
+    )
+    source_app.register_agent(
+        AgentSpec(name="assistant", model=model),
+        tools=[EchoTool()],
+    )
+    await _collect_events(
+        source_app,
+        RunRequest(
+            agent_name="assistant",
+            session_id="same-name-chat-target-adoption",
+            messages=[Message.text("user", "Use the tool.")],
+        ),
+    )
+
+    target_transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "id": "target-final",
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "target complete"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            ]
+        ]
+    )
+    target_app = CayuApp(
+        session_store=store,
+        execution_profile_policy=_AdoptExecutionProfilePolicy(),
+        enable_logging=False,
+    )
+    target_app.register_provider(
+        ChatCompletionsProvider(
+            api_key="target-key",
+            name="shared-chat",
+            base_url="https://target.example.test/v1",
+            transport=target_transport,
+        ),
+        default=True,
+    )
+    target_app.register_agent(
+        AgentSpec(name="assistant", model=model),
+        tools=[EchoTool()],
+    )
+    resumed_events = [
+        event
+        async for event in target_app.resume(
+            ResumeRequest(
+                session_id="same-name-chat-target-adoption",
+                messages=[Message.text("user", "Continue on the adopted endpoint.")],
+                profile_adoption=ExecutionProfileAdoptionIntent(
+                    idempotency_key="adopt-same-name-chat-target-v1",
+                    reason="Adopt the reviewed endpoint.",
+                    requested_by=ResolutionActor(
+                        subject="maintainer",
+                        source=ResolutionActorSource.REQUEST,
+                    ),
+                ),
+            )
+        )
+    ]
+
+    assert resumed_events[-1].type == EventType.SESSION_COMPLETED
+    target_messages = target_transport.calls[0]["payload"]["messages"]
+    assert all("reasoning_details" not in message for message in target_messages)
+    assert any(message.get("tool_calls") for message in target_messages)
+    transcript = await store.load_transcript("same-name-chat-target-adoption")
+    assert any(
+        type(part) is ProviderStatePart and part.state.get("details") == reasoning_details
+        for message in transcript
+        for part in message.content
+    )
 
 
 @pytest.mark.anyio
@@ -1362,6 +1921,12 @@ async def test_chat_completions_stream_events_handles_gemini_tool_call_without_i
 
 @pytest.mark.anyio
 async def test_chat_completions_stream_events_preserves_gemini_tool_call_extra_content() -> None:
+    target_sha256, target = _provider_state_target(
+        provider_name="gemini",
+        endpoint_url="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        model="gemini-3.1-flash-lite",
+    )
+
     async def raw_events():
         yield {
             "id": "gemini-1",
@@ -1398,7 +1963,13 @@ async def test_chat_completions_stream_events_preserves_gemini_tool_call_extra_c
             ],
         }
 
-    events = [event async for event in chat_completions_stream_events(raw_events())]
+    events = [
+        event
+        async for event in chat_completions_stream_events(
+            raw_events(),
+            provider_state_target_sha256=target_sha256,
+        )
+    ]
 
     assert [event.type for event in events] == [
         ModelStreamEventType.TOOL_CALL,
@@ -1416,11 +1987,204 @@ async def test_chat_completions_stream_events_preserves_gemini_tool_call_extra_c
             "provider": "chat_completions",
             "state": {
                 "type": "tool_call_extra_content",
+                "version": 1,
+                "target": target,
                 "tool_call_id": "function-call-123",
                 "extra_content": {"google": {"thought_signature": "signature-1"}},
             },
         }
     ]
+
+
+@pytest.mark.anyio
+async def test_chat_completions_stream_events_rejects_malformed_reasoning_before_tool_call() -> (
+    None
+):
+    async def raw_events():
+        yield {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "reasoning_details": {"type": "reasoning.text"},
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "must-not-run",
+                                "function": {"name": "echo", "arguments": '{"text":"no"}'},
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+
+    emitted: list[ModelStreamEvent] = []
+    with pytest.raises(ChatCompletionsProtocolError, match="reasoning_details must be a list"):
+        async for event in chat_completions_stream_events(raw_events()):
+            emitted.append(event)
+
+    assert emitted == []
+
+
+@pytest.mark.anyio
+async def test_chat_completions_stream_events_rejects_undurable_reasoning_before_tool_call() -> (
+    None
+):
+    async def raw_events():
+        yield {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "reasoning_details": [{"type": "future.reasoning", "counter": 2**63}],
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "must-not-run",
+                                "function": {"name": "echo", "arguments": '{"text":"no"}'},
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+
+    emitted: list[ModelStreamEvent] = []
+    with pytest.raises(ChatCompletionsProtocolError, match="not durable JSON"):
+        async for event in chat_completions_stream_events(raw_events()):
+            emitted.append(event)
+
+    assert emitted == []
+
+
+@pytest.mark.anyio
+async def test_chat_completions_stream_events_projects_bounded_openrouter_route_evidence() -> None:
+    async def raw_events():
+        yield {
+            "id": "gen-1",
+            "model": "anthropic/claude-sonnet-4.6",
+            "provider": "Tencent Cloud",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "openrouter_metadata": {
+                "requested": "openrouter/auto",
+                "strategy": "direct",
+                "region": "iad",
+                "summary": "unbounded human description must not persist",
+                "attempt": 2,
+                "is_byok": False,
+                "endpoints": {
+                    "total": 2,
+                    "available": [
+                        {
+                            "provider": "Tencent Cloud",
+                            "model": "anthropic/claude-sonnet-4.6",
+                            "selected": True,
+                            "unknown": "ignored",
+                        },
+                        {
+                            "provider": "Other",
+                            "model": "other/model",
+                            "selected": False,
+                        },
+                    ],
+                },
+                "attempts": [{"provider": "secret-upstream-detail"}],
+                "pipeline": [{"data": {"prompt": "must-not-persist"}}],
+                "future": {"free_form": "must-not-persist"},
+            },
+        }
+
+    events = [
+        event
+        async for event in chat_completions_stream_events(
+            raw_events(),
+            requested_model="openrouter/auto",
+        )
+    ]
+
+    assert events[-1].payload["model"] == "anthropic/claude-sonnet-4.6"
+    assert events[-1].payload["upstream_provider"] == "Tencent Cloud"
+    assert events[-1].payload["openrouter_metadata"] == {
+        "requested": "openrouter/auto",
+        "strategy": "direct",
+        "attempt": 2,
+        "is_byok": False,
+        "endpoint_total": 2,
+        "selected_endpoint": {
+            "provider": "Tencent Cloud",
+            "model": "anthropic/claude-sonnet-4.6",
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        "alias",
+        "auto",
+        "bodybuilder",
+        "direct",
+        "fallback",
+        "free",
+        "fusion",
+        "latest",
+        "pareto",
+    ],
+)
+def test_openrouter_documented_router_strategies_are_retained(strategy: str) -> None:
+    assert chat_completions_module._safe_openrouter_metadata(
+        {"strategy": strategy},
+        requested_model=None,
+        effective_model=None,
+    ) == {"strategy": strategy}
+
+
+@pytest.mark.anyio
+async def test_chat_completions_stream_events_omits_untrusted_router_strings() -> None:
+    arbitrary = "prompt-or-credential-canary"
+
+    async def raw_events():
+        yield {
+            "id": "gen-unsafe-route-evidence",
+            "model": "anthropic/claude-sonnet-4.6",
+            "provider": arbitrary,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "openrouter_metadata": {
+                "requested": arbitrary,
+                "strategy": arbitrary,
+                "region": arbitrary,
+                "attempt": 1,
+                "endpoints": {
+                    "available": [
+                        {
+                            "selected": True,
+                            "provider": arbitrary,
+                            "model": arbitrary,
+                        }
+                    ]
+                },
+            },
+        }
+
+    events = [
+        event
+        async for event in chat_completions_stream_events(
+            raw_events(),
+            requested_model="openrouter/auto",
+        )
+    ]
+
+    completion = events[-1].payload
+    assert "upstream_provider" not in completion
+    assert len(completion["upstream_provider_sha256"]) == 64
+    assert completion["openrouter_metadata"]["attempt"] == 1
+    assert len(completion["openrouter_metadata"]["strategy_sha256"]) == 64
+    selected = completion["openrouter_metadata"]["selected_endpoint"]
+    assert len(selected["provider_sha256"]) == 64
+    assert arbitrary not in repr(completion)
 
 
 @pytest.mark.anyio
@@ -1540,6 +2304,94 @@ async def test_chat_completions_stream_events_raises_on_mid_stream_error_chunk()
     assert exc_info.value.status_code == 500
     assert exc_info.value.retryable is True
     assert exc_info.value.response_body is None
+
+
+@pytest.mark.anyio
+async def test_openrouter_mid_stream_error_uses_nested_typed_identity_and_numeric_status() -> None:
+    async def raw_events():
+        yield {
+            "request_id": "gen-openrouter-error",
+            "error": {
+                "code": 429,
+                "message": "upstream detail must not surface",
+                "metadata": {
+                    "error_type": "rate_limit_exceeded",
+                    "provider_code": "rate_limited",
+                },
+            },
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}],
+        }
+
+    with pytest.raises(ChatCompletionsAPIError) as exc_info:
+        [event async for event in chat_completions_stream_events(raw_events())]
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.error_type == "rate_limit_exceeded"
+    assert exc_info.value.error_code == "rate_limited"
+    assert exc_info.value.request_id == "gen-openrouter-error"
+    assert exc_info.value.retryable is True
+    assert "upstream detail" not in str(exc_info.value)
+
+
+@pytest.mark.anyio
+async def test_openrouter_mid_stream_context_error_preserves_overflow_classification() -> None:
+    async def raw_events():
+        yield {
+            "id": "gen-openrouter-overflow",
+            "model": "vendor/reasoning-model",
+            "provider": "Upstream",
+            "error": {
+                "code": 400,
+                "message": "request exceeded context window",
+                "metadata": {"error_type": "context_length_exceeded"},
+            },
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": ""},
+                    "finish_reason": "error",
+                }
+            ],
+        }
+
+    with pytest.raises(ChatCompletionsContextOverflowError) as exc_info:
+        [event async for event in chat_completions_stream_events(raw_events())]
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.error_type == "context_length_exceeded"
+    assert exc_info.value.retryable is False
+    assert "context window" not in str(exc_info.value)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("nested_type", "code", "message"),
+    [
+        pytest.param("rate_limited", 400, "context too large", id="context-message"),
+        pytest.param("rate_limit_error", 429, "denied", id="retryable-type"),
+    ],
+)
+async def test_openrouter_mid_stream_conflicting_type_aliases_fail_closed(
+    nested_type: str,
+    code: int,
+    message: str,
+) -> None:
+    async def raw_events():
+        yield {
+            "error": {
+                "type": "authentication_error",
+                "code": code,
+                "message": message,
+                "metadata": {"error_type": nested_type},
+            }
+        }
+
+    with pytest.raises(ChatCompletionsAPIError) as exc_info:
+        [event async for event in chat_completions_stream_events(raw_events())]
+
+    assert not isinstance(exc_info.value, ChatCompletionsContextOverflowError)
+    assert exc_info.value.error_type is None
+    assert exc_info.value.retryable is False
 
 
 @pytest.mark.anyio
@@ -2374,6 +3226,34 @@ def test_chat_http_error_uses_stream_identity_classification(
     assert error.error_code == error_code
     assert error.retryable is expected_retryable
     assert error.retry_after_s == 4.0
+
+
+def test_openrouter_http_error_uses_nested_typed_identity_and_provider_code() -> None:
+    response = httpx.Response(
+        502,
+        headers={"content-type": "application/json"},
+        json={
+            "error": {
+                "code": 502,
+                "message": "provider disconnected",
+                "metadata": {
+                    "error_type": "provider_unavailable",
+                    "provider_code": "connection_reset",
+                },
+            }
+        },
+    )
+
+    error = chat_completions_module._chat_api_error_from_response(
+        response,
+        "Chat Completions failed",
+        None,
+    )
+
+    assert error.status_code == 502
+    assert error.error_type == "provider_unavailable"
+    assert error.error_code == "connection_reset"
+    assert error.retryable is True
 
 
 @pytest.mark.anyio

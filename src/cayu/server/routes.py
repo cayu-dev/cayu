@@ -3225,7 +3225,12 @@ def _serialize_message_part(cayu_app: Any, part: Any) -> dict[str, Any]:
         for field_name in ("model_step_id", "model_attempt_id", "tool_round_id")
         if getattr(part, field_name, None) is None
     }
-    if part.type == "thinking":
+    if part.type == "provider_state":
+        # ProviderStatePart is private replay state. Its payload can contain
+        # signatures, encrypted reasoning blobs, and unknown future protocol
+        # extensions that are neither display data nor safe public evidence.
+        excluded_fields.add("state")
+    elif part.type == "thinking":
         # The opaque round-trip state (Anthropic signatures / redacted blobs) is
         # provider-internal and must not be exposed to transcript API consumers.
         excluded_fields.add("provider_state")

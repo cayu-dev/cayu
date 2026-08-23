@@ -538,6 +538,15 @@ jobs:
           check = json.loads(Path("completed-check.json").read_text())
           assert check["diagnostics"] == []
           PY
+          openrouter_root="$(mktemp -d)"
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" new proof-openrouter \
+            --provider openrouter --dir "$openrouter_root"
+          cd "$openrouter_root/proof-openrouter"
+          unset CAYU_PROVIDER CAYU_MODEL OPENROUTER_API_KEY \
+            OPENROUTER_HTTP_REFERER OPENROUTER_APP_TITLE \
+            OPENROUTER_ROUTER_METADATA
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" -m pytest -q
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" eval run >/dev/null
       - name: Check built-wheel secure public-service contract
         run: |
           uv pip install --python .release-server-venv/bin/python pytest 'ruff>=0.15.15,<0.16'

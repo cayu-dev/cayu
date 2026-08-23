@@ -534,15 +534,17 @@ def test_package_shipped_provider_guide_is_short_and_agent_discoverable(capsys) 
         assert configuration_value in guide
 
     assert "`CAYU_PROVIDER` is only a scaffold convenience" in guide
+    assert "`cayu new APP --provider openrouter`" in guide
+    assert "explicit `CAYU_MODEL=vendor/model`" in guide
+    assert "reasoning_details" in guide
     assert "ChatCompletionsProvider" in guide
     assert "AgentSpec.provider_name" in guide
     assert "`opencode-go/...`" in guide
     assert "authenticated live inference" not in guide
     assert "Route/auth only" not in guide
-    assert len(guide.splitlines()) < 140
+    assert len(guide.splitlines()) < 155
 
     assert main(["guide", "providers#compatible-chat-completions"]) == 0
     compatible = capsys.readouterr().out
     assert compatible.startswith("## Compatible Chat Completions")
-    assert "OpenRouter" in compatible
     assert "OpenCode Go" in compatible

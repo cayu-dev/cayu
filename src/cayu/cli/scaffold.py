@@ -41,6 +41,7 @@ from cayu import (
     AlwaysRequireApprovalToolPolicy,
     AnthropicProvider,
     CayuApp,
+    ChatCompletionsProvider,
     ModelProvider,
     OpenAIProvider,
     OpenAISubscriptionProvider,
@@ -61,7 +62,15 @@ from configuration import configured_provider_choice
 
 
 class _ScaffoldPlaceholderProvider(ScriptedModelProvider):
-    """Credential-free placeholder rejected only by live ``run.py`` validation."""
+    """Credential-free placeholder rejected by every runtime entry point."""
+
+    def __init__(self, *, name: str, setup_error: str) -> None:
+        super().__init__([], name=name)
+        self._setup_error = setup_error
+
+    def preflight_model_target(self, *, model: str) -> None:
+        del model
+        raise RuntimeError(self._setup_error)
 
 
 def configured_provider() -> ModelProvider:
@@ -74,7 +83,13 @@ def configured_provider() -> ModelProvider:
 
     choice = configured_provider_choice()
     if choice is None:
-        return _ScaffoldPlaceholderProvider([], name="unconfigured")
+        return _ScaffoldPlaceholderProvider(
+            name="unconfigured",
+            setup_error=(
+                "no provider is selected; set CAYU_PROVIDER to openai, anthropic, "
+                "openrouter, or openai-subscription (credentials do not select a provider)"
+            ),
+        )
     if choice == "openai-subscription":
         return OpenAISubscriptionProvider()
     if choice == "openai":
@@ -82,18 +97,51 @@ def configured_provider() -> ModelProvider:
         return (
             OpenAIProvider(api_key=api_key)
             if api_key
-            else _ScaffoldPlaceholderProvider([], name="openai")
+            else _ScaffoldPlaceholderProvider(
+                name="openai",
+                setup_error="provider 'openai' is selected but OPENAI_API_KEY is not set",
+            )
+        )
+    if choice == "openrouter":
+        router_metadata_enabled = _openrouter_router_metadata_enabled()
+        model = (os.environ.get("CAYU_MODEL") or "").strip()
+        if not model:
+            return _ScaffoldPlaceholderProvider(
+                name="openrouter",
+                setup_error="provider 'openrouter' requires an explicit CAYU_MODEL model slug",
+            )
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        return (
+            ChatCompletionsProvider(
+                name="openrouter",
+                api_key=api_key,
+                api_key_env="OPENROUTER_API_KEY",
+                base_url="https://openrouter.ai/api/v1",
+                openrouter_http_referer=os.environ.get("OPENROUTER_HTTP_REFERER"),
+                openrouter_app_title=os.environ.get("OPENROUTER_APP_TITLE"),
+                openrouter_router_metadata=router_metadata_enabled,
+            )
+            if api_key
+            else _ScaffoldPlaceholderProvider(
+                name="openrouter",
+                setup_error=(
+                    "provider 'openrouter' is selected but OPENROUTER_API_KEY is not set"
+                ),
+            )
         )
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     return (
         AnthropicProvider(api_key=api_key)
         if api_key
-        else _ScaffoldPlaceholderProvider([], name="anthropic")
+        else _ScaffoldPlaceholderProvider(
+            name="anthropic",
+            setup_error="provider 'anthropic' is selected but ANTHROPIC_API_KEY is not set",
+        )
     )
 
 
 def validate_run_configuration(app: CayuApp, agent_name: str) -> None:
-    """Require live-provider setup after the command has selected an agent."""
+    """Run the same target preflight used by every runtime entry point."""
 
     manifest_agent = next(
         agent for agent in app.describe().agents if agent.name == agent_name
@@ -103,16 +151,18 @@ def validate_run_configuration(app: CayuApp, agent_name: str) -> None:
             f"agent {agent_name!r} does not resolve to exactly one model provider"
         )
     provider = app.get_provider(manifest_agent.resolved_provider)
-    if not isinstance(provider, _ScaffoldPlaceholderProvider):
-        return
-    choice = configured_provider_choice()
-    if choice is None:
-        raise RuntimeError(
-            "no provider is selected; set CAYU_PROVIDER to openai, anthropic, or "
-            "openai-subscription (credentials do not select a provider)"
-        )
-    credential = "OPENAI_API_KEY" if choice == "openai" else "ANTHROPIC_API_KEY"
-    raise RuntimeError(f"provider {choice!r} is selected but {credential} is not set")
+    provider.preflight_model_target(model=manifest_agent.model)
+
+
+def _openrouter_router_metadata_enabled() -> bool:
+    value = os.environ.get("OPENROUTER_ROUTER_METADATA")
+    if value is None or value.lower() == "disabled":
+        return False
+    if value.lower() == "enabled":
+        return True
+    raise RuntimeError(
+        "OPENROUTER_ROUTER_METADATA must be 'enabled' or 'disabled' when set"
+    )
 
 
 def _agent_for_provider_override(
@@ -177,10 +227,11 @@ _CONFIGURATION_PY = '''"""Explicit provider and compatible model selection for t
 import os
 
 _SCAFFOLDED_PROVIDER = __PROVIDER_LITERAL__
-_SUPPORTED_PROVIDERS = {"openai", "anthropic", "openai-subscription"}
+_SUPPORTED_PROVIDERS = {"openai", "anthropic", "openrouter", "openai-subscription"}
 _PROVIDER_NAMES = {
     "openai": "openai",
     "anthropic": "anthropic",
+    "openrouter": "openrouter",
     "openai-subscription": "openai_subscription",
 }
 _DEFAULT_MODELS = {
@@ -208,10 +259,14 @@ def configured_provider_name() -> str | None:
 
 
 def configured_model() -> str:
-    override = os.environ.get("CAYU_MODEL")
+    override = (os.environ.get("CAYU_MODEL") or "").strip()
     if override:
         return override
     selected = configured_provider_choice()
+    if selected == "openrouter":
+        # Inspection and hermetic tests remain credential-free. Live run.py
+        # validation rejects this sentinel until CAYU_MODEL is explicit.
+        return "openrouter-model-unconfigured"
     return (
         "provider-model-unconfigured" if selected is None else _DEFAULT_MODELS[selected]
     )
@@ -356,8 +411,8 @@ path = "data/cayu.db"
 pythonpath = ["."]
 """
 
-_PROVIDER_GUIDE_POINTER = """OpenRouter, Fireworks, Baseten, OpenCode Go, and other compatible endpoints work
-through Cayu even though they are not scaffold choices. Run
+_PROVIDER_GUIDE_POINTER = """OpenRouter is a first-class scaffold choice. Fireworks, Baseten, OpenCode Go,
+and other compatible endpoints work through Cayu's generic adapter. Run
 `uv run cayu guide providers#compatible-chat-completions` for exact setup."""
 
 _README = """# __PROJECT_NAME__
@@ -419,7 +474,7 @@ access requires an authenticated access policy.
 ## Run with a live provider
 
 Provider intent is explicit. This scaffold defaults to `__PROVIDER_DISPLAY__`;
-override it with `CAYU_PROVIDER=openai`, `anthropic`, or
+override it with `CAYU_PROVIDER=openai`, `anthropic`, `openrouter`, or
 `openai-subscription`. API-key variables authenticate that choice and never
 select it automatically.
 
@@ -440,6 +495,22 @@ export CAYU_PROVIDER=anthropic
 export ANTHROPIC_API_KEY=sk-ant-...
 uv run python run.py --message "YOUR REQUEST"
 ```
+
+OpenRouter (the model slug is always explicit):
+
+```bash
+export CAYU_PROVIDER=openrouter
+export OPENROUTER_API_KEY=sk-or-...
+export CAYU_MODEL=vendor/model
+uv run python run.py --message "YOUR REQUEST"
+```
+
+Optional `OPENROUTER_HTTP_REFERER` and `OPENROUTER_APP_TITLE` values add
+OpenRouter attribution headers. Set `OPENROUTER_ROUTER_METADATA=enabled` to
+retain only bounded routing evidence; free-form pipeline and attempt data is
+never persisted. Put OpenRouter routing controls such as `provider.order`,
+`provider.allow_fallbacks`, `provider.require_parameters`, `provider.zdr`, and
+`provider.data_collection` in `AgentSpec.provider_options["openrouter"]`.
 
 Your own ChatGPT subscription for local testing:
 
@@ -2847,7 +2918,7 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     parser.add_argument(
         "--provider",
-        choices=("openai", "anthropic", "openai-subscription"),
+        choices=("openai", "anthropic", "openrouter", "openai-subscription"),
         help=(
             "Explicit live-provider default. Omit for a provider-neutral scaffold; "
             "CAYU_PROVIDER can select or override it later."

@@ -1634,7 +1634,7 @@ def _cayu_provider_material(provider: object) -> dict[str, Any] | None:
             return None
         return {
             "adapter": "chat-completions",
-            "version": 1,
+            "version": 2,
             "base_url": provider.base_url,
             "endpoint_url": provider.endpoint_url,
             "api_key_env": provider.api_key_env,
@@ -1653,11 +1653,20 @@ def _cayu_provider_material(provider: object) -> dict[str, Any] | None:
                 and provider.auth_value_prefix == DEFAULT_CHAT_COMPLETIONS_AUTH_VALUE_PREFIX
                 and not provider.allow_http
                 and provider.api_version is None
+                and provider.openrouter_http_referer is None
+                and provider.openrouter_app_title is None
+                and not provider.openrouter_router_metadata
             ),
             "clean_schemas": provider.clean_schemas,
             "strip_additional_properties": provider.strip_additional_properties,
             "document_encoding": provider.document_encoding,
             "usage_dialect": provider.usage_dialect.value,
+            # Attribution values are request headers, not durable runtime
+            # evidence. Only their presence affects inspectable behavior
+            # material so the values never enter profile events or metadata.
+            "openrouter_http_referer_configured": (provider.openrouter_http_referer is not None),
+            "openrouter_app_title_configured": provider.openrouter_app_title is not None,
+            "openrouter_router_metadata": provider.openrouter_router_metadata,
         }
     if type(provider) is AnthropicProvider:
         if (

@@ -6565,6 +6565,7 @@ class SessionEngine:
                 field_name=field_name,
                 redactor=self._secret_redactor,
             )
+        registered_provider.provider.preflight_model_target(model=model)
         registered_environment = self._get_registered_environment(request.environment_name)
         if registered_environment is not None:
             session_request_boundary.require_secret_free_session_authority(

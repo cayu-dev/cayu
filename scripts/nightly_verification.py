@@ -44,6 +44,8 @@ _LIVE_CREDENTIAL_ENV = (
     "E2B_API_KEY",
     "GEMINI_API_KEY",
     "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "CAYU_OPENROUTER_MODEL",
 )
 _SUCCESS_STATUSES = frozenset({STATUS_HERMETIC, STATUS_VERIFIED})
 _PATH_ENV = {
@@ -668,7 +670,21 @@ CHECKS: tuple[VerificationCheck, ...] = (
         command=("uv", "run", "python", "examples/chat_completions_contract_live.py"),
         status_on_success=STATUS_VERIFIED,
         prerequisites=("GEMINI_API_KEY",),
+        env={"CAYU_PROVIDER": "gemini"},
         required_env=("GEMINI_API_KEY",),
+    ),
+    VerificationCheck(
+        id="openrouter-contract",
+        capability=(
+            "OpenRouter tool-call, reasoning replay, routing, usage, and structured-output contract"
+        ),
+        lane="chat-completions",
+        command=("uv", "run", "python", "examples/chat_completions_contract_live.py"),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=("OPENROUTER_API_KEY", "CAYU_OPENROUTER_MODEL"),
+        env={"CAYU_PROVIDER": "openrouter"},
+        required_env=("OPENROUTER_API_KEY", "CAYU_OPENROUTER_MODEL"),
+        requires_provider_api_key=True,
     ),
     VerificationCheck(
         id="structured-output-live",
@@ -1317,8 +1333,14 @@ def _provider_api_key_missing(environ: Mapping[str, str]) -> list[str]:
             if environ.get("ANTHROPIC_API_KEY")
             else ["ANTHROPIC_API_KEY is not set for CAYU_PROVIDER=anthropic"]
         )
+    if provider == "openrouter":
+        return (
+            []
+            if environ.get("OPENROUTER_API_KEY")
+            else ["OPENROUTER_API_KEY is not set for CAYU_PROVIDER=openrouter"]
+        )
     if provider:
-        return ["CAYU_PROVIDER must be openai or anthropic"]
+        return ["CAYU_PROVIDER must be openai, anthropic, or openrouter"]
     return []
 
 

@@ -447,6 +447,13 @@ def test_late_resolved_secret_is_quarantined_until_terminal_projection() -> None
 def test_provider_state_uses_complete_round_secret_projection() -> None:
     async def run() -> None:
         secret = "late-openai-provider-state-secret-canary"
+        provider_state_target_sha256 = "a" * 64
+        provider_state_target = {
+            "protocol": "openai-chat-completions",
+            "protocol_version": 1,
+            "version": 1,
+            "sha256": provider_state_target_sha256,
+        }
         arguments = {"provided": secret, "nested": {"token": secret}}
         store = InMemorySessionStore()
         provider = FakeProvider(
@@ -486,6 +493,8 @@ def test_provider_state_uses_complete_round_secret_projection() -> None:
                                     "provider": "chat_completions",
                                     "state": {
                                         "type": "tool_call_extra_content",
+                                        "version": 1,
+                                        "target": provider_state_target,
                                         "tool_call_id": "call_openai_provider_state",
                                         "extra_content": {
                                             "google": {"thought_signature": "signature-safe"}
@@ -563,7 +572,10 @@ def test_provider_state_uses_complete_round_secret_projection() -> None:
             and part.state["extra_content"]["google"]["thought_signature"] == "signature-safe"
             for part in provider_states
         )
-        chat_payload = build_chat_completions_payload(provider.requests[1])
+        chat_payload = build_chat_completions_payload(
+            provider.requests[1],
+            provider_state_target_sha256=provider_state_target_sha256,
+        )
         assert secret not in repr(chat_payload)
         assert "signature-safe" in repr(chat_payload)
         exported = io.StringIO()

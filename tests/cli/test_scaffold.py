@@ -15,6 +15,7 @@ import pytest
 
 from cayu import (
     CayuApp,
+    ChatCompletionsProvider,
     EvalStatus,
     InMemorySessionStore,
     InMemoryTaskStore,
@@ -94,6 +95,7 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     app_source = (proj / "app.py").read_text(encoding="utf-8")
     configuration_source = (proj / "configuration.py").read_text(encoding="utf-8")
     assert "AnthropicProvider" in app_source
+    assert "ChatCompletionsProvider" in app_source
     assert "OpenAISubscriptionProvider" in app_source
     assert "CAYU_OPENAI_SUBSCRIPTION" not in app_source
     assert "_SCAFFOLDED_PROVIDER = None" in configuration_source
@@ -128,6 +130,10 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "CAYU_PROVIDER=openai-subscription" in readme
     assert "CAYU_PROVIDER=anthropic" in readme
     assert "ANTHROPIC_API_KEY" in readme
+    assert "CAYU_PROVIDER=openrouter" in readme
+    assert "OPENROUTER_API_KEY" in readme
+    assert "CAYU_MODEL=vendor/model" in readme
+    assert 'provider_options["openrouter"]' in readme
     assert "subscription holder's own local" in readme
     assert "development and evaluation" in readme
     assert "not intended for production" in readme
@@ -430,6 +436,132 @@ def test_scaffold_provider_env_explicitly_overrides_scaffold_default(
     assert agent.model == "claude-sonnet-4-6"
 
 
+def test_scaffold_openrouter_builds_first_class_provider_with_explicit_model(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    assert main(["new", "myproj", "--dir", str(tmp_path), "--provider", "openrouter"]) == 0
+    project = tmp_path / "myproj"
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setenv("CAYU_MODEL", "stealth/ox-alpha")
+    monkeypatch.setenv("OPENROUTER_HTTP_REFERER", "https://example.test/cayu")
+    monkeypatch.setenv("OPENROUTER_APP_TITLE", "Cayu")
+    monkeypatch.setenv("OPENROUTER_ROUTER_METADATA", "enabled")
+
+    spec = importlib.util.spec_from_file_location("openrouter_scaffold_app", project / "app.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    with project_context(project):
+        spec.loader.exec_module(module)
+        provider = module.configured_provider()
+        app = module.build_app(
+            provider=provider,
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+        )
+        module.validate_run_configuration(app, "myproj")
+
+    assert app.describe().agents[0].model == "stealth/ox-alpha"
+    assert isinstance(provider, ChatCompletionsProvider)
+    assert provider.name == "openrouter"
+    assert provider.api_key_env == "OPENROUTER_API_KEY"
+    assert provider.base_url == "https://openrouter.ai/api/v1"
+    headers = provider._headers()
+    assert headers["HTTP-Referer"] == "https://example.test/cayu"
+    assert headers["X-OpenRouter-Title"] == "Cayu"
+    assert headers["X-OpenRouter-Metadata"] == "enabled"
+
+
+def test_scaffold_openrouter_requires_model_before_live_run(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    assert main(["new", "myproj", "--dir", str(tmp_path), "--provider", "openrouter"]) == 0
+    project = tmp_path / "myproj"
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.delenv("CAYU_MODEL", raising=False)
+
+    spec = importlib.util.spec_from_file_location(
+        "openrouter_missing_model_scaffold_app",
+        project / "app.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    with project_context(project):
+        spec.loader.exec_module(module)
+        session_store = InMemorySessionStore()
+        app = module.build_app(
+            session_store=session_store,
+            task_store=InMemoryTaskStore(),
+        )
+        with pytest.raises(RuntimeError, match="requires an explicit CAYU_MODEL"):
+            module.validate_run_configuration(app, "myproj")
+
+        outcome = asyncio.run(
+            run_to_completion(
+                app,
+                RunRequest(
+                    agent_name="myproj",
+                    session_id="openrouter-missing-model-direct-sdk",
+                    messages=[Message.text("user", "must not dispatch")],
+                ),
+            )
+        )
+
+    assert app.describe().agents[0].model == "openrouter-model-unconfigured"
+    assert outcome.events == ()
+    assert outcome.error == (
+        "RuntimeError: provider 'openrouter' requires an explicit CAYU_MODEL model slug"
+    )
+    assert asyncio.run(session_store.load("openrouter-missing-model-direct-sdk")) is None
+
+
+def test_scaffold_openrouter_requires_selected_provider_key_before_live_run(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    assert main(["new", "myproj", "--dir", str(tmp_path), "--provider", "openrouter"]) == 0
+    project = tmp_path / "myproj"
+    monkeypatch.setenv("CAYU_MODEL", "vendor/model")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    spec = importlib.util.spec_from_file_location(
+        "openrouter_missing_key_scaffold_app",
+        project / "app.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    with project_context(project):
+        spec.loader.exec_module(module)
+        app = module.build_app(
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+        )
+        with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY is not set"):
+            module.validate_run_configuration(app, "myproj")
+
+
+def test_scaffold_openrouter_rejects_invalid_router_metadata_setting(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    assert main(["new", "myproj", "--dir", str(tmp_path), "--provider", "openrouter"]) == 0
+    project = tmp_path / "myproj"
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-key")
+    monkeypatch.setenv("OPENROUTER_ROUTER_METADATA", "verbose")
+
+    spec = importlib.util.spec_from_file_location(
+        "openrouter_invalid_metadata_scaffold_app",
+        project / "app.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    with project_context(project):
+        spec.loader.exec_module(module)
+        with pytest.raises(RuntimeError, match="must be 'enabled' or 'disabled'"):
+            module.configured_provider()
+
+
 @pytest.mark.parametrize(
     ("scaffold_provider", "environment_provider"),
     [
@@ -437,9 +569,11 @@ def test_scaffold_provider_env_explicitly_overrides_scaffold_default(
         pytest.param("openai", None, id="openai"),
         pytest.param("anthropic", None, id="anthropic"),
         pytest.param("openai-subscription", None, id="openai-subscription"),
+        pytest.param("openrouter", None, id="openrouter"),
         pytest.param(None, "openai", id="neutral-env-openai"),
         pytest.param(None, "anthropic", id="neutral-env-anthropic"),
         pytest.param(None, "openai-subscription", id="neutral-env-openai-subscription"),
+        pytest.param(None, "openrouter", id="neutral-env-openrouter"),
     ],
 )
 def test_scaffolded_credential_free_proof_ignores_live_provider_selection(
@@ -453,7 +587,13 @@ def test_scaffolded_credential_free_proof_ignores_live_provider_selection(
     assert main(command) == 0
     project = tmp_path / "myproj"
     environment = os.environ.copy()
-    for name in ("CAYU_PROVIDER", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+    for name in (
+        "CAYU_PROVIDER",
+        "CAYU_MODEL",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENROUTER_API_KEY",
+    ):
         environment.pop(name, None)
     if environment_provider is not None:
         environment["CAYU_PROVIDER"] = environment_provider
@@ -646,7 +786,8 @@ def test_cayu_new_routes_provider_questions_to_the_package_compatibility_guide(
 
     for relative_path in ("README.md", "AGENTS.md"):
         text = " ".join((project / relative_path).read_text(encoding="utf-8").split())
-        assert "work through Cayu even though they are not scaffold choices" in text
+        assert "OpenRouter is a first-class scaffold choice" in text
+        assert "other compatible endpoints work through Cayu's generic adapter" in text
         assert "uv run cayu guide providers#compatible-chat-completions" in text
         for service in ("OpenRouter", "Fireworks", "Baseten", "OpenCode Go"):
             assert service in text

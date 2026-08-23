@@ -409,6 +409,122 @@ def test_normalize_openai_chat_usage_shape() -> None:
     assert metrics.cache.uncached_input_tokens == 60
 
 
+def test_normalize_openrouter_usage_preserves_cache_write_and_reasoning_tokens() -> None:
+    raw_usage = {
+        "prompt_tokens": 100,
+        "prompt_tokens_details": {
+            "cached_tokens": 40,
+            "cache_write_tokens": 10,
+        },
+        "completion_tokens": 20,
+        "completion_tokens_details": {"reasoning_tokens": 7},
+        "total_tokens": 120,
+        "cost": 0.0123,
+        "cost_details": {"upstream_inference_cost": 0.01},
+    }
+
+    metrics = normalize_usage_metrics(
+        provider_name="openrouter",
+        model="anthropic/claude-sonnet-4.6",
+        requested_model="openrouter/auto",
+        raw_usage=raw_usage,
+        usage_dialect=UsageDialect.OPENAI,
+    )
+
+    assert metrics is not None
+    assert metrics.provider_name == "openrouter"
+    assert metrics.requested_model == "openrouter/auto"
+    assert metrics.model == "anthropic/claude-sonnet-4.6"
+    assert metrics.reasoning_output_tokens == 7
+    assert metrics.cache.read_tokens == 40
+    assert metrics.cache.write_tokens == 10
+    assert metrics.cache.write_unknown_ttl_tokens == 10
+    assert metrics.cache.uncached_input_tokens == 50
+    # Raw provider cost remains separate completion evidence; it does not enter
+    # normalized usage or Cayu's PriceBook estimate inputs.
+    assert "cost" not in metrics.model_dump(mode="json")
+    assert raw_usage["cost"] == 0.0123
+    assert raw_usage["cost_details"] == {"upstream_inference_cost": 0.01}
+
+
+def test_openrouter_fallback_is_priced_only_by_its_effective_model() -> None:
+    metrics = normalize_usage_metrics(
+        provider_name="openrouter",
+        requested_model="openrouter/auto",
+        model="anthropic/claude-sonnet-4.6",
+        raw_usage={
+            "prompt_tokens": 1_000,
+            "completion_tokens": 100,
+            "total_tokens": 1_100,
+            "cost": 99,
+        },
+        usage_dialect=UsageDialect.OPENAI,
+    )
+    assert metrics is not None
+    event = Event(
+        type=EventType.MODEL_COMPLETED,
+        session_id="openrouter-fallback-cost",
+        payload={"usage_metrics": metrics.model_dump(mode="json")},
+    )
+
+    requested_only = estimate_session_cost(
+        session_id="openrouter-fallback-cost",
+        events=[event],
+        pricing=PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="openrouter",
+                    model="openrouter/auto",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("1"),
+                ),
+            )
+        ),
+    )
+    effective = estimate_session_cost(
+        session_id="openrouter-fallback-cost",
+        events=[event],
+        pricing=PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="openrouter",
+                    model="anthropic/claude-sonnet-4.6",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("1"),
+                ),
+            )
+        ),
+    )
+
+    assert requested_only.priced_model_steps == 0
+    assert requested_only.unpriced_model_steps == 1
+    assert requested_only.total_cost == 0
+    assert effective.priced_model_steps == 1
+    assert effective.unpriced_model_steps == 0
+    assert effective.line_items[0].model == "anthropic/claude-sonnet-4.6"
+    assert effective.line_items[0].requested_model == "openrouter/auto"
+    assert effective.total_cost == Decimal("0.0011")
+
+
+def test_normalize_openrouter_usage_rejects_cache_write_larger_than_prompt() -> None:
+    assert (
+        normalize_usage_metrics(
+            provider_name="openrouter",
+            model="vendor/model",
+            raw_usage={
+                "prompt_tokens": 3,
+                "prompt_tokens_details": {
+                    "cached_tokens": 2,
+                    "cache_write_tokens": 2,
+                },
+                "completion_tokens": 0,
+            },
+            usage_dialect=UsageDialect.OPENAI,
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize(
     ("input_tokens", "cached_tokens", "expected_uncached"),
     [(100, 0, 100), (100, 40, 60), (100, 100, 0)],

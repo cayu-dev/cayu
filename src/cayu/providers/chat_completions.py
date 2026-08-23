@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import re
@@ -8,7 +9,12 @@ from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import unquote_plus, urlencode, urlsplit, urlunsplit
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_finite
+from cayu._validation import (
+    copy_durable_json_value,
+    copy_json_value,
+    require_clean_nonblank,
+    require_finite,
+)
 from cayu.artifacts import (
     FileAttachmentKind,
     file_attachment_from_payload,
@@ -85,6 +91,7 @@ _RESERVED_CHAT_COMPLETIONS_OPTIONS = {
     "stream_options",
 }
 _CHAT_COMPLETIONS_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 # JSON Schema keys rejected broadly enough by OpenAI-compatible vendors to strip
 # whenever schema cleaning is enabled. Gemini additionally rejects
 # ``additionalProperties``; endpoint detection or an explicit compatibility
@@ -99,6 +106,139 @@ _SUBSCHEMA_MAP_KEYS = {"properties", "patternProperties", "$defs", "definitions"
 # shape, so this is selectable per provider instance.
 DEFAULT_DOCUMENT_ENCODING = "file"
 _VALID_DOCUMENT_ENCODINGS = {"file", "image_url"}
+_MAX_ROUTER_ATTEMPT = 1_000_000
+_MAX_ROUTER_EVIDENCE_BYTES = 256
+_CHAT_COMPLETIONS_STATE_PROTOCOL = "openai-chat-completions"
+_CHAT_COMPLETIONS_STATE_PROTOCOL_VERSION = 1
+_CHAT_COMPLETIONS_STATE_TARGET_VERSION = 1
+_OPENROUTER_ROUTER_STRATEGIES = frozenset(
+    {
+        "alias",
+        "auto",
+        "bodybuilder",
+        "direct",
+        "fallback",
+        "free",
+        "fusion",
+        "latest",
+        "pareto",
+    }
+)
+# Snapshot of public OpenRouter provider identities on 2026-08-22, plus
+# documented display aliases. Future identities are retained only as a
+# domain-separated digest until this allowlist is updated.
+_OPENROUTER_UPSTREAM_PROVIDER_IDENTITIES: dict[str, str] = {
+    value.casefold(): value
+    for value in (
+        "AI21",
+        "AionLabs",
+        "AkashML",
+        "Alibaba",
+        "Ambient",
+        "Amazon Bedrock",
+        "Amazon Nova",
+        "Anthropic",
+        "Arcee AI",
+        "AtlasCloud",
+        "AWS Bedrock",
+        "Azure",
+        "Baidu",
+        "BaseTen",
+        "Black Forest Labs",
+        "Cerebras",
+        "Chutes",
+        "Cirrascale",
+        "Clarifai",
+        "Cloudflare",
+        "Cohere",
+        "CoreWeave",
+        "Crucible",
+        "Crusoe",
+        "Darkbloom",
+        "Databricks",
+        "Decart",
+        "Deepgram",
+        "DeepInfra",
+        "DeepSeek",
+        "DekaLLM",
+        "DigitalOcean",
+        "Featherless",
+        "Fireworks",
+        "Fish Audio",
+        "Friendli",
+        "GMICloud",
+        "Google",
+        "Google AI Studio",
+        "Google Vertex",
+        "Groq",
+        "HeyGen",
+        "Hyperbolic",
+        "Inception",
+        "Inceptron",
+        "InferenceNet",
+        "Inferact vLLM",
+        "Infermatic",
+        "Inflection",
+        "Ionstream",
+        "Io Net",
+        "Krea",
+        "Liquid",
+        "Makora",
+        "Mancer 2",
+        "Mara",
+        "Meta",
+        "Minimax",
+        "Mistral",
+        "Modal",
+        "ModelRun",
+        "Modular",
+        "Moonshot AI",
+        "Morph",
+        "NCompass",
+        "Nebius",
+        "NextBit",
+        "Nex AGI",
+        "Nvidia",
+        "Novita",
+        "NovitaAI",
+        "NVIDIA",
+        "OpenAI",
+        "OpenInference",
+        "Parasail",
+        "Perceptron",
+        "Perplexity",
+        "Phala",
+        "Poolside",
+        "Quiver",
+        "Recraft",
+        "Reka",
+        "Relace",
+        "Runway",
+        "Sail Research",
+        "Sakana AI",
+        "SambaNova",
+        "Seed",
+        "SiliconFlow",
+        "Sourceful",
+        "Stealth",
+        "StepFun",
+        "StreamLake",
+        "Switchpoint",
+        "Tencent",
+        "Tencent Cloud",
+        "Tenstorrent",
+        "Thinking Machines",
+        "Together",
+        "Upstage",
+        "Venice",
+        "Vertex AI",
+        "VoyageAI by MongoDB",
+        "Wafer",
+        "Xiaomi",
+        "xAI",
+        "Z.AI",
+    )
+}
 
 _TOOL_RESULT_ATTACHMENT_LEAD_IN = "The previous tool result returned file content for inspection."
 
@@ -284,6 +424,9 @@ class ChatCompletionsProvider(ModelProvider):
         stream_idle_timeout_s: float = DEFAULT_CHAT_COMPLETIONS_STREAM_IDLE_TIMEOUT_SECONDS,
         transport: ChatCompletionsTransport | None = None,
         extra_headers: Mapping[str, str] | None = None,
+        openrouter_http_referer: str | None = None,
+        openrouter_app_title: str | None = None,
+        openrouter_router_metadata: bool = False,
         api_version: str | None = None,
         clean_schemas: bool = True,
         strip_additional_properties: bool | None = None,
@@ -348,11 +491,29 @@ class ChatCompletionsProvider(ModelProvider):
             if transport is not None
             else HttpxChatCompletionsTransport(allow_http=allow_http)
         )
-        # Protect the headers we set (content-type + the chosen auth header) from
-        # being clobbered by extra_headers.
-        self.extra_headers = copy_headers(
-            extra_headers, protected={"content-type", self.auth_header.lower()}
+        if type(openrouter_router_metadata) is not bool:
+            raise TypeError("openrouter_router_metadata must be a bool.")
+        self.openrouter_http_referer = (
+            None
+            if openrouter_http_referer is None
+            else require_clean_nonblank(openrouter_http_referer, "openrouter_http_referer")
         )
+        self.openrouter_app_title = (
+            None
+            if openrouter_app_title is None
+            else require_clean_nonblank(openrouter_app_title, "openrouter_app_title")
+        )
+        self.openrouter_router_metadata = openrouter_router_metadata
+        # Protect the headers we set (content-type, auth, and explicit OpenRouter
+        # controls) from being clobbered by arbitrary extra_headers.
+        protected_headers = {"content-type", self.auth_header.lower()}
+        if self.openrouter_http_referer is not None:
+            protected_headers.add("http-referer")
+        if self.openrouter_app_title is not None:
+            protected_headers.add("x-openrouter-title")
+        if self.openrouter_router_metadata:
+            protected_headers.add("x-openrouter-metadata")
+        self.extra_headers = copy_headers(extra_headers, protected=protected_headers)
         if api_version is not None and not require_clean_nonblank(api_version, "api_version"):
             raise ValueError("api_version must be a nonblank string.")
         self.api_version = api_version
@@ -404,6 +565,12 @@ class ChatCompletionsProvider(ModelProvider):
         error_event: ModelStreamEvent | None = None
         completion_emitted = False
         try:
+            endpoint = self._endpoint()
+            provider_state_target_sha256 = _chat_completions_state_target_sha256(
+                provider_name=self.name,
+                endpoint_url=endpoint,
+                model=request.model,
+            )
             payload = build_chat_completions_payload(
                 request,
                 stream=True,
@@ -412,15 +579,20 @@ class ChatCompletionsProvider(ModelProvider):
                 options_key=self.name,
                 document_encoding=self.document_encoding,
                 include_usage=self.stream_include_usage,
+                provider_state_target_sha256=provider_state_target_sha256,
             )
             raw_events = self.transport.stream_chat_completions(
-                url=self._endpoint(),
+                url=endpoint,
                 headers=self._headers(),
                 payload=payload,
                 timeout_s=self.timeout_s,
                 stream_idle_timeout_s=self.stream_idle_timeout_s,
             )
-            events = chat_completions_stream_events(raw_events)
+            events = chat_completions_stream_events(
+                raw_events,
+                requested_model=request.model,
+                provider_state_target_sha256=provider_state_target_sha256,
+            )
             async with aclosing_provider_stream(raw_events), aclosing_provider_stream(events):
                 # Chat completion is synthesized only after the raw stream
                 # terminates. Exhaust the translator so a deferred transport-
@@ -526,6 +698,12 @@ class ChatCompletionsProvider(ModelProvider):
             "content-type": "application/json",
             self.auth_header: f"{self.auth_value_prefix}{self.api_key}",
         }
+        if self.openrouter_http_referer is not None:
+            headers["HTTP-Referer"] = self.openrouter_http_referer
+        if self.openrouter_app_title is not None:
+            headers["X-OpenRouter-Title"] = self.openrouter_app_title
+        if self.openrouter_router_metadata:
+            headers["X-OpenRouter-Metadata"] = "enabled"
         headers.update(self.extra_headers)
         return headers
 
@@ -539,6 +717,7 @@ def build_chat_completions_payload(
     options_key: str = "openai",
     document_encoding: str = DEFAULT_DOCUMENT_ENCODING,
     include_usage: bool = True,
+    provider_state_target_sha256: str | None = None,
 ) -> dict[str, Any]:
     if type(request) is not ModelRequest:
         raise TypeError("request must be a ModelRequest.")
@@ -548,6 +727,9 @@ def build_chat_completions_payload(
         raise TypeError("strip_additional_properties must be a bool.")
     if type(include_usage) is not bool:
         raise TypeError("include_usage must be a bool.")
+    provider_state_target_sha256 = _validate_provider_state_target_sha256(
+        provider_state_target_sha256
+    )
     document_encoding = _validate_document_encoding(document_encoding)
 
     options = _effective_chat_completions_request_options(
@@ -566,6 +748,7 @@ def build_chat_completions_payload(
                 message,
                 resolved_attachments=resolved_attachments,
                 document_encoding=document_encoding,
+                provider_state_target_sha256=provider_state_target_sha256,
             )
         )
     if not messages:
@@ -620,12 +803,174 @@ def _apply_thinking_options(payload: dict[str, Any], neutral: Any) -> None:
     payload.update(_chat_completions_reasoning_options(neutral))
 
 
+def _chat_completions_state_target_sha256(
+    *,
+    provider_name: str,
+    endpoint_url: str,
+    model: str,
+) -> str:
+    """Bind opaque state to one exact Chat Completions protocol target."""
+
+    material = {
+        "endpoint_url": require_clean_nonblank(endpoint_url, "endpoint_url"),
+        "model": require_clean_nonblank(model, "model"),
+        "protocol": _CHAT_COMPLETIONS_STATE_PROTOCOL,
+        "protocol_version": _CHAT_COMPLETIONS_STATE_PROTOCOL_VERSION,
+        "provider_name": require_clean_nonblank(provider_name, "provider_name"),
+    }
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _provider_state_target(target_sha256: str) -> dict[str, Any]:
+    return {
+        "protocol": _CHAT_COMPLETIONS_STATE_PROTOCOL,
+        "protocol_version": _CHAT_COMPLETIONS_STATE_PROTOCOL_VERSION,
+        "version": _CHAT_COMPLETIONS_STATE_TARGET_VERSION,
+        "sha256": target_sha256,
+    }
+
+
+def _validate_provider_state_target_sha256(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str or _SHA256_RE.fullmatch(value) is None:
+        raise ValueError("provider_state_target_sha256 must be a lowercase SHA-256 value.")
+    return value
+
+
+def _provider_state_target_matches(state: Mapping[str, Any], target_sha256: str | None) -> bool:
+    if target_sha256 is None:
+        return False
+    target = state.get("target")
+    return isinstance(target, Mapping) and target == _provider_state_target(target_sha256)
+
+
+def _router_evidence_string(value: Any) -> str | None:
+    if type(value) is not str:
+        return None
+    normalized = value.strip()
+    if not normalized or len(normalized.encode("utf-8")) > _MAX_ROUTER_EVIDENCE_BYTES:
+        return None
+    return normalized
+
+
+def _router_evidence_sha256(value: Any, *, domain: str) -> str | None:
+    normalized = _router_evidence_string(value)
+    if normalized is None:
+        return None
+    encoded = f"cayu:openrouter:{domain}:v1\0{normalized}".encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _safe_openrouter_provider_identity(value: Any) -> str | None:
+    normalized = _router_evidence_string(value)
+    if normalized is None:
+        return None
+    return _OPENROUTER_UPSTREAM_PROVIDER_IDENTITIES.get(normalized.casefold())
+
+
+def _openrouter_provider_evidence(value: Any) -> tuple[str, str] | None:
+    provider = _safe_openrouter_provider_identity(value)
+    if provider is not None:
+        return "provider", provider
+    digest = _router_evidence_sha256(value, domain="provider")
+    return None if digest is None else ("provider_sha256", digest)
+
+
+def _matching_router_model_identity(value: Any, *, expected: str | None) -> str | None:
+    normalized = _router_evidence_string(value)
+    expected_normalized = _router_evidence_string(expected)
+    if normalized is None or expected_normalized is None or normalized != expected_normalized:
+        return None
+    return normalized
+
+
+def _safe_openrouter_metadata(
+    value: Any,
+    *,
+    requested_model: str | None,
+    effective_model: str | None,
+) -> dict[str, Any] | None:
+    """Project additive OpenRouter metadata onto a fixed, bounded allowlist.
+
+    Router ``pipeline``, ``attempts``, ``params``, human summaries, and unknown
+    future fields are deliberately omitted. They are free-form and can contain
+    provider- or plugin-specific data that does not belong in public runtime
+    evidence.
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ChatCompletionsProtocolError("OpenRouter metadata must be an object.")
+    projected: dict[str, Any] = {}
+    requested = _matching_router_model_identity(
+        value.get("requested"),
+        expected=requested_model,
+    )
+    if requested is not None:
+        projected["requested"] = requested
+    strategy = _router_evidence_string(value.get("strategy"))
+    if strategy in _OPENROUTER_ROUTER_STRATEGIES:
+        projected["strategy"] = strategy
+    elif strategy is not None:
+        projected["strategy_sha256"] = _router_evidence_sha256(
+            strategy,
+            domain="strategy",
+        )
+    attempt = value.get("attempt")
+    if type(attempt) is int and 0 <= attempt <= _MAX_ROUTER_ATTEMPT:
+        projected["attempt"] = attempt
+    is_byok = value.get("is_byok")
+    if type(is_byok) is bool:
+        projected["is_byok"] = is_byok
+
+    endpoints = value.get("endpoints")
+    if isinstance(endpoints, Mapping):
+        total = endpoints.get("total")
+        if type(total) is int and 0 <= total <= _MAX_ROUTER_ATTEMPT:
+            projected["endpoint_total"] = total
+        available = endpoints.get("available")
+        if type(available) is list and len(available) <= 256:
+            selected: dict[str, str] | None = None
+            for endpoint in available:
+                if not isinstance(endpoint, Mapping) or endpoint.get("selected") is not True:
+                    continue
+                provider_evidence = _openrouter_provider_evidence(endpoint.get("provider"))
+                model = _matching_router_model_identity(
+                    endpoint.get("model"),
+                    expected=effective_model,
+                )
+                candidate: dict[str, str] = {}
+                if provider_evidence is not None:
+                    candidate[provider_evidence[0]] = provider_evidence[1]
+                if model is not None:
+                    candidate["model"] = model
+                if not candidate or selected is not None:
+                    selected = None
+                    break
+                selected = candidate
+            if selected is not None:
+                projected["selected_endpoint"] = selected
+    return projected
+
+
 async def chat_completions_stream_events(
     events: AsyncIterator[Mapping[str, Any]],
+    *,
+    requested_model: str | None = None,
+    provider_state_target_sha256: str | None = None,
 ) -> AsyncIterator[ModelStreamEvent]:
+    provider_state_target_sha256 = _validate_provider_state_target_sha256(
+        provider_state_target_sha256
+    )
     tool_calls = _ToolCallAccumulator()
+    reasoning_details = _ReasoningDetailsAccumulator()
     response_id: str | None = None
     model: str | None = None
+    upstream_provider_evidence: tuple[str, str] | None = None
+    openrouter_metadata: dict[str, Any] | None = None
     choice_index: int | None = None
     finish_reason: str | None = None
     usage: Any = None
@@ -660,6 +1005,27 @@ async def chat_completions_stream_events(
             )
         response_id = response_id or _optional_string(event, "id")
         model = model or _optional_string(event, "model")
+        chunk_upstream_provider_evidence = _openrouter_provider_evidence(event.get("provider"))
+        if chunk_upstream_provider_evidence is not None:
+            if (
+                upstream_provider_evidence is not None
+                and chunk_upstream_provider_evidence != upstream_provider_evidence
+            ):
+                raise ChatCompletionsProtocolError(
+                    "Chat Completions stream emitted conflicting upstream providers."
+                )
+            upstream_provider_evidence = chunk_upstream_provider_evidence
+        chunk_router_metadata = _safe_openrouter_metadata(
+            event.get("openrouter_metadata"),
+            requested_model=requested_model,
+            effective_model=model,
+        )
+        if chunk_router_metadata is not None:
+            if openrouter_metadata is not None and chunk_router_metadata != openrouter_metadata:
+                raise ChatCompletionsProtocolError(
+                    "Chat Completions stream emitted conflicting OpenRouter metadata."
+                )
+            openrouter_metadata = chunk_router_metadata
         chunk_usage = event.get("usage")
         if chunk_usage is not None:
             if not isinstance(chunk_usage, Mapping):
@@ -675,6 +1041,7 @@ async def chat_completions_stream_events(
         if error is not None:
             failure = _stream_error_chunk_exception(
                 error,
+                request_id=_optional_string(event, "request_id"),
                 retry_after_s=_trusted_sse_retry_after_s(event),
             )
             # The exported parser is itself a public exception boundary. Do
@@ -713,6 +1080,7 @@ async def chat_completions_stream_events(
         if delta is not None:
             if not isinstance(delta, Mapping):
                 raise ChatCompletionsProtocolError("Chat Completions delta must be an object.")
+            reasoning_details.record(delta.get("reasoning_details"))
             reasoning = delta.get("reasoning_content")
             if not (isinstance(reasoning, str) and reasoning):
                 # Fall back to `reasoning` unless reasoning_content is a non-empty
@@ -749,7 +1117,14 @@ async def chat_completions_stream_events(
     # Tool calls are emitted once, after the upstream stream, before Cayu's terminal
     # completed event. Deferring normalization lets trailing usage or repeated
     # identical finish metadata arrive without producing multiple terminal events.
-    provider_state = tool_calls.provider_state_items()
+    provider_state = [
+        *reasoning_details.provider_state_items(
+            target_sha256=provider_state_target_sha256,
+        ),
+        *tool_calls.provider_state_items(
+            target_sha256=provider_state_target_sha256,
+        ),
+    ]
     if tool_calls.has_pending():
         for tool_call_event in tool_calls.events():
             yield tool_call_event
@@ -772,6 +1147,11 @@ async def chat_completions_stream_events(
     }
     if provider_state:
         completed_payload["provider_state"] = provider_state
+    if upstream_provider_evidence is not None:
+        upstream_key, upstream_value = upstream_provider_evidence
+        completed_payload[f"upstream_{upstream_key}"] = upstream_value
+    if openrouter_metadata is not None:
+        completed_payload["openrouter_metadata"] = openrouter_metadata
     yield ModelStreamEvent.completed(completed_payload)
     if post_terminal_failure is not None:
         failure = post_terminal_failure
@@ -784,6 +1164,7 @@ async def chat_completions_stream_events(
 def _stream_error_chunk_exception(
     error: Any,
     *,
+    request_id: str | None = None,
     retry_after_s: float | None = None,
 ) -> ChatCompletionsError:
     """Build the typed exception for a mid-stream ``{"error": ...}`` chunk.
@@ -792,29 +1173,31 @@ def _stream_error_chunk_exception(
     indicate one (so runtime recovery can see it), else as a plain API error.
     """
     error_mapping = error if isinstance(error, Mapping) else {}
-    error_type = optional_error_string(error_mapping.get("type"))
-    code = optional_error_string(error_mapping.get("code"))
+    error_type, code, reported_status, identity_conflict = _chat_error_identity(error_mapping)
     message = optional_error_string(error_mapping.get("message"))
-    request_id = optional_error_string(error_mapping.get("request_id"))
+    request_id = optional_error_string(error_mapping.get("request_id")) or request_id
     safe_message = f"Chat Completions stream reported an error: {OMITTED_PROVIDER_ERROR_BODY}"
-    if _is_chat_context_overflow(
-        status_code=None,
+    if not identity_conflict and _is_chat_context_overflow(
+        status_code=reported_status,
         error_type=error_type,
         code=code,
         message=message,
     ):
         return ChatCompletionsContextOverflowError(
             safe_message,
+            status_code=reported_status,
             error_type=error_type,
             error_code=code,
             request_id=request_id,
             response_body=None,
         )
     status_code, retryable = _chat_retry_metadata(
-        transport_status_code=None,
+        transport_status_code=reported_status,
         error_type=error_type,
         error_code=code,
     )
+    if identity_conflict:
+        retryable = False
     return ChatCompletionsAPIError(
         safe_message,
         status_code=status_code,
@@ -828,13 +1211,25 @@ def _stream_error_chunk_exception(
 
 
 _CHAT_ERROR_TYPE_CLASSIFICATION = {
+    "authentication": (401, False),
     "authentication_error": (401, False),
+    "content_policy_violation": (403, False),
     "context_length_exceeded": (400, False),
+    "invalid_prompt": (400, False),
+    "invalid_request": (400, False),
     "invalid_request_error": (400, False),
+    "not_found": (404, False),
     "not_found_error": (404, False),
+    "payment_required": (402, False),
+    "permission_denied": (403, False),
     "permission_error": (403, False),
+    "provider_overloaded": (503, True),
+    "provider_unavailable": (502, True),
+    "rate_limit_exceeded": (429, True),
     "rate_limit_error": (429, True),
+    "server": (500, True),
     "server_error": (500, True),
+    "timeout": (408, True),
 }
 _CHAT_ERROR_CODE_CLASSIFICATION = {
     "context_length_exceeded": (400, False),
@@ -842,6 +1237,72 @@ _CHAT_ERROR_CODE_CLASSIFICATION = {
     "rate_limit_exceeded": (429, True),
     "server_error": (500, True),
 }
+
+
+def _chat_error_identity(
+    error: Mapping[str, Any],
+) -> tuple[str | None, str | None, int | None, bool]:
+    """Extract OpenAI-compatible and OpenRouter typed error evidence.
+
+    OpenRouter's Chat Completions skin carries its stable type in
+    ``error.metadata.error_type``, the upstream code in ``provider_code``, and
+    the HTTP identity as a numeric ``error.code`` even after streaming begins.
+    Preserve those fields without letting contradictory aliases authorize a
+    retry.
+    """
+
+    metadata_value = error.get("metadata")
+    metadata = metadata_value if isinstance(metadata_value, Mapping) else {}
+    canonical_types = [
+        value
+        for value in (
+            optional_error_string(metadata.get("error_type")),
+            optional_error_string(error.get("error_type")),
+            optional_error_string(error.get("type")),
+        )
+        if value is not None
+    ]
+    identity_conflict = bool(
+        canonical_types and any(value != canonical_types[0] for value in canonical_types[1:])
+    )
+    error_type = None if identity_conflict else (canonical_types[0] if canonical_types else None)
+    provider_codes = [
+        value
+        for value in (
+            optional_error_string(metadata.get("provider_code")),
+            optional_error_string(error.get("provider_code")),
+        )
+        if value is not None
+    ]
+    if provider_codes and any(value != provider_codes[0] for value in provider_codes[1:]):
+        identity_conflict = True
+        provider_code = None
+    else:
+        provider_code = provider_codes[0] if provider_codes else None
+    wire_code = error.get("code")
+    string_code = optional_error_string(wire_code)
+    error_code = provider_code or string_code
+
+    reported_statuses = [
+        value
+        for value in (
+            _optional_http_status(wire_code),
+            _optional_http_status(error.get("http_status")),
+        )
+        if value is not None
+    ]
+    if reported_statuses and any(value != reported_statuses[0] for value in reported_statuses[1:]):
+        identity_conflict = True
+        reported_status = None
+    else:
+        reported_status = reported_statuses[0] if reported_statuses else None
+    return error_type, error_code, reported_status, identity_conflict
+
+
+def _optional_http_status(value: Any) -> int | None:
+    if type(value) is int and 100 <= value <= 599:
+        return value
+    return None
 
 
 def _chat_retry_metadata(
@@ -879,6 +1340,58 @@ def _tool_call_names_function(tool_call: Mapping[str, Any]) -> bool:
 
 def _canonical_chat_finish_reason(value: str) -> str:
     return "tool_calls" if value == "function_call" else value
+
+
+class _ReasoningDetailsAccumulator:
+    """Collect opaque streamed reasoning blocks in provider order for exact replay."""
+
+    def __init__(self) -> None:
+        self._seen = False
+        self._details: list[dict[str, Any]] = []
+
+    def record(self, value: Any) -> None:
+        if value is None:
+            return
+        self._seen = True
+        if type(value) is not list:
+            raise ChatCompletionsProtocolError(
+                "Chat Completions delta reasoning_details must be a list."
+            )
+        for detail in value:
+            if type(detail) is not dict:
+                raise ChatCompletionsProtocolError(
+                    "Chat Completions reasoning_detail must be an object."
+                )
+            try:
+                copied = copy_durable_json_value(detail, "reasoning_detail")
+            except (TypeError, ValueError):
+                raise ChatCompletionsProtocolError(
+                    "Chat Completions reasoning_detail is not durable JSON."
+                ) from None
+            if type(copied) is not dict:
+                raise ChatCompletionsProtocolError(
+                    "Chat Completions reasoning_detail must be an object."
+                )
+            self._details.append(copied)
+
+    def provider_state_items(self, *, target_sha256: str | None) -> list[dict[str, Any]]:
+        if not self._seen:
+            return []
+        if target_sha256 is None:
+            raise ChatCompletionsProtocolError(
+                "Chat Completions reasoning_details have no exact replay target."
+            )
+        return [
+            {
+                "provider": "chat_completions",
+                "state": {
+                    "type": "reasoning_details",
+                    "version": 1,
+                    "target": _provider_state_target(target_sha256),
+                    "details": copy_durable_json_value(self._details, "reasoning_details"),
+                },
+            }
+        ]
 
 
 class _PendingToolCall:
@@ -1038,7 +1551,7 @@ class _ToolCallAccumulator:
             )
         return tool_call_events
 
-    def provider_state_items(self) -> list[dict[str, Any]]:
+    def provider_state_items(self, *, target_sha256: str | None) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         for pending in self._pending:
             if pending.extra_content is None:
@@ -1047,11 +1560,17 @@ class _ToolCallAccumulator:
                 raise ChatCompletionsProtocolError(
                     "Chat Completions tool_call with extra_content is missing an id."
                 )
+            if target_sha256 is None:
+                raise ChatCompletionsProtocolError(
+                    "Chat Completions tool_call extra_content has no exact replay target."
+                )
             items.append(
                 {
                     "provider": "chat_completions",
                     "state": {
                         "type": "tool_call_extra_content",
+                        "version": 1,
+                        "target": _provider_state_target(target_sha256),
                         "tool_call_id": pending.call_id,
                         "extra_content": copy_json_value(
                             pending.extra_content, "tool_call.extra_content"
@@ -1078,13 +1597,19 @@ def _chat_completions_messages(
     *,
     resolved_attachments: dict[str, dict[str, Any]],
     document_encoding: str,
+    provider_state_target_sha256: str | None,
 ) -> list[dict[str, Any]]:
     if message.role == MessageRole.SYSTEM:
         return []
     if message.role == MessageRole.USER:
         return [_user_message(message.content, resolved_attachments, document_encoding)]
     if message.role == MessageRole.ASSISTANT:
-        return [_assistant_message(message)]
+        return [
+            _assistant_message(
+                message,
+                provider_state_target_sha256=provider_state_target_sha256,
+            )
+        ]
     if message.role == MessageRole.TOOL:
         messages: list[dict[str, Any]] = []
         attachment_parts: list[dict[str, Any]] = []
@@ -1117,10 +1642,21 @@ def _chat_completions_messages(
     raise ChatCompletionsProtocolError(f"Unsupported Cayu message role: {message.role!r}.")
 
 
-def _assistant_message(message: Message) -> dict[str, Any]:
+def _assistant_message(
+    message: Message,
+    *,
+    provider_state_target_sha256: str | None = None,
+) -> dict[str, Any]:
     text_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
-    tool_call_extra_content = _tool_call_extra_content_by_id(message)
+    reasoning_details = _reasoning_details(
+        message,
+        provider_state_target_sha256=provider_state_target_sha256,
+    )
+    tool_call_extra_content = _tool_call_extra_content_by_id(
+        message,
+        provider_state_target_sha256=provider_state_target_sha256,
+    )
     for part in message.content:
         if type(part) is TextPart:
             text_parts.append(part.text)
@@ -1149,12 +1685,62 @@ def _assistant_message(message: Message) -> dict[str, Any]:
     assistant: dict[str, Any] = {"role": "assistant"}
     # Chat Completions requires a content key; tool-call-only turns use null.
     assistant["content"] = "\n".join(text_parts) or None
+    if reasoning_details is not None:
+        assistant["reasoning_details"] = reasoning_details
     if tool_calls:
         assistant["tool_calls"] = tool_calls
     return assistant
 
 
-def _tool_call_extra_content_by_id(message: Message) -> dict[str, dict[str, Any]]:
+def _reasoning_details(
+    message: Message,
+    *,
+    provider_state_target_sha256: str | None,
+) -> list[dict[str, Any]] | None:
+    details: list[dict[str, Any]] | None = None
+    for part in message.content:
+        if type(part) is not ProviderStatePart or part.provider != "chat_completions":
+            continue
+        state = part.state
+        if state.get("type") != "reasoning_details":
+            continue
+        if not _provider_state_target_matches(state, provider_state_target_sha256):
+            continue
+        if details is not None:
+            raise ChatCompletionsProtocolError(
+                "Chat Completions assistant message has duplicate reasoning_details state."
+            )
+        if state.get("version") != 1:
+            raise ChatCompletionsProtocolError(
+                "Chat Completions reasoning_details state has an unsupported version."
+            )
+        raw_details = state.get("details")
+        if type(raw_details) is not list:
+            raise ChatCompletionsProtocolError(
+                "Chat Completions provider_state reasoning_details must be a list."
+            )
+        try:
+            copied = copy_durable_json_value(
+                raw_details,
+                "provider_state.reasoning_details",
+            )
+        except (TypeError, ValueError):
+            raise ChatCompletionsProtocolError(
+                "Chat Completions provider_state reasoning_details is not durable JSON."
+            ) from None
+        if type(copied) is not list or any(type(item) is not dict for item in copied):
+            raise ChatCompletionsProtocolError(
+                "Chat Completions provider_state reasoning_details must contain objects."
+            )
+        details = copied
+    return details
+
+
+def _tool_call_extra_content_by_id(
+    message: Message,
+    *,
+    provider_state_target_sha256: str | None,
+) -> dict[str, dict[str, Any]]:
     extra_content_by_id: dict[str, dict[str, Any]] = {}
     for part in message.content:
         if type(part) is not ProviderStatePart or part.provider != "chat_completions":
@@ -1162,6 +1748,12 @@ def _tool_call_extra_content_by_id(message: Message) -> dict[str, dict[str, Any]
         state = part.state
         if state.get("type") != "tool_call_extra_content":
             continue
+        if not _provider_state_target_matches(state, provider_state_target_sha256):
+            continue
+        if state.get("version") != 1:
+            raise ChatCompletionsProtocolError(
+                "Chat Completions tool_call extra_content state has an unsupported version."
+            )
         tool_call_id = state.get("tool_call_id")
         if not isinstance(tool_call_id, str) or not tool_call_id.strip():
             raise ChatCompletionsProtocolError(
@@ -1484,13 +2076,16 @@ def _chat_api_error_from_response(
     if decoded is not None:
         raw_error = decoded.get("error")
         error = raw_error if isinstance(raw_error, Mapping) else decoded
-    error_type = optional_error_string(error.get("type"))
-    error_code = optional_error_string(error.get("code"))
+    error_type, error_code, reported_status, identity_conflict = _chat_error_identity(error)
+    if reported_status is not None and reported_status != response.status_code:
+        identity_conflict = True
     status_code, retryable = _chat_retry_metadata(
         transport_status_code=response.status_code,
         error_type=error_type,
         error_code=error_code,
     )
+    if identity_conflict:
+        retryable = False
     request_id = optional_error_string(error.get("request_id"))
     if request_id is None and decoded is not None:
         request_id = optional_error_string(decoded.get("request_id"))
@@ -1513,21 +2108,26 @@ def _raise_chat_context_overflow_if_applicable(response: httpx.Response) -> None
     error = decoded.get("error")
     if not isinstance(error, Mapping):
         error = decoded
-    error_type = optional_error_string(error.get("type")) or optional_error_string(
-        error.get("status")
-    )
-    code = optional_error_string(error.get("code"))
+    error_type, code, reported_status, identity_conflict = _chat_error_identity(error)
+    if error_type is None and not identity_conflict:
+        error_type = optional_error_string(error.get("status"))
     message = optional_error_string(error.get("message"))
-    if not _is_chat_context_overflow(
-        status_code=response.status_code,
-        error_type=error_type,
-        code=code,
-        message=message,
+    status_code = response.status_code
+    if reported_status is not None and reported_status != status_code:
+        identity_conflict = True
+    if (
+        not _is_chat_context_overflow(
+            status_code=status_code,
+            error_type=error_type,
+            code=code,
+            message=message,
+        )
+        or identity_conflict
     ):
         return
     raise ChatCompletionsContextOverflowError(
         "Chat Completions model context overflow",
-        status_code=response.status_code,
+        status_code=status_code,
         error_type=error_type,
         error_code=code,
         response_body=_safe_error_response_text(response),

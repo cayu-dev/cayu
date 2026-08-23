@@ -104,7 +104,7 @@ or in CI.
 | microsandbox live | `cayu[microsandbox]` runtime support; explicit opt-in for network-default, virtual-egress, and guest-agent-liveness checks | $0 | `microsandbox-live-*` |
 | E2B live | `cayu[e2b]`, `E2B_API_KEY`; IPv4-literal raw TCP tunnel inputs and explicit opt-in for virtual egress | E2B quota | `e2b-live-*` |
 | AWS Lambda MicroVM live | `cayu[aws]`, plus `cayu[egress]` for the metadata-isolation check, AWS credentials/region, an operator-selected protocol-compatible image for the generic runner task; canonical image-build and deployed integrated-stack prerequisites for their dedicated tasks | AWS MicroVM/Fargate charges | `lambda-microvm-live`, `aws-lambda-microvm-image-build-live`, `aws-lambda-microvm-metadata-isolation-live` |
-| Chat Completions live | `GEMINI_API_KEY` | provider-dependent | `gemini-eval`, `chat-completions-contract` |
+| Chat Completions live | `GEMINI_API_KEY`; or `OPENROUTER_API_KEY` plus explicit `CAYU_OPENROUTER_MODEL` | provider-dependent | `gemini-eval`, `chat-completions-contract`, `openrouter-contract` |
 | Amazon Bedrock contract | `cayu[aws]`, AWS credentials/region/model | provider-dependent | `bedrock-provider-live` |
 | OpenAI/Anthropic contracts | provider API key; file readers for artifact files | provider-dependent | `context-counting-live`, `artifact-file-live`, `structured-output-live` |
 | OpenAI embeddings | `OPENAI_API_KEY` | provider-dependent | `knowledge-embedding-live` |
@@ -173,6 +173,7 @@ high level:
 | real AWS Lambda MicroVM required metadata denial plus proxy, public-egress, execution-role, UID/capability/namespace/route/sidecar-port, guest inspection, vault-canary, credential, revocation, workspace-release, and cleanup boundaries | verified only when the integrated agent-network-namespace boundary emits the exact versioned schema and the explicit opt-in is enabled | `aws-lambda-microvm-metadata-isolation-live` |
 | Gemini Chat Completions eval path | verified when `GEMINI_API_KEY` is present | `gemini-eval` |
 | Chat Completions tool-call and structured-output contract | verified when `GEMINI_API_KEY` is present | `chat-completions-contract` |
+| OpenRouter tool-call, lossless reasoning replay, routing evidence, usage, and structured-output contract | verified when `OPENROUTER_API_KEY` and `CAYU_OPENROUTER_MODEL` are present | `openrouter-contract` |
 | Amazon Bedrock text, tool structured output, usage, and token counting | verified when AWS and a Bedrock model are available | `bedrock-provider-live` |
 | OpenAI/Anthropic artifact-file, context-counting, and structured-output contracts | verified when the selected provider key is present | `artifact-file-live`, `context-counting-live`, `structured-output-live` |
 | OpenAI embedding and semantic-retrieval contract | verified when `OPENAI_API_KEY` is present | `knowledge-embedding-live` |

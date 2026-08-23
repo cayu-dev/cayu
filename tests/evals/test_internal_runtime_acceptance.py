@@ -21,6 +21,7 @@ _LIVE_CREDENTIAL_ENV = {
     "E2B_API_KEY",
     "GEMINI_API_KEY",
     "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
 }
 _WORKSPACE_FILE = "runtime-acceptance/workspace-roundtrip.txt"
 

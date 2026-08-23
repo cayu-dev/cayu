@@ -4232,6 +4232,7 @@ class ModelStepExecutor:
                 raise ValueError(
                     "Tool exposure evidence does not match the frozen model request authority."
                 )
+        provider.preflight_model_target(model=model_request.model)
         provider.preflight_hosted_tools(
             model=model_request.model,
             hosted_tools=model_request.hosted_tools,

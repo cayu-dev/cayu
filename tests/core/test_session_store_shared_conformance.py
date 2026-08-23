@@ -70,6 +70,7 @@ from cayu.core import (
     HostedToolCallPart,
     Message,
     MessageRole,
+    ProviderStatePart,
     TextPart,
     ToolCallPart,
     ToolResultPart,
@@ -1401,6 +1402,58 @@ def conformance_postgres_dsn(postgres_dsn) -> Iterator[str]:
         yield postgres_dsn
     finally:
         asyncio.run(_reset_postgres_data(postgres_dsn))
+
+
+def test_session_store_conformance_preserves_openrouter_reasoning_details(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = f"openrouter-reasoning-details-{session_store_case[0]}"
+            await store.create(
+                RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+                identity=_identity(),
+            )
+            details = [
+                {
+                    "type": "reasoning.encrypted",
+                    "data": "opaque-provider-state",
+                    "signature": "signed-state",
+                    "format": "future-format-v9",
+                    "unknown": {"ordered": [3, 1, 2]},
+                }
+            ]
+            await store.append_transcript_messages(
+                session_id,
+                [
+                    Message(
+                        role=MessageRole.ASSISTANT,
+                        content=[
+                            ProviderStatePart(
+                                provider="chat_completions",
+                                state={
+                                    "type": "reasoning_details",
+                                    "version": 1,
+                                    "details": details,
+                                },
+                            )
+                        ],
+                    )
+                ],
+            )
+            store = await _reopen_store(session_store_case, store)
+
+            transcript = await store.load_transcript(session_id)
+
+            assert len(transcript) == 1
+            part = transcript[0].content[0]
+            assert type(part) is ProviderStatePart
+            assert part.state["details"] == details
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
 
 
 def test_session_store_conformance_reconstructs_tool_exposure_evidence(

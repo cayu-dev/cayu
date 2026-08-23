@@ -384,11 +384,13 @@ typed failures behind one runtime contract. Applications register providers
 explicitly and may add deterministic model-pattern routing; an arbitrary model
 name never selects a provider.
 
-Cayu focuses on OpenAI, Anthropic, Google, Bedrock, and Vertex. Compatible Chat
-Completions services such as OpenRouter, Fireworks, Baseten Model APIs, and
-OpenCode Go also work through the generic adapter even though they are not
-scaffold choices. Run `cayu guide providers#compatible-chat-completions` or use
-the [package guide](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/providers.md#compatible-chat-completions)
+Cayu focuses on OpenAI, Anthropic, OpenRouter, Google, Bedrock, and Vertex.
+OpenRouter is a first-class `cayu new --provider openrouter` and
+`CAYU_PROVIDER=openrouter` choice backed by the generic Chat Completions adapter;
+it requires `OPENROUTER_API_KEY` and an explicit `CAYU_MODEL` slug. Compatible
+Chat Completions services such as Fireworks, Baseten Model APIs, and OpenCode Go
+use that generic adapter directly. Run `cayu guide providers#openrouter` or use
+the [package guide](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/providers.md#openrouter)
 for exact setup.
 
 For local development without separate OpenAI API billing, users can sign in

@@ -1033,6 +1033,18 @@ class ModelProvider(ABC):
             if key not in _DEFAULT_FINGERPRINT_RUNTIME_OPTION_KEYS and value is not None
         }
 
+    def preflight_model_target(self, *, model: str) -> None:
+        """Reject an unavailable provider/model target before runtime mutation.
+
+        This side-effect-free hook is called during initial-run admission before
+        the session is created and again immediately before provider dispatch.
+        Ordinary providers need no override. Applications may use it for
+        credential-free inspection placeholders whose live execution must fail
+        with a concrete setup diagnostic.
+        """
+
+        del model
+
     def preflight_portable_messages(
         self,
         *,

@@ -5407,6 +5407,49 @@ endpoint, streaming-usage, and local HTTP behavior are explicit constructor
 options. Native structured output is not claimed on this generic path; use the
 provider-neutral tool strategy.
 
+OpenRouter uses this adapter with an explicit provider name, endpoint, and
+`vendor/model` slug; Cayu never infers an OpenRouter model from credentials.
+Generated projects may build and inspect a credential-free same-name placeholder,
+but every runtime entrance calls `ModelProvider.preflight_model_target(...)`
+during initial admission before session creation. The generated placeholder
+therefore reports missing `OPENROUTER_API_KEY`, missing `CAYU_MODEL`, or missing
+provider selection consistently for direct SDK runs, the control plane, and task
+workers. The same side-effect-free hook runs again at the provider dispatch
+boundary. Injected test/eval providers and ordinary built-in providers remain
+credential-free unless they explicitly override this hook.
+
+OpenRouter `reasoning_details` and compatible tool-call `extra_content` are
+opaque protocol continuation state. Cayu preserves their complete ordered JSON
+without interpreting, redacting, coalescing, or reconstructing it. Each retained
+state item carries a Cayu-owned target fingerprint over the registered provider
+name, exact Chat Completions endpoint (including API-version query), requested
+model, protocol family, and protocol version. Replay occurs only when that
+fingerprint and protocol envelope exactly match the active request target.
+Malformed, legacy untagged, and cross-target state remains durable but is omitted
+from provider requests; malformed state that claims the active target fails the
+attempt. This also prevents a same-name execution-profile adoption to another
+endpoint from replaying source-endpoint reasoning state. A stream that produces
+opaque continuation state without an exact target fails before Cayu publishes
+the tool call.
+
+When OpenRouter metadata retention is enabled, Cayu persists only bounded route
+evidence. The documented router strategies (`direct`, `auto`, `free`, `latest`,
+`alias`, `fallback`, `pareto`, `bodybuilder`, and `fusion`) and known public
+provider identities are retained verbatim. Unknown future strategy/provider
+identities are represented by domain-separated SHA-256 values, never by their
+raw strings; free-form pipeline, attempts, region, summary, and extension data is
+omitted. Requested and effective models are retained only when they exactly
+match the request or response model already admitted by the runtime.
+
+OpenRouter usage and cost fields flow through the ordinary Chat Completions
+normalization and billing evidence. Provider-reported
+`completion_tokens_details.reasoning_tokens` is accounting evidence only: zero
+does not override observed reasoning deltas or the opaque replay requirement.
+Unknown provider/model/route prices remain unpriced unless the application
+registers an exact `PriceBook` entry. Mid-stream OpenRouter error envelopes use
+the same typed Chat Completions error and conservative retry boundary as other
+compatible endpoints.
+
 `auth_header` and `auth_value_prefix` support schemes such as Azure's
 `api-key`; `endpoint_url` overrides the complete request URL;
 `stream_include_usage=False` supports servers that reject stream options; and

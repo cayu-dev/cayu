@@ -1,12 +1,12 @@
 # Cayu providers
 
-Cayu focuses on official OpenAI, Anthropic, Google, AWS, and Vertex AI
-endpoints. Services that expose OpenAI Chat Completions also work through
+Cayu focuses on OpenAI, Anthropic, OpenRouter, Google, AWS, and Vertex AI
+endpoints. Other services that expose OpenAI Chat Completions work through
 `ChatCompletionsProvider`.
 
 Provider selection is explicit. `CAYU_PROVIDER` is only a scaffold convenience
-for `openai`, `anthropic`, and `openai-subscription`; it is not the complete Cayu
-provider surface. Credentials authenticate a provider but never select one.
+for `openai`, `anthropic`, `openrouter`, and `openai-subscription`; it is not the
+complete Cayu provider surface. Credentials authenticate but never select one.
 
 ## Primary integrations
 
@@ -14,6 +14,7 @@ provider surface. Credentials authenticate a provider but never select one.
 | --- | --- | --- |
 | OpenAI Platform | `OpenAIProvider()` | `OPENAI_API_KEY`; use an OpenAI model ID |
 | Anthropic API | `AnthropicProvider()` | `ANTHROPIC_API_KEY`; use an Anthropic model ID |
+| OpenRouter | `ChatCompletionsProvider(name="openrouter", api_key_env="OPENROUTER_API_KEY", base_url="https://openrouter.ai/api/v1")` | `OPENROUTER_API_KEY`; require an explicit `vendor/model` slug |
 | Google AI Studio | `ChatCompletionsProvider(name="google", api_key_env="GEMINI_API_KEY", base_url="https://generativelanguage.googleapis.com/v1beta/openai")` | Use a Gemini API model ID |
 | Amazon Bedrock | `BedrockProvider(region_name=...)` | Install `cayu[aws]`; use AWS credentials and a Bedrock model or inference-profile ID |
 | Anthropic on Vertex AI | `VertexProvider(project_id=..., region=...)` | Install `cayu[vertex]`; use Google credentials and a Vertex Claude model ID |
@@ -70,11 +71,25 @@ See OpenAI's [data controls](https://developers.openai.com/api/docs/guides/your-
 and [background mode](https://developers.openai.com/api/docs/guides/background)
 guides for the current provider policy.
 
+## OpenRouter
+
+`cayu new APP --provider openrouter` generates the first-class preset. Set
+`OPENROUTER_API_KEY` and an explicit `CAYU_MODEL=vendor/model`; Cayu deliberately
+has no mutable router, free, or paid default. `CAYU_PROVIDER=openrouter` selects
+the same preset in a neutral scaffold. Optional `OPENROUTER_HTTP_REFERER` and
+`OPENROUTER_APP_TITLE` add attribution, while
+`OPENROUTER_ROUTER_METADATA=enabled` retains only bounded routing evidence.
+
+Put routing controls in `AgentSpec.provider_options["openrouter"]`. Streamed
+`reasoning_details` are concatenated in order and privately replayed unchanged,
+value-for-value, across tool continuations; malformed state fails before tools execute.
+Raw OpenRouter `usage.cost` evidence stays separate from Cayu PriceBook estimates.
+Native structured-output support remains model/upstream dependent.
+
 ## Compatible Chat Completions
 
-OpenRouter, Fireworks, Baseten Model APIs, OpenCode Go, and other compatible
-endpoints work through Cayu even though they are not scaffold choices. Register
-the generic adapter and route the agent to its name:
+Fireworks, Baseten Model APIs, OpenCode Go, and other compatible endpoints work
+through Cayu's generic adapter. Register it and route the agent to its name:
 
 ```python
 from cayu import AgentSpec, CayuApp, ChatCompletionsProvider
@@ -101,7 +116,6 @@ together:
 
 | Service | Base URL and credential | Model ID |
 | --- | --- | --- |
-| OpenRouter | `https://openrouter.ai/api/v1`; `OPENROUTER_API_KEY` | Provider slug such as `vendor/model` |
 | Fireworks | `https://api.fireworks.ai/inference/v1`; `FIREWORKS_API_KEY` | `accounts/fireworks/models/...` |
 | Baseten Model APIs | `https://inference.baseten.co/v1`; `BASETEN_API_KEY` | Baseten catalog model ID |
 | OpenCode Go | `https://opencode.ai/zen/go/v1`; `OPENCODE_API_KEY` | Raw API ID such as `grok-4.5`, never `opencode-go/...` |

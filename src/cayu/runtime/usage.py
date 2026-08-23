@@ -773,7 +773,14 @@ def normalize_usage_metrics_with_overflow_error(
 
     anthropic_shaped = dialect == _DIALECT_ANTHROPIC
     if dialect in {_DIALECT_GEMINI, _DIALECT_OPENAI}:
-        if cache_write_tokens > 0:
+        has_nested_cache_write = any(
+            type(raw_usage.get(key)) is dict
+            and raw_usage[key].get("cache_write_tokens") is not None
+            for key in ("input_tokens_details", "prompt_tokens_details")
+        )
+        if cache_write_tokens > 0 and not has_nested_cache_write:
+            return None
+        if cached_input_tokens + cache_write_tokens > input_tokens:
             return None
         if has_explicit_cache_read and cache_read_tokens != cached_input_tokens:
             return None
@@ -798,7 +805,10 @@ def normalize_usage_metrics_with_overflow_error(
         computed_total_tokens = input_tokens + output_tokens
         total_tokens = computed_total_tokens
 
-    uncached_input_tokens = max(input_tokens - cached_input_tokens, 0)
+    uncached_input_tokens = max(
+        input_tokens - cached_input_tokens - cache_write_tokens,
+        0,
+    )
     if anthropic_shaped:
         uncached_input_tokens = _first_nonnegative_int(raw_usage, ("input_tokens",))
 
@@ -1314,6 +1324,19 @@ def _strict_cache_write_tokens(raw_usage: dict[str, Any]) -> int | None:
     if present:
         observed.append(total)
 
+    for details_key in ("input_tokens_details", "prompt_tokens_details"):
+        if details_key not in raw_usage or raw_usage[details_key] is None:
+            continue
+        details = raw_usage[details_key]
+        if type(details) is not dict:
+            return None
+        nested = _optional_nonnegative_int_field(details, "cache_write_tokens")
+        if nested is None:
+            return None
+        nested_total, nested_present = nested
+        if nested_present:
+            observed.append(nested_total)
+
     cache_creation = raw_usage.get("cache_creation")
     if "cache_creation" in raw_usage and cache_creation is not None:
         if type(cache_creation) is not dict:
@@ -1371,6 +1394,11 @@ def _has_positive_usage_counter(values: dict[str, Any]) -> bool:
     if type(input_details) is not dict:
         input_details = values.get("prompt_tokens_details")
     if type(input_details) is dict and _nonnegative_int(input_details.get("cached_tokens")) > 0:
+        return True
+    if (
+        type(input_details) is dict
+        and _nonnegative_int(input_details.get("cache_write_tokens")) > 0
+    ):
         return True
     output_details = values.get("output_tokens_details")
     if type(output_details) is not dict:

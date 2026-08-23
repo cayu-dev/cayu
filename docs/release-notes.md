@@ -248,6 +248,23 @@ provider-native dynamic-tool behavior, and it does not change default provider
 payloads. Persisted prerelease exposure authority without a catalogue revision
 is rejected rather than supported through a compatibility path.
 
+### OpenRouter is a first-class provider choice
+
+Generated applications can now select `openrouter` through `cayu new --provider
+openrouter` or `CAYU_PROVIDER=openrouter`. Live use requires
+`OPENROUTER_API_KEY` and an explicit `CAYU_MODEL` slug; Cayu does not select a
+mutable, free, or paid default. Optional attribution and bounded router metadata
+remain application-controlled, and routing preferences continue through
+`provider_options["openrouter"]`.
+
+The Chat Completions seam now preserves streamed OpenRouter
+`reasoning_details` as opaque private state and replays the complete unchanged
+sequence across tool continuations, retries, recovery, and durable stores.
+Selected-route evidence and effective model identity are bounded, OpenRouter
+errors retain typed retry/context identity, and cache-read, cache-write, and
+reasoning usage normalize without treating provider-reported cost as a Cayu
+PriceBook estimate.
+
 ### OpenAI Responses background work survives worker loss
 
 `OpenAIProvider(background=True)` now starts stored, streamed Responses API

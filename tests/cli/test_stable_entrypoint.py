@@ -148,7 +148,7 @@ def test_generated_command_explains_how_to_configure_a_live_provider(
     assert completed.stdout == ""
     assert completed.stderr == (
         "setup error: no provider is selected; set CAYU_PROVIDER to openai, anthropic, "
-        "or openai-subscription (credentials do not select a provider)\n"
+        "openrouter, or openai-subscription (credentials do not select a provider)\n"
     )
 
 

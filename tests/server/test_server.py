@@ -184,6 +184,19 @@ class OneShotProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
+class UnavailableTargetProvider(OneShotProvider):
+    def __init__(self) -> None:
+        self.dispatches = 0
+
+    def preflight_model_target(self, *, model: str) -> None:
+        raise RuntimeError(f"model target {model!r} is not configured")
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.dispatches += 1
+        async for event in super().stream(request):
+            yield event
+
+
 class UsageProvider(ModelProvider):
     name = "fake"
     usage_dialect = UsageDialect.OPENAI
@@ -638,6 +651,22 @@ def test_server_run_rejection_before_session_creates_no_task() -> None:
     response = client.post("/api/run", json={"prompt": "x", "agent": "ghost"})
     assert response.status_code == 404
 
+    assert client.get("/api/tasks").json() == []
+    assert client.get("/api/sessions").json()["sessions"] == []
+
+
+def test_server_run_provider_target_preflight_precedes_session_and_task_mutation() -> None:
+    provider = UnavailableTargetProvider()
+    app = CayuApp(task_store=InMemoryTaskStore(), enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="missing-model"))
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    response = client.post("/api/run", json={"prompt": "must not dispatch"})
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Mutation failed before streaming began."}
+    assert provider.dispatches == 0
     assert client.get("/api/tasks").json() == []
     assert client.get("/api/sessions").json()["sessions"] == []
 
@@ -10093,6 +10122,54 @@ def test_transcript_pagination_terminates_when_excluding_thinking() -> None:
     parts = [part for message in collected for part in message["content"]]
     assert any(part["type"] == "text" for part in parts)  # the answer survives
     assert all(part["type"] != "thinking" for part in parts)  # thinking excluded
+
+
+def test_transcript_api_omits_opaque_provider_state_payload() -> None:
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store)
+
+    async def seed() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="opaque_provider_state",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_transcript_messages(
+            "opaque_provider_state",
+            [
+                Message(
+                    role=MessageRole.ASSISTANT,
+                    content=[
+                        ProviderStatePart(
+                            provider="chat_completions",
+                            state={
+                                "type": "reasoning_details",
+                                "details": [
+                                    {
+                                        "data": "encrypted-provider-canary",
+                                        "signature": "signed-provider-canary",
+                                    }
+                                ],
+                            },
+                        )
+                    ],
+                )
+            ],
+        )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    response = client.get("/api/sessions/opaque_provider_state/transcript")
+
+    assert response.status_code == 200
+    [message] = response.json()["messages"]
+    assert message["content"] == [{"type": "provider_state", "provider": "chat_completions"}]
+    assert "encrypted-provider-canary" not in response.text
+    assert "signed-provider-canary" not in response.text
 
 
 def _sse_frames(response) -> list[dict]:

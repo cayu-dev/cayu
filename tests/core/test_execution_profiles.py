@@ -156,6 +156,7 @@ from cayu.egress import (
 from cayu.egress.authority import _build_adapter_verified_egress_authority_cutover_receipt
 from cayu.providers import (
     AnthropicProvider,
+    ChatCompletionsProvider,
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
@@ -268,6 +269,28 @@ def test_builtin_retrying_compactors_version_the_unknown_provider_allowance(
     assert material is not None
     assert material["version"] == 2
     assert material["retry_policy"]["max_unknown_attempts"] == 2
+
+
+def test_openrouter_attribution_values_are_not_execution_profile_evidence() -> None:
+    referer = "https://private-app.example.test/attribution-canary"
+    title = "private OpenRouter title canary"
+    material = execution_profile_admission._cayu_provider_material(
+        ChatCompletionsProvider(
+            api_key="test-key",
+            name="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            openrouter_http_referer=referer,
+            openrouter_app_title=title,
+            openrouter_router_metadata=True,
+        )
+    )
+
+    assert material is not None
+    assert material["openrouter_http_referer_configured"] is True
+    assert material["openrouter_app_title_configured"] is True
+    assert material["openrouter_router_metadata"] is True
+    assert referer not in repr(material)
+    assert title not in repr(material)
 
 
 def test_dashboard_profile_fixture_delegates_to_the_runtime_resolver() -> None:
