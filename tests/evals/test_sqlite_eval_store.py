@@ -7,6 +7,7 @@ from contextlib import suppress
 
 import pytest
 from tests.evals.eval_store_conformance import (
+    _scenario,
     assert_captured_eval_store_conformance,
     assert_eval_store_conformance,
     assert_eval_store_reconstruction_releases_heartbeat_capacity,
@@ -96,7 +97,7 @@ def test_sqlite_eval_store_shared_conformance(tmp_path) -> None:
     asyncio.run(exercise())
 
 
-def test_sqlite_eval_store_creates_revision_fifty_schema(tmp_path) -> None:
+def test_sqlite_eval_store_creates_revision_fifty_three_schema(tmp_path) -> None:
     path = tmp_path / "evals.db"
 
     async def initialize() -> None:
@@ -108,7 +109,7 @@ def test_sqlite_eval_store_creates_revision_fifty_schema(tmp_path) -> None:
     try:
         revisions = connection.execute(
             "SELECT revision, kind, compatible_from FROM cayu_schema_migrations "
-            "WHERE revision IN (47, 48, 49, 50) ORDER BY revision"
+            "WHERE revision IN (47, 48, 49, 50, 51, 52, 53) ORDER BY revision"
         ).fetchall()
         invocation_column = connection.execute("PRAGMA table_info(cayu_eval_runs)").fetchall()
         case_table = connection.execute(
@@ -126,6 +127,7 @@ def test_sqlite_eval_store_creates_revision_fifty_schema(tmp_path) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'index' "
                 "AND (name LIKE 'idx_cayu_eval_runs_target_%' "
                 "OR name LIKE 'idx_cayu_eval_result_records_%' "
+                "OR name LIKE 'idx_cayu_eval_scenarios_%' "
                 "OR name = 'idx_cayu_eval_baseline_mutations_scope')"
             ).fetchall()
         }
@@ -136,6 +138,9 @@ def test_sqlite_eval_store_creates_revision_fifty_schema(tmp_path) -> None:
         (48, "breaking", 48),
         (49, "breaking", 49),
         (50, "breaking", 50),
+        (51, "additive", 50),
+        (52, "breaking", 52),
+        (53, "additive", 52),
     ]
     assert next(row for row in invocation_column if row[1] == "invocation_json")[2:4] == (
         "TEXT",
@@ -152,6 +157,7 @@ def test_sqlite_eval_store_creates_revision_fifty_schema(tmp_path) -> None:
         "cayu_eval_result_records",
         "cayu_eval_results",
         "cayu_eval_runs",
+        "cayu_eval_scenarios",
         "cayu_eval_suites",
     }
     assert indexes == {
@@ -160,7 +166,137 @@ def test_sqlite_eval_store_creates_revision_fifty_schema(tmp_path) -> None:
         "idx_cayu_eval_result_records_target_catalog",
         "idx_cayu_eval_runs_target_catalog",
         "idx_cayu_eval_runs_target_status_claim",
+        "idx_cayu_eval_scenarios_catalog",
+        "idx_cayu_eval_scenarios_id_catalog",
+        "idx_cayu_eval_scenarios_target_catalog",
     }
+
+
+def test_sqlite_revision_fifty_three_adds_scenarios_without_rewriting_corpora(
+    tmp_path,
+) -> None:
+    path = tmp_path / "evals.db"
+    corpus = _corpus(trials=1)
+
+    async def initialize() -> None:
+        store = SQLiteEvalStore(path)
+        try:
+            await _save_corpus(store, corpus)
+        finally:
+            await store.close()
+
+    asyncio.run(initialize())
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            DROP TABLE cayu_eval_scenarios;
+            DELETE FROM cayu_schema_migrations WHERE revision = 53;
+            PRAGMA user_version = 52;
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    async def migrate() -> None:
+        store = SQLiteEvalStore(path, schema_mode=SchemaMode.MIGRATE)
+        try:
+            assert await store.load_corpus(corpus.revision) == corpus
+            assert (await store.list_scenarios()).items == ()
+        finally:
+            await store.close()
+
+    asyncio.run(migrate())
+
+
+def test_sqlite_revision_fifty_three_rejects_conflicting_scenario_table(tmp_path) -> None:
+    path = tmp_path / "evals.db"
+
+    async def initialize() -> None:
+        store = SQLiteEvalStore(path)
+        await store.close()
+
+    asyncio.run(initialize())
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            DROP TABLE cayu_eval_scenarios;
+            CREATE TABLE cayu_eval_scenarios (
+                revision TEXT PRIMARY KEY,
+                scenario_id TEXT COLLATE BINARY NOT NULL,
+                target_key TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                event_count INTEGER NOT NULL,
+                input_event_count INTEGER NOT NULL,
+                approval_checkpoint_count INTEGER NOT NULL,
+                message_count INTEGER NOT NULL,
+                part_count INTEGER NOT NULL,
+                artifact_requirement_count INTEGER NOT NULL,
+                secret_requirement_count INTEGER NOT NULL,
+                document_json TEXT NOT NULL,
+                document_bytes INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            DELETE FROM cayu_schema_migrations WHERE revision = 53;
+            PRAGMA user_version = 52;
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="scenario safety constraints"):
+        SQLiteEvalStore(path, schema_mode=SchemaMode.MIGRATE)
+    connection = sqlite3.connect(path)
+    try:
+        assert (
+            connection.execute(
+                "SELECT 1 FROM cayu_schema_migrations WHERE revision = 53"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+
+def test_sqlite_revision_fifty_three_rejects_unique_scenario_catalog_index(tmp_path) -> None:
+    path = tmp_path / "evals.db"
+
+    async def initialize() -> None:
+        store = SQLiteEvalStore(path)
+        await store.close()
+
+    asyncio.run(initialize())
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            DROP INDEX idx_cayu_eval_scenarios_catalog;
+            CREATE UNIQUE INDEX idx_cayu_eval_scenarios_catalog
+                ON cayu_eval_scenarios(created_at DESC, revision ASC);
+            DELETE FROM cayu_schema_migrations WHERE revision = 53;
+            PRAGMA user_version = 52;
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="unexpected unique"):
+        SQLiteEvalStore(path, schema_mode=SchemaMode.MIGRATE)
+    connection = sqlite3.connect(path)
+    try:
+        assert (
+            connection.execute(
+                "SELECT 1 FROM cayu_schema_migrations WHERE revision = 53"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
 
 
 def test_sqlite_revision_forty_eight_preserves_cases_and_admits_zero_messages(
@@ -295,6 +431,8 @@ def test_sqlite_eval_store_is_restart_durable_and_idempotent(tmp_path) -> None:
         )
         first = SQLiteEvalStore(path)
         await _save_corpus(first, corpus)
+        scenario = _scenario(corpus, text="Persist this scenario.")
+        await first.save_scenario(scenario, redact_json=_NO_SECRETS.redact_json)
         admitted = await _admit_run(first, _request(corpus))
         assert admitted.status is EvalRunStatus.QUEUED
         claimed = await first.claim_run()
@@ -326,6 +464,7 @@ def test_sqlite_eval_store_is_restart_durable_and_idempotent(tmp_path) -> None:
 
         reopened = SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
         assert await reopened.load_corpus(corpus.revision) == corpus
+        assert await reopened.load_scenario(scenario.revision) == scenario
         assert await reopened.load_run(completed.id) == completed
         assert await reopened.load_result(completed.id) == result
         assert await reopened.load_result_by_revision(result.revision) == result

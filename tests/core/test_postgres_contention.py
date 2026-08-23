@@ -652,13 +652,20 @@ def test_postgres_budget_ledger_concurrent_scoped_reaping_does_not_deadlock(
             reservation_ttl_seconds=1,
         )
         try:
-            return await asyncio.wait_for(
+            results = await asyncio.wait_for(
                 asyncio.gather(
                     _reserve(first, first_limit, "sess_first_replacement"),
                     _reserve(second, second_limit, "sess_second_replacement"),
                 ),
                 timeout=5,
             )
+            for result in results:
+                if result.record is not None:
+                    await first.release(
+                        reservation_id=result.record.reservation_id,
+                        reason="test cleanup",
+                    )
+            return results
         finally:
             await first.close()
             await second.close()

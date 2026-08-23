@@ -4,7 +4,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from tests.evals.eval_store_conformance import assert_eval_store_conformance
+from tests.evals.eval_store_conformance import _scenario, assert_eval_store_conformance
 from tests.evals.test_corpus_execution import (
     _corpus,
     _model_judge_corpus,
@@ -90,11 +90,14 @@ def test_memory_eval_store_is_explicitly_process_local() -> None:
         corpus = _corpus()
         first = InMemoryEvalStore()
         await _save_corpus(first, corpus)
+        scenario = _scenario(corpus, text="Process-local scenario.")
+        await first.save_scenario(scenario, redact_json=_NO_SECRETS.redact_json)
         await _admit_run(first, _request(corpus))
 
         restarted = InMemoryEvalStore()
         assert restarted.durable is False
         assert await restarted.load_corpus(corpus.revision) is None
+        assert await restarted.load_scenario(scenario.revision) is None
         assert await restarted.load_run("run-1") is None
 
     asyncio.run(exercise())

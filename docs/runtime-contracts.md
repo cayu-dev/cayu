@@ -4592,6 +4592,20 @@ deployment dependency or runtime limitation. It does not grant authority or
 weaken route-level authentication, mutation policy, target admission, or
 execution preconditions.
 
+Portable scenario-v2 documents describe stimuli, never authority. They contain
+one initial input followed by ordered queued input, resumed input, or
+fresh-approval checkpoints, plus bounded artifact and named-secret
+requirements. They cannot carry a provider, tool implementation, environment,
+secret value or handle, actor, approval choice, approval identifier, or source
+session authorization. File parts reference declared fixture digests or stable
+artifact references rather than embedding file bytes. Their canonical JSON,
+content-derived revision, compiler, and corpus-v1 conversion bridge are strict
+and bounded; captured-only corpus cases require separately authored stimuli.
+Compilation produces a validated launch template but resolves no executable
+objects. Built-in stores persist immutable scenarios only after the configured
+credential-redaction boundary accepts the complete document; additive storage
+revision 53 owns the independent scenario table and catalog indexes.
+
 Its storage and target evidence are independent. Project serving may make
 durable storage and project/release identity available before it can resolve a
 trusted executable target. In that state catalog, launch, cancellation,

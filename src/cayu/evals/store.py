@@ -60,6 +60,16 @@ from cayu.evals.results import (
     eval_result_projection,
     validate_captured_result_for_corpus,
 )
+from cayu.evals.scenario import (
+    EVAL_SCENARIO_MAX_ARTIFACT_REQUIREMENTS,
+    EVAL_SCENARIO_MAX_BYTES,
+    EVAL_SCENARIO_MAX_EVENTS,
+    EVAL_SCENARIO_MAX_SECRET_REQUIREMENTS,
+    EvalScenarioDocumentV2,
+    EvalScenarioInspectionV2,
+    eval_scenario_from_json,
+    inspect_eval_scenario,
+)
 from cayu.runtime.invocation import (
     InvocationOrigin,
     InvocationOriginTrust,
@@ -147,6 +157,10 @@ class EvalCorpusConflict(ValueError):
     """One immutable corpus revision resolves to contradictory stored content."""
 
 
+class EvalScenarioConflict(ValueError):
+    """One immutable scenario revision resolves to contradictory stored content."""
+
+
 class EvalStorePublicationRejected(ValueError):
     """Public eval data could not cross the active credential-redaction boundary."""
 
@@ -213,6 +227,31 @@ def _prepare_corpus_for_store(
     ).encode("utf-8")
     if len(wire_document) > EVAL_CORPUS_MAX_BYTES:
         raise EvalStoreResultTooLarge(EVAL_CORPUS_MAX_BYTES)
+    return validated, wire_document
+
+
+def _prepare_scenario_for_store(
+    scenario: EvalScenarioDocumentV2,
+    *,
+    redact_json: Callable[[Any], Any],
+) -> tuple[EvalScenarioDocumentV2, bytes]:
+    """Validate and serialize one scenario after a fail-closed credential scan."""
+
+    validated = _exact_model(scenario, EvalScenarioDocumentV2, "scenario")
+    document = validated.model_dump(mode="json")
+    _require_publication_safe(
+        document,
+        redact_json=redact_json,
+        resource_name="Eval scenario",
+    )
+    wire_document = json.dumps(
+        document,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(wire_document) > EVAL_SCENARIO_MAX_BYTES:
+        raise EvalStoreResultTooLarge(EVAL_SCENARIO_MAX_BYTES)
     return validated, wire_document
 
 
@@ -317,6 +356,36 @@ class EvalCatalogQuery(_EvalStoreModel):
     @field_validator("target_key")
     @classmethod
     def validate_target_key(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _portable_id(value, info.field_name)
+
+    @field_validator("cursor")
+    @classmethod
+    def validate_cursor(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_cursor(value, info.field_name)
+
+
+class EvalScenarioCatalogQuery(_EvalStoreModel):
+    target_key: StrictStr | None = None
+    scenario_id: StrictStr | None = None
+    cursor: StrictStr | None = None
+    limit: StrictInt = Field(
+        default=EVAL_STORE_DEFAULT_PAGE_SIZE,
+        ge=1,
+        le=EVAL_STORE_MAX_PAGE_SIZE,
+    )
+    max_result_bytes: StrictInt = Field(
+        default=EVAL_STORE_DEFAULT_PAGE_BYTES,
+        ge=1_024,
+        le=EVAL_STORE_MAX_PAGE_BYTES,
+    )
+
+    @field_validator("target_key", "scenario_id")
+    @classmethod
+    def validate_ids(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
         return _portable_id(value, info.field_name)
@@ -479,6 +548,84 @@ class EvalCorpusCatalogEntry(_EvalStoreModel):
         return self
 
 
+class EvalScenarioCatalogEntry(_EvalStoreModel):
+    revision: StrictStr
+    id: StrictStr
+    target_key: StrictStr
+    name: StrictStr
+    description: StrictStr | None = None
+    event_count: StrictInt = Field(ge=1, le=EVAL_SCENARIO_MAX_EVENTS)
+    input_event_count: StrictInt = Field(ge=1, le=EVAL_SCENARIO_MAX_EVENTS)
+    approval_checkpoint_count: StrictInt = Field(ge=0, le=EVAL_SCENARIO_MAX_EVENTS)
+    message_count: StrictInt = Field(
+        ge=1,
+        le=EVAL_SCENARIO_MAX_EVENTS * 32,
+    )
+    part_count: StrictInt = Field(
+        ge=1,
+        le=EVAL_SCENARIO_MAX_EVENTS * 32 * 32,
+    )
+    artifact_requirement_count: StrictInt = Field(
+        ge=0,
+        le=EVAL_SCENARIO_MAX_ARTIFACT_REQUIREMENTS,
+    )
+    secret_requirement_count: StrictInt = Field(
+        ge=0,
+        le=EVAL_SCENARIO_MAX_SECRET_REQUIREMENTS,
+    )
+    document_bytes: StrictInt = Field(ge=1, le=EVAL_SCENARIO_MAX_BYTES)
+    created_at: datetime
+
+    @field_validator("revision")
+    @classmethod
+    def validate_revision(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("id", "target_key")
+    @classmethod
+    def validate_ids(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=256,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=2_048,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("created_at")
+    @classmethod
+    def validate_created_at(cls, value: datetime, info) -> datetime:
+        return _aware_utc(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> EvalScenarioCatalogEntry:
+        if self.input_event_count + self.approval_checkpoint_count != self.event_count:
+            raise ValueError("Eval scenario catalog event counts are inconsistent.")
+        if self.message_count < self.input_event_count:
+            raise ValueError("Eval scenario catalog message count is impossible.")
+        if self.part_count < self.message_count:
+            raise ValueError("Eval scenario catalog part count is impossible.")
+        return self
+
+
 class EvalSuiteCatalogEntry(_EvalStoreModel):
     corpus_revision: StrictStr
     id: StrictStr
@@ -614,6 +761,40 @@ class EvalCorpusCatalogPage(_EvalStoreModel):
                 raise ValueError("Eval corpus catalog cursor does not follow its last item.")
             if target_key and any(item.target_key != target_key for item in self.items):
                 raise ValueError("Eval corpus catalog cursor filter does not match its items.")
+        return self
+
+
+class EvalScenarioCatalogPage(_EvalStoreModel):
+    items: tuple[EvalScenarioCatalogEntry, ...] = Field(max_length=EVAL_STORE_MAX_PAGE_SIZE)
+    next_cursor: StrictStr | None = None
+    has_more: StrictBool = False
+
+    @model_validator(mode="after")
+    def validate_page(self) -> EvalScenarioCatalogPage:
+        _validate_page_boundary(self.items, self.next_cursor, self.has_more)
+        if len({item.revision for item in self.items}) != len(self.items):
+            raise ValueError("Eval scenario catalog page contains duplicate revisions.")
+        expected = list(self.items)
+        expected.sort(key=lambda item: item.revision)
+        expected.sort(key=lambda item: item.created_at, reverse=True)
+        if list(self.items) != expected:
+            raise ValueError("Eval scenario catalog page is not in keyset order.")
+        if self.has_more:
+            assert self.next_cursor is not None
+            timestamp, revision, target_key, scenario_id = _decode_cursor(
+                self.next_cursor,
+                "scenarios",
+                ("created_at", "revision", "target_key", "scenario_id"),
+            )
+            if (timestamp, revision) != (
+                self.items[-1].created_at.isoformat(),
+                self.items[-1].revision,
+            ):
+                raise ValueError("Eval scenario catalog cursor does not follow its last item.")
+            if target_key and any(item.target_key != target_key for item in self.items):
+                raise ValueError("Eval scenario catalog cursor filter does not match its items.")
+            if scenario_id and any(item.id != scenario_id for item in self.items):
+                raise ValueError("Eval scenario catalog cursor filter does not match its items.")
         return self
 
 
@@ -1274,6 +1455,40 @@ def decode_corpus_cursor(cursor: str, target_key: str | None) -> tuple[datetime,
     )
 
 
+def _scenario_cursor(entry: EvalScenarioCatalogEntry, query: EvalScenarioCatalogQuery) -> str:
+    return _encode_cursor(
+        "scenarios",
+        {
+            "created_at": entry.created_at.isoformat(),
+            "revision": entry.revision,
+            "target_key": query.target_key or "",
+            "scenario_id": query.scenario_id or "",
+        },
+    )
+
+
+def decode_scenario_cursor(
+    cursor: str,
+    target_key: str | None,
+    scenario_id: str | None,
+) -> tuple[datetime, str]:
+    timestamp, revision, cursor_target_key, cursor_scenario_id = _decode_cursor(
+        cursor,
+        "scenarios",
+        ("created_at", "revision", "target_key", "scenario_id"),
+    )
+    if cursor_target_key != (target_key or "") or cursor_scenario_id != (scenario_id or ""):
+        raise ValueError("Eval-store scenario cursor does not match this query.")
+    try:
+        created_at = datetime.fromisoformat(timestamp)
+    except ValueError as exc:
+        raise ValueError("Invalid eval-store scenario cursor timestamp.") from exc
+    return _aware_utc(created_at, "cursor created_at"), _sha256_revision(
+        revision,
+        "cursor revision",
+    )
+
+
 def _suite_cursor(entry: EvalSuiteCatalogEntry) -> str:
     return _encode_cursor(
         "suites",
@@ -1408,6 +1623,33 @@ def corpus_catalog_entry(
     )
 
 
+def scenario_catalog_entry(
+    scenario: EvalScenarioDocumentV2,
+    *,
+    created_at: datetime,
+    document_bytes: int | None = None,
+) -> EvalScenarioCatalogEntry:
+    validated = _exact_model(scenario, EvalScenarioDocumentV2, "scenario")
+    inspection = inspect_eval_scenario(validated)
+    size = len(_wire_model_bytes(validated)) if document_bytes is None else document_bytes
+    return EvalScenarioCatalogEntry(
+        revision=inspection.revision,
+        id=inspection.id,
+        target_key=inspection.target_key,
+        name=validated.name,
+        description=validated.description,
+        event_count=inspection.event_count,
+        input_event_count=inspection.input_event_count,
+        approval_checkpoint_count=inspection.approval_checkpoint_count,
+        message_count=inspection.message_count,
+        part_count=inspection.part_count,
+        artifact_requirement_count=inspection.artifact_requirement_count,
+        secret_requirement_count=inspection.secret_requirement_count,
+        document_bytes=size,
+        created_at=created_at,
+    )
+
+
 def suite_catalog_entries(
     corpus: EvalCorpusDocument,
 ) -> tuple[EvalSuiteCatalogEntry, ...]:
@@ -1478,6 +1720,20 @@ def _prepare_corpus_catalog_for_store(
         suite_catalog_entries(validated),
         case_catalog_entries(validated),
     )
+
+
+def _prepare_scenario_catalog_for_store(
+    scenario: EvalScenarioDocumentV2,
+    *,
+    redact_json: Callable[[Any], Any],
+) -> tuple[EvalScenarioDocumentV2, bytes, EvalScenarioInspectionV2]:
+    """Prepare one immutable scenario and its catalog projection in one CPU phase."""
+
+    validated, document = _prepare_scenario_for_store(
+        scenario,
+        redact_json=redact_json,
+    )
+    return validated, document, inspect_eval_scenario(validated)
 
 
 def validate_run_request_for_corpus(
@@ -1598,6 +1854,7 @@ class EvalStore(ABC):
 
     durable: ClassVar[bool] = False
     captured_results: ClassVar[bool] = False
+    scenarios: ClassVar[bool] = False
 
     @abstractmethod
     async def close(self) -> None:
@@ -1627,6 +1884,37 @@ class EvalStore(ABC):
         query: EvalCatalogQuery | None = None,
     ) -> EvalCorpusCatalogPage:
         """List immutable corpus revisions in newest-first keyset order."""
+
+    async def save_scenario(
+        self,
+        scenario: EvalScenarioDocumentV2,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalScenarioCatalogEntry:
+        """Scan and atomically save one immutable portable scenario revision."""
+
+        del scenario, redact_json
+        raise NotImplementedError("Eval scenario persistence is not supported.")
+
+    async def load_scenario(
+        self,
+        revision: str,
+        *,
+        max_bytes: int = EVAL_SCENARIO_MAX_BYTES,
+    ) -> EvalScenarioDocumentV2 | None:
+        """Load one scenario without crossing the caller's byte ceiling."""
+
+        del revision, max_bytes
+        raise NotImplementedError("Eval scenario persistence is not supported.")
+
+    async def list_scenarios(
+        self,
+        query: EvalScenarioCatalogQuery | None = None,
+    ) -> EvalScenarioCatalogPage:
+        """List immutable scenario revisions in newest-first keyset order."""
+
+        del query
+        raise NotImplementedError("Eval scenario persistence is not supported.")
 
     @abstractmethod
     async def list_suites(self, query: EvalSuiteCatalogQuery) -> EvalSuiteCatalogPage:
@@ -1826,6 +2114,7 @@ class InMemoryEvalStore(EvalStore):
 
     durable: ClassVar[bool] = False
     captured_results: ClassVar[bool] = True
+    scenarios: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -1838,6 +2127,8 @@ class InMemoryEvalStore(EvalStore):
         self._lock = asyncio.Lock()
         self._corpus_documents: dict[str, bytes] = {}
         self._corpora: dict[str, EvalCorpusCatalogEntry] = {}
+        self._scenario_documents: dict[str, bytes] = {}
+        self._scenarios: dict[str, EvalScenarioCatalogEntry] = {}
         self._suites: dict[str, tuple[EvalSuiteCatalogEntry, ...]] = {}
         self._cases: dict[str, tuple[EvalCaseCatalogEntry, ...]] = {}
         self._runs: dict[str, _MemoryRunState] = {}
@@ -1943,6 +2234,78 @@ class InMemoryEvalStore(EvalStore):
                     or (item.created_at == created_at and item.revision > revision)
                 ]
             return _bounded_corpus_page(items, query)
+
+    async def save_scenario(
+        self,
+        scenario: EvalScenarioDocumentV2,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalScenarioCatalogEntry:
+        validated, document, _ = _prepare_scenario_catalog_for_store(
+            scenario,
+            redact_json=redact_json,
+        )
+        async with self._lock:
+            existing = self._scenario_documents.get(validated.revision)
+            if existing is not None:
+                if existing != document:
+                    raise EvalScenarioConflict(
+                        f"Eval scenario revision {validated.revision} has conflicting content."
+                    )
+                return self._scenarios[validated.revision].model_copy(deep=True)
+            entry = scenario_catalog_entry(
+                validated,
+                created_at=self._now(),
+                document_bytes=len(document),
+            )
+            self._scenario_documents[validated.revision] = document
+            self._scenarios[validated.revision] = entry
+            return entry.model_copy(deep=True)
+
+    async def load_scenario(
+        self,
+        revision: str,
+        *,
+        max_bytes: int = EVAL_SCENARIO_MAX_BYTES,
+    ) -> EvalScenarioDocumentV2 | None:
+        revision = _sha256_revision(revision, "revision")
+        max_bytes = _read_limit(max_bytes, hard_max=EVAL_SCENARIO_MAX_BYTES)
+        async with self._lock:
+            document = self._scenario_documents.get(revision)
+            if document is None:
+                return None
+            if len(document) > max_bytes:
+                raise EvalStoreResultTooLarge(max_bytes)
+            return eval_scenario_from_json(document.decode("utf-8"))
+
+    async def list_scenarios(
+        self,
+        query: EvalScenarioCatalogQuery | None = None,
+    ) -> EvalScenarioCatalogPage:
+        query = _copy_query(query, EvalScenarioCatalogQuery)
+        boundary = (
+            decode_scenario_cursor(query.cursor, query.target_key, query.scenario_id)
+            if query.cursor is not None
+            else None
+        )
+        async with self._lock:
+            items = [
+                item
+                for item in self._scenarios.values()
+                if (query.target_key is None or item.target_key == query.target_key)
+                and (query.scenario_id is None or item.id == query.scenario_id)
+            ]
+            items.sort(key=lambda item: item.revision)
+            items.sort(key=lambda item: item.created_at, reverse=True)
+            if boundary is not None:
+                created_at, revision = boundary
+                items = [
+                    item
+                    for item in items
+                    if item.created_at < created_at
+                    or (item.created_at == created_at and item.revision > revision)
+                ]
+            return _bounded_scenario_page(items, query)
 
     async def list_suites(self, query: EvalSuiteCatalogQuery) -> EvalSuiteCatalogPage:
         query = _exact_model(query, EvalSuiteCatalogQuery, "query")
@@ -2650,6 +3013,23 @@ def _bounded_corpus_page(
     )
 
 
+def _bounded_scenario_page(
+    items: list[EvalScenarioCatalogEntry],
+    query: EvalScenarioCatalogQuery,
+) -> EvalScenarioCatalogPage:
+    retained, next_cursor, has_more = _bounded_page(
+        items,
+        limit=query.limit,
+        max_bytes=query.max_result_bytes,
+        cursor=lambda item: _scenario_cursor(item, query),
+    )
+    return EvalScenarioCatalogPage(
+        items=retained,
+        next_cursor=next_cursor,
+        has_more=has_more,
+    )
+
+
 def _bounded_case_page(
     items: list[EvalCaseCatalogEntry],
     query: EvalCaseCatalogQuery,
@@ -2735,6 +3115,10 @@ __all__ = [
     "EvalRunSpec",
     "EvalRunStateConflict",
     "EvalRunStatus",
+    "EvalScenarioCatalogEntry",
+    "EvalScenarioCatalogPage",
+    "EvalScenarioCatalogQuery",
+    "EvalScenarioConflict",
     "EvalStore",
     "EvalStorePublicationRejected",
     "EvalStoreResultTooLarge",

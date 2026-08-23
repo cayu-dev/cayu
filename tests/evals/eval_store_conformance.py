@@ -26,6 +26,15 @@ from cayu.evals.results import (
     EvalResultOrigin,
     EvalResultTargetIdentityV1,
 )
+from cayu.evals.scenario import (
+    EvalScenarioDocumentV2,
+    ScenarioApprovalCheckpointEventV2,
+    ScenarioInitialInputEventV2,
+    ScenarioInputV2,
+    ScenarioQueuedInputEventV2,
+    ScenarioTextPartV2,
+    ScenarioUserMessageV2,
+)
 from cayu.evals.store import (
     EvalBaselineConflict,
     EvalBaselineKey,
@@ -42,6 +51,7 @@ from cayu.evals.store import (
     EvalRunRequest,
     EvalRunStateConflict,
     EvalRunStatus,
+    EvalScenarioCatalogQuery,
     EvalStore,
     EvalStorePublicationRejected,
     EvalStoreResultTooLarge,
@@ -57,6 +67,42 @@ from cayu.runtime.stop_policy import RunLimits
 from cayu.vaults.redaction import SecretRedactor
 
 _NO_SECRETS = SecretRedactor()
+
+
+def _scenario(corpus: EvalCorpusDocument, *, text: str) -> EvalScenarioDocumentV2:
+    def scenario_input(value: str) -> ScenarioInputV2:
+        return ScenarioInputV2.create(
+            (
+                ScenarioUserMessageV2.create(
+                    (ScenarioTextPartV2(text=value),),
+                ),
+            )
+        )
+
+    return EvalScenarioDocumentV2.create(
+        id="checkout-regression",
+        target_key=corpus.target_key,
+        name="Checkout regression",
+        events=(
+            ScenarioInitialInputEventV2(
+                sequence=0,
+                id="initial",
+                input=scenario_input(text),
+            ),
+            ScenarioApprovalCheckpointEventV2(
+                sequence=1,
+                id="approve-payment",
+                tool_name="charge-card",
+                occurrence=1,
+            ),
+            ScenarioQueuedInputEventV2(
+                sequence=2,
+                id="follow-up",
+                delivery_mode="next_turn",
+                input=scenario_input("Confirm the final amount."),
+            ),
+        ),
+    )
 
 
 def _corpus_with_input(corpus: EvalCorpusDocument, text: str) -> EvalCorpusDocument:
@@ -324,6 +370,86 @@ async def assert_eval_store_conformance(
     result: CorpusExecutionResult,
 ) -> None:
     """Pin backend-neutral catalog, lifecycle, fencing, and result semantics."""
+
+    assert store.scenarios is True
+    first_scenario = _scenario(corpus, text="Buy the standard plan.")
+    first_scenario_entry = await store.save_scenario(
+        first_scenario,
+        redact_json=_NO_SECRETS.redact_json,
+    )
+    assert (
+        await store.save_scenario(
+            first_scenario,
+            redact_json=_NO_SECRETS.redact_json,
+        )
+        == first_scenario_entry
+    )
+    scenario_bytes = len(
+        json.dumps(
+            first_scenario.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    assert first_scenario_entry.document_bytes == scenario_bytes
+    assert (
+        await store.load_scenario(first_scenario.revision, max_bytes=scenario_bytes)
+        == first_scenario
+    )
+    with pytest.raises(EvalStoreResultTooLarge):
+        await store.load_scenario(first_scenario.revision, max_bytes=scenario_bytes - 1)
+
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+    unsafe_scenario = _scenario(corpus, text=secret)
+    with pytest.raises(EvalStorePublicationRejected, match="configured workload secret"):
+        await store.save_scenario(
+            unsafe_scenario,
+            redact_json=SecretRedactor(secret).redact_json,
+        )
+    assert await store.load_scenario(unsafe_scenario.revision) is None
+    with pytest.raises(EvalStorePublicationRejected, match="could not cross"):
+        await store.save_scenario(
+            first_scenario,
+            redact_json=_broken_redaction_boundary,
+        )
+
+    second_scenario = _scenario(corpus, text="Buy the premium plan.")
+    second_scenario_entry = await store.save_scenario(
+        second_scenario,
+        redact_json=_NO_SECRETS.redact_json,
+    )
+    first_page = await store.list_scenarios(
+        EvalScenarioCatalogQuery(
+            target_key=corpus.target_key,
+            scenario_id=first_scenario.id,
+            limit=1,
+        )
+    )
+    assert len(first_page.items) == 1
+    assert first_page.has_more is True
+    assert first_page.next_cursor is not None
+    second_page = await store.list_scenarios(
+        EvalScenarioCatalogQuery(
+            target_key=corpus.target_key,
+            scenario_id=first_scenario.id,
+            limit=1,
+            cursor=first_page.next_cursor,
+        )
+    )
+    assert second_page.has_more is False
+    assert {first_page.items[0].revision, second_page.items[0].revision} == {
+        first_scenario_entry.revision,
+        second_scenario_entry.revision,
+    }
+    with pytest.raises(ValueError, match="cursor does not match"):
+        await store.list_scenarios(
+            EvalScenarioCatalogQuery(
+                target_key="another-target",
+                limit=1,
+                cursor=first_page.next_cursor,
+            )
+        )
 
     saved = await store.save_corpus(
         corpus,

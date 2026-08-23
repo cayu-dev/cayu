@@ -766,7 +766,7 @@ def test_revision_52_rejects_a_conflicting_targeted_grant_index(
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 52")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 52")
             await conn.commit()
 
         migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
@@ -806,7 +806,7 @@ def test_revision_52_rejects_a_populated_pre_grant_session_store(
             async with conn.cursor() as cur:
                 await cur.execute("DROP TABLE cayu_targeted_tool_grant_uses")
                 await cur.execute("DROP TABLE cayu_targeted_tool_grants")
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 52")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 52")
             await conn.commit()
 
         migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)

@@ -89,6 +89,24 @@ guard.
 
 ## Unreleased
 
+### Portable multi-stage eval scenarios
+
+Cayu now defines an immutable scenario-v2 document for ordered initial,
+queued, and resumed user input plus fresh-approval checkpoints. Text, portable
+JSON, and bounded file requirements can be authored without embedding artifact
+contents, secret values, actor identity, approval decisions, providers, tools,
+environments, or any other executable authority. Runnable corpus-v1 cases can
+be converted explicitly; captured-only cases still require authored stimuli.
+
+Built-in eval stores persist scenario documents behind the same fail-closed
+credential-redaction boundary and bounded newest-first catalogs as corpora.
+Storage revision 53 is an additive migration that creates the independent
+scenario catalog. Run `cayu storage migrate` and confirm revision 53 before
+using scenario persistence. Revision-52 workers may coexist because they do not
+write this table, but scenario-aware `SQLiteEvalStore` and `PostgresEvalStore`
+instances require revision 53. This release establishes portable authoring and
+durable storage; target binding and execution remain separate launch-time work.
+
 ### Targeted tool grants add durable interaction-scoped addressability
 
 `RunRequest` and `ResumeRequest` can now carry strict `TargetedToolGrant`
@@ -142,10 +160,10 @@ the normal provider, start `cayu serve --dev`, evaluate a session, approve its
 captured baseline, and launch one bounded fresh trial without Evals-specific
 Python. The credential-gated release check now creates that scaffold and proves
 the Control Plane plus JSON, HTML, CLI, and CI round trip with one source run and
-one fresh trial. This slice adds no storage revision: existing SQLite and
-PostgreSQL deployments must already complete the documented revision-50
-migration before current workers start, and the shared restart suites continue
-to cover corpora, results, baselines, and run publication.
+one fresh trial. The fresh-launch slice itself adds no storage revision. Current
+scenario-aware builds additionally require the additive revision-53 migration
+documented above; the shared restart suites cover scenarios as well as corpora,
+results, baselines, and run publication.
 
 ### Captured sessions can launch bounded fresh trials from the Control Plane
 
@@ -463,12 +481,12 @@ workers together. The server contract advances from version 10 to version 16,
 and the public application manifest and generator plan advance from schema 7
 to schema 9.
 
-The storage schema advances from revision 36 to revision 52. Follow the
+The storage schema advances from revision 36 to revision 53. Follow the
 revision-specific migration boundaries below: revisions 39 through 52 contain
 breaking durable contracts, and populated legacy knowledge or task stores may
 require the explicitly documented rebuild or drain procedure. Run `cayu storage
 status` followed by `cayu storage migrate` against every configured SQLite or
-PostgreSQL store, and confirm revision 52 with no pending migrations before
+PostgreSQL store, and confirm revision 53 with no pending migrations before
 starting `v0.3.0` workers. Mixed-version deployment and application-only
 rollback across these boundaries are unsupported.
 

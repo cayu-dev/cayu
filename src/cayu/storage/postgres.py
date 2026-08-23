@@ -2472,6 +2472,55 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "CREATE INDEX IF NOT EXISTS idx_cayu_targeted_tool_grant_uses_grant "
         "ON cayu_targeted_tool_grant_uses(grant_id, bound_at, use_id)",
     ),
+    53: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_eval_scenarios (
+            revision TEXT COLLATE "C" PRIMARY KEY,
+            scenario_id TEXT COLLATE "C" NOT NULL,
+            target_key TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            event_count BIGINT NOT NULL
+                CONSTRAINT cayu_eval_scenarios_event_count_check
+                CHECK (event_count BETWEEN 1 AND 1024),
+            input_event_count BIGINT NOT NULL
+                CONSTRAINT cayu_eval_scenarios_input_event_count_check
+                CHECK (input_event_count BETWEEN 1 AND 1024),
+            approval_checkpoint_count BIGINT NOT NULL
+                CONSTRAINT cayu_eval_scenarios_approval_checkpoint_count_check
+                CHECK (approval_checkpoint_count BETWEEN 0 AND 1024),
+            message_count BIGINT NOT NULL
+                CONSTRAINT cayu_eval_scenarios_message_count_check
+                CHECK (message_count >= input_event_count AND message_count <= 32768),
+            part_count BIGINT NOT NULL
+                CONSTRAINT cayu_eval_scenarios_part_count_check
+                CHECK (part_count >= message_count AND part_count <= 1048576),
+            artifact_requirement_count BIGINT NOT NULL
+                CONSTRAINT cayu_eval_scenarios_artifact_requirement_count_check
+                CHECK (artifact_requirement_count BETWEEN 0 AND 128),
+            secret_requirement_count BIGINT NOT NULL
+                CONSTRAINT cayu_eval_scenarios_secret_requirement_count_check
+                CHECK (secret_requirement_count BETWEEN 0 AND 128),
+            document_json TEXT NOT NULL,
+            document_bytes BIGINT NOT NULL
+                CONSTRAINT cayu_eval_scenarios_document_bytes_check
+                CHECK (document_bytes BETWEEN 1 AND 8388608)
+                CONSTRAINT cayu_eval_scenarios_document_size_check
+                CHECK (document_bytes = octet_length(document_json)),
+            created_at TIMESTAMPTZ NOT NULL,
+            CONSTRAINT cayu_eval_scenarios_event_partition_check
+                CHECK (input_event_count + approval_checkpoint_count = event_count),
+            CONSTRAINT cayu_eval_scenarios_document_json_check
+                CHECK (document_json::jsonb IS NOT NULL)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_eval_scenarios_catalog "
+        "ON cayu_eval_scenarios(created_at DESC, revision ASC)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_eval_scenarios_target_catalog "
+        "ON cayu_eval_scenarios(target_key, created_at DESC, revision ASC)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_eval_scenarios_id_catalog "
+        "ON cayu_eval_scenarios(scenario_id, created_at DESC, revision ASC)",
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -3883,6 +3932,8 @@ class _PostgresStoreBase:
                             await self._validate_memory_evidence_schema(cur)
                         if self._min_required_revision >= 52:
                             await self._validate_targeted_tool_grant_schema(cur)
+                        if self._min_required_revision >= 53:
+                            await self._validate_eval_scenario_schema(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -4057,6 +4108,8 @@ class _PostgresStoreBase:
             await self._validate_memory_evidence_schema(cur)
         if self._min_required_revision >= 52:
             await self._validate_targeted_tool_grant_schema(cur)
+        if self._min_required_revision >= 53:
+            await self._validate_eval_scenario_schema(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -4149,6 +4202,8 @@ class _PostgresStoreBase:
             await self._validate_memory_evidence_schema(cur)
         if revision.revision == 52:
             await self._validate_targeted_tool_grant_schema(cur)
+        if revision.revision == 53:
+            await self._validate_eval_scenario_schema(cur)
 
     async def _validate_transcript_search_document_column(self, cur: Any) -> None:
         await cur.execute(
@@ -5804,6 +5859,185 @@ class _PostgresStoreBase:
             f"Postgres schema object {name!r} conflicts with Cayu's revision-52 "
             "targeted-grant durability contract. Run `cayu storage migrate` or "
             "restore the database from a known-good backup."
+        )
+
+    async def _validate_eval_scenario_schema(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable, collation_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_eval_scenarios'
+            ORDER BY ordinal_position
+            """
+        )
+        expected_columns = (
+            ("revision", "text", "NO", "C"),
+            ("scenario_id", "text", "NO", "C"),
+            ("target_key", "text", "NO", None),
+            ("name", "text", "NO", None),
+            ("description", "text", "YES", None),
+            ("event_count", "bigint", "NO", None),
+            ("input_event_count", "bigint", "NO", None),
+            ("approval_checkpoint_count", "bigint", "NO", None),
+            ("message_count", "bigint", "NO", None),
+            ("part_count", "bigint", "NO", None),
+            ("artifact_requirement_count", "bigint", "NO", None),
+            ("secret_requirement_count", "bigint", "NO", None),
+            ("document_json", "text", "NO", None),
+            ("document_bytes", "bigint", "NO", None),
+            ("created_at", "timestamp with time zone", "NO", None),
+        )
+        if tuple(await cur.fetchall()) != expected_columns:
+            self._raise_eval_scenario_schema_error("cayu_eval_scenarios")
+        expected_constraints = (
+            ("p", ("primary key (revision)",)),
+            ("c", ("event_count >= 1", "event_count <= 1024")),
+            ("c", ("input_event_count >= 1", "input_event_count <= 1024")),
+            (
+                "c",
+                ("approval_checkpoint_count >= 0", "approval_checkpoint_count <= 1024"),
+            ),
+            ("c", ("message_count >= input_event_count", "message_count <= 32768")),
+            ("c", ("part_count >= message_count", "part_count <= 1048576")),
+            (
+                "c",
+                ("artifact_requirement_count >= 0", "artifact_requirement_count <= 128"),
+            ),
+            (
+                "c",
+                ("secret_requirement_count >= 0", "secret_requirement_count <= 128"),
+            ),
+            ("c", ("document_bytes >= 1", "document_bytes <= 8388608")),
+            ("c", ("document_bytes = octet_length(document_json)",)),
+            (
+                "c",
+                ("input_event_count + approval_checkpoint_count", "= event_count"),
+            ),
+            ("c", ("document_json", "::jsonb is not null")),
+        )
+        await cur.execute(
+            """
+            SELECT constraint_record.contype,
+                   pg_get_constraintdef(constraint_record.oid)
+            FROM pg_catalog.pg_constraint AS constraint_record
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = constraint_record.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = 'cayu_eval_scenarios'
+              AND constraint_record.contype IN ('p', 'u', 'f', 'c')
+            """
+        )
+        candidates = [
+            (str(kind), " ".join(str(definition).lower().split()))
+            for kind, definition in await cur.fetchall()
+        ]
+        if not _constraint_fragments_match_exactly(candidates, expected_constraints):
+            self._raise_eval_scenario_schema_error("eval scenario constraints")
+        expected_indexes = {
+            "idx_cayu_eval_scenarios_catalog": (
+                "cayu_eval_scenarios",
+                "using btree (created_at desc, revision)",
+            ),
+            "idx_cayu_eval_scenarios_target_catalog": (
+                "cayu_eval_scenarios",
+                "using btree (target_key, created_at desc, revision)",
+            ),
+            "idx_cayu_eval_scenarios_id_catalog": (
+                "cayu_eval_scenarios",
+                "using btree (scenario_id, created_at desc, revision)",
+            ),
+        }
+        await cur.execute(
+            """
+            SELECT table_record.relname, index_record.relname,
+                   index_state.indisvalid, index_state.indisready,
+                   index_state.indisunique, index_state.indpred IS NULL,
+                   index_state.indexprs IS NULL,
+                   index_state.indnatts = index_state.indnkeyatts,
+                   pg_get_indexdef(index_record.oid)
+            FROM pg_catalog.pg_index AS index_state
+            JOIN pg_catalog.pg_class AS index_record
+              ON index_record.oid = index_state.indexrelid
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = index_state.indrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND index_record.relname = ANY(%s)
+            """,
+            (list(expected_indexes),),
+        )
+        indexes = {
+            str(index): (
+                str(table),
+                bool(valid),
+                bool(ready),
+                bool(unique),
+                bool(unconditional),
+                bool(plain_columns),
+                bool(key_columns_only),
+                " ".join(str(definition).lower().split()),
+            )
+            for (
+                table,
+                index,
+                valid,
+                ready,
+                unique,
+                unconditional,
+                plain_columns,
+                key_columns_only,
+                definition,
+            ) in await cur.fetchall()
+        }
+        for name, (table, definition_fragment) in expected_indexes.items():
+            value = indexes.get(name)
+            if (
+                value is None
+                or value[0] != table
+                or not value[1]
+                or not value[2]
+                or value[3]
+                or not value[4]
+                or not value[5]
+                or not value[6]
+                or definition_fragment not in value[7]
+            ):
+                self._raise_eval_scenario_schema_error(name)
+
+        await cur.execute(
+            """
+            SELECT index_record.relname
+            FROM pg_catalog.pg_index AS index_state
+            JOIN pg_catalog.pg_class AS index_record
+              ON index_record.oid = index_state.indexrelid
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = index_state.indrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            LEFT JOIN pg_catalog.pg_constraint AS constraint_record
+              ON constraint_record.conindid = index_state.indexrelid
+             AND constraint_record.contype IN ('p', 'u')
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = 'cayu_eval_scenarios'
+              AND index_state.indisunique
+              AND constraint_record.oid IS NULL
+            LIMIT 1
+            """
+        )
+        unexpected_unique_index = await cur.fetchone()
+        if unexpected_unique_index is not None:
+            self._raise_eval_scenario_schema_error(str(unexpected_unique_index[0]))
+
+    @staticmethod
+    def _raise_eval_scenario_schema_error(name: str) -> NoReturn:
+        raise RuntimeError(
+            f"Postgres schema object {name!r} conflicts with Cayu's revision-53 "
+            "portable scenario contract. Run `cayu storage migrate` or restore "
+            "the database from a known-good backup."
         )
 
     @staticmethod

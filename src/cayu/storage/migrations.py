@@ -301,6 +301,11 @@ REVISIONS: tuple[Revision, ...] = (
     # Populated pre-grant session stores must be recreated rather than carrying
     # incomplete pre-grant fork evidence or a permanent compatibility path.
     Revision(revision=52, kind=RevisionKind.BREAKING, compatible_from=52),
+    # Revision 53 adds an independent immutable scenario-v2 document catalog.
+    # Revision-52 writers do not touch this table, so mixed-version processes
+    # remain safe while scenario-aware EvalStore implementations require the
+    # new additive object.
+    Revision(revision=53, kind=RevisionKind.ADDITIVE, compatible_from=52),
 )
 
 #: The revision an empty database is initialized to.

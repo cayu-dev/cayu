@@ -816,6 +816,65 @@ corpus identity. **Approve baseline** performs an actor-attributed, idempotent
 compare-and-swap update; the request cannot supply or spoof its actor. Concurrent
 baseline changes fail instead of silently overwriting another operator's choice.
 
+### Portable multi-stage scenarios
+
+Corpus v1 remains the supported assertion and execution contract. Scenario v2
+adds a separate, authority-free description of external stimuli for sessions
+that need more than one initial user message. A scenario can contain:
+
+- exactly one initial input, followed by ordered queued or resumed inputs;
+- checkpoints that require a new approval decision when the named tool call is
+  reached;
+- text, portable JSON, and file parts whose content is resolved through a
+  declared fixture digest or stable artifact reference; and
+- named provider, tool, environment, artifact, or other secret requirements
+  without their values or handles.
+
+```python
+from cayu import (
+    EvalScenarioDocumentV2,
+    ScenarioInitialInputEventV2,
+    ScenarioInputV2,
+    ScenarioTextPartV2,
+    ScenarioUserMessageV2,
+    compile_eval_scenario,
+)
+
+message = ScenarioUserMessageV2.create((ScenarioTextPartV2(text="Start checkout"),))
+scenario = EvalScenarioDocumentV2.create(
+    id="checkout",
+    target_key="support-agent",
+    name="Checkout",
+    events=(
+        ScenarioInitialInputEventV2(
+            sequence=0,
+            id="initial",
+            input=ScenarioInputV2.create((message,)),
+        ),
+    ),
+)
+compiled = compile_eval_scenario(scenario)
+```
+
+Compilation validates and indexes the portable template; it does not resolve a
+provider, tool, environment, artifact, secret, actor, or approval. Those are
+trusted launch-time bindings. An approval checkpoint deliberately carries no
+approve/deny choice or reusable authorization. `scenario_from_corpus_case(...)`
+provides the explicit corpus-v1 bridge for runnable cases, while captured-only
+cases fail until input is authored.
+
+Scenario JSON is strict, deterministic, content-revisioned, and capped at 8
+MiB. Event, message, part, text, JSON-part, artifact, secret, and aggregate
+artifact-byte limits are validated before persistence. Built-in stores expose
+`save_scenario`, `load_scenario`, and `list_scenarios`; every save crosses the
+configured credential-redaction boundary before it writes. SQLite and
+PostgreSQL scenario persistence requires additive storage revision 53.
+
+This is the portable authoring and persistence foundation. It does not yet add
+Control Plane scenario authoring, captured-session reconstruction, target
+binding, or scenario execution; those layers consume this contract rather than
+placing runtime authority into the document.
+
 ### Durable eval catalog and run state
 
 Use an `EvalStore` when promoted corpora, queued work, and published results
@@ -823,8 +882,9 @@ must survive beyond the promotion request. `SQLiteEvalStore` is restart-durable
 for one embedded database; `PostgresEvalStore` supports shared multi-worker
 claims; `InMemoryEvalStore` is intentionally process-local and is suitable for
 tests and transient SDK workflows only. SQLite and PostgreSQL require storage
-schema revision 50. Corpus saves, run admission, and result publication require
-the active application's complete JSON redaction boundary. A configured workload
+schema revision 50 for corpora and run state, and revision 53 for scenario
+persistence. Corpus and scenario saves, run admission, and result publication
+require the active application's complete JSON redaction boundary. A configured workload
 secret or redaction failure rejects before any write; the store never retains
 the redaction function or secret registry.
 

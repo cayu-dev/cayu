@@ -187,6 +187,21 @@ def test_revision_fifty_one_adds_empty_memory_evidence_tables_additively() -> No
     )
 
 
+def test_revision_fifty_three_adds_compatible_portable_eval_scenarios() -> None:
+    state = m.SchemaState(revision=53, compatible_from=52)
+
+    # Revision-52 workers remain safe because they do not use the independent
+    # scenario catalog, while scenario-aware stores require revision 53.
+    m.validate(state, app_latest=52, app_min_supported=52)
+    m.validate(state, app_latest=53, app_min_supported=53)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 53"):
+        m.validate(
+            m.SchemaState(revision=52, compatible_from=52),
+            app_latest=53,
+            app_min_supported=53,
+        )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

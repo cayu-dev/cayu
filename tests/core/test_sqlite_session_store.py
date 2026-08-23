@@ -1910,7 +1910,7 @@ def test_sqlite_revision_52_rejects_a_conflicting_targeted_grant_index(tmp_path)
 
     connection = sqlite3.connect(db_path)
     try:
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 52")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 52")
         connection.execute("PRAGMA user_version = 51")
         connection.commit()
     finally:
@@ -1948,7 +1948,7 @@ def test_sqlite_revision_52_rejects_a_populated_pre_grant_session_store(tmp_path
     try:
         connection.execute("DROP TABLE cayu_targeted_tool_grant_uses")
         connection.execute("DROP TABLE cayu_targeted_tool_grants")
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 52")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 52")
         connection.execute("PRAGMA user_version = 51")
         connection.commit()
     finally:
@@ -3156,6 +3156,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (50, 50),
         (51, 50),
         (52, 52),
+        (53, 52),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

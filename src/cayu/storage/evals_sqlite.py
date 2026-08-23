@@ -25,6 +25,11 @@ from cayu.evals.results import (
     EvalResultTargetIdentityV1,
     captured_evaluation_result_from_json,
 )
+from cayu.evals.scenario import (
+    EVAL_SCENARIO_MAX_BYTES,
+    EvalScenarioDocumentV2,
+    eval_scenario_from_json,
+)
 from cayu.evals.store import (
     TERMINAL_EVAL_RUN_STATUSES,
     EvalBaselineConflict,
@@ -57,6 +62,10 @@ from cayu.evals.store import (
     EvalRunSpec,
     EvalRunStateConflict,
     EvalRunStatus,
+    EvalScenarioCatalogEntry,
+    EvalScenarioCatalogPage,
+    EvalScenarioCatalogQuery,
+    EvalScenarioConflict,
     EvalStore,
     EvalStoreResultTooLarge,
     EvalSuiteCatalogEntry,
@@ -66,6 +75,7 @@ from cayu.evals.store import (
     _bounded_corpus_page,
     _bounded_result_page,
     _bounded_run_page,
+    _bounded_scenario_page,
     _bounded_suite_page,
     _claim_target_keys,
     _copy_query,
@@ -76,6 +86,7 @@ from cayu.evals.store import (
     _prepare_corpus_catalog_for_store,
     _prepare_result_for_store,
     _prepare_run_request_for_store,
+    _prepare_scenario_catalog_for_store,
     _read_limit,
     _store_identifier,
     _validate_baseline_result,
@@ -83,6 +94,7 @@ from cayu.evals.store import (
     decode_corpus_cursor,
     decode_result_cursor,
     decode_run_cursor,
+    decode_scenario_cursor,
     decode_suite_cursor,
     eval_result_record,
     eval_run_invocation_from_json,
@@ -93,7 +105,7 @@ from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage.sqlite import _run_off_thread_with_connection_ownership
 
-_SQLITE_EVAL_MIN_REQUIRED_REVISION = 50
+_SQLITE_EVAL_MIN_REQUIRED_REVISION = 53
 
 _RUN_COLUMNS = """
     run_id,
@@ -255,6 +267,7 @@ class SQLiteEvalStore(EvalStore):
 
     durable: ClassVar[bool] = True
     captured_results: ClassVar[bool] = True
+    scenarios: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -408,6 +421,146 @@ class SQLiteEvalStore(EvalStore):
             ).fetchall()
             items = [self._corpus_entry_from_row(row) for row in rows]
             return _bounded_corpus_page(items, query)
+
+        return await self._run(operation)
+
+    async def save_scenario(
+        self,
+        scenario: EvalScenarioDocumentV2,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalScenarioCatalogEntry:
+        scenario, document, inspection = await asyncio.to_thread(
+            _prepare_scenario_catalog_for_store,
+            scenario,
+            redact_json=redact_json,
+        )
+        document_text = document.decode("utf-8")
+
+        def operation(connection: sqlite3.Connection) -> EvalScenarioCatalogEntry:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                existing = connection.execute(
+                    "SELECT document_json FROM cayu_eval_scenarios WHERE revision = ?",
+                    (scenario.revision,),
+                ).fetchone()
+                if existing is not None:
+                    if existing["document_json"] != document_text:
+                        raise EvalScenarioConflict(
+                            f"Eval scenario revision {scenario.revision} has conflicting content."
+                        )
+                    entry = self._load_scenario_entry(connection, scenario.revision)
+                    assert entry is not None
+                    connection.commit()
+                    return entry
+                connection.execute(
+                    """
+                    INSERT INTO cayu_eval_scenarios (
+                        revision, scenario_id, target_key, name, description,
+                        event_count, input_event_count, approval_checkpoint_count,
+                        message_count, part_count, artifact_requirement_count,
+                        secret_requirement_count, document_json, document_bytes, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        scenario.revision,
+                        scenario.id,
+                        scenario.target_key,
+                        scenario.name,
+                        scenario.description,
+                        inspection.event_count,
+                        inspection.input_event_count,
+                        inspection.approval_checkpoint_count,
+                        inspection.message_count,
+                        inspection.part_count,
+                        inspection.artifact_requirement_count,
+                        inspection.secret_requirement_count,
+                        document_text,
+                        len(document),
+                        _format_datetime(datetime.now(UTC)),
+                    ),
+                )
+                entry = self._load_scenario_entry(connection, scenario.revision)
+                assert entry is not None
+                connection.commit()
+                return entry
+            except BaseException:
+                connection.rollback()
+                raise
+
+        return await self._run(operation)
+
+    async def load_scenario(
+        self,
+        revision: str,
+        *,
+        max_bytes: int = EVAL_SCENARIO_MAX_BYTES,
+    ) -> EvalScenarioDocumentV2 | None:
+        revision = _sha256_revision(revision, "revision")
+        max_bytes = _read_limit(max_bytes, hard_max=EVAL_SCENARIO_MAX_BYTES)
+
+        def operation(connection: sqlite3.Connection) -> str | None:
+            row = connection.execute(
+                """
+                SELECT document_json, document_bytes
+                FROM cayu_eval_scenarios
+                WHERE revision = ?
+                """,
+                (revision,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["document_bytes"] > max_bytes:
+                raise EvalStoreResultTooLarge(max_bytes)
+            return row["document_json"]
+
+        document = await self._run(operation)
+        if document is None:
+            return None
+        return await asyncio.to_thread(eval_scenario_from_json, document)
+
+    async def list_scenarios(
+        self,
+        query: EvalScenarioCatalogQuery | None = None,
+    ) -> EvalScenarioCatalogPage:
+        query = _copy_query(query, EvalScenarioCatalogQuery)
+        boundary = (
+            decode_scenario_cursor(query.cursor, query.target_key, query.scenario_id)
+            if query.cursor is not None
+            else None
+        )
+
+        def operation(connection: sqlite3.Connection) -> EvalScenarioCatalogPage:
+            clauses: list[str] = []
+            params: list[object] = []
+            if query.target_key is not None:
+                clauses.append("target_key = ?")
+                params.append(query.target_key)
+            if query.scenario_id is not None:
+                clauses.append("scenario_id = ?")
+                params.append(query.scenario_id)
+            if boundary is not None:
+                clauses.append("(created_at < ? OR (created_at = ? AND revision > ?))")
+                timestamp = _format_datetime(boundary[0])
+                params.extend((timestamp, timestamp, boundary[1]))
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            rows = connection.execute(
+                f"""
+                SELECT revision, scenario_id, target_key, name, description,
+                       event_count, input_event_count, approval_checkpoint_count,
+                       message_count, part_count, artifact_requirement_count,
+                       secret_requirement_count, document_bytes, created_at
+                FROM cayu_eval_scenarios
+                {where}
+                ORDER BY created_at DESC, revision ASC
+                LIMIT ?
+                """,
+                (*params, query.limit + 1),
+            ).fetchall()
+            return _bounded_scenario_page(
+                [self._scenario_entry_from_row(row) for row in rows],
+                query,
+            )
 
         return await self._run(operation)
 
@@ -1684,6 +1837,44 @@ class SQLiteEvalStore(EvalStore):
             case_count=row["case_count"],
             assertion_count=row["assertion_count"],
             expanded_assertion_result_count=row["expanded_assertion_result_count"],
+            document_bytes=row["document_bytes"],
+            created_at=sqlite_support.parse_datetime(row["created_at"]),
+        )
+
+    @classmethod
+    def _load_scenario_entry(
+        cls,
+        connection: sqlite3.Connection,
+        revision: str,
+    ) -> EvalScenarioCatalogEntry | None:
+        row = connection.execute(
+            """
+            SELECT revision, scenario_id, target_key, name, description,
+                   event_count, input_event_count, approval_checkpoint_count,
+                   message_count, part_count, artifact_requirement_count,
+                   secret_requirement_count, document_bytes, created_at
+            FROM cayu_eval_scenarios
+            WHERE revision = ?
+            """,
+            (revision,),
+        ).fetchone()
+        return None if row is None else cls._scenario_entry_from_row(row)
+
+    @staticmethod
+    def _scenario_entry_from_row(row: sqlite3.Row) -> EvalScenarioCatalogEntry:
+        return EvalScenarioCatalogEntry(
+            revision=row["revision"],
+            id=row["scenario_id"],
+            target_key=row["target_key"],
+            name=row["name"],
+            description=row["description"],
+            event_count=row["event_count"],
+            input_event_count=row["input_event_count"],
+            approval_checkpoint_count=row["approval_checkpoint_count"],
+            message_count=row["message_count"],
+            part_count=row["part_count"],
+            artifact_requirement_count=row["artifact_requirement_count"],
+            secret_requirement_count=row["secret_requirement_count"],
             document_bytes=row["document_bytes"],
             created_at=sqlite_support.parse_datetime(row["created_at"]),
         )

@@ -6,6 +6,7 @@ from contextlib import suppress
 
 import pytest
 from tests.evals.eval_store_conformance import (
+    _scenario,
     assert_captured_eval_store_conformance,
     assert_eval_store_conformance,
     assert_eval_store_reconstruction_releases_heartbeat_capacity,
@@ -110,7 +111,7 @@ def test_postgres_eval_store_shared_conformance(postgres_dsn) -> None:
     asyncio.run(exercise())
 
 
-def test_postgres_eval_store_creates_revision_fifty_schema(postgres_dsn) -> None:
+def test_postgres_eval_store_creates_revision_fifty_three_schema(postgres_dsn) -> None:
     async def exercise() -> None:
         import psycopg
 
@@ -130,13 +131,16 @@ def test_postgres_eval_store_creates_revision_fifty_schema(postgres_dsn) -> None
         ):
             await cur.execute(
                 "SELECT revision, kind, compatible_from FROM cayu_schema_migrations "
-                "WHERE revision IN (47, 48, 49, 50) ORDER BY revision"
+                "WHERE revision IN (47, 48, 49, 50, 51, 52, 53) ORDER BY revision"
             )
             assert await cur.fetchall() == [
                 (47, "breaking", 47),
                 (48, "breaking", 48),
                 (49, "breaking", 49),
                 (50, "breaking", 50),
+                (51, "additive", 50),
+                (52, "breaking", 52),
+                (53, "additive", 52),
             ]
             await cur.execute(
                 "SELECT data_type, is_nullable, column_default "
@@ -166,6 +170,7 @@ def test_postgres_eval_store_creates_revision_fifty_schema(postgres_dsn) -> None
                 "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() "
                 "AND (indexname LIKE 'idx_cayu_eval_runs_target_%' "
                 "OR indexname LIKE 'idx_cayu_eval_result_records_%' "
+                "OR indexname LIKE 'idx_cayu_eval_scenarios_%' "
                 "OR indexname = 'idx_cayu_eval_baseline_mutations_scope') "
                 "ORDER BY indexname"
             )
@@ -175,6 +180,9 @@ def test_postgres_eval_store_creates_revision_fifty_schema(postgres_dsn) -> None
                 "idx_cayu_eval_result_records_target_catalog",
                 "idx_cayu_eval_runs_target_catalog",
                 "idx_cayu_eval_runs_target_status_claim",
+                "idx_cayu_eval_scenarios_catalog",
+                "idx_cayu_eval_scenarios_id_catalog",
+                "idx_cayu_eval_scenarios_target_catalog",
             ]
             await cur.execute(
                 "SELECT tablename FROM pg_tables "
@@ -188,6 +196,7 @@ def test_postgres_eval_store_creates_revision_fifty_schema(postgres_dsn) -> None
                 "cayu_eval_result_records",
                 "cayu_eval_results",
                 "cayu_eval_runs",
+                "cayu_eval_scenarios",
                 "cayu_eval_suites",
             }
             await cur.execute(
@@ -217,6 +226,124 @@ def test_postgres_eval_store_creates_revision_fifty_schema(postgres_dsn) -> None
                 ("cayu_eval_runs", "run_id", "C"),
                 ("cayu_eval_suites", "suite_id", "C"),
             ]
+
+    asyncio.run(exercise())
+
+
+def test_postgres_revision_fifty_three_adds_scenarios_without_rewriting_corpora(
+    postgres_dsn,
+) -> None:
+    async def exercise() -> None:
+        import psycopg
+
+        from cayu.storage.evals_postgres import PostgresEvalStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _drop_eval_tables(postgres_dsn)
+        corpus = _corpus(trials=1)
+        initialized = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            await _save_corpus(initialized, corpus)
+        finally:
+            await initialized.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP TABLE cayu_eval_scenarios")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 53")
+            await conn.commit()
+
+        migrated = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            assert await migrated.load_corpus(corpus.revision) == corpus
+            assert (await migrated.list_scenarios()).items == ()
+        finally:
+            await migrated.close()
+
+    asyncio.run(exercise())
+
+
+def test_postgres_revision_fifty_three_rejects_missing_scenario_constraint(
+    postgres_dsn,
+) -> None:
+    async def exercise() -> None:
+        import psycopg
+
+        from cayu.storage.evals_postgres import PostgresEvalStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _drop_eval_tables(postgres_dsn)
+        initialized = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            await initialized.list_scenarios()
+        finally:
+            await initialized.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "ALTER TABLE cayu_eval_scenarios DROP CONSTRAINT "
+                    "cayu_eval_scenarios_document_size_check"
+                )
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 53")
+            await conn.commit()
+
+        conflicting = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(RuntimeError, match="eval scenario constraints"):
+                await conflicting.list_scenarios()
+        finally:
+            await conflicting.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT 1 FROM cayu_schema_migrations WHERE revision = 53")
+            assert await cur.fetchone() is None
+
+    asyncio.run(exercise())
+
+
+def test_postgres_revision_fifty_three_rejects_unique_scenario_catalog_index(
+    postgres_dsn,
+) -> None:
+    async def exercise() -> None:
+        import psycopg
+
+        from cayu.storage.evals_postgres import PostgresEvalStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _drop_eval_tables(postgres_dsn)
+        initialized = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            await initialized.list_scenarios()
+        finally:
+            await initialized.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP INDEX idx_cayu_eval_scenarios_catalog")
+                await cur.execute(
+                    "CREATE UNIQUE INDEX idx_cayu_eval_scenarios_catalog "
+                    "ON cayu_eval_scenarios(created_at DESC, revision ASC)"
+                )
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 53")
+            await conn.commit()
+
+        conflicting = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(RuntimeError, match="idx_cayu_eval_scenarios_catalog"):
+                await conflicting.list_scenarios()
+        finally:
+            await conflicting.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT 1 FROM cayu_schema_migrations WHERE revision = 53")
+            assert await cur.fetchone() is None
 
     asyncio.run(exercise())
 
@@ -343,6 +470,8 @@ def test_postgres_eval_store_is_restart_durable_and_idempotent(postgres_dsn) -> 
         )
         try:
             await _save_corpus(first, corpus)
+            scenario = _scenario(corpus, text="Persist this scenario.")
+            await first.save_scenario(scenario, redact_json=_NO_SECRETS.redact_json)
             admitted = await _admit_run(first, _request(corpus))
             assert admitted.status is EvalRunStatus.QUEUED
             claimed = await first.claim_run()
@@ -381,6 +510,7 @@ def test_postgres_eval_store_is_restart_durable_and_idempotent(postgres_dsn) -> 
         )
         try:
             assert await reopened.load_corpus(corpus.revision) == corpus
+            assert await reopened.load_scenario(scenario.revision) == scenario
             assert await reopened.load_run(completed.id) == completed
             assert await reopened.load_result(completed.id) == result
             assert await reopened.load_result_by_revision(result.revision) == result

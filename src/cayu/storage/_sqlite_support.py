@@ -2555,6 +2555,56 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_targeted_tool_grant_uses_grant
             ON cayu_targeted_tool_grant_uses(grant_id, bound_at, use_id);
     """,
+    53: """
+        CREATE TABLE IF NOT EXISTS cayu_eval_scenarios (
+            revision TEXT PRIMARY KEY,
+            scenario_id TEXT COLLATE BINARY NOT NULL,
+            target_key TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            event_count INTEGER NOT NULL
+                CONSTRAINT cayu_eval_scenarios_event_count_check
+                CHECK (event_count >= 1 AND event_count <= 1024),
+            input_event_count INTEGER NOT NULL
+                CONSTRAINT cayu_eval_scenarios_input_event_count_check
+                CHECK (input_event_count >= 1 AND input_event_count <= 1024),
+            approval_checkpoint_count INTEGER NOT NULL
+                CONSTRAINT cayu_eval_scenarios_approval_checkpoint_count_check
+                CHECK (approval_checkpoint_count >= 0
+                    AND approval_checkpoint_count <= 1024),
+            message_count INTEGER NOT NULL
+                CONSTRAINT cayu_eval_scenarios_message_count_check
+                CHECK (message_count >= input_event_count AND message_count <= 32768),
+            part_count INTEGER NOT NULL
+                CONSTRAINT cayu_eval_scenarios_part_count_check
+                CHECK (part_count >= message_count AND part_count <= 1048576),
+            artifact_requirement_count INTEGER NOT NULL
+                CONSTRAINT cayu_eval_scenarios_artifact_requirement_count_check
+                CHECK (artifact_requirement_count >= 0
+                    AND artifact_requirement_count <= 128),
+            secret_requirement_count INTEGER NOT NULL
+                CONSTRAINT cayu_eval_scenarios_secret_requirement_count_check
+                CHECK (secret_requirement_count >= 0
+                    AND secret_requirement_count <= 128),
+            document_json TEXT NOT NULL
+                CONSTRAINT cayu_eval_scenarios_document_json_check
+                CHECK (json_valid(document_json)),
+            document_bytes INTEGER NOT NULL
+                CONSTRAINT cayu_eval_scenarios_document_bytes_check
+                CHECK (document_bytes >= 1 AND document_bytes <= 8388608)
+                CONSTRAINT cayu_eval_scenarios_document_size_check
+                CHECK (document_bytes = length(CAST(document_json AS BLOB))),
+            created_at TEXT NOT NULL,
+            CONSTRAINT cayu_eval_scenarios_event_partition_check
+                CHECK (input_event_count + approval_checkpoint_count = event_count)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_eval_scenarios_catalog
+            ON cayu_eval_scenarios(created_at DESC, revision ASC);
+        CREATE INDEX IF NOT EXISTS idx_cayu_eval_scenarios_target_catalog
+            ON cayu_eval_scenarios(target_key, created_at DESC, revision ASC);
+        CREATE INDEX IF NOT EXISTS idx_cayu_eval_scenarios_id_catalog
+            ON cayu_eval_scenarios(scenario_id, created_at DESC, revision ASC);
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -3717,6 +3767,8 @@ def reconcile_schema(
         _validate_memory_evidence_schema(connection)
     if app_min_supported >= 52:
         _validate_targeted_tool_grant_schema(connection)
+    if app_min_supported >= 53:
+        _validate_eval_scenario_schema(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -4969,6 +5021,116 @@ def _validate_captured_eval_case_schema(connection: sqlite3.Connection) -> None:
         )
 
 
+def _validate_eval_scenario_schema(connection: sqlite3.Connection) -> None:
+    expected_columns = (
+        ("revision", "TEXT", 0, 1),
+        ("scenario_id", "TEXT", 1, 0),
+        ("target_key", "TEXT", 1, 0),
+        ("name", "TEXT", 1, 0),
+        ("description", "TEXT", 0, 0),
+        ("event_count", "INTEGER", 1, 0),
+        ("input_event_count", "INTEGER", 1, 0),
+        ("approval_checkpoint_count", "INTEGER", 1, 0),
+        ("message_count", "INTEGER", 1, 0),
+        ("part_count", "INTEGER", 1, 0),
+        ("artifact_requirement_count", "INTEGER", 1, 0),
+        ("secret_requirement_count", "INTEGER", 1, 0),
+        ("document_json", "TEXT", 1, 0),
+        ("document_bytes", "INTEGER", 1, 0),
+        ("created_at", "TEXT", 1, 0),
+    )
+    actual_columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(cayu_eval_scenarios)")
+    )
+    if actual_columns != expected_columns:
+        raise RuntimeError(
+            "SQLite schema object 'cayu_eval_scenarios' conflicts with Cayu's "
+            "revision-53 portable scenario contract. Run `cayu storage migrate` "
+            "or restore the database from a known-good backup."
+        )
+    table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cayu_eval_scenarios'"
+    ).fetchone()
+    normalized_table = (
+        ""
+        if table_row is None or table_row[0] is None
+        else "".join(str(table_row[0]).lower().split())
+    )
+    required_constraints = (
+        "constraintcayu_eval_scenarios_event_count_checkcheck(event_count>=1andevent_count<=1024)",
+        "constraintcayu_eval_scenarios_input_event_count_checkcheck(input_event_count>=1andinput_event_count<=1024)",
+        "constraintcayu_eval_scenarios_approval_checkpoint_count_checkcheck(approval_checkpoint_count>=0andapproval_checkpoint_count<=1024)",
+        "constraintcayu_eval_scenarios_message_count_checkcheck(message_count>=input_event_countandmessage_count<=32768)",
+        "constraintcayu_eval_scenarios_part_count_checkcheck(part_count>=message_countandpart_count<=1048576)",
+        "constraintcayu_eval_scenarios_artifact_requirement_count_checkcheck(artifact_requirement_count>=0andartifact_requirement_count<=128)",
+        "constraintcayu_eval_scenarios_secret_requirement_count_checkcheck(secret_requirement_count>=0andsecret_requirement_count<=128)",
+        "constraintcayu_eval_scenarios_document_json_checkcheck(json_valid(document_json))",
+        "constraintcayu_eval_scenarios_document_bytes_checkcheck(document_bytes>=1anddocument_bytes<=8388608)",
+        "constraintcayu_eval_scenarios_document_size_checkcheck(document_bytes=length(cast(document_jsonasblob)))",
+        "constraintcayu_eval_scenarios_event_partition_checkcheck(input_event_count+approval_checkpoint_count=event_count)",
+    )
+    if "collatenocase" in normalized_table or any(
+        fragment not in normalized_table for fragment in required_constraints
+    ):
+        raise RuntimeError(
+            "SQLite schema object 'cayu_eval_scenarios' is missing Cayu's "
+            "revision-53 scenario safety constraints. Run `cayu storage migrate` "
+            "or restore the database from a known-good backup."
+        )
+    index_rows = tuple(connection.execute("PRAGMA index_list(cayu_eval_scenarios)"))
+    if any(bool(row[2]) and str(row[3]) in {"c", "u"} for row in index_rows):
+        raise RuntimeError(
+            "SQLite schema object 'cayu_eval_scenarios' has an unexpected unique "
+            "constraint or index under Cayu's revision-53 scenario contract. Run "
+            "`cayu storage migrate` or restore the database from a known-good backup."
+        )
+    expected_indexes = {
+        "idx_cayu_eval_scenarios_catalog": (
+            ("created_at", 1, "BINARY"),
+            ("revision", 0, "BINARY"),
+        ),
+        "idx_cayu_eval_scenarios_id_catalog": (
+            ("scenario_id", 0, "BINARY"),
+            ("created_at", 1, "BINARY"),
+            ("revision", 0, "BINARY"),
+        ),
+        "idx_cayu_eval_scenarios_target_catalog": (
+            ("target_key", 0, "BINARY"),
+            ("created_at", 1, "BINARY"),
+            ("revision", 0, "BINARY"),
+        ),
+    }
+    for index_name, expected_index_columns in expected_indexes.items():
+        index_row = connection.execute(
+            "SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index_name,),
+        ).fetchone()
+        index_metadata = next(
+            (row for row in index_rows if str(row[1]) == index_name),
+            None,
+        )
+        actual_index_columns = tuple(
+            (str(row[2]), int(row[3]), str(row[4]).upper())
+            for row in connection.execute(f"PRAGMA index_xinfo({index_name})")
+            if bool(row[5])
+        )
+        if (
+            index_row is None
+            or str(index_row[0]) != "cayu_eval_scenarios"
+            or index_metadata is None
+            or bool(index_metadata[2])
+            or str(index_metadata[3]) != "c"
+            or bool(index_metadata[4])
+            or actual_index_columns != expected_index_columns
+        ):
+            raise RuntimeError(
+                f"SQLite schema object {index_name!r} conflicts with Cayu's "
+                "revision-53 scenario catalog contract. Run `cayu storage migrate` "
+                "or restore the database from a known-good backup."
+            )
+
+
 def _validate_verified_work_schema(connection: sqlite3.Connection) -> None:
     task_columns = {
         str(row[1]): (str(row[2]).upper(), int(row[3]))
@@ -5694,6 +5856,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_memory_evidence_schema(connection)
         if rev.revision == 52:
             _validate_targeted_tool_grant_schema(connection)
+        if rev.revision == 53:
+            _validate_eval_scenario_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 
