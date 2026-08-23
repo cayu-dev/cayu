@@ -485,7 +485,14 @@ def test_session_export_and_import_reject_future_root_checkpoint_versions() -> N
     assert "must-not-appear" not in str(caught.value)
 
 
-@pytest.mark.parametrize("missing_field", ["transcript_records", "deferred_interaction_input"])
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "transcript_records",
+        "deferred_interaction_input",
+        "targeted_tool_grant_state",
+    ],
+)
 def test_import_sessions_rejects_incomplete_session_export(missing_field: str):
     session = SessionIdentity(provider_name="fake", model="fake-model")
 
@@ -507,6 +514,11 @@ def test_import_sessions_rejects_incomplete_session_export(missing_field: str):
                 "transcript_records": [],
                 "checkpoint": None,
                 "deferred_interaction_input": None,
+                "targeted_tool_grant_state": {
+                    "schema_version": 1,
+                    "records": [],
+                    "uses": [],
+                },
             }
         )
 
@@ -536,6 +548,11 @@ def test_import_sessions_rejects_removed_bare_transcript_field():
                 "transcript_records": [],
                 "checkpoint": None,
                 "deferred_interaction_input": None,
+                "targeted_tool_grant_state": {
+                    "schema_version": 1,
+                    "records": [],
+                    "uses": [],
+                },
             }
         )
 

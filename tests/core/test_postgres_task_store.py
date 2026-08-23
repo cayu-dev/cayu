@@ -116,6 +116,8 @@ _TABLES = (
     "cayu_event_watcher_state",
     "cayu_budget_reservation_identities",
     "cayu_events",
+    "cayu_targeted_tool_grant_uses",
+    "cayu_targeted_tool_grants",
     "cayu_public_authority_aliases",
     "cayu_public_authority_alias_keys",
     "cayu_transcript_search_configuration",

@@ -306,6 +306,53 @@ _BASELINE_DDL = """
     CREATE INDEX IF NOT EXISTS idx_cayu_public_authority_private_value
         ON cayu_public_authority_aliases(field_name, scope_session_id, private_value);
 
+    CREATE INDEX IF NOT EXISTS idx_cayu_public_authority_public_alias
+        ON cayu_public_authority_aliases(field_name, public_alias);
+
+    CREATE TABLE IF NOT EXISTS cayu_targeted_tool_grants (
+        grant_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+        interaction_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        tool_ref TEXT NOT NULL,
+        generation_id TEXT NOT NULL,
+        tool_id TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        catalogue_revision TEXT NOT NULL,
+        descriptor_version TEXT NOT NULL,
+        issued_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        max_calls INTEGER NOT NULL CHECK (max_calls >= 1 AND max_calls <= 32),
+        used_calls INTEGER NOT NULL DEFAULT 0
+            CHECK (used_calls >= 0 AND used_calls <= max_calls),
+        revoked_at TEXT,
+        record_json TEXT NOT NULL CHECK (json_valid(record_json)),
+        UNIQUE (session_id, interaction_id, request_id),
+        UNIQUE (session_id, interaction_id, tool_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_cayu_targeted_tool_grants_interaction
+        ON cayu_targeted_tool_grants(session_id, interaction_id, issued_at, grant_id);
+
+    CREATE TABLE IF NOT EXISTS cayu_targeted_tool_grant_uses (
+        use_id TEXT PRIMARY KEY,
+        grant_id TEXT NOT NULL
+            REFERENCES cayu_targeted_tool_grants(grant_id) ON DELETE CASCADE,
+        session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+        interaction_id TEXT NOT NULL,
+        model_step_id TEXT NOT NULL,
+        outer_tool_call_id TEXT NOT NULL,
+        arguments_sha256 TEXT NOT NULL,
+        invocation_id TEXT NOT NULL,
+        bound_at TEXT NOT NULL,
+        record_json TEXT NOT NULL CHECK (json_valid(record_json)),
+        UNIQUE (session_id, interaction_id, invocation_id),
+        UNIQUE (session_id, interaction_id, outer_tool_call_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_cayu_targeted_tool_grant_uses_grant
+        ON cayu_targeted_tool_grant_uses(grant_id, bound_at, use_id);
+
     CREATE TABLE IF NOT EXISTS cayu_public_authority_alias_keys (
         key_id TEXT PRIMARY KEY,
         fingerprint TEXT NOT NULL,
@@ -2464,6 +2511,50 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_recall_item_exposures_receipt
             ON cayu_recall_item_exposures(receipt_id, exposure_id, ordinal);
     """,
+    52: """
+        CREATE INDEX IF NOT EXISTS idx_cayu_public_authority_public_alias
+            ON cayu_public_authority_aliases(field_name, public_alias);
+        CREATE TABLE IF NOT EXISTS cayu_targeted_tool_grants (
+            grant_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            interaction_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            tool_ref TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            tool_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            catalogue_revision TEXT NOT NULL,
+            descriptor_version TEXT NOT NULL,
+            issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            max_calls INTEGER NOT NULL CHECK (max_calls >= 1 AND max_calls <= 32),
+            used_calls INTEGER NOT NULL DEFAULT 0
+                CHECK (used_calls >= 0 AND used_calls <= max_calls),
+            revoked_at TEXT,
+            record_json TEXT NOT NULL CHECK (json_valid(record_json)),
+            UNIQUE (session_id, interaction_id, request_id),
+            UNIQUE (session_id, interaction_id, tool_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_targeted_tool_grants_interaction
+            ON cayu_targeted_tool_grants(session_id, interaction_id, issued_at, grant_id);
+        CREATE TABLE IF NOT EXISTS cayu_targeted_tool_grant_uses (
+            use_id TEXT PRIMARY KEY,
+            grant_id TEXT NOT NULL
+                REFERENCES cayu_targeted_tool_grants(grant_id) ON DELETE CASCADE,
+            session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            interaction_id TEXT NOT NULL,
+            model_step_id TEXT NOT NULL,
+            outer_tool_call_id TEXT NOT NULL,
+            arguments_sha256 TEXT NOT NULL,
+            invocation_id TEXT NOT NULL,
+            bound_at TEXT NOT NULL,
+            record_json TEXT NOT NULL CHECK (json_valid(record_json)),
+            UNIQUE (session_id, interaction_id, invocation_id),
+            UNIQUE (session_id, interaction_id, outer_tool_call_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_targeted_tool_grant_uses_grant
+            ON cayu_targeted_tool_grant_uses(grant_id, bound_at, use_id);
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -2606,6 +2697,17 @@ def _reject_populated_pre_invocation_database(connection: sqlite3.Connection) ->
             "Storage revision 36 requires invocation provenance for every session and "
             "cannot migrate a populated Cayu session database. Recreate the Cayu "
             "database before starting this build."
+        )
+
+
+def _reject_populated_pre_targeted_tool_grant_database(
+    connection: sqlite3.Connection,
+) -> None:
+    if connection.execute("SELECT EXISTS(SELECT 1 FROM cayu_sessions)").fetchone()[0]:
+        raise schema.SchemaTooOld(
+            "Storage revision 52 is a clean prerelease break and cannot migrate a "
+            "populated Cayu session database. Recreate the Cayu database before "
+            "starting this build."
         )
 
 
@@ -3613,6 +3715,8 @@ def reconcile_schema(
         _validate_eval_run_invocation_column(connection)
     if app_min_supported >= 51:
         _validate_memory_evidence_schema(connection)
+    if app_min_supported >= 52:
+        _validate_targeted_tool_grant_schema(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -3626,6 +3730,124 @@ def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
             "Cayu's required invocation-provenance contract. Recreate the Cayu "
             "database from a known-good revision-36 schema."
         )
+
+
+def _validate_targeted_tool_grant_schema(connection: sqlite3.Connection) -> None:
+    expected_columns = {
+        "cayu_targeted_tool_grants": (
+            ("grant_id", "TEXT", 0, 1),
+            ("session_id", "TEXT", 1, 0),
+            ("interaction_id", "TEXT", 1, 0),
+            ("request_id", "TEXT", 1, 0),
+            ("tool_ref", "TEXT", 1, 0),
+            ("generation_id", "TEXT", 1, 0),
+            ("tool_id", "TEXT", 1, 0),
+            ("tool_name", "TEXT", 1, 0),
+            ("catalogue_revision", "TEXT", 1, 0),
+            ("descriptor_version", "TEXT", 1, 0),
+            ("issued_at", "TEXT", 1, 0),
+            ("expires_at", "TEXT", 1, 0),
+            ("max_calls", "INTEGER", 1, 0),
+            ("used_calls", "INTEGER", 1, 0),
+            ("revoked_at", "TEXT", 0, 0),
+            ("record_json", "TEXT", 1, 0),
+        ),
+        "cayu_targeted_tool_grant_uses": (
+            ("use_id", "TEXT", 0, 1),
+            ("grant_id", "TEXT", 1, 0),
+            ("session_id", "TEXT", 1, 0),
+            ("interaction_id", "TEXT", 1, 0),
+            ("model_step_id", "TEXT", 1, 0),
+            ("outer_tool_call_id", "TEXT", 1, 0),
+            ("arguments_sha256", "TEXT", 1, 0),
+            ("invocation_id", "TEXT", 1, 0),
+            ("bound_at", "TEXT", 1, 0),
+            ("record_json", "TEXT", 1, 0),
+        ),
+    }
+    for table, expected in expected_columns.items():
+        actual = tuple(
+            (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        )
+        if actual != expected:
+            raise RuntimeError(
+                f"SQLite schema object {table!r} conflicts with Cayu's revision-52 "
+                "targeted-grant durability contract. Run `cayu storage migrate` or "
+                "restore the database from a known-good backup."
+            )
+
+    required_indexes = {
+        "cayu_public_authority_aliases": {
+            (False, ("field_name", "public_alias")),
+        },
+        "cayu_targeted_tool_grants": {
+            (False, ("session_id", "interaction_id", "issued_at", "grant_id")),
+            (True, ("session_id", "interaction_id", "request_id")),
+            (True, ("session_id", "interaction_id", "tool_id")),
+        },
+        "cayu_targeted_tool_grant_uses": {
+            (False, ("grant_id", "bound_at", "use_id")),
+            (True, ("session_id", "interaction_id", "invocation_id")),
+            (True, ("session_id", "interaction_id", "outer_tool_call_id")),
+        },
+    }
+    for table, required in required_indexes.items():
+        actual: set[tuple[bool, tuple[str, ...]]] = set()
+        for index_row in connection.execute(f"PRAGMA index_list({table})"):
+            columns = tuple(
+                str(column_row[0])
+                for column_row in connection.execute(
+                    "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+                    (str(index_row[1]),),
+                )
+            )
+            actual.add((bool(index_row[2]), columns))
+        if not required <= actual:
+            raise RuntimeError(
+                f"SQLite indexes for {table!r} conflict with Cayu's revision-52 "
+                "targeted-grant contention contract."
+            )
+
+    expected_foreign_keys = {
+        "cayu_targeted_tool_grants": {
+            ("cayu_sessions", "session_id", "id", "CASCADE"),
+        },
+        "cayu_targeted_tool_grant_uses": {
+            ("cayu_targeted_tool_grants", "grant_id", "grant_id", "CASCADE"),
+            ("cayu_sessions", "session_id", "id", "CASCADE"),
+        },
+    }
+    for table, expected in expected_foreign_keys.items():
+        actual_foreign_keys: set[tuple[str, str, str, str]] = {
+            (str(row[2]), str(row[3]), str(row[4]), str(row[6]).upper())
+            for row in connection.execute(f"PRAGMA foreign_key_list({table})")
+        }
+        if actual_foreign_keys != expected:
+            raise RuntimeError(
+                f"SQLite foreign keys for {table!r} conflict with Cayu's revision-52 "
+                "targeted-grant scope contract."
+            )
+
+    required_table_fragments = {
+        "cayu_targeted_tool_grants": {
+            "check(max_calls>=1andmax_calls<=32)",
+            "check(used_calls>=0andused_calls<=max_calls)",
+            "check(json_valid(record_json))",
+        },
+        "cayu_targeted_tool_grant_uses": {"check(json_valid(record_json))"},
+    }
+    for table, required in required_table_fragments.items():
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        normalized = "" if row is None or row[0] is None else "".join(str(row[0]).lower().split())
+        if any(fragment not in normalized for fragment in required):
+            raise RuntimeError(
+                f"SQLite checks for {table!r} conflict with Cayu's revision-52 "
+                "targeted-grant budget contract."
+            )
 
 
 def _validate_revision_42_knowledge_schema(connection: sqlite3.Connection) -> None:
@@ -5369,6 +5591,12 @@ def _apply_pending(connection: sqlite3.Connection, state: schema.SchemaState) ->
         _reject_populated_pre_knowledge_revision_database(connection)
     if current < 46 and any(revision.revision == 46 for revision in schema.pending(current)):
         _reject_populated_pre_transcript_search_database(connection)
+    if (
+        current != schema.UNINITIALIZED
+        and current < 52
+        and any(revision.revision == 52 for revision in schema.pending(current))
+    ):
+        _reject_populated_pre_targeted_tool_grant_database(connection)
     if current == schema.UNINITIALIZED:
         _apply_baseline(connection)
         current = schema.BASELINE_REVISION
@@ -5427,6 +5655,10 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             # BEGIN IMMEDIATE fences transcript writers between the clean-break
             # check and installation of the final non-null projection.
             _reject_populated_pre_transcript_search_database(connection)
+        if rev.revision == 52:
+            # BEGIN IMMEDIATE fences session writers between the clean-break
+            # check and installation of targeted-grant durability.
+            _reject_populated_pre_targeted_tool_grant_database(connection)
         for table, column, decl in _MIGRATION_ADD_COLUMNS.get(rev.revision, ()):
             _add_column_if_missing(connection, table, column, decl)
         for table, column in _MIGRATION_DROP_COLUMNS.get(rev.revision, ()):
@@ -5460,6 +5692,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_eval_run_invocation_column(connection)
         if rev.revision == 51:
             _validate_memory_evidence_schema(connection)
+        if rev.revision == 52:
+            _validate_targeted_tool_grant_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

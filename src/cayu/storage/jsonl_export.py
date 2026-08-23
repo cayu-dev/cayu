@@ -38,7 +38,7 @@ from cayu._validation import (
     reject_nonportable_json_constant,
     require_durable_text,
 )
-from cayu.core import Event, Message
+from cayu.core import Event, EventType, Message
 from cayu.runtime.checkpoints import decode_runtime_checkpoint
 from cayu.runtime.sessions import (
     DeferredInteractionInput,
@@ -51,6 +51,10 @@ from cayu.runtime.sessions import (
     restore_persisted_event_authority,
 )
 from cayu.runtime.tasks import Task, TaskOrder, TaskQuery, TaskStore
+from cayu.runtime.tool_grants import (
+    TargetedToolGrantStateSnapshot,
+    validate_targeted_tool_grant_batch_evidence,
+)
 
 _EXPORT_PAGE_SIZE = 1000
 _SESSION_RECORD_FIELDS = frozenset(
@@ -61,6 +65,7 @@ _SESSION_RECORD_FIELDS = frozenset(
         "transcript_records",
         "checkpoint",
         "deferred_interaction_input",
+        "targeted_tool_grant_state",
     }
 )
 
@@ -111,6 +116,11 @@ async def export_sessions(store: SessionStore, *, stream: _TextStream) -> int:
                 session_id=session.id,
             )
             deferred_interaction_input = await store.load_deferred_interaction_input(session.id)
+            targeted_tool_grant_state = (
+                await store.load_targeted_tool_grant_state(session.id)
+                if store.supports_targeted_tool_grants
+                else TargetedToolGrantStateSnapshot()
+            )
             _write_line(
                 stream,
                 {
@@ -126,6 +136,7 @@ async def export_sessions(store: SessionStore, *, stream: _TextStream) -> int:
                         if deferred_interaction_input is None
                         else deferred_interaction_input.model_dump(mode="json")
                     ),
+                    "targeted_tool_grant_state": targeted_tool_grant_state.model_dump(mode="json"),
                 },
             )
             count += 1
@@ -213,6 +224,7 @@ class ImportedSession:
     transcript_records: list[TranscriptRecord]
     checkpoint: dict[str, Any] | None
     deferred_interaction_input: DeferredInteractionInput | None
+    targeted_tool_grant_state: TargetedToolGrantStateSnapshot
 
 
 def _iter_json_lines(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
@@ -287,15 +299,42 @@ def import_sessions(lines: Iterable[str]) -> Iterator[ImportedSession]:
         if any(current <= previous for previous, current in pairwise(transcript_indices)):
             raise ValueError("Session transcript record indices must be strictly increasing.")
         transcript = [record.message for record in transcript_records]
+        targeted_tool_grant_state = TargetedToolGrantStateSnapshot.model_validate(
+            obj["targeted_tool_grant_state"]
+        )
+        if any(record.session_id != session.id for record in targeted_tool_grant_state.records):
+            raise ValueError("Targeted grant state belongs to a different session.")
+        events = [
+            restore_persisted_event_authority(
+                Event.model_validate(event),
+                input_contract_runtime_owned=True,
+            )
+            for event in obj["events"]
+        ]
+        records_by_interaction: dict[str, list] = {}
+        for record in targeted_tool_grant_state.records:
+            records_by_interaction.setdefault(record.interaction_id, []).append(record)
+        validated_interactions: set[str] = set()
+        for event in events:
+            carries_targeted_admission = event.type is EventType.INTERACTION_STARTED and (
+                "targeted_tool_grant_count" in event.payload
+                or "targeted_tool_grant_batch_fingerprint" in event.payload
+                or event.interaction_id in records_by_interaction
+            )
+            if not carries_targeted_admission:
+                continue
+            if event.interaction_id is None or event.interaction_id in validated_interactions:
+                raise ValueError("Targeted grant state has ambiguous interaction admission.")
+            validate_targeted_tool_grant_batch_evidence(
+                tuple(records_by_interaction.get(event.interaction_id, ())),
+                event,
+            )
+            validated_interactions.add(event.interaction_id)
+        if validated_interactions != set(records_by_interaction):
+            raise ValueError("Targeted grant state has no matching interaction admission.")
         yield ImportedSession(
             session=session,
-            events=[
-                restore_persisted_event_authority(
-                    Event.model_validate(event),
-                    input_contract_runtime_owned=True,
-                )
-                for event in obj["events"]
-            ],
+            events=events,
             transcript=transcript,
             transcript_records=transcript_records,
             checkpoint=checkpoint,
@@ -304,6 +343,7 @@ def import_sessions(lines: Iterable[str]) -> Iterator[ImportedSession]:
                 if obj["deferred_interaction_input"] is None
                 else DeferredInteractionInput.model_validate(obj["deferred_interaction_input"])
             ),
+            targeted_tool_grant_state=targeted_tool_grant_state,
         )
 
 

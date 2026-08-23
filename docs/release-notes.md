@@ -89,6 +89,37 @@ guard.
 
 ## Unreleased
 
+### Targeted tool grants add durable interaction-scoped addressability
+
+`RunRequest` and `ResumeRequest` can now carry strict `TargetedToolGrant`
+requests for one canonical tool already registered inside the session's durable
+capability ceiling. Cayu issues an opaque interaction-scoped reference backed by
+durable expiry, revocation, and positive call-budget state. Exact retries rejoin
+one digest-only consumption binding; altered replay, copied references, scope or
+catalogue drift, task-boundary changes, and exhausted grants fail closed. Forks
+copy no targeted grant or consumption authority and record an explicit reset
+event.
+
+Targeted grants do not expose another provider tool definition and do not
+authorize or execute a target. This release intentionally contains no
+model-visible `call_tool` gateway; existing direct provider tools, policies,
+approvals, and execution behavior are unchanged. Authenticated application
+inspection can retrieve the opaque reference, while general events and request
+footprints retain only bounded identities and counts.
+
+Server contract version 20 adds the targeted-grant admission count and batch
+fingerprint to interaction summary evidence. Independently deployed servers,
+generated clients, and dashboards must be upgraded together.
+
+Storage revision 52 adds first-class grant and digest-only use tables plus the
+public-alias lookup needed for opaque references. Current session stores require
+revision 52. Revision 52 is a clean prerelease break: stop revision-51 workers,
+back up and recreate populated SQLite or PostgreSQL session stores, then run
+`cayu storage migrate` for empty stores and confirm revision 52 before starting
+this build. Migration rejects populated pre-52 session stores without mutation;
+there is no fork-evidence backfill or legacy replay path. Do not run mixed
+revision-51/revision-52 fleets.
+
 ### Captured and fresh Evals share one release gate
 
 The Control Plane now compares immutable captured-session and fresh-execution
@@ -424,12 +455,12 @@ workers together. The server contract advances from version 10 to version 16,
 and the public application manifest and generator plan advance from schema 7
 to schema 9.
 
-The storage schema advances from revision 36 to revision 51. Follow the
-revision-specific migration boundaries below: revisions 39 through 50 contain
+The storage schema advances from revision 36 to revision 52. Follow the
+revision-specific migration boundaries below: revisions 39 through 52 contain
 breaking durable contracts, and populated legacy knowledge or task stores may
 require the explicitly documented rebuild or drain procedure. Run `cayu storage
 status` followed by `cayu storage migrate` against every configured SQLite or
-PostgreSQL store, and confirm revision 51 with no pending migrations before
+PostgreSQL store, and confirm revision 52 with no pending migrations before
 starting `v0.3.0` workers. Mixed-version deployment and application-only
 rollback across these boundaries are unsupported.
 

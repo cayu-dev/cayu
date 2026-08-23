@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, m
 
 from cayu._validation import require_clean_nonblank
 from cayu.core.events import Event, EventType
+from cayu.runtime.tool_grants import TARGETED_TOOL_GRANT_MAX_REQUESTS
 from cayu.runtime.usage import (
     USAGE_BEARING_EVENT_TYPES,
     AggregateUsageMetrics,
@@ -111,6 +112,17 @@ class InteractionSummaryEvidence(BaseModel):
     provider_names: list[str] = Field(default_factory=list)
     models: list[str] = Field(default_factory=list)
     pending_action_kind: str | None = None
+    targeted_tool_grant_count: StrictInt | None = Field(
+        default=None,
+        ge=1,
+        le=TARGETED_TOOL_GRANT_MAX_REQUESTS,
+        exclude_if=lambda value: value is None,
+    )
+    targeted_tool_grant_batch_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+        exclude_if=lambda value: value is None,
+    )
 
     @field_validator("token_usage", mode="before")
     @classmethod
@@ -148,6 +160,10 @@ class InteractionSummaryEvidence(BaseModel):
 
     @model_validator(mode="after")
     def validate_ranges_and_terminal_time(self) -> InteractionSummaryEvidence:
+        if (self.targeted_tool_grant_count is None) != (
+            self.targeted_tool_grant_batch_fingerprint is None
+        ):
+            raise ValueError("Targeted grant count and batch fingerprint must be present together.")
         for label, start, end in (
             ("source transcript", self.source_transcript_start, self.source_transcript_end),
             ("result transcript", self.result_transcript_start, self.result_transcript_end),

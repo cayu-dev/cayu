@@ -421,9 +421,11 @@ from cayu.runtime.request_footprints import (
     PromptContributionManifest,
     RequestFootprintConfig,
     RequestVariant,
+    TargetedToolGrantFootprint,
     analyze_request_footprint,
     build_prompt_contribution_manifest,
     copy_request_footprint_config,
+    targeted_tool_grant_footprint,
 )
 from cayu.runtime.retry_policy import (
     RetryPolicy,
@@ -580,6 +582,18 @@ from cayu.runtime.tool_exposure import (
     session_metadata_with_tool_capability_ceiling,
     tool_capability_ceiling_from_session_metadata,
     validate_resolved_tool_exposure_authority,
+)
+from cayu.runtime.tool_grants import (
+    PreparedTargetedToolGrant,
+    TargetedToolGrant,
+    TargetedToolGrantRecord,
+    TargetedToolUseRejectionReason,
+    build_targeted_tool_grant_record,
+    copy_targeted_tool_grant_record,
+    prepare_targeted_tool_grants,
+    prepared_targeted_tool_grant_batch_fingerprint,
+    targeted_tool_grant_event,
+    targeted_tool_view_generation_id,
 )
 from cayu.runtime.tool_policy import (
     metadata_with_taint_labels,
@@ -2838,6 +2852,7 @@ class _PreparedInitialRun:
     prompt_contributions: tuple[Any, ...]
     execution_profile: ExecutionProfileIdentity
     tool_capability_ceiling: ToolCapabilityCeiling
+    targeted_tool_grants: tuple[PreparedTargetedToolGrant, ...]
     budget_policy: BudgetPolicy | None
     session_identity: SessionIdentity
 
@@ -5770,12 +5785,14 @@ class SessionEngine:
         registered_agent: runtime_records.RegisteredAgentState,
         environment_name: str | None,
         interaction_id: str,
+        targeted_tool_grants: tuple[PreparedTargetedToolGrant, ...] = (),
     ) -> Event:
         return self._interaction_started_event_from_identity(
             session_id=session.id,
             agent_name=registered_agent.spec.name,
             environment_name=environment_name,
             interaction_id=interaction_id,
+            targeted_tool_grants=targeted_tool_grants,
         )
 
     def _interaction_started_event_from_identity(
@@ -5786,6 +5803,7 @@ class SessionEngine:
         environment_name: str | None,
         interaction_id: str,
         event_id: str | None = None,
+        targeted_tool_grants: tuple[PreparedTargetedToolGrant, ...] = (),
     ) -> Event:
         event_id = (
             str(uuid4()) if event_id is None else require_clean_nonblank(event_id, "event_id")
@@ -5795,6 +5813,12 @@ class SessionEngine:
             status=InteractionStatus.ACTIVE,
             start_event_id=event_id,
             started_at=started_at,
+            targeted_tool_grant_count=(len(targeted_tool_grants) if targeted_tool_grants else None),
+            targeted_tool_grant_batch_fingerprint=(
+                prepared_targeted_tool_grant_batch_fingerprint(targeted_tool_grants)
+                if targeted_tool_grants
+                else None
+            ),
         )
         return event_with_runtime_payload_authority(
             event_with_runtime_envelope_authority(
@@ -6846,6 +6870,146 @@ class SessionEngine:
         )
         return ModelTarget(provider_name=registered_provider.name, model=model)
 
+    def _prepare_targeted_tool_grants(
+        self,
+        grants: tuple[TargetedToolGrant, ...],
+        *,
+        registered_agent: runtime_records.RegisteredAgentState,
+        capability_ceiling: ToolCapabilityCeiling,
+    ) -> tuple[PreparedTargetedToolGrant, ...]:
+        """Freeze typed grant requests against current registered authority."""
+
+        if not grants:
+            return ()
+        if (
+            not self.session_store.supports_targeted_tool_grants
+            or not self.session_store.supports_public_authority_aliases
+            or self.session_store.public_authority_alias_codec is None
+        ):
+            raise RuntimeError(
+                "Targeted tool grants require a SessionStore with durable grant state "
+                "and an explicitly configured public authority alias keyring."
+            )
+        return prepare_targeted_tool_grants(
+            grants,
+            catalogue=registered_agent.tool_catalogue,
+            capability_ceiling=capability_ceiling,
+        )
+
+    async def _issue_targeted_tool_grants(
+        self,
+        *,
+        session: Session,
+        interaction_id: str,
+        task_id: str | None,
+        prepared: tuple[PreparedTargetedToolGrant, ...],
+        issued_at: datetime,
+    ) -> tuple[tuple[TargetedToolGrantRecord, ...], tuple[Event, ...]]:
+        """Materialize one exact batch before any provider work can begin."""
+
+        if not prepared:
+            return (), ()
+        codec = self.session_store.public_authority_alias_codec
+        if codec is None:  # pragma: no cover - preflight capability invariant
+            raise RuntimeError("Targeted tool grant alias authority is unavailable.")
+        generation_id = targeted_tool_view_generation_id(
+            session_id=session.id,
+            root_invocation_id=session.invocation.root_invocation_id,
+        )
+        records = tuple(
+            build_targeted_tool_grant_record(
+                grant,
+                session_id=session.id,
+                interaction_id=interaction_id,
+                generation_id=generation_id,
+                agent_name=session.agent_name,
+                task_id=task_id,
+                environment_name=session.environment_name,
+                principal=session.invocation.origin.subject,
+                tenant=session.invocation.origin.tenant,
+                issued_at=issued_at,
+                codec=codec,
+            )
+            for grant in prepared
+        )
+        events = tuple(
+            targeted_tool_grant_event(
+                record,
+                event_type=EventType.TARGETED_TOOL_GRANT_ISSUED,
+                timestamp=issued_at,
+                outcome="issued",
+                event_id_suffix="issued",
+            )
+            for record in records
+        )
+        result = await self.session_store.issue_targeted_tool_grants(
+            session.id,
+            expected_run_epoch=session.run_epoch,
+            records=records,
+            events=events,
+        )
+        if len(result.records) != len(prepared) or len(result.events) != len(prepared):
+            raise RuntimeError("Targeted tool grant issuance returned incomplete evidence.")
+        return (
+            tuple(copy_targeted_tool_grant_record(record) for record in result.records),
+            result.events,
+        )
+
+    async def _reconstruct_targeted_tool_grants(
+        self,
+        *,
+        session: Session,
+        interaction_id: str,
+        task_id: str | None,
+        registered_agent: runtime_records.RegisteredAgentState,
+        capability_ceiling: ToolCapabilityCeiling,
+        observed_at: datetime,
+    ) -> tuple[tuple[TargetedToolGrantRecord, ...], tuple[Event, ...]]:
+        """Revalidate an interrupted interaction's durable references before dispatch."""
+
+        if not self.session_store.supports_targeted_tool_grants:
+            return (), ()
+        catalogue = registered_agent.tool_catalogue
+        result = await self.session_store.reconstruct_targeted_tool_grants(
+            session.id,
+            expected_run_epoch=session.run_epoch,
+            interaction_id=interaction_id,
+            generation_id=targeted_tool_view_generation_id(
+                session_id=session.id,
+                root_invocation_id=session.invocation.root_invocation_id,
+            ),
+            agent_name=session.agent_name,
+            task_id=task_id,
+            environment_name=session.environment_name,
+            principal=session.invocation.origin.subject,
+            tenant=session.invocation.origin.tenant,
+            catalogue_revision=catalogue.revision,
+            descriptors_by_id={
+                descriptor.tool_id: (
+                    descriptor.name,
+                    descriptor.version,
+                    descriptor.schema_fingerprint,
+                )
+                for descriptor in catalogue.descriptors
+            },
+            capability_ceiling_names=frozenset(capability_ceiling.tool_names),
+            observed_at=observed_at,
+        )
+        if result.events:
+            await self._event_writer.fan_out_persisted(list(result.events))
+        blocking_rejections = tuple(
+            (grant_id, reason)
+            for grant_id, reason in result.rejected
+            if reason is not TargetedToolUseRejectionReason.EXPIRED
+        )
+        if blocking_rejections:
+            reasons = ", ".join(sorted({reason.value for _grant_id, reason in blocking_rejections}))
+            raise RuntimeError("Targeted tool grant reconstruction failed closed: " + reasons)
+        return (
+            tuple(copy_targeted_tool_grant_record(record) for record in result.valid),
+            result.events,
+        )
+
     async def _prepare_initial_run(
         self,
         request: RunRequest,
@@ -6919,6 +7083,11 @@ class SessionEngine:
             )
         request = request.model_copy(
             update={"tool_capability_ceiling": effective_tool_capability_ceiling}
+        )
+        targeted_tool_grants = self._prepare_targeted_tool_grants(
+            request.tool_grants,
+            registered_agent=registered_agent,
+            capability_ceiling=effective_tool_capability_ceiling,
         )
         # An explicit target is exact. Otherwise the agent model and optional
         # provider pin feed the existing routing/default selection.
@@ -7043,6 +7212,7 @@ class SessionEngine:
             prompt_contributions=tuple(prompt_contributions),
             execution_profile=execution_profile,
             tool_capability_ceiling=effective_tool_capability_ceiling,
+            targeted_tool_grants=targeted_tool_grants,
             budget_policy=budget_policy,
             session_identity=session_identity,
         )
@@ -7253,6 +7423,7 @@ class SessionEngine:
         prompt_contributions = list(prepared.prompt_contributions)
         execution_profile = prepared.execution_profile
         tool_capability_ceiling = prepared.tool_capability_ceiling
+        targeted_tool_grants = prepared.targeted_tool_grants
         budget_policy = prepared.budget_policy
         session_identity = prepared.session_identity
         # ``prepared`` also retains the registered provider, whose repr may contain
@@ -7279,6 +7450,7 @@ class SessionEngine:
                 if prepared_session_authority is None
                 else prepared_session_authority.interaction_started_event_id
             ),
+            targeted_tool_grants=targeted_tool_grants,
         )
         if prepared_session_authority is None:
             bind_runtime_session_create_claim(
@@ -7373,8 +7545,22 @@ class SessionEngine:
         messages: list[Message] | None = None
         prompt_contribution_manifest: PromptContributionManifest | None = None
         try:
+            (
+                targeted_tool_grant_records,
+                targeted_tool_grant_events,
+            ) = await self._issue_targeted_tool_grants(
+                session=session,
+                interaction_id=interaction_id,
+                task_id=request.task_id,
+                prepared=targeted_tool_grants,
+                issued_at=interaction_started_event.timestamp,
+            )
             await self._event_writer.fan_out_persisted([interaction_started_event])
+            if targeted_tool_grant_events:
+                await self._event_writer.fan_out_persisted(list(targeted_tool_grant_events))
             yield interaction_started_event
+            for targeted_tool_grant_event_record in targeted_tool_grant_events:
+                yield targeted_tool_grant_event_record
             factory_started_event = await self._environment_lifecycle.emit_factory_started(
                 session=session,
                 registered_agent=registered_agent,
@@ -7722,6 +7908,7 @@ class SessionEngine:
                 request_loop_policies=request.loop_policies,
                 request_metadata=request.metadata,
                 request_trace_metadata=request.metadata,
+                targeted_tool_grants=targeted_tool_grant_footprint(targeted_tool_grant_records),
                 task_id=request.task_id,
                 task_worker_id=request.task_worker_id,
                 start_event_type=EventType.SESSION_STARTED,
@@ -12586,6 +12773,15 @@ class SessionEngine:
             raise RuntimeError(
                 "An execution profile cannot be adopted while model or tool recovery is pending."
             )
+        if continuing_recovery_boundary and request.tool_grants:
+            raise RuntimeError(
+                "Targeted tool grants cannot be issued while model or tool recovery is pending."
+            )
+        prepared_targeted_tool_grants = self._prepare_targeted_tool_grants(
+            request.tool_grants,
+            registered_agent=registered_agent,
+            capability_ceiling=effective_tool_capability_ceiling,
+        )
         candidate_execution_profile: ExecutionProfileIdentity | None = None
         execution_profile_decision: ExecutionProfileDecision | None = None
         if not continuing_recovery_boundary:
@@ -12935,6 +13131,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 environment_name=_environment_name(registered_environment),
                 interaction_id=interaction_id,
+                targeted_tool_grants=prepared_targeted_tool_grants,
             )
         model_transition = None
         model_transition_event = None
@@ -13089,6 +13286,40 @@ class SessionEngine:
                 raise RuntimeError("New interaction admission produced no interaction identity.")
             _activate_session_interaction(session.id, interaction_id)
         try:
+            (
+                issued_targeted_tool_grant_records,
+                targeted_tool_grant_events,
+            ) = await self._issue_targeted_tool_grants(
+                session=session,
+                interaction_id=interaction_id,
+                task_id=task_id,
+                prepared=prepared_targeted_tool_grants,
+                issued_at=(
+                    self._clock()
+                    if interaction_started_event is None
+                    else interaction_started_event.timestamp
+                ),
+            )
+            (
+                reconstructed_targeted_tool_grant_records,
+                reconstructed_targeted_tool_grant_events,
+            ) = (
+                await self._reconstruct_targeted_tool_grants(
+                    session=session,
+                    interaction_id=interaction_id,
+                    task_id=task_id,
+                    registered_agent=registered_agent,
+                    capability_ceiling=effective_tool_capability_ceiling,
+                    observed_at=self._clock(),
+                )
+                if continuing_recovery_boundary
+                else ((), ())
+            )
+            targeted_tool_grant_records = (
+                reconstructed_targeted_tool_grant_records
+                if continuing_recovery_boundary
+                else issued_targeted_tool_grant_records
+            )
             if session.run_epoch != loaded_session.run_epoch + 1:
                 # Another complete invocation won admission after our preflight
                 # snapshot. Refresh the adjacent profile while this invocation
@@ -13124,6 +13355,12 @@ class SessionEngine:
                     ):
                         continue
                     yield admission_event
+            if targeted_tool_grant_events:
+                await self._event_writer.fan_out_persisted(list(targeted_tool_grant_events))
+                for targeted_tool_grant_event_record in targeted_tool_grant_events:
+                    yield targeted_tool_grant_event_record
+            for reconstructed_event in reconstructed_targeted_tool_grant_events:
+                yield reconstructed_event
             model_boundary = await self._recovery_coordinator.reconcile_model_completion_boundary(
                 session,
                 registered_agent=registered_agent,
@@ -13363,6 +13600,7 @@ class SessionEngine:
             request_trace_metadata=(
                 _runtime_resume_transport_metadata(request) or request.metadata
             ),
+            targeted_tool_grants=targeted_tool_grant_footprint(targeted_tool_grant_records),
             task_id=task_id,
             task_worker_id=None,
             start_event_type=EventType.SESSION_RESUMED,
@@ -13488,7 +13726,10 @@ class SessionEngine:
                     ) from None
                 evidence_ids = (
                     [relationship.decision.event_id] if relationship.decision is not None else []
-                ) + [relationship.fork_event_id]
+                ) + [
+                    relationship.fork_event_id,
+                    f"{relationship.fork_event_id}:targeted-tool-grants-reset",
+                ]
                 persisted_events: list[Event] = []
                 for evidence_id in evidence_ids:
                     records = await self.session_store.query_events(
@@ -13552,7 +13793,13 @@ class SessionEngine:
                         events=[],
                     )
                 delivered = await self._event_writer.fan_out_persisted(persisted_events)
-                yield delivered[-1]
+                delivered_fork_event = next(
+                    (event for event in delivered if event.type is EventType.SESSION_FORKED),
+                    None,
+                )
+                if delivered_fork_event is None:
+                    raise RuntimeError("Existing profiled fork lost its public fork event.")
+                yield delivered_fork_event
                 return
         expected_source_snapshot = request._expected_source_snapshot
         if expected_source_snapshot is not None and (
@@ -14325,6 +14572,36 @@ class SessionEngine:
             deep=True,
         )
         fork_event = self._event_writer.prepare(_fork_event_with_runtime_authority(raw_fork_event))
+        source_grant_interaction_id = (
+            None if source_active_profile is None else source_active_profile.interaction_id
+        )
+        raw_grant_reset_event = event_with_runtime_envelope_authority(
+            event_with_runtime_generated_id(
+                Event(
+                    id=f"{fork_event.id}:targeted-tool-grants-reset",
+                    type=EventType.TARGETED_TOOL_GRANT_FORK_RESET,
+                    session_id=fork_session.id,
+                    timestamp=fork_session.created_at,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=_environment_name(registered_environment),
+                    payload={
+                        "schema_version": 1,
+                        "source_session_id": source_session.id,
+                        "source_interaction_id": source_grant_interaction_id,
+                        "inherited_grant_count": 0,
+                        "inherited_reference_count": 0,
+                    },
+                )
+            ),
+            "session_id",
+        )
+        grant_reset_event = self._event_writer.prepare(
+            event_with_runtime_payload_authority(
+                raw_grant_reset_event,
+                "source_session_id",
+                *(("source_interaction_id",) if source_grant_interaction_id is not None else ()),
+            )
+        )
         decision_record: ForkExecutionProfileDecisionRecord | None = None
         prepared_events: list[Event] = []
         if execution_profile_decision is not None:
@@ -14388,6 +14665,7 @@ class SessionEngine:
             deep=True,
         )
         prepared_events.append(fork_event)
+        prepared_events.append(grant_reset_event)
 
         async def reconcile_profiled_fork(
             initial_error: BaseException | None,
@@ -14720,7 +14998,16 @@ class SessionEngine:
                 concurrent_failures,
             ) from None
         delivered_events = await self._event_writer.fan_out_persisted(list(profiled_result.events))
-        yield delivered_events[-1]
+        delivered_fork_event = next(
+            (event for event in delivered_events if event.type is EventType.SESSION_FORKED),
+            None,
+        )
+        if delivered_fork_event is None:
+            raise RuntimeError("Profiled fork publication lost its public fork event.")
+        # Fork orchestration has always exposed exactly the session.forked
+        # boundary. The adjacent grant-reset record remains durable and is
+        # delivered to event sinks without changing that public stream contract.
+        yield delivered_fork_event
 
     async def _publish_assistant_model_completion(
         self,
@@ -14941,6 +15228,7 @@ class SessionEngine:
         request_loop_policies: tuple[LoopPolicy, ...],
         request_metadata: dict[str, Any],
         request_trace_metadata: dict[str, Any],
+        targeted_tool_grants: TargetedToolGrantFootprint | None,
         task_id: str | None,
         task_worker_id: str | None,
         start_event_type: EventType | None,
@@ -14967,6 +15255,14 @@ class SessionEngine:
             redactor=self._secret_redactor,
             field_name="structured_output",
         )
+        if targeted_tool_grants is not None:
+            if type(targeted_tool_grants) is not TargetedToolGrantFootprint:
+                raise TypeError(
+                    "targeted_tool_grants must be a TargetedToolGrantFootprint or None."
+                )
+            targeted_tool_grants = TargetedToolGrantFootprint.model_validate(
+                targeted_tool_grants.model_dump(mode="python")
+            )
         if messages_already_persisted and messages_deferred:
             raise ValueError(
                 "messages_already_persisted and messages_deferred are mutually exclusive."
@@ -15821,6 +16117,7 @@ class SessionEngine:
                 validate_live_model_semantics=validate_live_model_semantics,
                 initial_tool_exposure=initial_model_step_tool_exposure,
                 previous_tool_exposure_profile_id=previous_tool_exposure_profile_id,
+                targeted_tool_grants=targeted_tool_grants,
                 model_completion_recovery_context_factory=(model_completion_recovery_context),
                 model_completion_publisher=publish_model_completion,
             )

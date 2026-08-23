@@ -767,6 +767,14 @@ export type ApiInteractionSummary = {
     started_at: string;
     status: InteractionStatus;
     /**
+     * Targeted Tool Grant Batch Fingerprint
+     */
+    targeted_tool_grant_batch_fingerprint?: string | null;
+    /**
+     * Targeted Tool Grant Count
+     */
+    targeted_tool_grant_count?: number | null;
+    /**
      * Terminal Event Id
      */
     terminal_event_id: string | null;

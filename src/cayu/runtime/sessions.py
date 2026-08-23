@@ -246,6 +246,40 @@ from cayu.runtime.tool_exposure import (
     session_metadata_with_tool_capability_ceiling,
     tool_capability_ceiling_from_session_metadata,
 )
+from cayu.runtime.tool_grants import (
+    TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS,
+    TARGETED_TOOL_GRANT_MAX_REQUESTS,
+    TARGETED_TOOL_REFERENCE_FIELD_NAME,
+    TargetedToolGrant,
+    TargetedToolGrantIssueOutcome,
+    TargetedToolGrantIssueResult,
+    TargetedToolGrantReconstructionResult,
+    TargetedToolGrantRecord,
+    TargetedToolGrantStateSnapshot,
+    TargetedToolUseBinding,
+    TargetedToolUseDisposition,
+    TargetedToolUseRejectionReason,
+    TargetedToolUseRequest,
+    TargetedToolUseResult,
+    copy_targeted_tool_grant_record,
+    targeted_tool_grant_event,
+    targeted_tool_grant_reconstruction_rejection_reason,
+    targeted_tool_grant_with_active_reference,
+    targeted_tool_unresolved_rejection_event,
+    targeted_tool_use_binding,
+    targeted_tool_use_rejection_event,
+    targeted_tool_use_rejection_reason,
+    targeted_tool_use_scope_rejection_reason,
+    validate_targeted_tool_grant_batch_evidence,
+    validate_targeted_tool_grant_issuance_evidence,
+    validate_targeted_tool_grant_lifecycle_event,
+    validate_targeted_tool_grant_reference,
+    validate_targeted_tool_grant_revocation_evidence,
+    validate_targeted_tool_grant_revocation_reason,
+    validate_targeted_tool_grants,
+    validate_targeted_tool_unresolved_rejection_evidence,
+    validate_targeted_tool_use_rejection_evidence,
+)
 from cayu.runtime.usage import UsageMetrics
 from cayu.vaults.redaction import SecretRedactor
 
@@ -1159,6 +1193,8 @@ class RunRequest(BaseModel):
     target: ModelTarget | None = None
     # Durable application-tool maximum. None selects the current registered catalog.
     tool_capability_ceiling: ToolCapabilityCeiling | None = None
+    # Interaction-scoped addressability requests resolved from the registered catalogue.
+    tool_grants: tuple[TargetedToolGrant, ...] = ()
     environment_name: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -1241,6 +1277,11 @@ class RunRequest(BaseModel):
         value: object,
     ) -> ToolCapabilityCeiling | None:
         return _copy_optional_tool_capability_ceiling(value)
+
+    @field_validator("tool_grants", mode="before")
+    @classmethod
+    def copy_tool_grants(cls, value: object) -> tuple[TargetedToolGrant, ...]:
+        return validate_targeted_tool_grants(value)
 
     @field_validator("budget_limits", mode="before")
     @classmethod
@@ -1372,6 +1413,8 @@ class ResumeRequest(BaseModel):
     target: ModelTarget | None = None
     # None preserves the durable maximum; an explicit subset narrows it permanently.
     tool_capability_ceiling: ToolCapabilityCeiling | None = None
+    # Fresh grants apply only to the newly admitted ordinary interaction.
+    tool_grants: tuple[TargetedToolGrant, ...] = ()
     profile_adoption: ExecutionProfileAdoptionIntent | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     max_steps: StrictInt = Field(default=16, ge=1, le=256)
@@ -1414,6 +1457,11 @@ class ResumeRequest(BaseModel):
         value: object,
     ) -> ToolCapabilityCeiling | None:
         return _copy_optional_tool_capability_ceiling(value)
+
+    @field_validator("tool_grants", mode="before")
+    @classmethod
+    def copy_tool_grants(cls, value: object) -> tuple[TargetedToolGrant, ...]:
+        return validate_targeted_tool_grants(value)
 
     @field_validator("profile_adoption", mode="before")
     @classmethod
@@ -2504,8 +2552,8 @@ class ProfiledSessionForkResult(BaseModel):
         if type(value) not in {list, tuple}:
             raise TypeError("Profiled fork events must be a list or tuple.")
         events = cast("list[Event] | tuple[Event, ...]", value)
-        if not 1 <= len(events) <= 2:
-            raise ValueError("Profiled fork evidence must contain one or two events.")
+        if not 2 <= len(events) <= 3:
+            raise ValueError("Profiled fork evidence must contain two or three events.")
         return tuple(copy_event(event) for event in events)
 
 
@@ -2521,7 +2569,7 @@ def copy_profiled_session_fork_result(
         raise TypeError("Profiled fork publication returned malformed result state.")
     session = state["session"]
     events = state["events"]
-    if type(session) is not Session or type(events) is not tuple or not 1 <= len(events) <= 2:
+    if type(session) is not Session or type(events) is not tuple or not 2 <= len(events) <= 3:
         raise TypeError("Profiled fork publication returned malformed result fields.")
     return ProfiledSessionForkResult(
         session=copy_session(session),
@@ -7304,12 +7352,12 @@ def _public_authority_alias_store_key(
         if scope_session_id is not None:
             raise ValueError("Session aliases must not have a session scope.")
         scope_key = ""
-    elif field_name == "interaction_id":
+    elif field_name in {"interaction_id", TARGETED_TOOL_REFERENCE_FIELD_NAME}:
         if scope_session_id is None:
-            raise ValueError("Interaction aliases require a private session scope.")
+            raise ValueError(f"{field_name} aliases require a private session scope.")
         scope_key = require_nonblank(scope_session_id, "scope_session_id")
     else:
-        raise ValueError("field_name must be session_id or interaction_id.")
+        raise ValueError("field_name must be session_id, interaction_id, or tool_ref.")
     if private_value is not None:
         require_nonblank(private_value, "private_value")
     return field_name, scope_key, public_alias
@@ -7358,6 +7406,7 @@ class SessionStore(ABC):
     supports_session_topology: ClassVar[bool] = False
     supports_session_lineage: ClassVar[bool] = False
     supports_public_authority_aliases: ClassVar[bool] = False
+    supports_targeted_tool_grants: ClassVar[bool] = False
     supports_terminal_session_evidence: ClassVar[bool] = False
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = False
     supports_execution_profile_admission: ClassVar[bool] = False
@@ -7419,6 +7468,93 @@ class SessionStore(ABC):
 
         raise NotImplementedError(
             "This SessionStore does not support durable public authority aliases."
+        )
+
+    async def issue_targeted_tool_grants(
+        self,
+        session_id: str,
+        *,
+        expected_run_epoch: int,
+        records: tuple[TargetedToolGrantRecord, ...],
+        events: tuple[Event, ...],
+    ) -> TargetedToolGrantIssueResult:
+        """Atomically issue or rejoin one exact interaction-scoped grant batch."""
+
+        raise NotImplementedError(
+            "This SessionStore does not support durable targeted tool grants."
+        )
+
+    async def list_targeted_tool_grants(
+        self,
+        session_id: str,
+        *,
+        interaction_id: str | None = None,
+        limit: int = TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS,
+    ) -> tuple[TargetedToolGrantRecord, ...]:
+        """Load a bounded session or interaction grant view for inspection."""
+
+        raise NotImplementedError(
+            "This SessionStore does not support durable targeted tool grants."
+        )
+
+    async def load_targeted_tool_grant_state(
+        self,
+        session_id: str,
+    ) -> TargetedToolGrantStateSnapshot:
+        """Load complete typed grant state for a trusted durable export."""
+
+        raise NotImplementedError(
+            "This SessionStore does not support durable targeted tool grants."
+        )
+
+    async def bind_targeted_tool_grant_use(
+        self,
+        request: TargetedToolUseRequest,
+        *,
+        observed_at: datetime,
+    ) -> TargetedToolUseResult:
+        """Atomically consume one budget unit or rejoin its exact prior binding."""
+
+        raise NotImplementedError(
+            "This SessionStore does not support durable targeted tool grants."
+        )
+
+    async def revoke_targeted_tool_grant(
+        self,
+        tool_ref: str,
+        *,
+        session_id: str,
+        expected_run_epoch: int,
+        reason: str,
+        revoked_at: datetime,
+    ) -> TargetedToolGrantRecord | None:
+        """Atomically revoke one exact session-scoped reference, idempotently."""
+
+        raise NotImplementedError(
+            "This SessionStore does not support durable targeted tool grants."
+        )
+
+    async def reconstruct_targeted_tool_grants(
+        self,
+        session_id: str,
+        *,
+        expected_run_epoch: int,
+        interaction_id: str,
+        generation_id: str,
+        agent_name: str,
+        task_id: str | None,
+        environment_name: str | None,
+        principal: str | None,
+        tenant: str | None,
+        catalogue_revision: str,
+        descriptors_by_id: Mapping[str, tuple[str, str, str]],
+        capability_ceiling_names: frozenset[str],
+        observed_at: datetime,
+    ) -> TargetedToolGrantReconstructionResult:
+        """Validate durable grants against current bounded registration evidence."""
+
+        raise NotImplementedError(
+            "This SessionStore does not support durable targeted tool grants."
         )
 
     @abstractmethod
@@ -9234,6 +9370,7 @@ class InMemorySessionStore(SessionStore):
     supports_session_topology: ClassVar[bool] = True
     supports_session_lineage: ClassVar[bool] = True
     supports_public_authority_aliases: ClassVar[bool] = True
+    supports_targeted_tool_grants: ClassVar[bool] = True
     supports_terminal_session_evidence: ClassVar[bool] = True
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
     supports_execution_profile_admission: ClassVar[bool] = True
@@ -9273,6 +9410,19 @@ class InMemorySessionStore(SessionStore):
         self._lock = asyncio.Lock()
         self._sessions: dict[str, Session] = {}
         self._public_authority_aliases: dict[tuple[str, str, str], str] = {}
+        self._targeted_tool_grants: dict[str, TargetedToolGrantRecord] = {}
+        self._targeted_tool_grant_ids_by_session: dict[str, list[str]] = {}
+        self._targeted_tool_grant_ids_by_interaction: dict[tuple[str, str], list[str]] = {}
+        self._targeted_tool_grant_ids_by_request: dict[tuple[str, str, str], str] = {}
+        self._targeted_tool_grant_ids_by_tool: dict[tuple[str, str, str], str] = {}
+        self._targeted_tool_grant_refs: dict[str, tuple[str, str]] = {}
+        self._targeted_tool_uses: dict[str, dict[str, TargetedToolUseBinding]] = {}
+        self._targeted_tool_use_by_invocation: dict[
+            tuple[str, str, str], TargetedToolUseBinding
+        ] = {}
+        self._targeted_tool_use_by_outer_call: dict[
+            tuple[str, str, str], TargetedToolUseBinding
+        ] = {}
         # Stable direct-child keys maintained with session lifecycle writes. Topology
         # pages can therefore seek one parent branch without scanning the complete
         # in-memory session registry.
@@ -9797,6 +9947,846 @@ class InMemorySessionStore(SessionStore):
             return any(
                 key_field == field_name and key_scope == scope_key and stored == private_value
                 for (key_field, key_scope, _alias), stored in self._public_authority_aliases.items()
+            )
+
+    async def issue_targeted_tool_grants(
+        self,
+        session_id: str,
+        *,
+        expected_run_epoch: int,
+        records: tuple[TargetedToolGrantRecord, ...],
+        events: tuple[Event, ...],
+    ) -> TargetedToolGrantIssueResult:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if type(expected_run_epoch) is not int or expected_run_epoch < 0:
+            raise ValueError("expected_run_epoch must be a non-negative integer.")
+        if type(records) is not tuple or type(events) is not tuple:
+            raise TypeError("records and events must be tuples.")
+        if len(records) > TARGETED_TOOL_GRANT_MAX_REQUESTS:
+            raise ValueError("Targeted grant issuance exceeds the bounded request count.")
+        copied_records = tuple(copy_targeted_tool_grant_record(record) for record in records)
+        copied_events = tuple(copy_event(event) for event in events)
+        if len(copied_records) != len(copied_events):
+            raise ValueError("Each targeted grant record requires one issuance event.")
+        if len({record.request_id for record in copied_records}) != len(copied_records):
+            raise ValueError("Targeted grant records must have unique request identities.")
+        if len({record.tool_id for record in copied_records}) != len(copied_records):
+            raise ValueError("Targeted grant records must have unique tool identities.")
+        interaction_ids = {record.interaction_id for record in copied_records}
+        if len(interaction_ids) > 1:
+            raise ValueError("Targeted grant records must share one interaction scope.")
+        codec = self.public_authority_alias_codec
+        if copied_records and codec is None:
+            raise RuntimeError("Targeted grants require a public authority alias codec.")
+        for record, event in zip(copied_records, copied_events, strict=True):
+            if record.session_id != session_id:
+                raise ValueError("Targeted grant scope is inconsistent.")
+            assert codec is not None
+            validate_targeted_tool_grant_reference(record, codec)
+            validate_targeted_tool_grant_issuance_evidence(record, event)
+
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            if session.run_epoch != expected_run_epoch:
+                raise SessionRunFenced(
+                    f"Session source run epoch is stale: expected {expected_run_epoch}, "
+                    f"current {session.run_epoch}."
+                )
+            if session.status is not SessionStatus.RUNNING:
+                raise SessionStatusConflict("Targeted grants require a running session.")
+            if interaction_ids:
+                latest_interactions = self._latest_interaction_event_records_by_sequence.get(
+                    session_id,
+                    (),
+                )
+                latest = latest_interactions[-1] if latest_interactions else None
+                if (
+                    latest is None
+                    or latest.event.interaction_id != next(iter(interaction_ids))
+                    or latest.event.type
+                    in {
+                        EventType.INTERACTION_COMPLETED,
+                        EventType.INTERACTION_FAILED,
+                        EventType.INTERACTION_INTERRUPTED,
+                    }
+                ):
+                    raise ValueError("Targeted grants require the current open interaction.")
+                interaction_started = next(
+                    (
+                        event_record.event
+                        for event_record in latest_interactions
+                        if event_record.event.type is EventType.INTERACTION_STARTED
+                        and event_record.event.interaction_id == next(iter(interaction_ids))
+                    ),
+                    None,
+                )
+                if interaction_started is None:
+                    raise RuntimeError("Targeted grant issuance lost interaction admission.")
+                validate_targeted_tool_grant_batch_evidence(
+                    copied_records,
+                    interaction_started,
+                )
+            for record in copied_records:
+                if (
+                    record.agent_name != session.agent_name
+                    or record.environment_name != session.environment_name
+                    or record.principal != session.invocation.origin.subject
+                    or record.tenant != session.invocation.origin.tenant
+                ):
+                    raise ValueError("Targeted grant scope conflicts with session authority.")
+
+            resolved_records: list[TargetedToolGrantRecord] = []
+            outcomes: list[TargetedToolGrantIssueOutcome] = []
+            resolved_events: list[Event] = []
+            new_records: list[tuple[TargetedToolGrantRecord, Event]] = []
+            events_to_append: list[Event] = []
+            for record, event in zip(copied_records, copied_events, strict=True):
+                request_key = (session_id, record.interaction_id, record.request_id)
+                tool_key = (session_id, record.interaction_id, record.tool_id)
+                existing_id = self._targeted_tool_grant_ids_by_request.get(request_key)
+                existing = (
+                    None if existing_id is None else self._targeted_tool_grants.get(existing_id)
+                )
+                if existing is not None:
+                    if existing.grant_id != record.grant_id:
+                        raise ValueError(
+                            "Targeted grant request identity conflicts with durable authority."
+                        )
+                    if len(self._targeted_tool_uses.get(existing.grant_id, ())) != (
+                        existing.used_calls
+                    ):
+                        raise ValueError("Targeted grant call counter conflicts with durable uses.")
+                    existing_event_record = self._event_records_by_id.get((session_id, event.id))
+                    if existing_event_record is None:
+                        raise RuntimeError("Targeted grant lost its durable issuance evidence.")
+                    validate_targeted_tool_grant_issuance_evidence(
+                        existing,
+                        existing_event_record.event,
+                    )
+                    reused_event = targeted_tool_grant_event(
+                        existing,
+                        event_type=EventType.TARGETED_TOOL_GRANT_REUSED,
+                        timestamp=event.timestamp,
+                        outcome=TargetedToolGrantIssueOutcome.REUSED.value,
+                        event_id_suffix="reused",
+                    )
+                    existing_reuse = self._event_records_by_id.get((session_id, reused_event.id))
+                    codec = self.public_authority_alias_codec
+                    if codec is None:  # pragma: no cover - capability invariant
+                        raise RuntimeError("Targeted grants require a public alias codec.")
+                    resolved_records.append(
+                        targeted_tool_grant_with_active_reference(existing, codec)
+                    )
+                    outcomes.append(TargetedToolGrantIssueOutcome.REUSED)
+                    if existing_reuse is None:
+                        events_to_append.append(reused_event)
+                        resolved_events.append(reused_event)
+                    else:
+                        resolved_events.append(copy_event(existing_reuse.event))
+                    continue
+                conflicting_tool_grant_id = self._targeted_tool_grant_ids_by_tool.get(tool_key)
+                if conflicting_tool_grant_id is not None:
+                    raise ValueError(
+                        "Targeted grant tool identity conflicts with durable authority."
+                    )
+                if record.grant_id in self._targeted_tool_grants:
+                    raise ValueError("Targeted grant identity collides with existing authority.")
+                if (session_id, event.id) in self._event_records_by_id:
+                    raise ValueError("Targeted grant event identity is already in use.")
+                new_records.append((record, event))
+                resolved_records.append(record)
+                outcomes.append(TargetedToolGrantIssueOutcome.ISSUED)
+                resolved_events.append(event)
+                events_to_append.append(event)
+
+            if new_records:
+                interaction_id = new_records[0][0].interaction_id
+                existing_count = len(
+                    self._targeted_tool_grant_ids_by_interaction.get(
+                        (session_id, interaction_id),
+                        (),
+                    )
+                )
+                if existing_count + len(new_records) > TARGETED_TOOL_GRANT_MAX_REQUESTS:
+                    raise ValueError("Targeted grant interaction exceeds its bounded count.")
+            if events_to_append:
+                prepared_append = self._prepare_event_append_unlocked(
+                    session,
+                    events_to_append,
+                )
+            alias_plans: dict[
+                str,
+                tuple[tuple[str, str, str], str, str],
+            ] = {}
+            for record, _event in new_records:
+                assert codec is not None
+                for public_alias in codec.aliases(
+                    record.grant_id,
+                    field_name=TARGETED_TOOL_REFERENCE_FIELD_NAME,
+                    session_id=session_id,
+                ):
+                    alias_key = _public_authority_alias_store_key(
+                        public_alias,
+                        field_name=TARGETED_TOOL_REFERENCE_FIELD_NAME,
+                        private_value=record.grant_id,
+                        scope_session_id=session_id,
+                    )
+                    existing_private = self._public_authority_aliases.get(alias_key)
+                    if existing_private is not None and existing_private != record.grant_id:
+                        raise ValueError("Targeted tool reference collides with authority.")
+                    existing_plan = alias_plans.get(public_alias)
+                    if existing_plan is not None and existing_plan[1] != record.grant_id:
+                        raise ValueError("Targeted tool reference batch contains a collision.")
+                    existing_ref = self._targeted_tool_grant_refs.get(public_alias)
+                    if existing_ref is not None and existing_ref != (
+                        session_id,
+                        record.grant_id,
+                    ):
+                        raise ValueError("Targeted tool reference collides with authority.")
+                    alias_plans[public_alias] = (
+                        alias_key,
+                        record.grant_id,
+                        session_id,
+                    )
+            if new_records:
+                for record, _event in new_records:
+                    for public_alias in codec.aliases(
+                        record.grant_id,
+                        field_name=TARGETED_TOOL_REFERENCE_FIELD_NAME,
+                        session_id=session_id,
+                    ):
+                        alias_key, private_value, scope_key = alias_plans[public_alias]
+                        self._public_authority_aliases[alias_key] = private_value
+                        self._targeted_tool_grant_refs[public_alias] = (
+                            scope_key,
+                            private_value,
+                        )
+                    self._targeted_tool_grants[record.grant_id] = record
+                    self._targeted_tool_grant_ids_by_session.setdefault(session_id, []).append(
+                        record.grant_id
+                    )
+                    self._targeted_tool_grant_ids_by_interaction.setdefault(
+                        (session_id, record.interaction_id),
+                        [],
+                    ).append(record.grant_id)
+                    self._targeted_tool_grant_ids_by_request[
+                        (session_id, record.interaction_id, record.request_id)
+                    ] = record.grant_id
+                    self._targeted_tool_grant_ids_by_tool[
+                        (session_id, record.interaction_id, record.tool_id)
+                    ] = record.grant_id
+            if events_to_append:
+                self._sessions[session_id] = self._apply_event_append_unlocked(
+                    session,
+                    prepared_append,
+                )
+            return TargetedToolGrantIssueResult(
+                records=tuple(resolved_records),
+                outcomes=tuple(outcomes),
+                events=tuple(resolved_events),
+            )
+
+    async def list_targeted_tool_grants(
+        self,
+        session_id: str,
+        *,
+        interaction_id: str | None = None,
+        limit: int = TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS,
+    ) -> tuple[TargetedToolGrantRecord, ...]:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if interaction_id is not None:
+            interaction_id = require_clean_nonblank(interaction_id, "interaction_id")
+        if type(limit) is not int or not 1 <= limit <= TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS:
+            raise ValueError(
+                f"limit must be between 1 and {TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS}."
+            )
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+            codec = self.public_authority_alias_codec
+            if codec is None:  # pragma: no cover - in-memory capability invariant
+                raise RuntimeError("Targeted grants require a public authority alias codec.")
+            grant_ids = (
+                self._targeted_tool_grant_ids_by_session.get(session_id, ())
+                if interaction_id is None
+                else self._targeted_tool_grant_ids_by_interaction.get(
+                    (session_id, interaction_id),
+                    (),
+                )
+            )
+            selected = (self._targeted_tool_grants[grant_id] for grant_id in grant_ids)
+            bounded = heapq.nsmallest(
+                limit + 1,
+                selected,
+                key=lambda candidate: (candidate.issued_at, candidate.grant_id),
+            )
+            if len(bounded) > limit:
+                raise ValueError("Targeted grant inspection exceeds its bounded result limit.")
+            if any(
+                len(self._targeted_tool_uses.get(record.grant_id, ())) != record.used_calls
+                for record in bounded
+            ):
+                raise ValueError("Targeted grant call counter conflicts with durable uses.")
+            return tuple(
+                targeted_tool_grant_with_active_reference(record, codec) for record in bounded
+            )
+
+    async def load_targeted_tool_grant_state(
+        self,
+        session_id: str,
+    ) -> TargetedToolGrantStateSnapshot:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+            codec = self.public_authority_alias_codec
+            if codec is None:  # pragma: no cover - in-memory capability invariant
+                raise RuntimeError("Targeted grants require a public authority alias codec.")
+            records = tuple(
+                targeted_tool_grant_with_active_reference(record, codec)
+                for record in sorted(
+                    (
+                        self._targeted_tool_grants[grant_id]
+                        for grant_id in self._targeted_tool_grant_ids_by_session.get(
+                            session_id,
+                            (),
+                        )
+                    ),
+                    key=lambda record: (record.issued_at, record.grant_id),
+                )
+            )
+            grant_ids = {record.grant_id for record in records}
+            uses = tuple(
+                TargetedToolUseBinding.model_validate(binding.model_dump(mode="python"))
+                for binding in sorted(
+                    (
+                        binding
+                        for grant_id in grant_ids
+                        for binding in self._targeted_tool_uses.get(grant_id, {}).values()
+                    ),
+                    key=lambda binding: (binding.bound_at, binding.use_id),
+                )
+            )
+            return TargetedToolGrantStateSnapshot(records=records, uses=uses)
+
+    def _resolve_targeted_tool_ref_unlocked(
+        self,
+        tool_ref: str,
+    ) -> tuple[str, str] | None:
+        try:
+            parsed = parse_public_authority_alias(tool_ref)
+        except (TypeError, ValueError):
+            return None
+        if parsed is None or parsed.field_name != TARGETED_TOOL_REFERENCE_FIELD_NAME:
+            return None
+        resolved = self._targeted_tool_grant_refs.get(tool_ref)
+        if resolved is None:
+            return None
+        scope_session_id, grant_id = resolved
+        codec = self.public_authority_alias_codec
+        if codec is None or not codec.matches(
+            tool_ref,
+            grant_id,
+            field_name=TARGETED_TOOL_REFERENCE_FIELD_NAME,
+            session_id=scope_session_id,
+        ):
+            return None
+        return resolved
+
+    async def bind_targeted_tool_grant_use(
+        self,
+        request: TargetedToolUseRequest,
+        *,
+        observed_at: datetime,
+    ) -> TargetedToolUseResult:
+        if type(request) is not TargetedToolUseRequest:
+            raise TypeError("request must be a TargetedToolUseRequest.")
+        request = TargetedToolUseRequest.model_validate(request.model_dump(mode="python"))
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ValueError("observed_at must be timezone-aware.")
+        observed_at = observed_at.astimezone(UTC)
+        async with self._lock:
+            session = self._sessions.get(request.session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {request.session_id}")
+            if session.run_epoch != request.expected_run_epoch:
+                raise SessionRunFenced(
+                    f"Session source run epoch is stale: expected {request.expected_run_epoch}, "
+                    f"current {session.run_epoch}."
+                )
+            if session.status is not SessionStatus.RUNNING:
+                raise SessionStatusConflict("Targeted tool use requires a running session.")
+
+            resolved = self._resolve_targeted_tool_ref_unlocked(request.tool_ref)
+            if resolved is None:
+                try:
+                    parsed = parse_public_authority_alias(request.tool_ref)
+                    well_formed = (
+                        parsed is not None
+                        and parsed.field_name == TARGETED_TOOL_REFERENCE_FIELD_NAME
+                    )
+                except (TypeError, ValueError):
+                    well_formed = False
+                reason = (
+                    TargetedToolUseRejectionReason.UNKNOWN
+                    if well_formed
+                    else TargetedToolUseRejectionReason.MALFORMED
+                )
+                event = targeted_tool_unresolved_rejection_event(
+                    request,
+                    reason=reason,
+                    timestamp=observed_at,
+                    agent_name=session.agent_name,
+                    environment_name=session.environment_name,
+                )
+                existing = self._event_records_by_id.get((request.session_id, event.id))
+                if existing is None:
+                    prepared = self._prepare_event_append_unlocked(session, [event])
+                    session = self._apply_event_append_unlocked(session, prepared)
+                    self._sessions[request.session_id] = session
+                else:
+                    event = copy_event(existing.event)
+                validate_targeted_tool_unresolved_rejection_evidence(
+                    request,
+                    reason=reason,
+                    event=event,
+                    agent_name=session.agent_name,
+                    environment_name=session.environment_name,
+                )
+                return TargetedToolUseResult(
+                    disposition=TargetedToolUseDisposition.REJECTED,
+                    reason=reason,
+                    event=event,
+                )
+            scope_session_id, grant_id = resolved
+            if scope_session_id != request.session_id:
+                event = targeted_tool_unresolved_rejection_event(
+                    request,
+                    reason=TargetedToolUseRejectionReason.CROSS_SESSION,
+                    timestamp=observed_at,
+                    agent_name=session.agent_name,
+                    environment_name=session.environment_name,
+                )
+                existing = self._event_records_by_id.get((request.session_id, event.id))
+                if existing is None:
+                    prepared = self._prepare_event_append_unlocked(session, [event])
+                    session = self._apply_event_append_unlocked(session, prepared)
+                    self._sessions[request.session_id] = session
+                else:
+                    event = copy_event(existing.event)
+                validate_targeted_tool_unresolved_rejection_evidence(
+                    request,
+                    reason=TargetedToolUseRejectionReason.CROSS_SESSION,
+                    event=event,
+                    agent_name=session.agent_name,
+                    environment_name=session.environment_name,
+                )
+                return TargetedToolUseResult(
+                    disposition=TargetedToolUseDisposition.REJECTED,
+                    reason=TargetedToolUseRejectionReason.CROSS_SESSION,
+                    event=event,
+                )
+            record = self._targeted_tool_grants.get(grant_id)
+            if record is None:
+                raise RuntimeError("Targeted tool reference lost its durable grant record.")
+            if len(self._targeted_tool_uses.get(grant_id, ())) != record.used_calls:
+                raise ValueError("Targeted grant call counter conflicts with durable uses.")
+            current_session: Session = session
+
+            def append_once(event: Event) -> Event:
+                nonlocal current_session
+                existing = self._event_records_by_id.get((request.session_id, event.id))
+                if existing is not None:
+                    return copy_event(existing.event)
+                prepared = self._prepare_event_append_unlocked(current_session, [event])
+                current_session = self._apply_event_append_unlocked(current_session, prepared)
+                self._sessions[request.session_id] = current_session
+                return event
+
+            def rejected(reason: TargetedToolUseRejectionReason) -> TargetedToolUseResult:
+                if reason is TargetedToolUseRejectionReason.EXPIRED:
+                    expiry_event = append_once(
+                        targeted_tool_grant_event(
+                            record,
+                            event_type=EventType.TARGETED_TOOL_GRANT_EXPIRED,
+                            timestamp=observed_at,
+                            outcome="expired",
+                            event_id_suffix="expired",
+                            rejection_reason=reason,
+                        )
+                    )
+                    validate_targeted_tool_grant_lifecycle_event(
+                        record,
+                        expiry_event,
+                        event_type=EventType.TARGETED_TOOL_GRANT_EXPIRED,
+                        outcome="expired",
+                        event_id_suffix="expired",
+                        rejection_reason=reason,
+                        require_current_call_count=False,
+                    )
+                event = append_once(
+                    targeted_tool_use_rejection_event(
+                        record,
+                        request,
+                        reason=reason,
+                        timestamp=observed_at,
+                    )
+                )
+                validate_targeted_tool_use_rejection_evidence(
+                    record,
+                    request,
+                    reason=reason,
+                    event=event,
+                )
+                return TargetedToolUseResult(
+                    disposition=TargetedToolUseDisposition.REJECTED,
+                    reason=reason,
+                    grant=record,
+                    event=event,
+                )
+
+            from cayu.runtime.interactions import INTERACTION_TERMINAL_EVENT_TYPES
+
+            if any(
+                event_record.event.type in INTERACTION_TERMINAL_EVENT_TYPES
+                for event_record in self._interaction_event_records.get(
+                    request.session_id,
+                    {},
+                ).get(record.interaction_id, ())
+            ):
+                return rejected(TargetedToolUseRejectionReason.EXPIRED)
+            uses = self._targeted_tool_uses.setdefault(grant_id, {})
+            related_by_id = {
+                binding.use_id: binding
+                for binding in (
+                    self._targeted_tool_use_by_invocation.get(
+                        (request.session_id, request.interaction_id, request.invocation_id)
+                    ),
+                    self._targeted_tool_use_by_outer_call.get(
+                        (request.session_id, request.interaction_id, request.outer_tool_call_id)
+                    ),
+                )
+                if binding is not None
+            }
+            related = tuple(related_by_id.values())
+            if related:
+                scope_rejection = targeted_tool_use_scope_rejection_reason(record, request)
+                if scope_rejection is not None:
+                    return rejected(scope_rejection)
+                candidate = targeted_tool_use_binding(
+                    grant_id,
+                    request,
+                    bound_at=related[0].bound_at,
+                )
+                if len(related) == 1 and related[0].model_dump(mode="json") == candidate.model_dump(
+                    mode="json"
+                ):
+                    event_record = self._event_records_by_id.get(
+                        (request.session_id, f"{grant_id}:use:{candidate.use_id}")
+                    )
+                    if event_record is None:
+                        raise RuntimeError("Targeted tool use lost its durable event evidence.")
+                    validate_targeted_tool_grant_lifecycle_event(
+                        record,
+                        event_record.event,
+                        event_type=EventType.TARGETED_TOOL_REFERENCE_CONSUMED,
+                        outcome=TargetedToolUseDisposition.BOUND.value,
+                        event_id_suffix=f"use:{candidate.use_id}",
+                        binding=related[0],
+                        require_current_call_count=False,
+                    )
+                    rejoined_event = append_once(
+                        targeted_tool_grant_event(
+                            record,
+                            event_type=EventType.TARGETED_TOOL_REFERENCE_REJOINED,
+                            timestamp=observed_at,
+                            outcome=TargetedToolUseDisposition.REJOINED.value,
+                            event_id_suffix=f"rejoined:{candidate.use_id}",
+                            binding=related[0],
+                        )
+                    )
+                    return TargetedToolUseResult(
+                        disposition=TargetedToolUseDisposition.REJOINED,
+                        grant=record,
+                        binding=related[0],
+                        event=rejoined_event,
+                    )
+                return rejected(TargetedToolUseRejectionReason.ALTERED_REPLAY)
+
+            reason = targeted_tool_use_rejection_reason(
+                record,
+                request,
+                observed_at=observed_at,
+            )
+            if reason is not None:
+                return rejected(reason)
+            binding = targeted_tool_use_binding(grant_id, request, bound_at=observed_at)
+            updated = TargetedToolGrantRecord.model_validate(
+                record.model_copy(update={"used_calls": record.used_calls + 1}).model_dump(
+                    mode="python"
+                )
+            )
+            event = targeted_tool_grant_event(
+                updated,
+                event_type=EventType.TARGETED_TOOL_REFERENCE_CONSUMED,
+                timestamp=observed_at,
+                outcome=TargetedToolUseDisposition.BOUND.value,
+                event_id_suffix=f"use:{binding.use_id}",
+                binding=binding,
+            )
+            prepared_append = self._prepare_event_append_unlocked(session, [event])
+            uses[binding.use_id] = binding
+            self._targeted_tool_use_by_invocation[
+                (binding.session_id, binding.interaction_id, binding.invocation_id)
+            ] = binding
+            self._targeted_tool_use_by_outer_call[
+                (binding.session_id, binding.interaction_id, binding.outer_tool_call_id)
+            ] = binding
+            self._targeted_tool_grants[grant_id] = updated
+            self._sessions[request.session_id] = self._apply_event_append_unlocked(
+                session,
+                prepared_append,
+            )
+            return TargetedToolUseResult(
+                disposition=TargetedToolUseDisposition.BOUND,
+                grant=updated,
+                binding=binding,
+                event=event,
+            )
+
+    async def revoke_targeted_tool_grant(
+        self,
+        tool_ref: str,
+        *,
+        session_id: str,
+        expected_run_epoch: int,
+        reason: str,
+        revoked_at: datetime,
+    ) -> TargetedToolGrantRecord | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if type(expected_run_epoch) is not int or expected_run_epoch < 0:
+            raise ValueError("expected_run_epoch must be a non-negative integer.")
+        reason = validate_targeted_tool_grant_revocation_reason(reason)
+        if revoked_at.tzinfo is None or revoked_at.utcoffset() is None:
+            raise ValueError("revoked_at must be timezone-aware.")
+        revoked_at = revoked_at.astimezone(UTC)
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            if session.run_epoch != expected_run_epoch:
+                raise SessionRunFenced(
+                    f"Session source run epoch is stale: expected {expected_run_epoch}, "
+                    f"current {session.run_epoch}."
+                )
+            resolved = self._resolve_targeted_tool_ref_unlocked(tool_ref)
+            if resolved is None or resolved[0] != session_id:
+                return None
+            record = self._targeted_tool_grants.get(resolved[1])
+            if record is None:
+                raise RuntimeError("Targeted tool reference lost its durable grant record.")
+            if len(self._targeted_tool_uses.get(record.grant_id, ())) != record.used_calls:
+                raise ValueError("Targeted grant call counter conflicts with durable uses.")
+            if record.revoked_at is not None:
+                if record.revocation_reason != reason:
+                    raise ValueError("Targeted grant was revoked with a different reason.")
+                event_record = self._event_records_by_id.get(
+                    (session_id, f"{record.grant_id}:revoked")
+                )
+                if event_record is None:
+                    raise RuntimeError("Targeted grant revocation lost its durable event evidence.")
+                validate_targeted_tool_grant_revocation_evidence(
+                    record,
+                    event_record.event,
+                )
+                return copy_targeted_tool_grant_record(record)
+            uses = self._targeted_tool_uses.get(record.grant_id, {})
+            if any(binding.bound_at > revoked_at for binding in uses.values()):
+                raise ValueError("revoked_at cannot precede a bound targeted tool use.")
+            updated = TargetedToolGrantRecord.model_validate(
+                record.model_copy(
+                    update={"revoked_at": revoked_at, "revocation_reason": reason}
+                ).model_dump(mode="python")
+            )
+            event = targeted_tool_grant_event(
+                updated,
+                event_type=EventType.TARGETED_TOOL_GRANT_REVOKED,
+                timestamp=revoked_at,
+                outcome="revoked",
+                event_id_suffix="revoked",
+            )
+            prepared_append = self._prepare_event_append_unlocked(session, [event])
+            self._targeted_tool_grants[record.grant_id] = updated
+            self._sessions[session_id] = self._apply_event_append_unlocked(
+                session,
+                prepared_append,
+            )
+            return copy_targeted_tool_grant_record(updated)
+
+    async def reconstruct_targeted_tool_grants(
+        self,
+        session_id: str,
+        *,
+        expected_run_epoch: int,
+        interaction_id: str,
+        generation_id: str,
+        agent_name: str,
+        task_id: str | None,
+        environment_name: str | None,
+        principal: str | None,
+        tenant: str | None,
+        catalogue_revision: str,
+        descriptors_by_id: Mapping[str, tuple[str, str, str]],
+        capability_ceiling_names: frozenset[str],
+        observed_at: datetime,
+    ) -> TargetedToolGrantReconstructionResult:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        interaction_id = require_clean_nonblank(interaction_id, "interaction_id")
+        if type(expected_run_epoch) is not int or expected_run_epoch < 0:
+            raise ValueError("expected_run_epoch must be a non-negative integer.")
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ValueError("observed_at must be timezone-aware.")
+        observed_at = observed_at.astimezone(UTC)
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            if session.run_epoch != expected_run_epoch:
+                raise SessionRunFenced(
+                    f"Session source run epoch is stale: expected {expected_run_epoch}, "
+                    f"current {session.run_epoch}."
+                )
+            if session.status is not SessionStatus.RUNNING:
+                raise SessionStatusConflict("Grant reconstruction requires a running session.")
+            records = sorted(
+                (
+                    self._targeted_tool_grants[grant_id]
+                    for grant_id in self._targeted_tool_grant_ids_by_interaction.get(
+                        (session_id, interaction_id),
+                        (),
+                    )
+                ),
+                key=lambda candidate: (candidate.issued_at, candidate.grant_id),
+            )
+            if len(records) > TARGETED_TOOL_GRANT_MAX_REQUESTS:
+                raise ValueError("Targeted grant interaction exceeds its bounded count.")
+            if any(
+                len(self._targeted_tool_uses.get(record.grant_id, ())) != record.used_calls
+                for record in records
+            ):
+                raise ValueError("Targeted grant call counter conflicts with durable uses.")
+
+            current_session: Session = session
+
+            def append_once(event: Event) -> Event:
+                nonlocal current_session
+                existing = self._event_records_by_id.get((session_id, event.id))
+                if existing is not None:
+                    return copy_event(existing.event)
+                prepared = self._prepare_event_append_unlocked(current_session, [event])
+                current_session = self._apply_event_append_unlocked(current_session, prepared)
+                self._sessions[session_id] = current_session
+                return event
+
+            from cayu.runtime.interactions import INTERACTION_TERMINAL_EVENT_TYPES
+
+            interaction_records = self._interaction_event_records.get(session_id, {}).get(
+                interaction_id,
+                (),
+            )
+            interaction_started = next(
+                (
+                    event_record.event
+                    for event_record in interaction_records
+                    if event_record.event.type is EventType.INTERACTION_STARTED
+                ),
+                None,
+            )
+            if interaction_started is None:
+                raise RuntimeError("Targeted grant reconstruction lost interaction admission.")
+            validate_targeted_tool_grant_batch_evidence(tuple(records), interaction_started)
+            interaction_ended = any(
+                event_record.event.type in INTERACTION_TERMINAL_EVENT_TYPES
+                for event_record in interaction_records
+            )
+            valid: list[TargetedToolGrantRecord] = []
+            rejected: list[tuple[str, TargetedToolUseRejectionReason]] = []
+            events: list[Event] = []
+            for record in records:
+                reason = targeted_tool_grant_reconstruction_rejection_reason(
+                    record,
+                    generation_id=generation_id,
+                    agent_name=agent_name,
+                    task_id=task_id,
+                    environment_name=environment_name,
+                    principal=principal,
+                    tenant=tenant,
+                    catalogue_revision=catalogue_revision,
+                    descriptors_by_id=descriptors_by_id,
+                    capability_ceiling_names=capability_ceiling_names,
+                    observed_at=observed_at,
+                    interaction_ended=interaction_ended,
+                )
+                if reason is None:
+                    valid.append(record)
+                    event = targeted_tool_grant_event(
+                        record,
+                        event_type=EventType.TARGETED_TOOL_GRANT_RECONSTRUCTED,
+                        timestamp=observed_at,
+                        outcome="reconstructed",
+                        event_id_suffix="reconstructed",
+                    )
+                else:
+                    rejected.append((record.grant_id, reason))
+                    if reason is TargetedToolUseRejectionReason.EXPIRED:
+                        persisted_expiry = append_once(
+                            targeted_tool_grant_event(
+                                record,
+                                event_type=EventType.TARGETED_TOOL_GRANT_EXPIRED,
+                                timestamp=observed_at,
+                                outcome="expired",
+                                event_id_suffix="expired",
+                                rejection_reason=reason,
+                            )
+                        )
+                        validate_targeted_tool_grant_lifecycle_event(
+                            record,
+                            persisted_expiry,
+                            event_type=EventType.TARGETED_TOOL_GRANT_EXPIRED,
+                            outcome="expired",
+                            event_id_suffix="expired",
+                            rejection_reason=reason,
+                            require_current_call_count=False,
+                        )
+                    event = targeted_tool_grant_event(
+                        record,
+                        event_type=EventType.TARGETED_TOOL_GRANT_RECONSTRUCTED,
+                        timestamp=observed_at,
+                        outcome="rejected",
+                        event_id_suffix=f"reconstruction-rejected:{reason.value}",
+                        rejection_reason=reason,
+                    )
+                persisted = append_once(event)
+                validate_targeted_tool_grant_lifecycle_event(
+                    record,
+                    persisted,
+                    event_type=EventType.TARGETED_TOOL_GRANT_RECONSTRUCTED,
+                    outcome="reconstructed" if reason is None else "rejected",
+                    event_id_suffix=(
+                        "reconstructed"
+                        if reason is None
+                        else f"reconstruction-rejected:{reason.value}"
+                    ),
+                    rejection_reason=reason,
+                    require_current_call_count=False,
+                )
+                events.append(persisted)
+            return TargetedToolGrantReconstructionResult(
+                valid=tuple(valid),
+                rejected=tuple(rejected),
+                events=tuple(events),
             )
 
     async def create(
@@ -10343,6 +11333,49 @@ class InMemorySessionStore(SessionStore):
                         f"event is pending: {session_id}"
                     )
             self._remove_session_parent_index_unlocked(session)
+            targeted_grant_ids = {
+                grant_id
+                for grant_id, record in self._targeted_tool_grants.items()
+                if record.session_id == session_id
+            }
+            self._targeted_tool_grants = {
+                grant_id: record
+                for grant_id, record in self._targeted_tool_grants.items()
+                if grant_id not in targeted_grant_ids
+            }
+            self._targeted_tool_grant_ids_by_session.pop(session_id, None)
+            self._targeted_tool_grant_ids_by_interaction = {
+                key: grant_ids
+                for key, grant_ids in self._targeted_tool_grant_ids_by_interaction.items()
+                if key[0] != session_id
+            }
+            self._targeted_tool_grant_ids_by_request = {
+                key: grant_id
+                for key, grant_id in self._targeted_tool_grant_ids_by_request.items()
+                if key[0] != session_id and grant_id not in targeted_grant_ids
+            }
+            self._targeted_tool_grant_ids_by_tool = {
+                key: grant_id
+                for key, grant_id in self._targeted_tool_grant_ids_by_tool.items()
+                if key[0] != session_id and grant_id not in targeted_grant_ids
+            }
+            self._targeted_tool_grant_refs = {
+                public_alias: target
+                for public_alias, target in self._targeted_tool_grant_refs.items()
+                if target[0] != session_id and target[1] not in targeted_grant_ids
+            }
+            for grant_id in targeted_grant_ids:
+                self._targeted_tool_uses.pop(grant_id, None)
+            self._targeted_tool_use_by_invocation = {
+                key: binding
+                for key, binding in self._targeted_tool_use_by_invocation.items()
+                if key[0] != session_id and binding.grant_id not in targeted_grant_ids
+            }
+            self._targeted_tool_use_by_outer_call = {
+                key: binding
+                for key, binding in self._targeted_tool_use_by_outer_call.items()
+                if key[0] != session_id and binding.grant_id not in targeted_grant_ids
+            }
             self._sessions.pop(session_id, None)
             self._events.pop(session_id, None)
             self._event_ids.pop(session_id, None)
@@ -15012,6 +16045,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         tool_capability_ceiling=_copy_optional_tool_capability_ceiling(
             request.tool_capability_ceiling
         ),
+        tool_grants=validate_targeted_tool_grants(request.tool_grants),
         environment_name=request.environment_name,
         labels=copy_label_map(request.labels, "labels"),
         metadata=copy_durable_json_object(request.metadata, "metadata"),
@@ -15682,6 +16716,7 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
         tool_capability_ceiling=_copy_optional_tool_capability_ceiling(
             request.tool_capability_ceiling
         ),
+        tool_grants=validate_targeted_tool_grants(request.tool_grants),
         profile_adoption=(
             None
             if request.profile_adoption is None
@@ -16654,9 +17689,11 @@ def validate_profiled_fork_evidence(
     ):
         raise ValueError("Fork execution-profile relationship conflicts with child metadata.")
     if relationship.selection is ForkExecutionProfileSelection.CURRENT_CHILD:
-        if len(events) != 2 or relationship.decision is None:
-            raise ValueError("Current-child fork evidence requires decision then fork events.")
-        decision_event, fork_event = events
+        if len(events) != 3 or relationship.decision is None:
+            raise ValueError(
+                "Current-child fork evidence requires decision, fork, and grant-reset events."
+            )
+        decision_event, fork_event, grant_reset_event = events
         if (
             decision_event.type != EventType.SESSION_EXECUTION_PROFILE_DECIDED
             or decision_event.id != relationship.decision.event_id
@@ -16688,9 +17725,9 @@ def validate_profiled_fork_evidence(
         ):
             raise ValueError("Fork profile decision event conflicts with its relationship.")
     else:
-        if len(events) != 1:
-            raise ValueError("Inherited fork evidence requires exactly one fork event.")
-        fork_event = events[0]
+        if len(events) != 2:
+            raise ValueError("Inherited fork evidence requires fork and grant-reset events.")
+        fork_event, grant_reset_event = events
     if (
         fork_event.type != EventType.SESSION_FORKED
         or fork_event.id != relationship.fork_event_id
@@ -16698,6 +17735,17 @@ def validate_profiled_fork_evidence(
         or any(event.session_id != fork.id for event in events)
     ):
         raise ValueError("Fork event evidence conflicts with its relationship.")
+    if (
+        grant_reset_event.type is not EventType.TARGETED_TOOL_GRANT_FORK_RESET
+        or grant_reset_event.timestamp != fork.created_at
+        or grant_reset_event.payload.get("schema_version") != 1
+        or grant_reset_event.payload.get("source_session_id") != relationship.source_session_id
+        or grant_reset_event.payload.get("source_interaction_id")
+        != relationship.source_active_interaction_id
+        or grant_reset_event.payload.get("inherited_grant_count") != 0
+        or grant_reset_event.payload.get("inherited_reference_count") != 0
+    ):
+        raise ValueError("Fork targeted-grant reset evidence is inconsistent.")
     payload = fork_event.payload
     if (
         payload.get("source_session_id") != relationship.source_session_id

@@ -7,7 +7,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -141,8 +141,12 @@ from cayu.runtime.execution_units import (
     copy_model_attempt_identity,
     copy_tool_round_identity,
 )
+from cayu.runtime.interactions import (
+    INTERACTION_LIFECYCLE_EVENT_TYPES,
+    INTERACTION_TERMINAL_EVENT_TYPES,
+)
 from cayu.runtime.invocation import SessionInvocation, SessionInvocationBinding, TaskInvocation
-from cayu.runtime.public_authority import PublicAuthorityAliasCodec
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec, parse_public_authority_alias
 from cayu.runtime.service_manifest import RuntimeStoreDurability
 from cayu.runtime.sessions import (
     _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES,
@@ -477,6 +481,38 @@ from cayu.runtime.tasks import (
     task_query_from_aggregate_filter,
 )
 from cayu.runtime.tool_exposure import ToolCapabilityCeiling
+from cayu.runtime.tool_grants import (
+    TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS,
+    TARGETED_TOOL_GRANT_MAX_REQUESTS,
+    TARGETED_TOOL_REFERENCE_FIELD_NAME,
+    TargetedToolGrantIssueOutcome,
+    TargetedToolGrantIssueResult,
+    TargetedToolGrantReconstructionResult,
+    TargetedToolGrantRecord,
+    TargetedToolGrantStateSnapshot,
+    TargetedToolUseBinding,
+    TargetedToolUseDisposition,
+    TargetedToolUseRejectionReason,
+    TargetedToolUseRequest,
+    TargetedToolUseResult,
+    copy_targeted_tool_grant_record,
+    targeted_tool_grant_event,
+    targeted_tool_grant_reconstruction_rejection_reason,
+    targeted_tool_grant_with_active_reference,
+    targeted_tool_unresolved_rejection_event,
+    targeted_tool_use_binding,
+    targeted_tool_use_rejection_event,
+    targeted_tool_use_rejection_reason,
+    targeted_tool_use_scope_rejection_reason,
+    validate_targeted_tool_grant_batch_evidence,
+    validate_targeted_tool_grant_issuance_evidence,
+    validate_targeted_tool_grant_lifecycle_event,
+    validate_targeted_tool_grant_reference,
+    validate_targeted_tool_grant_revocation_evidence,
+    validate_targeted_tool_grant_revocation_reason,
+    validate_targeted_tool_unresolved_rejection_evidence,
+    validate_targeted_tool_use_rejection_evidence,
+)
 from cayu.runtime.work_contracts import WorkCompletionConflict
 from cayu.storage import _postgres_aggregates as postgres_aggregates
 from cayu.storage import _postgres_support as pg_support
@@ -612,7 +648,7 @@ from cayu.storage.memory import (
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 51
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 52
 _POSTGRES_TASK_MIN_REQUIRED_REVISION = 49
 
 
@@ -726,6 +762,87 @@ _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     contains_style="postgres_ilike",
     datetime_param=pg_support.to_utc,
 )
+
+
+def _targeted_tool_grant_from_postgres(value: object) -> TargetedToolGrantRecord:
+    try:
+        decoded = json.loads(value) if type(value) is str else value
+        return copy_targeted_tool_grant_record(TargetedToolGrantRecord.model_validate(decoded))
+    except (TypeError, ValueError):
+        raise ValueError("Stored targeted tool grant is malformed.") from None
+
+
+def _targeted_tool_use_from_postgres(value: object) -> TargetedToolUseBinding:
+    try:
+        decoded = json.loads(value) if type(value) is str else value
+        return TargetedToolUseBinding.model_validate(decoded)
+    except (TypeError, ValueError):
+        raise ValueError("Stored targeted tool use is malformed.") from None
+
+
+def _targeted_tool_grant_from_postgres_row(row: Sequence[object]) -> TargetedToolGrantRecord:
+    if len(row) != 16:
+        raise ValueError("Stored targeted tool grant row is malformed.")
+    record = _targeted_tool_grant_from_postgres(row[15])
+    indexed = (
+        record.grant_id,
+        record.session_id,
+        record.interaction_id,
+        record.request_id,
+        record.tool_ref,
+        record.generation_id,
+        record.tool_id,
+        record.tool_name,
+        record.catalogue_revision,
+        record.descriptor_version,
+        pg_support.to_utc(record.issued_at),
+        pg_support.to_utc(record.expires_at),
+        record.max_calls,
+        record.used_calls,
+        None if record.revoked_at is None else pg_support.to_utc(record.revoked_at),
+    )
+    if tuple(row[:15]) != indexed:
+        raise ValueError("Stored targeted tool grant conflicts with indexed authority.")
+    return record
+
+
+def _targeted_tool_use_from_postgres_row(row: Sequence[object]) -> TargetedToolUseBinding:
+    if len(row) != 10:
+        raise ValueError("Stored targeted tool use row is malformed.")
+    binding = _targeted_tool_use_from_postgres(row[9])
+    indexed = (
+        binding.use_id,
+        binding.grant_id,
+        binding.session_id,
+        binding.interaction_id,
+        binding.model_step_id,
+        binding.outer_tool_call_id,
+        binding.arguments_sha256,
+        binding.invocation_id,
+        pg_support.to_utc(binding.bound_at),
+    )
+    if tuple(row[:9]) != indexed:
+        raise ValueError("Stored targeted tool use conflicts with indexed authority.")
+    return binding
+
+
+async def _validate_targeted_tool_use_counts(
+    cur: Any,
+    records: Iterable[TargetedToolGrantRecord],
+) -> None:
+    expected = {record.grant_id: record.used_calls for record in records}
+    if not expected:
+        return
+    await cur.execute(
+        "SELECT grant_id, COUNT(*) FROM cayu_targeted_tool_grant_uses "
+        "WHERE grant_id = ANY(%s) GROUP BY grant_id",
+        (list(expected),),
+    )
+    actual = dict.fromkeys(expected, 0)
+    for row in await cur.fetchall():
+        actual[str(row[0])] = int(row[1])
+    if actual != expected:
+        raise ValueError("Targeted grant call counter conflicts with durable uses.")
 
 
 def _postgres_transcript_search_expression(query: TranscriptSearchQuery) -> str:
@@ -2309,6 +2426,52 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "CREATE INDEX IF NOT EXISTS idx_cayu_recall_item_exposures_receipt "
         "ON cayu_recall_item_exposures(receipt_id, exposure_id, ordinal)",
     ),
+    52: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_targeted_tool_grants (
+            grant_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            interaction_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            tool_ref TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            tool_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            catalogue_revision TEXT NOT NULL,
+            descriptor_version TEXT NOT NULL,
+            issued_at TIMESTAMPTZ NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL,
+            max_calls BIGINT NOT NULL CHECK (max_calls >= 1 AND max_calls <= 32),
+            used_calls BIGINT NOT NULL DEFAULT 0
+                CHECK (used_calls >= 0 AND used_calls <= max_calls),
+            revoked_at TIMESTAMPTZ,
+            record JSONB NOT NULL,
+            UNIQUE (session_id, interaction_id, request_id),
+            UNIQUE (session_id, interaction_id, tool_id)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_targeted_tool_grants_interaction "
+        "ON cayu_targeted_tool_grants(session_id, interaction_id, issued_at, grant_id)",
+        """
+        CREATE TABLE IF NOT EXISTS cayu_targeted_tool_grant_uses (
+            use_id TEXT PRIMARY KEY,
+            grant_id TEXT NOT NULL
+                REFERENCES cayu_targeted_tool_grants(grant_id) ON DELETE CASCADE,
+            session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            interaction_id TEXT NOT NULL,
+            model_step_id TEXT NOT NULL,
+            outer_tool_call_id TEXT NOT NULL,
+            arguments_sha256 TEXT NOT NULL,
+            invocation_id TEXT NOT NULL,
+            bound_at TIMESTAMPTZ NOT NULL,
+            record JSONB NOT NULL,
+            UNIQUE (session_id, interaction_id, invocation_id),
+            UNIQUE (session_id, interaction_id, outer_tool_call_id)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_targeted_tool_grant_uses_grant "
+        "ON cayu_targeted_tool_grant_uses(grant_id, bound_at, use_id)",
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -3220,6 +3383,22 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
             access_method="gin",
         ),
     ),
+    52: (
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_public_authority_public_alias",
+            table_name="cayu_public_authority_aliases",
+            key_definitions=("field_name", "public_alias"),
+            predicate_definition=None,
+            create_statement=(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+                "idx_cayu_public_authority_public_alias "
+                "ON cayu_public_authority_aliases(field_name, public_alias)"
+            ),
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_public_authority_public_alias"
+            ),
+        ),
+    ),
 }
 
 
@@ -3310,6 +3489,17 @@ async def _reject_populated_pre_invocation_database(cur: Any) -> None:
             "Storage revision 36 requires invocation provenance for every session and "
             "cannot migrate a populated Cayu session database. Recreate the Cayu "
             "database before starting this build."
+        )
+
+
+async def _reject_populated_pre_targeted_tool_grant_database(cur: Any) -> None:
+    await cur.execute("SELECT EXISTS(SELECT 1 FROM cayu_sessions)")
+    row = await cur.fetchone()
+    if row is not None and row[0] is True:
+        raise schema.SchemaTooOld(
+            "Storage revision 52 is a clean prerelease break and cannot migrate a "
+            "populated Cayu session database. Recreate the Cayu database before "
+            "starting this build."
         )
 
 
@@ -3643,6 +3833,12 @@ class _PostgresStoreBase:
                         revision.revision == 46 for revision in schema.pending(current)
                     ):
                         await _reject_populated_pre_transcript_search_database(cur)
+                    if (
+                        current != schema.UNINITIALIZED
+                        and current < 52
+                        and any(revision.revision == 52 for revision in schema.pending(current))
+                    ):
+                        await _reject_populated_pre_targeted_tool_grant_database(cur)
                     if current == schema.UNINITIALIZED:
                         await self._apply_baseline(cur)
                         current = schema.BASELINE_REVISION
@@ -3685,6 +3881,8 @@ class _PostgresStoreBase:
                             await self._validate_eval_run_invocation_column(cur)
                         if self._min_required_revision >= 51:
                             await self._validate_memory_evidence_schema(cur)
+                        if self._min_required_revision >= 52:
+                            await self._validate_targeted_tool_grant_schema(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -3857,6 +4055,8 @@ class _PostgresStoreBase:
             await self._validate_eval_run_invocation_column(cur)
         if self._min_required_revision >= 51:
             await self._validate_memory_evidence_schema(cur)
+        if self._min_required_revision >= 52:
+            await self._validate_targeted_tool_grant_schema(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -3947,6 +4147,8 @@ class _PostgresStoreBase:
             await self._validate_eval_run_invocation_column(cur)
         if revision.revision == 51:
             await self._validate_memory_evidence_schema(cur)
+        if revision.revision == 52:
+            await self._validate_targeted_tool_grant_schema(cur)
 
     async def _validate_transcript_search_document_column(self, cur: Any) -> None:
         await cur.execute(
@@ -5458,6 +5660,152 @@ class _PostgresStoreBase:
             "revision-51 backup."
         )
 
+    async def _validate_targeted_tool_grant_schema(self, cur: Any) -> None:
+        expected_columns = {
+            "cayu_targeted_tool_grants": (
+                ("grant_id", "text", "NO"),
+                ("session_id", "text", "NO"),
+                ("interaction_id", "text", "NO"),
+                ("request_id", "text", "NO"),
+                ("tool_ref", "text", "NO"),
+                ("generation_id", "text", "NO"),
+                ("tool_id", "text", "NO"),
+                ("tool_name", "text", "NO"),
+                ("catalogue_revision", "text", "NO"),
+                ("descriptor_version", "text", "NO"),
+                ("issued_at", "timestamp with time zone", "NO"),
+                ("expires_at", "timestamp with time zone", "NO"),
+                ("max_calls", "bigint", "NO"),
+                ("used_calls", "bigint", "NO"),
+                ("revoked_at", "timestamp with time zone", "YES"),
+                ("record", "jsonb", "NO"),
+            ),
+            "cayu_targeted_tool_grant_uses": (
+                ("use_id", "text", "NO"),
+                ("grant_id", "text", "NO"),
+                ("session_id", "text", "NO"),
+                ("interaction_id", "text", "NO"),
+                ("model_step_id", "text", "NO"),
+                ("outer_tool_call_id", "text", "NO"),
+                ("arguments_sha256", "text", "NO"),
+                ("invocation_id", "text", "NO"),
+                ("bound_at", "timestamp with time zone", "NO"),
+                ("record", "jsonb", "NO"),
+            ),
+        }
+        for table_name, expected in expected_columns.items():
+            await cur.execute(
+                """
+                SELECT column_name, data_type, is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (table_name,),
+            )
+            if tuple(await cur.fetchall()) != expected:
+                self._raise_targeted_tool_grant_schema_error(table_name)
+
+        await cur.execute(
+            """
+            SELECT column_default
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_targeted_tool_grants'
+              AND column_name = 'used_calls'
+            """
+        )
+        default_row = await cur.fetchone()
+        if default_row is None or re.sub(r"\s|::bigint", "", str(default_row[0])) != "0":
+            self._raise_targeted_tool_grant_schema_error("cayu_targeted_tool_grants.used_calls")
+
+        expected_constraints = {
+            "cayu_targeted_tool_grants": {
+                ("p", "primarykeygrant_id"),
+                ("u", "uniquesession_id,interaction_id,request_id"),
+                ("u", "uniquesession_id,interaction_id,tool_id"),
+                (
+                    "f",
+                    "foreignkeysession_idreferencescayu_sessionsidondeletecascade",
+                ),
+                ("c", "checkmax_calls>=1andmax_calls<=32"),
+                ("c", "checkused_calls>=0andused_calls<=max_calls"),
+            },
+            "cayu_targeted_tool_grant_uses": {
+                ("p", "primarykeyuse_id"),
+                ("u", "uniquesession_id,interaction_id,invocation_id"),
+                ("u", "uniquesession_id,interaction_id,outer_tool_call_id"),
+                (
+                    "f",
+                    "foreignkeygrant_idreferencescayu_targeted_tool_grantsgrant_idondeletecascade",
+                ),
+                (
+                    "f",
+                    "foreignkeysession_idreferencescayu_sessionsidondeletecascade",
+                ),
+            },
+        }
+        for table_name, expected in expected_constraints.items():
+            await cur.execute(
+                """
+                SELECT constraint_record.contype,
+                       pg_get_constraintdef(constraint_record.oid)
+                FROM pg_catalog.pg_constraint AS constraint_record
+                JOIN pg_catalog.pg_class AS table_record
+                  ON table_record.oid = constraint_record.conrelid
+                JOIN pg_catalog.pg_namespace AS namespace
+                  ON namespace.oid = table_record.relnamespace
+                WHERE namespace.nspname = current_schema()
+                  AND table_record.relname = %s
+                """,
+                (table_name,),
+            )
+            actual = {
+                (
+                    str(row[0]),
+                    re.sub(r'[\s()"]', "", str(row[1]).lower()),
+                )
+                for row in await cur.fetchall()
+            }
+            if actual != expected:
+                self._raise_targeted_tool_grant_schema_error(f"{table_name} constraints")
+
+        required_indexes = {
+            "idx_cayu_targeted_tool_grants_interaction": (
+                "cayu_targeted_tool_grantsusingbtreesession_id,interaction_id,issued_at,grant_id"
+            ),
+            "idx_cayu_targeted_tool_grant_uses_grant": (
+                "cayu_targeted_tool_grant_usesusingbtreegrant_id,bound_at,use_id"
+            ),
+        }
+        for index_name, required_definition in required_indexes.items():
+            await cur.execute(
+                """
+                SELECT indexdef
+                FROM pg_indexes
+                WHERE schemaname = current_schema() AND indexname = %s
+                """,
+                (index_name,),
+            )
+            index_rows = tuple(await cur.fetchall())
+            if len(index_rows) != 1:
+                self._raise_targeted_tool_grant_schema_error(index_name)
+            index_definition = re.sub(r'[\s()"]', "", str(index_rows[0][0]).lower())
+            if (
+                "createindex" not in index_definition
+                or "createuniqueindex" in index_definition
+                or required_definition not in index_definition
+            ):
+                self._raise_targeted_tool_grant_schema_error(index_name)
+
+    @staticmethod
+    def _raise_targeted_tool_grant_schema_error(name: str) -> NoReturn:
+        raise RuntimeError(
+            f"Postgres schema object {name!r} conflicts with Cayu's revision-52 "
+            "targeted-grant durability contract. Run `cayu storage migrate` or "
+            "restore the database from a known-good backup."
+        )
+
     @staticmethod
     def _raise_eval_result_baseline_schema_error(name: str) -> NoReturn:
         raise RuntimeError(
@@ -6043,6 +6391,12 @@ class _PostgresStoreBase:
             await _reject_populated_pre_knowledge_revision_database(cur)
         if current < 46 and any(revision.revision == 46 for revision in schema.pending(current)):
             await _reject_populated_pre_transcript_search_database(cur)
+        if (
+            current != schema.UNINITIALIZED
+            and current < 52
+            and any(revision.revision == 52 for revision in schema.pending(current))
+        ):
+            await _reject_populated_pre_targeted_tool_grant_database(cur)
         if current == schema.UNINITIALIZED:
             await self._apply_baseline(cur)
             current = schema.BASELINE_REVISION
@@ -12587,6 +12941,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_usage_aggregates: ClassVar[bool] = True
     supports_mcp_manifest_history: ClassVar[bool] = True
     supports_public_authority_aliases: ClassVar[bool] = True
+    supports_targeted_tool_grants: ClassVar[bool] = True
     supports_session_topology: ClassVar[bool] = True
     supports_session_lineage: ClassVar[bool] = True
     supports_terminal_session_evidence: ClassVar[bool] = True
@@ -12754,6 +13109,1086 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             row = await cur.fetchone()
             return bool(row is not None and row[0])
 
+    async def issue_targeted_tool_grants(
+        self,
+        session_id: str,
+        *,
+        expected_run_epoch: int,
+        records: tuple[TargetedToolGrantRecord, ...],
+        events: tuple[Event, ...],
+    ) -> TargetedToolGrantIssueResult:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if type(expected_run_epoch) is not int or expected_run_epoch < 0:
+            raise ValueError("expected_run_epoch must be a non-negative integer.")
+        if type(records) is not tuple or type(events) is not tuple:
+            raise TypeError("records and events must be tuples.")
+        if len(records) > TARGETED_TOOL_GRANT_MAX_REQUESTS:
+            raise ValueError("Targeted grant issuance exceeds the bounded request count.")
+        copied_records = tuple(copy_targeted_tool_grant_record(record) for record in records)
+        copied_events = tuple(
+            Event.model_validate(event.model_dump(mode="python")) for event in events
+        )
+        if len(copied_records) != len(copied_events):
+            raise ValueError("Each targeted grant record requires one issuance event.")
+        if len({record.request_id for record in copied_records}) != len(copied_records):
+            raise ValueError("Targeted grant records must have unique request identities.")
+        if len({record.tool_id for record in copied_records}) != len(copied_records):
+            raise ValueError("Targeted grant records must have unique tool identities.")
+        interaction_ids = {record.interaction_id for record in copied_records}
+        if len(interaction_ids) > 1:
+            raise ValueError("Targeted grant records must share one interaction scope.")
+        codec = self.public_authority_alias_codec
+        if codec is None:
+            raise RuntimeError("Targeted grants require a public authority alias codec.")
+        for record, event in zip(copied_records, copied_events, strict=True):
+            if record.session_id != session_id:
+                raise ValueError("Targeted grant scope is inconsistent.")
+            validate_targeted_tool_grant_reference(record, codec)
+            validate_targeted_tool_grant_issuance_evidence(record, event)
+        await self._ensure_ready()
+        resolved: list[TargetedToolGrantRecord] = []
+        outcomes: list[TargetedToolGrantIssueOutcome] = []
+        resolved_events: list[Event] = []
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT agent_name, environment_name, status, run_epoch, invocation "
+                        "FROM cayu_sessions WHERE id = %s FOR UPDATE",
+                        (session_id,),
+                    )
+                    session_row = await cur.fetchone()
+                    if session_row is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    if int(session_row[3]) != expected_run_epoch:
+                        raise SessionRunFenced(
+                            "Session source run epoch is stale: expected "
+                            f"{expected_run_epoch}, current {session_row[3]}."
+                        )
+                    if str(session_row[2]) != str(SessionStatus.RUNNING):
+                        raise SessionStatusConflict("Targeted grants require a running session.")
+                    if interaction_ids:
+                        await cur.execute(
+                            "SELECT interaction_id, event_type FROM cayu_events "
+                            "WHERE session_id = %s AND event_type = ANY(%s) "
+                            "ORDER BY sequence DESC LIMIT 1",
+                            (
+                                session_id,
+                                [str(value) for value in INTERACTION_LIFECYCLE_EVENT_TYPES],
+                            ),
+                        )
+                        latest_interaction = await cur.fetchone()
+                        if (
+                            latest_interaction is None
+                            or latest_interaction[0] != next(iter(interaction_ids))
+                            or EventType(str(latest_interaction[1]))
+                            in INTERACTION_TERMINAL_EVENT_TYPES
+                        ):
+                            raise ValueError(
+                                "Targeted grants require the current open interaction."
+                            )
+                        await cur.execute(
+                            "SELECT event FROM cayu_events WHERE session_id = %s "
+                            "AND interaction_id = %s AND event_type = %s "
+                            "ORDER BY sequence ASC LIMIT 1",
+                            (
+                                session_id,
+                                next(iter(interaction_ids)),
+                                str(EventType.INTERACTION_STARTED),
+                            ),
+                        )
+                        interaction_started_row = await cur.fetchone()
+                        if interaction_started_row is None:
+                            raise RuntimeError(
+                                "Targeted grant issuance lost interaction admission."
+                            )
+                        validate_targeted_tool_grant_batch_evidence(
+                            copied_records,
+                            Event(**_json_obj(interaction_started_row[0])),
+                        )
+                    invocation = SessionInvocation.model_validate(session_row[4])
+                    new_events: list[Event] = []
+                    for record, event in zip(copied_records, copied_events, strict=True):
+                        if (
+                            record.session_id != session_id
+                            or record.agent_name != session_row[0]
+                            or record.environment_name != session_row[1]
+                            or record.principal != invocation.origin.subject
+                            or record.tenant != invocation.origin.tenant
+                        ):
+                            raise ValueError("Targeted grant scope is inconsistent.")
+                        await cur.execute(
+                            "SELECT grant_id, session_id, interaction_id, request_id, tool_ref, "
+                            "generation_id, tool_id, tool_name, catalogue_revision, "
+                            "descriptor_version, issued_at, expires_at, max_calls, used_calls, "
+                            "revoked_at, record FROM cayu_targeted_tool_grants "
+                            "WHERE session_id = %s AND interaction_id = %s "
+                            "AND (request_id = %s OR tool_id = %s) LIMIT 2 FOR UPDATE",
+                            (
+                                session_id,
+                                record.interaction_id,
+                                record.request_id,
+                                record.tool_id,
+                            ),
+                        )
+                        existing_row = await cur.fetchone()
+                        if existing_row is not None:
+                            existing = _targeted_tool_grant_from_postgres_row(existing_row)
+                            await _validate_targeted_tool_use_counts(cur, (existing,))
+                            if existing.request_id != record.request_id:
+                                raise ValueError(
+                                    "Targeted grant tool identity conflicts with durable authority."
+                                )
+                            if existing.grant_id != record.grant_id:
+                                raise ValueError(
+                                    "Targeted grant request identity conflicts with "
+                                    "durable authority."
+                                )
+                            resolved.append(
+                                targeted_tool_grant_with_active_reference(existing, codec)
+                            )
+                            outcomes.append(TargetedToolGrantIssueOutcome.REUSED)
+                            await cur.execute(
+                                "SELECT event FROM cayu_events "
+                                "WHERE session_id = %s AND event_id = %s",
+                                (session_id, event.id),
+                            )
+                            issued_row = await cur.fetchone()
+                            if issued_row is None:
+                                raise RuntimeError(
+                                    "Targeted grant lost its durable issuance evidence."
+                                )
+                            validate_targeted_tool_grant_issuance_evidence(
+                                existing,
+                                Event(**_json_obj(issued_row[0])),
+                            )
+                            reused_event = targeted_tool_grant_event(
+                                existing,
+                                event_type=EventType.TARGETED_TOOL_GRANT_REUSED,
+                                timestamp=event.timestamp,
+                                outcome=TargetedToolGrantIssueOutcome.REUSED.value,
+                                event_id_suffix="reused",
+                            )
+                            resolved_events.append(
+                                await self._append_event_once_with_cursor(
+                                    cur,
+                                    reused_event,
+                                    expected_run_epoch=expected_run_epoch,
+                                    activity_at=reused_event.timestamp,
+                                )
+                            )
+                            continue
+                        await cur.execute(
+                            "SELECT 1 FROM cayu_targeted_tool_grants "
+                            "WHERE grant_id = %s FOR UPDATE",
+                            (record.grant_id,),
+                        )
+                        if await cur.fetchone() is not None:
+                            raise ValueError("Targeted grant identity collides with authority.")
+                        for public_alias in codec.aliases(
+                            record.grant_id,
+                            field_name=TARGETED_TOOL_REFERENCE_FIELD_NAME,
+                            session_id=session_id,
+                        ):
+                            field_name, scope_key, public_alias = _public_authority_alias_store_key(
+                                public_alias,
+                                field_name=TARGETED_TOOL_REFERENCE_FIELD_NAME,
+                                private_value=record.grant_id,
+                                scope_session_id=session_id,
+                            )
+                            await self._register_public_authority_alias_row(
+                                cur,
+                                field_name=field_name,
+                                scope_key=scope_key,
+                                public_alias=public_alias,
+                                private_value=record.grant_id,
+                            )
+                        await cur.execute(
+                            """
+                            INSERT INTO cayu_targeted_tool_grants (
+                                grant_id, session_id, interaction_id, request_id, tool_ref,
+                                generation_id, tool_id, tool_name, catalogue_revision,
+                                descriptor_version, issued_at, expires_at, max_calls,
+                                used_calls, revoked_at, record
+                            ) VALUES (
+                                %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s, %s
+                            )
+                            """,
+                            (
+                                record.grant_id,
+                                record.session_id,
+                                record.interaction_id,
+                                record.request_id,
+                                record.tool_ref,
+                                record.generation_id,
+                                record.tool_id,
+                                record.tool_name,
+                                record.catalogue_revision,
+                                record.descriptor_version,
+                                pg_support.to_utc(record.issued_at),
+                                pg_support.to_utc(record.expires_at),
+                                record.max_calls,
+                                record.used_calls,
+                                None,
+                                _dumps(record.model_dump(mode="json")),
+                            ),
+                        )
+                        resolved.append(record)
+                        outcomes.append(TargetedToolGrantIssueOutcome.ISSUED)
+                        resolved_events.append(event)
+                        new_events.append(event)
+                    if interaction_ids:
+                        await cur.execute(
+                            "SELECT COUNT(*) FROM cayu_targeted_tool_grants "
+                            "WHERE session_id = %s AND interaction_id = %s",
+                            (session_id, next(iter(interaction_ids))),
+                        )
+                        interaction_count_row = await cur.fetchone()
+                        if (
+                            interaction_count_row is None
+                            or int(interaction_count_row[0]) > TARGETED_TOOL_GRANT_MAX_REQUESTS
+                        ):
+                            raise ValueError(
+                                "Targeted grant interaction exceeds its bounded count."
+                            )
+                    await self._append_events_with_cursor(
+                        cur,
+                        session_id,
+                        new_events,
+                        expected_run_epoch=expected_run_epoch,
+                        activity_at=datetime.now(UTC),
+                    )
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+        return TargetedToolGrantIssueResult(
+            records=tuple(resolved),
+            outcomes=tuple(outcomes),
+            events=tuple(resolved_events),
+        )
+
+    async def list_targeted_tool_grants(
+        self,
+        session_id: str,
+        *,
+        interaction_id: str | None = None,
+        limit: int = TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS,
+    ) -> tuple[TargetedToolGrantRecord, ...]:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if interaction_id is not None:
+            interaction_id = require_clean_nonblank(interaction_id, "interaction_id")
+        if type(limit) is not int or not 1 <= limit <= TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS:
+            raise ValueError(
+                f"limit must be between 1 and {TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS}."
+            )
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM cayu_sessions WHERE id = %s FOR SHARE",
+                (session_id,),
+            )
+            if await cur.fetchone() is None:
+                raise KeyError(f"Session not found: {session_id}")
+            if interaction_id is None:
+                await cur.execute(
+                    "SELECT grant_id, session_id, interaction_id, request_id, tool_ref, "
+                    "generation_id, tool_id, tool_name, catalogue_revision, "
+                    "descriptor_version, issued_at, expires_at, max_calls, used_calls, "
+                    "revoked_at, record FROM cayu_targeted_tool_grants "
+                    "WHERE session_id = %s ORDER BY issued_at, grant_id LIMIT %s",
+                    (session_id, limit + 1),
+                )
+            else:
+                await cur.execute(
+                    "SELECT grant_id, session_id, interaction_id, request_id, tool_ref, "
+                    "generation_id, tool_id, tool_name, catalogue_revision, "
+                    "descriptor_version, issued_at, expires_at, max_calls, used_calls, "
+                    "revoked_at, record FROM cayu_targeted_tool_grants "
+                    "WHERE session_id = %s AND interaction_id = %s "
+                    "ORDER BY issued_at, grant_id LIMIT %s",
+                    (session_id, interaction_id, limit + 1),
+                )
+            rows = await cur.fetchall()
+            if len(rows) > limit:
+                raise ValueError("Targeted grant inspection exceeds its bounded result limit.")
+            if not rows:
+                return ()
+            records = tuple(_targeted_tool_grant_from_postgres_row(row) for row in rows)
+            await _validate_targeted_tool_use_counts(cur, records)
+            codec = self.public_authority_alias_codec
+            if codec is None:
+                raise RuntimeError("Targeted grants require a public authority alias codec.")
+            return tuple(
+                targeted_tool_grant_with_active_reference(
+                    record,
+                    codec,
+                )
+                for record in records
+            )
+
+    async def load_targeted_tool_grant_state(
+        self,
+        session_id: str,
+    ) -> TargetedToolGrantStateSnapshot:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM cayu_sessions WHERE id = %s FOR SHARE",
+                (session_id,),
+            )
+            if await cur.fetchone() is None:
+                raise KeyError(f"Session not found: {session_id}")
+            await cur.execute(
+                "SELECT grant_id, session_id, interaction_id, request_id, tool_ref, "
+                "generation_id, tool_id, tool_name, catalogue_revision, descriptor_version, "
+                "issued_at, expires_at, max_calls, used_calls, revoked_at, record "
+                "FROM cayu_targeted_tool_grants "
+                "WHERE session_id = %s ORDER BY issued_at, grant_id",
+                (session_id,),
+            )
+            grant_rows = await cur.fetchall()
+            await cur.execute(
+                "SELECT use_id, grant_id, session_id, interaction_id, model_step_id, "
+                "outer_tool_call_id, arguments_sha256, invocation_id, bound_at, record "
+                "FROM cayu_targeted_tool_grant_uses "
+                "WHERE session_id = %s ORDER BY bound_at, use_id",
+                (session_id,),
+            )
+            use_rows = await cur.fetchall()
+            if not grant_rows:
+                if use_rows:
+                    raise ValueError("Targeted grant uses exist without grant records.")
+                return TargetedToolGrantStateSnapshot()
+            codec = self.public_authority_alias_codec
+            if codec is None:
+                raise RuntimeError("Targeted grants require a public authority alias codec.")
+            records: list[TargetedToolGrantRecord] = []
+            for row in grant_rows:
+                record = _targeted_tool_grant_from_postgres_row(row)
+                records.append(targeted_tool_grant_with_active_reference(record, codec))
+            return TargetedToolGrantStateSnapshot(
+                records=tuple(records),
+                uses=tuple(_targeted_tool_use_from_postgres_row(row) for row in use_rows),
+            )
+
+    async def bind_targeted_tool_grant_use(
+        self,
+        request: TargetedToolUseRequest,
+        *,
+        observed_at: datetime,
+    ) -> TargetedToolUseResult:
+        if type(request) is not TargetedToolUseRequest:
+            raise TypeError("request must be a TargetedToolUseRequest.")
+        request = TargetedToolUseRequest.model_validate(request.model_dump(mode="python"))
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ValueError("observed_at must be timezone-aware.")
+        observed_at = observed_at.astimezone(UTC)
+        codec = self.public_authority_alias_codec
+        if codec is None:
+            raise RuntimeError("Targeted grants require a public authority alias codec.")
+        await self._ensure_ready()
+        result: TargetedToolUseResult
+        new_event: Event | None = None
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT agent_name, environment_name, status, run_epoch "
+                        "FROM cayu_sessions WHERE id = %s FOR UPDATE",
+                        (request.session_id,),
+                    )
+                    session_row = await cur.fetchone()
+                    if session_row is None:
+                        raise KeyError(f"Session not found: {request.session_id}")
+                    if int(session_row[3]) != request.expected_run_epoch:
+                        raise SessionRunFenced(
+                            "Session source run epoch is stale: expected "
+                            f"{request.expected_run_epoch}, current {session_row[3]}."
+                        )
+                    if str(session_row[2]) != str(SessionStatus.RUNNING):
+                        raise SessionStatusConflict("Targeted tool use requires a running session.")
+
+                    async def unresolved(
+                        reason: TargetedToolUseRejectionReason,
+                    ) -> TargetedToolUseResult:
+                        session_agent_name = str(session_row[0])
+                        session_environment_name = (
+                            None if session_row[1] is None else str(session_row[1])
+                        )
+                        event = targeted_tool_unresolved_rejection_event(
+                            request,
+                            reason=reason,
+                            timestamp=observed_at,
+                            agent_name=session_agent_name,
+                            environment_name=session_environment_name,
+                        )
+                        persisted = await self._append_event_once_with_cursor(
+                            cur,
+                            event,
+                            expected_run_epoch=request.expected_run_epoch,
+                            activity_at=observed_at,
+                        )
+                        validate_targeted_tool_unresolved_rejection_evidence(
+                            request,
+                            reason=reason,
+                            event=persisted,
+                            agent_name=session_agent_name,
+                            environment_name=session_environment_name,
+                        )
+                        return TargetedToolUseResult(
+                            disposition=TargetedToolUseDisposition.REJECTED,
+                            reason=reason,
+                            event=persisted,
+                        )
+
+                    try:
+                        parsed = parse_public_authority_alias(request.tool_ref)
+                        well_formed = (
+                            parsed is not None
+                            and parsed.field_name == TARGETED_TOOL_REFERENCE_FIELD_NAME
+                        )
+                    except (TypeError, ValueError):
+                        well_formed = False
+                    if not well_formed:
+                        result = await unresolved(TargetedToolUseRejectionReason.MALFORMED)
+                        await conn.commit()
+                        return result
+                    await cur.execute(
+                        "SELECT scope_session_id, private_value "
+                        "FROM cayu_public_authority_aliases "
+                        "WHERE field_name = %s AND public_alias = %s LIMIT 2",
+                        (TARGETED_TOOL_REFERENCE_FIELD_NAME, request.tool_ref),
+                    )
+                    aliases = await cur.fetchall()
+                    if not aliases:
+                        result = await unresolved(TargetedToolUseRejectionReason.UNKNOWN)
+                    elif len(aliases) != 1:
+                        raise RuntimeError("Targeted tool reference registry is ambiguous.")
+                    else:
+                        scope_session_id = str(aliases[0][0])
+                        grant_id = str(aliases[0][1])
+                        if not codec.matches(
+                            request.tool_ref,
+                            grant_id,
+                            field_name=TARGETED_TOOL_REFERENCE_FIELD_NAME,
+                            session_id=scope_session_id,
+                        ):
+                            result = await unresolved(TargetedToolUseRejectionReason.UNKNOWN)
+                        elif scope_session_id != request.session_id:
+                            result = await unresolved(TargetedToolUseRejectionReason.CROSS_SESSION)
+                        else:
+                            await cur.execute(
+                                "SELECT grant_id, session_id, interaction_id, request_id, "
+                                "tool_ref, generation_id, tool_id, tool_name, "
+                                "catalogue_revision, descriptor_version, issued_at, expires_at, "
+                                "max_calls, used_calls, revoked_at, record "
+                                "FROM cayu_targeted_tool_grants "
+                                "WHERE grant_id = %s FOR UPDATE",
+                                (grant_id,),
+                            )
+                            grant_row = await cur.fetchone()
+                            if grant_row is None:
+                                raise RuntimeError("Targeted tool reference lost its grant record.")
+                            record = _targeted_tool_grant_from_postgres_row(grant_row)
+                            await _validate_targeted_tool_use_counts(cur, (record,))
+
+                            async def rejected(
+                                reason: TargetedToolUseRejectionReason,
+                            ) -> TargetedToolUseResult:
+                                if reason is TargetedToolUseRejectionReason.EXPIRED:
+                                    expiry_event = targeted_tool_grant_event(
+                                        record,
+                                        event_type=EventType.TARGETED_TOOL_GRANT_EXPIRED,
+                                        timestamp=observed_at,
+                                        outcome="expired",
+                                        event_id_suffix="expired",
+                                        rejection_reason=reason,
+                                    )
+                                    persisted_expiry = await self._append_event_once_with_cursor(
+                                        cur,
+                                        expiry_event,
+                                        expected_run_epoch=request.expected_run_epoch,
+                                        activity_at=observed_at,
+                                    )
+                                    validate_targeted_tool_grant_lifecycle_event(
+                                        record,
+                                        persisted_expiry,
+                                        event_type=EventType.TARGETED_TOOL_GRANT_EXPIRED,
+                                        outcome="expired",
+                                        event_id_suffix="expired",
+                                        rejection_reason=reason,
+                                        require_current_call_count=False,
+                                    )
+                                rejection_event = targeted_tool_use_rejection_event(
+                                    record,
+                                    request,
+                                    reason=reason,
+                                    timestamp=observed_at,
+                                )
+                                persisted = await self._append_event_once_with_cursor(
+                                    cur,
+                                    rejection_event,
+                                    expected_run_epoch=request.expected_run_epoch,
+                                    activity_at=observed_at,
+                                )
+                                validate_targeted_tool_use_rejection_evidence(
+                                    record,
+                                    request,
+                                    reason=reason,
+                                    event=persisted,
+                                )
+                                return TargetedToolUseResult(
+                                    disposition=TargetedToolUseDisposition.REJECTED,
+                                    reason=reason,
+                                    grant=record,
+                                    event=persisted,
+                                )
+
+                            await cur.execute(
+                                "SELECT 1 FROM cayu_events "
+                                "WHERE session_id = %s AND interaction_id = %s "
+                                "AND event_type = ANY(%s) LIMIT 1",
+                                (
+                                    request.session_id,
+                                    record.interaction_id,
+                                    [
+                                        str(event_type)
+                                        for event_type in INTERACTION_TERMINAL_EVENT_TYPES
+                                    ],
+                                ),
+                            )
+                            if await cur.fetchone() is not None:
+                                result = await rejected(TargetedToolUseRejectionReason.EXPIRED)
+                                await conn.commit()
+                                return result
+                            await cur.execute(
+                                "SELECT use_id, grant_id, session_id, interaction_id, "
+                                "model_step_id, outer_tool_call_id, arguments_sha256, "
+                                "invocation_id, bound_at, record "
+                                "FROM cayu_targeted_tool_grant_uses "
+                                "WHERE session_id = %s AND interaction_id = %s "
+                                "AND (invocation_id = %s OR outer_tool_call_id = %s) LIMIT 2",
+                                (
+                                    request.session_id,
+                                    request.interaction_id,
+                                    request.invocation_id,
+                                    request.outer_tool_call_id,
+                                ),
+                            )
+                            use_rows = await cur.fetchall()
+                            if use_rows:
+                                scope_rejection = targeted_tool_use_scope_rejection_reason(
+                                    record,
+                                    request,
+                                )
+                                if scope_rejection is not None:
+                                    result = await rejected(scope_rejection)
+                                    new_event = result.event
+                                elif len(use_rows) != 1:
+                                    result = await rejected(
+                                        TargetedToolUseRejectionReason.ALTERED_REPLAY
+                                    )
+                                    new_event = result.event
+                                else:
+                                    binding = _targeted_tool_use_from_postgres_row(use_rows[0])
+                                    candidate = targeted_tool_use_binding(
+                                        grant_id,
+                                        request,
+                                        bound_at=binding.bound_at,
+                                    )
+                                    if binding != candidate:
+                                        result = await rejected(
+                                            TargetedToolUseRejectionReason.ALTERED_REPLAY
+                                        )
+                                        new_event = result.event
+                                    else:
+                                        expected_event = targeted_tool_grant_event(
+                                            record,
+                                            event_type=(EventType.TARGETED_TOOL_REFERENCE_CONSUMED),
+                                            timestamp=binding.bound_at,
+                                            outcome=TargetedToolUseDisposition.BOUND.value,
+                                            event_id_suffix=f"use:{binding.use_id}",
+                                            binding=binding,
+                                        )
+                                        await cur.execute(
+                                            "SELECT event FROM cayu_events "
+                                            "WHERE session_id = %s AND event_id = %s",
+                                            (request.session_id, expected_event.id),
+                                        )
+                                        event_row = await cur.fetchone()
+                                        if event_row is None:
+                                            raise RuntimeError(
+                                                "Targeted tool use lost its durable event evidence."
+                                            )
+                                        validate_targeted_tool_grant_lifecycle_event(
+                                            record,
+                                            Event(**_json_obj(event_row[0])),
+                                            event_type=(EventType.TARGETED_TOOL_REFERENCE_CONSUMED),
+                                            outcome=TargetedToolUseDisposition.BOUND.value,
+                                            event_id_suffix=f"use:{binding.use_id}",
+                                            binding=binding,
+                                            require_current_call_count=False,
+                                        )
+                                        rejoined_event = targeted_tool_grant_event(
+                                            record,
+                                            event_type=(EventType.TARGETED_TOOL_REFERENCE_REJOINED),
+                                            timestamp=observed_at,
+                                            outcome=TargetedToolUseDisposition.REJOINED.value,
+                                            event_id_suffix=f"rejoined:{binding.use_id}",
+                                            binding=binding,
+                                        )
+                                        new_event = await self._append_event_once_with_cursor(
+                                            cur,
+                                            rejoined_event,
+                                            expected_run_epoch=request.expected_run_epoch,
+                                            activity_at=observed_at,
+                                        )
+                                        result = TargetedToolUseResult(
+                                            disposition=TargetedToolUseDisposition.REJOINED,
+                                            grant=record,
+                                            binding=binding,
+                                            event=new_event,
+                                        )
+                            else:
+                                rejection = targeted_tool_use_rejection_reason(
+                                    record,
+                                    request,
+                                    observed_at=observed_at,
+                                )
+                                if rejection is not None:
+                                    result = await rejected(rejection)
+                                    new_event = result.event
+                                else:
+                                    binding = targeted_tool_use_binding(
+                                        grant_id,
+                                        request,
+                                        bound_at=observed_at,
+                                    )
+                                    updated = TargetedToolGrantRecord.model_validate(
+                                        record.model_copy(
+                                            update={"used_calls": record.used_calls + 1}
+                                        ).model_dump(mode="python")
+                                    )
+                                    await cur.execute(
+                                        """
+                                        INSERT INTO cayu_targeted_tool_grant_uses (
+                                            use_id, grant_id, session_id, interaction_id,
+                                            model_step_id, outer_tool_call_id,
+                                            arguments_sha256, invocation_id, bound_at, record
+                                        ) VALUES (
+                                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                                        )
+                                        """,
+                                        (
+                                            binding.use_id,
+                                            binding.grant_id,
+                                            binding.session_id,
+                                            binding.interaction_id,
+                                            binding.model_step_id,
+                                            binding.outer_tool_call_id,
+                                            binding.arguments_sha256,
+                                            binding.invocation_id,
+                                            pg_support.to_utc(binding.bound_at),
+                                            _dumps(binding.model_dump(mode="json")),
+                                        ),
+                                    )
+                                    await cur.execute(
+                                        "UPDATE cayu_targeted_tool_grants "
+                                        "SET used_calls = %s, record = %s "
+                                        "WHERE grant_id = %s AND used_calls = %s",
+                                        (
+                                            updated.used_calls,
+                                            _dumps(updated.model_dump(mode="json")),
+                                            grant_id,
+                                            record.used_calls,
+                                        ),
+                                    )
+                                    if cur.rowcount != 1:
+                                        raise RuntimeError("Targeted grant use lost its row lock.")
+                                    new_event = targeted_tool_grant_event(
+                                        updated,
+                                        event_type=(EventType.TARGETED_TOOL_REFERENCE_CONSUMED),
+                                        timestamp=observed_at,
+                                        outcome=TargetedToolUseDisposition.BOUND.value,
+                                        event_id_suffix=f"use:{binding.use_id}",
+                                        binding=binding,
+                                    )
+                                    result = TargetedToolUseResult(
+                                        disposition=TargetedToolUseDisposition.BOUND,
+                                        grant=updated,
+                                        binding=binding,
+                                        event=new_event,
+                                    )
+                                    await self._append_events_with_cursor(
+                                        cur,
+                                        request.session_id,
+                                        [new_event],
+                                        expected_run_epoch=request.expected_run_epoch,
+                                        activity_at=observed_at,
+                                    )
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+        if result.disposition is TargetedToolUseDisposition.REJECTED:
+            return result
+        binding = result.binding
+        if binding is None or result.grant is None:  # pragma: no cover - model invariant
+            raise AssertionError("Accepted targeted tool use lost its binding.")
+        if new_event is None:  # pragma: no cover - transaction invariant
+            raise RuntimeError("Accepted targeted tool use lost its durable event evidence.")
+        if result.event is None:  # pragma: no cover - model invariant
+            raise RuntimeError("Accepted targeted tool use lost its result event evidence.")
+        return result
+
+    async def revoke_targeted_tool_grant(
+        self,
+        tool_ref: str,
+        *,
+        session_id: str,
+        expected_run_epoch: int,
+        reason: str,
+        revoked_at: datetime,
+    ) -> TargetedToolGrantRecord | None:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if type(expected_run_epoch) is not int or expected_run_epoch < 0:
+            raise ValueError("expected_run_epoch must be a non-negative integer.")
+        reason = validate_targeted_tool_grant_revocation_reason(reason)
+        if revoked_at.tzinfo is None or revoked_at.utcoffset() is None:
+            raise ValueError("revoked_at must be timezone-aware.")
+        revoked_at = revoked_at.astimezone(UTC)
+        codec = self.public_authority_alias_codec
+        if codec is None:
+            raise RuntimeError("Targeted grants require a public authority alias codec.")
+        await self._ensure_ready()
+        record: TargetedToolGrantRecord | None = None
+        event: Event | None = None
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT run_epoch FROM cayu_sessions WHERE id = %s FOR UPDATE",
+                        (session_id,),
+                    )
+                    session_row = await cur.fetchone()
+                    if session_row is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    if int(session_row[0]) != expected_run_epoch:
+                        raise SessionRunFenced(
+                            "Session source run epoch is stale: expected "
+                            f"{expected_run_epoch}, current {session_row[0]}."
+                        )
+                    try:
+                        parsed = parse_public_authority_alias(tool_ref)
+                    except (TypeError, ValueError):
+                        parsed = None
+                    if parsed is None or parsed.field_name != TARGETED_TOOL_REFERENCE_FIELD_NAME:
+                        await conn.commit()
+                        return None
+                    await cur.execute(
+                        "SELECT scope_session_id, private_value "
+                        "FROM cayu_public_authority_aliases "
+                        "WHERE field_name = %s AND public_alias = %s LIMIT 2",
+                        (TARGETED_TOOL_REFERENCE_FIELD_NAME, tool_ref),
+                    )
+                    aliases = await cur.fetchall()
+                    if aliases:
+                        if len(aliases) != 1:
+                            raise RuntimeError("Targeted tool reference registry is ambiguous.")
+                        scope = str(aliases[0][0])
+                        grant_id = str(aliases[0][1])
+                        if scope == session_id and codec.matches(
+                            tool_ref,
+                            grant_id,
+                            field_name=TARGETED_TOOL_REFERENCE_FIELD_NAME,
+                            session_id=scope,
+                        ):
+                            await cur.execute(
+                                "SELECT grant_id, session_id, interaction_id, request_id, "
+                                "tool_ref, generation_id, tool_id, tool_name, "
+                                "catalogue_revision, descriptor_version, issued_at, expires_at, "
+                                "max_calls, used_calls, revoked_at, record "
+                                "FROM cayu_targeted_tool_grants "
+                                "WHERE grant_id = %s FOR UPDATE",
+                                (grant_id,),
+                            )
+                            row = await cur.fetchone()
+                            if row is None:
+                                raise RuntimeError("Targeted tool reference lost its grant record.")
+                            stored = _targeted_tool_grant_from_postgres_row(row)
+                            await _validate_targeted_tool_use_counts(cur, (stored,))
+                            if stored.revoked_at is not None:
+                                if stored.revocation_reason != reason:
+                                    raise ValueError(
+                                        "Targeted grant was revoked with a different reason."
+                                    )
+                                record = stored
+                                expected_event = targeted_tool_grant_event(
+                                    stored,
+                                    event_type=EventType.TARGETED_TOOL_GRANT_REVOKED,
+                                    timestamp=stored.revoked_at,
+                                    outcome="revoked",
+                                    event_id_suffix="revoked",
+                                )
+                                await cur.execute(
+                                    "SELECT event FROM cayu_events "
+                                    "WHERE session_id = %s AND event_id = %s",
+                                    (session_id, expected_event.id),
+                                )
+                                event_row = await cur.fetchone()
+                                if event_row is None:
+                                    raise RuntimeError(
+                                        "Targeted grant revocation lost its durable event evidence."
+                                    )
+                                event = Event(**_json_obj(event_row[0]))
+                                validate_targeted_tool_grant_revocation_evidence(
+                                    stored,
+                                    event,
+                                )
+                            else:
+                                await cur.execute(
+                                    "SELECT MAX(bound_at) "
+                                    "FROM cayu_targeted_tool_grant_uses WHERE grant_id = %s",
+                                    (grant_id,),
+                                )
+                                latest_use_row = await cur.fetchone()
+                                latest_bound_at = latest_use_row[0]
+                                if latest_bound_at is not None and (
+                                    pg_support.to_utc(latest_bound_at) > revoked_at
+                                ):
+                                    raise ValueError(
+                                        "revoked_at cannot precede a bound targeted tool use."
+                                    )
+                                record = TargetedToolGrantRecord.model_validate(
+                                    stored.model_copy(
+                                        update={
+                                            "revoked_at": revoked_at,
+                                            "revocation_reason": reason,
+                                        }
+                                    ).model_dump(mode="python")
+                                )
+                                await cur.execute(
+                                    "UPDATE cayu_targeted_tool_grants "
+                                    "SET revoked_at = %s, record = %s "
+                                    "WHERE grant_id = %s AND revoked_at IS NULL",
+                                    (
+                                        pg_support.to_utc(revoked_at),
+                                        _dumps(record.model_dump(mode="json")),
+                                        grant_id,
+                                    ),
+                                )
+                                if cur.rowcount != 1:
+                                    raise RuntimeError(
+                                        "Targeted grant revocation lost its row lock."
+                                    )
+                                event = targeted_tool_grant_event(
+                                    record,
+                                    event_type=EventType.TARGETED_TOOL_GRANT_REVOKED,
+                                    timestamp=revoked_at,
+                                    outcome="revoked",
+                                    event_id_suffix="revoked",
+                                )
+                                await self._append_events_with_cursor(
+                                    cur,
+                                    session_id,
+                                    [event],
+                                    expected_run_epoch=expected_run_epoch,
+                                    activity_at=revoked_at,
+                                )
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+        if record is None:
+            return None
+        if event is None:  # pragma: no cover - transaction invariant
+            raise RuntimeError("Targeted grant revocation lost its durable event evidence.")
+        return record
+
+    async def reconstruct_targeted_tool_grants(
+        self,
+        session_id: str,
+        *,
+        expected_run_epoch: int,
+        interaction_id: str,
+        generation_id: str,
+        agent_name: str,
+        task_id: str | None,
+        environment_name: str | None,
+        principal: str | None,
+        tenant: str | None,
+        catalogue_revision: str,
+        descriptors_by_id: Mapping[str, tuple[str, str, str]],
+        capability_ceiling_names: frozenset[str],
+        observed_at: datetime,
+    ) -> TargetedToolGrantReconstructionResult:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        interaction_id = require_clean_nonblank(interaction_id, "interaction_id")
+        if type(expected_run_epoch) is not int or expected_run_epoch < 0:
+            raise ValueError("expected_run_epoch must be a non-negative integer.")
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ValueError("observed_at must be timezone-aware.")
+        observed_at = observed_at.astimezone(UTC)
+        await self._ensure_ready()
+        result: TargetedToolGrantReconstructionResult
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT status, run_epoch FROM cayu_sessions WHERE id = %s FOR UPDATE",
+                        (session_id,),
+                    )
+                    session_row = await cur.fetchone()
+                    if session_row is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    if int(session_row[1]) != expected_run_epoch:
+                        raise SessionRunFenced(
+                            "Session source run epoch is stale: expected "
+                            f"{expected_run_epoch}, current {session_row[1]}."
+                        )
+                    if str(session_row[0]) != str(SessionStatus.RUNNING):
+                        raise SessionStatusConflict(
+                            "Grant reconstruction requires a running session."
+                        )
+                    await cur.execute(
+                        "SELECT grant_id, session_id, interaction_id, request_id, tool_ref, "
+                        "generation_id, tool_id, tool_name, catalogue_revision, "
+                        "descriptor_version, issued_at, expires_at, max_calls, used_calls, "
+                        "revoked_at, record FROM cayu_targeted_tool_grants "
+                        "WHERE session_id = %s AND interaction_id = %s "
+                        "ORDER BY issued_at, grant_id LIMIT %s",
+                        (
+                            session_id,
+                            interaction_id,
+                            TARGETED_TOOL_GRANT_MAX_REQUESTS + 1,
+                        ),
+                    )
+                    records = tuple(
+                        _targeted_tool_grant_from_postgres_row(row) for row in await cur.fetchall()
+                    )
+                    if len(records) > TARGETED_TOOL_GRANT_MAX_REQUESTS:
+                        raise ValueError("Targeted grant interaction exceeds its bounded count.")
+                    await _validate_targeted_tool_use_counts(cur, records)
+                    await cur.execute(
+                        "SELECT event FROM cayu_events WHERE session_id = %s "
+                        "AND interaction_id = %s AND event_type = %s "
+                        "ORDER BY sequence ASC LIMIT 1",
+                        (session_id, interaction_id, str(EventType.INTERACTION_STARTED)),
+                    )
+                    interaction_started_row = await cur.fetchone()
+                    if interaction_started_row is None:
+                        raise RuntimeError(
+                            "Targeted grant reconstruction lost interaction admission."
+                        )
+                    validate_targeted_tool_grant_batch_evidence(
+                        records,
+                        Event(**_json_obj(interaction_started_row[0])),
+                    )
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_events "
+                        "WHERE session_id = %s AND interaction_id = %s "
+                        "AND event_type = ANY(%s) LIMIT 1",
+                        (
+                            session_id,
+                            interaction_id,
+                            [str(value) for value in INTERACTION_TERMINAL_EVENT_TYPES],
+                        ),
+                    )
+                    interaction_ended = await cur.fetchone() is not None
+                    valid: list[TargetedToolGrantRecord] = []
+                    rejected: list[tuple[str, TargetedToolUseRejectionReason]] = []
+                    events: list[Event] = []
+                    for record in records:
+                        reason = targeted_tool_grant_reconstruction_rejection_reason(
+                            record,
+                            generation_id=generation_id,
+                            agent_name=agent_name,
+                            task_id=task_id,
+                            environment_name=environment_name,
+                            principal=principal,
+                            tenant=tenant,
+                            catalogue_revision=catalogue_revision,
+                            descriptors_by_id=descriptors_by_id,
+                            capability_ceiling_names=capability_ceiling_names,
+                            observed_at=observed_at,
+                            interaction_ended=interaction_ended,
+                        )
+                        if reason is None:
+                            valid.append(record)
+                            event = targeted_tool_grant_event(
+                                record,
+                                event_type=EventType.TARGETED_TOOL_GRANT_RECONSTRUCTED,
+                                timestamp=observed_at,
+                                outcome="reconstructed",
+                                event_id_suffix="reconstructed",
+                            )
+                        else:
+                            rejected.append((record.grant_id, reason))
+                            if reason is TargetedToolUseRejectionReason.EXPIRED:
+                                persisted_expiry = await self._append_event_once_with_cursor(
+                                    cur,
+                                    targeted_tool_grant_event(
+                                        record,
+                                        event_type=EventType.TARGETED_TOOL_GRANT_EXPIRED,
+                                        timestamp=observed_at,
+                                        outcome="expired",
+                                        event_id_suffix="expired",
+                                        rejection_reason=reason,
+                                    ),
+                                    expected_run_epoch=expected_run_epoch,
+                                    activity_at=observed_at,
+                                )
+                                validate_targeted_tool_grant_lifecycle_event(
+                                    record,
+                                    persisted_expiry,
+                                    event_type=EventType.TARGETED_TOOL_GRANT_EXPIRED,
+                                    outcome="expired",
+                                    event_id_suffix="expired",
+                                    rejection_reason=reason,
+                                    require_current_call_count=False,
+                                )
+                            event = targeted_tool_grant_event(
+                                record,
+                                event_type=EventType.TARGETED_TOOL_GRANT_RECONSTRUCTED,
+                                timestamp=observed_at,
+                                outcome="rejected",
+                                event_id_suffix=f"reconstruction-rejected:{reason.value}",
+                                rejection_reason=reason,
+                            )
+                        persisted = await self._append_event_once_with_cursor(
+                            cur,
+                            event,
+                            expected_run_epoch=expected_run_epoch,
+                            activity_at=observed_at,
+                        )
+                        validate_targeted_tool_grant_lifecycle_event(
+                            record,
+                            persisted,
+                            event_type=EventType.TARGETED_TOOL_GRANT_RECONSTRUCTED,
+                            outcome="reconstructed" if reason is None else "rejected",
+                            event_id_suffix=(
+                                "reconstructed"
+                                if reason is None
+                                else f"reconstruction-rejected:{reason.value}"
+                            ),
+                            rejection_reason=reason,
+                            require_current_call_count=False,
+                        )
+                        events.append(persisted)
+                    result = TargetedToolGrantReconstructionResult(
+                        valid=tuple(valid),
+                        rejected=tuple(rejected),
+                        events=tuple(events),
+                    )
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+        return result
+
     async def _register_public_authority_alias_row(
         self,
         cur: Any,
@@ -12892,7 +14327,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         # marker and must register aliases in their own transaction.
                         await cur.execute(
                             "LOCK TABLE cayu_sessions, cayu_events, "
-                            "cayu_transcript_messages IN SHARE ROW EXCLUSIVE MODE"
+                            "cayu_transcript_messages, cayu_targeted_tool_grants "
+                            "IN SHARE ROW EXCLUSIVE MODE"
                         )
                     for key_id in missing:
                         await cur.execute(
@@ -13044,6 +14480,32 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             scope_key=private_session_id,
                             public_alias=public_alias,
                             private_value=private_interaction_id,
+                        )
+
+        grant_cursor_name = f"{cursor_name}_targeted_grants"
+        async with (
+            conn.cursor(name=grant_cursor_name) as source,
+            conn.cursor() as target,
+        ):
+            await source.execute(
+                "SELECT session_id, grant_id "
+                "FROM cayu_targeted_tool_grants ORDER BY session_id, grant_id"
+            )
+            while rows := await source.fetchmany(500):
+                for session_id, grant_id in rows:
+                    private_session_id = str(session_id)
+                    private_grant_id = str(grant_id)
+                    for public_alias in codec.aliases(
+                        private_grant_id,
+                        field_name=TARGETED_TOOL_REFERENCE_FIELD_NAME,
+                        session_id=private_session_id,
+                    ):
+                        await self._register_public_authority_alias_row(
+                            target,
+                            field_name=TARGETED_TOOL_REFERENCE_FIELD_NAME,
+                            scope_key=private_session_id,
+                            public_alias=public_alias,
+                            private_value=private_grant_id,
                         )
 
     async def _register_public_authorities(
@@ -15639,9 +17101,112 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     "Budget ledger reused a reservation identity."
                 )
 
-    async def append_events(self, session_id: str, events: list[Event]) -> None:
+    async def _append_events_with_cursor(
+        self,
+        cur: Any,
+        session_id: str,
+        events: Sequence[Event],
+        *,
+        expected_run_epoch: int | None,
+        activity_at: datetime,
+    ) -> None:
+        """Append events and their delivery outbox rows in the caller's transaction."""
+
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
+        if expected_run_epoch is None:
+            await cur.execute(
+                "UPDATE cayu_sessions SET event_seq = event_seq + %s, "
+                "last_activity_at = %s WHERE id = %s RETURNING event_seq",
+                (len(events), activity_at, session_id),
+            )
+        else:
+            await cur.execute(
+                "UPDATE cayu_sessions SET event_seq = event_seq + %s, "
+                "last_activity_at = %s WHERE id = %s AND run_epoch = %s "
+                "RETURNING event_seq",
+                (len(events), activity_at, session_id, expected_run_epoch),
+            )
+        order_row = await cur.fetchone()
+        if order_row is None:
+            if expected_run_epoch is not None:
+                await _raise_session_write_conflict(cur, session_id, expected_run_epoch)
+            raise KeyError(f"Session not found: {session_id}")
+        if not events:
+            return
+
+        copied_events = list(events)
+        await self._register_event_public_authorities(cur, session_id, copied_events)
+        await self._publish_budget_reservation_identities(cur, copied_events)
+        next_order = order_row[0] - len(copied_events)
+        rows = []
+        for event in copied_events:
+            next_order += 1
+            lookup_key, projection, projection_bytes = pending_action_event_storage_values(event)
+            rows.append(
+                (
+                    session_id,
+                    next_order,
+                    event.id,
+                    event.interaction_id,
+                    str(event.type),
+                    pg_support.to_utc(event.timestamp),
+                    event.agent_name,
+                    event.environment_name,
+                    event.workflow_name,
+                    event.tool_name,
+                    _dumps(event.payload),
+                    _dumps(event.model_dump(mode="json")),
+                    lookup_key,
+                    projection,
+                    projection_bytes,
+                )
+            )
+        await cur.executemany(
+            """
+            INSERT INTO cayu_events (
+                session_id, session_order, event_id, interaction_id,
+                event_type, timestamp,
+                agent_name, environment_name, workflow_name, tool_name,
+                payload, event, pending_action_lookup_key,
+                pending_action_projection, pending_action_projection_bytes
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s
+            )
+            """,
+            rows,
+        )
+        await self._enqueue_persisted_event_side_effects(cur, session_id, copied_events)
+
+    async def _append_event_once_with_cursor(
+        self,
+        cur: Any,
+        event: Event,
+        *,
+        expected_run_epoch: int,
+        activity_at: datetime,
+    ) -> Event:
+        """Return existing exact evidence or append it in the caller's transaction."""
+
+        await cur.execute(
+            "SELECT event FROM cayu_events WHERE session_id = %s AND event_id = %s",
+            (event.session_id, event.id),
+        )
+        row = await cur.fetchone()
+        if row is not None:
+            return Event(**_json_obj(row[0]))
+        await self._append_events_with_cursor(
+            cur,
+            event.session_id,
+            [event],
+            expected_run_epoch=expected_run_epoch,
+            activity_at=activity_at,
+        )
+        return event
+
+    async def append_events(self, session_id: str, events: list[Event]) -> None:
         session_id, copied_events = _copy_session_event_batch(session_id, events)
 
         await self._ensure_ready()
@@ -15649,102 +17214,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
-                    # Reserve a contiguous block of per-session order values by
-                    # advancing the session's event counter. UPDATE ... RETURNING
-                    # row-locks the session row (serializing concurrent appends to
-                    # the same session) and hands back the new counter in one round
-                    # trip, replacing a SELECT ... FOR UPDATE + COALESCE(MAX())
-                    # scan on this hot write path. A no-op (+0) update on an empty
-                    # batch still returns the row, so a missing session is caught.
-                    activity_at = datetime.now(UTC)
-                    if expected_run_epoch is None:
-                        await cur.execute(
-                            """
-                            UPDATE cayu_sessions
-                            SET event_seq = event_seq + %s, last_activity_at = %s
-                            WHERE id = %s
-                            RETURNING event_seq
-                            """,
-                            (len(copied_events), activity_at, session_id),
-                        )
-                    else:
-                        await cur.execute(
-                            """
-                            UPDATE cayu_sessions
-                            SET event_seq = event_seq + %s, last_activity_at = %s
-                            WHERE id = %s AND run_epoch = %s
-                            RETURNING event_seq
-                            """,
-                            (
-                                len(copied_events),
-                                activity_at,
-                                session_id,
-                                expected_run_epoch,
-                            ),
-                        )
-                    order_row = await cur.fetchone()
-                    if order_row is None:
-                        if expected_run_epoch is not None:
-                            await _raise_session_write_conflict(cur, session_id, expected_run_epoch)
-                        raise KeyError(f"Session not found: {session_id}")
-                    if not copied_events:
-                        await conn.commit()
-                        return
-
-                    await self._register_event_public_authorities(
+                    await self._append_events_with_cursor(
                         cur,
                         session_id,
                         copied_events,
-                    )
-                    await self._publish_budget_reservation_identities(cur, copied_events)
-                    # RETURNING yields the post-increment counter, i.e. the order
-                    # of the last event in this batch; walk back to the first.
-                    next_order = order_row[0] - len(copied_events)
-                    rows = []
-                    for event in copied_events:
-                        next_order += 1
-                        lookup_key, projection, projection_bytes = (
-                            pending_action_event_storage_values(event)
-                        )
-                        rows.append(
-                            (
-                                session_id,
-                                next_order,
-                                event.id,
-                                event.interaction_id,
-                                str(event.type),
-                                pg_support.to_utc(event.timestamp),
-                                event.agent_name,
-                                event.environment_name,
-                                event.workflow_name,
-                                event.tool_name,
-                                _dumps(event.payload),
-                                _dumps(event.model_dump(mode="json")),
-                                lookup_key,
-                                projection,
-                                projection_bytes,
-                            )
-                        )
-                    await cur.executemany(
-                        """
-                        INSERT INTO cayu_events (
-                            session_id, session_order, event_id, interaction_id,
-                            event_type, timestamp,
-                            agent_name, environment_name, workflow_name, tool_name,
-                            payload, event, pending_action_lookup_key,
-                            pending_action_projection, pending_action_projection_bytes
-                        )
-                        VALUES (
-                            %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s
-                        )
-                        """,
-                        rows,
-                    )
-                    await self._enqueue_persisted_event_side_effects(
-                        cur,
-                        session_id,
-                        copied_events,
+                        expected_run_epoch=expected_run_epoch,
+                        activity_at=datetime.now(UTC),
                     )
                 await conn.commit()
             except UniqueViolation as exc:

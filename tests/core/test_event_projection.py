@@ -114,6 +114,38 @@ def test_non_secret_turn_interaction_ids_match_public_event_envelopes() -> None:
     assert public.payload["interaction_ids"] == [interaction_id]
 
 
+def test_targeted_grant_fork_reset_keeps_source_authority_private() -> None:
+    private = event_with_runtime_payload_authority(
+        Event(
+            id="targeted-grant-fork-reset",
+            type=EventType.TARGETED_TOOL_GRANT_FORK_RESET,
+            session_id="child-session",
+            interaction_id="child-interaction",
+            payload={
+                "schema_version": 1,
+                "source_session_id": "source-session",
+                "source_interaction_id": "source-interaction",
+                "inherited_grant_count": 0,
+                "inherited_reference_count": 0,
+            },
+        ),
+        "source_session_id",
+        "source_interaction_id",
+    )
+
+    public = project_runtime_event(private, sequence=2, redactor=SecretRedactor())
+
+    assert public.payload == {
+        "schema_version": 1,
+        "source_session_id": PRIVATE_EVENT_AUTHORITY,
+        "source_interaction_id": PRIVATE_EVENT_AUTHORITY,
+        "inherited_grant_count": 0,
+        "inherited_reference_count": 0,
+    }
+    assert "source-session" not in public.model_dump_json()
+    assert "source-interaction" not in public.model_dump_json()
+
+
 _TERMINAL_CONTROL_KEYS_FOR_TEST = {
     "terminal_outcome",
     "tool_effect",

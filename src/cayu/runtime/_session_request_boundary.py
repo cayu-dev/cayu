@@ -195,6 +195,11 @@ def prepare_run_request(
                     "invocation origin contains a workload secret and cannot be used "
                     "as durable session authority."
                 )
+    _require_secret_free_targeted_tool_grants(
+        request.tool_grants,
+        redactor=redactor,
+        field_name="RunRequest.tool_grants",
+    )
     redacted_messages = redact_messages(
         request.messages,
         redactor=redactor,
@@ -266,6 +271,11 @@ def prepare_resume_request(
             reason=redactor.redact_text(profile_adoption.reason),
             requested_by=requested_by,
         )
+    _require_secret_free_targeted_tool_grants(
+        request.tool_grants,
+        redactor=redactor,
+        field_name="ResumeRequest.tool_grants",
+    )
     return request.model_copy(
         update={
             "messages": redact_messages(
@@ -281,6 +291,24 @@ def prepare_resume_request(
             "profile_adoption": profile_adoption,
         },
     )
+
+
+def _require_secret_free_targeted_tool_grants(
+    grants: tuple[object, ...],
+    *,
+    redactor: SecretRedactor,
+    field_name: str,
+) -> None:
+    """Reject grant identities that would make workload secrets durable authority."""
+
+    for index, grant in enumerate(grants):
+        for attribute in ("request_id", "tool_id", "origin"):
+            value = getattr(grant, attribute, None)
+            if value is not None and redactor.redact_text(value) != value:
+                raise ValueError(
+                    f"{field_name}[{index}].{attribute} contains a workload secret and "
+                    "cannot be used as durable targeted-tool authority."
+                )
 
 
 def prepare_compact_session_request(

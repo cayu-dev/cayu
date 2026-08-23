@@ -295,6 +295,12 @@ REVISIONS: tuple[Revision, ...] = (
     # tables, so they remain compatible until runtime wiring
     # makes pre-dispatch evidence mandatory in a later breaking revision.
     Revision(revision=51, kind=RevisionKind.ADDITIVE, compatible_from=50),
+    # Add first-class interaction-scoped targeted tool grants and their permanent
+    # digest-only use bindings. Older session writers cannot preserve fork-reset,
+    # pruning, export, or lifecycle evidence, so mixed-version operation is unsafe.
+    # Populated pre-grant session stores must be recreated rather than carrying
+    # incomplete pre-grant fork evidence or a permanent compatibility path.
+    Revision(revision=52, kind=RevisionKind.BREAKING, compatible_from=52),
 )
 
 #: The revision an empty database is initialized to.

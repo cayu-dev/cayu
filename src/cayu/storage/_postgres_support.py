@@ -128,6 +128,58 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         ON cayu_public_authority_aliases(field_name, scope_session_id, private_value)
     """,
     """
+    CREATE INDEX IF NOT EXISTS idx_cayu_public_authority_public_alias
+        ON cayu_public_authority_aliases(field_name, public_alias)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_targeted_tool_grants (
+        grant_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+        interaction_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        tool_ref TEXT NOT NULL,
+        generation_id TEXT NOT NULL,
+        tool_id TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        catalogue_revision TEXT NOT NULL,
+        descriptor_version TEXT NOT NULL,
+        issued_at TIMESTAMPTZ NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        max_calls BIGINT NOT NULL CHECK (max_calls >= 1 AND max_calls <= 32),
+        used_calls BIGINT NOT NULL DEFAULT 0
+            CHECK (used_calls >= 0 AND used_calls <= max_calls),
+        revoked_at TIMESTAMPTZ,
+        record JSONB NOT NULL,
+        UNIQUE (session_id, interaction_id, request_id),
+        UNIQUE (session_id, interaction_id, tool_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_cayu_targeted_tool_grants_interaction
+        ON cayu_targeted_tool_grants(session_id, interaction_id, issued_at, grant_id)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_targeted_tool_grant_uses (
+        use_id TEXT PRIMARY KEY,
+        grant_id TEXT NOT NULL
+            REFERENCES cayu_targeted_tool_grants(grant_id) ON DELETE CASCADE,
+        session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+        interaction_id TEXT NOT NULL,
+        model_step_id TEXT NOT NULL,
+        outer_tool_call_id TEXT NOT NULL,
+        arguments_sha256 TEXT NOT NULL,
+        invocation_id TEXT NOT NULL,
+        bound_at TIMESTAMPTZ NOT NULL,
+        record JSONB NOT NULL,
+        UNIQUE (session_id, interaction_id, invocation_id),
+        UNIQUE (session_id, interaction_id, outer_tool_call_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_cayu_targeted_tool_grant_uses_grant
+        ON cayu_targeted_tool_grant_uses(grant_id, bound_at, use_id)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS cayu_public_authority_alias_keys (
         key_id TEXT PRIMARY KEY,
         fingerprint TEXT NOT NULL,

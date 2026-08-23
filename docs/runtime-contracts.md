@@ -1611,8 +1611,10 @@ over arbitrary per-turn schema churn because changing the tool array can split
 or invalidate provider prompt-cache prefixes; a smaller single request is not
 proof of lower whole-task cost.
 
-When request-footprint observation is enabled, conversational requests use
-`RequestFootprint.schema_version == 3` and embed the same content-minimized
+When request-footprint observation is enabled, conversational requests without
+targeted grants use `RequestFootprint.schema_version == 3`; a request carrying
+targeted grants uses schema version 4 and adds only their bounded identity and
+call-count summary. Both versions embed the same content-minimized direct-tool
 exposure profile/fingerprint/count summary. The keyed
 `fingerprints.tool_manifest` and cache-breakpoint fingerprints bind that summary
 to the exact prepared request without persisting tool definitions.
@@ -1645,6 +1647,105 @@ error `tool_result` and performs no approval, policy authorization, hook, or
 tool execution for that call. The compact frozen authority follows the pending
 tool round through ordinary recovery, approval, and user-input interruption so
 continuation cannot reinterpret the call against a wider request.
+
+### Targeted tool grants and scoped references
+
+A targeted grant gives one already registered catalogue tool bounded
+addressability inside one session interaction. It is distinct from all of the
+following:
+
+- registration, which admits the application-owned implementation;
+- exposure, which places a direct tool definition in a provider request;
+- the opaque `tool_ref`, which identifies one durable targeted grant; and
+- authorization, approval, or execution, none of which a grant supplies.
+
+`RunRequest.tool_grants` and `ResumeRequest.tool_grants` accept immutable
+`TargetedToolGrant` values. Each value contains only an application request id,
+one canonical `tool_id`, a positive bounded call count, a bounded lifetime that
+also ends with the issuing interaction, and optional bounded non-secret origin
+evidence. It cannot contain a callable, name fallback, schema, descriptor or
+implementation version, policy, approval, credential, or execution metadata.
+Cayu resolves the exact registered descriptor against the session's durable
+capability ceiling before provider work. Unknown, duplicate, malformed,
+framework-reserved, and out-of-ceiling targets fail before the provider is
+called.
+
+Issuance persists the catalogue revision, descriptor version and schema digest,
+private session and interaction scope, branch-local generation, agent, task,
+environment, principal and tenant where present, expiry, call budget, and
+bounded origin. `CayuApp.inspect_targeted_tool_grants(...)` returns a bounded
+authenticated view whose session, interaction, and optional task identities are
+public aliases and whose `tool_ref` is an opaque non-secret reference. The
+public inspection type omits the private principal, tenant, and free-form
+revocation reason. Applications that need those trusted fields must inspect the store on their
+operator boundary. General events, request footprints, and logs never expose
+the raw reference. The reference is addressability, not permission: it cannot
+bypass `ToolPolicy`, approval, environment, effect, secret, budget, hook,
+idempotency, or recovery checks.
+
+```python
+from cayu import Message, ResumeRequest, TargetedToolGrant
+
+request = ResumeRequest(
+    session_id=session_id,
+    messages=[Message.text("user", "Review the work and retain any durable gotchas.")],
+    tool_grants=(
+        TargetedToolGrant(
+            request_id="review-gotchas",
+            tool_id="cayu:remember",
+            max_calls=1,
+            lifetime_seconds=300,
+            origin="post-work-review",
+        ),
+    ),
+)
+
+async for event in app.resume(request):
+    handle(event)
+```
+
+This slice deliberately does not add a model-visible `call_tool` gateway and
+does not put targeted descriptors in the provider's direct `tools` array. The
+request footprint records stable grant/catalogue identities and counts with
+`direct_tool_prefix_changed=false`; the existing direct-tool prefix is
+unchanged.
+
+The stores provide atomic issue-or-reuse, bounded inspection,
+consume-or-rejoin, revocation, expiry evidence, and reconstruction. First use
+binds only stable model-step, outer-call, arguments-digest, and invocation
+identities. Exact retry rejoins that binding without consuming another call;
+outer-call and invocation identities are unique across every grant in that
+interaction, so swapping a reference is an altered replay rather than a second
+admission. Altered replay and distinct calls cannot steal or underflow a grant's
+budget. Durable records retain no raw arguments or schemas. Reconstruction
+admits a still-live record only when its private scope, catalogue,
+descriptor/schema identity, and ceiling still match. Missing or invalid state
+fails closed—there is no legacy name fallback. The atomically admitted
+interaction start binds the expected batch count and a canonical digest of the
+resolved requests; issuance, recovery, pruning, and JSONL import require the
+durable batch to match, so a process loss between interaction admission and
+grant persistence cannot silently resume with an empty or partial grant view.
+Every fork writes explicit reset
+evidence, copies no parent grant or consumption authority, and treats
+references present in copied transcript text as inert text. A child needs a
+newly requested child-scoped grant inside its inherited or narrowed ceiling.
+
+Natural expiry, including interaction termination, is an expected loss of
+addressability rather than authority drift. Recovery records the expiry and
+rejected reconstruction evidence, omits the expired grant from subsequent
+request footprints, and continues. The expired reference remains unusable at
+the atomic bind boundary. Scope, catalogue, descriptor, ceiling, revocation,
+and durable-evidence mismatches still stop recovery fail closed.
+
+Revision 52 is a clean prerelease storage boundary. Empty stores migrate, while
+populated pre-52 session stores are rejected without mutation and must be
+recreated. Cayu does not synthesize fork-reset evidence for old sessions or
+carry a legacy fork-replay branch.
+
+Session JSONL export carries the complete typed grant and use-binding snapshot.
+Import validates its schema, per-interaction bounds and counters, and requires
+every grant record to match the enclosing exported session before exposing the
+snapshot to restoration tooling.
 
 ## Execution profiles
 
@@ -4446,8 +4547,9 @@ storage and target discovery. Server contract version 18 adds captured-session
 preview/save/export, the target-scoped immutable result catalog, actor-attributed
 baseline selection, and explicit captured-result store readiness. Server contract
 version 19 adds immutable captured/fresh result comparison and JSON/HTML report
-endpoints. Clients generated against contract version 1 through 18 must regenerate
-from the current OpenAPI document.
+endpoints. Server contract version 20 adds the targeted-grant admission count and
+batch fingerprint to interaction summary evidence. Clients generated against
+contract version 1 through 19 must regenerate from the current OpenAPI document.
 Version 1 and 2 clients must also treat all aggregate
 counter fields as strings. Independently hosted dashboards must not render
 control-plane routes against a server reporting a different contract version.

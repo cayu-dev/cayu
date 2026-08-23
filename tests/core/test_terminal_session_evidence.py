@@ -248,6 +248,8 @@ async def _reset_postgres(dsn: str) -> None:
     async with await psycopg.AsyncConnection.connect(dsn) as connection:
         async with connection.cursor() as cursor:
             for table in (
+                "cayu_targeted_tool_grant_uses",
+                "cayu_targeted_tool_grants",
                 "cayu_public_authority_aliases",
                 "cayu_public_authority_alias_keys",
                 "cayu_public_authority_alias_config",

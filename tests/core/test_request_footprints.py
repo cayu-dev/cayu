@@ -26,6 +26,7 @@ from cayu import (
     RequestFootprintConfig,
     RequestVariant,
     StructuredOutputSpec,
+    TargetedToolGrantFootprint,
     ToolExposure,
     build_prompt_contribution_manifest,
     build_request_footprint,
@@ -148,13 +149,13 @@ def _build(
     )
 
 
-@pytest.mark.parametrize("invalid_version", [True, 1.0, "1", 4])
+@pytest.mark.parametrize("invalid_version", [True, 1.0, "1", 5])
 def test_request_footprint_versions_require_supported_exact_integers(
     invalid_version: object,
 ) -> None:
     footprint_payload = _build(_request()).model_dump(mode="python")
     footprint_payload["schema_version"] = invalid_version
-    with pytest.raises(ValidationError, match="schema_version must be integer 1, 2, or 3"):
+    with pytest.raises(ValidationError, match="schema_version must be integer 1, 2, 3, or 4"):
         RequestFootprint.model_validate(footprint_payload)
 
     fingerprint_payload = _build(
@@ -260,6 +261,103 @@ def test_request_footprint_v3_binds_the_prepared_tool_exposure() -> None:
             model_attempt_id="matt_00000000000000000000000000000002",
             execution_profile_fingerprint=execution_profile_fingerprint,
             tool_exposure=mismatched,
+        )
+
+
+def test_request_footprint_v4_adds_bounded_targeted_grants_without_tool_prefix_drift() -> None:
+    execution_profile_fingerprint = "a" * 64
+    exposure = ToolExposure(
+        execution_profile_fingerprint=execution_profile_fingerprint,
+        profile_id="review",
+        catalogue_revision=_CATALOGUE_REVISION,
+        exposure_fingerprint="b" * 64,
+        registered_count=1,
+        ceiling_count=1,
+        exposed_count=1,
+        profile_changed=False,
+        step=1,
+        provider_name="provider-a",
+        model="model-a",
+        model_step_id="mstep_00000000000000000000000000000001",
+    )
+    targeted = TargetedToolGrantFootprint(
+        generation_id=f"sha256:{'d' * 64}",
+        catalogue_revision=_CATALOGUE_REVISION,
+        grant_count=1,
+        grant_ids=(f"sha256:{'e' * 64}",),
+        tool_ids=("cayu:remember",),
+        max_calls=2,
+        used_calls=1,
+        remaining_calls=1,
+    )
+    request = _request()
+    direct_tools = request.model_dump(mode="python")["tools"]
+    footprint = build_request_footprint(
+        request,
+        provider_name="provider-a",
+        step=1,
+        attempt=1,
+        max_attempts=1,
+        request_variant=RequestVariant.INITIAL,
+        observation_id="targeted-grant-footprint",
+        model_step_id=exposure.model_step_id,
+        model_attempt_id="matt_00000000000000000000000000000001",
+        execution_profile_fingerprint=execution_profile_fingerprint,
+        tool_exposure=exposure,
+        targeted_tool_grants=targeted,
+    )
+
+    assert footprint.schema_version == 4
+    assert footprint.targeted_tool_grants == targeted
+    assert footprint.targeted_tool_grants.direct_tool_prefix_changed is False
+    assert request.model_dump(mode="python")["tools"] == direct_tools
+
+    invalid = footprint.model_dump(mode="python")
+    invalid["targeted_tool_grants"] = None
+    with pytest.raises(ValidationError, match="schema v4 requires"):
+        RequestFootprint.model_validate(invalid)
+
+
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"schema_version": True}, "schema_version must be the integer 1"),
+        ({"direct_tool_prefix_changed": 0}, "cannot change the direct provider tool prefix"),
+        ({"grant_ids": ("e" * 64,)}, "grant_ids must be SHA-256 identities"),
+        ({"tool_ids": ("remember",)}, "canonical Cayu or MCP tool identity"),
+    ],
+)
+def test_targeted_grant_footprint_rejects_coerced_or_noncanonical_identity(
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    values: dict[str, object] = {
+        "generation_id": f"sha256:{'d' * 64}",
+        "catalogue_revision": _CATALOGUE_REVISION,
+        "grant_count": 1,
+        "grant_ids": (f"sha256:{'e' * 64}",),
+        "tool_ids": ("cayu:remember",),
+        "max_calls": 2,
+        "used_calls": 1,
+        "remaining_calls": 1,
+    }
+    values.update(updates)
+
+    with pytest.raises(ValidationError, match=message):
+        TargetedToolGrantFootprint.model_validate(values)
+
+
+def test_targeted_grant_footprint_rejects_unbounded_iterators_before_consuming() -> None:
+    with pytest.raises(TypeError, match="grant_ids must be a sequence"):
+        TargetedToolGrantFootprint(
+            generation_id=f"sha256:{'d' * 64}",
+            catalogue_revision=_CATALOGUE_REVISION,
+            grant_count=1,
+            grant_ids=(item for item in ()),
+            tool_ids=("cayu:remember",),
+            max_calls=1,
+            used_calls=0,
+            remaining_calls=1,
         )
 
 

@@ -1284,6 +1284,31 @@
         "status": {
           "$ref": "#/components/schemas/InteractionStatus"
         },
+        "targeted_tool_grant_batch_fingerprint": {
+          "anyOf": [
+            {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Targeted Tool Grant Batch Fingerprint"
+        },
+        "targeted_tool_grant_count": {
+          "anyOf": [
+            {
+              "maximum": 32.0,
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Targeted Tool Grant Count"
+        },
         "terminal_event_id": {
           "anyOf": [
             {
@@ -6945,7 +6970,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "19",
+          "default": "20",
           "title": "Contract Version",
           "type": "string"
         },
@@ -10284,7 +10309,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "19",
+          "default": "20",
           "title": "Contract Version",
           "type": "string"
         }

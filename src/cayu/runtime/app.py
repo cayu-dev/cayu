@@ -298,6 +298,7 @@ from cayu.runtime.public_authority import (
 from cayu.runtime.request_footprints import (
     RequestFootprintConfig,
     copy_request_footprint_config,
+    targeted_tool_grant_footprint,
 )
 from cayu.runtime.retry_policy import (
     RetryPolicy,
@@ -334,6 +335,7 @@ from cayu.runtime.sessions import (
     SessionStatus,
     SessionStore,
     _checkpoint_after_queued_dispatch_acknowledgement,
+    _current_session_interaction_id,
     _queued_dispatch_session_instance_fingerprint,
     _queued_dispatch_terminal_receipts_from_checkpoint,
     _session_run_operation_from_checkpoint,
@@ -382,6 +384,13 @@ from cayu.runtime.tool_exposure import (
     ResolvedToolExposure,
     ToolExposurePolicy,
     resolved_tool_exposure_from_authority,
+    tool_capability_ceiling_from_session_metadata,
+)
+from cayu.runtime.tool_grants import (
+    TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS,
+    TargetedToolGrantInspection,
+    TargetedToolGrantRecord,
+    targeted_tool_grant_inspection,
 )
 from cayu.runtime.tool_policy import (
     AllowAllToolPolicy,
@@ -1715,6 +1724,38 @@ class CayuApp:
             require_clean_nonblank(session_id, "session_id")
         )
         return await self._session_engine.interruption_cascade_status(session_id=session_id)
+
+    async def inspect_targeted_tool_grants(
+        self,
+        session_id: str,
+        *,
+        interaction_id: str | None = None,
+        limit: int = TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS,
+    ) -> tuple[TargetedToolGrantInspection, ...]:
+        """Return bounded grant state through authenticated public aliases."""
+
+        if not self.session_store.supports_targeted_tool_grants:
+            raise RuntimeError("The configured SessionStore does not support targeted grants.")
+        private_session_id = await self._resolve_public_session_id(
+            require_clean_nonblank(session_id, "session_id")
+        )
+        private_interaction_id = (
+            None
+            if interaction_id is None
+            else await self._resolve_public_interaction_id(
+                session_id=private_session_id,
+                value=require_clean_nonblank(interaction_id, "interaction_id"),
+            )
+        )
+        records = await self.session_store.list_targeted_tool_grants(
+            private_session_id,
+            interaction_id=private_interaction_id,
+            limit=limit,
+        )
+        codec = self.session_store.public_authority_alias_codec
+        if codec is None:
+            raise RuntimeError("Targeted grant inspection requires public alias authority.")
+        return tuple(targeted_tool_grant_inspection(record, codec) for record in records)
 
     def register_agent(
         self,
@@ -5385,6 +5426,21 @@ class CayuApp:
         previous_tool_exposure_profile_id: str | None = None,
         preserve_failure_until_initial_provider_dispatch: bool = False,
     ) -> AsyncGenerator[Event, None]:
+        interaction_id = _current_session_interaction_id(session.id)
+        targeted_tool_grant_records: tuple[TargetedToolGrantRecord, ...] = ()
+        targeted_tool_grant_events: tuple[Event, ...] = ()
+        if interaction_id is not None:
+            (
+                targeted_tool_grant_records,
+                targeted_tool_grant_events,
+            ) = await self._session_engine._reconstruct_targeted_tool_grants(
+                session=session,
+                interaction_id=interaction_id,
+                task_id=task_id,
+                registered_agent=registered_agent,
+                capability_ceiling=tool_capability_ceiling_from_session_metadata(session.metadata),
+                observed_at=self._clock(),
+            )
         stream = self._session_engine._run_session(
             session=session,
             registered_agent=registered_agent,
@@ -5403,6 +5459,7 @@ class CayuApp:
             request_loop_policies=request_loop_policies,
             request_metadata=request_metadata,
             request_trace_metadata=request_metadata,
+            targeted_tool_grants=targeted_tool_grant_footprint(targeted_tool_grant_records),
             task_id=task_id,
             task_worker_id=task_worker_id,
             start_event_type=start_event_type,
@@ -5419,6 +5476,8 @@ class CayuApp:
                 preserve_failure_until_initial_provider_dispatch
             ),
         )
+        for targeted_tool_grant_event in targeted_tool_grant_events:
+            yield targeted_tool_grant_event
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
                 yield item

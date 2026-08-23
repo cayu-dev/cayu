@@ -50,13 +50,20 @@ from cayu.runtime.context import (
     estimate_model_request_context_pressure,
 )
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.runtime.tool_catalogue import validate_canonical_tool_id
 from cayu.runtime.tool_exposure import (
     TOOL_EXPOSURE_MAX_REGISTERED_TOOLS,
     TOOL_EXPOSURE_PROFILE_ID_MAX_CHARS,
     ToolExposure,
 )
+from cayu.runtime.tool_grants import (
+    TARGETED_TOOL_GRANT_MAX_CALLS,
+    TARGETED_TOOL_GRANT_MAX_REQUESTS,
+    TargetedToolGrantRecord,
+    copy_targeted_tool_grant_record,
+)
 
-REQUEST_FOOTPRINT_SCHEMA_VERSION = 3
+REQUEST_FOOTPRINT_SCHEMA_VERSION = 4
 PROMPT_CONTRIBUTION_MANIFEST_SCHEMA_VERSION = 1
 REQUEST_FOOTPRINT_CANONICALIZATION_VERSION = 1
 _HMAC_CONTEXT = b"cayu.request-footprint"
@@ -441,14 +448,142 @@ class RequestPromptContributionAttribution(BaseModel):
         return self
 
 
+class TargetedToolGrantFootprint(BaseModel):
+    """Bounded content-free identity for grants adjacent to a provider request."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    schema_version: Literal[1] = 1
+    generation_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    catalogue_revision: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    grant_count: StrictInt = Field(ge=1, le=TARGETED_TOOL_GRANT_MAX_REQUESTS)
+    grant_ids: tuple[str, ...]
+    tool_ids: tuple[str, ...]
+    max_calls: StrictInt = Field(
+        ge=1,
+        le=TARGETED_TOOL_GRANT_MAX_REQUESTS * TARGETED_TOOL_GRANT_MAX_CALLS,
+    )
+    used_calls: StrictInt = Field(
+        ge=0,
+        le=TARGETED_TOOL_GRANT_MAX_REQUESTS * TARGETED_TOOL_GRANT_MAX_CALLS,
+    )
+    remaining_calls: StrictInt = Field(
+        ge=0,
+        le=TARGETED_TOOL_GRANT_MAX_REQUESTS * TARGETED_TOOL_GRANT_MAX_CALLS,
+    )
+    direct_tool_prefix_changed: Literal[False] = False
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version(cls, value: object) -> object:
+        if type(value) is not int or value != 1:
+            raise ValueError("Targeted grant footprint schema_version must be the integer 1.")
+        return value
+
+    @field_validator("direct_tool_prefix_changed", mode="before")
+    @classmethod
+    def validate_direct_tool_prefix_changed(cls, value: object) -> object:
+        if type(value) is not bool or value is not False:
+            raise ValueError("Targeted grants cannot change the direct provider tool prefix.")
+        return value
+
+    @field_validator("grant_ids", mode="before")
+    @classmethod
+    def validate_grant_ids(cls, value: object) -> object:
+        if not isinstance(value, tuple | list):
+            raise TypeError("Targeted grant footprint grant_ids must be a sequence.")
+        if len(value) > TARGETED_TOOL_GRANT_MAX_REQUESTS:
+            raise ValueError("Targeted grant footprint grant_ids exceed the bounded count.")
+        return value
+
+    @field_validator("grant_ids")
+    @classmethod
+    def validate_grant_identities(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(
+            len(grant_id) != 71
+            or not grant_id.startswith("sha256:")
+            or _HMAC_SHA256_PATTERN.fullmatch(grant_id[7:]) is None
+            for grant_id in value
+        ):
+            raise ValueError("Targeted grant footprint grant_ids must be SHA-256 identities.")
+        return value
+
+    @field_validator("tool_ids", mode="before")
+    @classmethod
+    def bound_tool_ids(cls, value: object) -> object:
+        if not isinstance(value, tuple | list):
+            raise TypeError("Targeted grant footprint tool_ids must be a sequence.")
+        if len(value) > TARGETED_TOOL_GRANT_MAX_REQUESTS:
+            raise ValueError("Targeted grant footprint tool_ids exceed the bounded count.")
+        return value
+
+    @field_validator("tool_ids")
+    @classmethod
+    def validate_tool_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(
+            validate_canonical_tool_id(tool_id, f"tool_ids[{index}]")
+            for index, tool_id in enumerate(value)
+        )
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> TargetedToolGrantFootprint:
+        if (
+            len(self.grant_ids) != self.grant_count
+            or len(self.tool_ids) != self.grant_count
+            or len(set(self.grant_ids)) != self.grant_count
+            or len(set(self.tool_ids)) != self.grant_count
+            or self.grant_ids != tuple(sorted(self.grant_ids))
+            or self.tool_ids != tuple(sorted(self.tool_ids))
+        ):
+            raise ValueError("Targeted grant footprint identities must be unique and canonical.")
+        if self.used_calls + self.remaining_calls != self.max_calls:
+            raise ValueError("Targeted grant footprint call totals are inconsistent.")
+        return self
+
+
+def targeted_tool_grant_footprint(
+    records: tuple[TargetedToolGrantRecord, ...],
+) -> TargetedToolGrantFootprint | None:
+    """Build one stable footprint without projecting refs, schemas, or policy state."""
+
+    if type(records) is not tuple:
+        raise TypeError("records must be a tuple of TargetedToolGrantRecord values.")
+    if not records:
+        return None
+    if len(records) > TARGETED_TOOL_GRANT_MAX_REQUESTS:
+        raise ValueError("A request footprint cannot contain an unbounded targeted grant set.")
+    copied = tuple(copy_targeted_tool_grant_record(record) for record in records)
+    generation_ids = {record.generation_id for record in copied}
+    catalogue_revisions = {record.catalogue_revision for record in copied}
+    interaction_ids = {record.interaction_id for record in copied}
+    if len(generation_ids) != 1 or len(catalogue_revisions) != 1 or len(interaction_ids) != 1:
+        raise ValueError("Targeted grant footprint records must share one request authority.")
+    return TargetedToolGrantFootprint(
+        generation_id=next(iter(generation_ids)),
+        catalogue_revision=next(iter(catalogue_revisions)),
+        grant_count=len(copied),
+        grant_ids=tuple(sorted(record.grant_id for record in copied)),
+        tool_ids=tuple(sorted(record.tool_id for record in copied)),
+        max_calls=sum(record.max_calls for record in copied),
+        used_calls=sum(record.used_calls for record in copied),
+        remaining_calls=sum(record.remaining_calls for record in copied),
+    )
+
+
 class RequestFootprint(BaseModel):
     """Versioned, content-minimized evidence about one prepared provider request."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    schema_version: Literal[1, 2, 3]
+    schema_version: Literal[1, 2, 3, 4]
     execution_profile_fingerprint: str | None = None
     tool_exposure: ToolExposureFootprint | None = None
+    targeted_tool_grants: TargetedToolGrantFootprint | None = None
     observation_id: str
     provider_name: str
     model: str
@@ -475,8 +610,8 @@ class RequestFootprint(BaseModel):
     @field_validator("schema_version", mode="before")
     @classmethod
     def validate_schema_version(cls, value: object) -> object:
-        if type(value) is not int or value not in (1, 2, REQUEST_FOOTPRINT_SCHEMA_VERSION):
-            raise ValueError("Request footprint schema_version must be integer 1, 2, or 3.")
+        if type(value) is not int or value not in (1, 2, 3, REQUEST_FOOTPRINT_SCHEMA_VERSION):
+            raise ValueError("Request footprint schema_version must be integer 1, 2, 3, or 4.")
         return value
 
     @field_validator("execution_profile_fingerprint")
@@ -528,7 +663,9 @@ class RequestFootprint(BaseModel):
     @model_validator(mode="after")
     def validate_attempt(self) -> RequestFootprint:
         if self.schema_version == 1 and (
-            self.execution_profile_fingerprint is not None or self.tool_exposure is not None
+            self.execution_profile_fingerprint is not None
+            or self.tool_exposure is not None
+            or self.targeted_tool_grants is not None
         ):
             raise ValueError(
                 "Request footprint schema v1 cannot carry an execution profile or tool exposure."
@@ -539,6 +676,14 @@ class RequestFootprint(BaseModel):
             raise ValueError("Request footprint schema v2 cannot carry tool exposure.")
         if self.schema_version == 3 and self.tool_exposure is None:
             raise ValueError("Request footprint schema v3 requires tool exposure.")
+        if self.schema_version < 4 and self.targeted_tool_grants is not None:
+            raise ValueError("Request footprint schema v1-v3 cannot carry targeted grants.")
+        if self.schema_version == 4 and (
+            self.tool_exposure is None or self.targeted_tool_grants is None
+        ):
+            raise ValueError(
+                "Request footprint schema v4 requires tool exposure and targeted grants."
+            )
         if self.attempt > self.max_attempts:
             raise ValueError("attempt cannot exceed max_attempts.")
         if (self.operation_id is None) != (self.attempt_id is None):
@@ -588,6 +733,7 @@ def analyze_request_footprint(
     operation_attempt_id: str | None = None,
     execution_profile_fingerprint: str | None = None,
     tool_exposure: ToolExposure | None = None,
+    targeted_tool_grants: TargetedToolGrantFootprint | None = None,
 ) -> RequestFootprint:
     """Analyze one detached request with the provider's effective cache policy."""
 
@@ -631,6 +777,7 @@ def analyze_request_footprint(
         operation_attempt_id=operation_attempt_id,
         execution_profile_fingerprint=execution_profile_fingerprint,
         tool_exposure=tool_exposure,
+        targeted_tool_grants=targeted_tool_grants,
     )
 
 
@@ -694,6 +841,7 @@ def build_request_footprint(
     operation_attempt_id: str | None = None,
     execution_profile_fingerprint: str | None = None,
     tool_exposure: ToolExposure | None = None,
+    targeted_tool_grants: TargetedToolGrantFootprint | None = None,
 ) -> RequestFootprint:
     """Analyze one final provider-neutral request without retaining its content."""
 
@@ -765,6 +913,14 @@ def build_request_footprint(
             raise ValueError("tool_exposure step must match step.")
         if tool_exposure.model_step_id != model_step_id:
             raise ValueError("tool_exposure model_step_id must match model_step_id.")
+    if targeted_tool_grants is not None:
+        if type(targeted_tool_grants) is not TargetedToolGrantFootprint:
+            raise TypeError("targeted_tool_grants must be a TargetedToolGrantFootprint or None.")
+        targeted_tool_grants = TargetedToolGrantFootprint.model_validate(
+            targeted_tool_grants.model_dump(mode="python")
+        )
+        if tool_exposure is None:
+            raise ValueError("targeted_tool_grants requires tool_exposure evidence.")
 
     resolved_attachments = resolved_file_attachments_from_options(model_request.options)
     attachment_occurrences = _attachment_occurrences(
@@ -970,8 +1126,12 @@ def build_request_footprint(
     return RequestFootprint(
         schema_version=(
             REQUEST_FOOTPRINT_SCHEMA_VERSION
-            if tool_exposure is not None
-            else (2 if execution_profile_fingerprint is not None else 1)
+            if targeted_tool_grants is not None
+            else (
+                3
+                if tool_exposure is not None
+                else (2 if execution_profile_fingerprint is not None else 1)
+            )
         ),
         execution_profile_fingerprint=execution_profile_fingerprint,
         tool_exposure=(
@@ -986,6 +1146,7 @@ def build_request_footprint(
                 profile_changed=tool_exposure.profile_changed,
             )
         ),
+        targeted_tool_grants=targeted_tool_grants,
         observation_id=observation_id,
         provider_name=provider_name,
         model=model_request.model,

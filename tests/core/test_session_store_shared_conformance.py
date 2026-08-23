@@ -183,6 +183,11 @@ from cayu.runtime import (
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
+    TargetedToolGrant,
+    TargetedToolGrantRecord,
+    TargetedToolUseDisposition,
+    TargetedToolUseRejectionReason,
+    TargetedToolUseRequest,
     ToolApprovalDecision,
     ToolApprovalRequest,
     ToolCapabilityCeiling,
@@ -304,6 +309,8 @@ def _admit_test_workspace_observation_intent(
 
 
 _POSTGRES_TABLES = (
+    "cayu_targeted_tool_grant_uses",
+    "cayu_targeted_tool_grants",
     "cayu_public_authority_aliases",
     "cayu_public_authority_alias_keys",
     "cayu_public_authority_alias_config",
@@ -1335,6 +1342,37 @@ class _CeilingConformanceTool(Tool):
         return ToolResult(content=self.name)
 
 
+def _targeted_use_request(
+    record: TargetedToolGrantRecord,
+    *,
+    run_epoch: int,
+    identity: str,
+    arguments: str | None = None,
+) -> TargetedToolUseRequest:
+    argument_evidence = identity if arguments is None else arguments
+    return TargetedToolUseRequest(
+        tool_ref=record.tool_ref,
+        session_id=record.session_id,
+        interaction_id=record.interaction_id,
+        generation_id=record.generation_id,
+        agent_name=record.agent_name,
+        task_id=record.task_id,
+        environment_name=record.environment_name,
+        principal=record.principal,
+        tenant=record.tenant,
+        catalogue_revision=record.catalogue_revision,
+        descriptor_version=record.descriptor_version,
+        schema_fingerprint=record.schema_fingerprint,
+        tool_id=record.tool_id,
+        tool_name=record.tool_name,
+        model_step_id=f"model-step-{identity}",
+        outer_tool_call_id=f"outer-call-{identity}",
+        arguments_sha256=f"sha256:{sha256(argument_evidence.encode()).hexdigest()}",
+        invocation_id=f"invocation-{identity}",
+        expected_run_epoch=run_epoch,
+    )
+
+
 class _PreviousProfileConformancePolicy(ToolExposurePolicy):
     def __init__(self) -> None:
         self.requests: list[ToolExposurePolicyRequest] = []
@@ -1742,6 +1780,499 @@ def test_session_store_conformance_reconstructs_tool_exposure_evidence(
                     )
                 ]
         finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_targeted_grant_lifecycle_survives_reopen(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        stream: AsyncIterator[Event] | None = None
+        try:
+            session_id = f"targeted-lifecycle-{session_store_case[0]}"
+            provider = FakeProvider(
+                [
+                    [
+                        ModelStreamEvent.text_delta("done"),
+                        ModelStreamEvent.completed({"finish_reason": "stop"}),
+                    ]
+                ]
+            )
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=(_CeilingConformanceTool("remember"),),
+            )
+            stream = app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "review")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="lifecycle-grant",
+                            tool_id="cayu:remember",
+                            max_calls=2,
+                        ),
+                    ),
+                )
+            )
+            while True:
+                event = await anext(stream)
+                if event.type is EventType.TARGETED_TOOL_GRANT_ISSUED:
+                    break
+
+            [record] = await store.list_targeted_tool_grants(session_id)
+            session = await store.load(session_id)
+            assert session is not None
+            premature = await store.bind_targeted_tool_grant_use(
+                _targeted_use_request(
+                    record,
+                    run_epoch=session.run_epoch,
+                    identity="before-issuance",
+                ),
+                observed_at=record.issued_at - timedelta(seconds=1),
+            )
+            assert premature.disposition is TargetedToolUseDisposition.REJECTED
+            assert premature.reason is TargetedToolUseRejectionReason.NOT_YET_VALID
+            reconstructed = await store.reconstruct_targeted_tool_grants(
+                session_id,
+                expected_run_epoch=session.run_epoch,
+                interaction_id=record.interaction_id,
+                generation_id=record.generation_id,
+                agent_name=record.agent_name,
+                task_id=record.task_id,
+                environment_name=record.environment_name,
+                principal=record.principal,
+                tenant=record.tenant,
+                catalogue_revision=record.catalogue_revision,
+                descriptors_by_id={
+                    record.tool_id: (
+                        record.tool_name,
+                        record.descriptor_version,
+                        record.schema_fingerprint,
+                    )
+                },
+                capability_ceiling_names=frozenset({record.tool_name}),
+                observed_at=datetime.now(UTC),
+            )
+            assert reconstructed.valid == (record,)
+            assert reconstructed.rejected == ()
+
+            first_request = _targeted_use_request(
+                record,
+                run_epoch=session.run_epoch,
+                identity="first",
+            )
+            first = await store.bind_targeted_tool_grant_use(
+                first_request,
+                observed_at=datetime.now(UTC),
+            )
+            assert first.disposition is TargetedToolUseDisposition.BOUND
+            rejoined = await store.bind_targeted_tool_grant_use(
+                first_request,
+                observed_at=datetime.now(UTC),
+            )
+            assert rejoined.disposition is TargetedToolUseDisposition.REJOINED
+            altered_scope_request = TargetedToolUseRequest.model_validate(
+                {
+                    **first_request.model_dump(mode="python"),
+                    "principal": "different-principal",
+                }
+            )
+            altered_scope = await store.bind_targeted_tool_grant_use(
+                altered_scope_request,
+                observed_at=datetime.now(UTC),
+            )
+            assert altered_scope.disposition is TargetedToolUseDisposition.REJECTED
+            assert altered_scope.reason is TargetedToolUseRejectionReason.PRINCIPAL_MISMATCH
+            altered = await store.bind_targeted_tool_grant_use(
+                _targeted_use_request(
+                    record,
+                    run_epoch=session.run_epoch,
+                    identity="first",
+                    arguments="altered",
+                ),
+                observed_at=datetime.now(UTC),
+            )
+            assert altered.reason is TargetedToolUseRejectionReason.ALTERED_REPLAY
+
+            second = await store.bind_targeted_tool_grant_use(
+                _targeted_use_request(
+                    record,
+                    run_epoch=session.run_epoch,
+                    identity="second",
+                ),
+                observed_at=datetime.now(UTC),
+            )
+            assert second.disposition is TargetedToolUseDisposition.BOUND
+            late_rejoin = await store.bind_targeted_tool_grant_use(
+                first_request,
+                observed_at=datetime.now(UTC),
+            )
+            assert late_rejoin.disposition is TargetedToolUseDisposition.REJOINED
+            reconstructed_after_uses = await store.reconstruct_targeted_tool_grants(
+                session_id,
+                expected_run_epoch=session.run_epoch,
+                interaction_id=record.interaction_id,
+                generation_id=record.generation_id,
+                agent_name=record.agent_name,
+                task_id=record.task_id,
+                environment_name=record.environment_name,
+                principal=record.principal,
+                tenant=record.tenant,
+                catalogue_revision=record.catalogue_revision,
+                descriptors_by_id={
+                    record.tool_id: (
+                        record.tool_name,
+                        record.descriptor_version,
+                        record.schema_fingerprint,
+                    )
+                },
+                capability_ceiling_names=frozenset({record.tool_name}),
+                observed_at=datetime.now(UTC),
+            )
+            assert reconstructed_after_uses.valid[0].used_calls == 2
+            exhausted = await store.bind_targeted_tool_grant_use(
+                _targeted_use_request(
+                    record,
+                    run_epoch=session.run_epoch,
+                    identity="third",
+                ),
+                observed_at=datetime.now(UTC),
+            )
+            assert exhausted.reason is TargetedToolUseRejectionReason.EXHAUSTED
+
+            for invalid_epoch in (-1, True):
+                with pytest.raises(
+                    ValueError,
+                    match="expected_run_epoch must be a non-negative integer",
+                ):
+                    await store.revoke_targeted_tool_grant(
+                        record.tool_ref,
+                        session_id=session_id,
+                        expected_run_epoch=invalid_epoch,
+                        reason="operator revoked",
+                        revoked_at=datetime.now(UTC),
+                    )
+
+            with pytest.raises(
+                ValueError,
+                match="revoked_at cannot precede a bound targeted tool use",
+            ):
+                await store.revoke_targeted_tool_grant(
+                    record.tool_ref,
+                    session_id=session_id,
+                    expected_run_epoch=session.run_epoch,
+                    reason="operator revoked",
+                    revoked_at=record.issued_at,
+                )
+            state_after_rejected_revocation = await store.load_targeted_tool_grant_state(session_id)
+            assert state_after_rejected_revocation.records[0].revoked_at is None
+
+            revoked = await store.revoke_targeted_tool_grant(
+                record.tool_ref,
+                session_id=session_id,
+                expected_run_epoch=session.run_epoch,
+                reason="operator revoked",
+                revoked_at=datetime.now(UTC),
+            )
+            assert revoked is not None
+            assert revoked.revocation_reason == "operator revoked"
+            rejected_after_revocation = await store.bind_targeted_tool_grant_use(
+                _targeted_use_request(
+                    record,
+                    run_epoch=session.run_epoch,
+                    identity="after-revocation",
+                ),
+                observed_at=datetime.now(UTC),
+            )
+            assert rejected_after_revocation.reason is TargetedToolUseRejectionReason.REVOKED
+
+            reconstructed_after_revocation = await store.reconstruct_targeted_tool_grants(
+                session_id,
+                expected_run_epoch=session.run_epoch,
+                interaction_id=record.interaction_id,
+                generation_id=record.generation_id,
+                agent_name=record.agent_name,
+                task_id=record.task_id,
+                environment_name=record.environment_name,
+                principal=record.principal,
+                tenant=record.tenant,
+                catalogue_revision=record.catalogue_revision,
+                descriptors_by_id={
+                    record.tool_id: (
+                        record.tool_name,
+                        record.descriptor_version,
+                        record.schema_fingerprint,
+                    )
+                },
+                capability_ceiling_names=frozenset({record.tool_name}),
+                observed_at=datetime.now(UTC),
+            )
+            assert reconstructed_after_revocation.valid == ()
+            assert reconstructed_after_revocation.rejected == (
+                (record.grant_id, TargetedToolUseRejectionReason.REVOKED),
+            )
+
+            async for _event in stream:
+                pass
+            stream = None
+            store = await _reopen_store(session_store_case, store)
+            state = await store.load_targeted_tool_grant_state(session_id)
+            assert len(state.records) == 1
+            assert state.records[0].used_calls == 2
+            assert state.records[0].revocation_reason == "operator revoked"
+            assert len(state.uses) == 2
+
+            exported = io.StringIO()
+            assert await export_sessions(store, stream=exported) == 1
+            [imported] = list(import_sessions(io.StringIO(exported.getvalue())))
+            assert imported.targeted_tool_grant_state == state
+        finally:
+            if stream is not None:
+                await stream.aclose()
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_targeted_grant_replay_identity_is_interaction_wide(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        stream: AsyncIterator[Event] | None = None
+        try:
+            session_id = f"targeted-cross-grant-replay-{session_store_case[0]}"
+            provider = FakeProvider(
+                [
+                    [
+                        ModelStreamEvent.text_delta("done"),
+                        ModelStreamEvent.completed({"finish_reason": "stop"}),
+                    ]
+                ]
+            )
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=(
+                    _CeilingConformanceTool("remember"),
+                    _CeilingConformanceTool("recall"),
+                ),
+            )
+            stream = app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "review")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="remember-grant",
+                            tool_id="cayu:remember",
+                        ),
+                        TargetedToolGrant(
+                            request_id="recall-grant",
+                            tool_id="cayu:recall",
+                        ),
+                    ),
+                )
+            )
+            issued_count = 0
+            while issued_count < 2:
+                event = await anext(stream)
+                issued_count += event.type is EventType.TARGETED_TOOL_GRANT_ISSUED
+
+            records = await store.list_targeted_tool_grants(session_id)
+            records_by_tool = {record.tool_name: record for record in records}
+            remember = records_by_tool["remember"]
+            recall = records_by_tool["recall"]
+            session = await store.load(session_id)
+            assert session is not None
+            remember_request = _targeted_use_request(
+                remember,
+                run_epoch=session.run_epoch,
+                identity="shared-call",
+            )
+            recall_request = _targeted_use_request(
+                recall,
+                run_epoch=session.run_epoch,
+                identity="shared-call",
+            )
+            results = await asyncio.gather(
+                store.bind_targeted_tool_grant_use(
+                    remember_request,
+                    observed_at=datetime.now(UTC),
+                ),
+                store.bind_targeted_tool_grant_use(
+                    recall_request,
+                    observed_at=datetime.now(UTC),
+                ),
+            )
+            bound = [
+                result
+                for result in results
+                if result.disposition is TargetedToolUseDisposition.BOUND
+            ]
+            rejected = [
+                result
+                for result in results
+                if result.disposition is TargetedToolUseDisposition.REJECTED
+            ]
+            assert len(bound) == 1
+            assert len(rejected) == 1
+            assert rejected[0].reason is TargetedToolUseRejectionReason.ALTERED_REPLAY
+            winning_request = (
+                remember_request
+                if bound[0].grant is not None and bound[0].grant.tool_name == "remember"
+                else recall_request
+            )
+            exact_retry = await store.bind_targeted_tool_grant_use(
+                winning_request,
+                observed_at=datetime.now(UTC),
+            )
+            assert exact_retry.disposition is TargetedToolUseDisposition.REJOINED
+
+            state = await store.load_targeted_tool_grant_state(session_id)
+            state_by_tool = {record.tool_name: record for record in state.records}
+            assert sorted(record.used_calls for record in state_by_tool.values()) == [0, 1]
+            assert len(state.uses) == 1
+        finally:
+            if stream is not None:
+                await stream.aclose()
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("max_calls", "request_count", "exact_retry"),
+    [
+        (1, 16, True),
+        (4, 16, False),
+    ],
+)
+def test_session_store_conformance_targeted_grant_contention_is_bounded(
+    session_store_case,
+    max_calls: int,
+    request_count: int,
+    exact_retry: bool,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"targeted-contention-{max_calls}-{exact_retry}"
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("done"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            ]
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(_CeilingConformanceTool("remember"),),
+        )
+        stream = app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "review")],
+                tool_grants=(
+                    TargetedToolGrant(
+                        request_id="contention-grant",
+                        tool_id="cayu:remember",
+                        max_calls=max_calls,
+                    ),
+                ),
+            )
+        )
+        try:
+            while True:
+                event = await anext(stream)
+                if event.type is EventType.TARGETED_TOOL_GRANT_ISSUED:
+                    break
+            [record] = await store.list_targeted_tool_grants(session_id)
+            session = await store.load(session_id)
+            assert session is not None
+
+            def use_request(index: int) -> TargetedToolUseRequest:
+                identity = 0 if exact_retry else index
+                return TargetedToolUseRequest(
+                    tool_ref=record.tool_ref,
+                    session_id=session_id,
+                    interaction_id=record.interaction_id,
+                    generation_id=record.generation_id,
+                    agent_name=record.agent_name,
+                    task_id=record.task_id,
+                    environment_name=record.environment_name,
+                    principal=record.principal,
+                    tenant=record.tenant,
+                    catalogue_revision=record.catalogue_revision,
+                    descriptor_version=record.descriptor_version,
+                    schema_fingerprint=record.schema_fingerprint,
+                    tool_id=record.tool_id,
+                    tool_name=record.tool_name,
+                    model_step_id=f"model-step-{identity}",
+                    outer_tool_call_id=f"outer-call-{identity}",
+                    arguments_sha256=f"sha256:{identity:064x}",
+                    invocation_id=f"invocation-{identity}",
+                    expected_run_epoch=session.run_epoch,
+                )
+
+            observed_at = datetime.now(UTC)
+            results = await asyncio.gather(
+                *(
+                    store.bind_targeted_tool_grant_use(
+                        use_request(index),
+                        observed_at=observed_at,
+                    )
+                    for index in range(request_count)
+                )
+            )
+            if exact_retry:
+                assert (
+                    sum(
+                        result.disposition is TargetedToolUseDisposition.BOUND for result in results
+                    )
+                    == 1
+                )
+                assert (
+                    sum(
+                        result.disposition is TargetedToolUseDisposition.REJOINED
+                        for result in results
+                    )
+                    == request_count - 1
+                )
+            else:
+                assert (
+                    sum(
+                        result.disposition is TargetedToolUseDisposition.BOUND for result in results
+                    )
+                    == max_calls
+                )
+                assert (
+                    sum(
+                        result.reason is TargetedToolUseRejectionReason.EXHAUSTED
+                        for result in results
+                    )
+                    == request_count - max_calls
+                )
+            state = await store.load_targeted_tool_grant_state(session_id)
+            assert state.records[0].used_calls == max_calls
+            assert len(state.uses) == max_calls
+            assert state.records[0].remaining_calls == 0
+            async for _event in stream:
+                pass
+        finally:
+            await stream.aclose()
             await _close_store(store)
 
     asyncio.run(run())
@@ -20076,8 +20607,9 @@ def test_session_store_conformance_equal_current_child_authorization_is_replayab
             assert [record.event.type for record in records] == [
                 EventType.SESSION_EXECUTION_PROFILE_DECIDED,
                 EventType.SESSION_FORKED,
+                EventType.TARGETED_TOOL_GRANT_FORK_RESET,
             ]
-            assert records[-1].event.id == relationship.fork_event_id
+            assert records[-2].event.id == relationship.fork_event_id
         finally:
             await _close_store(store)
 
@@ -20164,7 +20696,10 @@ def test_session_store_conformance_profiled_fork_is_atomic_and_exactly_replayabl
             assert relationship.source_session_id == source.id
             if profile_mode == "inherit":
                 assert relationship.selected_profile == relationship.source_profile
-                expected_event_types = [EventType.SESSION_FORKED]
+                expected_event_types = [
+                    EventType.SESSION_FORKED,
+                    EventType.TARGETED_TOOL_GRANT_FORK_RESET,
+                ]
             else:
                 assert relationship.selected_profile != relationship.source_profile
                 assert relationship.decision is not None
@@ -20173,10 +20708,11 @@ def test_session_store_conformance_profiled_fork_is_atomic_and_exactly_replayabl
                 expected_event_types = [
                     EventType.SESSION_EXECUTION_PROFILE_DECIDED,
                     EventType.SESSION_FORKED,
+                    EventType.TARGETED_TOOL_GRANT_FORK_RESET,
                 ]
             records = await store.query_events(EventQuery(session_id=child_id, limit=10))
             assert [record.event.type for record in records] == expected_event_types
-            assert records[-1].event.id == relationship.fork_event_id
+            assert records[-2].event.id == relationship.fork_event_id
         finally:
             await _close_store(store)
 
@@ -20224,7 +20760,10 @@ def test_session_store_conformance_generated_profiled_fork_is_idempotent(
             assert relationship is not None
             assert relationship.source_session_id == source.id
             records = await store.query_events(EventQuery(session_id=children[0].id, limit=10))
-            assert [record.event.type for record in records] == [EventType.SESSION_FORKED]
+            assert [record.event.type for record in records] == [
+                EventType.SESSION_FORKED,
+                EventType.TARGETED_TOOL_GRANT_FORK_RESET,
+            ]
         finally:
             await _close_store(store)
 
@@ -20284,7 +20823,10 @@ def test_session_store_conformance_runtime_hook_fork_preserves_generated_provena
             assert [event.type for event in source_events].count(EventType.HOOK_STARTED) == 1
             assert [event.type for event in source_events].count(EventType.HOOK_COMPLETED) == 1
             child_events = await store.load_events(child.id)
-            assert [event.type for event in child_events] == [EventType.SESSION_FORKED]
+            assert [event.type for event in child_events] == [
+                EventType.SESSION_FORKED,
+                EventType.TARGETED_TOOL_GRANT_FORK_RESET,
+            ]
         finally:
             await _close_store(store)
 

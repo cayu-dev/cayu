@@ -698,7 +698,10 @@ def test_fork_profile_inheritance_is_atomic_and_exactly_replayable(
         assert relationship.selected_profile == expected
         assert relationship.decision is None
         records = await store.query_events(EventQuery(session_id=child.id, limit=10))
-        assert [record.event.type for record in records] == [EventType.SESSION_FORKED]
+        assert [record.event.type for record in records] == [
+            EventType.SESSION_FORKED,
+            EventType.TARGETED_TOOL_GRANT_FORK_RESET,
+        ]
         stored_payload = records[0].event.payload
         assert stored_payload["fork_request_sha256"] == relationship.request_sha256
         assert stored_payload["selected_profile_fingerprint"] == expected.fingerprint
@@ -844,7 +847,10 @@ def test_profiled_fork_reconciles_ambiguous_custom_store_results(
         relationship = session_fork_profile_relationship(child)
         assert relationship is not None
         records = await store.query_events(EventQuery(session_id=child.id, limit=10))
-        assert [record.event.type for record in records] == [EventType.SESSION_FORKED]
+        assert [record.event.type for record in records] == [
+            EventType.SESSION_FORKED,
+            EventType.TARGETED_TOOL_GRANT_FORK_RESET,
+        ]
         assert records[0].event.id == relationship.fork_event_id
 
     asyncio.run(scenario())
@@ -1020,7 +1026,10 @@ def test_profiled_fork_cancellation_waits_for_dispatched_store_mutation() -> Non
         relationship = session_fork_profile_relationship(child)
         assert relationship is not None
         records = await store.query_events(EventQuery(session_id=child.id, limit=10))
-        assert [record.event.type for record in records] == [EventType.SESSION_FORKED]
+        assert [record.event.type for record in records] == [
+            EventType.SESSION_FORKED,
+            EventType.TARGETED_TOOL_GRANT_FORK_RESET,
+        ]
 
         replayed = await collect(app.fork_session(request))
         assert [event.type for event in replayed] == [EventType.SESSION_FORKED]
@@ -1099,7 +1108,10 @@ def test_profiled_fork_supervisory_exit_waits_for_store_settlement(
         relationship = session_fork_profile_relationship(child)
         assert relationship is not None
         records = await store.query_events(EventQuery(session_id=child.id, limit=10))
-        assert [record.event.type for record in records] == [EventType.SESSION_FORKED]
+        assert [record.event.type for record in records] == [
+            EventType.SESSION_FORKED,
+            EventType.TARGETED_TOOL_GRANT_FORK_RESET,
+        ]
         assert records[0].event.id == relationship.fork_event_id
 
         replayed = await collect(app.fork_session(request))
@@ -1190,6 +1202,7 @@ def test_fork_current_child_profile_requires_and_records_authorized_adoption(
         assert [record.event.type for record in records] == [
             EventType.SESSION_EXECUTION_PROFILE_DECIDED,
             EventType.SESSION_FORKED,
+            EventType.TARGETED_TOOL_GRANT_FORK_RESET,
         ]
         if isinstance(store, SQLiteSessionStore):
             assert (

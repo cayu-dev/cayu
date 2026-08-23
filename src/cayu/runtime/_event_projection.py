@@ -175,11 +175,27 @@ _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS = frozenset({"exposure_fingerprint", "profi
 _TOOL_EXPOSURE_RECORD_PUBLIC_AUTHORITY_KEYS = _TOOL_EXPOSURE_PUBLIC_AUTHORITY_KEYS | {
     "catalogue_revision"
 }
+_TARGETED_TOOL_GRANT_PUBLIC_AUTHORITY_KEYS = frozenset(
+    {
+        "arguments_sha256",
+        "catalogue_revision",
+        "descriptor_version",
+        "generation_id",
+        "grant_id",
+        "rejection_id",
+        "request_id",
+        "schema_fingerprint",
+        "tool_id",
+        "use_id",
+    }
+)
 # Unlike caller-selected public linkage such as a server mutation id, these
 # fields assert which runtime authority governed an effect. They may survive a
 # first write or an untrusted projection only with exact in-process provenance.
 _PROVENANCE_REQUIRED_PUBLIC_AUTHORITY_KEYS = (
-    _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS | _TOOL_EXPOSURE_RECORD_PUBLIC_AUTHORITY_KEYS
+    _EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS
+    | _TOOL_EXPOSURE_RECORD_PUBLIC_AUTHORITY_KEYS
+    | _TARGETED_TOOL_GRANT_PUBLIC_AUTHORITY_KEYS
 )
 _TOOL_EVENT_TYPES = frozenset(
     {
@@ -603,7 +619,7 @@ _DECLARED_FIXED_CONTROLS: Mapping[
         ("duplicate_request_risk",): frozenset({True, False}),
     },
     EventType.REQUEST_FOOTPRINT_RECORDED: {
-        ("schema_version",): frozenset({1, 2, 3}),
+        ("schema_version",): frozenset({1, 2, 3, 4}),
         ("request_variant",): _REQUEST_VARIANT_VALUES,
         ("messages", "groups", "*", "role"): _REQUEST_MESSAGE_ROLE_VALUES,
         ("messages", "groups", "*", "part_type"): _REQUEST_MESSAGE_PART_TYPE_VALUES,
@@ -1082,6 +1098,16 @@ _REQUEST_FOOTPRINT_NESTED_PATHS = frozenset(
         ("tool_exposure", "ceiling_count"),
         ("tool_exposure", "exposed_count"),
         ("tool_exposure", "profile_changed"),
+        ("targeted_tool_grants", "schema_version"),
+        ("targeted_tool_grants", "generation_id"),
+        ("targeted_tool_grants", "catalogue_revision"),
+        ("targeted_tool_grants", "grant_count"),
+        ("targeted_tool_grants", "grant_ids"),
+        ("targeted_tool_grants", "tool_ids"),
+        ("targeted_tool_grants", "max_calls"),
+        ("targeted_tool_grants", "used_calls"),
+        ("targeted_tool_grants", "remaining_calls"),
+        ("targeted_tool_grants", "direct_tool_prefix_changed"),
     }
     | {
         (*prefix, field_name)
@@ -1746,6 +1772,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "start_event_sequence",
         "started_at",
         "status",
+        "targeted_tool_grant_batch_fingerprint",
+        "targeted_tool_grant_count",
         "token_usage",
         "tool_call_count",
         "wall_duration_ms",
@@ -1775,7 +1803,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "attempt attempt_id attachments cache_breakpoints component_tokens context_pressure execution_profile_fingerprint "
         "fingerprints max_attempts messages model model_attempt_id model_step_id observation_id "
         "operation_id options provider_name prompt_contributions request_variant schema_version "
-        "step structured_output tool_exposure tools total",
+        "step structured_output targeted_tool_grants tool_exposure tools total",
         owned_nested_paths=_REQUEST_FOOTPRINT_NESTED_PATHS,
         authority_keys={"execution_profile_fingerprint"},
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
@@ -1790,6 +1818,30 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS
         | _TOOL_EXPOSURE_RECORD_PUBLIC_AUTHORITY_KEYS,
         aliased_authority_keys={"model_step_id"},
+    )
+    targeted_grant_lifecycle = _observed_policy(
+        "arguments_sha256 catalogue_revision descriptor_version expires_at generation_id "
+        "grant_id invocation_id issued_at max_calls model_step_id origin outer_tool_call_id "
+        "outcome rejection_id rejection_reason remaining_calls request_id schema_fingerprint schema_version "
+        "tool_id use_id used_calls",
+        authority_keys=_TARGETED_TOOL_GRANT_PUBLIC_AUTHORITY_KEYS,
+        public_authority_keys=_TARGETED_TOOL_GRANT_PUBLIC_AUTHORITY_KEYS,
+        aliased_authority_keys={"invocation_id", "model_step_id", "outer_tool_call_id"},
+    )
+    for event_type in {
+        EventType.TARGETED_TOOL_GRANT_ISSUED,
+        EventType.TARGETED_TOOL_GRANT_REUSED,
+        EventType.TARGETED_TOOL_GRANT_RECONSTRUCTED,
+        EventType.TARGETED_TOOL_GRANT_EXPIRED,
+        EventType.TARGETED_TOOL_GRANT_REVOKED,
+        EventType.TARGETED_TOOL_REFERENCE_CONSUMED,
+        EventType.TARGETED_TOOL_REFERENCE_REJOINED,
+        EventType.TARGETED_TOOL_REFERENCE_REJECTED,
+    }:
+        policies[event_type] = targeted_grant_lifecycle
+    policies[EventType.TARGETED_TOOL_GRANT_FORK_RESET] = _observed_policy(
+        "inherited_grant_count inherited_reference_count schema_version "
+        "source_interaction_id source_session_id"
     )
     model_delta = _policy(
         "attempt",
@@ -3298,7 +3350,7 @@ def _prepare_runtime_event(
         redactor=redactor,
         reject_malformed=True,
     )
-    _restore_publication_safe_tool_exposure_footprint(
+    _restore_publication_safe_tool_footprints(
         event,
         redacted_payload=redacted_payload,
         trust_persisted_projection=False,
@@ -3582,7 +3634,7 @@ def _project_runtime_event(
         redactor=redactor,
         reject_malformed=False,
     )
-    _restore_publication_safe_tool_exposure_footprint(
+    _restore_publication_safe_tool_footprints(
         event,
         redacted_payload=redacted_payload,
         trust_persisted_projection=trust_persisted_projection,
@@ -3755,39 +3807,62 @@ def _restore_publication_safe_request_fingerprints(
             )
 
 
-def _restore_publication_safe_tool_exposure_footprint(
+def _restore_publication_safe_tool_footprints(
     event: Event,
     *,
     redacted_payload: dict[str, Any],
     trust_persisted_projection: bool,
     reject_malformed: bool,
 ) -> None:
-    """Retain a typed public exposure summary only with producer provenance."""
+    """Retain typed public tool summaries only with producer provenance."""
 
     if event.type != EventType.REQUEST_FOOTPRINT_RECORDED:
         return
     raw_exposure = event.payload.get("tool_exposure")
+    raw_targeted_grants = event.payload.get("targeted_tool_grants")
     schema_version = event.payload.get("schema_version")
     if raw_exposure is None:
-        if schema_version == 3 and reject_malformed:
-            raise ValueError("Request footprint schema v3 has no tool exposure summary.")
+        if schema_version in {3, 4} and reject_malformed:
+            raise ValueError("Request footprint schema v3+ has no tool exposure summary.")
         redacted_payload.pop("tool_exposure", None)
+        redacted_payload.pop("targeted_tool_grants", None)
         return
-    if schema_version != 3:
+    if schema_version not in {3, 4}:
         if reject_malformed:
-            raise ValueError("Only request footprint schema v3 may carry tool exposure.")
+            raise ValueError("Only request footprint schema v3+ may carry tool exposure.")
         redacted_payload.pop("tool_exposure", None)
+        redacted_payload.pop("targeted_tool_grants", None)
         return
 
-    from cayu.runtime.request_footprints import ToolExposureFootprint
+    from cayu.runtime.request_footprints import (
+        TargetedToolGrantFootprint,
+        ToolExposureFootprint,
+    )
 
     try:
         exposure = ToolExposureFootprint.model_validate(raw_exposure)
+        targeted_grants = (
+            TargetedToolGrantFootprint.model_validate(raw_targeted_grants)
+            if schema_version == 4
+            else None
+        )
     except (TypeError, ValueError) as exc:
         if reject_malformed:
-            raise ValueError("Request footprint tool exposure is malformed.") from exc
+            raise ValueError("Request footprint tool evidence is malformed.") from exc
         redacted_payload.pop("tool_exposure", None)
+        redacted_payload.pop("targeted_tool_grants", None)
         return
+    if (schema_version == 4) != (targeted_grants is not None):
+        if reject_malformed:
+            raise ValueError("Only request footprint schema v4 may carry targeted grant evidence.")
+        redacted_payload.pop("targeted_tool_grants", None)
+        if schema_version == 4:
+            redacted_payload.pop("tool_exposure", None)
+        return
+    if schema_version == 3 and raw_targeted_grants is not None:
+        if reject_malformed:
+            raise ValueError("Only request footprint schema v4 may carry targeted grant evidence.")
+        redacted_payload.pop("targeted_tool_grants", None)
     if not _public_authority_is_trusted(
         event,
         field_name="execution_profile_fingerprint",
@@ -3796,6 +3871,7 @@ def _restore_publication_safe_tool_exposure_footprint(
         if reject_malformed:
             raise ValueError("Request footprint tool exposure lacks runtime provenance.")
         redacted_payload.pop("tool_exposure", None)
+        redacted_payload.pop("targeted_tool_grants", None)
         return
 
     # profile_id is an explicitly public application label and exposure_fingerprint
@@ -3803,6 +3879,8 @@ def _restore_publication_safe_tool_exposure_footprint(
     # survive accidental workload-secret substring collisions, matching the
     # standalone tool.exposure.recorded contract.
     redacted_payload["tool_exposure"] = exposure.model_dump(mode="json")
+    if targeted_grants is not None:
+        redacted_payload["targeted_tool_grants"] = targeted_grants.model_dump(mode="json")
 
 
 def _restore_publication_safe_execution_profile_decision(
@@ -4206,6 +4284,39 @@ def _public_authority_is_trusted(
         type(value) is str and bool(value.strip()) and len(value) <= 256
     ):
         return False
+    if field_name in {
+        "arguments_sha256",
+        "generation_id",
+        "grant_id",
+        "rejection_id",
+        "schema_fingerprint",
+        "use_id",
+    } and not (
+        type(value) is str
+        and len(value) == 71
+        and value.startswith("sha256:")
+        and all(character in "0123456789abcdef" for character in value[7:])
+    ):
+        return False
+    if field_name == "request_id" and not (
+        type(value) is str and bool(value.strip()) and len(value) <= 256
+    ):
+        return False
+    if field_name in {"descriptor_version", "tool_id"}:
+        if type(value) is not str:
+            return False
+        try:
+            from cayu.runtime.tool_catalogue import (
+                validate_canonical_tool_id,
+                validate_tool_descriptor_version,
+            )
+
+            if field_name == "tool_id":
+                validate_canonical_tool_id(value)
+            else:
+                validate_tool_descriptor_version(value)
+        except (TypeError, ValueError):
+            return False
     if trust_persisted_projection:
         return True
     assert type(value) is str

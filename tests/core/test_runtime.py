@@ -217,6 +217,7 @@ from cayu.runtime import (
     StaticToolPolicy,
     StructuredOutputSpec,
     TaintAwareToolPolicy,
+    TargetedToolGrant,
     TaskCreate,
     TaskStatus,
     TaskTerminalizationRequest,
@@ -15356,7 +15357,10 @@ def test_cayu_app_forks_completed_session_and_preserves_source():
     )
     app = CayuApp(session_store=store)
     app.register_provider(provider, default=True)
-    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=(EchoTool(),),
+    )
 
     asyncio.run(
         collect_events(
@@ -15366,9 +15370,16 @@ def test_cayu_app_forks_completed_session_and_preserves_source():
                 session_id="sess_fork_source",
                 labels={"owner": "org_123", "project": "feature_a"},
                 messages=[Message.text("user", "first request")],
+                tool_grants=(
+                    TargetedToolGrant(
+                        request_id="fork-source-grant",
+                        tool_id="cayu:echo",
+                    ),
+                ),
             ),
         )
     )
+    assert len(asyncio.run(store.list_targeted_tool_grants("sess_fork_source"))) == 1
 
     async def make_source_checkpoint_versionless() -> None:
         checkpoint = await store.load_checkpoint("sess_fork_source")
@@ -15411,6 +15422,12 @@ def test_cayu_app_forks_completed_session_and_preserves_source():
     fork_transcript = asyncio.run(store.load_transcript("sess_fork_child"))
     source_transcript = asyncio.run(store.load_transcript("sess_fork_source"))
     assert fork_transcript == source_transcript
+    assert asyncio.run(store.list_targeted_tool_grants("sess_fork_child")) == ()
+    assert len(asyncio.run(store.list_targeted_tool_grants("sess_fork_source"))) == 1
+    fork_reset = asyncio.run(store.load_events("sess_fork_child"))[-1]
+    assert fork_reset.type is EventType.TARGETED_TOOL_GRANT_FORK_RESET
+    assert fork_reset.payload["inherited_grant_count"] == 0
+    assert fork_reset.payload["inherited_reference_count"] == 0
 
     asyncio.run(
         collect_resume_events(
@@ -15529,6 +15546,7 @@ def test_cayu_app_fork_can_install_current_body_prompt_and_preserve_history(
     assert [event.type for event in asyncio.run(child_store.load_events(child.id))] == [
         EventType.SESSION_EXECUTION_PROFILE_DECIDED,
         EventType.SESSION_FORKED,
+        EventType.TARGETED_TOOL_GRANT_FORK_RESET,
     ]
     receipt = session_prompt_anatomy_transition(child)
     assert receipt is not None
@@ -15667,6 +15685,7 @@ def test_prompt_anatomy_fork_recovers_after_descendant_commit_before_receipt() -
     assert [event.type for event in asyncio.run(store.load_events("sess_prompt_crash_child"))] == [
         EventType.SESSION_EXECUTION_PROFILE_DECIDED,
         EventType.SESSION_FORKED,
+        EventType.TARGETED_TOOL_GRANT_FORK_RESET,
     ]
 
     restarted_app = CayuApp(
@@ -15682,7 +15701,7 @@ def test_prompt_anatomy_fork_recovers_after_descendant_commit_before_receipt() -
     recovered = asyncio.run(collect_fork_events(restarted_app, request))
 
     assert [event.type for event in recovered] == [EventType.SESSION_FORKED]
-    assert len(asyncio.run(store.load_events("sess_prompt_crash_child"))) == 2
+    assert len(asyncio.run(store.load_events("sess_prompt_crash_child"))) == 3
     completed_checkpoint = asyncio.run(store.load_checkpoint("sess_prompt_crash_parent"))
     assert completed_checkpoint is not None
     completed_intents = completed_checkpoint["prompt_anatomy_transition_intents"]
@@ -15766,6 +15785,7 @@ def test_prompt_anatomy_fork_exact_retry_survives_source_advance_after_process_d
         assert [event.type for event in await store.load_events("sess_prompt_advanced_child")] == [
             EventType.SESSION_EXECUTION_PROFILE_DECIDED,
             EventType.SESSION_FORKED,
+            EventType.TARGETED_TOOL_GRANT_FORK_RESET,
         ]
         await store.close()
 
@@ -15802,7 +15822,7 @@ def test_prompt_anatomy_fork_exact_retry_survives_source_advance_after_process_d
         child = await recovered_store.load("sess_prompt_advanced_child")
         assert child is not None
         assert [event.type for event in recovered] == [EventType.SESSION_FORKED]
-        assert len(await recovered_store.load_events(child.id)) == 2
+        assert len(await recovered_store.load_events(child.id)) == 3
         assert session_prompt_anatomy_transition(child) is not None
         await recovered_store.close()
 
@@ -29812,7 +29832,10 @@ def test_cayu_app_recovery_and_resume_preserve_healthy_fork_baseline() -> None:
         )
 
         assert recovered.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
-        assert [record.event.type for record in before_resume] == [EventType.SESSION_FORKED]
+        assert [record.event.type for record in before_resume] == [
+            EventType.SESSION_FORKED,
+            EventType.TARGETED_TOOL_GRANT_FORK_RESET,
+        ]
         assert resumed[0].type == EventType.SESSION_RESUMED
         assert resumed[-1].type == EventType.SESSION_COMPLETED
         assert [record.event.type for record in lifecycle] == [

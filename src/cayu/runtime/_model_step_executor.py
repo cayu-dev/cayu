@@ -259,6 +259,7 @@ from cayu.runtime.request_footprints import (
     RequestFootprint,
     RequestFootprintConfig,
     RequestVariant,
+    TargetedToolGrantFootprint,
     analyze_request_context_pressure,
     analyze_request_footprint,
     copy_request_footprint_config,
@@ -3963,6 +3964,7 @@ class ModelStepExecutor:
         validate_live_model_semantics: Callable[[], None],
         initial_tool_exposure: ResolvedToolExposure | None = None,
         previous_tool_exposure_profile_id: str | None = None,
+        targeted_tool_grants: TargetedToolGrantFootprint | None = None,
         model_completion_recovery_context_factory: (
             ModelCompletionRecoveryContextFactory | None
         ) = None,
@@ -3992,6 +3994,7 @@ class ModelStepExecutor:
             validate_live_model_semantics=validate_live_model_semantics,
             initial_tool_exposure=initial_tool_exposure,
             previous_tool_exposure_profile_id=previous_tool_exposure_profile_id,
+            targeted_tool_grants=targeted_tool_grants,
             model_completion_recovery_context_factory=(
                 model_completion_recovery_context_factory
                 or (
@@ -4215,6 +4218,7 @@ class ModelStepExecutor:
         execution_profile: ExecutionProfileIdentity | None = None,
         tool_exposure: ResolvedToolExposure | None = None,
         tool_exposure_evidence: ToolExposure | None = None,
+        targeted_tool_grants: TargetedToolGrantFootprint | None = None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         retry_policy = copy_retry_policy(retry_policy)
         request_variant = RequestVariant(request_variant)
@@ -4223,6 +4227,14 @@ class ModelStepExecutor:
         resolved_tool_exposure = (
             None if tool_exposure is None else _require_frozen_tool_exposure(tool_exposure)
         )
+        if targeted_tool_grants is not None:
+            if type(targeted_tool_grants) is not TargetedToolGrantFootprint:
+                raise TypeError(
+                    "targeted_tool_grants must be a TargetedToolGrantFootprint or None."
+                )
+            targeted_tool_grants = TargetedToolGrantFootprint.model_validate(
+                targeted_tool_grants.model_dump(mode="python")
+            )
         if tool_exposure_evidence is not None:
             if type(tool_exposure_evidence) is not ToolExposure:
                 raise TypeError("tool_exposure_evidence must be a ToolExposure or None.")
@@ -4329,6 +4341,7 @@ class ModelStepExecutor:
                 structured_output=structured_output,
                 execution_profile=execution_profile,
                 tool_exposure=tool_exposure_evidence,
+                targeted_tool_grants=targeted_tool_grants,
             )
             if request_footprint_event is not None:
                 yield request_footprint_event, None
@@ -4592,6 +4605,7 @@ class ModelStepExecutor:
         structured_output: StructuredOutputSpec | None,
         execution_profile: ExecutionProfileIdentity | None,
         tool_exposure: ToolExposure | None,
+        targeted_tool_grants: TargetedToolGrantFootprint | None,
     ) -> tuple[RequestFootprint | None, Event | None]:
         if not self._request_footprint.enabled:
             return None, None
@@ -4620,6 +4634,7 @@ class ModelStepExecutor:
                 None if execution_profile is None else execution_profile.fingerprint
             ),
             tool_exposure=tool_exposure,
+            targeted_tool_grants=targeted_tool_grants,
         )
         footprint_event = Event(
             type=EventType.REQUEST_FOOTPRINT_RECORDED,
@@ -6353,6 +6368,7 @@ class ModelStepRun:
         validate_live_model_semantics: Callable[[], None],
         initial_tool_exposure: ResolvedToolExposure | None,
         previous_tool_exposure_profile_id: str | None,
+        targeted_tool_grants: TargetedToolGrantFootprint | None,
         model_completion_recovery_context_factory: ModelCompletionRecoveryContextFactory,
         model_completion_publisher: ModelCompletionPublisher | None = None,
     ) -> None:
@@ -6418,6 +6434,15 @@ class ModelStepRun:
         )
         self._model_completion_publisher = model_completion_publisher
         self._previous_tool_exposure_profile_id = previous_tool_exposure_profile_id
+        if targeted_tool_grants is not None:
+            if type(targeted_tool_grants) is not TargetedToolGrantFootprint:
+                raise TypeError(
+                    "targeted_tool_grants must be a TargetedToolGrantFootprint or None."
+                )
+            targeted_tool_grants = TargetedToolGrantFootprint.model_validate(
+                targeted_tool_grants.model_dump(mode="python")
+            )
+        self._targeted_tool_grants = targeted_tool_grants
         contextual_limits = (
             *budget_limits_for_session(
                 policy=self._budget_policy,
@@ -7565,6 +7590,7 @@ class ModelStepRun:
                 execution_profile=self._execution_profile,
                 tool_exposure=tool_exposure,
                 tool_exposure_evidence=tool_exposure_evidence,
+                targeted_tool_grants=self._targeted_tool_grants,
             )
 
         attempt_events = run_attempt(

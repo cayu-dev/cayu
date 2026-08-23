@@ -121,6 +121,8 @@ _TABLES = (
     "cayu_budget_reservation_identities",
     "cayu_events",
     "cayu_session_labels",
+    "cayu_targeted_tool_grant_uses",
+    "cayu_targeted_tool_grants",
     "cayu_public_authority_aliases",
     "cayu_public_authority_alias_keys",
     "cayu_public_authority_alias_config",
@@ -187,6 +189,80 @@ def _new_store(dsn: str):
 
     # Tests own a throwaway database and (re)create the schema each run.
     return PostgresSessionStore(dsn, min_size=1, max_size=4, schema_mode=SchemaMode.CREATE)
+
+
+async def _issue_targeted_grant_record(
+    store,
+    *,
+    codec: PublicAuthorityAliasCodec,
+    session_id: str,
+    interaction_id: str,
+):
+    from cayu.runtime.tool_grants import (
+        PreparedTargetedToolGrant,
+        TargetedToolGrant,
+        build_targeted_tool_grant_record,
+        prepared_targeted_tool_grant_batch_fingerprint,
+        targeted_tool_grant_event,
+    )
+
+    prepared = PreparedTargetedToolGrant(
+        request=TargetedToolGrant(
+            request_id="postgres-targeted-grant",
+            tool_id="cayu:remember",
+        ),
+        tool_name="remember",
+        catalogue_revision=f"sha256:{'1' * 64}",
+        descriptor_version=f"sha256:{'2' * 64}",
+        schema_fingerprint=f"sha256:{'3' * 64}",
+    )
+    interaction_started = Event(
+        id=f"{interaction_id}:started",
+        type=EventType.INTERACTION_STARTED,
+        session_id=session_id,
+        interaction_id=interaction_id,
+        timestamp=datetime.now(UTC),
+        agent_name="assistant",
+        payload={
+            "targeted_tool_grant_count": 1,
+            "targeted_tool_grant_batch_fingerprint": (
+                prepared_targeted_tool_grant_batch_fingerprint((prepared,))
+            ),
+        },
+    )
+    session = await store.create(
+        RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+        identity=_identity(),
+        interaction_started_event=interaction_started,
+        interaction_source_messages=[],
+    )
+    record = build_targeted_tool_grant_record(
+        prepared,
+        session_id=session.id,
+        interaction_id=interaction_id,
+        generation_id=f"sha256:{'4' * 64}",
+        agent_name=session.agent_name,
+        task_id=None,
+        environment_name=session.environment_name,
+        principal=session.invocation.origin.subject,
+        tenant=session.invocation.origin.tenant,
+        issued_at=datetime.now(UTC),
+        codec=codec,
+    )
+    event = targeted_tool_grant_event(
+        record,
+        event_type=EventType.TARGETED_TOOL_GRANT_ISSUED,
+        timestamp=record.issued_at,
+        outcome="issued",
+        event_id_suffix="issued",
+    )
+    await store.issue_targeted_tool_grants(
+        session.id,
+        expected_run_epoch=session.run_epoch,
+        records=(record,),
+        events=(event,),
+    )
+    return record
 
 
 def _run(dsn: str, coro_factory) -> object:
@@ -815,6 +891,118 @@ def test_postgres_public_authority_alias_startup_backfills_every_identity_source
                 )
         finally:
             await backfilling.close()
+
+    asyncio.run(runner())
+
+
+def test_postgres_public_authority_rotation_backfills_targeted_references(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        from cayu import PostgresSessionStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _truncate(postgres_dsn)
+        first_codec = _public_authority_codec(active_key_id="first", key_byte=41)
+        first = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            public_authority_alias_codec=first_codec,
+        )
+        session_id = "targeted-reference-rotation"
+        interaction_id = "targeted-reference-rotation-interaction"
+        try:
+            record = await _issue_targeted_grant_record(
+                first,
+                codec=first_codec,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            )
+        finally:
+            await first.close()
+
+        first_key = SecretStr(base64.urlsafe_b64encode(bytes([41]) * 32).decode().rstrip("="))
+        second_key = SecretStr(base64.urlsafe_b64encode(bytes([42]) * 32).decode().rstrip("="))
+        rotated_codec = PublicAuthorityAliasCodec(
+            PublicAuthorityAliasKeyring(
+                active_key_id="second",
+                keys={"first": first_key, "second": second_key},
+            )
+        )
+        rotated = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+            public_authority_alias_codec=rotated_codec,
+        )
+        try:
+            [loaded] = await rotated.list_targeted_tool_grants(session_id)
+            assert loaded.grant_id == record.grant_id
+            assert loaded.tool_ref != record.tool_ref
+            assert (
+                await rotated.resolve_public_authority_alias(
+                    loaded.tool_ref,
+                    field_name="tool_ref",
+                    scope_session_id=session_id,
+                )
+                == record.grant_id
+            )
+        finally:
+            await rotated.close()
+
+    asyncio.run(runner())
+
+
+def test_postgres_targeted_grant_reads_reject_indexed_state_corruption(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        from cayu import PostgresSessionStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _truncate(postgres_dsn)
+        codec = _public_authority_codec()
+        store = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            public_authority_alias_codec=codec,
+        )
+        try:
+            record = await _issue_targeted_grant_record(
+                store,
+                codec=codec,
+                session_id="targeted-index-corruption",
+                interaction_id="targeted-index-corruption-interaction",
+            )
+            async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(
+                        "UPDATE cayu_targeted_tool_grants SET used_calls = 1 WHERE grant_id = %s",
+                        (record.grant_id,),
+                    )
+                await connection.commit()
+            with pytest.raises(ValueError, match="conflicts with indexed authority"):
+                await store.load_targeted_tool_grant_state(record.session_id)
+            async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+                async with connection.cursor() as cursor:
+                    await cursor.execute(
+                        "UPDATE cayu_targeted_tool_grants "
+                        "SET record = jsonb_set(record, '{used_calls}', '1'::jsonb) "
+                        "WHERE grant_id = %s",
+                        (record.grant_id,),
+                    )
+                await connection.commit()
+            with pytest.raises(ValueError, match="call counter conflicts with durable uses"):
+                await store.list_targeted_tool_grants(record.session_id)
+        finally:
+            await store.close()
 
     asyncio.run(runner())
 

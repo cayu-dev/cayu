@@ -1557,7 +1557,10 @@ def test_sqlite_session_store_persists_forked_session_state(tmp_path):
         ).sessions
         assert [session.id for session in children] == ["sess_sqlite_fork_child"]
         events = await reopened.load_events("sess_sqlite_fork_child")
-        assert [event.type for event in events] == [EventType.SESSION_FORKED]
+        assert [event.type for event in events] == [
+            EventType.SESSION_FORKED,
+            EventType.TARGETED_TOOL_GRANT_FORK_RESET,
+        ]
         await _close(reopened)
 
     asyncio.run(assert_persisted())
@@ -1883,6 +1886,124 @@ def test_sqlite_session_store_validate_mode_fails_fast_on_uninitialized(tmp_path
     # empty database fails fast instead of silently creating the schema.
     db_path = tmp_path / "sessions.sqlite"
     with pytest.raises(schema_migrations.SchemaUninitialized):
+        SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
+
+
+def test_sqlite_revision_52_rejects_a_conflicting_targeted_grant_index(tmp_path) -> None:
+    db_path = tmp_path / "sessions.sqlite"
+    creator = SQLiteSessionStore(db_path)
+    asyncio.run(_close(creator))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP INDEX idx_cayu_targeted_tool_grants_interaction")
+        connection.execute(
+            "CREATE INDEX idx_cayu_targeted_tool_grants_interaction "
+            "ON cayu_targeted_tool_grants(grant_id)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="targeted-grant contention contract"):
+        SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 52")
+        connection.execute("PRAGMA user_version = 51")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="targeted-grant contention contract"):
+        SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        recorded = connection.execute(
+            "SELECT COUNT(*) FROM cayu_schema_migrations WHERE revision = 52"
+        ).fetchone()
+        version = connection.execute("PRAGMA user_version").fetchone()
+    finally:
+        connection.close()
+    assert recorded == (0,)
+    assert version == (51,)
+
+
+def test_sqlite_revision_52_rejects_a_populated_pre_grant_session_store(tmp_path) -> None:
+    db_path = tmp_path / "pre-targeted-grants.sqlite"
+    creator = SQLiteSessionStore(db_path)
+
+    async def create_session() -> None:
+        await creator.create(
+            RunRequest(agent_name="assistant", session_id="existing", messages=[]),
+            identity=_identity(),
+        )
+        await _close(creator)
+
+    asyncio.run(create_session())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP TABLE cayu_targeted_tool_grant_uses")
+        connection.execute("DROP TABLE cayu_targeted_tool_grants")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 52")
+        connection.execute("PRAGMA user_version = 51")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(schema_migrations.SchemaTooOld, match="clean prerelease break"):
+        SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone() == (51,)
+        assert connection.execute(
+            "SELECT MAX(revision) FROM cayu_schema_migrations"
+        ).fetchone() == (51,)
+        assert connection.execute("SELECT id FROM cayu_sessions").fetchall() == [("existing",)]
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name LIKE 'cayu_targeted_tool_grant%'"
+            ).fetchall()
+            == []
+        )
+    finally:
+        connection.close()
+
+
+def test_sqlite_revision_52_requires_the_targeted_use_lookup_index(tmp_path) -> None:
+    db_path = tmp_path / "sessions.sqlite"
+    creator = SQLiteSessionStore(db_path)
+    asyncio.run(_close(creator))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP INDEX idx_cayu_targeted_tool_grant_uses_grant")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="targeted-grant contention contract"):
+        SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
+
+
+def test_sqlite_revision_52_rejects_a_missing_targeted_grant_table(tmp_path) -> None:
+    db_path = tmp_path / "sessions.sqlite"
+    creator = SQLiteSessionStore(db_path)
+    asyncio.run(_close(creator))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP TABLE cayu_targeted_tool_grant_uses")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="targeted-grant durability contract"):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
 
@@ -3034,6 +3155,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (49, 49),
         (50, 50),
         (51, 50),
+        (52, 52),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
@@ -3043,7 +3165,7 @@ def test_sqlite_revision_forty_one_rejects_populated_knowledge_receipt_database(
     monkeypatch,
 ) -> None:
     # This test intentionally boots historical revision-40/41 binaries. The
-    # The current SessionStore requires revision 46 for its transcript-search index.
+    # The current SessionStore requires revision 52 for targeted tool grant state.
     monkeypatch.setattr(sqlite_storage, "_SQLITE_SESSION_MIN_REQUIRED_REVISION", 40)
     db_path = tmp_path / "pre-knowledge-access-snapshot.sqlite"
     revisions = schema_migrations.REVISIONS

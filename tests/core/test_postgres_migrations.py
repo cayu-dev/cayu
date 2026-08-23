@@ -652,6 +652,8 @@ _TABLES = (
     "cayu_budget_reservation_identities",
     "cayu_events",
     "cayu_session_labels",
+    "cayu_targeted_tool_grant_uses",
+    "cayu_targeted_tool_grants",
     "cayu_public_authority_aliases",
     "cayu_public_authority_alias_keys",
     "cayu_public_authority_alias_config",
@@ -729,6 +731,160 @@ def test_create_mode_initializes_and_records_baseline(postgres_dsn: str) -> None
             await store.close()
         # A new database is initialized through every known revision.
         assert await _recorded_revisions(postgres_dsn) == _expected_revisions()
+
+    asyncio.run(runner())
+
+
+def test_revision_52_rejects_a_conflicting_targeted_grant_index(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP INDEX idx_cayu_targeted_tool_grants_interaction")
+                await cur.execute(
+                    "CREATE INDEX idx_cayu_targeted_tool_grants_interaction "
+                    "ON cayu_targeted_tool_grants(grant_id)"
+                )
+            await conn.commit()
+
+        validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            with pytest.raises(RuntimeError, match="targeted-grant durability contract"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 52")
+            await conn.commit()
+
+        migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(RuntimeError, match="targeted-grant durability contract"):
+                await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT COUNT(*) FROM cayu_schema_migrations WHERE revision = 52")
+            assert await cur.fetchone() == (0,)
+
+    asyncio.run(runner())
+
+
+def test_revision_52_rejects_a_populated_pre_grant_session_store(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.create(
+                RunRequest(agent_name="assistant", session_id="existing", messages=[]),
+                identity=_identity(),
+            )
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP TABLE cayu_targeted_tool_grant_uses")
+                await cur.execute("DROP TABLE cayu_targeted_tool_grants")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 52")
+            await conn.commit()
+
+        migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(schema.SchemaTooOld, match="clean prerelease break"):
+                await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cur.fetchone() == (51,)
+            await cur.execute("SELECT id FROM cayu_sessions")
+            assert await cur.fetchall() == [("existing",)]
+            await cur.execute(
+                "SELECT to_regclass('cayu_targeted_tool_grants'), "
+                "to_regclass('cayu_targeted_tool_grant_uses')"
+            )
+            assert await cur.fetchone() == (None, None)
+
+    asyncio.run(runner())
+
+
+def test_revision_52_requires_the_targeted_use_lookup_index(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP INDEX idx_cayu_targeted_tool_grant_uses_grant")
+            await conn.commit()
+
+        validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            with pytest.raises(RuntimeError, match="targeted-grant durability contract"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+    asyncio.run(runner())
+
+
+def test_recorded_revision_52_requires_both_targeted_grant_tables(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP TABLE cayu_targeted_tool_grant_uses")
+            await conn.commit()
+
+        validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            with pytest.raises(RuntimeError, match="targeted-grant durability contract"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
 
     asyncio.run(runner())
 
