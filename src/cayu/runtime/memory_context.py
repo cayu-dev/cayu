@@ -26,9 +26,9 @@ from cayu.core.messages import (
 )
 from cayu.memory import (
     AutomaticRecallContribution,
-    AutomaticRecallContributor,
     AutomaticRecallMode,
     AutomaticRecallPolicy,
+    admit_recall,
 )
 from cayu.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
@@ -46,6 +46,14 @@ from cayu.recall import (
     TranscriptRecallSource,
 )
 from cayu.retrieval import WeightedReciprocalRankFusionConfig
+from cayu.runtime._memory_evidence import (
+    MemoryEvidenceKey,
+    active_memory_evidence_key,
+    build_recall_receipt,
+    persist_recall_receipt,
+    recall_receipt_document_sha256,
+    recall_receipt_manifest_binding_hmac_sha256,
+)
 from cayu.runtime.checkpoints import (
     AUTOMATIC_RECALL_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
@@ -74,7 +82,7 @@ from cayu.runtime.sessions import (
 from cayu.storage.memory import DEFAULT_KNOWLEDGE_NAMESPACE, KnowledgeStore
 from cayu.vaults import SecretRedactor
 
-_AUTOMATIC_RECALL_CHECKPOINT_VERSION = 1
+_AUTOMATIC_RECALL_CHECKPOINT_VERSION = 2
 _AUTOMATIC_RECALL_MANIFEST_VERSION = 1
 _AUTOMATIC_RECALL_OPEN_TAG = '<cayu_automatic_memory version="1">'
 _AUTOMATIC_RECALL_CLOSE_TAG = "</cayu_automatic_memory>"
@@ -346,6 +354,8 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
                 state=None,
             )
 
+        _require_memory_evidence_runtime(request)
+
         current_configuration_sha256 = self.configuration_fingerprint()
         loaded = _load_automatic_recall_state(
             checkpoint,
@@ -490,7 +500,10 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
                 anchor_text_digest=state["user_text_sha256"],
             )
             if projected is None:
-                state = _state_without_projection(state)
+                state = _state_without_projection(
+                    state,
+                    key=_memory_evidence_key(request),
+                )
                 admission_payload = None
                 result = result.model_copy(
                     update={"messages": _remove_manifest(result.messages, manifest_text)}
@@ -571,10 +584,30 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
         )
         started_at = time.perf_counter()
         try:
-            contribution = await AutomaticRecallContributor(
-                engine,
-                self.admission_policy,
-            ).contribute(situation)
+            result = await engine.recall(situation)
+            contribution = admit_recall(result, self.admission_policy)
+            evidence_key = _memory_evidence_key(request)
+            if request.interaction_id is None or request.model_step_id is None:
+                raise RuntimeError("Automatic recall lost its runtime evidence identity.")
+            receipt = build_recall_receipt(
+                session_id=request.session.id,
+                interaction_id=request.interaction_id,
+                model_step_id=request.model_step_id,
+                situation=situation,
+                result=result,
+                contribution=contribution,
+                admission_policy=self.admission_policy,
+                source_configuration={
+                    "sources": self.sources.model_dump(mode="json"),
+                    "engine_config": self.engine_config.model_dump(mode="json"),
+                    "fusion_config": self.fusion_config.model_dump(mode="json"),
+                },
+                key=evidence_key,
+            )
+            receipt = await persist_recall_receipt(
+                store=request.session_store,
+                receipt=receipt,
+            )
             projection = _contribution_projection(
                 contribution,
                 configuration_sha256=configuration_sha256,
@@ -593,6 +626,20 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
                     "automatic recall contribution",
                 )
             ).hexdigest()
+            projection_sha256 = (
+                None
+                if projection is None
+                else sha256(
+                    canonical_durable_json_bytes(
+                        projection,
+                        "automatic recall frozen projection",
+                    )
+                ).hexdigest()
+            )
+            manifest_sha256 = (
+                None if manifest_text is None else sha256(manifest_text.encode("utf-8")).hexdigest()
+            )
+            receipt_document_sha256 = recall_receipt_document_sha256(receipt)
             state = {
                 "version": _AUTOMATIC_RECALL_CHECKPOINT_VERSION,
                 "session_id": request.session.id,
@@ -603,21 +650,17 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
                 "policy_sha256": contribution.policy_sha256,
                 "configuration_sha256": configuration_sha256,
                 "contribution_sha256": contribution_sha256,
-                "projection_sha256": (
-                    None
-                    if projection is None
-                    else sha256(
-                        canonical_durable_json_bytes(
-                            projection,
-                            "automatic recall frozen projection",
-                        )
-                    ).hexdigest()
+                "receipt_id": receipt.receipt_id,
+                "receipt_document_sha256": receipt_document_sha256,
+                "receipt_manifest_binding_hmac_sha256": (
+                    recall_receipt_manifest_binding_hmac_sha256(
+                        receipt_document_sha256=receipt_document_sha256,
+                        manifest_sha256=manifest_sha256,
+                        key=evidence_key,
+                    )
                 ),
-                "manifest_sha256": (
-                    None
-                    if manifest_text is None
-                    else sha256(manifest_text.encode("utf-8")).hexdigest()
-                ),
+                "projection_sha256": projection_sha256,
+                "manifest_sha256": manifest_sha256,
                 "projection": projection,
                 "projected_bytes": (
                     0 if manifest_text is None else len(manifest_text.encode("utf-8"))
@@ -726,6 +769,38 @@ class AutomaticRecallContextPolicy(RuntimeManagedContextPolicy):
                     )
                 )
         return tuple(sources)
+
+
+def _require_memory_evidence_runtime(request: ContextRequest) -> None:
+    if getattr(request.session_store, "supports_recall_evidence", False) is not True:
+        error = RuntimeError("Automatic recall requires a recall-evidence-capable SessionStore.")
+        raise ContextBuildError(
+            str(error),
+            compaction_telemetry=[],
+            cause=error,
+        ) from error
+    if (
+        request.interaction_id is None
+        or request.model_step_id is None
+        or active_memory_evidence_key() is None
+    ):
+        error = RuntimeError(
+            "Automatic recall requires keyed request-footprint configuration and "
+            "runtime interaction/model-step identity."
+        )
+        raise ContextBuildError(
+            str(error),
+            compaction_telemetry=[],
+            cause=error,
+        ) from error
+
+
+def _memory_evidence_key(request: ContextRequest) -> MemoryEvidenceKey:
+    del request
+    key = active_memory_evidence_key()
+    if key is None:
+        raise RuntimeError("Automatic recall memory-evidence key is unavailable.")
+    return key
 
 
 def _configured_channels(config: AutomaticRecallSourceConfig) -> set[str]:
@@ -1158,6 +1233,9 @@ def _load_automatic_recall_state(
         "policy_sha256",
         "configuration_sha256",
         "contribution_sha256",
+        "receipt_id",
+        "receipt_document_sha256",
+        "receipt_manifest_binding_hmac_sha256",
         "projection_sha256",
         "manifest_sha256",
         "projection",
@@ -1190,8 +1268,12 @@ def _load_automatic_recall_state(
                 "policy_sha256",
                 "configuration_sha256",
                 "contribution_sha256",
+                "receipt_document_sha256",
+                "receipt_manifest_binding_hmac_sha256",
             )
         )
+        or type(copied.get("receipt_id")) is not str
+        or not copied["receipt_id"].strip()
         or type(projected_bytes) is not int
         or not 0 <= projected_bytes <= _MAX_PROJECTION_BYTES
     ):
@@ -1247,10 +1329,24 @@ def _load_automatic_recall_state(
     return copied
 
 
-def _state_without_projection(state: dict[str, Any]) -> dict[str, Any]:
+def _state_without_projection(
+    state: dict[str, Any],
+    *,
+    key: MemoryEvidenceKey,
+) -> dict[str, Any]:
     copied = copy_json_value(state, "automatic recall state")
+    receipt_document_sha256 = copied.get("receipt_document_sha256")
+    if type(receipt_document_sha256) is not str:
+        raise ValueError("Automatic recall state lost its receipt-document digest.")
     copied.update(
         {
+            "receipt_manifest_binding_hmac_sha256": (
+                recall_receipt_manifest_binding_hmac_sha256(
+                    receipt_document_sha256=receipt_document_sha256,
+                    manifest_sha256=None,
+                    key=key,
+                )
+            ),
             "projection_sha256": None,
             "manifest_sha256": None,
             "projection": None,

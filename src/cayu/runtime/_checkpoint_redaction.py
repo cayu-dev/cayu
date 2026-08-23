@@ -46,6 +46,7 @@ _DURABLE_STRUCTURE_STRING_FIELDS = frozenset(
         "policy_decision",
         "policy_evidence",
         "profile_id",
+        "receipt_id",
         "phase",
         "role",
         "round_id",
@@ -105,6 +106,8 @@ _DURABLE_SHA256_STRING_FIELDS = frozenset(
         "manifest_sha256",
         "policy_sha256",
         "projection_sha256",
+        "receipt_document_sha256",
+        "receipt_manifest_binding_hmac_sha256",
         "resolution_request_digest",
         "situation_sha256",
         "user_message_sha256",
@@ -542,6 +545,7 @@ def durable_value_contains_secret(
             return False
         if (
             _is_active_invocation_profile_identity_path(path)
+            or _is_automatic_recall_evidence_identity_path(path)
             or _is_workspace_observation_identity_path(path)
             or _is_pending_tool_round_execution_identity_path(path)
             or _is_tool_exposure_authority_identity_path(path)
@@ -713,6 +717,10 @@ def _path_has_typed_schema(path: tuple[str, ...]) -> bool:
             continue
         return False
     return True
+
+
+def _is_automatic_recall_evidence_identity_path(path: tuple[str, ...]) -> bool:
+    return path == (AUTOMATIC_RECALL_CHECKPOINT_KEY, "receipt_id")
 
 
 def _is_durable_subagent_structural_key(path: tuple[str, ...], key: str) -> bool:

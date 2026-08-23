@@ -708,6 +708,8 @@ class ContextRequest(BaseModel):
     agent: AgentSpec
     messages: list[Message]
     step: StrictInt = Field(ge=1)
+    interaction_id: str | None = Field(default=None, exclude=True)
+    model_step_id: str | None = Field(default=None, exclude=True)
     environment_name: str | None = None
     session_store: Any = Field(default=None, exclude=True)
     knowledge_store: Any = Field(default=None, exclude=True)
@@ -769,6 +771,13 @@ class ContextRequest(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, "environment_name")
+
+    @field_validator("interaction_id", "model_step_id")
+    @classmethod
+    def validate_optional_runtime_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("compaction_instructions")
     @classmethod

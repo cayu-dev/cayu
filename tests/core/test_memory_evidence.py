@@ -191,6 +191,33 @@ def test_recall_receipt_rejects_unkeyed_or_cross_domain_private_fingerprints() -
         RecallReceipt.model_validate(cross_domain)
 
 
+def test_recall_receipt_requires_one_key_identity() -> None:
+    mixed_top_level = _receipt_document()
+    frontier = mixed_top_level["frontier_fingerprint"]
+    assert isinstance(frontier, dict)
+    frontier["key_id"] = "rotated-memory-evidence-test"
+    with pytest.raises(ValidationError, match="must use one key identity"):
+        RecallReceipt.model_validate(mixed_top_level)
+
+    mixed_locator = _receipt_document()
+    items = mixed_locator["items"]
+    assert isinstance(items, list)
+    items[0]["identity"] = {
+        "record_type": "custom_memory_record",
+        "record_id": "custom-contract",
+        "revision": "1",
+    }
+    items[0]["locator"] = {
+        "kind": "opaque",
+        "fingerprint": {
+            **_fingerprint("private-custom-locator", "recall_source_locator"),
+            "key_id": "rotated-memory-evidence-test",
+        },
+    }
+    with pytest.raises(ValidationError, match="must use one key identity"):
+        RecallReceipt.model_validate(mixed_locator)
+
+
 def test_keyed_evidence_fingerprint_is_deterministic_and_domain_separated() -> None:
     source_digest = _digest("private low-entropy material")
     key = bytes(range(32))
@@ -509,6 +536,42 @@ def test_context_exposure_cannot_combine_different_provider_requests() -> None:
             state="completed",
             state_revision=4,
             transitions=transitions,
+        )
+
+
+def test_context_exposure_requires_one_key_identity() -> None:
+    occurred_at = datetime(2026, 8, 22, tzinfo=UTC)
+    planned = ContextExposureTransition(
+        transition_id="transition-planned",
+        revision=0,
+        state="planned",
+        occurred_at=occurred_at,
+        evidence_kind="composition_planned",
+        evidence_ref="composition-plan",
+    )
+    with pytest.raises(ValidationError, match="must use one key identity"):
+        ContextExposure(
+            exposure_id="exposure-contract",
+            session_id="session-contract",
+            interaction_id="interaction-contract",
+            model_step_id=f"mstep_{'1' * 32}",
+            model_attempt_id=f"matt_{'2' * 32}",
+            provider_attempt_id=f"patt_{'3' * 32}",
+            provider_name="scripted",
+            model_name="scripted-model",
+            composition_fingerprint=_fingerprint("composition", "context_composition"),
+            execution_profile_fingerprint={
+                **_fingerprint("profile", "execution_profile"),
+                "key_id": "rotated-memory-evidence-test",
+            },
+            context_policy_fingerprint=_fingerprint("context", "context_policy"),
+            tool_exposure_fingerprint=_fingerprint("tools", "tool_exposure"),
+            request_contract_fingerprint=_fingerprint("request", "provider_request_contract"),
+            created_at=occurred_at,
+            updated_at=occurred_at,
+            state="planned",
+            state_revision=0,
+            transitions=(planned,),
         )
 
 

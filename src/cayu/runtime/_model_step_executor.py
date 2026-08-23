@@ -88,6 +88,11 @@ from cayu.core.messages import (
     detach_message,
 )
 from cayu.core.thinking import ThinkingConfig, thinking_config_payload
+from cayu.memory_evidence import (
+    ContextExposure,
+    ContextExposureEvidenceKind,
+    ContextExposureState,
+)
 from cayu.providers import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
@@ -129,6 +134,18 @@ from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime._completion_projection import portable_model_completion_projection
 from cayu.runtime._diagnostics import exception_diagnostic
 from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._memory_evidence import (
+    MemoryEvidenceKey,
+    MemoryEvidenceReference,
+    context_exposure_identity_payload,
+    memory_evidence_key,
+    memory_evidence_key_scope,
+    memory_evidence_reference_from_checkpoint,
+    prepare_context_exposure,
+    recover_context_exposure,
+    transition_context_exposure,
+    validate_context_exposure_stage_scope,
+)
 from cayu.runtime._message_redaction import (
     redact_runtime_message_for_boundary,
 )
@@ -286,6 +303,7 @@ from cayu.runtime.sessions import (
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
+    _current_session_interaction_id,
 )
 from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.structured_output import (
@@ -699,6 +717,36 @@ class ModelAttemptFailed(Exception):
         super().__init__(self.message)
 
 
+def _provider_failure_proves_no_model_effect(failure: BaseException) -> bool:
+    """Return whether typed provider evidence proves dispatch was rejected pre-effect."""
+
+    authentication_rejection_observed = False
+    for candidate in iter_exception_tree(failure):
+        if isinstance(candidate, BaseExceptionGroup):
+            continue
+        attempt_failure = (
+            candidate if isinstance(candidate, ModelAttemptFailed) else exception_cause(candidate)
+        )
+        if isinstance(attempt_failure, ModelAttemptFailed):
+            if attempt_failure.provider_effect_observed:
+                return False
+            provider_failure = (
+                attempt_failure.cause if isinstance(candidate, ModelAttemptFailed) else candidate
+            )
+        else:
+            provider_failure = candidate
+        if not isinstance(provider_failure, ModelProviderError):
+            return False
+        if not (
+            provider_failure.status_code == 401
+            or provider_failure.error_type == "authentication_error"
+            or provider_failure.error_code in {"authentication_error", "invalid_api_key"}
+        ):
+            return False
+        authentication_rejection_observed = True
+    return authentication_rejection_observed
+
+
 def _raise_terminal_model_attempt_failure(exc: ModelAttemptFailed) -> Never:
     if exc.cause is None:
         raise RuntimeError(exc.message) from exc
@@ -819,6 +867,7 @@ class ModelCompletionDispatch:
 
     stage: ModelCompletionStage
     request_fingerprint: str
+    context_exposure: ContextExposure | None = None
 
     def __post_init__(self) -> None:
         stage = _copy_model_completion_stage(self.stage)
@@ -834,8 +883,17 @@ class ModelCompletionDispatch:
             raise ValueError("A provider dispatch requires an in-flight completion stage.")
         if stage.intent.get("request_fingerprint") != request_fingerprint:
             raise ValueError("Completion-stage intent does not match its request fingerprint.")
+        exposure = self.context_exposure
+        if exposure is not None:
+            exposure = ContextExposure.model_validate(exposure.model_dump(mode="python"))
+            if exposure.state is not ContextExposureState.DISPATCH_STARTED:
+                raise ValueError("A dispatched context exposure must be dispatch_started.")
+            if stage.intent.get("context_exposure") != context_exposure_identity_payload(exposure):
+                raise ValueError("Completion-stage intent does not match its context exposure.")
+            validate_context_exposure_stage_scope(exposure, stage.intent)
         object.__setattr__(self, "stage", stage)
         object.__setattr__(self, "request_fingerprint", request_fingerprint)
+        object.__setattr__(self, "context_exposure", exposure)
 
     @property
     def stage_id(self) -> str:
@@ -876,6 +934,7 @@ class ModelCompletionPublicationRequest:
         dispatch = ModelCompletionDispatch(
             stage=self.dispatch.stage,
             request_fingerprint=self.dispatch.request_fingerprint,
+            context_exposure=self.dispatch.context_exposure,
         )
         result = (
             None
@@ -1035,6 +1094,7 @@ def _model_completion_stage_intent(
     request_fingerprint: str,
     recovery_context: ModelCompletionRecoveryContext | None,
     provider_operation_start: dict[str, Any] | None = None,
+    context_exposure: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
     if (
@@ -1063,7 +1123,55 @@ def _model_completion_stage_intent(
             provider_operation_start,
             "provider_operation_start",
         )
+    if context_exposure is not None:
+        intent["context_exposure"] = copy_durable_json_object(
+            context_exposure,
+            "context_exposure",
+        )
     return intent
+
+
+async def _terminate_pre_dispatch_context_exposure(
+    *,
+    store: SessionStore,
+    exposure: ContextExposure,
+    failure: BaseException,
+    evidence_ref: str,
+) -> bool:
+    """Record a locally conclusive pre-dispatch outcome without hiding its cause."""
+
+    cancelled = exception_tree_contains(
+        failure,
+        (asyncio.CancelledError, GeneratorExit, SessionInterruptedByRequest),
+    )
+    try:
+        durable_exposure = await store.load_context_exposure(
+            exposure.session_id,
+            exposure.exposure_id,
+        )
+        if durable_exposure is None:
+            raise RuntimeError("Prepared context exposure disappeared before dispatch.")
+        if durable_exposure.state.terminal:
+            return True
+        await transition_context_exposure(
+            store=store,
+            exposure=durable_exposure,
+            state=(ContextExposureState.CANCELLED if cancelled else ContextExposureState.FAILED),
+            evidence_kind=(
+                ContextExposureEvidenceKind.CONCLUSIVE_CANCELLATION
+                if cancelled
+                else ContextExposureEvidenceKind.CONCLUSIVE_FAILURE
+            ),
+            evidence_ref=evidence_ref,
+        )
+        return True
+    except BaseException as evidence_failure:
+        add_exception_note_safely(
+            failure,
+            "Context-exposure pre-dispatch termination also failed: "
+            f"{type(evidence_failure).__name__}.",
+        )
+        return False
 
 
 def _non_turn_model_completion_event(
@@ -3106,6 +3214,16 @@ class ModelStepExecutor:
             )
 
         await require_recovery_owner()
+        await recover_context_exposure(
+            store=self._session_store,
+            session_id=session.id,
+            stage_id=stage.stage_id,
+            stage_intent=stage.intent,
+            state=ContextExposureState.ACKNOWLEDGED,
+            evidence_kind=ContextExposureEvidenceKind.RECOVERY_ACKNOWLEDGEMENT,
+            evidence_ref=f"provider-operation:{operation.state.operation_id}:recovered",
+            provider_request_id=operation.state.operation_id,
+        )
         scheduled = await self._event_writer.emit(
             recovery_event(
                 EventType.PROVIDER_OPERATION_RECONNECT_SCHEDULED,
@@ -3154,6 +3272,15 @@ class ModelStepExecutor:
             cleanup_failure: Exception | None = None,
         ) -> ProviderOperationRecoveryResult:
             await require_recovery_owner()
+            await recover_context_exposure(
+                store=self._session_store,
+                session_id=session.id,
+                stage_id=stage.stage_id,
+                stage_intent=stage.intent,
+                state=ContextExposureState.INDETERMINATE,
+                evidence_kind=ContextExposureEvidenceKind.RECOVERY_INDETERMINATE,
+                evidence_ref=f"provider-operation:{operation.state.operation_id}:unavailable",
+            )
             status_value = status.value if isinstance(status, ProviderOperationStatus) else status
             required = await _emit_provider_recovery_required_event(
                 self._event_writer,
@@ -3900,6 +4027,16 @@ class ModelStepExecutor:
             structured_output_validation=structured_output_validation,
             tool_exposure=tool_exposure,
         )
+        await recover_context_exposure(
+            store=self._session_store,
+            session_id=session.id,
+            stage_id=stage.stage_id,
+            stage_intent=stage.intent,
+            state=ContextExposureState.COMPLETED,
+            evidence_kind=ContextExposureEvidenceKind.RECOVERY_COMPLETION,
+            evidence_ref=f"provider-operation:{operation.state.operation_id}:completed",
+            provider_request_id=operation.state.operation_id,
+        )
         await _publish_model_completion(
             model_completion_publisher,
             publication,
@@ -4210,7 +4347,7 @@ class ModelStepExecutor:
         billing_identity: BillingIdentity | None = None,
         structured_output: StructuredOutputSpec | None = None,
         prepare_model_completion_dispatch: Callable[
-            [ModelRequest],
+            [ModelRequest, MemoryEvidenceReference | None],
             Awaitable[ModelCompletionDispatch],
         ]
         | None = None,
@@ -4219,6 +4356,7 @@ class ModelStepExecutor:
         tool_exposure: ResolvedToolExposure | None = None,
         tool_exposure_evidence: ToolExposure | None = None,
         targeted_tool_grants: TargetedToolGrantFootprint | None = None,
+        memory_evidence_reference: MemoryEvidenceReference | None = None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         retry_policy = copy_retry_policy(retry_policy)
         request_variant = RequestVariant(request_variant)
@@ -4372,6 +4510,25 @@ class ModelStepExecutor:
             )
             if context_pressure_event is not None:
                 yield context_pressure_event, None
+            pre_count_completion_dispatch: ModelCompletionDispatch | None = None
+            if (
+                memory_evidence_reference is not None
+                and self._context_counting.mode is not ContextCountingMode.OFF
+            ):
+                if prepare_model_completion_dispatch is None:
+                    raise RuntimeError(
+                        "Automatic recall requires durable model-completion staging before "
+                        "provider-backed context counting."
+                    )
+                # Provider-backed counters receive the complete request and may
+                # perform network I/O. Commit the same durable dispatch/evidence
+                # fence used by the model call before handing them recalled
+                # context, then reuse that exact dispatch below.
+                validate_live_model_semantics()
+                pre_count_completion_dispatch = await prepare_model_completion_dispatch(
+                    attempt_model_request,
+                    memory_evidence_reference,
+                )
             context_count_observation, context_count_event = await self._observe_context_count(
                 provider=provider,
                 model_request=attempt_model_request,
@@ -4436,6 +4593,8 @@ class ModelStepExecutor:
                 model_completion_publisher=model_completion_publisher,
                 execution_profile=execution_profile,
                 tool_exposure=resolved_tool_exposure,
+                memory_evidence_reference=memory_evidence_reference,
+                prepared_model_completion_dispatch=pre_count_completion_dispatch,
             )
             try:
                 result: AssistantStepResult | None = None
@@ -4855,13 +5014,15 @@ class ModelStepExecutor:
         structured_output: StructuredOutputSpec | None,
         context_pressure_estimate: ContextPressureEstimate | None,
         prepare_model_completion_dispatch: Callable[
-            [ModelRequest],
+            [ModelRequest, MemoryEvidenceReference | None],
             Awaitable[ModelCompletionDispatch],
         ]
         | None,
         model_completion_publisher: ModelCompletionPublisher | None,
         execution_profile: ExecutionProfileIdentity | None,
         tool_exposure: ResolvedToolExposure | None,
+        memory_evidence_reference: MemoryEvidenceReference | None,
+        prepared_model_completion_dispatch: ModelCompletionDispatch | None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         retry_policy = copy_retry_policy(retry_policy)
         if retry_policy.max_attempts != max_attempts:
@@ -4878,7 +5039,15 @@ class ModelStepExecutor:
         completed_stream_event: ModelStreamEvent | None = None
         step_result: AssistantStepResult | None = None
         completion_event: Event | None = None
-        completion_dispatch: ModelCompletionDispatch | None = None
+        completion_dispatch = (
+            None
+            if prepared_model_completion_dispatch is None
+            else ModelCompletionDispatch(
+                stage=prepared_model_completion_dispatch.stage,
+                request_fingerprint=prepared_model_completion_dispatch.request_fingerprint,
+                context_exposure=prepared_model_completion_dispatch.context_exposure,
+            )
+        )
         model_completed = False
         # Request analysis invokes provider-owned projection hooks.  A mutable
         # built-in adapter must still match the profile admitted for this
@@ -4902,13 +5071,98 @@ class ModelStepExecutor:
         await asyncio.sleep(0)
         current_task = asyncio.current_task()
         provider_cancellation_baseline = 0 if current_task is None else current_task.cancelling()
-        # This is the accounting boundary: after the callback returns, the next
-        # expression enters provider-controlled code and billable work may occur.
+        # This is the final in-method accounting boundary. A memory-bearing
+        # request may already have crossed the same durable fence before an
+        # optional provider-backed token count; in that case reuse its dispatch.
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
-        if prepare_model_completion_dispatch is None:
+        if completion_dispatch is not None:
+            expected_request_fingerprint = _model_request_fingerprint(
+                provider_name=registered_provider.name,
+                model_request=model_request,
+            )
+            if completion_dispatch.request_fingerprint != expected_request_fingerprint:
+                raise RuntimeError(
+                    "Prepared model-completion dispatch does not match the provider request."
+                )
+        elif prepare_model_completion_dispatch is None:
             await before_provider_dispatch(model_attempt_identity)
         else:
-            completion_dispatch = await prepare_model_completion_dispatch(model_request)
+            completion_dispatch = await prepare_model_completion_dispatch(
+                model_request,
+                memory_evidence_reference,
+            )
+        context_exposure = (
+            None if completion_dispatch is None else completion_dispatch.context_exposure
+        )
+
+        async def advance_context_exposure(
+            state: ContextExposureState,
+            evidence_kind: ContextExposureEvidenceKind,
+            evidence_ref: str,
+            *,
+            provider_request_id: str | None = None,
+        ) -> None:
+            nonlocal context_exposure
+            if context_exposure is None or context_exposure.state.terminal:
+                return
+            if context_exposure.state is state:
+                return
+            context_exposure = await transition_context_exposure(
+                store=self._session_store,
+                exposure=context_exposure,
+                state=state,
+                evidence_kind=evidence_kind,
+                evidence_ref=evidence_ref,
+                provider_request_id=provider_request_id,
+            )
+
+        def context_exposure_ref(suffix: str) -> str:
+            stage_ref = (
+                model_attempt_identity.model_attempt_id
+                if completion_dispatch is None
+                else completion_dispatch.stage_id
+            )
+            return f"model-stage:{stage_ref}:{suffix}"
+
+        async def refresh_context_exposure() -> None:
+            nonlocal context_exposure
+            if context_exposure is None:
+                return
+            durable = await self._session_store.load_context_exposure(
+                context_exposure.session_id,
+                context_exposure.exposure_id,
+            )
+            if durable is None:
+                raise RuntimeError("Provider dispatch lost its context exposure evidence.")
+            context_exposure = durable
+
+        async def record_provider_cancellation_outcome(
+            snapshot: ProviderOperationSnapshot | None,
+            *,
+            ambiguous_suffix: str,
+        ) -> None:
+            if snapshot is not None and snapshot.status is ProviderOperationStatus.CANCELLED:
+                await advance_context_exposure(
+                    ContextExposureState.CANCELLED,
+                    ContextExposureEvidenceKind.CONCLUSIVE_CANCELLATION,
+                    context_exposure_ref("provider-cancelled"),
+                )
+            elif snapshot is not None and snapshot.status in {
+                ProviderOperationStatus.FAILED,
+                ProviderOperationStatus.EXPIRED,
+            }:
+                await advance_context_exposure(
+                    ContextExposureState.FAILED,
+                    ContextExposureEvidenceKind.CONCLUSIVE_FAILURE,
+                    context_exposure_ref(f"provider-{snapshot.status.value}"),
+                )
+            elif snapshot is None or snapshot.status is not ProviderOperationStatus.COMPLETED:
+                await advance_context_exposure(
+                    ContextExposureState.INDETERMINATE,
+                    ContextExposureEvidenceKind.AMBIGUOUS_TRANSPORT,
+                    context_exposure_ref(ambiguous_suffix),
+                )
+
         provider_events: AsyncIterator[ModelStreamEvent] | None = None
         provider_operation_adapter: ProviderOperationAdapter | None = None
         provider_operation_state: ProviderOperationState | None = None
@@ -4921,6 +5175,13 @@ class ModelStepExecutor:
         provider_control_error_emitted = False
         provider_effect_observed = False
         post_completion_failure: BaseException | None = None
+
+        def background_exposure_recovery_pending() -> bool:
+            return bool(
+                provider_operation_state is not None
+                and provider_operation_identity_durable
+                and not model_completed
+            )
 
         async def reconcile_completion_that_won_cancellation(
             snapshot: ProviderOperationSnapshot | None,
@@ -5352,6 +5613,12 @@ class ModelStepExecutor:
                         ) from delivery_error
                     raise
                 provider_operation_identity_durable = True
+                await advance_context_exposure(
+                    ContextExposureState.ACKNOWLEDGED,
+                    ContextExposureEvidenceKind.PROVIDER_ACKNOWLEDGEMENT,
+                    context_exposure_ref("provider-operation-started"),
+                    provider_request_id=provider_operation_state.operation_id,
+                )
                 if start_outcome.cancellation is not None:
                     raise start_outcome.cancellation
                 yield emitted_operation_event, None
@@ -5375,6 +5642,15 @@ class ModelStepExecutor:
                 stream_event = assistant_boundary.event
                 if stream_event.type is not ModelStreamEventType.ERROR:
                     provider_effect_observed = True
+                    if (
+                        context_exposure is not None
+                        and context_exposure.state is ContextExposureState.DISPATCH_STARTED
+                    ):
+                        await advance_context_exposure(
+                            ContextExposureState.ACKNOWLEDGED,
+                            ContextExposureEvidenceKind.PROVIDER_ACKNOWLEDGEMENT,
+                            context_exposure_ref("response"),
+                        )
                 await interrupt_poll.raise_if_interrupted()
                 if model_completed:
                     if (
@@ -5679,6 +5955,11 @@ class ModelStepExecutor:
                             }
                     model_completed = True
                     completed_stream_event = stream_event
+                    await advance_context_exposure(
+                        ContextExposureState.COMPLETED,
+                        ContextExposureEvidenceKind.PROVIDER_COMPLETION,
+                        context_exposure_ref("completed"),
+                    )
                     assistant_message = None
                     classification = None
                     if completion_terminal_error is None:
@@ -5804,6 +6085,11 @@ class ModelStepExecutor:
                         stream_event.payload,
                         fallback_provider=registered_provider.name,
                         fallback_message=message,
+                    )
+                    await advance_context_exposure(
+                        ContextExposureState.FAILED,
+                        ContextExposureEvidenceKind.CONCLUSIVE_FAILURE,
+                        context_exposure_ref("provider-error"),
                     )
                     if (
                         isinstance(provider_error, ModelContextOverflowError)
@@ -5940,6 +6226,7 @@ class ModelStepExecutor:
 
         except SessionInterruptedByRequest as exc:
             if model_completion_publisher is None or not model_completed:
+                cancellation_snapshot = None
                 if (
                     provider_operation_adapter is not None
                     and provider_operation_state is not None
@@ -5963,10 +6250,24 @@ class ModelStepExecutor:
                         model_attempt_identity=model_attempt_identity,
                     )
                     await reconcile_completion_that_won_cancellation(cancellation_snapshot)
+                try:
+                    await refresh_context_exposure()
+                except Exception as evidence_failure:
+                    add_exception_note_safely(
+                        exc,
+                        "Context-exposure cancellation readback failed: "
+                        f"{type(evidence_failure).__name__}.",
+                    )
+                    raise exc from evidence_failure
+                await record_provider_cancellation_outcome(
+                    cancellation_snapshot,
+                    ambiguous_suffix="interrupted",
+                )
                 raise
             post_completion_failure = exc
         except asyncio.CancelledError as exc:
             if model_completion_publisher is None or not model_completed:
+                cancellation_snapshot = None
                 if (
                     provider_operation_adapter is not None
                     and provider_operation_state is not None
@@ -5990,18 +6291,78 @@ class ModelStepExecutor:
                         model_attempt_identity=model_attempt_identity,
                     )
                     await reconcile_completion_that_won_cancellation(cancellation_snapshot)
+                try:
+                    await refresh_context_exposure()
+                except Exception as evidence_failure:
+                    add_exception_note_safely(
+                        exc,
+                        "Context-exposure cancellation readback failed: "
+                        f"{type(evidence_failure).__name__}.",
+                    )
+                    raise exc from evidence_failure
+                await record_provider_cancellation_outcome(
+                    cancellation_snapshot,
+                    ambiguous_suffix="cancelled-with-unknown-provider-outcome",
+                )
                 raise
             post_completion_failure = exc
         except GeneratorExit as exc:
             if model_completion_publisher is None or not model_completed:
+                if not background_exposure_recovery_pending():
+                    await advance_context_exposure(
+                        ContextExposureState.INDETERMINATE,
+                        ContextExposureEvidenceKind.AMBIGUOUS_TRANSPORT,
+                        context_exposure_ref("consumer-abandoned-stream"),
+                    )
                 raise
             post_completion_failure = exc
         except BaseExceptionGroup as exc:
             if model_completion_publisher is None or not model_completed:
+                if not background_exposure_recovery_pending():
+                    authentication_rejection = _provider_failure_proves_no_model_effect(exc)
+                    if authentication_rejection and not provider_effect_observed:
+                        await advance_context_exposure(
+                            ContextExposureState.FAILED,
+                            ContextExposureEvidenceKind.CONCLUSIVE_FAILURE,
+                            context_exposure_ref("provider-rejected-before-effect"),
+                        )
+                    else:
+                        await advance_context_exposure(
+                            ContextExposureState.INDETERMINATE,
+                            ContextExposureEvidenceKind.AMBIGUOUS_TRANSPORT,
+                            context_exposure_ref("exception-group-without-provider-outcome"),
+                        )
+                    if authentication_rejection and provider_effect_observed:
+                        late_failure = ModelProviderError(
+                            "A model provider exception group was raised after provider output "
+                            "was observed.",
+                            provider=registered_provider.name,
+                            error_type="ProviderExceptionGroup",
+                            error_code="provider_exception_group_after_effect",
+                            retryable=False,
+                        )
+                        set_exception_cause(late_failure, exc)
+                        raise ModelAttemptFailed(
+                            message=str(late_failure),
+                            payload={
+                                "error": str(late_failure),
+                                "error_type": "ProviderExceptionGroup",
+                            },
+                            emitted_error_event=False,
+                            cause=late_failure,
+                            provider_effect_observed=True,
+                            automatic_retry_disabled=True,
+                        ) from exc
                 raise
             post_completion_failure = exc
         except ModelAttemptFailed as exc:
             if model_completion_publisher is None or not model_completed:
+                if not background_exposure_recovery_pending():
+                    await advance_context_exposure(
+                        ContextExposureState.INDETERMINATE,
+                        ContextExposureEvidenceKind.AMBIGUOUS_TRANSPORT,
+                        context_exposure_ref("attempt-failed-without-terminal-provider-evidence"),
+                    )
                 if background_dispatch_invoked and not exc.automatic_retry_disabled:
                     raise ModelAttemptFailed(
                         message=exc.message,
@@ -6107,6 +6468,12 @@ class ModelStepExecutor:
                 raise RuntimeError("Provider exception handling lost its failure state.") from None
         except BaseException as exc:
             if model_completion_publisher is None or not model_completed:
+                if not background_exposure_recovery_pending():
+                    await advance_context_exposure(
+                        ContextExposureState.INDETERMINATE,
+                        ContextExposureEvidenceKind.AMBIGUOUS_TRANSPORT,
+                        context_exposure_ref("fatal-stream-failure"),
+                    )
                 raise
             post_completion_failure = exc
         finally:
@@ -6141,6 +6508,38 @@ class ModelStepExecutor:
                             post_completion_failure,
                             exc,
                         )
+
+        if (
+            not model_completed
+            and context_exposure is not None
+            and not background_exposure_recovery_pending()
+            and (
+                provider_control_failure is not None
+                or durable_stream_failure is not None
+                or post_completion_failure is not None
+                or provider_exhausted
+            )
+        ):
+            if isinstance(provider_control_failure, ModelContextOverflowError):
+                await advance_context_exposure(
+                    ContextExposureState.FAILED,
+                    ContextExposureEvidenceKind.CONCLUSIVE_FAILURE,
+                    context_exposure_ref("provider-context-overflow"),
+                )
+            elif durable_stream_failure is not None and _provider_failure_proves_no_model_effect(
+                durable_stream_failure
+            ):
+                await advance_context_exposure(
+                    ContextExposureState.FAILED,
+                    ContextExposureEvidenceKind.CONCLUSIVE_FAILURE,
+                    context_exposure_ref("provider-rejected-before-effect"),
+                )
+            else:
+                await advance_context_exposure(
+                    ContextExposureState.INDETERMINATE,
+                    ContextExposureEvidenceKind.AMBIGUOUS_TRANSPORT,
+                    context_exposure_ref("stream-ended-without-completion"),
+                )
 
         if model_completed and model_completion_publisher is not None:
             if completed_stream_event is None:
@@ -6710,6 +7109,8 @@ class ModelStepRun:
         context_build_cancellation_requests = (
             0 if current_task is None else current_task.cancelling()
         )
+        interaction_id = _current_session_interaction_id(self._session.id)
+        evidence_key = memory_evidence_key(self._executor._request_footprint)
         try:
             self._validate_live_model_semantics()
             (
@@ -6718,6 +7119,7 @@ class ModelStepRun:
                 checkpoint_event_payload,
                 context_compaction_telemetry,
                 context_recall_telemetry,
+                memory_evidence_reference,
             ) = await _build_context(
                 context_policy=self._registered_agent.context_policy,
                 session_store=self._executor._session_store,
@@ -6728,6 +7130,9 @@ class ModelStepRun:
                 ),
                 messages=messages,
                 step=step,
+                interaction_id=interaction_id,
+                model_step_id=model_step_identity.model_step_id,
+                evidence_key=evidence_key,
                 environment_name=self._environment_name,
                 knowledge_store=self._knowledge_store,
                 knowledge_access_scope=self._knowledge_access_scope,
@@ -6907,6 +7312,8 @@ class ModelStepRun:
             request_variant=request_variant,
             tool_exposure=tool_exposure,
             tool_exposure_evidence=tool_exposure_evidence,
+            memory_evidence_reference=memory_evidence_reference,
+            memory_evidence_key=evidence_key,
         )
         try:
             async for event, outcome in request_events:
@@ -6925,8 +7332,14 @@ class ModelStepRun:
         request_variant: RequestVariant = RequestVariant.INITIAL,
         tool_exposure: ResolvedToolExposure | None = None,
         tool_exposure_evidence: ToolExposure | None = None,
+        memory_evidence_reference: MemoryEvidenceReference | None = None,
+        memory_evidence_key: MemoryEvidenceKey | None = None,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
+        if memory_evidence_reference is not None and self._model_completion_publisher is None:
+            raise RuntimeError(
+                "Automatic recall dispatch requires durable model-completion publication."
+            )
         tool_exposure = (
             _all_registered_tool_exposure(self._registered_agent)
             if tool_exposure is None
@@ -7175,6 +7588,7 @@ class ModelStepRun:
 
         async def prepare_model_completion_dispatch(
             attempt_model_request: ModelRequest,
+            evidence_reference: MemoryEvidenceReference | None,
         ) -> ModelCompletionDispatch:
             nonlocal next_dispatch_ordinal
             request_fingerprint = _model_request_fingerprint(
@@ -7236,37 +7650,85 @@ class ModelStepRun:
                         "idempotency_support": idempotency_support.value,
                         "idempotency_key": idempotency_key,
                     }
-                intent = _model_completion_stage_intent(
-                    model_attempt_identity=pending_model_attempt_identity,
-                    provider_name=self._registered_provider.name,
-                    requested_model=attempt_model_request.model,
-                    source_transcript_cursor=source_transcript_cursor,
-                    request_fingerprint=request_fingerprint,
-                    recovery_context=recovery_context,
-                    provider_operation_start=provider_operation_start,
-                )
-                prepared = await self._executor._session_store.prepare_model_completion_stage(
-                    self._session.id,
-                    request=ModelCompletionStageRequest(
-                        stage_id=stage_id,
-                        logical_step_id=logical_step_id,
-                        dispatch_ordinal=dispatch_ordinal,
-                        purpose="assistant-turn",
-                        intent=intent,
-                        reservation_ids=tuple(
-                            reservation.record.reservation_id
-                            for reservation in pending_reservations
+                context_exposure: ContextExposure | None = None
+                try:
+                    if evidence_reference is not None:
+                        if memory_evidence_key is None or self._execution_profile is None:
+                            raise RuntimeError(
+                                "Automatic recall dispatch requires keyed execution-profile "
+                                "evidence."
+                            )
+                        exposure_interaction_id = _current_session_interaction_id(self._session.id)
+                        if exposure_interaction_id is None:
+                            raise RuntimeError(
+                                "Automatic recall dispatch lost its interaction identity."
+                            )
+                        context_exposure = await prepare_context_exposure(
+                            store=self._executor._session_store,
+                            session_id=self._session.id,
+                            interaction_id=exposure_interaction_id,
+                            model_request=attempt_model_request,
+                            request_fingerprint_sha256=request_fingerprint,
+                            provider_name=self._registered_provider.name,
+                            model_attempt_identity=pending_model_attempt_identity,
+                            execution_profile=self._execution_profile,
+                            tool_exposure=tool_exposure,
+                            reference=evidence_reference,
+                            key=memory_evidence_key,
+                        )
+                    intent = _model_completion_stage_intent(
+                        model_attempt_identity=pending_model_attempt_identity,
+                        provider_name=self._registered_provider.name,
+                        requested_model=attempt_model_request.model,
+                        source_transcript_cursor=source_transcript_cursor,
+                        request_fingerprint=request_fingerprint,
+                        recovery_context=recovery_context,
+                        provider_operation_start=provider_operation_start,
+                        context_exposure=(
+                            None
+                            if context_exposure is None
+                            else context_exposure_identity_payload(context_exposure)
                         ),
-                    ),
-                    expected_statuses={SessionStatus.RUNNING},
-                    expected_run_epoch=self._session.run_epoch,
-                    expected_transcript_cursor=source_transcript_cursor,
-                )
+                    )
+                    prepared = await self._executor._session_store.prepare_model_completion_stage(
+                        self._session.id,
+                        request=ModelCompletionStageRequest(
+                            stage_id=stage_id,
+                            logical_step_id=logical_step_id,
+                            dispatch_ordinal=dispatch_ordinal,
+                            purpose="assistant-turn",
+                            intent=intent,
+                            reservation_ids=tuple(
+                                reservation.record.reservation_id
+                                for reservation in pending_reservations
+                            ),
+                        ),
+                        expected_statuses={SessionStatus.RUNNING},
+                        expected_run_epoch=self._session.run_epoch,
+                        expected_transcript_cursor=source_transcript_cursor,
+                    )
+                except BaseException as preparation_failure:
+                    if context_exposure is not None:
+                        await _terminate_pre_dispatch_context_exposure(
+                            store=self._executor._session_store,
+                            exposure=context_exposure,
+                            failure=preparation_failure,
+                            evidence_ref=f"model-stage:{stage_id}",
+                        )
+                    raise
                 if not prepared.dispatch_authorized:
-                    raise ModelCompletionDispatchNotAuthorized(
+                    authorization_failure = ModelCompletionDispatchNotAuthorized(
                         stage=prepared.stage,
                         request_fingerprint=request_fingerprint,
                     )
+                    if context_exposure is not None:
+                        await _terminate_pre_dispatch_context_exposure(
+                            store=self._executor._session_store,
+                            exposure=context_exposure,
+                            failure=authorization_failure,
+                            evidence_ref=f"model-stage:{stage_id}",
+                        )
+                    raise authorization_failure
                 dispatch_fence_attempted = False
                 dispatch_fence_committed = False
                 try:
@@ -7275,6 +7737,14 @@ class ModelStepRun:
                     # between durable staging and provider-controlled code.
                     if budget_reservations and controller.reservation_ttl_seconds is not None:
                         await controller.renew_reservations(budget_reservations)
+                    if context_exposure is not None:
+                        context_exposure = await transition_context_exposure(
+                            store=self._executor._session_store,
+                            exposure=context_exposure,
+                            state=ContextExposureState.DISPATCH_STARTED,
+                            evidence_kind=(ContextExposureEvidenceKind.DISPATCH_INTENT_COMMITTED),
+                            evidence_ref=f"model-stage:{prepared.stage.stage_id}",
+                        )
                     dispatch_fence_attempted = True
                     deferred_dispatch_failure = await controller.mark_reservations_dispatched(
                         pending_reservations,
@@ -7288,15 +7758,32 @@ class ModelStepRun:
                     dispatch = ModelCompletionDispatch(
                         stage=prepared.stage,
                         request_fingerprint=request_fingerprint,
+                        context_exposure=context_exposure,
                     )
                     lifecycle.mark_provider_dispatch(pending_model_attempt_identity)
                     if deferred_dispatch_failure is not None:
                         raise deferred_dispatch_failure
                 except BaseException as authoritative_exc:
-                    if not dispatch_fence_attempted or dispatch_fence_committed:
+                    exposure_terminal = context_exposure is None or context_exposure.state.terminal
+                    if not exposure_terminal and context_exposure is not None:
+                        exposure_terminal = await _terminate_pre_dispatch_context_exposure(
+                            store=self._executor._session_store,
+                            exposure=context_exposure,
+                            failure=authoritative_exc,
+                            evidence_ref=f"model-stage:{stage_id}",
+                        )
+                    if exposure_terminal and (
+                        not dispatch_fence_attempted or dispatch_fence_committed
+                    ):
                         await self._abandon_pre_dispatch_model_stage(
                             prepared.stage,
                             authoritative_failure=authoritative_exc,
+                        )
+                    elif not exposure_terminal:
+                        add_exception_note_safely(
+                            authoritative_exc,
+                            "The prepared model-completion stage was retained because linked "
+                            "context-exposure termination is not durable.",
                         )
                     else:
                         add_exception_note_safely(
@@ -7342,6 +7829,8 @@ class ModelStepRun:
             model_completion_publisher=self._model_completion_publisher,
             tool_exposure=tool_exposure,
             tool_exposure_evidence=tool_exposure_evidence,
+            memory_evidence_reference=memory_evidence_reference,
+            memory_evidence_key=memory_evidence_key,
         )
         guarded_events = controller.model_step_events_with_heartbeat(
             model_step_events,
@@ -7521,13 +8010,15 @@ class ModelStepRun:
         before_provider_dispatch: Callable[[ModelAttemptIdentity], Awaitable[None]],
         billing_identity: BillingIdentity | None,
         prepare_model_completion_dispatch: Callable[
-            [ModelRequest],
+            [ModelRequest, MemoryEvidenceReference | None],
             Awaitable[ModelCompletionDispatch],
         ]
         | None,
         model_completion_publisher: ModelCompletionPublisher | None,
         tool_exposure: ResolvedToolExposure,
         tool_exposure_evidence: ToolExposure,
+        memory_evidence_reference: MemoryEvidenceReference | None,
+        memory_evidence_key: MemoryEvidenceKey | None,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
         request_variant = RequestVariant(request_variant)
@@ -7562,6 +8053,7 @@ class ModelStepRun:
         def run_attempt(
             request: ModelRequest,
             *,
+            evidence_reference: MemoryEvidenceReference | None,
             initial_identity: ModelAttemptIdentity | None = None,
             attempt_variant: RequestVariant,
         ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
@@ -7591,10 +8083,12 @@ class ModelStepRun:
                 tool_exposure=tool_exposure,
                 tool_exposure_evidence=tool_exposure_evidence,
                 targeted_tool_grants=self._targeted_tool_grants,
+                memory_evidence_reference=evidence_reference,
             )
 
         attempt_events = run_attempt(
             model_request,
+            evidence_reference=memory_evidence_reference,
             initial_identity=initial_model_attempt_identity,
             attempt_variant=request_variant,
         )
@@ -7689,6 +8183,7 @@ class ModelStepRun:
                 checkpoint_event_payload,
                 compaction_telemetry,
                 recall_telemetry,
+                recovery_memory_evidence_reference,
             ) = await _build_context(
                 context_policy=overflow_policy,
                 session_store=self._executor._session_store,
@@ -7699,6 +8194,9 @@ class ModelStepRun:
                 ),
                 messages=messages,
                 step=step,
+                interaction_id=_current_session_interaction_id(self._session.id),
+                model_step_id=model_step_identity.model_step_id,
+                evidence_key=memory_evidence_key,
                 environment_name=self._environment_name,
                 knowledge_store=self._knowledge_store,
                 knowledge_access_scope=self._knowledge_access_scope,
@@ -7914,6 +8412,7 @@ class ModelStepRun:
         )
         recovery_events = run_attempt(
             recovery_request,
+            evidence_reference=recovery_memory_evidence_reference,
             attempt_variant=RequestVariant.CONTEXT_OVERFLOW_RECOVERY,
         )
         try:
@@ -9611,6 +10110,9 @@ async def _build_context(
     agent_spec: AgentSpec,
     messages: list[Message],
     step: int,
+    interaction_id: str | None,
+    model_step_id: str,
+    evidence_key: MemoryEvidenceKey | None,
     environment_name: str | None,
     knowledge_store: Any,
     knowledge_access_scope: Any,
@@ -9628,6 +10130,7 @@ async def _build_context(
     dict[str, Any] | None,
     list[ContextCompactionTelemetry],
     list[ContextRecallTelemetry],
+    MemoryEvidenceReference | None,
 ]:
     context_usage = await _context_usage_state_for_session(
         session_store=session_store,
@@ -9645,6 +10148,8 @@ async def _build_context(
         agent=agent_spec.model_copy(deep=True),
         messages=[message.model_copy(deep=True) for message in messages],
         step=step,
+        interaction_id=interaction_id,
+        model_step_id=model_step_id,
         environment_name=environment_name,
         session_store=session_store,
         knowledge_store=knowledge_store,
@@ -9664,6 +10169,7 @@ async def _build_context(
                 _context_recall_telemetry_publisher_scope(publish_recall_telemetry),
                 _defer_billing_identity_cancellation_scope(),
                 _automatic_compaction_runner_scope(run_compaction),
+                memory_evidence_key_scope(evidence_key),
             ):
                 result = await context_policy.build_with_checkpoint(
                     request,
@@ -9685,11 +10191,14 @@ async def _build_context(
             safe_checkpoint_event_payload,
             [telemetry.model_copy(deep=True) for telemetry in result.compaction_telemetry],
             [telemetry.model_copy(deep=True) for telemetry in result.recall_telemetry],
+            memory_evidence_reference_from_checkpoint(
+                safe_checkpoint if safe_checkpoint is not None else checkpoint
+            ),
         )
 
     with _context_secret_redactor_scope(secret_redactor):
         result = await context_policy.build(request)
-    return copy_context_messages(result), None, None, [], []
+    return copy_context_messages(result), None, None, [], [], None
 
 
 async def _context_usage_state_for_session(

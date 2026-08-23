@@ -384,8 +384,11 @@ are rejected so private source fields cannot leak into durable evidence.
 
 `create_context_exposure(...)` atomically stores one revision-zero planned
 composition and its exact `RecallItemExposure` links. It rejects receipt drift,
-cross-interaction or cross-step links, duplicate receipt items, and reused model
-or provider attempt IDs. `transition_context_exposure(...)` requires the exact
+cross-session or cross-interaction links, mixed evidence-key identities,
+duplicate receipt items, and reused model or provider attempt IDs. The receipt's
+model step identifies where recall
+ran; later model steps in the same interaction may expose the frozen decision
+through new attempt-scoped records. `transition_context_exposure(...)` requires the exact
 current state and revision and appends one evidence-typed transition. An exact
 transition-ID replay is idempotent even after later states; a competing writer
 gets `ContextExposureTransitionConflict`. Terminal states cannot be reopened.
@@ -8175,6 +8178,42 @@ policy = AutomaticRecallContextPolicy(
 )
 ```
 
+The owning application must also use the complete evidence-capable session-store
+surface and configure keyed request footprints. Rotate the secret and its
+non-secret key ID together. Cayu derives a purpose-separated memory evidence key
+and never persists either secret value.
+
+```python
+from cayu import CayuApp, RequestFootprintConfig
+
+app = CayuApp(
+    session_store=session_store,
+    request_footprint=RequestFootprintConfig(
+        fingerprint_key_id="production-evidence-2026-08",
+        fingerprint_key=memory_evidence_secret,
+    ),
+)
+```
+
+For every new recall operation, the runtime persists a `RecallReceipt` from the
+exact `RecallResult` already used by admission. It then creates one
+`ContextExposure` per actual provider attempt from the final request after
+context projection, compaction/overflow handling, structured-output controls,
+and tool exposure are fixed. Its `dispatch_started` transition commits in the
+final pre-network fence sequence before the budget dispatch fence; the exact
+model-stage dispatch receipt remains the last local durable fence before
+provider-controlled code. Required evidence-write failure therefore prevents
+both budget dispatch marking and provider dispatch. Optional provider-backed
+input counting receives a memory-bearing request only after this fence and shares
+the prepared logical dispatch with the subsequent model call. Receipt-less
+recovery closes the linked exposure as undispatched, while receipt-bearing
+synchronous recovery remains conservative. Provider events, conclusive cancellation, generic retry,
+and durable background recovery advance distinct attempt lifecycles without
+guessing that a merely planned request was seen. Once a background operation is
+durably acknowledged, local stream or worker loss retains that nonterminal
+evidence for operation recovery; an explicit unavailable recovery result closes
+it as indeterminate.
+
 One `AutomaticRecallContextPolicy` owns the automatic-memory frame; nesting it
 directly or through `UsageTriggeredContextPolicy` is rejected. It identifies the
 latest real user message with non-blank text and never falls back to an earlier
@@ -8211,8 +8250,9 @@ durable user transcript.
 
 The frozen redacted provider-neutral contribution projection and its session id,
 anchor digest/index, admission-policy and complete automatic-recall configuration
-fingerprints, situation and contribution/projection/manifest digests, byte count,
-and runtime-authored anchors are stored under the versioned
+fingerprints, situation and contribution/projection/manifest digests, receipt
+ID, exact receipt-document digest, purpose-separated receipt-to-manifest HMAC,
+byte count, and runtime-authored anchors are stored under the versioned
 `automatic_recall` checkpoint root. The delimited manifest is reconstructed
 deterministically from that typed JSON projection rather than stored as opaque
 prompt text. The
@@ -8231,7 +8271,8 @@ Forks inherit authoritative transcript history but never the source interaction'
 `automatic_recall` checkpoint root. The child derives a new frame from its next
 real user interaction under the child's session identity.
 
-Only the versioned `automatic_recall` root is recognized. The removed
+Only the current versioned `automatic_recall` root is recognized. Earlier roots
+without a durable receipt identity are not translated. The removed
 `knowledge_injection` checkpoint shape is neither read nor translated; sessions
 created against that prerelease contract must be recreated.
 

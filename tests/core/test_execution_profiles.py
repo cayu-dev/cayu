@@ -99,6 +99,7 @@ from cayu import (
     PromptCacheCompactor,
     RememberKnowledgePolicy,
     RememberKnowledgeTool,
+    RequestFootprintConfig,
     RequiredAllowlistRule,
     RequiredFieldRule,
     ResolutionActor,
@@ -7856,7 +7857,14 @@ def test_automatic_recall_profile_adoption_readmits_instead_of_bricking_session(
             max_injected_items=3,
             mode=AutomaticRecallMode.STRONG_MATCHES,
         )
-        original_app = CayuApp(session_store=store, enable_logging=False)
+        original_app = CayuApp(
+            session_store=store,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="automatic-recall-profile-adoption",
+                fingerprint_key="automatic-recall-profile-adoption-key",
+            ),
+            enable_logging=False,
+        )
         original_app.register_provider(_completed_provider(), default=True)
         original_app.register_environment(environment, default=True)
         original_app.register_agent(
@@ -7896,6 +7904,10 @@ def test_automatic_recall_profile_adoption_readmits_instead_of_bricking_session(
         adopted_app = CayuApp(
             session_store=store,
             execution_profile_policy=profile_policy,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="automatic-recall-profile-adoption",
+                fingerprint_key="automatic-recall-profile-adoption-key",
+            ),
             enable_logging=False,
         )
         adopted_app.register_provider(adopted_provider, default=True)

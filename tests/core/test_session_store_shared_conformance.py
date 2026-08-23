@@ -3565,6 +3565,46 @@ def test_session_store_conformance_persists_fenced_recall_exposure_evidence(
                 == item_exposures
             )
 
+            later_step_exposure, later_step_items = _planned_context_exposure(
+                "later-step",
+                first_receipt,
+            )
+            later_step_exposure = later_step_exposure.model_copy(
+                update={"model_step_id": f"mstep_{'3' * 32}"}
+            )
+            await store.create_context_exposure(later_step_exposure, later_step_items)
+            assert (
+                await store.load_context_exposure(
+                    later_step_exposure.session_id,
+                    later_step_exposure.exposure_id,
+                )
+                == later_step_exposure
+            )
+
+            mixed_key_exposure, mixed_key_items = _planned_context_exposure(
+                "mixed-key",
+                first_receipt,
+            )
+            mixed_key_exposure = mixed_key_exposure.model_copy(
+                update={
+                    field_name: getattr(mixed_key_exposure, field_name).model_copy(
+                        update={"key_id": "another-memory-evidence-key"}
+                    )
+                    for field_name in (
+                        "composition_fingerprint",
+                        "execution_profile_fingerprint",
+                        "context_policy_fingerprint",
+                        "tool_exposure_fingerprint",
+                        "request_contract_fingerprint",
+                    )
+                }
+            )
+            with pytest.raises(ValueError, match="one evidence-key identity"):
+                await store.create_context_exposure(
+                    mixed_key_exposure,
+                    mixed_key_items,
+                )
+
             second_attempt_owner, second_attempt_items = _planned_context_exposure(
                 "attempt-owner-b",
                 first_receipt,
@@ -4137,7 +4177,14 @@ def test_session_store_conformance_recovers_one_frozen_automatic_recall_frame(
         session_id = f"automatic-recall-recovery-{session_store_case[0]}"
         try:
             first_provider = _ApprovalRecoveryProvider()
-            first_app = CayuApp(session_store=store, enable_logging=False)
+            first_app = CayuApp(
+                session_store=store,
+                request_footprint=RequestFootprintConfig(
+                    fingerprint_key_id="automatic-recall-recovery",
+                    fingerprint_key="automatic-recall-recovery-key-material",
+                ),
+                enable_logging=False,
+            )
             first_app.register_provider(first_provider, default=True)
             first_app.register_environment(
                 Environment(
@@ -4183,7 +4230,14 @@ def test_session_store_conformance_recovers_one_frozen_automatic_recall_frame(
 
             store = await _reopen_store(session_store_case, store)
             recovery_provider = _ApprovalRecoveryProvider(complete_without_tools=True)
-            recovery_app = CayuApp(session_store=store, enable_logging=False)
+            recovery_app = CayuApp(
+                session_store=store,
+                request_footprint=RequestFootprintConfig(
+                    fingerprint_key_id="automatic-recall-recovery",
+                    fingerprint_key="automatic-recall-recovery-key-material",
+                ),
+                enable_logging=False,
+            )
             recovery_app.register_provider(recovery_provider, default=True)
             recovery_app.register_environment(
                 Environment(
@@ -4231,6 +4285,18 @@ def test_session_store_conformance_recovers_one_frozen_automatic_recall_frame(
             session = await store.load(session_id)
             assert session is not None
             assert session.status is SessionStatus.COMPLETED
+            receipts = (
+                await store.list_recall_receipts(RecallEvidenceQuery(session_id=session_id))
+            ).items
+            exposures = (
+                await store.list_context_exposures(RecallEvidenceQuery(session_id=session_id))
+            ).items
+            assert len(receipts) == 1
+            assert len(exposures) == 2
+            assert all(exposure.state is ContextExposureState.COMPLETED for exposure in exposures)
+            assert {exposure.receipt_ids for exposure in exposures} == {(receipts[0].receipt_id,)}
+            assert len({exposure.exposure_id for exposure in exposures}) == 2
+            assert len({exposure.composition_fingerprint.digest for exposure in exposures}) == 2
         finally:
             await _close_store(store)
 

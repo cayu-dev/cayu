@@ -180,11 +180,15 @@ unsupported.
 
 Session stores now persist immutable, bounded `RecallReceipt` records for exact
 retrieval/admission decisions and revision-fenced `ContextExposure` lifecycles
-for exact model/provider attempts. Per-item links must match receipt identity,
+for exact model/provider attempts. The automatic-recall runtime now constructs
+each receipt from the exact fused result already used for admission, then
+creates an attempt-scoped exposure from the final provider request. Per-item
+links must match receipt identity,
 revision, representation, content hash, and locator exactly. Reused identities,
-cross-step links, duplicate items, stale transitions, and post-terminal updates
-fail closed. In-memory, SQLite, and PostgreSQL implementations share the same
-idempotency, concurrency, pagination, and session-deletion behavior.
+cross-interaction links, duplicate items, stale transitions, and post-terminal
+updates fail closed. A frozen receipt may support multiple model steps within
+its owning interaction. In-memory, SQLite, and PostgreSQL implementations share
+the same idempotency, concurrency, pagination, and session-deletion behavior.
 
 The lifecycle deliberately distinguishes planned composition, prepared request,
 durable dispatch intent, provider acknowledgement, completion, conclusive
@@ -201,8 +205,12 @@ history.
 
 Storage revision 51 is additive and creates only empty evidence tables and
 indexes. It does not backfill historical sessions or add a legacy compatibility
-path. Runtime provider-boundary publication will be wired in a later slice;
-this release establishes the strict public values and durable store contract.
+path. Automatic-recall checkpoints use a purpose-separated HMAC to bind the
+receipt ID and exact durable document to the rendered manifest; missing or
+mismatched bindings are rejected.
+Required evidence persistence fails closed before provider network I/O; retries,
+overflow rebuilding, typed provider outcomes, cancellation, and durable
+background recovery advance the original attempt lifecycles conservatively.
 
 ### OpenAI subscription retries are bounded with migration-explicit authority
 

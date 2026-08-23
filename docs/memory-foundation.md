@@ -3,8 +3,8 @@
 This document records Cayu's v5.1 long-term-memory foundations, immutable
 knowledge revisions, and the bounded cross-source recall layer built on them.
 Context composition, curation, admission, and exposure evidence remain separate
-layers. Automatic recall admission and the durable evidence-store boundary are
-implemented; provider-boundary publication remains a later integration step.
+layers. Automatic recall now publishes its exact retrieval/admission receipt and
+tracks every provider-facing use through the durable exposure lifecycle.
 
 ## Knowledge and memory are different layers
 
@@ -146,7 +146,11 @@ evidence reference when no such ID is available.
 `RecallItemExposure` links each exact recalled representation in the planned
 composition back to its immutable receipt item. Stores reject altered hashes,
 locators, identities, duplicate receipt items, cross-interaction links, and
-reused model/provider attempt identities. Lifecycle transitions carry an exact
+mixed receipt/exposure key identities, or reused model/provider attempt identities.
+A receipt records the model step where
+recall ran; structured-output repair and other later model steps in the same
+interaction may link that frozen receipt through their own distinct exposures.
+Lifecycle transitions carry an exact
 expected state and revision. Concurrent writers therefore produce one winner
 and a typed conflict instead of a lost update; replaying the same transition ID
 returns the current durable record.
@@ -159,6 +163,56 @@ bound to their query scope, and page reads use bounded lookahead rather than a
 full remaining-row count. Deleting the owning session cascades its receipts,
 exposures, and item links. Custom stores advertise the complete surface with
 `supports_recall_evidence = True`.
+
+`AutomaticRecallContextPolicy` builds its receipt from the same frozen
+`RecallResult` used for admission; it does not rerun retrieval or reconstruct a
+frontier later. Receipt persistence succeeds before the automatic-recall
+checkpoint can authorize context composition. The checkpoint binds the receipt
+ID and exact durable receipt-document digest to the exact rendered manifest
+with a purpose-separated HMAC, so substitution fails closed at the provider
+boundary without persisting the key.
+After context selection,
+compaction, pressure handling, tool/structured-output preparation, and provider
+request construction have settled, Cayu fingerprints that exact final
+`ModelRequest`, creates the attempt's planned/prepared exposure and item links,
+and includes the exposure identity in the durable model-completion stage.
+Recall items removed completely by later context selection receive no item link;
+an altered automatic-memory envelope fails closed instead of being misreported.
+`dispatch_started` is committed inside the final pre-network fence sequence,
+before the budget dispatch fence. The exact model-stage dispatch receipt remains
+the last local durable fence before provider-controlled code. If any required
+receipt, exposure, item-link, or transition write fails, the provider is not
+called and budget reservations have not been marked dispatched. When optional
+provider-backed input counting is enabled, a memory-bearing request crosses this
+same fence before the counter receives it and the later model call reuses the
+exact prepared dispatch. Recovery closes
+an exposure as failed when that final model-stage receipt is absent; a
+receipt-bearing synchronous attempt remains conservatively ambiguous.
+
+The first normalized non-error provider response establishes acknowledgement. A
+normalized completion records `completed`; an error-only response records `failed`
+without claiming positive exposure, while an error after output preserves the
+earlier acknowledgement in its history. Typed authentication
+rejections and context-overflow exceptions end that attempt as `failed` even
+when the adapter raises them before yielding a frame; cancellation and transport
+paths record cancellation only when adapter evidence proves it and otherwise
+finish as `indeterminate`. Generic retries get distinct model,
+provider, and exposure attempt identities while retaining the same composition
+fingerprint. Context-overflow recovery rebuilds and fingerprints the replacement
+request. Durable background-operation recovery advances the original exposure
+with recovery acknowledgement/completion evidence. A local connection or worker
+loss after the durable operation acknowledgement leaves that exposure open for
+recovery; explicit unavailable recovery closes it as indeterminate. An unrecoverable
+synchronous dispatch becomes indeterminate and requires the runtime-owned
+`CayuApp.recover_model_completion_stage(...)` operation.
+
+Automatic recall therefore requires a recall-evidence-capable `SessionStore`
+and a keyed `RequestFootprintConfig` (`fingerprint_key_id` plus
+`fingerprint_key`). Cayu derives a purpose-separated in-memory HMAC key for
+memory evidence; the configured secret and derived key never enter checkpoints,
+events, receipts, or exposures. Missing evidence capability or key material
+fails context construction before recall or provider dispatch. `off` mode does
+not require either capability.
 
 Storage revision 51 only creates empty evidence tables and indexes. It does not
 scan runtime history, synthesize receipts for past recall, or carry a legacy

@@ -60,6 +60,7 @@ from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import _TOOL_POLICY_DENIAL_SOURCE, ToolResult
 from cayu.environments import EnvironmentFactoryOperation
 from cayu.environments.bindings import _runtime_owned_workspace_observer_name
+from cayu.memory_evidence import ContextExposureEvidenceKind, ContextExposureState
 from cayu.providers import (
     ProviderOperationAdapter,
     ProviderOperationMode,
@@ -113,6 +114,11 @@ from cayu.runtime._event_writer import (
 from cayu.runtime._interruption_coordinator import (
     _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY,
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
+)
+from cayu.runtime._memory_evidence import (
+    close_context_exposure_without_provider_effect,
+    close_unrecoverable_context_exposure,
+    recover_context_exposure,
 )
 from cayu.runtime._message_redaction import redact_runtime_message_for_boundary
 from cayu.runtime._model_errors import (
@@ -1830,6 +1836,13 @@ class RecoveryCoordinator:
                 )
                 is None
             ):
+                await close_context_exposure_without_provider_effect(
+                    store=self._session_store,
+                    session_id=session.id,
+                    stage_id=stage.stage_id,
+                    stage_intent=stage.intent,
+                    evidence_ref_suffix="dispatch-receipt-absent",
+                )
                 recovery_context = model_completion_recovery_context_from_stage(stage)
                 release_events = await (
                     self._run_limit_controller.release_pre_provider_dispatch_reservations(
@@ -1868,6 +1881,12 @@ class RecoveryCoordinator:
                     registered_provider=registered_provider,
                 )
                 if recoverable is None:
+                    await close_unrecoverable_context_exposure(
+                        store=self._session_store,
+                        session_id=session.id,
+                        stage_id=stage.stage_id,
+                        stage_intent=stage.intent,
+                    )
                     raise ModelCompletionManualRecoveryRequired(
                         "The active model-completion dispatch has no durable terminal response. "
                         "Its provider outcome and linked budget reservations require "
@@ -1960,6 +1979,15 @@ class RecoveryCoordinator:
                     f"status ({session.status.value}); expected {stage.source_status.value}."
                 )
             else:
+                await recover_context_exposure(
+                    store=self._session_store,
+                    session_id=session.id,
+                    stage_id=stage.stage_id,
+                    stage_intent=stage.intent,
+                    state=ContextExposureState.COMPLETED,
+                    evidence_kind=ContextExposureEvidenceKind.RECOVERY_COMPLETION,
+                    evidence_ref=f"model-stage:{stage.stage_id}:completed",
+                )
                 session = await self._promote_completed_model_stage(
                     session=session,
                     stage_id=stage.stage_id,

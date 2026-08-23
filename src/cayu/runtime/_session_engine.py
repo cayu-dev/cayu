@@ -94,7 +94,6 @@ from cayu.providers import (
     CachePolicy,
     HostedToolCapabilityError,
     ModelProvider,
-    ModelProviderError,
     ModelRequest,
     NativeStructuredOutputSchemaInvalid,
     ProviderOperationMode,
@@ -161,6 +160,10 @@ from cayu.runtime._interruption_coordinator import (
     interruption_cascade_suppressed,
     suppress_interruption_cascade,
 )
+from cayu.runtime._memory_evidence import (
+    close_context_exposure_without_provider_effect,
+    close_unrecoverable_context_exposure,
+)
 from cayu.runtime._message_redaction import redact_runtime_message_for_boundary
 from cayu.runtime._model_errors import (
     _FallbackBillingCancellationStateCheckFailed,
@@ -168,7 +171,6 @@ from cayu.runtime._model_errors import (
     detach_billing_identity_cancellation_group,
 )
 from cayu.runtime._model_step_executor import (
-    ModelAttemptFailed,
     ModelCompletionPublicationRequest,
     ModelCompletionPublicationResult,
     ModelCompletionRecoveryContext,
@@ -181,6 +183,7 @@ from cayu.runtime._model_step_executor import (
     _event_with_model_identity_authority,
     _model_request_messages,
     _model_request_tools,
+    _provider_failure_proves_no_model_effect,
     _require_frozen_tool_exposure,
     _session_agent_spec,
     _tool_capability_ceiling_exposure,
@@ -4026,36 +4029,6 @@ def _failure_carries_interaction_publication_rejection(
     )
 
 
-def _provider_failure_proves_no_model_effect(failure: BaseException) -> bool:
-    """Return whether typed provider evidence proves dispatch was rejected pre-effect."""
-
-    authentication_rejection_observed = False
-    for candidate in iter_exception_tree(failure):
-        if isinstance(candidate, BaseExceptionGroup):
-            continue
-        attempt_failure = (
-            candidate if isinstance(candidate, ModelAttemptFailed) else exception_cause(candidate)
-        )
-        if isinstance(attempt_failure, ModelAttemptFailed):
-            if attempt_failure.provider_effect_observed:
-                return False
-            provider_failure = (
-                attempt_failure.cause if isinstance(candidate, ModelAttemptFailed) else candidate
-            )
-        else:
-            provider_failure = candidate
-        if not isinstance(provider_failure, ModelProviderError):
-            return False
-        if not (
-            provider_failure.status_code == 401
-            or provider_failure.error_type == "authentication_error"
-            or provider_failure.error_code in {"authentication_error", "invalid_api_key"}
-        ):
-            return False
-        authentication_rejection_observed = True
-    return authentication_rejection_observed
-
-
 def _active_transition_matches_profile_decision(
     *,
     transition: EgressAuthorityTransitionRecord | None,
@@ -6201,6 +6174,21 @@ class SessionEngine:
             failed_before_effect = (
                 not model_completion_dispatched or provider_rejected_before_effect
             )
+            if failed_before_effect:
+                await close_context_exposure_without_provider_effect(
+                    store=self.session_store,
+                    session_id=session.id,
+                    stage_id=active_model_completion.stage.stage_id,
+                    stage_intent=active_model_completion.stage.intent,
+                    evidence_ref_suffix="provider-effect-absent",
+                )
+            else:
+                await close_unrecoverable_context_exposure(
+                    store=self.session_store,
+                    session_id=session.id,
+                    stage_id=active_model_completion.stage.stage_id,
+                    stage_intent=active_model_completion.stage.intent,
+                )
             if not model_completion_dispatched:
                 await self._run_limit_controller.release_pre_provider_dispatch_reservations(
                     reservation_ids=active_model_completion.stage.reservation_ids,

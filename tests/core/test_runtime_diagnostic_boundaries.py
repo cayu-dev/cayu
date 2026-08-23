@@ -31,6 +31,7 @@ from cayu import (
     KnowledgeAccessScope,
     Message,
     ModelStreamEvent,
+    RequestFootprintConfig,
     RunRequest,
     RuntimeHook,
     RuntimeHookContext,
@@ -547,6 +548,10 @@ def test_automatic_recall_source_failure_does_not_cross_diagnostic_boundary() ->
     )
     app = CayuApp(
         secret_redactor=SecretRedactor(secret),
+        request_footprint=RequestFootprintConfig(
+            fingerprint_key_id="automatic-recall-diagnostic-boundary",
+            fingerprint_key="automatic-recall-diagnostic-boundary-key",
+        ),
         enable_logging=False,
     )
     app.register_provider(provider, default=True)
@@ -1411,7 +1416,14 @@ def test_optional_automatic_recall_source_failure_is_portable_and_calls_provider
             ]
         ]
     )
-    app = CayuApp(session_store=store, enable_logging=False)
+    app = CayuApp(
+        session_store=store,
+        request_footprint=RequestFootprintConfig(
+            fingerprint_key_id="automatic-recall-diagnostic-boundary",
+            fingerprint_key="automatic-recall-diagnostic-boundary-key",
+        ),
+        enable_logging=False,
+    )
     app.register_provider(provider, default=True)
     app.register_environment(
         Environment(

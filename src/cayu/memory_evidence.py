@@ -570,6 +570,20 @@ class RecallReceipt(BaseModel):
         for field_name, domain in expected.items():
             if getattr(self, field_name).domain is not domain:
                 raise ValueError(f"`{field_name}` has the wrong keyed-fingerprint domain.")
+        key_ids = {
+            self.situation_fingerprint.key_id,
+            self.source_configuration_fingerprint.key_id,
+            self.admission_policy_fingerprint.key_id,
+            self.access_scope_fingerprint.key_id,
+            self.frontier_fingerprint.key_id,
+            *(
+                item.locator.fingerprint.key_id
+                for item in self.items
+                if type(item.locator) is OpaqueRecallEvidenceLocator
+            ),
+        }
+        if len(key_ids) != 1:
+            raise ValueError("Recall receipt keyed fingerprints must use one key identity.")
         return self
 
     @field_validator("engine_version")
@@ -783,6 +797,19 @@ class ContextExposure(BaseModel):
         for field_name, domain in expected.items():
             if getattr(self, field_name).domain is not domain:
                 raise ValueError(f"`{field_name}` has the wrong keyed-fingerprint domain.")
+        if (
+            len(
+                {
+                    self.composition_fingerprint.key_id,
+                    self.execution_profile_fingerprint.key_id,
+                    self.context_policy_fingerprint.key_id,
+                    self.tool_exposure_fingerprint.key_id,
+                    self.request_contract_fingerprint.key_id,
+                }
+            )
+            != 1
+        ):
+            raise ValueError("Context exposure keyed fingerprints must use one key identity.")
         return self
 
     @field_validator("receipt_ids", mode="before")
@@ -1312,14 +1339,21 @@ def validate_context_exposure_receipt_scope(
     exposure: ContextExposure,
     receipt: RecallReceipt,
 ) -> None:
-    """Reject a receipt linked across interaction or model-step boundaries."""
+    """Reject a receipt linked across session or interaction boundaries.
+
+    A frozen recall decision may be exposed by multiple logical model steps in
+    the same interaction (for example, structured-output repair). The receipt's
+    model-step identity records where recall ran; the exposure records each
+    later provider-facing use.
+    """
 
     if (
         receipt.session_id != exposure.session_id
         or receipt.interaction_id != exposure.interaction_id
-        or receipt.model_step_id != exposure.model_step_id
     ):
         raise ValueError("Context exposure receipt scope does not match its parent.")
+    if receipt.situation_fingerprint.key_id != exposure.composition_fingerprint.key_id:
+        raise ValueError("Context exposure and linked receipt must use one evidence-key identity.")
     if receipt.created_at > exposure.created_at:
         raise ValueError("Context exposure cannot predate its linked recall receipt.")
 

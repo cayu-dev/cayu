@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from hashlib import sha256
 from typing import Any
 
@@ -14,7 +17,9 @@ from cayu import (
     Environment,
     EnvironmentSpec,
     EventType,
+    ExecutionProfileBehaviorIdentity,
     ForkSessionRequest,
+    IncompleteSessionRecoveryRequest,
     LoopPolicy,
     ModelStreamEvent,
     ResumeRequest,
@@ -32,6 +37,24 @@ from cayu.core.messages import (
     copy_message_part,
 )
 from cayu.memory import AutomaticRecallPolicy
+from cayu.memory_evidence import (
+    ContextExposureEvidenceKind,
+    ContextExposureState,
+    RecallEvidenceQuery,
+)
+from cayu.providers import (
+    ModelContextOverflowError,
+    ModelProvider,
+    ModelProviderError,
+    ProviderOperationAdapter,
+    ProviderOperationConnection,
+    ProviderOperationMode,
+    ProviderOperationSnapshot,
+    ProviderOperationStartRequest,
+    ProviderOperationState,
+    ProviderOperationStatus,
+)
+from cayu.providers.base import ModelRequest
 from cayu.recall import (
     KNOWLEDGE_LEXICAL_CHANNEL,
     KNOWLEDGE_SEMANTIC_CHANNEL,
@@ -42,14 +65,32 @@ from cayu.retrieval import (
     WeightedReciprocalRankFusionConfig,
 )
 from cayu.runtime._checkpoint_redaction import require_secret_free_durable_object
+from cayu.runtime._memory_evidence import (
+    MemoryEvidenceKey,
+    _request_includes_exact_frozen_manifest,
+    memory_evidence_key,
+    memory_evidence_key_scope,
+    recall_receipt_document_sha256,
+    recall_receipt_manifest_binding_hmac_sha256,
+    recover_context_exposure,
+)
+from cayu.runtime.budgets import (
+    BudgetLimit,
+    BudgetPolicy,
+    BudgetReservation,
+    InMemoryBudgetLedger,
+)
 from cayu.runtime.context import (
     CheckpointCompactionContextPolicy,
     ContextBuildError,
     ContextPolicy,
     ContextRequest,
+    RecentTurnsContextPolicy,
     TranscriptDigestCompactor,
     _context_secret_redactor_scope,
 )
+from cayu.runtime.context_counting import ContextCountingConfig, ContextCountingMode
+from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.memory_context import (
     _AUTOMATIC_RECALL_NOTICE,
     AutomaticRecallContextPolicy,
@@ -58,6 +99,8 @@ from cayu.runtime.memory_context import (
     _redacted_locator_json,
     _render_projection,
 )
+from cayu.runtime.request_footprints import RequestFootprintConfig
+from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import InMemorySessionStore, RunRequest, SessionIdentity
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
@@ -74,6 +117,12 @@ class _CountingKnowledgeStore(InMemoryKnowledgeStore):
         return await super().search(query, access_scope=access_scope)
 
 
+@pytest.fixture(autouse=True)
+def _direct_context_memory_evidence_key():
+    with memory_evidence_key_scope(MemoryEvidenceKey(key_id="test-memory-key", key=b"m" * 32)):
+        yield
+
+
 class _CountingSessionStore(InMemorySessionStore):
     def __init__(self) -> None:
         super().__init__()
@@ -82,6 +131,277 @@ class _CountingSessionStore(InMemorySessionStore):
     async def search_transcript(self, query):
         self.transcript_search_count += 1
         return await super().search_transcript(query)
+
+
+class _DispatchEvidenceFailingSessionStore(_CountingSessionStore):
+    async def transition_context_exposure(self, session_id, exposure_id, request):
+        if request.state is ContextExposureState.DISPATCH_STARTED:
+            raise RuntimeError("context exposure dispatch persistence failed")
+        return await super().transition_context_exposure(session_id, exposure_id, request)
+
+
+class _StageDispatchReceiptFailingSessionStore(_CountingSessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self._terminal_transition_failures_remaining = 2
+
+    async def mark_model_completion_stage_dispatched(self, session_id, *, stage):
+        del session_id, stage
+        raise RuntimeError("model dispatch receipt persistence failed")
+
+    async def transition_context_exposure(self, session_id, exposure_id, request):
+        if (
+            request.state is ContextExposureState.FAILED
+            and self._terminal_transition_failures_remaining
+        ):
+            self._terminal_transition_failures_remaining -= 1
+            raise RuntimeError("initial context exposure terminal persistence failed")
+        return await super().transition_context_exposure(session_id, exposure_id, request)
+
+
+class _ExposureCreationReconciliationFailingSessionStore(_CountingSessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self._creation_ack_failures_remaining = 2
+        self._creation_readback_failures_remaining = 1
+
+    async def create_context_exposure(self, exposure, item_exposures=()):
+        persisted = await super().create_context_exposure(exposure, item_exposures)
+        if self._creation_ack_failures_remaining:
+            self._creation_ack_failures_remaining -= 1
+            raise RuntimeError("context exposure creation acknowledgement lost")
+        return persisted
+
+    async def load_context_exposure(self, session_id, exposure_id):
+        if self._creation_readback_failures_remaining:
+            self._creation_readback_failures_remaining -= 1
+            raise RuntimeError("context exposure creation readback unavailable")
+        return await super().load_context_exposure(session_id, exposure_id)
+
+
+class _EvidenceAcknowledgementLosingSessionStore(_CountingSessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self._lose_receipt_ack = True
+        self._lose_exposure_ack = True
+        self._lose_transition_acks = {
+            ContextExposureState.PREPARED,
+            ContextExposureState.DISPATCH_STARTED,
+        }
+
+    async def create_recall_receipt(self, receipt):
+        persisted = await super().create_recall_receipt(receipt)
+        if self._lose_receipt_ack:
+            self._lose_receipt_ack = False
+            raise RuntimeError("recall receipt acknowledgement lost")
+        return persisted
+
+    async def create_context_exposure(self, exposure, item_exposures=()):
+        persisted = await super().create_context_exposure(exposure, item_exposures)
+        if self._lose_exposure_ack:
+            self._lose_exposure_ack = False
+            raise RuntimeError("context exposure acknowledgement lost")
+        return persisted
+
+    async def transition_context_exposure(self, session_id, exposure_id, request):
+        persisted = await super().transition_context_exposure(
+            session_id,
+            exposure_id,
+            request,
+        )
+        if request.state in self._lose_transition_acks:
+            self._lose_transition_acks.remove(request.state)
+            raise RuntimeError("context exposure transition acknowledgement lost")
+        return persisted
+
+
+class _TimeoutBeforeAcknowledgementScriptedProvider(ScriptedModelProvider):
+    async def stream(self, request):
+        self._consume_batch(request)
+        if False:  # pragma: no cover - keeps this an async generator
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+        raise TimeoutError("provider response boundary timed out")
+
+
+class _RecordingCountScriptedProvider(ScriptedModelProvider):
+    def __init__(self, events) -> None:
+        super().__init__(events)
+        self.count_requests: list[ModelRequest] = []
+
+    async def count_input_tokens(self, request: ModelRequest) -> None:
+        self.count_requests.append(
+            ModelRequest(
+                model=request.model,
+                messages=request.messages,
+                tools=request.tools,
+                hosted_tools=request.hosted_tools,
+                options=request.options,
+            )
+        )
+        return None
+
+
+class _FirstRequestRaisingScriptedProvider(ScriptedModelProvider):
+    def __init__(
+        self,
+        failure: Exception,
+        recovery_events: tuple[ModelStreamEvent, ...] = (),
+    ) -> None:
+        completed = ModelStreamEvent.completed({"finish_reason": "stop"})
+        super().__init__([[completed], list(recovery_events or (completed,))])
+        self.failure = failure
+
+    async def stream(self, request):
+        events = self._consume_batch(request)
+        if len(self.requests) == 1:
+            raise self.failure
+        for event in events:
+            yield event
+
+
+class _ProviderEffectThenRaisingScriptedProvider(ScriptedModelProvider):
+    def __init__(self, failure: Exception) -> None:
+        super().__init__(
+            [
+                ModelStreamEvent.text_delta("partial provider output"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        self.failure = failure
+
+    async def stream(self, request):
+        events = self._consume_batch(request)
+        yield events[0]
+        raise self.failure
+
+
+class _MalformedAcknowledgementScriptedProvider(ScriptedModelProvider):
+    async def stream(self, request):
+        self._consume_batch(request)
+        yield {"type": "text_delta", "payload": {"text": "not a typed event"}}
+
+
+class _BlockingBeforeAcknowledgementScriptedProvider(ScriptedModelProvider):
+    def __init__(self) -> None:
+        super().__init__([ModelStreamEvent.completed({"finish_reason": "stop"})])
+        self.started = asyncio.Event()
+
+    async def stream(self, request):
+        self._consume_batch(request)
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+        yield  # pragma: no cover
+
+
+class _MemoryRecoveryProcessLoss(BaseException):
+    pass
+
+
+class _MemoryRecoveryOperationAdapter(ProviderOperationAdapter):
+    def __init__(self) -> None:
+        self.status = ProviderOperationStatus.IN_PROGRESS
+        self.state = ProviderOperationState(
+            operation_id="automatic_recall_recovery_operation",
+            stream_protocol="responses-v1",
+            recovery_metadata={"cursor": 0},
+        )
+        self.start_calls = 0
+        self.retrieve_calls = 0
+
+    async def start(self, request: ProviderOperationStartRequest) -> ProviderOperationConnection:
+        del request
+        self.start_calls += 1
+
+        async def events() -> AsyncIterator[ModelStreamEvent]:
+            raise _MemoryRecoveryProcessLoss("worker lost after operation publication")
+            yield  # pragma: no cover
+
+        return ProviderOperationConnection(
+            state=self.state,
+            status=ProviderOperationStatus.IN_PROGRESS,
+            events=events(),
+        )
+
+    async def retrieve(self, state: ProviderOperationState) -> ProviderOperationSnapshot:
+        assert state == self.state
+        self.retrieve_calls += 1
+        return ProviderOperationSnapshot(
+            state=self.state,
+            status=self.status,
+            events=(
+                ModelStreamEvent.text_delta("Friday"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            )
+            if self.status is ProviderOperationStatus.COMPLETED
+            else (),
+        )
+
+    async def reconnect(self, state: ProviderOperationState) -> ProviderOperationConnection:
+        del state
+        raise AssertionError("terminal recovery must not reconnect")
+
+    async def cancel(self, state: ProviderOperationState) -> ProviderOperationSnapshot:
+        del state
+        raise AssertionError("recovery must not cancel the completed operation")
+
+
+class _MemoryRecoveryOperationProvider(ModelProvider):
+    name = "automatic-recall-recovery"
+
+    def __init__(self) -> None:
+        self.adapter = _MemoryRecoveryOperationAdapter()
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:automatic-recall-recovery-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    @property
+    def provider_operation_mode(self) -> ProviderOperationMode:
+        return ProviderOperationMode.BACKGROUND
+
+    @property
+    def provider_operations(self) -> ProviderOperationAdapter:
+        return self.adapter
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        raise AssertionError("background provider must not use synchronous streaming")
+        yield  # pragma: no cover
+
+
+class _CorruptingAutomaticRecallEvidencePolicy(AutomaticRecallContextPolicy):
+    corrupted_field: str
+
+    async def build_with_checkpoint(self, request, *, checkpoint):
+        result = await super().build_with_checkpoint(request, checkpoint=checkpoint)
+        assert result.checkpoint is not None
+        corrupted = json.loads(json.dumps(result.checkpoint))
+        corrupted["automatic_recall"][self.corrupted_field] = "0" * 64
+        return result.model_copy(update={"checkpoint": corrupted})
+
+
+class _ReceiptDigestCorruptingAutomaticRecallPolicy(_CorruptingAutomaticRecallEvidencePolicy):
+    corrupted_field = "receipt_document_sha256"
+
+
+class _ReceiptManifestBindingCorruptingAutomaticRecallPolicy(
+    _CorruptingAutomaticRecallEvidencePolicy
+):
+    corrupted_field = "receipt_manifest_binding_hmac_sha256"
+
+
+class _ReceiptIdentityRemovingAutomaticRecallPolicy(AutomaticRecallContextPolicy):
+    async def build_with_checkpoint(self, request, *, checkpoint):
+        result = await super().build_with_checkpoint(request, checkpoint=checkpoint)
+        assert result.checkpoint is not None
+        corrupted = json.loads(json.dumps(result.checkpoint))
+        del corrupted["automatic_recall"]["receipt_id"]
+        return result.model_copy(update={"checkpoint": corrupted})
 
 
 class _StripAutomaticMemoryPart(ContextPolicy):
@@ -204,6 +524,8 @@ def _request(
         agent=AgentSpec(name="assistant", model="fake-model"),
         messages=messages,
         step=step,
+        interaction_id=f"interaction-{step}",
+        model_step_id="mstep_00000000000000000000000000000000",
         session_store=sessions,
         knowledge_store=knowledge,
         knowledge_access_scope=knowledge.bound_access_scope(),
@@ -513,6 +835,8 @@ def test_automatic_recall_reuses_one_frame_across_checkpoint_compaction() -> Non
             agent=AgentSpec(name="assistant", model="fake-model"),
             messages=messages,
             step=1,
+            interaction_id="recall-compaction-interaction",
+            model_step_id="mstep_00000000000000000000000000000001",
             session_store=sessions,
             knowledge_store=knowledge,
             knowledge_access_scope=scope,
@@ -897,6 +1221,99 @@ def test_runtime_protocol_values_survive_secret_value_collisions() -> None:
     asyncio.run(run())
 
 
+def test_automatic_recall_evidence_bindings_survive_secret_value_collisions() -> None:
+    async def run() -> None:
+        sessions, knowledge, session, messages = await _fixture()
+        result = await _policy().build_with_checkpoint(
+            _request(
+                sessions=sessions,
+                knowledge=knowledge,
+                session=session,
+                messages=messages,
+            ),
+            checkpoint=None,
+        )
+
+        assert result.checkpoint is not None
+        state = result.checkpoint["automatic_recall"]
+        redactor = SecretRedactor(
+            [
+                state["receipt_id"],
+                state["receipt_document_sha256"][:16],
+                state["receipt_manifest_binding_hmac_sha256"][:16],
+            ]
+        )
+        safe_checkpoint = require_secret_free_durable_object(
+            result.checkpoint,
+            redactor=redactor,
+            field_name="automatic recall checkpoint",
+        )
+
+        safe_state = safe_checkpoint["automatic_recall"]
+        assert safe_state["receipt_id"] == state["receipt_id"]
+        assert safe_state["receipt_document_sha256"] == state["receipt_document_sha256"]
+        assert (
+            safe_state["receipt_manifest_binding_hmac_sha256"]
+            == (state["receipt_manifest_binding_hmac_sha256"])
+        )
+
+    asyncio.run(run())
+
+
+def test_final_request_rejects_duplicate_or_altered_automatic_memory_envelopes() -> None:
+    manifest = (
+        '<cayu_automatic_memory version="1">\n'
+        '{"notice":"trusted runtime envelope"}\n'
+        "</cayu_automatic_memory>"
+    )
+    manifest_sha256 = sha256(manifest.encode("utf-8")).hexdigest()
+    exact = ModelRequest(
+        model="fake-model",
+        messages=[Message(role="user", content=(TextPart(text=manifest),))],
+    )
+    removed = ModelRequest(
+        model="fake-model",
+        messages=[Message.text("user", "Memory projection removed.")],
+    )
+    duplicate = ModelRequest(
+        model="fake-model",
+        messages=[
+            Message(
+                role="user",
+                content=(TextPart(text=manifest), TextPart(text=manifest)),
+            )
+        ],
+    )
+    altered = ModelRequest(
+        model="fake-model",
+        messages=[
+            Message(
+                role="user",
+                content=(
+                    TextPart(text=manifest),
+                    TextPart(
+                        text=(
+                            '<cayu_automatic_memory version="1">\n'
+                            '{"notice":"altered envelope"}\n'
+                            "</cayu_automatic_memory>"
+                        )
+                    ),
+                ),
+            )
+        ],
+    )
+
+    assert _request_includes_exact_frozen_manifest(exact, manifest_sha256) is True
+    assert _request_includes_exact_frozen_manifest(removed, manifest_sha256) is False
+    assert _request_includes_exact_frozen_manifest(removed, None) is False
+    with pytest.raises(RuntimeError, match="manifest changed"):
+        _request_includes_exact_frozen_manifest(duplicate, manifest_sha256)
+    with pytest.raises(RuntimeError, match="manifest changed"):
+        _request_includes_exact_frozen_manifest(altered, manifest_sha256)
+    with pytest.raises(RuntimeError, match="manifest changed"):
+        _request_includes_exact_frozen_manifest(altered, None)
+
+
 def test_transcript_automatic_recall_excludes_the_anchoring_user_message() -> None:
     async def run() -> None:
         sessions = _CountingSessionStore()
@@ -925,6 +1342,8 @@ def test_transcript_automatic_recall_excludes_the_anchoring_user_message() -> No
             agent=AgentSpec(name="assistant", model="fake-model"),
             messages=[current],
             step=1,
+            interaction_id="interaction-current",
+            model_step_id="mstep_00000000000000000000000000000002",
             session_store=sessions,
         )
 
@@ -951,7 +1370,7 @@ def test_runtime_publishes_one_atomic_automatic_recall_outcome_without_content()
                 text=secret_text,
             )
         )
-        provider = ScriptedModelProvider(
+        provider = _RecordingCountScriptedProvider(
             [
                 [
                     ModelStreamEvent.text_delta("Friday"),
@@ -959,7 +1378,16 @@ def test_runtime_publishes_one_atomic_automatic_recall_outcome_without_content()
                 ]
             ]
         )
-        app = CayuApp(session_store=sessions, enable_logging=False)
+        footprint = RequestFootprintConfig(
+            fingerprint_key_id="test-memory-key",
+            fingerprint_key="automatic-recall-test-key-material",
+        )
+        app = CayuApp(
+            session_store=sessions,
+            request_footprint=footprint,
+            context_counting=ContextCountingConfig(mode=ContextCountingMode.OBSERVE),
+            enable_logging=False,
+        )
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(
@@ -1034,8 +1462,1109 @@ def test_runtime_publishes_one_atomic_automatic_recall_outcome_without_content()
         checkpoint = await sessions.load_checkpoint("automatic-recall-events")
         assert checkpoint is not None
         assert checkpoint["automatic_recall"]["projection"] is not None
+        receipts = (
+            await sessions.list_recall_receipts(
+                RecallEvidenceQuery(session_id="automatic-recall-events")
+            )
+        ).items
+        exposures = (
+            await sessions.list_context_exposures(
+                RecallEvidenceQuery(session_id="automatic-recall-events")
+            )
+        ).items
+        assert len(receipts) == 1
+        assert len(exposures) == 1
+        assert len(provider.count_requests) == 1
+        assert provider.count_requests[0] == provider.requests[0]
+        receipt = receipts[0]
+        exposure = exposures[0]
+        assert receipt.receipt_id == checkpoint["automatic_recall"]["receipt_id"]
+        assert (
+            recall_receipt_document_sha256(receipt)
+            == (checkpoint["automatic_recall"]["receipt_document_sha256"])
+        )
+        evidence_key = memory_evidence_key(footprint)
+        assert evidence_key is not None
+        assert checkpoint["automatic_recall"][
+            "receipt_manifest_binding_hmac_sha256"
+        ] == recall_receipt_manifest_binding_hmac_sha256(
+            receipt_document_sha256=checkpoint["automatic_recall"]["receipt_document_sha256"],
+            manifest_sha256=checkpoint["automatic_recall"]["manifest_sha256"],
+            key=evidence_key,
+        )
+        assert receipt.eligible_count == (
+            receipt.admitted_count
+            + receipt.offered_count
+            + receipt.silent_count
+            + receipt.omitted_count
+        )
+        assert exposure.receipt_ids == (receipt.receipt_id,)
+        assert exposure.state is ContextExposureState.COMPLETED
+        assert [transition.state for transition in exposure.transitions] == [
+            ContextExposureState.PLANNED,
+            ContextExposureState.PREPARED,
+            ContextExposureState.DISPATCH_STARTED,
+            ContextExposureState.ACKNOWLEDGED,
+            ContextExposureState.COMPLETED,
+        ]
+        assert {
+            fingerprint.key_id
+            for fingerprint in (
+                receipt.situation_fingerprint,
+                receipt.frontier_fingerprint,
+                exposure.composition_fingerprint,
+                exposure.request_contract_fingerprint,
+            )
+        } == {"test-memory-key"}
+        item_exposures = await sessions.load_recall_item_exposures(
+            exposure.session_id,
+            exposure.exposure_id,
+        )
+        assert len(item_exposures) == len(receipt.items)
         assert knowledge.search_count == 1
         assert sessions.transcript_search_count == 1
+
+    asyncio.run(run())
+
+
+def test_runtime_dispatches_after_wrapped_policy_suppresses_recalled_content() -> None:
+    async def run() -> None:
+        sessions = _CountingSessionStore()
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = _CountingKnowledgeStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-suppressed-exposure",
+                namespace="project:cayu",
+                text="Atlas suppressed evidence says Friday.",
+            )
+        )
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("No retained memory context."),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(
+            session_store=sessions,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="test-memory-key",
+                fingerprint_key="automatic-recall-test-key-material",
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=_policy(_SummarizeAndRemoveUserAnchor()),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="automatic-recall-suppressed-exposure",
+                    messages=[Message.text("user", "When is Atlas released?")],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert len(provider.requests) == 1
+        assert not any(
+            type(part) is TextPart and part.text.startswith('<cayu_automatic_memory version="1">')
+            for message in provider.requests[0].messages
+            for part in message.content
+        )
+        receipts = (
+            await sessions.list_recall_receipts(
+                RecallEvidenceQuery(session_id="automatic-recall-suppressed-exposure")
+            )
+        ).items
+        exposures = (
+            await sessions.list_context_exposures(
+                RecallEvidenceQuery(session_id="automatic-recall-suppressed-exposure")
+            )
+        ).items
+        assert len(receipts) == 1
+        assert len(exposures) == 1
+        assert exposures[0].state is ContextExposureState.COMPLETED
+        assert (
+            await sessions.load_recall_item_exposures(
+                exposures[0].session_id,
+                exposures[0].exposure_id,
+            )
+            == ()
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("policy_type", "expected_error"),
+    [
+        (
+            _ReceiptDigestCorruptingAutomaticRecallPolicy,
+            "does not match its durable receipt",
+        ),
+        (
+            _ReceiptManifestBindingCorruptingAutomaticRecallPolicy,
+            "receipt-to-manifest binding is invalid",
+        ),
+        (
+            _ReceiptIdentityRemovingAutomaticRecallPolicy,
+            "Automatic-recall memory-evidence checkpoint is malformed",
+        ),
+    ],
+    ids=["receipt-document", "receipt-manifest-binding", "missing-receipt-identity"],
+)
+def test_runtime_rejects_checkpoint_detached_from_its_durable_recall_receipt(
+    policy_type,
+    expected_error: str,
+) -> None:
+    async def run() -> None:
+        sessions = _CountingSessionStore()
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = _CountingKnowledgeStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-detached-receipt",
+                namespace="project:cayu",
+                text="Atlas receipt evidence says Friday.",
+            )
+        )
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("must not dispatch"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        policy = policy_type(
+            admission_policy=_admission(),
+            fusion_config=_fusion(
+                KNOWLEDGE_LEXICAL_CHANNEL,
+                KNOWLEDGE_SEMANTIC_CHANNEL,
+                TRANSCRIPT_LEXICAL_CHANNEL,
+            ),
+            sources=AutomaticRecallSourceConfig(knowledge_namespace="project:cayu"),
+        )
+        app = CayuApp(
+            session_store=sessions,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="test-memory-key",
+                fingerprint_key="automatic-recall-test-key-material",
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=policy,
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="automatic-recall-detached-receipt",
+                    messages=[Message.text("user", "When is Atlas released?")],
+                )
+            )
+        ]
+
+        assert provider.requests == []
+        assert events[-1].type is EventType.SESSION_FAILED
+        assert expected_error in events[-1].payload["error"]
+        receipts = (
+            await sessions.list_recall_receipts(
+                RecallEvidenceQuery(session_id="automatic-recall-detached-receipt")
+            )
+        ).items
+        exposures = (
+            await sessions.list_context_exposures(
+                RecallEvidenceQuery(session_id="automatic-recall-detached-receipt")
+            )
+        ).items
+        assert len(receipts) == 1
+        assert exposures == ()
+
+    asyncio.run(run())
+
+
+def test_runtime_records_distinct_exposures_for_automatic_recall_retry() -> None:
+    async def run() -> None:
+        sessions = _CountingSessionStore()
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = _CountingKnowledgeStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-retry",
+                namespace="project:cayu",
+                text="Atlas retry evidence says Friday.",
+            )
+        )
+        retry_error = ModelProviderError(
+            "provider temporarily unavailable",
+            provider="scripted",
+            status_code=503,
+            retryable=True,
+        )
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.error(str(retry_error), cause=retry_error),
+                    ModelStreamEvent.completed({"finish_reason": "error"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("Friday"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = CayuApp(
+            session_store=sessions,
+            retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="test-memory-key",
+                fingerprint_key="automatic-recall-test-key-material",
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=_policy(),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="automatic-recall-retry",
+                    messages=[Message.text("user", "When is Atlas released?")],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert len(provider.requests) == 2
+        assert _provider_manifest(provider.requests[0].messages) == _provider_manifest(
+            provider.requests[1].messages
+        )
+        receipts = (
+            await sessions.list_recall_receipts(
+                RecallEvidenceQuery(session_id="automatic-recall-retry")
+            )
+        ).items
+        exposures = (
+            await sessions.list_context_exposures(
+                RecallEvidenceQuery(session_id="automatic-recall-retry")
+            )
+        ).items
+        assert len(receipts) == 1
+        assert len(exposures) == 2
+        assert [exposure.state for exposure in exposures] == [
+            ContextExposureState.FAILED,
+            ContextExposureState.COMPLETED,
+        ]
+        assert [transition.state for transition in exposures[0].transitions] == [
+            ContextExposureState.PLANNED,
+            ContextExposureState.PREPARED,
+            ContextExposureState.DISPATCH_STARTED,
+            ContextExposureState.FAILED,
+        ]
+        assert exposures[0].provider_exposure_proven is False
+        assert len({exposure.exposure_id for exposure in exposures}) == 2
+        assert len({exposure.model_attempt_id for exposure in exposures}) == 2
+        assert len({exposure.provider_attempt_id for exposure in exposures}) == 2
+        assert len({exposure.composition_fingerprint.digest for exposure in exposures}) == 1
+        assert {exposure.receipt_ids for exposure in exposures} == {(receipts[0].receipt_id,)}
+        recovered_terminal = await recover_context_exposure(
+            store=sessions,
+            session_id="automatic-recall-retry",
+            stage_id="completed-failed-model-stage",
+            stage_intent={
+                "model_step_id": exposures[0].model_step_id,
+                "model_attempt_id": exposures[0].model_attempt_id,
+                "provider_name": exposures[0].provider_name,
+                "requested_model": exposures[0].model_name,
+                "context_exposure": {
+                    "exposure_id": exposures[0].exposure_id,
+                    "provider_attempt_id": exposures[0].provider_attempt_id,
+                },
+            },
+            state=ContextExposureState.COMPLETED,
+            evidence_kind=ContextExposureEvidenceKind.RECOVERY_COMPLETION,
+            evidence_ref="model-stage:completed-failed-model-stage:completed",
+        )
+        assert recovered_terminal is not None
+        assert recovered_terminal.state is ContextExposureState.FAILED
+        assert knowledge.search_count == 1
+
+    asyncio.run(run())
+
+
+def test_runtime_rebuilds_automatic_recall_exposure_after_context_overflow() -> None:
+    async def run() -> None:
+        sessions = _CountingSessionStore()
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = _CountingKnowledgeStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-overflow",
+                namespace="project:cayu",
+                text="Atlas overflow evidence says Friday.",
+            )
+        )
+        overflow = ModelContextOverflowError(
+            "context too large",
+            provider="scripted",
+            status_code=400,
+            error_code="context_length_exceeded",
+        )
+        provider = _FirstRequestRaisingScriptedProvider(
+            overflow,
+            (
+                ModelStreamEvent.text_delta("Friday"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ),
+        )
+        app = CayuApp(
+            session_store=sessions,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="test-memory-key",
+                fingerprint_key="automatic-recall-test-key-material",
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=_policy(),
+            context_overflow_policy=_policy(RecentTurnsContextPolicy(max_user_turns=1)),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="automatic-recall-overflow",
+                    messages=[
+                        Message.text("user", "Old Atlas question one."),
+                        Message.text("assistant", "Old answer one."),
+                        Message.text("user", "Old Atlas question two."),
+                        Message.text("assistant", "Old answer two."),
+                        Message.text("user", "When is Atlas released?"),
+                    ],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert len(provider.requests) == 2
+        assert len(provider.requests[1].messages) < len(provider.requests[0].messages)
+        assert _provider_manifest(provider.requests[0].messages) == _provider_manifest(
+            provider.requests[1].messages
+        )
+        receipts = (
+            await sessions.list_recall_receipts(
+                RecallEvidenceQuery(session_id="automatic-recall-overflow")
+            )
+        ).items
+        exposures = (
+            await sessions.list_context_exposures(
+                RecallEvidenceQuery(session_id="automatic-recall-overflow")
+            )
+        ).items
+        assert len(receipts) == 1
+        assert [exposure.state for exposure in exposures] == [
+            ContextExposureState.FAILED,
+            ContextExposureState.COMPLETED,
+        ]
+        assert len({exposure.composition_fingerprint.digest for exposure in exposures}) == 2
+        assert {exposure.receipt_ids for exposure in exposures} == {(receipts[0].receipt_id,)}
+        assert knowledge.search_count == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("grouped", "provider_effect_observed", "terminal_state"),
+    [
+        (False, False, ContextExposureState.FAILED),
+        (True, False, ContextExposureState.FAILED),
+        (False, True, ContextExposureState.INDETERMINATE),
+        (True, True, ContextExposureState.INDETERMINATE),
+    ],
+    ids=[
+        "single-pre-effect",
+        "grouped-pre-effect",
+        "single-after-effect",
+        "grouped-after-effect",
+    ],
+)
+def test_runtime_settles_raised_authentication_failure_with_truthful_provider_effect(
+    grouped: bool,
+    provider_effect_observed: bool,
+    terminal_state: ContextExposureState,
+) -> None:
+    async def run() -> None:
+        sessions = _CountingSessionStore()
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = _CountingKnowledgeStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-authentication-rejection",
+                namespace="project:cayu",
+                text="Atlas authentication evidence says Friday.",
+            )
+        )
+        authentication_failure = ModelProviderError(
+            "authentication failed",
+            provider="scripted",
+            status_code=401,
+            error_type="authentication_error",
+            retryable=False,
+        )
+        raised_failure = (
+            ExceptionGroup("provider authentication failed", [authentication_failure])
+            if grouped
+            else authentication_failure
+        )
+        provider = (
+            _ProviderEffectThenRaisingScriptedProvider(raised_failure)
+            if provider_effect_observed
+            else _FirstRequestRaisingScriptedProvider(raised_failure)
+        )
+        session_id = "automatic-recall-authentication-failure"
+        app = CayuApp(
+            session_store=sessions,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="test-memory-key",
+                fingerprint_key="automatic-recall-test-key-material",
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=_policy(),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "When is Atlas released?")],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_FAILED
+        assert len(provider.requests) == 1
+        assert await sessions.load_active_model_completion_stage(session_id) is None
+        exposures = (
+            await sessions.list_context_exposures(RecallEvidenceQuery(session_id=session_id))
+        ).items
+        assert len(exposures) == 1
+        assert [transition.state for transition in exposures[0].transitions] == [
+            ContextExposureState.PLANNED,
+            ContextExposureState.PREPARED,
+            ContextExposureState.DISPATCH_STARTED,
+            *([ContextExposureState.ACKNOWLEDGED] if provider_effect_observed else []),
+            terminal_state,
+        ]
+
+    asyncio.run(run())
+
+
+def test_runtime_fails_closed_before_provider_when_dispatch_evidence_cannot_persist() -> None:
+    async def run() -> None:
+        class RecordingBudgetLedger(InMemoryBudgetLedger):
+            def __init__(self) -> None:
+                super().__init__()
+                self.dispatch_calls = 0
+
+            async def mark_dispatched(self, **kwargs):
+                self.dispatch_calls += 1
+                return await super().mark_dispatched(**kwargs)
+
+        sessions = _DispatchEvidenceFailingSessionStore()
+        ledger = RecordingBudgetLedger()
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = _CountingKnowledgeStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-evidence-failure",
+                namespace="project:cayu",
+                text="Atlas evidence says Friday.",
+            )
+        )
+        provider = _RecordingCountScriptedProvider(
+            [
+                ModelStreamEvent.text_delta("must not dispatch"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(
+            session_store=sessions,
+            budget_ledger=ledger,
+            budget_policy=BudgetPolicy(
+                limits=(
+                    BudgetLimit(
+                        scope="app",
+                        max_estimated_cost=Decimal("1"),
+                        pricing=PriceBook(
+                            prices=(
+                                ModelPrice.fixed(
+                                    provider_name="scripted",
+                                    model="fake-model",
+                                    input_per_million=Decimal("1"),
+                                    output_per_million=Decimal("1"),
+                                ),
+                            )
+                        ),
+                        reservation=BudgetReservation(
+                            max_input_tokens=1_000,
+                            max_output_tokens=1_000,
+                        ),
+                    ),
+                )
+            ),
+            context_counting=ContextCountingConfig(mode=ContextCountingMode.OBSERVE),
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="test-memory-key",
+                fingerprint_key="automatic-recall-test-key-material",
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=_policy(),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="automatic-recall-evidence-failure",
+                    messages=[Message.text("user", "When is Atlas released?")],
+                )
+            )
+        ]
+
+        assert provider.requests == []
+        assert provider.count_requests == []
+        assert ledger.dispatch_calls == 0
+        assert events[-1].type is EventType.SESSION_FAILED
+        assert events[-1].payload["error"] == ("context exposure dispatch persistence failed")
+        exposures = (
+            await sessions.list_context_exposures(
+                RecallEvidenceQuery(session_id="automatic-recall-evidence-failure")
+            )
+        ).items
+        assert len(exposures) == 1
+        assert exposures[0].state is ContextExposureState.FAILED
+
+    asyncio.run(run())
+
+
+def test_runtime_replays_exact_memory_evidence_after_store_acknowledgement_loss() -> None:
+    async def run() -> None:
+        sessions = _EvidenceAcknowledgementLosingSessionStore()
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = _CountingKnowledgeStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-evidence-replay",
+                namespace="project:cayu",
+                text="Atlas evidence says Friday.",
+            )
+        )
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("Friday"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(
+            session_store=sessions,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="test-memory-key",
+                fingerprint_key="automatic-recall-test-key-material",
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=_policy(),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="automatic-recall-evidence-replay",
+                    messages=[Message.text("user", "When is Atlas released?")],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert len(provider.requests) == 1
+        receipts = (
+            await sessions.list_recall_receipts(
+                RecallEvidenceQuery(session_id="automatic-recall-evidence-replay")
+            )
+        ).items
+        exposures = (
+            await sessions.list_context_exposures(
+                RecallEvidenceQuery(session_id="automatic-recall-evidence-replay")
+            )
+        ).items
+        assert len(receipts) == 1
+        assert len(exposures) == 1
+        assert exposures[0].state is ContextExposureState.COMPLETED
+
+    asyncio.run(run())
+
+
+def test_runtime_recovers_original_memory_exposure_after_background_process_loss() -> None:
+    async def run() -> None:
+        sessions = _CountingSessionStore()
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = _CountingKnowledgeStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-background-recovery",
+                namespace="project:cayu",
+                text="Atlas background recovery evidence says Friday.",
+            )
+        )
+        provider = _MemoryRecoveryOperationProvider()
+        app = CayuApp(
+            session_store=sessions,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="test-memory-key",
+                fingerprint_key="automatic-recall-test-key-material",
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=_policy(),
+        )
+
+        with pytest.raises(_MemoryRecoveryProcessLoss):
+            _ = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="automatic-recall-background-recovery",
+                        messages=[Message.text("user", "When is Atlas released?")],
+                    )
+                )
+            ]
+
+        before = (
+            await sessions.list_context_exposures(
+                RecallEvidenceQuery(session_id="automatic-recall-background-recovery")
+            )
+        ).items
+        assert len(before) == 1
+        assert before[0].state is ContextExposureState.ACKNOWLEDGED
+
+        provider.adapter.status = ProviderOperationStatus.COMPLETED
+        await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(
+                session_id="automatic-recall-background-recovery",
+                inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+            )
+        )
+
+        receipts = (
+            await sessions.list_recall_receipts(
+                RecallEvidenceQuery(session_id="automatic-recall-background-recovery")
+            )
+        ).items
+        after = (
+            await sessions.list_context_exposures(
+                RecallEvidenceQuery(session_id="automatic-recall-background-recovery")
+            )
+        ).items
+        assert len(receipts) == 1
+        assert len(after) == 1
+        assert after[0].exposure_id == before[0].exposure_id
+        assert after[0].state is ContextExposureState.COMPLETED
+        assert after[0].receipt_ids == (receipts[0].receipt_id,)
+        assert provider.adapter.start_calls == 1
+        assert provider.adapter.retrieve_calls == 1
+        assert knowledge.search_count == 1
+
+    asyncio.run(run())
+
+
+def test_runtime_closes_exposure_when_model_dispatch_receipt_cannot_persist() -> None:
+    async def run() -> None:
+        sessions = _StageDispatchReceiptFailingSessionStore()
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = _CountingKnowledgeStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-model-dispatch-receipt",
+                namespace="project:cayu",
+                text="Atlas model dispatch receipt evidence says Friday.",
+            )
+        )
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("must not dispatch"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(
+            session_store=sessions,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="test-memory-key",
+                fingerprint_key="automatic-recall-test-key-material",
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=_policy(),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="automatic-recall-model-dispatch-receipt",
+                    messages=[Message.text("user", "When is Atlas released?")],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_FAILED
+        assert provider.requests == []
+        assert (
+            await sessions.load_active_model_completion_stage(
+                "automatic-recall-model-dispatch-receipt"
+            )
+            is None
+        )
+        exposures = (
+            await sessions.list_context_exposures(
+                RecallEvidenceQuery(session_id="automatic-recall-model-dispatch-receipt")
+            )
+        ).items
+        assert len(exposures) == 1
+        assert [transition.state for transition in exposures[0].transitions] == [
+            ContextExposureState.PLANNED,
+            ContextExposureState.PREPARED,
+            ContextExposureState.DISPATCH_STARTED,
+            ContextExposureState.FAILED,
+        ]
+
+    asyncio.run(run())
+
+
+def test_runtime_closes_partially_created_exposure_when_reconciliation_fails() -> None:
+    async def run() -> None:
+        sessions = _ExposureCreationReconciliationFailingSessionStore()
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = _CountingKnowledgeStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-exposure-creation-reconciliation",
+                namespace="project:cayu",
+                text="Atlas exposure creation evidence says Friday.",
+            )
+        )
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("must not dispatch"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(
+            session_store=sessions,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="test-memory-key",
+                fingerprint_key="automatic-recall-test-key-material",
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=_policy(),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="automatic-recall-exposure-creation-reconciliation",
+                    messages=[Message.text("user", "When is Atlas released?")],
+                )
+            )
+        ]
+
+        assert provider.requests == []
+        assert events[-1].type is EventType.SESSION_FAILED
+        exposures = (
+            await sessions.list_context_exposures(
+                RecallEvidenceQuery(session_id="automatic-recall-exposure-creation-reconciliation")
+            )
+        ).items
+        assert len(exposures) == 1
+        assert [transition.state for transition in exposures[0].transitions] == [
+            ContextExposureState.PLANNED,
+            ContextExposureState.FAILED,
+        ]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "provider",
+    [
+        _TimeoutBeforeAcknowledgementScriptedProvider(
+            [ModelStreamEvent.completed({"finish_reason": "stop"})]
+        ),
+        _MalformedAcknowledgementScriptedProvider(
+            [ModelStreamEvent.completed({"finish_reason": "stop"})]
+        ),
+    ],
+    ids=["timeout", "malformed-event"],
+)
+def test_runtime_requires_typed_provider_event_before_acknowledgement(provider) -> None:
+    async def run() -> None:
+        sessions = _CountingSessionStore()
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = _CountingKnowledgeStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-timeout",
+                namespace="project:cayu",
+                text="Atlas timeout evidence says Friday.",
+            )
+        )
+        app = CayuApp(
+            session_store=sessions,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="test-memory-key",
+                fingerprint_key="automatic-recall-test-key-material",
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=_policy(),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="automatic-recall-timeout",
+                    messages=[Message.text("user", "When is Atlas released?")],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_FAILED
+        assert len(provider.requests) == 1
+        exposures = (
+            await sessions.list_context_exposures(
+                RecallEvidenceQuery(session_id="automatic-recall-timeout")
+            )
+        ).items
+        assert len(exposures) == 1
+        assert [transition.state for transition in exposures[0].transitions] == [
+            ContextExposureState.PLANNED,
+            ContextExposureState.PREPARED,
+            ContextExposureState.DISPATCH_STARTED,
+            ContextExposureState.INDETERMINATE,
+        ]
+
+    asyncio.run(run())
+
+
+def test_runtime_records_unconfirmed_stream_cancellation_as_indeterminate() -> None:
+    async def run() -> None:
+        sessions = _CountingSessionStore()
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = _CountingKnowledgeStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-cancellation",
+                namespace="project:cayu",
+                text="Atlas cancellation evidence says Friday.",
+            )
+        )
+        provider = _BlockingBeforeAcknowledgementScriptedProvider()
+        app = CayuApp(
+            session_store=sessions,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="test-memory-key",
+                fingerprint_key="automatic-recall-test-key-material",
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=_policy(),
+        )
+
+        async def collect() -> list[Any]:
+            return [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="automatic-recall-cancellation",
+                        messages=[Message.text("user", "When is Atlas released?")],
+                    )
+                )
+            ]
+
+        task = asyncio.create_task(collect())
+        await asyncio.wait_for(provider.started.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        exposures = (
+            await sessions.list_context_exposures(
+                RecallEvidenceQuery(session_id="automatic-recall-cancellation")
+            )
+        ).items
+        assert len(exposures) == 1
+        assert exposures[0].state is ContextExposureState.INDETERMINATE
+        assert ContextExposureState.ACKNOWLEDGED not in {
+            transition.state for transition in exposures[0].transitions
+        }
+
+    asyncio.run(run())
+
+
+def test_runtime_requires_keyed_evidence_configuration_before_automatic_recall() -> None:
+    async def run() -> None:
+        sessions = _CountingSessionStore()
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = _CountingKnowledgeStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="atlas-missing-key",
+                namespace="project:cayu",
+                text="Atlas evidence says Friday.",
+            )
+        )
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("must not dispatch"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        app = CayuApp(session_store=sessions, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
+            default=True,
+        )
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=_policy(),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="automatic-recall-missing-key",
+                    messages=[Message.text("user", "When is Atlas released?")],
+                )
+            )
+        ]
+
+        assert provider.requests == []
+        assert knowledge.search_count == 0
+        assert events[-1].type is EventType.SESSION_FAILED
+        assert "keyed request-footprint configuration" in events[-1].payload["error"]
+        assert not (
+            await sessions.list_recall_receipts(
+                RecallEvidenceQuery(session_id="automatic-recall-missing-key")
+            )
+        ).items
 
     asyncio.run(run())
 
@@ -1064,7 +2593,14 @@ def test_fork_discards_source_recall_frame_and_recalls_for_child_interaction() -
                 ],
             ]
         )
-        app = CayuApp(session_store=sessions, enable_logging=False)
+        app = CayuApp(
+            session_store=sessions,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="test-memory-key",
+                fingerprint_key="automatic-recall-test-key-material",
+            ),
+            enable_logging=False,
+        )
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
@@ -1184,7 +2720,14 @@ def test_runtime_reuses_frozen_recall_for_runtime_authored_user_continuations(
                 "max_steps": 2,
                 "loop_policies": (_ContinueOnceBeforeStop(),),
             }
-        app = CayuApp(session_store=sessions, enable_logging=False)
+        app = CayuApp(
+            session_store=sessions,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id="test-memory-key",
+                fingerprint_key="automatic-recall-test-key-material",
+            ),
+            enable_logging=False,
+        )
         app.register_provider(provider, default=True)
         app.register_environment(
             Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
