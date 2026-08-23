@@ -114,7 +114,7 @@ uv sync --extra dev --extra server
 uv run pytest                                  # full suite, serial
 uv run pytest -n 3 --dist loadfile             # full suite, conservative parallelism
 uv run pytest tests/core -q                    # focused runs are fine while iterating
-uv run pytest --store-durations                # refresh CI's .test_durations snapshot
+uv run pytest --store-durations --clean-durations  # refresh CI's .test_durations snapshot
 ```
 
 The parallel command is safe with the default testcontainers-managed Postgres setup,
@@ -176,8 +176,17 @@ before regenerating the source bundle.
 ### Pull request verification scope
 
 Every pull request runs the repository-wide static checks and the complete Python 3.14
-test suite. CI adds the cross-version SQLite cancellation matrix, release-artifact
-verification, and dashboard checks only when the changed paths affect those contracts.
+test suite without coverage instrumentation. Duration-balanced general tests run across
+six single-process jobs, while stress and process tests share an isolated lane and Postgres
+conformance runs in two duration-balanced jobs. CI rejects a duration snapshot
+after more than 5% of collected tests lack timings; refresh it with the command above before
+it can materially unbalance the shards. CI adds the cross-version SQLite cancellation
+matrix, release-artifact verification, and dashboard checks only when the changed paths
+affect those contracts.
+For affected pull requests, the core package job verifies the installed dashboard/browser
+journey and generated secure-service contract while the ARM64 sidecar image runs alongside
+it. Both feed one stable release-artifact gate. Main and release tags keep the single
+exact-artifact release path before publication.
 The selector is intentionally fail-open for CI configuration, dependency, and selector
 changes. Pushes to `main` and `v*` release tags always run every verification job.
 

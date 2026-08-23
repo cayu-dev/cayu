@@ -7,6 +7,7 @@ _REPOSITORY_ROOT = Path(__file__).parents[2]
 _CI_WORKFLOW = _REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
 _TAG_VERIFIER = _REPOSITORY_ROOT / ".github" / "actions" / "verify-release-tag" / "action.yml"
 _RELEASE_RUNBOOK = _REPOSITORY_ROOT / "docs" / "releasing.md"
+_SIDECAR_VERIFIER = _REPOSITORY_ROOT / "scripts" / "verify_release_sidecar_artifacts.sh"
 _COMMIT_PIN = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")
 
 
@@ -43,6 +44,8 @@ def test_release_jobs_pin_every_external_action_to_immutable_commit() -> None:
             "test",
             "sqlite-cancellation",
             "package",
+            "release-sidecar-artifacts",
+            "windows-dashboard-artifact",
             "dashboard",
             "publish",
             "github-release",
@@ -62,22 +65,32 @@ def test_every_ref_uses_balanced_shards_behind_the_stable_test_gate() -> None:
     test_gate = _job_block(workflow, "test")
 
     assert "github.event_name == 'pull_request'" not in shards
-    assert "shard: [1, 2, 3, 4]" in shards
-    assert "--splits 4" in shards
+    assert "shard: [1, 2, 3, 4, 5, 6]" in shards
+    assert "--splits 6" in shards
     assert '--group "${{ matrix.shard }}"' in shards
     assert "--splitting-algorithm least_duration" in shards
+    assert "pytest -q" in shards
+    assert "-n 2" not in shards
     assert '-m "not (stress or process or postgres)"' in shards
+    assert 'if test "$EVENT_NAME" != "pull_request"' in shards
     assert "--cov=cayu" in shards
     assert "--cov-branch" in shards
+    assert "if: github.event_name != 'pull_request'" in shards
     assert "uses: actions/upload-artifact@" in shards
 
     assert "github.event_name == 'pull_request'" not in specialists
-    assert "marker: stress" in specialists
-    assert "marker: process" in specialists
-    assert "marker: postgres" in specialists
+    assert "lane: stress-process" in specialists
+    assert 'marker: "stress or process"' in specialists
+    assert specialists.count('marker: "postgres and not (stress or process)"') == 2
+    assert "lane: postgres-conformance-1" in specialists
+    assert "lane: postgres-conformance-2" in specialists
+    assert 'if test "$EVENT_NAME" != "pull_request"' in specialists
     assert '-m "${{ matrix.marker }}"' in specialists
+    assert '--splits "${{ matrix.splits }}"' in specialists
+    assert '--group "${{ matrix.group }}"' in specialists
     assert "--cov=cayu" in specialists
     assert "--cov-branch" in specialists
+    assert "if: github.event_name != 'pull_request'" in specialists
     assert "uses: actions/upload-artifact@" in specialists
 
     assert "name: Test (Python 3.14)" in test_gate
@@ -94,6 +107,7 @@ def test_stable_test_gate_combines_coverage_from_every_lane() -> None:
     assert "merge-multiple: true" in test_gate
     assert "coverage combine coverage-data" in test_gate
     assert "coverage report" in test_gate
+    assert test_gate.count("if: github.event_name != 'pull_request'") == 6
     assert "pytest" not in test_gate
 
 
@@ -145,6 +159,7 @@ def test_release_runbook_records_external_security_prerequisites() -> None:
 def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     workflow = _CI_WORKFLOW.read_text()
     package = _job_block(workflow, "package")
+    release_gate = _job_block(workflow, "release-artifacts")
     publish = _job_block(workflow, "publish")
     github_release = _job_block(workflow, "github-release")
 
@@ -152,8 +167,8 @@ def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     assert "startsWith(github.ref, 'refs/tags/v')" in publish
     assert "vars.PYPI_PUBLISH_ENABLED == 'true'" in publish
     assert (
-        "needs: [static, test, sqlite-cancellation, package, windows-dashboard-artifact, "
-        "dashboard]" in publish
+        "needs: [static, test, sqlite-cancellation, release-artifacts, "
+        "windows-dashboard-artifact, dashboard]" in publish
     )
     assert "if: startsWith(github.ref, 'refs/tags/v')" in github_release
     assert "needs: [publish, package]" in github_release
@@ -165,6 +180,8 @@ def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     assert package.index("name: Check installed CLI version") < upload
     assert "name: release-dist" in package[upload:]
     assert "path: dist/first/" in package[upload:]
+    assert "name: Release artifacts" in release_gate
+    assert "PACKAGE_RESULT: ${{ needs.package.result }}" in release_gate
 
     assert "name: release-dist" in publish
     assert "path: dist/" in publish
@@ -207,6 +224,8 @@ def test_pull_request_scopes_expensive_verification_jobs() -> None:
     scope = _job_block(workflow, "verification-scope")
     sqlite = _job_block(workflow, "sqlite-cancellation")
     package = _job_block(workflow, "package")
+    release_sidecar = _job_block(workflow, "release-sidecar-artifacts")
+    release_gate = _job_block(workflow, "release-artifacts")
     dashboard = _job_block(workflow, "dashboard")
 
     assert "python3 scripts/select_ci_jobs.py" in scope
@@ -224,3 +243,36 @@ def test_pull_request_scopes_expensive_verification_jobs() -> None:
     assert "needs.verification-scope.outputs.dashboard == 'true'" in dashboard
     assert "needs: verification-scope" in package
     assert "needs.verification-scope.outputs.release_artifacts == 'true'" in package
+    assert "needs: verification-scope" in release_sidecar
+    assert "github.event_name == 'pull_request'" in release_sidecar
+    assert "needs.verification-scope.outputs.release_artifacts == 'true'" in release_sidecar
+    sidecar_verifier_command = "bash scripts/verify_release_sidecar_artifacts.sh"
+    assert package.count(sidecar_verifier_command) == 1
+    assert release_sidecar.count(sidecar_verifier_command) == 1
+
+    sidecar_verifier = _SIDECAR_VERIFIER.read_text()
+    assert sidecar_verifier.startswith("#!/usr/bin/env bash\nset -euo pipefail\n")
+    assert sidecar_verifier.count("lambda-microvm sidecar export") == 3
+    assert "docker build --platform linux/arm64" in sidecar_verifier
+    assert "docker run --rm --platform linux/arm64" in sidecar_verifier
+
+    assert "name: Require every release-artifact lane" in release_gate
+    assert "always()" in release_gate
+    assert 'if test "$EVENT_NAME" = "pull_request"' in release_gate
+    for result in ("PACKAGE_RESULT", "SIDECAR_RESULT"):
+        assert f'test "${result}" = "success"' in release_gate
+
+    for preserved_check in (
+        "Verify the installed-wheel dashboard-to-local eval journey",
+        "Check built-wheel secure public-service contract",
+    ):
+        check_offset = package.index(preserved_check)
+        assert (
+            "if: github.event_name != 'pull_request'"
+            not in package[check_offset : check_offset + 180]
+        )
+
+    sidecar_offset = package.index("Verify installed wheel and source-distribution sidecar exports")
+    assert (
+        "if: github.event_name != 'pull_request'" in package[sidecar_offset : sidecar_offset + 180]
+    )

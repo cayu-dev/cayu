@@ -10,8 +10,10 @@ import pytest
 _DOCKER_SKIP_REASON = "Docker is unavailable; skipping Postgres store tests."
 _DSN_ENV_VAR = "CAYU_TEST_POSTGRES_DSN"
 _REQUIRE_POSTGRES_ENV_VAR = "CAYU_REQUIRE_POSTGRES"
+_REQUIRE_CURRENT_TEST_DURATIONS_ENV_VAR = "CAYU_REQUIRE_CURRENT_TEST_DURATIONS"
 _POSTGRES_CONTAINER_IMAGE = "pgvector/pgvector:pg16"
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+_MAX_UNKNOWN_DURATION_FRACTION = 0.05
 
 
 class ProviderCredentialCanaries:
@@ -155,12 +157,56 @@ def _skip_or_fail_postgres_unavailable(reason: str) -> None:
     pytest.skip(reason)
 
 
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    """Keep every statically declared Postgres consumer in one ordered CI lane."""
+def _requests_postgres(item: pytest.Item) -> bool:
+    if "postgres_dsn" in item.fixturenames:
+        return True
+    callspec = getattr(item, "callspec", None)
+    if callspec is None:
+        return False
+    return any(isinstance(value, str) and value == "postgres" for value in callspec.params.values())
+
+
+def _require_current_test_durations(
+    config: pytest.Config,
+    items: list[pytest.Item],
+) -> None:
+    required = (
+        os.environ.get(_REQUIRE_CURRENT_TEST_DURATIONS_ENV_VAR, "").strip().lower()
+        in _TRUTHY_ENV_VALUES
+    )
+    if not required or not items:
+        return
+    snapshot_path = Path(config.rootpath) / ".test_durations"
+    try:
+        stored = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        raise pytest.UsageError(f"invalid test-duration snapshot: {exc}") from exc
+    if not isinstance(stored, dict):
+        raise pytest.UsageError("test-duration snapshot must be a JSON object")
+    unknown = sorted(item.nodeid for item in items if item.nodeid not in stored)
+    allowed = max(1, int(len(items) * _MAX_UNKNOWN_DURATION_FRACTION))
+    if len(unknown) <= allowed:
+        return
+    examples = ", ".join(unknown[:5])
+    raise pytest.UsageError(
+        ".test_durations is stale: "
+        f"{len(unknown)} of {len(items)} collected tests lack timings "
+        f"(maximum {allowed}); run "
+        "`uv run pytest --store-durations --clean-durations`. "
+        f"First missing tests: {examples}"
+    )
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config,
+    items: list[pytest.Item],
+) -> None:
+    """Keep every Postgres consumer in its isolated CI lane."""
 
     for item in items:
-        if "postgres_dsn" in item.fixturenames:
+        if _requests_postgres(item):
             item.add_marker(pytest.mark.postgres)
+    _require_current_test_durations(config, items)
 
 
 @pytest.fixture(scope="session")

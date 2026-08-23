@@ -147,6 +147,13 @@ complete report is written to the GitHub Actions job summary. This is diagnostic
 visibility, not a release-quality score: CI has no global coverage threshold, so
 a percentage cannot fail the job; test or coverage-tool failures still do.
 
+The PR leg balances general tests across six single-process jobs from the committed
+`.test_durations` snapshot, combines stress and process tests in one isolated lane,
+and splits Postgres conformance across two isolated jobs.
+CI permits a small tail of newly collected tests, but rejects the snapshot once more
+than 5% of tests have no recorded duration so the sharding model cannot silently drift
+back into a long critical path.
+
 Source coverage shows which in-process Python paths the required pytest suite
 executed. It does not replace the capability checks above and does not prove the
 quality of their assertions, subprocess behavior, or credential-gated live

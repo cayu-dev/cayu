@@ -68,17 +68,18 @@ jobs:
       - run: uv lock --check
 
   test_shards:
-    name: Test shard ${{ matrix.shard }}/4 (Python 3.14)
+    name: Test shard ${{ matrix.shard }}/6 (Python 3.14)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6]
     env:
       CAYU_REQUIRE_POSTGRES: "1"
       CAYU_REQUIRE_DOCKER_RUNNER: "1"
       CAYU_REQUIRE_DOCKER_EGRESS: "1"
+      CAYU_REQUIRE_CURRENT_TEST_DURATIONS: "1"
       COVERAGE_FILE: coverage.${{ github.run_attempt }}.general-${{ matrix.shard }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -86,17 +87,22 @@ jobs:
       - run: uv python install 3.14
       - run: uv sync --frozen --extra dev --extra server --python 3.14
       - name: Test duration-balanced shard
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
+          coverage_args=()
+          if test "$EVENT_NAME" != "pull_request"; then
+            coverage_args=(--cov=cayu --cov-branch --cov-report=)
+          fi
           uv run pytest -q \
             -m "not (stress or process or postgres)" \
-            --splits 4 \
+            --splits 6 \
             --group "${{ matrix.shard }}" \
             --splitting-algorithm least_duration \
             --durations=20 \
-            --cov=cayu \
-            --cov-branch \
-            --cov-report=
+            "${coverage_args[@]}"
       - name: Upload shard coverage data
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage-${{ github.run_attempt }}-general-${{ matrix.shard }}
@@ -112,16 +118,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - lane: stress
-            marker: stress
-          - lane: process
-            marker: process
-          - lane: postgres-conformance
-            marker: postgres
+          - lane: stress-process
+            marker: "stress or process"
+            splits: 1
+            group: 1
+          - lane: postgres-conformance-1
+            marker: "postgres and not (stress or process)"
+            splits: 2
+            group: 1
+          - lane: postgres-conformance-2
+            marker: "postgres and not (stress or process)"
+            splits: 2
+            group: 2
     env:
       CAYU_REQUIRE_POSTGRES: "1"
       CAYU_REQUIRE_DOCKER_RUNNER: "1"
       CAYU_REQUIRE_DOCKER_EGRESS: "1"
+      CAYU_REQUIRE_CURRENT_TEST_DURATIONS: "1"
       COVERAGE_FILE: coverage.${{ github.run_attempt }}.specialist-${{ matrix.lane }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -129,14 +142,22 @@ jobs:
       - run: uv python install 3.14
       - run: uv sync --frozen --extra dev --extra server --python 3.14
       - name: Test specialist lane
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
+          coverage_args=()
+          if test "$EVENT_NAME" != "pull_request"; then
+            coverage_args=(--cov=cayu --cov-branch --cov-report=)
+          fi
           uv run pytest -q \
             -m "${{ matrix.marker }}" \
+            --splits "${{ matrix.splits }}" \
+            --group "${{ matrix.group }}" \
+            --splitting-algorithm least_duration \
             --durations=20 \
-            --cov=cayu \
-            --cov-branch \
-            --cov-report=
+            "${coverage_args[@]}"
       - name: Upload specialist coverage data
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage-${{ github.run_attempt }}-specialist-${{ matrix.lane }}
@@ -163,17 +184,23 @@ jobs:
         run: |
           test "$SHARD_RESULT" = "success"
           test "$SPECIALIST_RESULT" = "success"
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
-      - run: uv python install 3.14
-      - run: uv sync --frozen --extra dev --extra server --python 3.14
+      - if: github.event_name != 'pull_request'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - if: github.event_name != 'pull_request'
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - if: github.event_name != 'pull_request'
+        run: uv python install 3.14
+      - if: github.event_name != 'pull_request'
+        run: uv sync --frozen --extra dev --extra server --python 3.14
       - name: Download test coverage data
+        if: github.event_name != 'pull_request'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: coverage-${{ github.run_attempt }}-*
           path: coverage-data
           merge-multiple: true
       - name: Report combined coverage
+        if: github.event_name != 'pull_request'
         run: |
           uv run coverage combine coverage-data
           uv run coverage report --show-missing --skip-covered
@@ -214,7 +241,7 @@ jobs:
           done
 
   package:
-    name: Release artifacts
+    name: Release package contracts
     needs: verification-scope
     if: needs.verification-scope.outputs.release_artifacts == 'true'
     runs-on: ubuntu-latest
@@ -357,78 +384,13 @@ jobs:
           PY
       # The AWS Lambda MicroVM base image is published for ARM64 only. Register
       # emulation so the amd64 GitHub runner can verify the exact exported image.
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - if: github.event_name != 'pull_request'
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         with:
           platforms: arm64
       - name: Verify installed wheel and source-distribution sidecar exports
-        run: |
-          proof_root="$(mktemp -d)"
-          cd "$proof_root"
-          unset PYTHONPATH
-          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" \
-            lambda-microvm sidecar export "$proof_root/wheel"
-          "$GITHUB_WORKSPACE/.release-sdist-venv/bin/cayu" \
-            lambda-microvm sidecar export "$proof_root/sdist"
-          diff -ru "$proof_root/wheel" "$proof_root/sdist"
-          "$GITHUB_WORKSPACE/.release-venv/bin/python" - <<'PY'
-          import hashlib
-          import importlib.metadata
-          import importlib.util
-          import json
-          from pathlib import Path
-
-          from cayu.runners.aws_lambda_microvm import LAMBDA_MICROVM_PROTOCOL_VERSION
-
-          root = Path("wheel")
-          manifest = json.loads(
-              (root / "cayu-lambda-microvm-sidecar-manifest.json").read_text()
-          )
-          assert manifest["schema_version"] == 1
-          assert manifest["artifact_version"] == 1
-          assert manifest["cayu_version"] == importlib.metadata.version("cayu")
-          assert manifest["protocol_version"] == LAMBDA_MICROVM_PROTOCOL_VERSION
-          expected_paths = {
-              "cayu-lambda-microvm-sidecar-manifest.json",
-              *(item["path"] for item in manifest["files"]),
-          }
-          assert {
-              path.relative_to(root).as_posix()
-              for path in root.rglob("*")
-              if path.is_file()
-          } == expected_paths
-          for item in manifest["files"]:
-              content = (root / item["path"]).read_bytes()
-              assert len(content) == item["size"]
-              assert "sha256:" + hashlib.sha256(content).hexdigest() == item["sha256"]
-          canonical_files = json.dumps(
-              manifest["files"],
-              ensure_ascii=False,
-              sort_keys=True,
-              separators=(",", ":"),
-          ).encode()
-          assert (
-              "sha256:" + hashlib.sha256(canonical_files).hexdigest()
-              == manifest["content_digest"]
-          )
-          assert importlib.util.find_spec("boto3") is None
-          assert importlib.util.find_spec("fastapi") is None
-          PY
-          docker build --platform linux/arm64 \
-            -t cayu-lambda-microvm-sidecar-proof "$proof_root/wheel"
-          docker run --rm --platform linux/arm64 --entrypoint python3.11 \
-            cayu-lambda-microvm-sidecar-proof -c \
-            'import asyncio, json; from pathlib import Path; from lambda_microvm_sidecar.app import health; manifest = json.loads(Path("/opt/cayu/lambda_microvm_sidecar/cayu-lambda-microvm-sidecar-manifest.json").read_text()); result = asyncio.run(health()); assert result == {"status": "ok", "protocol_version": manifest["protocol_version"]}'
-          "$GITHUB_WORKSPACE/.release-sdist-venv/bin/python" - <<'PY'
-          from importlib.resources import files
-
-          resource = files("cayu.data").joinpath("lambda_microvm_sidecar", "app.py")
-          resource.write_bytes(resource.read_bytes() + b"\n# tampered\n")
-          PY
-          if "$GITHUB_WORKSPACE/.release-sdist-venv/bin/cayu" \
-            lambda-microvm sidecar export "$proof_root/tampered"; then
-            echo "tampered installed sidecar unexpectedly exported"
-            exit 1
-          fi
+        if: github.event_name != 'pull_request'
+        run: bash scripts/verify_release_sidecar_artifacts.sh
       - name: Check built-wheel authoring contract
         run: |
           uv pip install --python .release-venv/bin/python pytest
@@ -603,6 +565,58 @@ jobs:
           path: dist/first/
           if-no-files-found: error
 
+  release-sidecar-artifacts:
+    name: Release sidecar artifacts
+    needs: verification-scope
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.verification-scope.outputs.release_artifacts == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - run: uv python install 3.11
+      - run: uv build --out-dir dist/first
+      - run: uv venv --python 3.11 .release-venv
+      - run: uv pip install --python .release-venv/bin/python dist/first/*.whl
+      - run: uv venv --python 3.11 .release-sdist-venv
+      - run: uv pip install --python .release-sdist-venv/bin/python dist/first/*.tar.gz
+      # The AWS Lambda MicroVM base image is published for ARM64 only. Register
+      # emulation so the amd64 GitHub runner can verify the exported image.
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+      - name: Verify installed wheel and source-distribution sidecar exports
+        run: bash scripts/verify_release_sidecar_artifacts.sh
+
+  release-artifacts:
+    name: Release artifacts
+    needs:
+      - verification-scope
+      - package
+      - release-sidecar-artifacts
+    if: >-
+      always() &&
+      needs.verification-scope.outputs.release_artifacts == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Require every release-artifact lane
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCOPE_RESULT: ${{ needs.verification-scope.result }}
+          PACKAGE_RESULT: ${{ needs.package.result }}
+          SIDECAR_RESULT: ${{ needs.release-sidecar-artifacts.result }}
+        run: |
+          test "$SCOPE_RESULT" = "success"
+          test "$PACKAGE_RESULT" = "success"
+          if test "$EVENT_NAME" = "pull_request"; then
+            test "$SIDECAR_RESULT" = "success"
+          else
+            test "$SIDECAR_RESULT" = "skipped"
+          fi
+
   windows-dashboard-artifact:
     name: Windows dashboard artifact
     needs: verification-scope
@@ -746,7 +760,7 @@ jobs:
     if: >-
       startsWith(github.ref, 'refs/tags/v') &&
       vars.PYPI_PUBLISH_ENABLED == 'true'
-    needs: [static, test, sqlite-cancellation, package, windows-dashboard-artifact, dashboard]
+    needs: [static, test, sqlite-cancellation, release-artifacts, windows-dashboard-artifact, dashboard]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment:
