@@ -1727,7 +1727,7 @@ request = ResumeRequest(
     tool_grants=(
         TargetedToolGrant(
             request_id="review-gotchas",
-            tool_id="cayu:remember",
+            tool_id="cayu:remember_knowledge",
             max_calls=1,
             lifetime_seconds=300,
             origin="post-work-review",
@@ -1766,7 +1766,7 @@ argument object:
   "name": "call_tool",
   "arguments": {
     "tool_ref": "<opaque reference from Cayu's targeted-tool context>",
-    "arguments": {"fact": "Retries must retain the original call identity."}
+    "arguments": {"text": "Retries must retain the original call identity."}
   }
 }
 ```
@@ -1776,7 +1776,7 @@ registered descriptor, resolving document-local JSON Schema references only;
 an external or otherwise unresolvable reference is invalid. It then atomically
 binds the grant use before policy planning. Policy, approval, effects,
 credentials, hooks, concurrency, idempotency, execution, receipts, and recovery
-all receive the effective registered target (`remember` in this example); there
+all receive the effective registered target (`remember_knowledge` in this example); there
 is no wrapper tool or second execution path. Provider transcript messages retain
 the outer `call_tool` name and call id but replace the exact reference with a
 fixed non-authoritative placeholder, and the effective result returns through
@@ -1807,6 +1807,19 @@ Every fork writes explicit reset
 evidence, copies no parent grant or consumption authority, and treats
 references present in copied transcript text as inert text. A child needs a
 newly requested child-scoped grant inside its inherited or narrowed ceiling.
+
+The credential-free
+[`forked_session_knowledge.py`](../examples/forked_session_knowledge.py) example
+demonstrates that composition end to end. It registers `RememberKnowledgeTool`
+in the catalogue under an empty direct-exposure profile and enables the stable
+gateway, completes and forks a parent session, then concurrently resumes the
+parent and one child memory session. Only the child receives a bounded targeted
+grant and dynamic `remember_knowledge` descriptor; the registered knowledge
+schema is never part of the stable tool array. Each accepted call creates one
+child-attributed pending knowledge entry, and approval continuation reuses the
+same grant consumption. The deterministic provider is an API-key-free fixture,
+not a Cayu memory product: real applications own the memory prompt, schedule,
+finding criteria, and grant policy while composing the same runtime primitives.
 
 Natural expiry, including interaction termination, is an expected loss of
 addressability rather than authority drift. Recovery records the expiry and
