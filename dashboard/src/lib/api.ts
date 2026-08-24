@@ -44,6 +44,16 @@ import type {
   EvalRunPage,
   EvalRunRecord,
   EvalRunStatus,
+  EvalScenarioArtifactMaterializationRequest,
+  EvalScenarioArtifactMaterializationResponse,
+  EvalScenarioCatalogEntry,
+  EvalScenarioCatalogPage,
+  EvalScenarioDocumentV2,
+  EvalScenarioDraftV2,
+  EvalScenarioPreviewRequest,
+  EvalScenarioPreviewResponse,
+  EvalScenarioSaveRequest,
+  EvalScenarioSaveResponse,
   EvalSuiteCatalogPage,
   EvalTargetCatalogEntry,
   EvalTargetCatalogResponse,
@@ -72,6 +82,7 @@ import type {
   ListEvalCorporaApiEvalsCorporaGetData,
   ListEvalResultsApiEvalsResultsGetData,
   ListEvalRunsApiEvalsRunsGetData,
+  ListEvalScenariosApiEvalsScenariosGetData,
   ListEvalSuitesApiEvalsCorporaCorpusRevisionSuitesGetData,
   ListPendingActionsApiPendingActionsGetData,
   ListPendingActionsApiPendingActionsGetResponse,
@@ -216,6 +227,16 @@ export type EvalComparison = EvalComparisonResponse
 export type EvalResultComparison = EvalResultComparisonResponse
 export type EvalTarget = EvalTargetCatalogEntry
 export type EvalTargets = EvalTargetCatalogResponse
+export type EvalScenario = EvalScenarioDocumentV2
+export type EvalScenarioDraft = EvalScenarioDraftV2
+export type EvalScenarioPreviewRequestBody = EvalScenarioPreviewRequest
+export type EvalScenarioPreview = EvalScenarioPreviewResponse
+export type EvalScenarioSave = EvalScenarioSaveRequest
+export type EvalScenarioSaved = EvalScenarioSaveResponse
+export type EvalScenarioArtifactPreparation = EvalScenarioArtifactMaterializationRequest
+export type EvalScenarioArtifactPrepared = EvalScenarioArtifactMaterializationResponse
+export type EvalScenarioEntry = EvalScenarioCatalogEntry
+export type EvalScenariosPage = EvalScenarioCatalogPage
 export type EvalCorporaQuery = NonNullable<ListEvalCorporaApiEvalsCorporaGetData["query"]>
 export type EvalSuitesQuery = NonNullable<
   ListEvalSuitesApiEvalsCorporaCorpusRevisionSuitesGetData["query"]
@@ -225,6 +246,7 @@ export type EvalCasesQuery = NonNullable<
 >
 export type EvalRunsQuery = NonNullable<ListEvalRunsApiEvalsRunsGetData["query"]>
 export type EvalResultsQuery = NonNullable<ListEvalResultsApiEvalsResultsGetData["query"]>
+export type EvalScenariosQuery = NonNullable<ListEvalScenariosApiEvalsScenariosGetData["query"]>
 
 export type DownloadedFile = {
   blob: Blob
@@ -581,6 +603,66 @@ export async function downloadEvalCorpus(
   return downloadFile(
     `/evals/corpora/${encodeURIComponent(corpusRevision)}/download`,
     "cayu-eval-corpus.json",
+    signal,
+  )
+}
+
+export async function previewEvalScenario(
+  body: EvalScenarioPreviewRequestBody,
+  signal?: AbortSignal,
+): Promise<EvalScenarioPreview> {
+  return requestJson<EvalScenarioPreview>("/evals/scenarios/preview", {
+    method: "POST",
+    body: JSON.stringify(body),
+    signal,
+  })
+}
+
+export async function saveEvalScenario(
+  body: EvalScenarioSave,
+  signal?: AbortSignal,
+): Promise<EvalScenarioSaved> {
+  return requestJson<EvalScenarioSaved>("/evals/scenarios", {
+    method: "POST",
+    body: JSON.stringify(body),
+    signal,
+  })
+}
+
+export async function materializeEvalScenarioArtifact(
+  requirementId: string,
+  body: EvalScenarioArtifactPreparation,
+  signal?: AbortSignal,
+): Promise<EvalScenarioArtifactPrepared> {
+  return requestJson<EvalScenarioArtifactPrepared>(
+    `/evals/scenarios/artifacts/${encodeURIComponent(requirementId)}/materialize`,
+    { method: "POST", body: JSON.stringify(body), signal },
+  )
+}
+
+export async function fetchEvalScenarios(
+  query: EvalScenariosQuery = {},
+  signal?: AbortSignal,
+): Promise<EvalScenariosPage> {
+  return requestJson<EvalScenariosPage>(`/evals/scenarios${queryString(query)}`, { signal })
+}
+
+export async function fetchEvalScenario(
+  scenarioRevision: string,
+  signal?: AbortSignal,
+): Promise<EvalScenario> {
+  return requestJson<EvalScenario>(`/evals/scenarios/${encodeURIComponent(scenarioRevision)}`, {
+    signal,
+  })
+}
+
+export async function downloadEvalScenario(
+  scenarioRevision: string,
+  signal?: AbortSignal,
+): Promise<DownloadedFile> {
+  return downloadFile(
+    `/evals/scenarios/${encodeURIComponent(scenarioRevision)}/download`,
+    "cayu-eval-scenario.json",
     signal,
   )
 }

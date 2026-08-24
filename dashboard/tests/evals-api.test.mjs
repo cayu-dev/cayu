@@ -10,15 +10,21 @@ const {
   downloadCatalogEvalResultHtml,
   downloadCatalogEvalResultJson,
   downloadEvalResultJson,
+  downloadEvalScenario,
   fetchEvalCases,
   fetchEvalCorpora,
   fetchEvalRuns,
+  fetchEvalScenario,
+  fetchEvalScenarios,
   fetchEvalResultDetail,
   fetchEvalResults,
   fetchEvalTargets,
   importEvalCorpus,
+  materializeEvalScenarioArtifact,
   previewCapturedEvaluation,
+  previewEvalScenario,
   saveCapturedEvaluation,
+  saveEvalScenario,
   selectEvalBaseline,
 } = await import("../src/lib/api.ts")
 const { preflightEvalCorpusFile } = await import("../src/lib/evals-dashboard.ts")
@@ -269,4 +275,86 @@ test("captured evaluation adapters preserve revisions, target scope, and baselin
     operation_id: revision,
   })
   assert.equal(calls[4].init.signal, controller.signal)
+})
+
+test("scenario adapters preserve reviewed revisions, bindings, target scope, and cancellation", async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  const controller = new AbortController()
+  const revision = `sha256:${"c".repeat(64)}`
+  const scenario = {
+    schema_version: 2,
+    revision,
+    id: "production-flow",
+    target_key: "eval.target",
+    name: "Production flow",
+    events: [
+      {
+        kind: "initial",
+        sequence: 0,
+        id: "initial",
+        input: { messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }] },
+      },
+    ],
+  }
+  const draft = { ...scenario }
+  delete draft.schema_version
+  delete draft.revision
+  const settings = {
+    environment_name: "files",
+    trials: 1,
+    max_concurrency: 1,
+    timeout_seconds: 300,
+  }
+  globalThis.fetch = async (input, init) => {
+    calls.push({ input: String(input), init })
+    if (String(input).endsWith("/download")) {
+      return new Response("{}", {
+        headers: { "content-disposition": 'attachment; filename="production.scenario.json"' },
+      })
+    }
+    return new Response(JSON.stringify({ items: [], scenario, preflight: { ready: true } }), {
+      status: String(input) === "/api/evals/scenarios" && init?.method === "POST" ? 201 : 200,
+      headers: { "content-type": "application/json" },
+    })
+  }
+
+  try {
+    await previewEvalScenario({ draft, settings }, controller.signal)
+    await saveEvalScenario(
+      { expected_scenario_revision: revision, scenario, settings },
+      controller.signal,
+    )
+    await materializeEvalScenarioArtifact(
+      "invoice/file",
+      { expected_scenario_revision: revision, scenario, settings },
+      controller.signal,
+    )
+    await fetchEvalScenarios(
+      { target_key: "eval.target", scenario_id: "production-flow", cursor: "next", limit: 10 },
+      controller.signal,
+    )
+    await fetchEvalScenario(revision, controller.signal)
+    const downloaded = await downloadEvalScenario(revision, controller.signal)
+    assert.equal(downloaded.filename, "production.scenario.json")
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.equal(calls[0].input, "/api/evals/scenarios/preview")
+  assert.deepEqual(JSON.parse(calls[0].init.body), { draft, settings })
+  assert.equal(calls[1].input, "/api/evals/scenarios")
+  assert.deepEqual(JSON.parse(calls[1].init.body), {
+    expected_scenario_revision: revision,
+    scenario,
+    settings,
+  })
+  assert.equal(calls[2].input, "/api/evals/scenarios/artifacts/invoice%2Ffile/materialize")
+  assert.equal(
+    calls[3].input,
+    "/api/evals/scenarios?target_key=eval.target&scenario_id=production-flow&cursor=next&limit=10",
+  )
+  assert.equal(calls[4].input, `/api/evals/scenarios/${encodeURIComponent(revision)}`)
+  assert.equal(calls[5].input, `/api/evals/scenarios/${encodeURIComponent(revision)}/download`)
+  assert.ok(calls.every((call) => call.init.signal === controller.signal))
 })

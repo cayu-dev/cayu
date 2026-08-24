@@ -44,6 +44,7 @@ function DataCard({
   className,
   headerClassName,
   contentClassName,
+  testId,
   children,
 }: {
   title?: ReactNode
@@ -52,10 +53,11 @@ function DataCard({
   className?: string
   headerClassName?: string
   contentClassName?: string
+  testId?: string
   children: ReactNode
 }) {
   return (
-    <Card className={cn("min-w-0 gap-0 py-0", className)}>
+    <Card className={cn("min-w-0 gap-0 py-0", className)} data-testid={testId}>
       {(title || description || actions) && (
         <CardHeader className={cn("border-b border-border py-4", headerClassName)}>
           <div className="flex min-w-0 items-start justify-between gap-3">

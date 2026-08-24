@@ -47,7 +47,14 @@ from cayu.evals.promotion import (
     PromotionCandidateV1,
 )
 from cayu.evals.results import CapturedEvaluationResultV1
+from cayu.evals.scenario import EvalScenarioDocumentV2
+from cayu.evals.scenario_authoring import EvalScenarioDraftV2
 from cayu.evals.scenario_capture import ScenarioCaptureResultV2
+from cayu.evals.scenario_preflight import (
+    ScenarioArtifactMaterializationV2,
+    ScenarioLaunchPreflightResultV2,
+    ScenarioLaunchSettingsV2,
+)
 from cayu.evals.store import (
     EVAL_STORE_MAX_CLAIM_TARGETS,
     EvalBaselineMutationRecord,
@@ -56,6 +63,7 @@ from cayu.evals.store import (
     EvalRunCostBudget,
     EvalRunRecord,
     EvalRunStatus,
+    EvalScenarioCatalogEntry,
 )
 from cayu.runtime.aggregates import (
     AggregateAccuracy,
@@ -1340,6 +1348,65 @@ class CapturedEvaluationLaunchResponse(ApiBaseModel):
 
 class CapturedEvaluationExportRequest(CapturedEvaluationSaveRequest):
     pass
+
+
+def _eval_scenario_json_input(value: object) -> EvalScenarioDocumentV2 | object:
+    if type(value) is EvalScenarioDocumentV2:
+        return value
+    if isinstance(value, Mapping):
+        return EvalScenarioDocumentV2.model_validate_json(
+            json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        )
+    return value
+
+
+class EvalScenarioPreviewRequest(ApiBaseModel):
+    """Authority-free editor material plus current launch selections."""
+
+    draft: EvalScenarioDraftV2
+    settings: ScenarioLaunchSettingsV2 = Field(default_factory=ScenarioLaunchSettingsV2)
+
+
+class EvalScenarioPreviewResponse(ApiBaseModel):
+    scenario: EvalScenarioDocumentV2
+    preflight: ScenarioLaunchPreflightResultV2
+
+
+class EvalScenarioSaveRequest(ApiBaseModel):
+    """One reviewed immutable revision; settings affect only returned preflight."""
+
+    expected_scenario_revision: EvalRevision
+    scenario: EvalScenarioDocumentV2
+    settings: ScenarioLaunchSettingsV2 = Field(default_factory=ScenarioLaunchSettingsV2)
+
+    @field_validator("scenario", mode="before")
+    @classmethod
+    def validate_json_scenario(cls, value: object) -> EvalScenarioDocumentV2 | object:
+        return _eval_scenario_json_input(value)
+
+
+class EvalScenarioSaveResponse(ApiBaseModel):
+    entry: EvalScenarioCatalogEntry
+    scenario: EvalScenarioDocumentV2
+    preflight: ScenarioLaunchPreflightResultV2
+
+
+class EvalScenarioArtifactMaterializationRequest(ApiBaseModel):
+    """Explicit immutable fixture preparation bound to one reviewed revision."""
+
+    expected_scenario_revision: EvalRevision
+    scenario: EvalScenarioDocumentV2
+    settings: ScenarioLaunchSettingsV2 = Field(default_factory=ScenarioLaunchSettingsV2)
+
+    @field_validator("scenario", mode="before")
+    @classmethod
+    def validate_json_scenario(cls, value: object) -> EvalScenarioDocumentV2 | object:
+        return _eval_scenario_json_input(value)
+
+
+class EvalScenarioArtifactMaterializationResponse(ApiBaseModel):
+    materialization: ScenarioArtifactMaterializationV2
+    preflight: ScenarioLaunchPreflightResultV2
 
 
 class EvalBaselineSelectionRequest(ApiBaseModel):

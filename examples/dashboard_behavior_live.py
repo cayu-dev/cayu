@@ -1162,6 +1162,7 @@ async def _run_browser_contract(
             "sessions_list",
             "session_detail",
             "captured_evaluation_preview_and_assertion_authoring",
+            "scenario_authoring_and_launch_preflight",
             "captured_result_save_and_baseline",
             "eval_result_catalog_navigation",
             "eval_catalog_import_and_download",
@@ -1345,6 +1346,7 @@ async def _exercise_captured_evaluation(
     await expect(
         sheet.get_by_text("This score matches the current edits.", exact=True)
     ).to_be_visible()
+    await expect(sheet.get_by_test_id("scenario-authoring")).to_be_visible()
 
     export = sheet.get_by_test_id("promotion-export")
     await expect(export).to_be_enabled()
@@ -1362,6 +1364,35 @@ async def _exercise_captured_evaluation(
         sheet.get_by_text("This score matches the current edits.", exact=True)
     ).to_be_visible()
     await expect(export).to_be_enabled()
+
+    scenario_editor = sheet.get_by_test_id("scenario-authoring")
+    await scenario_editor.get_by_role("button", name="Queue input", exact=True).click()
+    queued_event = scenario_editor.get_by_test_id("scenario-event-1")
+    await expect(queued_event).to_be_visible()
+    queued_text = queued_event.locator("textarea")
+    require_equal(
+        await queued_text.count(),
+        1,
+        "a newly queued scenario event must expose exactly one text-part editor",
+    )
+    await queued_text.fill("Verify the queued production follow-up.")
+    await scenario_editor.get_by_role(
+        "spinbutton",
+        name="Max tool calls per trial",
+    ).fill("5")
+    await scenario_editor.get_by_role(
+        "button",
+        name="Check readiness",
+        exact=True,
+    ).click()
+    await expect(
+        scenario_editor.get_by_text(
+            "Current launch requirements are ready",
+            exact=True,
+        )
+    ).to_be_visible()
+    await scenario_editor.get_by_role("button", name="Save scenario", exact=True).click()
+    await expect(scenario_editor.get_by_text(re.compile(r"Saved scenario .+\."))).to_be_visible()
 
     async with page.expect_download() as download_info:
         await export.click()
@@ -1413,6 +1444,13 @@ async def _exercise_captured_evaluation(
     await expect(page.get_by_text("Immutable score evidence", exact=True)).to_be_visible()
     await expect(page.get_by_text("Baseline", exact=True)).to_be_visible()
     await page.get_by_role("button", name="Open corpus", exact=True).click()
+    scenario_row = (
+        page.get_by_test_id("scenario-catalog")
+        .get_by_role("row")
+        .filter(has_text="Captured dashboard regression")
+    )
+    await expect(scenario_row).to_be_visible()
+    await expect(scenario_row.get_by_text("2 events")).to_be_visible()
 
     runnable_preview_response = await page.request.post(
         f"{base_url}/api/evals/promotion/sessions/{PROMOTION_SESSION_ID}/preview",

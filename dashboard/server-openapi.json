@@ -8185,6 +8185,184 @@
         "title": "EvalRunStatus",
         "type": "string"
       },
+      "EvalScenarioArtifactMaterializationRequest": {
+        "additionalProperties": false,
+        "description": "Explicit immutable fixture preparation bound to one reviewed revision.",
+        "properties": {
+          "expected_scenario_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Expected Scenario Revision",
+            "type": "string"
+          },
+          "scenario": {
+            "$ref": "#/components/schemas/EvalScenarioDocumentV2"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/ScenarioLaunchSettingsV2"
+          }
+        },
+        "required": [
+          "expected_scenario_revision",
+          "scenario"
+        ],
+        "title": "EvalScenarioArtifactMaterializationRequest",
+        "type": "object"
+      },
+      "EvalScenarioArtifactMaterializationResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "materialization": {
+            "$ref": "#/components/schemas/ScenarioArtifactMaterializationV2"
+          },
+          "preflight": {
+            "$ref": "#/components/schemas/ScenarioLaunchPreflightResultV2"
+          }
+        },
+        "required": [
+          "materialization",
+          "preflight"
+        ],
+        "title": "EvalScenarioArtifactMaterializationResponse",
+        "type": "object"
+      },
+      "EvalScenarioCatalogEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "approval_checkpoint_count": {
+            "maximum": 1024.0,
+            "minimum": 0.0,
+            "title": "Approval Checkpoint Count",
+            "type": "integer"
+          },
+          "artifact_requirement_count": {
+            "maximum": 128.0,
+            "minimum": 0.0,
+            "title": "Artifact Requirement Count",
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "document_bytes": {
+            "maximum": 8388608.0,
+            "minimum": 1.0,
+            "title": "Document Bytes",
+            "type": "integer"
+          },
+          "event_count": {
+            "maximum": 1024.0,
+            "minimum": 1.0,
+            "title": "Event Count",
+            "type": "integer"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "input_event_count": {
+            "maximum": 1024.0,
+            "minimum": 1.0,
+            "title": "Input Event Count",
+            "type": "integer"
+          },
+          "message_count": {
+            "maximum": 32768.0,
+            "minimum": 1.0,
+            "title": "Message Count",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "part_count": {
+            "maximum": 1048576.0,
+            "minimum": 1.0,
+            "title": "Part Count",
+            "type": "integer"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "secret_requirement_count": {
+            "maximum": 128.0,
+            "minimum": 0.0,
+            "title": "Secret Requirement Count",
+            "type": "integer"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision",
+          "id",
+          "target_key",
+          "name",
+          "event_count",
+          "input_event_count",
+          "approval_checkpoint_count",
+          "message_count",
+          "part_count",
+          "artifact_requirement_count",
+          "secret_requirement_count",
+          "document_bytes",
+          "created_at"
+        ],
+        "title": "EvalScenarioCatalogEntry",
+        "type": "object"
+      },
+      "EvalScenarioCatalogPage": {
+        "additionalProperties": false,
+        "properties": {
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/EvalScenarioCatalogEntry"
+            },
+            "maxItems": 200,
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "EvalScenarioCatalogPage",
+        "type": "object"
+      },
       "EvalScenarioDocumentV2": {
         "additionalProperties": false,
         "description": "One canonical external-stimulus sequence with no executable authority.",
@@ -8288,6 +8466,180 @@
           "events"
         ],
         "title": "EvalScenarioDocumentV2",
+        "type": "object"
+      },
+      "EvalScenarioDraftV2": {
+        "additionalProperties": false,
+        "description": "Revision-free scenario material edited by a human or Control Plane.\n\nA draft is never executable and is not accepted by the durable store. The\nframework canonicalizes it into :class:`EvalScenarioDocumentV2`, computes\nthe content revision, and then runs launch preflight against current\nserver-owned authority.",
+        "properties": {
+          "artifact_requirements": {
+            "items": {
+              "$ref": "#/components/schemas/ScenarioArtifactRequirementV2"
+            },
+            "maxItems": 128,
+            "title": "Artifact Requirements",
+            "type": "array"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "events": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "approval_checkpoint": "#/components/schemas/ScenarioApprovalCheckpointEventV2",
+                  "initial": "#/components/schemas/ScenarioInitialInputEventV2",
+                  "queued": "#/components/schemas/ScenarioQueuedInputEventV2",
+                  "resumed": "#/components/schemas/ScenarioResumedInputEventV2"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/ScenarioInitialInputEventV2"
+                },
+                {
+                  "$ref": "#/components/schemas/ScenarioQueuedInputEventV2"
+                },
+                {
+                  "$ref": "#/components/schemas/ScenarioResumedInputEventV2"
+                },
+                {
+                  "$ref": "#/components/schemas/ScenarioApprovalCheckpointEventV2"
+                }
+              ]
+            },
+            "maxItems": 1024,
+            "minItems": 1,
+            "title": "Events",
+            "type": "array"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "secret_requirements": {
+            "items": {
+              "$ref": "#/components/schemas/ScenarioSecretRequirementV2"
+            },
+            "maxItems": 128,
+            "title": "Secret Requirements",
+            "type": "array"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvaluationSourceIdentityV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "target_key",
+          "name",
+          "events"
+        ],
+        "title": "EvalScenarioDraftV2",
+        "type": "object"
+      },
+      "EvalScenarioPreviewRequest": {
+        "additionalProperties": false,
+        "description": "Authority-free editor material plus current launch selections.",
+        "properties": {
+          "draft": {
+            "$ref": "#/components/schemas/EvalScenarioDraftV2"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/ScenarioLaunchSettingsV2"
+          }
+        },
+        "required": [
+          "draft"
+        ],
+        "title": "EvalScenarioPreviewRequest",
+        "type": "object"
+      },
+      "EvalScenarioPreviewResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "preflight": {
+            "$ref": "#/components/schemas/ScenarioLaunchPreflightResultV2"
+          },
+          "scenario": {
+            "$ref": "#/components/schemas/EvalScenarioDocumentV2"
+          }
+        },
+        "required": [
+          "scenario",
+          "preflight"
+        ],
+        "title": "EvalScenarioPreviewResponse",
+        "type": "object"
+      },
+      "EvalScenarioSaveRequest": {
+        "additionalProperties": false,
+        "description": "One reviewed immutable revision; settings affect only returned preflight.",
+        "properties": {
+          "expected_scenario_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Expected Scenario Revision",
+            "type": "string"
+          },
+          "scenario": {
+            "$ref": "#/components/schemas/EvalScenarioDocumentV2"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/ScenarioLaunchSettingsV2"
+          }
+        },
+        "required": [
+          "expected_scenario_revision",
+          "scenario"
+        ],
+        "title": "EvalScenarioSaveRequest",
+        "type": "object"
+      },
+      "EvalScenarioSaveResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "entry": {
+            "$ref": "#/components/schemas/EvalScenarioCatalogEntry"
+          },
+          "preflight": {
+            "$ref": "#/components/schemas/ScenarioLaunchPreflightResultV2"
+          },
+          "scenario": {
+            "$ref": "#/components/schemas/EvalScenarioDocumentV2"
+          }
+        },
+        "required": [
+          "entry",
+          "scenario",
+          "preflight"
+        ],
+        "title": "EvalScenarioSaveResponse",
         "type": "object"
       },
       "EvalSuiteCatalogEntry": {
@@ -12726,6 +13078,57 @@
         "title": "ScenarioApprovalCheckpointEventV2",
         "type": "object"
       },
+      "ScenarioArtifactLaunchBindingV2": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_id": {
+            "maxLength": 512,
+            "title": "Artifact Id",
+            "type": "string"
+          },
+          "content_sha256": {
+            "title": "Content Sha256",
+            "type": "string"
+          },
+          "requirement_id": {
+            "maxLength": 128,
+            "title": "Requirement Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "requirement_id",
+          "artifact_id",
+          "content_sha256"
+        ],
+        "title": "ScenarioArtifactLaunchBindingV2",
+        "type": "object"
+      },
+      "ScenarioArtifactMaterializationV2": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_id": {
+            "maxLength": 512,
+            "title": "Artifact Id",
+            "type": "string"
+          },
+          "requirement_id": {
+            "maxLength": 128,
+            "title": "Requirement Id",
+            "type": "string"
+          },
+          "scenario": {
+            "$ref": "#/components/schemas/EvalScenarioDocumentV2"
+          }
+        },
+        "required": [
+          "scenario",
+          "requirement_id",
+          "artifact_id"
+        ],
+        "title": "ScenarioArtifactMaterializationV2",
+        "type": "object"
+      },
       "ScenarioArtifactRequirementV2": {
         "additionalProperties": false,
         "description": "An immutable file requirement resolved and authorized only at launch.",
@@ -12996,6 +13399,332 @@
         "title": "ScenarioJsonPartV2",
         "type": "object"
       },
+      "ScenarioLaunchBindingV2": {
+        "additionalProperties": false,
+        "description": "Public-safe facts frozen by one successful current-authority preflight.",
+        "properties": {
+          "agent_name": {
+            "maxLength": 256,
+            "title": "Agent Name",
+            "type": "string"
+          },
+          "app_manifest_fingerprint": {
+            "title": "App Manifest Fingerprint",
+            "type": "string"
+          },
+          "application_release_id": {
+            "maxLength": 256,
+            "title": "Application Release Id",
+            "type": "string"
+          },
+          "approval_behavior": {
+            "const": "fresh_decision",
+            "default": "fresh_decision",
+            "title": "Approval Behavior",
+            "type": "string"
+          },
+          "artifacts": {
+            "items": {
+              "$ref": "#/components/schemas/ScenarioArtifactLaunchBindingV2"
+            },
+            "maxItems": 128,
+            "title": "Artifacts",
+            "type": "array"
+          },
+          "cost_budget": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalRunCostBudget-Output"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "environment_name": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Environment Name"
+          },
+          "max_concurrency": {
+            "maximum": 32.0,
+            "minimum": 1.0,
+            "title": "Max Concurrency",
+            "type": "integer"
+          },
+          "max_steps": {
+            "maximum": 256.0,
+            "minimum": 1.0,
+            "title": "Max Steps",
+            "type": "integer"
+          },
+          "operator_run_limits": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunLimits"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "scenario_revision": {
+            "title": "Scenario Revision",
+            "type": "string"
+          },
+          "secrets": {
+            "items": {
+              "$ref": "#/components/schemas/ScenarioSecretLaunchBindingV2"
+            },
+            "maxItems": 128,
+            "title": "Secrets",
+            "type": "array"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          },
+          "target_limits": {
+            "$ref": "#/components/schemas/RunLimits"
+          },
+          "timeout_seconds": {
+            "maximum": 3600.0,
+            "minimum": 1.0,
+            "title": "Timeout Seconds",
+            "type": "integer"
+          },
+          "trials": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Trials",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "scenario_revision",
+          "target_key",
+          "application_release_id",
+          "app_manifest_fingerprint",
+          "agent_name",
+          "trials",
+          "max_concurrency",
+          "timeout_seconds",
+          "max_steps",
+          "target_limits"
+        ],
+        "title": "ScenarioLaunchBindingV2",
+        "type": "object"
+      },
+      "ScenarioLaunchDiagnosticCode": {
+        "enum": [
+          "target_mismatch",
+          "provider_unavailable",
+          "environment_unavailable",
+          "execution_binding_required",
+          "artifact_binding_required",
+          "artifact_not_retained",
+          "artifact_access_denied",
+          "artifact_store_unavailable",
+          "artifact_content_inconsistent",
+          "secret_reference_unavailable",
+          "approval_tool_unavailable",
+          "approval_policy_selection_required",
+          "execution_limit_exceeded",
+          "pricing_unavailable",
+          "actor_authority_unavailable",
+          "scenario_content_unsafe"
+        ],
+        "title": "ScenarioLaunchDiagnosticCode",
+        "type": "string"
+      },
+      "ScenarioLaunchDiagnosticV2": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ScenarioLaunchDiagnosticCode"
+          },
+          "event_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event Id"
+          },
+          "message": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          },
+          "remediation": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Remediation",
+            "type": "string"
+          },
+          "requirement_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requirement Id"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "remediation"
+        ],
+        "title": "ScenarioLaunchDiagnosticV2",
+        "type": "object"
+      },
+      "ScenarioLaunchPreflightResultV2": {
+        "additionalProperties": false,
+        "properties": {
+          "binding": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ScenarioLaunchBindingV2"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/ScenarioLaunchDiagnosticV2"
+            },
+            "maxItems": 1024,
+            "title": "Diagnostics",
+            "type": "array"
+          },
+          "ready": {
+            "title": "Ready",
+            "type": "boolean"
+          },
+          "scenario_revision": {
+            "title": "Scenario Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ready",
+          "scenario_revision"
+        ],
+        "title": "ScenarioLaunchPreflightResultV2",
+        "type": "object"
+      },
+      "ScenarioLaunchSettingsV2": {
+        "additionalProperties": false,
+        "description": "Authority-free operator selections narrowed by current server policy.",
+        "properties": {
+          "approval_behavior": {
+            "const": "fresh_decision",
+            "default": "fresh_decision",
+            "title": "Approval Behavior",
+            "type": "string"
+          },
+          "artifact_references": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "maxProperties": 128,
+            "title": "Artifact References",
+            "type": "object"
+          },
+          "cost_budget": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalRunCostBudget-Input"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "environment_name": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Environment Name"
+          },
+          "limits": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunLimits"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "max_concurrency": {
+            "default": 1,
+            "maximum": 32.0,
+            "minimum": 1.0,
+            "title": "Max Concurrency",
+            "type": "integer"
+          },
+          "max_steps": {
+            "anyOf": [
+              {
+                "maximum": 256.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Steps"
+          },
+          "timeout_seconds": {
+            "default": 300,
+            "maximum": 3600.0,
+            "minimum": 1.0,
+            "title": "Timeout Seconds",
+            "type": "integer"
+          },
+          "trials": {
+            "default": 1,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Trials",
+            "type": "integer"
+          }
+        },
+        "title": "ScenarioLaunchSettingsV2",
+        "type": "object"
+      },
       "ScenarioQueuedInputEventV2": {
         "additionalProperties": false,
         "description": "Input queued while the scenario session is active.",
@@ -13076,6 +13805,34 @@
           "input"
         ],
         "title": "ScenarioResumedInputEventV2",
+        "type": "object"
+      },
+      "ScenarioSecretLaunchBindingV2": {
+        "additionalProperties": false,
+        "description": "Public proof that a named requirement has a current vault binding.",
+        "properties": {
+          "requirement_id": {
+            "maxLength": 128,
+            "title": "Requirement Id",
+            "type": "string"
+          },
+          "usage": {
+            "enum": [
+              "provider",
+              "tool",
+              "environment",
+              "artifact",
+              "other"
+            ],
+            "title": "Usage",
+            "type": "string"
+          }
+        },
+        "required": [
+          "requirement_id",
+          "usage"
+        ],
+        "title": "ScenarioSecretLaunchBindingV2",
         "type": "object"
       },
       "ScenarioSecretRequirementV2": {
@@ -13218,7 +13975,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "21",
+            "default": "22",
             "title": "Contract Version",
             "type": "string"
           },
@@ -16894,7 +17651,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "21",
+            "default": "22",
             "title": "Contract Version",
             "type": "string"
           }
@@ -19162,6 +19919,335 @@
           }
         },
         "summary": "Get Eval Result"
+      }
+    },
+    "/api/evals/scenarios": {
+      "get": {
+        "operationId": "list_eval_scenarios_api_evals_scenarios_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "target_key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Target Key"
+            }
+          },
+          {
+            "in": "query",
+            "name": "scenario_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scenario Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_result_bytes",
+            "required": false,
+            "schema": {
+              "default": 1048576,
+              "maximum": 8388608,
+              "minimum": 1024,
+              "title": "Max Result Bytes",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalScenarioCatalogPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "List Eval Scenarios"
+      },
+      "post": {
+        "operationId": "save_eval_scenario_api_evals_scenarios_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalScenarioSaveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalScenarioSaveResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Save Eval Scenario"
+      }
+    },
+    "/api/evals/scenarios/artifacts/{requirement_id}/materialize": {
+      "post": {
+        "operationId": "materialize_eval_scenario_artifact_api_evals_scenarios_artifacts__requirement_id__materialize_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "requirement_id",
+            "required": true,
+            "schema": {
+              "title": "Requirement Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalScenarioArtifactMaterializationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalScenarioArtifactMaterializationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Materialize Eval Scenario Artifact"
+      }
+    },
+    "/api/evals/scenarios/preview": {
+      "post": {
+        "operationId": "preview_eval_scenario_api_evals_scenarios_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalScenarioPreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalScenarioPreviewResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Preview Eval Scenario"
+      }
+    },
+    "/api/evals/scenarios/{scenario_revision}": {
+      "get": {
+        "operationId": "get_eval_scenario_api_evals_scenarios__scenario_revision__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_revision",
+            "required": true,
+            "schema": {
+              "title": "Scenario Revision",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalScenarioDocumentV2"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Get Eval Scenario"
+      }
+    },
+    "/api/evals/scenarios/{scenario_revision}/download": {
+      "get": {
+        "operationId": "download_eval_scenario_api_evals_scenarios__scenario_revision__download_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_revision",
+            "required": true,
+            "schema": {
+              "title": "Scenario Revision",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Download Eval Scenario"
       }
     },
     "/api/evals/sessions/{session_id}/evaluation/export": {

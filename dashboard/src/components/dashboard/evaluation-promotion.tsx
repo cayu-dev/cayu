@@ -14,6 +14,7 @@ import {
   XCircle,
 } from "lucide-react"
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { ScenarioAuthoring } from "@/components/dashboard/scenario-authoring"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
@@ -104,6 +105,7 @@ export function EvaluationPromotionAction({
   const capturedReadiness = readiness.captured_evaluation
   const persistenceReadiness = readiness.captured_result_persistence
   const freshReadiness = readiness.fresh_launch
+  const scenarioCatalogReady = readiness.catalog_write.state === "ready"
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
   const [preview, setPreview] = useState<EvaluationPromotionPreview | null>(null)
@@ -488,6 +490,19 @@ export function EvaluationPromotionAction({
               <div className="space-y-4">
                 {preview && (
                   <PromotionEvidenceSummary preview={preview} current={previewIsCurrent} />
+                )}
+                {preview?.scenario_conversion.available && preview.scenario_conversion.scenario && (
+                  <ScenarioAuthoring
+                    captured={preview.scenario_conversion.scenario}
+                    disabled={
+                      !scenarioCatalogReady ||
+                      previewing ||
+                      exporting ||
+                      saving ||
+                      launching ||
+                      baselining
+                    }
+                  />
                 )}
                 <fieldset
                   className="contents"

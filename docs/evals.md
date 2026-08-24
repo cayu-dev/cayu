@@ -908,10 +908,58 @@ as one coherent scenario. The authenticated Control Plane preview exposes this
 result and never invokes providers, tools, environments, hooks, recovery, or
 mutation paths.
 
-Scenario editing, launch-time target/secret/environment binding, fresh approval
-handling, and multi-stage execution remain separate follow-up layers. They
-consume this authority-free capture contract rather than placing runtime
-authority into the document.
+The same Evaluate sheet now opens an ordered scenario editor. Operators can
+rename the scenario, edit text and portable JSON, add/remove/reorder queued,
+resumed, and approval-checkpoint events, edit named secret requirements, select
+an environment, and set ordinary trial, concurrency, timeout, and per-run
+bounds. Saving writes the exact immutable revision shown by preview; a stale
+revision fails before any store or artifact mutation. Saved scenarios appear in
+the target-scoped **Evals → Catalog** view and can be reopened, edited into a new
+revision, and downloaded.
+
+**Check readiness** performs launch preflight against current server authority.
+It does not invoke a provider, run a tool, materialize an environment factory,
+or start application work. A successful result freezes the current release,
+AppManifest fingerprint, target, agent, environment, fresh-approval behavior,
+the unchanged target limits, any separate operator-selected run contraction,
+cost budget, named vault requirements, and verified
+environment-scoped artifact identities in a content-revisioned binding. Secret
+preflight checks only the selected environment's published logical-name mapping;
+it neither resolves nor serializes a vault handle or secret value. An
+unsuccessful result returns stable, public-safe diagnostics tied to the exact
+event or requirement when applicable. Target/provider/environment mismatches,
+broadened limits, missing pricing, unavailable tools, policies that do not prove
+a fresh approval pause, unpublished secret bindings, and unsafe public content
+all fail closed.
+
+Target and operator limits remain separate authorities in that binding. In
+particular, adding a per-run contraction never converts a session-cumulative
+target ceiling into a fresh allowance for each scenario stage or resume. File
+attachment count and byte ceilings are checked independently for every initial,
+queued, and resumed input. Each file part is one runtime attachment occurrence,
+so repeated references to the same immutable requirement count repeatedly.
+
+A session-scoped artifact cannot be attached to the fresh session. For a
+retained source artifact in the selected static environment, **Prepare fixture**
+verifies the exact size, media type, filename, and SHA-256 digest, then performs
+an explicit idempotent copy into that environment's artifact store under an
+environment-scoped identity. It returns a new unsaved scenario revision and
+reruns preflight. The operation never searches another environment's store,
+and factory-backed environments remain gated until a concrete server-published
+binding can be proven without allocating work.
+
+The protected API exposes the same bounded workflow at:
+
+- `POST /api/evals/scenarios/preview` for canonical draft compilation and
+  side-effect-free current-authority preflight;
+- `POST /api/evals/scenarios` plus target-scoped `GET` catalog/detail/download
+  routes for immutable persistence; and
+- `POST /api/evals/scenarios/artifacts/{requirement_id}/materialize` for the
+  explicit idempotent fixture operation.
+
+Scenario execution and fresh approval/resume recovery remain the next layer.
+They consume the reviewed scenario and preflight binding rather than placing
+runtime authority into the portable document.
 
 ### Durable eval catalog and run state
 

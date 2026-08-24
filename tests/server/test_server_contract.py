@@ -407,7 +407,7 @@ def test_system_diagnostics_reports_bounded_protected_runtime_state(tmp_path) ->
         "dashboard_enabled": True,
         "docs_enabled": False,
     }
-    assert body["versions"]["server_contract"] == "21"
+    assert body["versions"]["server_contract"] == "22"
     assert body["versions"]["cayu"] == body["capabilities"]["cayu_version"]
     assert body["capabilities"]["actor"] == {
         "subject": "operator-a",

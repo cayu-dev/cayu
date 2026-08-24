@@ -4104,6 +4104,108 @@ export type EvalRunSpec = {
 export type EvalRunStatus = 'queued' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
 
 /**
+ * EvalScenarioArtifactMaterializationRequest
+ *
+ * Explicit immutable fixture preparation bound to one reviewed revision.
+ */
+export type EvalScenarioArtifactMaterializationRequest = {
+    /**
+     * Expected Scenario Revision
+     */
+    expected_scenario_revision: string;
+    scenario: EvalScenarioDocumentV2;
+    settings?: ScenarioLaunchSettingsV2;
+};
+
+/**
+ * EvalScenarioArtifactMaterializationResponse
+ */
+export type EvalScenarioArtifactMaterializationResponse = {
+    materialization: ScenarioArtifactMaterializationV2;
+    preflight: ScenarioLaunchPreflightResultV2;
+};
+
+/**
+ * EvalScenarioCatalogEntry
+ */
+export type EvalScenarioCatalogEntry = {
+    /**
+     * Approval Checkpoint Count
+     */
+    approval_checkpoint_count: number;
+    /**
+     * Artifact Requirement Count
+     */
+    artifact_requirement_count: number;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Document Bytes
+     */
+    document_bytes: number;
+    /**
+     * Event Count
+     */
+    event_count: number;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Input Event Count
+     */
+    input_event_count: number;
+    /**
+     * Message Count
+     */
+    message_count: number;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Part Count
+     */
+    part_count: number;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Secret Requirement Count
+     */
+    secret_requirement_count: number;
+    /**
+     * Target Key
+     */
+    target_key: string;
+};
+
+/**
+ * EvalScenarioCatalogPage
+ */
+export type EvalScenarioCatalogPage = {
+    /**
+     * Has More
+     */
+    has_more?: boolean;
+    /**
+     * Items
+     */
+    items: Array<EvalScenarioCatalogEntry>;
+    /**
+     * Next Cursor
+     */
+    next_cursor?: string | null;
+};
+
+/**
  * EvalScenarioDocumentV2
  *
  * One canonical external-stimulus sequence with no executable authority.
@@ -4146,6 +4248,89 @@ export type EvalScenarioDocumentV2 = {
      * Target Key
      */
     target_key: string;
+};
+
+/**
+ * EvalScenarioDraftV2
+ *
+ * Revision-free scenario material edited by a human or Control Plane.
+ *
+ * A draft is never executable and is not accepted by the durable store. The
+ * framework canonicalizes it into :class:`EvalScenarioDocumentV2`, computes
+ * the content revision, and then runs launch preflight against current
+ * server-owned authority.
+ */
+export type EvalScenarioDraftV2 = {
+    /**
+     * Artifact Requirements
+     */
+    artifact_requirements?: Array<ScenarioArtifactRequirementV2>;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Events
+     */
+    events: Array<ScenarioInitialInputEventV2 | ScenarioQueuedInputEventV2 | ScenarioResumedInputEventV2 | ScenarioApprovalCheckpointEventV2>;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Secret Requirements
+     */
+    secret_requirements?: Array<ScenarioSecretRequirementV2>;
+    source?: EvaluationSourceIdentityV1 | null;
+    /**
+     * Target Key
+     */
+    target_key: string;
+};
+
+/**
+ * EvalScenarioPreviewRequest
+ *
+ * Authority-free editor material plus current launch selections.
+ */
+export type EvalScenarioPreviewRequest = {
+    draft: EvalScenarioDraftV2;
+    settings?: ScenarioLaunchSettingsV2;
+};
+
+/**
+ * EvalScenarioPreviewResponse
+ */
+export type EvalScenarioPreviewResponse = {
+    preflight: ScenarioLaunchPreflightResultV2;
+    scenario: EvalScenarioDocumentV2;
+};
+
+/**
+ * EvalScenarioSaveRequest
+ *
+ * One reviewed immutable revision; settings affect only returned preflight.
+ */
+export type EvalScenarioSaveRequest = {
+    /**
+     * Expected Scenario Revision
+     */
+    expected_scenario_revision: string;
+    scenario: EvalScenarioDocumentV2;
+    settings?: ScenarioLaunchSettingsV2;
+};
+
+/**
+ * EvalScenarioSaveResponse
+ */
+export type EvalScenarioSaveResponse = {
+    entry: EvalScenarioCatalogEntry;
+    preflight: ScenarioLaunchPreflightResultV2;
+    scenario: EvalScenarioDocumentV2;
 };
 
 /**
@@ -6538,6 +6723,39 @@ export type ScenarioApprovalCheckpointEventV2 = {
 };
 
 /**
+ * ScenarioArtifactLaunchBindingV2
+ */
+export type ScenarioArtifactLaunchBindingV2 = {
+    /**
+     * Artifact Id
+     */
+    artifact_id: string;
+    /**
+     * Content Sha256
+     */
+    content_sha256: string;
+    /**
+     * Requirement Id
+     */
+    requirement_id: string;
+};
+
+/**
+ * ScenarioArtifactMaterializationV2
+ */
+export type ScenarioArtifactMaterializationV2 = {
+    /**
+     * Artifact Id
+     */
+    artifact_id: string;
+    /**
+     * Requirement Id
+     */
+    requirement_id: string;
+    scenario: EvalScenarioDocumentV2;
+};
+
+/**
  * ScenarioArtifactRequirementV2
  *
  * An immutable file requirement resolved and authorized only at launch.
@@ -6688,6 +6906,160 @@ export type ScenarioJsonPartV2 = {
 };
 
 /**
+ * ScenarioLaunchBindingV2
+ *
+ * Public-safe facts frozen by one successful current-authority preflight.
+ */
+export type ScenarioLaunchBindingV2 = {
+    /**
+     * Agent Name
+     */
+    agent_name: string;
+    /**
+     * App Manifest Fingerprint
+     */
+    app_manifest_fingerprint: string;
+    /**
+     * Application Release Id
+     */
+    application_release_id: string;
+    /**
+     * Approval Behavior
+     */
+    approval_behavior?: 'fresh_decision';
+    /**
+     * Artifacts
+     */
+    artifacts?: Array<ScenarioArtifactLaunchBindingV2>;
+    cost_budget?: EvalRunCostBudgetOutput | null;
+    /**
+     * Environment Name
+     */
+    environment_name?: string | null;
+    /**
+     * Max Concurrency
+     */
+    max_concurrency: number;
+    /**
+     * Max Steps
+     */
+    max_steps: number;
+    operator_run_limits?: RunLimits | null;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Scenario Revision
+     */
+    scenario_revision: string;
+    /**
+     * Secrets
+     */
+    secrets?: Array<ScenarioSecretLaunchBindingV2>;
+    /**
+     * Target Key
+     */
+    target_key: string;
+    target_limits: RunLimits;
+    /**
+     * Timeout Seconds
+     */
+    timeout_seconds: number;
+    /**
+     * Trials
+     */
+    trials: number;
+};
+
+/**
+ * ScenarioLaunchDiagnosticCode
+ */
+export type ScenarioLaunchDiagnosticCode = 'target_mismatch' | 'provider_unavailable' | 'environment_unavailable' | 'execution_binding_required' | 'artifact_binding_required' | 'artifact_not_retained' | 'artifact_access_denied' | 'artifact_store_unavailable' | 'artifact_content_inconsistent' | 'secret_reference_unavailable' | 'approval_tool_unavailable' | 'approval_policy_selection_required' | 'execution_limit_exceeded' | 'pricing_unavailable' | 'actor_authority_unavailable' | 'scenario_content_unsafe';
+
+/**
+ * ScenarioLaunchDiagnosticV2
+ */
+export type ScenarioLaunchDiagnosticV2 = {
+    code: ScenarioLaunchDiagnosticCode;
+    /**
+     * Event Id
+     */
+    event_id?: string | null;
+    /**
+     * Message
+     */
+    message: string;
+    /**
+     * Remediation
+     */
+    remediation: string;
+    /**
+     * Requirement Id
+     */
+    requirement_id?: string | null;
+};
+
+/**
+ * ScenarioLaunchPreflightResultV2
+ */
+export type ScenarioLaunchPreflightResultV2 = {
+    binding?: ScenarioLaunchBindingV2 | null;
+    /**
+     * Diagnostics
+     */
+    diagnostics?: Array<ScenarioLaunchDiagnosticV2>;
+    /**
+     * Ready
+     */
+    ready: boolean;
+    /**
+     * Scenario Revision
+     */
+    scenario_revision: string;
+};
+
+/**
+ * ScenarioLaunchSettingsV2
+ *
+ * Authority-free operator selections narrowed by current server policy.
+ */
+export type ScenarioLaunchSettingsV2 = {
+    /**
+     * Approval Behavior
+     */
+    approval_behavior?: 'fresh_decision';
+    /**
+     * Artifact References
+     */
+    artifact_references?: {
+        [key: string]: string;
+    };
+    cost_budget?: EvalRunCostBudgetInput | null;
+    /**
+     * Environment Name
+     */
+    environment_name?: string | null;
+    limits?: RunLimits | null;
+    /**
+     * Max Concurrency
+     */
+    max_concurrency?: number;
+    /**
+     * Max Steps
+     */
+    max_steps?: number | null;
+    /**
+     * Timeout Seconds
+     */
+    timeout_seconds?: number;
+    /**
+     * Trials
+     */
+    trials?: number;
+};
+
+/**
  * ScenarioQueuedInputEventV2
  *
  * Input queued while the scenario session is active.
@@ -6735,6 +7107,22 @@ export type ScenarioResumedInputEventV2 = {
      * Sequence
      */
     sequence: number;
+};
+
+/**
+ * ScenarioSecretLaunchBindingV2
+ *
+ * Public proof that a named requirement has a current vault binding.
+ */
+export type ScenarioSecretLaunchBindingV2 = {
+    /**
+     * Requirement Id
+     */
+    requirement_id: string;
+    /**
+     * Usage
+     */
+    usage: 'provider' | 'tool' | 'environment' | 'artifact' | 'other';
 };
 
 /**
@@ -10288,6 +10676,274 @@ export type GetEvalResultApiEvalsRunsRunIdResultGetResponses = {
 };
 
 export type GetEvalResultApiEvalsRunsRunIdResultGetResponse = GetEvalResultApiEvalsRunsRunIdResultGetResponses[keyof GetEvalResultApiEvalsRunsRunIdResultGetResponses];
+
+export type ListEvalScenariosApiEvalsScenariosGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Target Key
+         */
+        target_key?: string | null;
+        /**
+         * Scenario Id
+         */
+        scenario_id?: string | null;
+        /**
+         * Cursor
+         */
+        cursor?: string | null;
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * Max Result Bytes
+         */
+        max_result_bytes?: number;
+    };
+    url: '/api/evals/scenarios';
+};
+
+export type ListEvalScenariosApiEvalsScenariosGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type ListEvalScenariosApiEvalsScenariosGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalScenarioCatalogPage;
+};
+
+export type ListEvalScenariosApiEvalsScenariosGetResponse = ListEvalScenariosApiEvalsScenariosGetResponses[keyof ListEvalScenariosApiEvalsScenariosGetResponses];
+
+export type SaveEvalScenarioApiEvalsScenariosPostData = {
+    body: EvalScenarioSaveRequest;
+    path?: never;
+    query?: never;
+    url: '/api/evals/scenarios';
+};
+
+export type SaveEvalScenarioApiEvalsScenariosPostErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type SaveEvalScenarioApiEvalsScenariosPostResponses = {
+    /**
+     * Successful Response
+     */
+    201: EvalScenarioSaveResponse;
+};
+
+export type SaveEvalScenarioApiEvalsScenariosPostResponse = SaveEvalScenarioApiEvalsScenariosPostResponses[keyof SaveEvalScenarioApiEvalsScenariosPostResponses];
+
+export type MaterializeEvalScenarioArtifactApiEvalsScenariosArtifactsRequirementIdMaterializePostData = {
+    body: EvalScenarioArtifactMaterializationRequest;
+    path: {
+        /**
+         * Requirement Id
+         */
+        requirement_id: string;
+    };
+    query?: never;
+    url: '/api/evals/scenarios/artifacts/{requirement_id}/materialize';
+};
+
+export type MaterializeEvalScenarioArtifactApiEvalsScenariosArtifactsRequirementIdMaterializePostErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type MaterializeEvalScenarioArtifactApiEvalsScenariosArtifactsRequirementIdMaterializePostResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalScenarioArtifactMaterializationResponse;
+};
+
+export type MaterializeEvalScenarioArtifactApiEvalsScenariosArtifactsRequirementIdMaterializePostResponse = MaterializeEvalScenarioArtifactApiEvalsScenariosArtifactsRequirementIdMaterializePostResponses[keyof MaterializeEvalScenarioArtifactApiEvalsScenariosArtifactsRequirementIdMaterializePostResponses];
+
+export type PreviewEvalScenarioApiEvalsScenariosPreviewPostData = {
+    body: EvalScenarioPreviewRequest;
+    path?: never;
+    query?: never;
+    url: '/api/evals/scenarios/preview';
+};
+
+export type PreviewEvalScenarioApiEvalsScenariosPreviewPostErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type PreviewEvalScenarioApiEvalsScenariosPreviewPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalScenarioPreviewResponse;
+};
+
+export type PreviewEvalScenarioApiEvalsScenariosPreviewPostResponse = PreviewEvalScenarioApiEvalsScenariosPreviewPostResponses[keyof PreviewEvalScenarioApiEvalsScenariosPreviewPostResponses];
+
+export type GetEvalScenarioApiEvalsScenariosScenarioRevisionGetData = {
+    body?: never;
+    path: {
+        /**
+         * Scenario Revision
+         */
+        scenario_revision: string;
+    };
+    query?: never;
+    url: '/api/evals/scenarios/{scenario_revision}';
+};
+
+export type GetEvalScenarioApiEvalsScenariosScenarioRevisionGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type GetEvalScenarioApiEvalsScenariosScenarioRevisionGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalScenarioDocumentV2;
+};
+
+export type GetEvalScenarioApiEvalsScenariosScenarioRevisionGetResponse = GetEvalScenarioApiEvalsScenariosScenarioRevisionGetResponses[keyof GetEvalScenarioApiEvalsScenariosScenarioRevisionGetResponses];
+
+export type DownloadEvalScenarioApiEvalsScenariosScenarioRevisionDownloadGetData = {
+    body?: never;
+    path: {
+        /**
+         * Scenario Revision
+         */
+        scenario_revision: string;
+    };
+    query?: never;
+    url: '/api/evals/scenarios/{scenario_revision}/download';
+};
+
+export type DownloadEvalScenarioApiEvalsScenariosScenarioRevisionDownloadGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type DownloadEvalScenarioApiEvalsScenariosScenarioRevisionDownloadGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
 
 export type ExportCapturedEvaluationApiEvalsSessionsSessionIdEvaluationExportPostData = {
     body: CapturedEvaluationExportRequest;

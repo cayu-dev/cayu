@@ -27,6 +27,7 @@ import {
   PayloadViewer,
   StateMessage,
 } from "@/components/dashboard/layout"
+import { ScenarioAuthoring } from "@/components/dashboard/scenario-authoring"
 import { useDashboardCapability, useServerContract } from "@/components/dashboard/server-contract"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -48,12 +49,14 @@ import {
   downloadEvalCorpus,
   downloadEvalResultHtml,
   downloadEvalResultJson,
+  downloadEvalScenario,
   type EvalCorpusEntry,
   type EvalResult,
   type EvalResultComparison,
   type EvalResultDetail,
   type EvalResultSummary,
   type EvalRun,
+  type EvalScenarioEntry,
   type EvalStatus,
   type EvalTarget,
   fetchEvalCases,
@@ -63,6 +66,8 @@ import {
   fetchEvalResults,
   fetchEvalRun,
   fetchEvalRuns,
+  fetchEvalScenario,
+  fetchEvalScenarios,
   fetchEvalSuites,
   fetchEvalTargets,
   importEvalCorpus,
@@ -434,14 +439,23 @@ export function EvalsPage() {
             hidden={activeTab !== "catalog"}
           >
             {activeTab === "catalog" && (
-              <CatalogView
-                search={search}
-                targetKey={selectedTargetKey}
-                updateSearch={updateSearch}
-                pendingAction={pendingAction}
-                runAction={runAction}
-                mutateEnabled={mutateCapability.enabled}
-              />
+              <div className="space-y-6">
+                <ScenarioCatalog
+                  key={selectedTargetKey}
+                  targetKey={selectedTargetKey}
+                  pendingAction={pendingAction}
+                  runAction={runAction}
+                  mutateEnabled={mutateCapability.enabled}
+                />
+                <CatalogView
+                  search={search}
+                  targetKey={selectedTargetKey}
+                  updateSearch={updateSearch}
+                  pendingAction={pendingAction}
+                  runAction={runAction}
+                  mutateEnabled={mutateCapability.enabled}
+                />
+              </div>
             )}
           </div>
           <div
@@ -556,6 +570,167 @@ function EvalsReadinessOverview({ readiness }: { readiness: EvalsReadiness }) {
             </div>
           )
         })}
+      </div>
+    </DataCard>
+  )
+}
+
+function ScenarioCatalog({
+  targetKey,
+  pendingAction,
+  runAction,
+  mutateEnabled,
+}: {
+  targetKey: string
+  pendingAction: string | null
+  runAction: (
+    name: string,
+    action: (signal: AbortSignal) => Promise<string | undefined>,
+  ) => Promise<void>
+  mutateEnabled: boolean
+}) {
+  const [cursor, setCursor] = useState<string | undefined>()
+  const [selectedRevision, setSelectedRevision] = useState<string | null>(null)
+  const scenarios = useQuery({
+    queryKey: ["evals", "scenarios", targetKey, cursor],
+    queryFn: ({ signal }) =>
+      fetchEvalScenarios({ target_key: targetKey, limit: 10, cursor }, signal),
+  })
+  useEffect(() => {
+    if (
+      selectedRevision === null ||
+      !scenarios.data?.items.some((item) => item.revision === selectedRevision)
+    ) {
+      setSelectedRevision(scenarios.data?.items[0]?.revision ?? null)
+    }
+  }, [scenarios.data?.items, selectedRevision])
+  const selected = useQuery({
+    queryKey: ["evals", "scenario", selectedRevision],
+    queryFn: ({ signal }) => fetchEvalScenario(selectedRevision ?? "", signal),
+    enabled: selectedRevision !== null,
+  })
+
+  const download = (entry: EvalScenarioEntry) => {
+    if (pendingAction !== null) return
+    void runAction(`download-scenario:${entry.revision}`, async (signal) => {
+      const file = await downloadEvalScenario(entry.revision, signal)
+      if (signal.aborted) return
+      downloadBlob(file.blob, file.filename)
+      return `Downloaded scenario ${shortEvalIdentity(entry.revision)}.`
+    })
+  }
+
+  return (
+    <DataCard
+      testId="scenario-catalog"
+      title="Production scenarios"
+      description="Immutable, editable multi-stage stimuli captured from production sessions."
+    >
+      <div className="grid min-w-0 gap-4 xl:grid-cols-[minmax(22rem,0.8fr)_minmax(0,1.4fr)]">
+        <div className="min-w-0 border-r-0 border-border xl:border-r">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Scenario</TableHead>
+                <TableHead>Stages</TableHead>
+                <TableHead>Created</TableHead>
+                <TableHead />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {scenarios.data?.items.map((entry) => (
+                <TableRow
+                  key={entry.revision}
+                  data-state={selectedRevision === entry.revision ? "selected" : undefined}
+                >
+                  <TableCell>
+                    <button
+                      type="button"
+                      className="max-w-56 truncate text-left font-medium text-primary hover:underline"
+                      title={entry.name}
+                      onClick={() => setSelectedRevision(entry.revision)}
+                    >
+                      {entry.name}
+                    </button>
+                    <div className="mt-1 font-mono text-xs text-muted-foreground">
+                      {shortEvalIdentity(entry.revision)}
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    {formatCount(entry.event_count)} events
+                    <div className="text-xs text-muted-foreground">
+                      {formatCount(entry.artifact_requirement_count)} files ·{" "}
+                      {formatCount(entry.secret_requirement_count)} secrets
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    {formatDateTime(entry.created_at)}
+                    <div className="text-xs text-muted-foreground">
+                      {formatBytes(entry.document_bytes)}
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <Button
+                      type="button"
+                      size="icon-xs"
+                      variant="ghost"
+                      aria-label={`Download scenario ${entry.name}`}
+                      disabled={pendingAction !== null}
+                      onClick={() => download(entry)}
+                    >
+                      {pendingAction === `download-scenario:${entry.revision}` ? (
+                        <LoaderCircle className="animate-spin" />
+                      ) : (
+                        <Download />
+                      )}
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+          {scenarios.isLoading ? (
+            <LoadingState label="Loading scenarios..." />
+          ) : scenarios.isError ? (
+            <QueryError
+              message="Could not load the scenario catalog."
+              retry={() => void scenarios.refetch()}
+            />
+          ) : scenarios.data?.items.length === 0 ? (
+            <StateMessage>
+              No scenarios yet. Open a completed session, choose Evaluate, and save its production
+              scenario.
+            </StateMessage>
+          ) : null}
+          <PageControls
+            scope="scenario catalog"
+            cursor={cursor}
+            nextCursor={scenarios.data?.next_cursor}
+            fetching={scenarios.isFetching}
+            first={() => {
+              setCursor(undefined)
+              setSelectedRevision(null)
+            }}
+            next={(nextCursor) => {
+              setCursor(nextCursor)
+              setSelectedRevision(null)
+            }}
+          />
+        </div>
+        <div className="min-w-0 p-3">
+          {selected.isLoading ? (
+            <LoadingState label="Loading scenario..." />
+          ) : selected.isError ? (
+            <QueryError
+              message="Could not load the selected scenario."
+              retry={() => void selected.refetch()}
+            />
+          ) : selected.data ? (
+            <ScenarioAuthoring captured={selected.data} disabled={!mutateEnabled} />
+          ) : (
+            <StateMessage>Select a scenario revision to inspect and edit it.</StateMessage>
+          )}
+        </div>
       </div>
     </DataCard>
   )

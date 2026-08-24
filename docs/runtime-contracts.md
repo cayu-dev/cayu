@@ -4750,6 +4750,16 @@ objects. Built-in stores persist immutable scenarios only after the configured
 credential-redaction boundary accepts the complete document; additive storage
 revision 53 owns the independent scenario table and catalog indexes.
 
+Scenario launch preflight binds current execution authority without collapsing
+its scopes. The target's declared `RunLimits` remain unchanged, including a
+session-cumulative scope, while an operator-selected contraction is recorded as
+a separate run-scoped authority. A multi-stage or resumed scenario must enforce
+both; it cannot turn the target's cumulative ceiling into a renewed per-stage
+allowance. Runtime file ceilings are checked per initial, queued, or resumed
+input from its actual `ScenarioFilePartV2` occurrences. Reusing one artifact
+requirement in the same input consumes the count and byte ceilings once per file
+part, while attachments in separate inputs are assessed independently.
+
 Production-session scenario capture consumes bounded terminal evidence and
 these runtime-owned input contracts. It accepts only exact initial, delivered
 queue, and ordinary resume boundaries whose transcript positions and digests
