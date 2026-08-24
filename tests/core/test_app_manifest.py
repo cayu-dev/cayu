@@ -449,6 +449,22 @@ def test_manifest_reports_prompt_presence_without_exposing_prompt_content() -> N
     assert changed_prompt.describe().fingerprint == present.fingerprint
 
 
+def test_manifest_reports_and_fingerprints_tool_gateway_opt_in() -> None:
+    disabled = CayuApp(enable_logging=False)
+    disabled.register_agent(AgentSpec(name="writer", model="model"))
+    enabled = CayuApp(enable_logging=False)
+    enabled.register_agent(
+        AgentSpec(name="writer", model="model"),
+        enable_tool_gateway=True,
+    )
+
+    disabled_manifest = disabled.describe()
+    enabled_manifest = enabled.describe()
+    assert disabled_manifest.agents[0].tool_gateway_enabled is False
+    assert enabled_manifest.agents[0].tool_gateway_enabled is True
+    assert disabled_manifest.fingerprint != enabled_manifest.fingerprint
+
+
 def test_agent_execution_requirements_are_typed_and_fingerprinted() -> None:
     trusted = CayuApp(enable_logging=False)
     trusted.register_agent(AgentSpec(name="worker", model="model"))

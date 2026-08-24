@@ -26,6 +26,7 @@ from cayu.runtime.tool_catalogue import CALL_TOOL_NAME, ToolCatalogSnapshot
 from cayu.runtime.tool_grants import (
     TARGETED_TOOL_GRANT_MAX_REQUESTS,
     TARGETED_TOOL_REFERENCE_MAX_BYTES,
+    TARGETED_TOOL_TRANSCRIPT_REFERENCE,
     RejectedTargetedToolInvocation,
     ResolvedTargetedToolInvocation,
     TargetedToolGrantRecord,
@@ -49,6 +50,47 @@ CALL_TOOL_REJECTION_CONTENT = {
         "The call_tool arguments do not satisfy the granted tool schema."
     ),
 }
+
+
+def call_tool_spec() -> dict[str, Any]:
+    """Return a detached provider-facing definition for the stable gateway tool."""
+
+    return {
+        "name": CALL_TOOL_NAME,
+        "description": (
+            "Call one tool from the current Cayu targeted-tool context using its exact "
+            "opaque reference. The reference grants addressability only; Cayu still "
+            "applies the target's validation, policy, approval, and execution controls."
+        ),
+        "input_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "tool_ref": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": TARGETED_TOOL_REFERENCE_MAX_BYTES,
+                },
+                "arguments": {"type": "object"},
+            },
+            "required": ["tool_ref", "arguments"],
+        },
+    }
+
+
+def call_tool_gateway_execution_profile_material() -> dict[str, Any]:
+    """Bind the exact stable gateway schema into an agent execution profile."""
+
+    return {
+        "kind": "cayu:portable-call-tool-gateway",
+        "schema_version": CALL_TOOL_SCHEMA_VERSION,
+        "tool_spec_sha256": (
+            "sha256:"
+            + sha256(
+                canonical_durable_json_bytes(call_tool_spec(), "call_tool.tool_spec")
+            ).hexdigest()
+        ),
+    }
 
 
 class CallToolEnvelope(BaseModel):
@@ -81,6 +123,36 @@ class CallToolEnvelope(BaseModel):
                 f"call_tool.arguments cannot exceed {CALL_TOOL_MAX_ARGUMENT_BYTES} bytes."
             )
         return copied
+
+
+def gateway_lifecycle_matches_outer_call(
+    *,
+    effective_tool_name: str | None,
+    event_payload: dict[str, Any],
+    outer_tool_name: str,
+    outer_arguments: dict[str, Any],
+) -> bool:
+    """Match effective lifecycle evidence to a safe ``call_tool`` transcript call."""
+
+    if (
+        type(effective_tool_name) is not str
+        or effective_tool_name == CALL_TOOL_NAME
+        or outer_tool_name != CALL_TOOL_NAME
+        or event_payload.get("dispatch_kind") != "gateway"
+        or event_payload.get("model_tool_name") != CALL_TOOL_NAME
+    ):
+        return False
+    try:
+        envelope = CallToolEnvelope.model_validate(outer_arguments)
+    except (TypeError, ValueError):
+        return False
+    if event_payload.get("arguments_sha256") == arguments_sha256(envelope.arguments):
+        return True
+    return (
+        event_payload.get("arguments_state") in {"quarantined", "unavailable"}
+        and envelope.tool_ref == TARGETED_TOOL_TRANSCRIPT_REFERENCE
+        and not envelope.arguments
+    )
 
 
 class TargetedToolGatewayGrant(BaseModel):
@@ -156,29 +228,6 @@ class TargetedToolGatewayProjection(BaseModel):
             )
         return self
 
-    def tool_spec(self) -> dict[str, Any]:
-        return {
-            "name": CALL_TOOL_NAME,
-            "description": (
-                "Call one tool from the current Cayu targeted-tool context using its exact "
-                "opaque reference. The reference grants addressability only; Cayu still "
-                "applies the target's validation, policy, approval, and execution controls."
-            ),
-            "input_schema": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "tool_ref": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": TARGETED_TOOL_REFERENCE_MAX_BYTES,
-                    },
-                    "arguments": {"type": "object"},
-                },
-                "required": ["tool_ref", "arguments"],
-            },
-        }
-
     def instruction_text(self, *, redactor: SecretRedactor | None = None) -> str:
         if redactor is not None and not isinstance(redactor, SecretRedactor):
             raise TypeError("redactor must be a SecretRedactor or None.")
@@ -232,8 +281,10 @@ class TargetedToolGatewayProjection(BaseModel):
             )
         return instruction
 
-    def instruction_message(self, *, redactor: SecretRedactor | None = None) -> Message:
-        return Message.text("system", self.instruction_text(redactor=redactor))
+    def context_message(self, *, redactor: SecretRedactor | None = None) -> Message:
+        """Return untrusted dynamic metadata as a cache-safe conversation suffix."""
+
+        return Message.text("user", self.instruction_text(redactor=redactor))
 
     def reference_grant_ids(self) -> dict[str, str]:
         """Return the exact runtime-projected reference-to-grant mapping."""

@@ -6871,6 +6871,10 @@ class SessionEngine:
 
         if not grants:
             return ()
+        if not registered_agent.tool_gateway_enabled:
+            raise ValueError(
+                "Targeted tool grants require enable_tool_gateway=True at agent registration."
+            )
         if (
             not self.session_store.supports_targeted_tool_grants
             or not self.session_store.supports_public_authority_aliases
@@ -13087,6 +13091,7 @@ class SessionEngine:
                             effective_tool_capability_ceiling.tool_names,
                         ),
                         structured_output=request.structured_output,
+                        tool_gateway_enabled=registered_agent.tool_gateway_enabled,
                     )
                     registered_provider.provider.preflight_portable_messages(
                         model=requested_target.model,
@@ -14219,6 +14224,7 @@ class SessionEngine:
                                     effective_tool_capability_ceiling.tool_names,
                                 ),
                                 structured_output=None,
+                                tool_gateway_enabled=registered_agent.tool_gateway_enabled,
                             )
                             registered_provider.provider.preflight_portable_messages(
                                 model=model,

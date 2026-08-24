@@ -337,6 +337,7 @@ from cayu.runtime.tool_exposure import (
 )
 from cayu.runtime.tool_gateway import (
     TargetedToolGatewayProjection,
+    call_tool_spec,
     targeted_tool_gateway_projection,
 )
 from cayu.runtime.usage import (
@@ -4299,8 +4300,12 @@ class ModelStepExecutor:
         model_tools = _model_request_tools(
             tool_exposure=resolved_tool_exposure,
             structured_output=structured_output,
-            targeted_tool_gateway=targeted_tool_gateway,
+            tool_gateway_enabled=registered_agent.tool_gateway_enabled,
         )
+        if targeted_tool_gateway is not None and not registered_agent.tool_gateway_enabled:
+            raise RuntimeError(
+                "Targeted tool context requires enable_tool_gateway=True at agent registration."
+            )
         model_messages = _model_request_messages(
             messages=context_messages,
             structured_output=structured_output,
@@ -10248,9 +10253,12 @@ def _model_request_tools(
     *,
     tool_exposure: ResolvedToolExposure,
     structured_output: StructuredOutputSpec | None,
-    targeted_tool_gateway: TargetedToolGatewayProjection | None = None,
+    tool_gateway_enabled: bool = False,
 ) -> list[dict[str, Any]]:
     """Build detached tool declarations shared by preflight and model dispatch."""
+
+    if type(tool_gateway_enabled) is not bool:
+        raise TypeError("tool_gateway_enabled must be a bool.")
 
     tools = [
         {
@@ -10265,8 +10273,8 @@ def _model_request_tools(
         and structured_output.strategy == StructuredOutputStrategy.TOOL
     ):
         tools.append(structured_output_tool_spec(structured_output))
-    if targeted_tool_gateway is not None:
-        tools.append(targeted_tool_gateway.tool_spec())
+    if tool_gateway_enabled:
+        tools.append(call_tool_spec())
     return tools
 
 
@@ -10343,17 +10351,13 @@ def _with_targeted_tool_gateway_instruction(
     targeted_tool_gateway: TargetedToolGatewayProjection,
     redactor: SecretRedactor | None = None,
 ) -> list[Message]:
-    """Insert one detached runtime-authored gateway descriptor message."""
+    """Append one detached runtime-authored gateway descriptor message."""
 
     if type(targeted_tool_gateway) is not TargetedToolGatewayProjection:
         raise TypeError("targeted_tool_gateway must be a TargetedToolGatewayProjection.")
     copied = [detach_message(message) for message in messages]
-    insert_at = 0
-    while insert_at < len(copied) and copied[insert_at].role == MessageRole.SYSTEM:
-        insert_at += 1
-    copied.insert(
-        insert_at,
-        targeted_tool_gateway.instruction_message(redactor=redactor),
+    copied.append(
+        targeted_tool_gateway.context_message(redactor=redactor),
     )
     return copied
 
@@ -10375,7 +10379,7 @@ def _context_pressure_overhead(
     tools = _model_request_tools(
         tool_exposure=tool_exposure,
         structured_output=structured_output,
-        targeted_tool_gateway=targeted_tool_gateway,
+        tool_gateway_enabled=registered_agent.tool_gateway_enabled,
     )
     structured_output_instruction: str | None = None
     if (

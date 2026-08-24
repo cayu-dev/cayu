@@ -74,6 +74,7 @@ from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.runtime.tool_gateway import (
     TargetedToolGatewayGrant,
     TargetedToolGatewayProjection,
+    gateway_lifecycle_matches_outer_call,
     validate_effective_tool_arguments,
 )
 from cayu.runtime.tool_grants import (
@@ -253,7 +254,7 @@ class _GatewayProvider(_Provider):
             gateway_message = next(
                 message
                 for message in request.messages
-                if message.role == "system"
+                if message.role == "user"
                 and message.content[0].text.startswith("Cayu runtime targeted-tool context")
             )
             projection = json.loads(gateway_message.content[0].text.rsplit("\n", 1)[1])
@@ -292,6 +293,64 @@ class _GatewayProvider(_Provider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
+def test_private_gateway_lifecycle_match_requires_the_safe_transcript_projection() -> None:
+    payload = {
+        "dispatch_kind": "gateway",
+        "model_tool_name": "call_tool",
+        "arguments_state": "unavailable",
+        "arguments_sha256": "sha256:" + "1" * 64,
+    }
+    safe_arguments = {
+        "tool_ref": TARGETED_TOOL_TRANSCRIPT_REFERENCE,
+        "arguments": {},
+    }
+
+    assert gateway_lifecycle_matches_outer_call(
+        effective_tool_name="remember",
+        event_payload=payload,
+        outer_tool_name="call_tool",
+        outer_arguments=safe_arguments,
+    )
+    assert gateway_lifecycle_matches_outer_call(
+        effective_tool_name="remember",
+        event_payload={**payload, "arguments_state": "quarantined"},
+        outer_tool_name="call_tool",
+        outer_arguments=safe_arguments,
+    )
+    for effective_tool_name, candidate_payload, outer_tool_name, outer_arguments in (
+        (
+            "remember",
+            {**payload, "arguments_state": "finalized"},
+            "call_tool",
+            safe_arguments,
+        ),
+        (
+            "remember",
+            payload,
+            "call_tool",
+            {"tool_ref": "altered-reference", "arguments": {}},
+        ),
+        (
+            "remember",
+            payload,
+            "call_tool",
+            {
+                "tool_ref": TARGETED_TOOL_TRANSCRIPT_REFERENCE,
+                "arguments": {"fact": "forged"},
+            },
+        ),
+        ("remember", {**payload, "dispatch_kind": "direct"}, "call_tool", safe_arguments),
+        ("call_tool", payload, "call_tool", safe_arguments),
+        ("remember", payload, "remember", safe_arguments),
+    ):
+        assert not gateway_lifecycle_matches_outer_call(
+            effective_tool_name=effective_tool_name,
+            event_payload=candidate_payload,
+            outer_tool_name=outer_tool_name,
+            outer_arguments=outer_arguments,
+        )
+
+
 class _MultiCallGatewayProvider(_Provider):
     name = "multi-call-gateway-fake"
 
@@ -301,7 +360,7 @@ class _MultiCallGatewayProvider(_Provider):
             gateway_message = next(
                 message
                 for message in request.messages
-                if message.role == "system"
+                if message.role == "user"
                 and message.content[0].text.startswith("Cayu runtime targeted-tool context")
             )
             projection = json.loads(gateway_message.content[0].text.rsplit("\n", 1)[1])
@@ -360,7 +419,7 @@ class _MixedExpiryGatewayProvider(_Provider):
         gateway_message = next(
             message
             for message in request.messages
-            if message.role == "system"
+            if message.role == "user"
             and message.content[0].text.startswith("Cayu runtime targeted-tool context")
         )
         projection = json.loads(gateway_message.content[0].text.rsplit("\n", 1)[1])
@@ -444,7 +503,7 @@ class _MixedStructuredOutputGatewayProvider(_Provider):
             gateway_message = next(
                 message
                 for message in request.messages
-                if message.role == "system"
+                if message.role == "user"
                 and message.content[0].text.startswith("Cayu runtime targeted-tool context")
             )
             projection = json.loads(gateway_message.content[0].text.rsplit("\n", 1)[1])
@@ -486,7 +545,7 @@ class _RejectedGatewayProvider(_Provider):
             gateway_message = next(
                 message
                 for message in request.messages
-                if message.role == "system"
+                if message.role == "user"
                 and message.content[0].text.startswith("Cayu runtime targeted-tool context")
             )
             projection = json.loads(gateway_message.content[0].text.rsplit("\n", 1)[1])
@@ -595,6 +654,7 @@ def _app(store) -> tuple[CayuApp, _Provider]:
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
+        enable_tool_gateway=True,
         tools=(_RememberTool(),),
     )
     return app, provider
@@ -877,7 +937,10 @@ def test_runtime_issues_before_provider_and_store_binds_exact_replay(
             "direct_tool_prefix_changed": False,
         }
         assert "tool_ref" not in footprint_event.model_dump_json()
-        assert [tool["name"] for tool in provider.requests[0].tools] == ["remember"]
+        assert [tool["name"] for tool in provider.requests[0].tools] == [
+            "remember",
+            "call_tool",
+        ]
         assert suffix[-1].type is EventType.SESSION_COMPLETED
 
         export = io.StringIO()
@@ -950,6 +1013,7 @@ async def _assert_call_tool_routes_outer_identity(
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
+        enable_tool_gateway=True,
         tools=(tool,),
         tool_policy=policy,
         tool_exposure_policy=StaticToolExposurePolicy(
@@ -1110,6 +1174,7 @@ def test_call_tool_preserves_unavailable_argument_projections(
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
+            enable_tool_gateway=True,
             tools=(tool,),
             tool_exposure_policy=StaticToolExposurePolicy(
                 profile_id="targeted-only",
@@ -1229,6 +1294,7 @@ def test_mixed_structured_output_round_preserves_private_targeted_selection(
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
+            enable_tool_gateway=True,
             tools=(tool,),
             tool_exposure_policy=StaticToolExposurePolicy(
                 profile_id="targeted-only",
@@ -1283,13 +1349,21 @@ def test_mixed_structured_output_round_preserves_private_targeted_selection(
     (None, "cayu_authority_v1.", "sha256:"),
     ids=("ordinary", "runtime-reference-secret-collision", "grant-identity-secret-collision"),
 )
+@pytest.mark.parametrize(
+    "publish_arguments",
+    (True, False),
+    ids=("published-arguments", "private-arguments"),
+)
 def test_call_tool_approval_preserves_bound_gateway_identity(
     targeted_store,
     redactor_secret: str | None,
+    publish_arguments: bool,
 ) -> None:
     async def run() -> None:
         provider = _GatewayProvider()
-        tool = _GatewayRememberTool()
+        tool = (
+            _GatewayRememberTool() if publish_arguments else _PrivateArgumentsGatewayRememberTool()
+        )
         secret_redactor = SecretRedactor(redactor_secret)
         app = CayuApp(
             session_store=targeted_store,
@@ -1299,6 +1373,7 @@ def test_call_tool_approval_preserves_bound_gateway_identity(
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
+            enable_tool_gateway=True,
             tools=(tool,),
             tool_policy=AlwaysRequireApprovalToolPolicy(),
             tool_exposure_policy=StaticToolExposurePolicy(
@@ -1348,6 +1423,7 @@ def test_call_tool_approval_preserves_bound_gateway_identity(
         resumed_app.register_provider(provider, default=True)
         resumed_app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
+            enable_tool_gateway=True,
             tools=(tool,),
             tool_policy=AlwaysRequireApprovalToolPolicy(),
             tool_exposure_policy=StaticToolExposurePolicy(
@@ -1378,7 +1454,7 @@ def test_call_tool_approval_preserves_bound_gateway_identity(
             )
             == 1
         )
-        assert [tool["name"] for tool in provider.requests[1].tools] == []
+        assert [tool["name"] for tool in provider.requests[1].tools] == ["call_tool"]
         transcript = await targeted_store.load_transcript(session_id)
         result = next(
             part
@@ -1389,6 +1465,19 @@ def test_call_tool_approval_preserves_bound_gateway_identity(
         )
         assert result.tool_name == "call_tool"
         assert result.tool_call_id == "outer-call"
+        assistant_call = next(
+            part
+            for message in transcript
+            if message.role == "assistant"
+            for part in message.content
+            if part.type == "tool_call"
+        )
+        assert assistant_call.arguments == {
+            "tool_ref": TARGETED_TOOL_TRANSCRIPT_REFERENCE,
+            "arguments": (
+                {"fact": "Keep the gateway identity stable."} if publish_arguments else {}
+            ),
+        }
 
     asyncio.run(run())
 
@@ -1430,6 +1519,7 @@ def test_call_tool_rejects_before_policy_or_execution(
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
+            enable_tool_gateway=True,
             tools=(tool,),
             tool_policy=policy,
             tool_exposure_policy=StaticToolExposurePolicy(
@@ -1504,6 +1594,7 @@ def test_call_tool_does_not_trust_an_unissued_secret_bearing_reference(targeted_
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
+            enable_tool_gateway=True,
             tools=(tool,),
             tool_policy=policy,
             tool_exposure_policy=StaticToolExposurePolicy(
@@ -1573,6 +1664,7 @@ def test_provider_retry_reuses_one_prepared_targeted_grant_snapshot(targeted_sto
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
+            enable_tool_gateway=True,
             tools=(_RememberTool(),),
         )
 
@@ -1622,6 +1714,7 @@ def test_context_overflow_reuses_one_prepared_targeted_grant_snapshot(targeted_s
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
+            enable_tool_gateway=True,
             tools=(_RememberTool(),),
             context_overflow_policy=RecentTurnsContextPolicy(max_user_turns=1),
         )
@@ -1678,6 +1771,7 @@ def test_approval_continuation_reconstructs_the_same_targeted_grant_snapshot(
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
+            enable_tool_gateway=True,
             tools=(_RememberTool(),),
             tool_policy=AlwaysRequireApprovalToolPolicy(),
         )
@@ -1760,6 +1854,7 @@ def test_approval_continuation_omits_a_naturally_expired_targeted_grant(
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
+            enable_tool_gateway=True,
             tools=(_RememberTool(),),
             tool_policy=AlwaysRequireApprovalToolPolicy(),
         )
@@ -1840,6 +1935,7 @@ def test_approval_continuation_keeps_the_nonexpired_targeted_grant(
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
+            enable_tool_gateway=True,
             tools=(remember, _GatewayOtherTool()),
             tool_policy=AlwaysRequireApprovalToolPolicy(),
             tool_exposure_policy=StaticToolExposurePolicy(
@@ -1929,6 +2025,7 @@ def test_task_backed_targeted_grant_binds_task_scope(targeted_store) -> None:
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
+            enable_tool_gateway=True,
             tools=(_RememberTool(),),
         )
         stream = app.run(
@@ -2079,6 +2176,117 @@ def test_invalid_targeted_grant_fails_before_session_or_provider(targeted_store)
 
         assert provider.requests == []
         assert await targeted_store.load("invalid-targeted-grant") is None
+
+    asyncio.run(run())
+
+
+def test_targeted_grant_requires_a_registration_wide_stable_gateway(targeted_store) -> None:
+    async def run() -> None:
+        provider = _Provider()
+        app = CayuApp(session_store=targeted_store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(_RememberTool(),),
+        )
+
+        with pytest.raises(ValueError, match="enable_tool_gateway=True"):
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="gateway-not-enabled",
+                    messages=[Message.text("user", "Review this work.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="remember",
+                            tool_id="cayu:remember",
+                        ),
+                    ),
+                )
+            ):
+                pass
+
+        assert provider.requests == []
+        assert await targeted_store.load("gateway-not-enabled") is None
+
+    asyncio.run(run())
+
+
+def test_enabled_gateway_is_stable_without_an_active_grant(targeted_store) -> None:
+    async def run() -> None:
+        app, provider = _app(targeted_store)
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="stable-gateway-without-grant",
+                    messages=[Message.text("user", "Continue ordinary work.")],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        [request] = provider.requests
+        assert [tool["name"] for tool in request.tools] == ["remember", "call_tool"]
+        assert all(
+            "cayu.targeted-tool-context.v1" not in part.text
+            for message in request.messages
+            for part in message.content
+            if part.type == "text"
+        )
+
+    asyncio.run(run())
+
+
+def test_call_tool_without_an_active_grant_rejects_without_target_execution(
+    targeted_store,
+) -> None:
+    class UngrantedGatewayProvider(_Provider):
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                yield ModelStreamEvent.tool_call(
+                    id="ungranted-call",
+                    name="call_tool",
+                    arguments={
+                        "tool_ref": "unissued-reference",
+                        "arguments": {"fact": "must not execute"},
+                    },
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
+            yield ModelStreamEvent.text_delta("rejection handled")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    async def run() -> None:
+        provider = UngrantedGatewayProvider()
+        tool = _GatewayRememberTool()
+        app = CayuApp(session_store=targeted_store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(tool,),
+            enable_tool_gateway=True,
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="ungranted-call-tool",
+                    messages=[Message.text("user", "Continue ordinary work.")],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        [rejected] = [
+            event for event in events if event.type is EventType.TARGETED_TOOL_REFERENCE_REJECTED
+        ]
+        assert rejected.payload["rejection_reason"] == "malformed"
+        assert tool.calls == []
 
     asyncio.run(run())
 

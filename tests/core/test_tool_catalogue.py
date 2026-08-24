@@ -175,6 +175,30 @@ def test_mcp_descriptor_identity_is_bounded_and_does_not_retain_source_name() ->
         ToolDescriptorProvenance.model_validate(malformed)
 
 
+def test_tool_gateway_opt_in_is_bound_without_changing_catalogued_tools() -> None:
+    disabled = CayuApp(enable_logging=False)
+    disabled.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=(_DeclaredTool("remember"),),
+    )
+    enabled = CayuApp(enable_logging=False)
+    enabled.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=(_DeclaredTool("remember"),),
+        enable_tool_gateway=True,
+    )
+
+    disabled_profile = _profile(disabled)
+    enabled_profile = _profile(enabled)
+    assert disabled_profile.component(
+        ExecutionProfileComponentClass.DIRECT_TOOLS
+    ) == enabled_profile.component(ExecutionProfileComponentClass.DIRECT_TOOLS)
+    assert disabled_profile.component(
+        ExecutionProfileComponentClass.EXECUTION_POLICIES
+    ) != enabled_profile.component(ExecutionProfileComponentClass.EXECUTION_POLICIES)
+    assert disabled_profile.fingerprint != enabled_profile.fingerprint
+
+
 def test_catalogue_revision_is_order_and_json_object_order_independent() -> None:
     alpha = _descriptor(
         "alpha",

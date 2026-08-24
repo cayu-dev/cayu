@@ -302,7 +302,7 @@ from cayu.runtime.tool_exposure import (
     unexposed_tool_result,
     validate_resolved_tool_exposure_authority,
 )
-from cayu.runtime.tool_gateway import CallToolEnvelope, arguments_sha256
+from cayu.runtime.tool_gateway import gateway_lifecycle_matches_outer_call
 from cayu.runtime.tool_policy import ToolPolicyDecision
 from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
 from cayu.runtime.usage import SessionUsageSummary, session_usage_summary
@@ -2613,17 +2613,11 @@ class RecoveryCoordinator:
                 )
             gateway_outer_call = False
             if event.tool_name != pending_call.tool_name:
-                try:
-                    envelope = CallToolEnvelope.model_validate(pending_call.arguments)
-                except (TypeError, ValueError):
-                    envelope = None
-                gateway_outer_call = (
-                    pending_call.tool_name == CALL_TOOL_NAME
-                    and event.payload.get("dispatch_kind") == "gateway"
-                    and event.payload.get("model_tool_name") == CALL_TOOL_NAME
-                    and envelope is not None
-                    and event.payload.get("arguments_sha256")
-                    == arguments_sha256(envelope.arguments)
+                gateway_outer_call = gateway_lifecycle_matches_outer_call(
+                    effective_tool_name=event.tool_name,
+                    event_payload=event.payload,
+                    outer_tool_name=pending_call.tool_name,
+                    outer_arguments=pending_call.arguments,
                 )
             if event.tool_name != pending_call.tool_name and not gateway_outer_call:
                 raise RuntimeError(

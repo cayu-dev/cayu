@@ -44,6 +44,7 @@ from cayu.runtime.structured_output import (
     structured_output_tool_instruction,
     structured_output_tool_spec,
 )
+from cayu.runtime.tool_gateway import call_tool_spec
 
 _CATALOGUE_REVISION = f"sha256:{'c' * 64}"
 
@@ -291,6 +292,10 @@ def test_request_footprint_v4_adds_bounded_targeted_grants_without_tool_prefix_d
         remaining_calls=1,
     )
     request = _request()
+    request = request.model_copy(
+        update={"tools": [*request.model_dump(mode="python")["tools"], call_tool_spec()]},
+        deep=True,
+    )
     direct_tools = request.model_dump(mode="python")["tools"]
     footprint = build_request_footprint(
         request,

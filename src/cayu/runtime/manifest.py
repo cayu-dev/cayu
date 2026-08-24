@@ -193,6 +193,7 @@ class AgentManifest(_ManifestModel):
     execution_requirements: ExecutionRequirements
     tools: tuple[ToolManifest, ...] = ()
     hosted_tools: tuple[HostedToolManifest, ...] = ()
+    tool_gateway_enabled: bool = False
     tool_policy: str
     context_policy: str
     context_overflow_policy: str | None
@@ -522,6 +523,7 @@ def _describe_agent(
             HostedToolManifest.model_validate(tool.model_dump(mode="python"))
             for tool in registration.hosted_tools
         ),
+        tool_gateway_enabled=registration.tool_gateway_enabled,
         tool_policy=_type_name(registration.tool_policy),
         context_policy=_type_name(registration.context_policy),
         context_overflow_policy=_optional_type_name(registration.context_overflow_policy),

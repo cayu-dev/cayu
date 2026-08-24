@@ -123,6 +123,11 @@
             "title": "Runtime Hooks",
             "type": "array"
           },
+          "tool_gateway_enabled": {
+            "default": false,
+            "title": "Tool Gateway Enabled",
+            "type": "boolean"
+          },
           "tool_policy": {
             "title": "Tool Policy",
             "type": "string"

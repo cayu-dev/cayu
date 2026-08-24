@@ -1814,6 +1814,7 @@ def test_session_store_conformance_targeted_grant_lifecycle_survives_reopen(
             app.register_provider(provider, default=True)
             app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),
+                enable_tool_gateway=True,
                 tools=(_CeilingConformanceTool("remember"),),
             )
             stream = app.run(
@@ -2070,6 +2071,7 @@ def test_session_store_conformance_targeted_grant_replay_identity_is_interaction
             app.register_provider(provider, default=True)
             app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),
+                enable_tool_gateway=True,
                 tools=(
                     _CeilingConformanceTool("remember"),
                     _CeilingConformanceTool("recall"),
@@ -2187,6 +2189,7 @@ def test_session_store_conformance_targeted_grant_contention_is_bounded(
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
+            enable_tool_gateway=True,
             tools=(_CeilingConformanceTool("remember"),),
         )
         stream = app.run(

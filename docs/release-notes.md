@@ -275,11 +275,14 @@ catalogue drift, task-boundary changes, and exhausted grants fail closed. Forks
 copy no targeted grant or consumption authority and record an explicit reset
 event.
 
-While an interaction has a callable targeted grant, Cayu now projects one
-strict provider-independent `call_tool(tool_ref, arguments)` definition plus a
-bounded runtime-authored descriptor context. Resolving that outer call validates
-the current descriptor and inner arguments, then atomically consumes or rejoins
-the grant before the ordinary policy plan. The canonical target continues
+Agents opt into the portable gateway at registration. Cayu then keeps one exact
+provider-independent `call_tool(tool_ref, arguments)` definition in every
+request for that execution profile, while an active grant appends its bounded
+runtime-authored descriptor context after conversation history. This preserves
+the provider-visible system, tool, and inherited-message prefix across a fork.
+Resolving an outer call validates the current descriptor and inner arguments,
+then atomically consumes or rejoins the grant before the ordinary policy plan.
+The canonical target continues
 through the existing approval, hook, effect, secret, environment, concurrency,
 idempotency, execution, receipt, and recovery paths; no wrapper executor or
 parallel authority path was added.
@@ -294,8 +297,9 @@ redaction. Model-authored lookalikes remain untrusted. Invalid references, stale
 scope, exhausted grants, invalid inner arguments, and schemas requiring external
 reference retrieval fail before policy or target-side work. General events and
 request footprints never expose the opaque reference. Requests without active
-grants retain their existing tools, messages, direct-tool prefix, and execution
-behavior.
+grants omit the dynamic descriptor suffix but retain the opted-in gateway tool.
+Agents that do not opt in retain their existing request and execution behavior,
+and a targeted-grant request against one of those agents fails before issuance.
 
 Server contract version 20 adds the targeted-grant admission count and batch
 fingerprint to interaction summary evidence. Independently deployed servers,

@@ -15359,6 +15359,7 @@ def test_cayu_app_forks_completed_session_and_preserves_source():
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
+        enable_tool_gateway=True,
         tools=(EchoTool(),),
     )
 
@@ -40880,6 +40881,28 @@ def test_register_agent_rejects_invalid_context_overflow_policy():
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             context_overflow_policy=object(),  # type: ignore[arg-type]
+        )
+
+
+def test_register_agent_rejects_non_boolean_tool_gateway_opt_in():
+    app = CayuApp()
+    with pytest.raises(TypeError, match="enable_tool_gateway must be a bool"):
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            enable_tool_gateway=1,  # type: ignore[arg-type]
+        )
+
+
+def test_register_agent_rejects_tool_gateway_without_store_authority():
+    class UnsupportedGatewayStore(InMemorySessionStore):
+        supports_public_authority_aliases = False
+        supports_targeted_tool_grants = False
+
+    app = CayuApp(session_store=UnsupportedGatewayStore())
+    with pytest.raises(RuntimeError, match="durable targeted-grant state"):
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            enable_tool_gateway=True,
         )
 
 

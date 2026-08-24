@@ -1524,9 +1524,13 @@ policy input, so adding this canonical index does not reorder existing model
 requests. Duplicate ids or model-visible names, malformed or oversized
 descriptors, inconsistent fingerprints, and application or MCP tools named
 `call_tool`, `search_tools`, or `__cayu_submit_structured_output` fail during
-registration. Those names form Cayu's framework namespace. Cayu projects
-`call_tool` only for active targeted grants; generalized `search_tools` remains
-reserved and is not yet exposed.
+registration. Those names form Cayu's framework namespace. An agent opts into
+the portable gateway with `enable_tool_gateway=True`; Cayu then projects the
+canonical `call_tool` definition on every request in that agent's execution
+profile. Registration requires targeted-grant-capable storage and configured
+public-alias authority, so an exposed gateway can always reject fabricated
+references durably. Generalized `search_tools` remains reserved and is not yet
+exposed.
 
 The catalogue revision and descriptor versions join the existing direct-tools
 execution-profile component. Tool implementation behavior remains solely in
@@ -1714,6 +1718,9 @@ idempotency, or recovery checks.
 ```python
 from cayu import Message, ResumeRequest, TargetedToolGrant
 
+# The agent must have been registered with enable_tool_gateway=True before its
+# session began. The registered target tool can remain outside direct exposure.
+
 request = ResumeRequest(
     session_id=session_id,
     messages=[Message.text("user", "Review the work and retain any durable gotchas.")],
@@ -1732,13 +1739,20 @@ async for event in app.resume(request):
     handle(event)
 ```
 
-While at least one issued grant remains callable, Cayu appends one
-framework-owned `call_tool` definition to the provider request and adds a
-bounded runtime-authored system message containing the active references,
-canonical tool ids and names, descriptions, input schemas, remaining-call
-counts, and expiries. The existing direct-tool prefix remains unchanged and the
-request footprint records `direct_tool_prefix_changed=false`. When no grant is
-callable, neither the gateway nor its descriptor message is projected.
+For an opted-in agent, Cayu keeps one exact framework-owned `call_tool`
+definition in every provider request and binds that stable capability into the
+session execution profile. A callable grant adds a bounded runtime-authored
+user-role context message containing the active references, canonical tool ids
+and names, descriptions, input schemas, remaining-call counts, and expiries.
+That untrusted metadata is appended after the selected conversation history;
+it never enters the leading system projection or durable transcript. The tool
+array and inherited message prefix therefore stay identical through a fork
+boundary. Cayu persists and replays both transcripts itself; provider-side
+conversation state is not required for this cache-friendly layout. When no
+grant is callable, Cayu omits only the dynamic context suffix, not `call_tool`.
+The request footprint continues to exclude the framework tool from the
+application direct-tool count and records
+`direct_tool_prefix_changed=false`.
 Descriptor and schema values cross the normal workload-secret boundary, while
 each exact runtime-issued reference is retained as separately attested
 authority. Model-authored lookalikes and unissued secret-bearing references do
@@ -1834,7 +1848,7 @@ baseline but cannot be rewritten in place as governed egress profiles.
 | `direct_tools` | Ordered names, descriptions, schemas, parallel-safety, effects, and workspace-mutation declarations | Reject as authority-changing. |
 | `tool_implementations` | Ordered application or Cayu behavior/implementation identities | Reject as authority-changing; missing custom identity is `process_local`. |
 | `tool_view_grants` | View kind, generation, and ordered grant baseline | Reject as authority-changing. The current implementation is the direct-tool view; future catalogued tool views can implement this same seam. |
-| `execution_policies` | Tool exposure policy, tool policy, per-tool command policies, and ordered app/agent loop policies | Reject as authority-changing; missing custom identity is `process_local`. |
+| `execution_policies` | Tool exposure policy, stable tool-gateway opt-in and schema identity, tool policy, per-tool command policies, and ordered app/agent loop policies | Reject as authority-changing; missing custom identity is `process_local`. |
 | `invocation_policies` | Ordered request loop policies for this run, resume, or continuation | Reject as authority-changing; missing custom identity is `process_local`. Cleanup-only recovery retains the already-admitted component instead of inventing a replacement. |
 | `runtime_hooks` | Ordered app-then-agent hook names and behavior identities | Reject as authority-changing; order is semantic and missing custom identity is `process_local`. |
 | `execution_environment` | Environment/factory/runner identities, binding shape, workspace/runner presence, and execution requirements | Reject as authority-changing; missing custom environment, factory, or runner identity is `process_local`. |

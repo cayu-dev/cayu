@@ -68,6 +68,10 @@ export type AgentManifest = {
      */
     runtime_hooks?: Array<string>;
     /**
+     * Tool Gateway Enabled
+     */
+    tool_gateway_enabled?: boolean;
+    /**
      * Tool Policy
      */
     tool_policy: string;

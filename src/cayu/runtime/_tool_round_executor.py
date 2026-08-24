@@ -149,6 +149,7 @@ from cayu.runtime.mcp_manifest_policy import (
     McpManifestPolicyError,
     mcp_manifest_policy_payload,
 )
+from cayu.runtime.public_authority import parse_public_authority_alias
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.sessions import (
     _MCP_MANIFEST_BASELINE_MAX_TOOLS,
@@ -193,6 +194,7 @@ from cayu.runtime.tool_gateway import (
     arguments_sha256 as targeted_arguments_sha256,
 )
 from cayu.runtime.tool_grants import (
+    TARGETED_TOOL_REFERENCE_FIELD_NAME,
     TargetedToolUseDisposition,
     TargetedToolUseRejectionReason,
     TargetedToolUseRequest,
@@ -1035,9 +1037,15 @@ class ToolRoundExecutor:
             record = records_by_ref.get(tool_ref)
             if record is not None:
                 return record
+            try:
+                parsed = parse_public_authority_alias(tool_ref)
+            except (TypeError, ValueError):
+                return None
+            if parsed is None or parsed.field_name != TARGETED_TOOL_REFERENCE_FIELD_NAME:
+                return None
             grant_id = await self._session_store.resolve_public_authority_alias(
                 tool_ref,
-                field_name="tool_ref",
+                field_name=TARGETED_TOOL_REFERENCE_FIELD_NAME,
                 scope_session_id=session.id,
             )
             return None if grant_id is None else records_by_id.get(grant_id)

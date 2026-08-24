@@ -31,6 +31,7 @@ from cayu.runtime.execution_profiles import (
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import Session
 from cayu.runtime.stop_policy import RunLimits
+from cayu.runtime.tool_gateway import call_tool_gateway_execution_profile_material
 from cayu.runtime.user_input import pending_user_input_from_checkpoint
 from cayu.vaults import SecretRedactor
 
@@ -518,6 +519,13 @@ def resolve_execution_profile_identity(
             "tool_policy": tool_policy_entry,
             "command_policies": command_policy_material,
             "loop_policies": loop_policy_material,
+            **(
+                {
+                    "tool_gateway": call_tool_gateway_execution_profile_material(),
+                }
+                if registered_agent.tool_gateway_enabled
+                else {}
+            ),
             **(
                 {}
                 if tool_exposure_policy_entry is None

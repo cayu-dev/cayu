@@ -59,6 +59,7 @@ class RegisteredAgentState:
     all_registered_tool_exposure: ResolvedToolExposure
     tool_exposure_policy: ToolExposurePolicy
     tool_exposure_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None
+    tool_gateway_enabled: bool
     hosted_tools: tuple[OpenAIWebSearch, ...]
     context_policy: ContextPolicy
     context_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None

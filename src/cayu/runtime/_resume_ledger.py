@@ -11,8 +11,7 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime.approvals import PendingToolCallApproval
-from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
-from cayu.runtime.tool_gateway import CallToolEnvelope, arguments_sha256
+from cayu.runtime.tool_gateway import gateway_lifecycle_matches_outer_call
 from cayu.runtime.tool_policy import ToolPolicyDecision, ToolPolicyResult
 from cayu.vaults import SecretRedactor
 
@@ -65,18 +64,14 @@ def _event_matches_pending_tool_call(
         return False
     if event.tool_name == pending_call.tool_name:
         return True
-    if (
-        pending_call.tool_name != CALL_TOOL_NAME
-        or pending_call.model_tool_name is not None
-        or event.payload.get("dispatch_kind") != "gateway"
-        or event.payload.get("model_tool_name") != CALL_TOOL_NAME
-    ):
+    if pending_call.model_tool_name is not None:
         return False
-    try:
-        envelope = CallToolEnvelope.model_validate(pending_call.arguments)
-    except (TypeError, ValueError):
-        return False
-    return event.payload.get("arguments_sha256") == arguments_sha256(envelope.arguments)
+    return gateway_lifecycle_matches_outer_call(
+        effective_tool_name=event.tool_name,
+        event_payload=event.payload,
+        outer_tool_name=pending_call.tool_name,
+        outer_arguments=pending_call.arguments,
+    )
 
 
 @dataclass(frozen=True)

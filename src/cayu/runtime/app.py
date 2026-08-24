@@ -1767,6 +1767,7 @@ class CayuApp:
         context_policy: ContextPolicy | None = None,
         context_overflow_policy: ContextPolicy | None = None,
         tool_exposure_policy: ToolExposurePolicy | None = None,
+        enable_tool_gateway: bool = False,
         tool_policy: ToolPolicy | None = None,
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         loop_policies: Iterable[LoopPolicy] | None = None,
@@ -1795,6 +1796,17 @@ class CayuApp:
             stored_tool_exposure_policy = tool_exposure_policy
         else:
             raise TypeError("tool_exposure_policy must be a ToolExposurePolicy.")
+        if type(enable_tool_gateway) is not bool:
+            raise TypeError("enable_tool_gateway must be a bool.")
+        if enable_tool_gateway and (
+            not self.session_store.supports_targeted_tool_grants
+            or not self.session_store.supports_public_authority_aliases
+            or self.session_store.public_authority_alias_codec is None
+        ):
+            raise RuntimeError(
+                "enable_tool_gateway requires a SessionStore with durable targeted-grant "
+                "state and configured public authority aliases."
+            )
         if tool_policy is None:
             stored_tool_policy = AllowAllToolPolicy()
         elif isinstance(tool_policy, ToolPolicy):
@@ -1891,6 +1903,7 @@ class CayuApp:
                     field_name=("tool_exposure_policy.execution_profile_identity"),
                 )
             ),
+            tool_gateway_enabled=enable_tool_gateway,
             hosted_tools=stored_hosted_tools,
             context_policy=stored_context_policy,
             context_policy_execution_profile_identity=(
@@ -2031,6 +2044,7 @@ class CayuApp:
                 ),
                 tool_exposure_policy=AllRegisteredToolsExposurePolicy(),
                 tool_exposure_policy_execution_profile_identity=None,
+                tool_gateway_enabled=False,
                 context_policy=evaluator_context_policy,
                 context_policy_execution_profile_identity=(
                     copy_secret_free_execution_profile_behavior_identity(
