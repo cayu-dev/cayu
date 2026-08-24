@@ -1176,6 +1176,33 @@ async def test_fresh_process_recovery_and_result_lineage_are_idempotent(tmp_path
 
 
 @_async_test
+async def test_sqlite_store_materializes_distinct_trials_concurrently(tmp_path) -> None:
+    snapshot = _snapshot()
+    store = SQLiteAgentSnapshotStore(tmp_path / "concurrent-materializations.db")
+    coordinator = AgentSnapshotCoordinator(_providers(snapshot), store=store)
+    captured = await coordinator.capture(_capture_request(snapshot))
+
+    materializations = await asyncio.gather(
+        *(
+            coordinator.materialize(
+                AgentSnapshotMaterializationRequest(
+                    snapshot_fingerprint=captured.fingerprint,
+                    candidate_id="candidate-a",
+                    trial_id=f"trial-{index}",
+                    state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
+                )
+            )
+            for index in range(10)
+        )
+    )
+
+    assert len({item.fingerprint for item in materializations}) == 10
+    assert len({item.state_scope_id for item in materializations}) == 10
+    with store._connect() as connection:
+        assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 30_000
+
+
+@_async_test
 async def test_begin_trial_binds_reset_scope_and_declared_evaluator() -> None:
     evaluator_fingerprint = _digest("evaluator-a")
     snapshot = _snapshot(

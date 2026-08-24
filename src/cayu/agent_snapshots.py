@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from datetime import UTC, datetime
@@ -2302,16 +2303,18 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+        self._write_lock = threading.RLock()
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, timeout=30.0)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 30000")
         return connection
 
     def _initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
+        with self._write_lock, self._connect() as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS cayu_agent_snapshot_records (
@@ -2355,7 +2358,7 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
             sort_keys=True,
             separators=(",", ":"),
         )
-        with self._connect() as connection:
+        with self._write_lock, self._connect() as connection:
             connection.execute(
                 "INSERT OR IGNORE INTO cayu_agent_snapshot_records "
                 "(record_kind, fingerprint, document) VALUES (?, ?, ?)",
@@ -2426,7 +2429,7 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
             separators=(",", ":"),
         )
         scope_values = _scope_key(validated)
-        with self._connect() as connection:
+        with self._write_lock, self._connect() as connection:
             connection.execute(
                 "INSERT OR IGNORE INTO cayu_agent_snapshot_materialization_progress "
                 "(snapshot_fingerprint, candidate_id, state_scope_id, state_mode, "
@@ -2498,7 +2501,7 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
             sort_keys=True,
             separators=(",", ":"),
         )
-        with self._connect() as connection:
+        with self._write_lock, self._connect() as connection:
             cursor = connection.execute(
                 "UPDATE cayu_agent_snapshot_materialization_progress "
                 "SET revision = ?, document = ?, materialization_fingerprint = ? "
@@ -2601,7 +2604,7 @@ class SQLiteAgentSnapshotStore(AgentSnapshotStore):
             sort_keys=True,
             separators=(",", ":"),
         )
-        with self._connect() as connection:
+        with self._write_lock, self._connect() as connection:
             connection.execute(
                 "INSERT OR IGNORE INTO cayu_agent_snapshot_records "
                 "(record_kind, fingerprint, document) VALUES (?, ?, ?)",
