@@ -426,6 +426,8 @@ export type ApiEnvironmentSummary = {
      * Vault Type
      */
     vault_type: string | null;
+    workspace_branch_capabilities: ApiWorkspaceBranchCapabilities;
+    workspace_branch_lifecycle: ApiWorkspaceBranchLifecycle;
     /**
      * Workspace Id
      */
@@ -2022,6 +2024,58 @@ export type ApiTranscriptMessage = {
 };
 
 /**
+ * ApiWorkspaceBranchCapabilities
+ */
+export type ApiWorkspaceBranchCapabilities = {
+    /**
+     * Detail Code
+     */
+    detail_code: string;
+    /**
+     * Isolation
+     */
+    isolation: boolean;
+    /**
+     * Lifecycle Inspection
+     */
+    lifecycle_inspection: 'unsupported' | 'attached' | 'recoverable_by_id';
+    /**
+     * Net Changes
+     */
+    net_changes: boolean;
+    /**
+     * Publication
+     */
+    publication: 'unsupported' | 'cooperative_atomic';
+    /**
+     * Recovery
+     */
+    recovery: 'unsupported' | 'process_local' | 'durable';
+    /**
+     * Retention
+     */
+    retention: 'unsupported' | 'process_local' | 'durable';
+};
+
+/**
+ * ApiWorkspaceBranchLifecycle
+ */
+export type ApiWorkspaceBranchLifecycle = {
+    /**
+     * Attached Count
+     */
+    attached_count: number;
+    /**
+     * Statuses
+     */
+    statuses: Array<'active' | 'publishing' | 'rolling_back' | 'committed' | 'rolled_back' | 'fenced'>;
+    /**
+     * Truncated
+     */
+    truncated: boolean;
+};
+
+/**
  * AppManifest
  */
 export type AppManifest = {
@@ -2050,7 +2104,7 @@ export type AppManifest = {
     /**
      * Schema Version
      */
-    schema_version?: '9';
+    schema_version?: '11';
     stores: StoreManifest;
 };
 
@@ -3465,6 +3519,18 @@ export type EnvironmentManifest = {
      * Workspace
      */
     workspace: string | null;
+    /**
+     * Workspace Branch Capabilities
+     */
+    workspace_branch_capabilities: {
+        [key: string]: unknown;
+    };
+    /**
+     * Workspace Branch Lifecycle
+     */
+    workspace_branch_lifecycle: {
+        [key: string]: unknown;
+    };
 };
 
 /**

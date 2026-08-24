@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import importlib
 import posixpath
 import shlex
@@ -41,6 +42,7 @@ from cayu.runners.base import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ExecCommand,
     ExecResult,
+    RemoteWorkspaceBranchCapability,
     Runner,
     RunnerExecutionError,
     RunnerWorkspaceCapability,
@@ -598,6 +600,22 @@ class _E2BWorkspaceCapability(E2BWorkspaceCapability):
             request_timeout=request_timeout_s,
         )
         return tuple(E2BWorkspaceEntry.from_provider_entry(entry) for entry in entries)
+
+
+class _E2BRemoteWorkspaceBranchCapability(RemoteWorkspaceBranchCapability):
+    """E2B's retained allocation filesystem for the guest branch protocol."""
+
+    def __init__(self, runner: E2BRunner) -> None:
+        self._runner = runner
+
+    @property
+    def resource_key(self) -> tuple[object, ...]:
+        return ("e2b", self._runner.sandbox_id)
+
+    @property
+    def allocation_fingerprint(self) -> str:
+        encoded = f"e2b\0{self._runner.sandbox_id}".encode()
+        return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -1165,6 +1183,9 @@ class E2BRunner(Runner):
     ) -> RunnerWorkspaceCapabilityT | None:
         if capability_type is E2BWorkspaceCapability:
             capability = _E2BWorkspaceCapability(self)
+            return cast("RunnerWorkspaceCapabilityT", capability)
+        if type(self) is E2BRunner and capability_type is RemoteWorkspaceBranchCapability:
+            capability = _E2BRemoteWorkspaceBranchCapability(self)
             return cast("RunnerWorkspaceCapabilityT", capability)
         return super().workspace_capability(capability_type)
 

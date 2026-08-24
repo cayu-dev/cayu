@@ -13,7 +13,12 @@ from cayu._validation import require_clean_nonblank, require_nonblank
 from cayu.runners.base import Runner
 
 if TYPE_CHECKING:
-    from cayu.workspaces.branches import WorkspaceBranchCreationResult, WorkspaceBranchRequest
+    from cayu.workspaces.branches import (
+        WorkspaceBranchCapabilities,
+        WorkspaceBranchCreationResult,
+        WorkspaceBranchLifecycleSummary,
+        WorkspaceBranchRequest,
+    )
 
 
 @dataclass(frozen=True)
@@ -417,6 +422,25 @@ class Workspace(ABC):
         ``Workspace`` to return a stable identity token and enable that safety check.
         """
         return None
+
+    def branch_capabilities(self) -> WorkspaceBranchCapabilities:
+        """Return explicit workspace-branch guarantees for this adapter.
+
+        Unsupported is the compatibility default. Capability must be declared
+        by the exact adapter instance and is never inferred from adjacent
+        filesystem, snapshot, runner, sync, reconnect, or Git behavior.
+        """
+
+        from cayu.workspaces.branches import WorkspaceBranchCapabilities
+
+        return WorkspaceBranchCapabilities()
+
+    def branch_lifecycle_summary(self) -> WorkspaceBranchLifecycleSummary:
+        """Return bounded lifecycle states for branch handles attached here."""
+
+        from cayu.workspaces.branches import WorkspaceBranchLifecycleSummary
+
+        return WorkspaceBranchLifecycleSummary(attached_count=0, statuses=(), truncated=False)
 
     async def create_branch(
         self,

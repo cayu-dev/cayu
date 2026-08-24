@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import warnings
 from pathlib import Path
 
 import pytest
@@ -18,6 +20,7 @@ from cayu import (
     EnvironmentSpec,
     ExecCommandTool,
     ExecutionRequirements,
+    LocalWorkspace,
     OpenAIWebSearch,
     ProcessCommandPolicy,
     RequestFootprintConfig,
@@ -154,12 +157,26 @@ def test_describe_returns_a_deterministic_public_application_manifest() -> None:
     manifest = _described_app().describe()
     reversed_manifest = _described_app(reverse=True).describe()
 
-    assert manifest.schema_version == "9"
+    assert manifest.schema_version == "11"
     assert manifest.defaults.provider == "primary"
     assert manifest.defaults.environment == "local"
     assert [agent.name for agent in manifest.agents] == ["reviewer", "writer"]
     assert [agent.resolved_provider for agent in manifest.agents] == ["secondary", "primary"]
     assert [provider.name for provider in manifest.providers] == ["primary", "secondary"]
+    assert manifest.environments[0].workspace_branch_capabilities == {
+        "detail_code": "workspace_branching_unsupported",
+        "isolation": False,
+        "lifecycle_inspection": "unsupported",
+        "net_changes": False,
+        "publication": "unsupported",
+        "recovery": "unsupported",
+        "retention": "unsupported",
+    }
+    assert manifest.environments[0].workspace_branch_lifecycle == {
+        "attached_count": 0,
+        "statuses": (),
+        "truncated": False,
+    }
     assert manifest.model_dump(mode="json") == reversed_manifest.model_dump(mode="json")
     assert manifest.fingerprint == reversed_manifest.fingerprint
     assert len(manifest.fingerprint) == 64
@@ -178,6 +195,105 @@ def test_environment_owner_capacity_is_manifested_and_fingerprinted() -> None:
     assert first.runtime.max_environment_lifecycle_owners == 1
     assert second.runtime.max_environment_lifecycle_owners == 2
     assert first.fingerprint != second.fingerprint
+
+
+def test_manifest_exposes_supported_workspace_branch_capability(tmp_path: Path) -> None:
+    app = CayuApp(enable_logging=False)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="branch-capable"),
+            workspace=LocalWorkspace(tmp_path),
+        ),
+        default=True,
+    )
+
+    capabilities = app.describe().environments[0].workspace_branch_capabilities
+
+    assert capabilities == {
+        "detail_code": "process_local_workspace_branches",
+        "isolation": True,
+        "lifecycle_inspection": "attached",
+        "net_changes": True,
+        "publication": "cooperative_atomic",
+        "recovery": "process_local",
+        "retention": "process_local",
+    }
+
+
+def test_manifest_preserves_branch_controls_while_redacting_capability_detail(
+    tmp_path: Path,
+) -> None:
+    app = CayuApp(
+        secret_redactor=SecretRedactor(["process_local", "workspace_branches"]),
+        enable_logging=False,
+    )
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="branch-capable"),
+            workspace=LocalWorkspace(tmp_path),
+        ),
+        default=True,
+    )
+
+    capabilities = app.describe().environments[0].workspace_branch_capabilities
+
+    assert capabilities["recovery"] == "process_local"
+    assert capabilities["retention"] == "process_local"
+    assert capabilities["publication"] == "cooperative_atomic"
+    assert "workspace_branches" not in capabilities["detail_code"]
+    assert "[REDACTED_SECRET]" in capabilities["detail_code"]
+
+
+def test_manifest_rejects_mutated_branch_capabilities_without_diagnostic_exposure(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from cayu import WorkspaceBranchCapabilities
+
+    canary = "mutated-capability-secret"
+
+    class SecretBearingWrongType:
+        def __repr__(self) -> str:
+            return canary
+
+        def __str__(self) -> str:
+            return canary
+
+    candidate = WorkspaceBranchCapabilities()
+    object.__setattr__(candidate, "detail_code", SecretBearingWrongType())
+
+    class MutatedCapabilityWorkspace(LocalWorkspace):
+        def branch_capabilities(self) -> WorkspaceBranchCapabilities:
+            return candidate
+
+    app = CayuApp(enable_logging=False)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="mutated-capability"),
+            workspace=MutatedCapabilityWorkspace(tmp_path),
+        ),
+        default=True,
+    )
+
+    with warnings.catch_warnings(record=True) as caught, caplog.at_level(logging.WARNING):
+        manifest = app.describe()
+
+    captured = capsys.readouterr()
+    assert manifest.environments[0].workspace_branch_capabilities["detail_code"] == (
+        "workspace_branch_capability_evidence_invalid"
+    )
+    diagnostic_text = "\n".join(
+        [
+            repr(manifest),
+            str(manifest),
+            *(str(item.message) for item in caught),
+            caplog.text,
+            captured.out,
+            captured.err,
+        ]
+    )
+    assert canary not in diagnostic_text
 
 
 def test_request_footprint_config_is_safely_manifested_and_fingerprinted() -> None:
@@ -462,7 +578,7 @@ def test_manifest_is_public_versioned_redacted_and_deeply_read_only(tmp_path: Pa
     payload = manifest.model_dump_json()
     schema = AppManifest.model_json_schema(mode="serialization")
 
-    assert schema["properties"]["schema_version"]["const"] == "9"
+    assert schema["properties"]["schema_version"]["const"] == "11"
     assert "manifest-secret" not in payload
     assert str(tmp_path) not in payload
     assert factory.called is False
@@ -571,7 +687,7 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
     with pytest.raises(ValidationError, match="JSON-compatible"):
         AppManifest.model_validate(
             {
-                "schema_version": "9",
+                "schema_version": "11",
                 "fingerprint": "0" * 64,
                 "agents": [
                     {

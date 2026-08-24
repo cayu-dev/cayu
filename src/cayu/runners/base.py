@@ -135,6 +135,23 @@ class RunnerWorkspaceCapability(ABC):
         """Stable identity of the sandbox that backs this capability."""
 
 
+class RemoteWorkspaceBranchCapability(RunnerWorkspaceCapability):
+    """Explicit provider proof for the durable guest branch protocol.
+
+    Merely being able to execute Python or reconnect to a runner is not this
+    capability. An exact runner adapter opts in only after verifying that its
+    allocation filesystem retains branch state across Cayu process loss and
+    supports the guest-side cooperative publication guard.
+    """
+
+    protocol_version = "cayu-runner-workspace-branch-v1"
+
+    @property
+    @abstractmethod
+    def allocation_fingerprint(self) -> str:
+        """Privacy-safe stable identity for the retained remote allocation."""
+
+
 RunnerWorkspaceCapabilityT = TypeVar(
     "RunnerWorkspaceCapabilityT",
     bound=RunnerWorkspaceCapability,

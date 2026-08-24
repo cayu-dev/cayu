@@ -2854,6 +2854,72 @@ def _workspace_instruction_summary(value: Any) -> str | None:
     return type(value).__name__
 
 
+def _workspace_branch_capabilities(cayu_app: Any, value: Any) -> dict[str, Any]:
+    from cayu.workspaces import WorkspaceBranchCapabilities
+    from cayu.workspaces.branches import _copy_workspace_branch_capabilities
+
+    inspect_capabilities = getattr(value, "branch_capabilities", None)
+    if not callable(inspect_capabilities):
+        capabilities = WorkspaceBranchCapabilities()
+    else:
+        try:
+            candidate = inspect_capabilities()
+        except Exception:
+            capabilities = WorkspaceBranchCapabilities(
+                detail_code="workspace_branch_capability_inspection_failed"
+            )
+        else:
+            try:
+                capabilities = _copy_workspace_branch_capabilities(candidate)
+            except (TypeError, ValueError):
+                capabilities = WorkspaceBranchCapabilities(
+                    detail_code="workspace_branch_capability_evidence_invalid"
+                )
+    projected = capabilities.model_dump(mode="json", warnings=False)
+    detail_code = _redact_control_plane_json(
+        cayu_app,
+        projected["detail_code"],
+        "workspace_branch_capabilities.detail_code",
+    )
+    projected["detail_code"] = (
+        detail_code
+        if type(detail_code) is str
+        else "workspace_branch_capability_detail_unavailable"
+    )
+    return projected
+
+
+def _workspace_branch_lifecycle(value: Any) -> dict[str, Any]:
+    from cayu.workspaces import WorkspaceBranchLifecycleSummary
+    from cayu.workspaces.branches import _copy_workspace_branch_lifecycle_summary
+
+    unavailable = WorkspaceBranchLifecycleSummary(
+        attached_count=0,
+        statuses=(),
+        truncated=True,
+    )
+    inspect_lifecycle = getattr(value, "branch_lifecycle_summary", None)
+    if value is None:
+        summary = WorkspaceBranchLifecycleSummary(
+            attached_count=0,
+            statuses=(),
+            truncated=False,
+        )
+    elif not callable(inspect_lifecycle):
+        summary = unavailable
+    else:
+        try:
+            candidate = inspect_lifecycle()
+        except Exception:
+            summary = unavailable
+        else:
+            try:
+                summary = _copy_workspace_branch_lifecycle_summary(candidate)
+            except (TypeError, ValueError):
+                summary = unavailable
+    return summary.model_dump(mode="json", warnings=False)
+
+
 def _serialize_environment(cayu_app: Any, record: Any) -> dict[str, Any]:
     environment = record.environment
     workspace = environment.workspace
@@ -2864,6 +2930,17 @@ def _serialize_environment(cayu_app: Any, record: Any) -> dict[str, Any]:
         bound_payload = {
             "source_workspace_id": _object_id(bound_workspace.source_workspace),
             "bound_workspace_id": _object_id(bound_workspace.workspace),
+            "workspace_branch_capabilities": _workspace_branch_capabilities(
+                cayu_app,
+                bound_workspace.workspace
+                if bound_workspace.workspace is not None
+                else bound_workspace.source_workspace,
+            ),
+            "workspace_branch_lifecycle": _workspace_branch_lifecycle(
+                bound_workspace.workspace
+                if bound_workspace.workspace is not None
+                else bound_workspace.source_workspace,
+            ),
             "runner_type": _object_type_name(bound_workspace.runner),
             "path": bound_workspace.path,
             "metadata": _redact_control_plane_json(
@@ -2877,6 +2954,8 @@ def _serialize_environment(cayu_app: Any, record: Any) -> dict[str, Any]:
         "metadata": _redact_control_plane_json(cayu_app, record.spec.metadata, "metadata"),
         "is_factory": record.factory is not None,
         "workspace_id": _object_id(workspace),
+        "workspace_branch_capabilities": _workspace_branch_capabilities(cayu_app, workspace),
+        "workspace_branch_lifecycle": _workspace_branch_lifecycle(workspace),
         "artifact_store_id": _object_id(artifact_store),
         "runner_type": _object_type_name(environment.runner),
         "binding_type": _object_type_name(environment.binding),

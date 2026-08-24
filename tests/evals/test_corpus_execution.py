@@ -12,6 +12,9 @@ import cayu.evals.execution as execution_module
 import cayu.evals.runner as runner_module
 from cayu import (
     AgentSpec,
+    Environment,
+    EnvironmentSpec,
+    LocalWorkspace,
     Message,
     ModelProvider,
     ModelStreamEvent,
@@ -22,6 +25,7 @@ from cayu import (
     ToolContext,
     ToolResult,
     ToolSpec,
+    WorkspaceBranchRequest,
 )
 from cayu.evals.corpus import (
     CorpusUserMessageSpec,
@@ -72,6 +76,10 @@ from cayu.evals.runner import EvalPlan, run_eval_plan
 from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.vaults import SecretRedactor
+from cayu.workspaces.revisions import (
+    WorkspaceRevisionObservationLimits,
+    observe_deterministic_workspace,
+)
 
 
 def _source() -> EvaluationSourceIdentityV1:
@@ -720,6 +728,55 @@ def test_target_identity_rejects_manifest_content_with_a_forged_fingerprint():
         )
 
 
+def test_target_identity_ignores_dynamic_branch_lifecycle_in_structural_fingerprint(
+    tmp_path,
+):
+    target = _target(_provider())
+    root = tmp_path / "workspace"
+    root.mkdir()
+    workspace = LocalWorkspace(root)
+    target.app.register_environment(
+        Environment(EnvironmentSpec(name="branch-capable"), workspace=workspace),
+        default=True,
+    )
+
+    async def scenario():
+        before = evaluation_target_identity(target)
+        observation = await observe_deterministic_workspace(
+            workspace,
+            observer="manifest-fingerprint-test",
+            limits=WorkspaceRevisionObservationLimits(),
+        )
+        created = await workspace.create_branch(WorkspaceBranchRequest(baseline=observation))
+        assert created.branch is not None
+        active = evaluation_target_identity(target)
+        await created.branch.rollback()
+        settled = evaluation_target_identity(target)
+
+        assert before.app_manifest.environments[0].workspace_branch_lifecycle == {
+            "attached_count": 0,
+            "statuses": (),
+            "truncated": False,
+        }
+        assert active.app_manifest.environments[0].workspace_branch_lifecycle == {
+            "attached_count": 1,
+            "statuses": ("active",),
+            "truncated": False,
+        }
+        assert settled.app_manifest.environments[0].workspace_branch_lifecycle == {
+            "attached_count": 1,
+            "statuses": ("rolled_back",),
+            "truncated": False,
+        }
+        assert {
+            before.app_manifest_fingerprint,
+            active.app_manifest_fingerprint,
+            settled.app_manifest_fingerprint,
+        } == {before.app_manifest_fingerprint}
+
+    asyncio.run(scenario())
+
+
 def test_execution_rejects_an_application_manifest_change_during_the_run(monkeypatch):
     provider = _provider()
     target = _target(provider)
@@ -733,6 +790,46 @@ def test_execution_rejects_an_application_manifest_change_during_the_run(monkeyp
         asyncio.run(run_corpus_suite(target, _corpus(), "refund-regressions"))
 
     assert len(provider.requests) == 2
+
+
+def test_execution_allows_dynamic_branch_lifecycle_change_during_finalization(
+    tmp_path,
+    monkeypatch,
+):
+    provider = _provider()
+    target = _target(provider)
+    root = tmp_path / "workspace"
+    root.mkdir()
+    workspace = LocalWorkspace(root)
+    target.app.register_environment(
+        Environment(EnvironmentSpec(name="branch-capable"), workspace=workspace),
+        default=True,
+    )
+
+    async def scenario():
+        before = target.app.describe()
+        observation = await observe_deterministic_workspace(
+            workspace,
+            observer="manifest-finalization-test",
+            limits=WorkspaceRevisionObservationLimits(),
+        )
+        created = await workspace.create_branch(WorkspaceBranchRequest(baseline=observation))
+        assert created.branch is not None
+        after = target.app.describe()
+        assert before.fingerprint == after.fingerprint
+        assert before.environments[0].workspace_branch_lifecycle != (
+            after.environments[0].workspace_branch_lifecycle
+        )
+        manifests = iter((before, after))
+        monkeypatch.setattr(target.app, "describe", lambda: next(manifests))
+
+        result = await run_corpus_suite(target, _corpus(), "refund-regressions")
+
+        assert result.run.status == "passed"
+        assert result.target.app_manifest == before
+        assert len(provider.requests) == 2
+
+    asyncio.run(scenario())
 
 
 def test_published_execution_json_is_deterministic_bounded_and_loadable(tmp_path):

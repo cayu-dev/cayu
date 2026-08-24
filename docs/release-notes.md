@@ -485,6 +485,36 @@ provider-native dynamic-tool behavior, and it does not change default provider
 payloads. Persisted prerelease exposure authority without a catalogue revision
 is rejected rather than supported through a compatibility path.
 
+### Portable workspace branches reach retained E2B allocations
+
+Workspace adapters now expose typed branch capabilities for isolation, net
+changes, cooperative atomic publication, recovery, retention, and lifecycle
+inspection. Unsupported remains the exact default. An explicitly enabled
+`RunnerWorkspace` on `E2BRunner` retains its bounded branch journal and private
+overlay inside the allocation, supports fresh-process recovery by branch ID,
+and shares the local isolation, conflict, publication, rollback, and resource
+conformance contract when paired with an explicitly durable, cross-process
+binding-claim provider. Public evidence contains content identities only; raw
+files, provider handles, credentials, environment data, and command output stay
+inside the provider boundary.
+
+`LocalWorkspace` now applies both durability boundaries: durable creation,
+recovery, retention, and recoverable-by-ID inspection require a branch journal
+whose typed durability is `durable` and a provider whose typed claim scope is
+`durable`. `SessionWorkspaceBranchStore` preserves the wrapped session store's
+exact durability declaration, so development-only stores such as
+`InMemorySessionStore` cannot advertise or admit cross-process durability. The
+built-in process-local authority registry continues to support attached local
+branches but cannot activate durable recovery by itself.
+
+The public application manifest and generator plan advance from schema version
+9 to version 11, and the server contract advances from version 22 to version
+24, so `cayu inspect`, server environment inventory, generated clients, and
+packaged control-plane consumers can inspect both the bounded branch declaration
+and the actual content-free lifecycle states of attached branches.
+Regenerate committed manifests, plans, and API clients, and upgrade separately
+deployed servers and dashboards together. No storage migration is required.
+
 ### OpenRouter is a first-class provider choice
 
 Generated applications can now select `openrouter` through `cayu new --provider
@@ -960,8 +990,10 @@ adapter for `SessionStore`, together with stable branch, idempotency, run-epoch,
 and binding authority. Custom session stores must explicitly support owned,
 off-thread guarded commits before the adapter accepts them. Creation,
 publication intent/progress, commit, rollback intent, rollback, conflict,
-expiry, failure, and ambiguity survive process replacement across the bundled
-in-memory, SQLite, and PostgreSQL stores. Recovery finishes only source paths
+expiry, failure, and ambiguity survive process replacement across bundled
+file-backed SQLite and PostgreSQL stores. Development-only in-memory stores do
+not advertise or admit that durable lifecycle. Recovery finishes only source
+paths
 that still match an exact recorded before state, recognizes already-applied
 paths, and reports durable ambiguity instead of guessing when external content
 appears. Commit and rollback become terminal in the store before cleanup, and

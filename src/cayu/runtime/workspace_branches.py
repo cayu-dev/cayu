@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from cayu.runtime.service_manifest import RuntimeStoreDurability
 from cayu.runtime.sessions import (
     SessionOperationPublication,
     _OwnedOffThreadSessionCommitGuard,
 )
+from cayu.workspaces.branches import WorkspaceBranchStoreDurability
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -36,7 +38,21 @@ class SessionWorkspaceBranchStore:
             raise TypeError(
                 "Workspace branch storage requires owned off-thread session commit guards."
             )
+        try:
+            self._durability = WorkspaceBranchStoreDurability(
+                RuntimeStoreDurability(store.service_durability).value
+            )
+        except (AttributeError, TypeError, ValueError):
+            raise TypeError(
+                "Workspace branch storage requires a declared SessionStore durability."
+            ) from None
         self._store = store
+
+    @property
+    def durability(self) -> WorkspaceBranchStoreDurability:
+        """Return the exact persistence evidence declared by the wrapped store."""
+
+        return self._durability
 
     async def load_workspace_branch_record(
         self,

@@ -12,7 +12,13 @@ from cayu._validation import (
     require_durable_text,
     require_nonblank,
 )
-from cayu.runners import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, LocalRunner, Runner
+from cayu.runners import (
+    DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ExecCommand,
+    LocalRunner,
+    RemoteWorkspaceBranchCapability,
+    Runner,
+)
 from cayu.workspaces._guest_guard import (
     GUEST_DESCRIPTOR_GUARD_SOURCE,
     guard_create,
@@ -37,6 +43,22 @@ from cayu.workspaces.base import (
     matches_list_pattern,
     translate_list_pattern,
     validate_list_pattern,
+)
+from cayu.workspaces.branches import (
+    RemoteWorkspaceBranchAuthorityProvider,
+    WorkspaceBranchBindingAuthorityClaimScope,
+    WorkspaceBranchBindingAuthorityProvider,
+    WorkspaceBranchCapabilities,
+    WorkspaceBranchCreationResult,
+    WorkspaceBranchLifecycleInspection,
+    WorkspaceBranchLifecycleSummary,
+    WorkspaceBranchPublicationStrength,
+    WorkspaceBranchRecoveryRequest,
+    WorkspaceBranchRecoveryResult,
+    WorkspaceBranchRecoveryStrength,
+    WorkspaceBranchRequest,
+    WorkspaceBranchRetentionStrength,
+    _WorkspaceBranchLifecycleRegistry,
 )
 
 DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES = 256 * 1024
@@ -419,20 +441,21 @@ def main():
     root_fd = None
     try:
         root_fd = open_guard_root(".", operation == "list")
-        if operation == "read":
-            read_operation(root_fd)
-        elif operation == "write":
-            write_operation(root_fd)
-        elif operation == "delete":
-            delete_operation(root_fd)
-        elif operation == "list":
-            list_operation(root_fd)
-        elif operation == "read_tar":
-            read_tar_operation(root_fd)
-        elif operation == "write_tar":
-            write_tar_operation(root_fd)
-        else:
-            raise ValueError("Unknown runner workspace operation: " + operation)
+        with workspace_source_lock(root_fd, False):
+            if operation == "read":
+                read_operation(root_fd)
+            elif operation == "write":
+                write_operation(root_fd)
+            elif operation == "delete":
+                delete_operation(root_fd)
+            elif operation == "list":
+                list_operation(root_fd)
+            elif operation == "read_tar":
+                read_tar_operation(root_fd)
+            elif operation == "write_tar":
+                write_tar_operation(root_fd)
+            else:
+                raise ValueError("Unknown runner workspace operation: " + operation)
     except GuardPathError as exc:
         fail_guard(exc)
     except Exception as exc:
@@ -467,6 +490,9 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
         python_executable: str = "python3",
         default_read_limit_bytes: int = DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES,
         default_list_limit: int = DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT,
+        enable_workspace_branches: bool = False,
+        branch_operation_timeout_s: int = 300,
+        branch_authority_resolver: WorkspaceBranchBindingAuthorityProvider | None = None,
     ) -> None:
         if not isinstance(runner, Runner):
             raise TypeError("RunnerWorkspace runner must be a Runner.")
@@ -478,6 +504,37 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
             "default_read_limit_bytes",
         )
         self.default_list_limit = _validate_required_limit(default_list_limit, "default_list_limit")
+        if type(enable_workspace_branches) is not bool:
+            raise TypeError("RunnerWorkspace enable_workspace_branches must be a bool.")
+        self.branch_operation_timeout_s = _validate_required_limit(
+            branch_operation_timeout_s,
+            "branch_operation_timeout_s",
+        )
+        self._branch_capability = (
+            runner.workspace_capability(RemoteWorkspaceBranchCapability)
+            if enable_workspace_branches
+            else None
+        )
+        if branch_authority_resolver is not None and not isinstance(
+            branch_authority_resolver,
+            WorkspaceBranchBindingAuthorityProvider,
+        ):
+            raise TypeError(
+                "RunnerWorkspace branch_authority_resolver must own binding-generation claims."
+            )
+        self._branch_authority_resolver = branch_authority_resolver
+        self._branch_lifecycle_registry = _WorkspaceBranchLifecycleRegistry()
+        if branch_authority_resolver is None:
+            self._branch_claim_scope = None
+        else:
+            try:
+                self._branch_claim_scope = WorkspaceBranchBindingAuthorityClaimScope(
+                    branch_authority_resolver.claim_scope
+                )
+            except Exception:
+                raise TypeError(
+                    "RunnerWorkspace branch_authority_resolver must declare its claim scope."
+                ) from None
         if workspace_id is None:
             self.id = f"runner:{getattr(runner, 'isolation', 'unknown')}:{self.cwd or '.'}"
         else:
@@ -521,6 +578,71 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
             self.default_read_limit_bytes,
             _validate_required_limit(max_bytes, "max_bytes"),
         )
+
+    def branch_capabilities(self) -> WorkspaceBranchCapabilities:
+        if type(self) is not RunnerWorkspace or self._branch_capability is None:
+            return WorkspaceBranchCapabilities()
+        durable = (
+            isinstance(
+                self._branch_authority_resolver,
+                RemoteWorkspaceBranchAuthorityProvider,
+            )
+            and self._branch_claim_scope is WorkspaceBranchBindingAuthorityClaimScope.DURABLE
+        )
+        return WorkspaceBranchCapabilities(
+            isolation=True,
+            net_changes=True,
+            publication=WorkspaceBranchPublicationStrength.COOPERATIVE_ATOMIC,
+            recovery=(
+                WorkspaceBranchRecoveryStrength.DURABLE
+                if durable
+                else WorkspaceBranchRecoveryStrength.PROCESS_LOCAL
+            ),
+            retention=(
+                WorkspaceBranchRetentionStrength.DURABLE
+                if durable
+                else WorkspaceBranchRetentionStrength.PROCESS_LOCAL
+            ),
+            lifecycle_inspection=(
+                WorkspaceBranchLifecycleInspection.RECOVERABLE_BY_ID
+                if durable
+                else WorkspaceBranchLifecycleInspection.ATTACHED
+            ),
+            detail_code=(
+                "durable_remote_runner_workspace_branches"
+                if durable
+                else "process_local_remote_runner_workspace_branches"
+            ),
+        )
+
+    def branch_lifecycle_summary(self) -> WorkspaceBranchLifecycleSummary:
+        if type(self) is not RunnerWorkspace:
+            return WorkspaceBranchLifecycleSummary(
+                attached_count=0,
+                statuses=(),
+                truncated=False,
+            )
+        return self._branch_lifecycle_registry.summary()
+
+    async def create_branch(
+        self,
+        request: WorkspaceBranchRequest,
+    ) -> WorkspaceBranchCreationResult:
+        from cayu.workspaces._runner_branch import create_runner_workspace_branch
+
+        result = await create_runner_workspace_branch(self, request)
+        self._branch_lifecycle_registry.attach(result.branch)
+        return result
+
+    async def recover_branch(
+        self,
+        request: WorkspaceBranchRecoveryRequest,
+    ) -> WorkspaceBranchRecoveryResult:
+        from cayu.workspaces._runner_branch import recover_runner_workspace_branch
+
+        result = await recover_runner_workspace_branch(self, request)
+        self._branch_lifecycle_registry.attach(result.branch)
+        return result
 
     async def read_bytes(
         self,

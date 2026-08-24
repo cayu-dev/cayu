@@ -33,12 +33,21 @@ from cayu.workspaces.base import (
     validate_list_pattern,
 )
 from cayu.workspaces.branches import (
+    WorkspaceBranchBindingAuthorityClaimScope,
     WorkspaceBranchBindingAuthorityProvider,
+    WorkspaceBranchCapabilities,
     WorkspaceBranchCreationResult,
+    WorkspaceBranchLifecycleInspection,
+    WorkspaceBranchLifecycleSummary,
+    WorkspaceBranchPublicationStrength,
     WorkspaceBranchRecoveryRequest,
     WorkspaceBranchRecoveryResult,
+    WorkspaceBranchRecoveryStrength,
     WorkspaceBranchRequest,
+    WorkspaceBranchRetentionStrength,
     WorkspaceBranchStore,
+    WorkspaceBranchStoreDurability,
+    _WorkspaceBranchLifecycleRegistry,
 )
 
 
@@ -69,6 +78,17 @@ class LocalWorkspace(Workspace):
         if branch_store is not None and not isinstance(branch_store, WorkspaceBranchStore):
             raise TypeError("LocalWorkspace branch_store must implement WorkspaceBranchStore.")
         self._branch_store = branch_store
+        if branch_store is None:
+            self._branch_store_durability = None
+        else:
+            try:
+                self._branch_store_durability = WorkspaceBranchStoreDurability(
+                    branch_store.durability
+                )
+            except Exception:
+                raise TypeError(
+                    "LocalWorkspace branch_store must declare its durability."
+                ) from None
         if branch_authority_resolver is not None and not isinstance(
             branch_authority_resolver,
             WorkspaceBranchBindingAuthorityProvider,
@@ -77,6 +97,18 @@ class LocalWorkspace(Workspace):
                 "LocalWorkspace branch_authority_resolver must own binding-generation claims."
             )
         self._branch_authority_resolver = branch_authority_resolver
+        if branch_authority_resolver is None:
+            self._branch_claim_scope = None
+        else:
+            try:
+                self._branch_claim_scope = WorkspaceBranchBindingAuthorityClaimScope(
+                    branch_authority_resolver.claim_scope
+                )
+            except Exception:
+                raise TypeError(
+                    "LocalWorkspace branch_authority_resolver must declare its claim scope."
+                ) from None
+        self._branch_lifecycle_registry = _WorkspaceBranchLifecycleRegistry()
 
     @property
     def resource_key(self) -> tuple[object, ...]:
@@ -88,13 +120,59 @@ class LocalWorkspace(Workspace):
             raise TypeError("Workspace max_bytes must be an integer.")
         return validated
 
+    def branch_capabilities(self) -> WorkspaceBranchCapabilities:
+        if type(self) is not LocalWorkspace:
+            return WorkspaceBranchCapabilities()
+        durable = (
+            self._branch_store is not None
+            and self._branch_store_durability is WorkspaceBranchStoreDurability.DURABLE
+            and self._branch_authority_resolver is not None
+            and self._branch_claim_scope is WorkspaceBranchBindingAuthorityClaimScope.DURABLE
+        )
+        return WorkspaceBranchCapabilities(
+            isolation=True,
+            net_changes=True,
+            publication=WorkspaceBranchPublicationStrength.COOPERATIVE_ATOMIC,
+            recovery=(
+                WorkspaceBranchRecoveryStrength.DURABLE
+                if durable
+                else WorkspaceBranchRecoveryStrength.PROCESS_LOCAL
+            ),
+            retention=(
+                WorkspaceBranchRetentionStrength.DURABLE
+                if durable
+                else WorkspaceBranchRetentionStrength.PROCESS_LOCAL
+            ),
+            lifecycle_inspection=(
+                WorkspaceBranchLifecycleInspection.RECOVERABLE_BY_ID
+                if durable
+                else WorkspaceBranchLifecycleInspection.ATTACHED
+            ),
+            detail_code=(
+                "durable_local_workspace_branches"
+                if durable
+                else "process_local_workspace_branches"
+            ),
+        )
+
+    def branch_lifecycle_summary(self) -> WorkspaceBranchLifecycleSummary:
+        if type(self) is not LocalWorkspace:
+            return WorkspaceBranchLifecycleSummary(
+                attached_count=0,
+                statuses=(),
+                truncated=False,
+            )
+        return self._branch_lifecycle_registry.summary()
+
     async def create_branch(
         self,
         request: WorkspaceBranchRequest,
     ) -> WorkspaceBranchCreationResult:
         from cayu.workspaces._local_branch import create_local_workspace_branch
 
-        return await create_local_workspace_branch(self, request)
+        result = await create_local_workspace_branch(self, request)
+        self._branch_lifecycle_registry.attach(result.branch)
+        return result
 
     async def recover_branch(
         self,
@@ -104,7 +182,9 @@ class LocalWorkspace(Workspace):
 
         from cayu.workspaces._local_branch import recover_local_workspace_branch
 
-        return await recover_local_workspace_branch(self, request)
+        result = await recover_local_workspace_branch(self, request)
+        self._branch_lifecycle_registry.attach(result.branch)
+        return result
 
     async def read_bytes(
         self,

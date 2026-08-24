@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -17,7 +15,7 @@ from pydantic import (
     model_validator,
 )
 
-from cayu._validation import copy_durable_json_object, json_utf8_size_within_limit
+from cayu._validation import json_utf8_size_within_limit
 from cayu.core.messages import Message, MessageRole, TextPart, detach_message
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_CASES,
@@ -54,7 +52,7 @@ from cayu.evals.result_contract import (
 from cayu.evals.runner import EvalCase, EvalSuite, _run_eval_suite_with_public_projection
 from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import PriceBook, copy_price_book
-from cayu.runtime.manifest import AppManifest
+from cayu.runtime.manifest import AppManifest, _app_manifest_fingerprint
 from cayu.runtime.sessions import RunRequest, copy_run_request
 
 CORPUS_EXECUTION_MAX_BOOTSTRAP_MESSAGES = EVAL_CORPUS_MAX_MESSAGES_PER_CASE
@@ -175,19 +173,7 @@ class EvaluationTargetIdentity(BaseModel):
             character not in "0123456789abcdef" for character in fingerprint
         ):
             raise ValueError("app_manifest_fingerprint must be a lowercase SHA-256 hex digest.")
-        manifest_document = copy_durable_json_object(
-            self.app_manifest.model_dump(mode="json"),
-            "AppManifest",
-        )
-        manifest_document.pop("fingerprint")
-        expected_fingerprint = hashlib.sha256(
-            json.dumps(
-                manifest_document,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            ).encode("utf-8")
-        ).hexdigest()
+        expected_fingerprint = _app_manifest_fingerprint(self.app_manifest.model_dump(mode="json"))
         if fingerprint != expected_fingerprint:
             raise ValueError("AppManifest fingerprint does not match its content.")
         if not json_utf8_size_within_limit(
@@ -892,7 +878,11 @@ def _finalize_compiled_corpus_result(
         target,
         project_root=manifest_project_root,
     )
-    if target_after != target_before:
+    if (
+        target_after.target_key != target_before.target_key
+        or target_after.application_release_id != target_before.application_release_id
+        or target_after.app_manifest_fingerprint != target_before.app_manifest_fingerprint
+    ):
         raise RuntimeError("CorpusTarget application manifest changed during eval execution.")
     run_document: dict[str, Any] = _model_instance_python_input(internal_run)
     run_document["run_contract"] = compiled.run_contract

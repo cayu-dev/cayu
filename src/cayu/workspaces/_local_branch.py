@@ -70,6 +70,7 @@ from cayu.workspaces.branches import (
     WorkspaceBranchAuthority,
     WorkspaceBranchBindingAuthority,
     WorkspaceBranchBindingAuthorityClaim,
+    WorkspaceBranchBindingAuthorityClaimScope,
     WorkspaceBranchChange,
     WorkspaceBranchChangeSet,
     WorkspaceBranchClosedError,
@@ -93,11 +94,12 @@ from cayu.workspaces.branches import (
     WorkspaceBranchRollbackRequest,
     WorkspaceBranchRollbackResult,
     WorkspaceBranchStore,
+    WorkspaceBranchStoreDurability,
     _bounded_workspace_branch_evidence,
     _copy_workspace_branch_request_envelope,
     _json_text_size,
-    _workspace_branch_empty_change_set_json_size,
     _workspace_branch_evidence_json_size,
+    _workspace_branch_fixed_authority_evidence_limit_violation,
     copy_workspace_branch_request,
     workspace_branch_change_set_digest,
     workspace_branch_evidence,
@@ -2042,6 +2044,25 @@ def _captured_from_durable_record(
     )
 
 
+def _require_durable_branch_support(source: LocalWorkspace) -> None:
+    if source._branch_store is None:
+        raise RuntimeError("Durable workspace branches require branch_store.")
+    if source._branch_store_durability is not WorkspaceBranchStoreDurability.DURABLE:
+        raise RuntimeError(
+            "Durable workspace branches require a branch store with durability='durable'."
+        )
+    provider = source._branch_authority_resolver
+    if provider is None:
+        raise RuntimeError(
+            "Durable workspace branches require LocalWorkspace branch_authority_resolver."
+        )
+    if source._branch_claim_scope is not WorkspaceBranchBindingAuthorityClaimScope.DURABLE:
+        raise RuntimeError(
+            "Durable workspace branches require a branch authority provider with "
+            "claim_scope='durable'."
+        )
+
+
 def _binding_authority_claim_lease(
     source: LocalWorkspace,
     authority: WorkspaceBranchAuthority,
@@ -2050,11 +2071,10 @@ def _binding_authority_claim_lease(
     if type(source_key) is not tuple or not source_key:
         raise WorkspaceBranchFencedError("Workspace source identity is unavailable.")
     _retry_pending_binding_claim_releases(source_key)
+    _require_durable_branch_support(source)
     provider = source._branch_authority_resolver
-    if provider is None:
-        raise RuntimeError(
-            "Durable workspace branches require LocalWorkspace branch_authority_resolver."
-        )
+    if provider is None:  # pragma: no cover - helper invariant
+        raise AssertionError("Durable workspace branch authority provider disappeared.")
     expected = WorkspaceBranchBindingAuthority(
         environment_name=authority.environment_name,
         binding_generation=authority.binding_generation,
@@ -2845,6 +2865,7 @@ async def recover_local_workspace_branch(
     store = source._branch_store
     if store is None:
         raise RuntimeError("Durable workspace branch recovery requires branch_store.")
+    _require_durable_branch_support(source)
     source_key = source.resource_key
     if type(source_key) is not tuple or not source_key:
         raise WorkspaceBranchFencedError("Workspace source identity is unavailable.")
@@ -3183,10 +3204,12 @@ async def create_local_workspace_branch(
         )
     if envelope.source.workspace_id != source.id:
         raise ValueError("Workspace branch baseline belongs to a different workspace.")
-    envelope_evidence_limit_violation = _fixed_authority_evidence_limit_violation(
+    envelope_evidence_limit_violation = _workspace_branch_fixed_authority_evidence_limit_violation(
         source=envelope.source,
         baseline_revision=envelope.baseline_revision,
+        branch_id=envelope.branch_id or "wsb_" + "0" * 32,
         limits=envelope.limits,
+        created_detail_code="workspace_branch_created",
     )
     if envelope_evidence_limit_violation is not None:
         return WorkspaceBranchCreationResult(
@@ -3230,6 +3253,8 @@ async def create_local_workspace_branch(
             WorkspaceBranchOutcomeStatus.RESOURCE_EXHAUSTED,
             detail_code=evidence_limit_violation,
         )
+    if copied.authority is not None:
+        _require_durable_branch_support(source)
     source_key = source.resource_key
     if type(source_key) is not tuple or not source_key:
         return _creation_result_without_branch(
@@ -3239,8 +3264,6 @@ async def create_local_workspace_branch(
         )
     await _retry_pending_durable_terminal_settlements(source_key)
     if copied.authority is not None:
-        if source._branch_store is None:
-            raise RuntimeError("Durable workspace branch creation requires branch_store.")
         binding_claim_lease = _binding_authority_claim_lease(source, copied.authority)
         try:
             result = await _create_durable_local_workspace_branch(
@@ -3413,61 +3436,13 @@ def _request_evidence_limit_violation(request: WorkspaceBranchRequest) -> str | 
     baseline_revision = request.baseline.revision
     if baseline_revision is None:  # pragma: no cover - request invariant
         raise AssertionError("Workspace branch baseline revision disappeared.")
-    return _fixed_authority_evidence_limit_violation(
+    return _workspace_branch_fixed_authority_evidence_limit_violation(
         source=request.baseline.identity,
         baseline_revision=baseline_revision,
+        branch_id=request.branch_id or "wsb_" + "0" * 32,
         limits=request.limits,
+        created_detail_code="workspace_branch_created",
     )
-
-
-def _fixed_authority_evidence_limit_violation(
-    *,
-    source: WorkspaceIdentity,
-    baseline_revision: str,
-    limits: WorkspaceBranchLimits,
-) -> str | None:
-    branch_id = "wsb_" + "0" * 32
-    digest = "sha256:" + "0" * 64
-    if (
-        _workspace_branch_empty_change_set_json_size(
-            branch_id=branch_id,
-            source=source,
-            baseline_revision=baseline_revision,
-        )
-        > limits.max_evidence_bytes
-    ):
-        return "change_evidence_limit_exceeded"
-    for outcome, change_set_digest, detail_code in (
-        (
-            WorkspaceBranchOutcomeStatus.CREATED,
-            None,
-            "workspace_branch_created",
-        ),
-        (
-            WorkspaceBranchOutcomeStatus.COMMITTED,
-            digest,
-            "workspace_branch_committed",
-        ),
-        (
-            WorkspaceBranchOutcomeStatus.RESOURCE_EXHAUSTED,
-            digest,
-            "result_evidence_limit_exceeded",
-        ),
-    ):
-        if (
-            _workspace_branch_evidence_json_size(
-                source=source,
-                outcome=outcome,
-                baseline_revision=baseline_revision,
-                branch_id=branch_id,
-                change_set_digest=change_set_digest,
-                affected_path_count=0,
-                detail_code=detail_code,
-            )
-            > limits.max_evidence_bytes
-        ):
-            return "result_evidence_limit_exceeded"
-    return None
 
 
 def _bounded_branch_evidence(

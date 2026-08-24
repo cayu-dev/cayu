@@ -1935,11 +1935,31 @@ class AgentsResponse(ApiBaseModel):
     total_count: StrictInt = Field(ge=0)
 
 
+class ApiWorkspaceBranchCapabilities(ApiBaseModel):
+    isolation: StrictBool
+    net_changes: StrictBool
+    publication: Literal["unsupported", "cooperative_atomic"]
+    recovery: Literal["unsupported", "process_local", "durable"]
+    retention: Literal["unsupported", "process_local", "durable"]
+    lifecycle_inspection: Literal["unsupported", "attached", "recoverable_by_id"]
+    detail_code: str
+
+
+class ApiWorkspaceBranchLifecycle(ApiBaseModel):
+    attached_count: StrictInt = Field(ge=0, le=256)
+    statuses: list[
+        Literal["active", "publishing", "rolling_back", "committed", "rolled_back", "fenced"]
+    ] = Field(max_length=256)
+    truncated: StrictBool
+
+
 class ApiEnvironmentSummary(ApiBaseModel):
     name: str
     metadata: dict[str, Any]
     is_factory: StrictBool
     workspace_id: str | None
+    workspace_branch_capabilities: ApiWorkspaceBranchCapabilities
+    workspace_branch_lifecycle: ApiWorkspaceBranchLifecycle
     artifact_store_id: str | None
     runner_type: str | None
     binding_type: str | None

@@ -8,6 +8,7 @@ import logging
 import re
 import threading
 import time
+import warnings
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta, timezone
@@ -46,6 +47,7 @@ from cayu import (
     KnowledgeRevisionConflict,
     KnowledgeStatus,
     LocalArtifactStore,
+    LocalWorkspace,
     Message,
     MessageRole,
     PublicAuthorityAliasCodec,
@@ -64,6 +66,9 @@ from cayu import (
     WorkContractDraft,
     WorkCriterion,
     WorkspaceBinding,
+    WorkspaceBranch,
+    WorkspaceBranchCapabilities,
+    WorkspaceBranchRequest,
     default_price_book,
     work_contract_from_draft,
 )
@@ -905,8 +910,113 @@ def test_server_run_binding_failure_terminalizes_prestarted_task() -> None:
     }
 
 
+def test_environment_capability_projection_preserves_controls_and_redacts_detail(
+    tmp_path,
+) -> None:
+    canary = "extension-capability-secret"
+
+    class DetailWorkspace(LocalWorkspace):
+        def branch_capabilities(self) -> WorkspaceBranchCapabilities:
+            return WorkspaceBranchCapabilities(detail_code=canary)
+
+    app = CayuApp(
+        secret_redactor=SecretRedactor([canary, "unsupported"]),
+        enable_logging=False,
+    )
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="detail-workspace"),
+            workspace=DetailWorkspace(tmp_path),
+        ),
+        default=True,
+    )
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    response = client.get("/api/environments")
+
+    assert response.status_code == 200
+    capabilities = response.json()["environments"][0]["workspace_branch_capabilities"]
+    assert capabilities["publication"] == "unsupported"
+    assert capabilities["recovery"] == "unsupported"
+    assert capabilities["retention"] == "unsupported"
+    assert capabilities["detail_code"] == "[REDACTED_SECRET]"
+    assert canary not in response.text
+
+
+def test_environment_capability_projection_rejects_mutated_evidence_safely(
+    tmp_path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    canary = "mutated-server-capability-secret"
+
+    class SecretBearingWrongType:
+        def __repr__(self) -> str:
+            return canary
+
+        def __str__(self) -> str:
+            return canary
+
+    candidate = WorkspaceBranchCapabilities()
+    object.__setattr__(candidate, "detail_code", SecretBearingWrongType())
+
+    class MutatedCapabilityWorkspace(LocalWorkspace):
+        def branch_capabilities(self) -> WorkspaceBranchCapabilities:
+            return candidate
+
+    app = CayuApp(enable_logging=False)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="mutated-capability"),
+            workspace=MutatedCapabilityWorkspace(tmp_path),
+        ),
+        default=True,
+    )
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    with warnings.catch_warnings(record=True) as caught, caplog.at_level(logging.WARNING):
+        response = client.get("/api/environments")
+
+    captured = capsys.readouterr()
+    assert response.status_code == 200
+    assert response.json()["environments"][0]["workspace_branch_capabilities"]["detail_code"] == (
+        "workspace_branch_capability_evidence_invalid"
+    )
+    diagnostic_text = "\n".join(
+        [
+            response.text,
+            repr(response),
+            *(str(item.message) for item in caught),
+            caplog.text,
+            captured.out,
+            captured.err,
+        ]
+    )
+    assert canary not in diagnostic_text
+
+
 def test_server_exposes_agent_environment_and_artifact_inventory(tmp_path) -> None:
     artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="test-artifacts")
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    workspace = LocalWorkspace(workspace_root)
+
+    async def attach_branch() -> WorkspaceBranch:
+        from cayu.workspaces.revisions import (
+            WorkspaceRevisionObservationLimits,
+            observe_deterministic_workspace,
+        )
+
+        observation = await observe_deterministic_workspace(
+            workspace,
+            observer="server-lifecycle-test",
+            limits=WorkspaceRevisionObservationLimits(),
+        )
+        created = await workspace.create_branch(WorkspaceBranchRequest(baseline=observation))
+        assert created.branch is not None
+        return created.branch
+
+    attached_branch = asyncio.run(attach_branch())
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)
     app.register_agent(
@@ -923,6 +1033,7 @@ def test_server_exposes_agent_environment_and_artifact_inventory(tmp_path) -> No
         Environment(
             EnvironmentSpec(name="local-review", metadata={"tenant": "test"}),
             artifact_store=artifact_store,
+            workspace=workspace,
             workspace_instructions="Use local workspace instructions.",
         ),
         default=True,
@@ -966,6 +1077,21 @@ def test_server_exposes_agent_environment_and_artifact_inventory(tmp_path) -> No
     assert environments_body["environments"][0]["name"] == "local-review"
     assert environments_body["environments"][0]["artifact_store_id"] == "test-artifacts"
     assert environments_body["environments"][0]["workspace_instructions"] == "inline"
+    assert environments_body["environments"][0]["workspace_branch_capabilities"] == {
+        "detail_code": "process_local_workspace_branches",
+        "isolation": True,
+        "lifecycle_inspection": "attached",
+        "net_changes": True,
+        "publication": "cooperative_atomic",
+        "recovery": "process_local",
+        "retention": "process_local",
+    }
+    assert environments_body["environments"][0]["workspace_branch_lifecycle"] == {
+        "attached_count": 1,
+        "statuses": ["active"],
+        "truncated": False,
+    }
+    assert attached_branch.lifecycle_status.value == "active"
 
     artifacts = client.get("/api/artifacts", params={"session_id": "sess_inventory"})
     assert artifacts.status_code == 200

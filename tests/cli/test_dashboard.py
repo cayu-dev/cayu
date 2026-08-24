@@ -15,6 +15,7 @@ from typing import Any, cast
 
 import pytest
 
+from cayu._server_contract_version import SERVER_CONTRACT_VERSION
 from cayu.cli import _version, main
 from cayu.cli import dashboard as dashboard_cli
 from cayu.cli.dashboard import DashboardSourceError, eject_dashboard_source
@@ -138,7 +139,7 @@ def test_dashboard_eject_materializes_version_matched_editable_project(
 
     manifest = json.loads((destination / "cayu-dashboard-source.json").read_text(encoding="utf-8"))
     assert manifest["cayu_version"] == _version()
-    assert manifest["server_contract_version"] == "22"
+    assert manifest["server_contract_version"] == SERVER_CONTRACT_VERSION
     assert manifest["source_digest"].startswith("sha256:")
     package = json.loads((destination / "package.json").read_text(encoding="utf-8"))
     assert "build:package" not in package["scripts"]
@@ -153,7 +154,7 @@ def test_dashboard_eject_materializes_version_matched_editable_project(
     output = capsys.readouterr().out
     assert f"installed Cayu version: {_version()}" in output
     assert f"dashboard source version: {_version()}" in output
-    assert "dashboard server contract: v22" in output
+    assert f"dashboard server contract: v{SERVER_CONTRACT_VERSION}" in output
     assert f"Project directory: {destination}" in output
     assert f"cd {destination}" not in output
     assert "npm ci" in output

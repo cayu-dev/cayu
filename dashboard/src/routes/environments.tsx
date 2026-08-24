@@ -55,6 +55,10 @@ function environmentMatches(environment: EnvironmentSummary, query: string) {
     environment.proxy_type,
     environment.knowledge_store_type,
     environment.workspace_instructions,
+    ...Object.values(environment.workspace_branch_capabilities).filter(
+      (value): value is string => typeof value === "string",
+    ),
+    ...environment.workspace_branch_lifecycle.statuses,
   ].some((value) => value?.toLowerCase().includes(needle))
 }
 
@@ -68,6 +72,7 @@ function capabilityCount(environment: EnvironmentSummary) {
     environment.proxy_type,
     environment.knowledge_store_type,
     environment.workspace_instructions,
+    environment.workspace_branch_capabilities.isolation,
   ].filter(Boolean).length
 }
 
@@ -174,6 +179,11 @@ function EnvironmentDetail({
           </Badge>
           {environment.artifact_store_id && <Badge variant="outline">artifacts</Badge>}
           {environment.runner_type && <Badge variant="outline">runner</Badge>}
+          {environment.workspace_branch_capabilities.isolation && (
+            <Badge variant="outline">
+              branches: {environment.workspace_branch_lifecycle.attached_count} attached
+            </Badge>
+          )}
           {environment.vault_type && <Badge variant="outline">vault</Badge>}
           {environment.mcp_server_count > 0 && (
             <Badge variant="outline">{formatCount(environment.mcp_server_count)} MCP</Badge>
@@ -203,6 +213,18 @@ function EnvironmentDetail({
         <DetailRow label="proxy" value={environment.proxy_type ?? "-"} />
         <DetailRow label="instructions" value={environment.workspace_instructions ?? "-"} />
         <DetailRow label="mcp servers" value={formatCount(environment.mcp_server_count)} />
+        <DetailRow
+          label="branch support"
+          value={
+            <PayloadViewer value={environment.workspace_branch_capabilities} maxHeight="max-h-44" />
+          }
+        />
+        <DetailRow
+          label="branch lifecycle"
+          value={
+            <PayloadViewer value={environment.workspace_branch_lifecycle} maxHeight="max-h-44" />
+          }
+        />
         <DetailRow
           label="metadata"
           value={<PayloadViewer value={environment.metadata} maxHeight="max-h-44" />}

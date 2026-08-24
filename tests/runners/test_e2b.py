@@ -17,6 +17,7 @@ from cayu.runners import (
     E2BWorkspaceCapability,
     ExecCommand,
     ExecResult,
+    RemoteWorkspaceBranchCapability,
     RunnerExecutionError,
 )
 from cayu.testing import verify_provider_credential_isolation
@@ -347,6 +348,28 @@ def test_e2b_runner_rejects_nonportable_default_cwd(invalid_text: str) -> None:
     runner.default_cwd = invalid_text
     with pytest.raises(ValueError, match="default_cwd"):
         runner.resolve_cwd()
+
+
+def test_e2b_runner_explicitly_exposes_remote_workspace_branch_capability() -> None:
+    runner = E2BRunner(object(), sandbox_id="sensitive-allocation-handle")
+
+    capability = runner.workspace_capability(RemoteWorkspaceBranchCapability)
+
+    assert capability is not None
+    assert capability.resource_key == ("e2b", "sensitive-allocation-handle")
+    assert capability.protocol_version == "cayu-runner-workspace-branch-v1"
+    assert capability.allocation_fingerprint.startswith("sha256:")
+    assert "sensitive-allocation-handle" not in capability.allocation_fingerprint
+
+
+def test_e2b_runner_subclass_does_not_inherit_unproven_branch_capability() -> None:
+    class ExtendedE2BRunner(E2BRunner):
+        pass
+
+    runner = ExtendedE2BRunner(object(), sandbox_id="extended-allocation")
+
+    assert runner.workspace_capability(RemoteWorkspaceBranchCapability) is None
+    assert runner.workspace_capability(E2BWorkspaceCapability) is not None
 
 
 def test_e2b_runner_create_passes_e2b_lifecycle_options() -> None:
@@ -2194,6 +2217,8 @@ def test_e2b_runner_does_not_settle_lost_start_acknowledgement(
 def test_e2b_runner_keeps_uncertainty_latched_across_concurrent_cleanups() -> None:
     async def run() -> tuple[bool, bool, bool, bool]:
         successful_handle = FakeHandle()
+        failed_start_allowed = asyncio.Event()
+        successful_start_allowed = asyncio.Event()
 
         class ConcurrentLostAcknowledgementCommands(FakeCommands):
             def __init__(self) -> None:
@@ -2209,9 +2234,10 @@ def test_e2b_runner_keeps_uncertainty_latched_across_concurrent_cleanups() -> No
                 try:
                     await asyncio.Event().wait()
                 except asyncio.CancelledError:
-                    await asyncio.sleep(0.015 if call == 1 else 0.025)
                     if call == 1:
+                        await failed_start_allowed.wait()
                         raise RuntimeError("first E2B start acknowledgement was lost") from None
+                    await successful_start_allowed.wait()
                     return successful_handle
 
         sandbox = FakeSandbox()
@@ -2221,6 +2247,7 @@ def test_e2b_runner_keeps_uncertainty_latched_across_concurrent_cleanups() -> No
             cancel_timeout_s=0.01,
             e2b_module=FakeE2BModule,
         )
+        runner._late_start_cleanup_timeout_s = 1.0
         commands = (
             asyncio.create_task(runner.exec(ExecCommand.process("first-mutation"))),
             asyncio.create_task(runner.exec(ExecCommand.process("second-mutation"))),
@@ -2232,6 +2259,14 @@ def test_e2b_runner_keeps_uncertainty_latched_across_concurrent_cleanups() -> No
             with pytest.raises(asyncio.CancelledError):
                 await command
 
+        failed_start_allowed.set()
+
+        async def wait_for_uncertainty() -> None:
+            while not runner._command_settlement_uncertain:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_uncertainty(), timeout=1.0)
+        successful_start_allowed.set()
         settled = await runner.await_pending_command_settlement()
         exec_closed_before_verification = runner._exec_closed
         sandbox.commands = FakeCommands()

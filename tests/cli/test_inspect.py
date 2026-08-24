@@ -66,12 +66,26 @@ def build_app():
     assert main(["inspect"]) == 0
 
     output = json.loads(capsys.readouterr().out)
-    assert output["schema_version"] == "9"
+    assert output["schema_version"] == "11"
     assert output["agents"][0]["name"] == "reviewer"
     assert output["agents"][0]["resolved_provider"] == "scripted"
     assert output["defaults"]["environment"] is None
     assert output["environments"][0]["name"] == "optional"
     assert output["environments"][0]["is_default"] is False
+    assert output["environments"][0]["workspace_branch_capabilities"] == {
+        "detail_code": "workspace_branching_unsupported",
+        "isolation": False,
+        "lifecycle_inspection": "unsupported",
+        "net_changes": False,
+        "publication": "unsupported",
+        "recovery": "unsupported",
+        "retention": "unsupported",
+    }
+    assert output["environments"][0]["workspace_branch_lifecycle"] == {
+        "attached_count": 0,
+        "statuses": [],
+        "truncated": False,
+    }
     assert output["agents"][0]["registration_provenance"]["location"] == "inspect_project.py"
     assert (
         output["agents"][0]["tools"][0]["implementation_provenance"]["location"]
@@ -117,7 +131,7 @@ def build_app():
 
     assert main(["inspect", "--environment", "missing", "--json"]) == 1
     error = json.loads(capsys.readouterr().out)
-    assert error["schema_version"] == "9"
+    assert error["schema_version"] == "11"
     assert error["error"] == {
         "code": "SUBJECT_NOT_FOUND",
         "message": "Environment not found: missing.",
@@ -145,7 +159,7 @@ def test_inspect_factory_failure_uses_current_manifest_schema_version(
 
     output = json.loads(capsys.readouterr().out)
     assert output == {
-        "schema_version": "9",
+        "schema_version": "11",
         "error": {
             "code": "PROJECT_BOOT_FAILED",
             "message": "Application factory failed (RuntimeError): boot exploded",

@@ -11,6 +11,7 @@ import warnings
 from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 from pydantic import ValidationError
@@ -27,6 +28,7 @@ from cayu import (
     WorkspaceBranchAuthority,
     WorkspaceBranchBindingAuthority,
     WorkspaceBranchBindingAuthorityClaim,
+    WorkspaceBranchBindingAuthorityClaimScope,
     WorkspaceBranchBindingAuthorityProvider,
     WorkspaceBranchBindingAuthorityRegistry,
     WorkspaceBranchChange,
@@ -43,6 +45,7 @@ from cayu import (
     WorkspaceBranchRequest,
     WorkspaceBranchResourceExhaustedError,
     WorkspaceBranchRollbackRequest,
+    WorkspaceBranchStoreDurability,
     WorkspaceRevisionObservationLimits,
 )
 from cayu._validation import canonical_durable_json_bytes
@@ -50,6 +53,14 @@ from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime.sessions import _OwnedOffThreadSessionCommitGuard
 from cayu.workspaces.branches import workspace_branch_change_set_digest
 from cayu.workspaces.revisions import WorkspaceIdentity, observe_deterministic_workspace
+
+
+class _TemporarySQLiteSessionStore(SQLiteSessionStore):
+    """Disk-backed durable session store for fault-injection tests."""
+
+    def __init__(self) -> None:
+        self._temporary_directory = TemporaryDirectory(prefix="cayu-branch-tests-")
+        super().__init__(Path(self._temporary_directory.name) / "sessions.sqlite3")
 
 
 def _replace_owned_commit_guard(
@@ -61,7 +72,7 @@ def _replace_owned_commit_guard(
     return callback
 
 
-class _LoseGuardedAcknowledgementStore(InMemorySessionStore):
+class _LoseGuardedAcknowledgementStore(_TemporarySQLiteSessionStore):
     supports_owned_off_thread_session_commit_guards = True
 
     def __init__(self) -> None:
@@ -76,7 +87,7 @@ class _LoseGuardedAcknowledgementStore(InMemorySessionStore):
         return result
 
 
-class _FailPublicationBeforeCommitStore(InMemorySessionStore):
+class _FailPublicationBeforeCommitStore(_TemporarySQLiteSessionStore):
     def __init__(self) -> None:
         super().__init__()
         self.successes_before_failure: int | None = None
@@ -91,7 +102,7 @@ class _FailPublicationBeforeCommitStore(InMemorySessionStore):
         return await super().publish_session_operation(session_id, **kwargs)
 
 
-class _BlockAfterTerminalCommitStore(InMemorySessionStore):
+class _BlockAfterTerminalCommitStore(_TemporarySQLiteSessionStore):
     def __init__(self) -> None:
         super().__init__()
         self.block_terminal_commit = False
@@ -119,7 +130,7 @@ class _BlockAfterTerminalCommitStore(InMemorySessionStore):
         return await super().load_session_operation(session_id, idempotency_key, **kwargs)
 
 
-class _CorruptLoadedBranchRecordStore(InMemorySessionStore):
+class _CorruptLoadedBranchRecordStore(_TemporarySQLiteSessionStore):
     def __init__(self) -> None:
         super().__init__()
         self.corrupt_branch_record = False
@@ -227,7 +238,7 @@ class _RewriteRetainedEvidenceStore(_FailPublicationBeforeCommitStore):
         return record
 
 
-class _RewriteDurableExpiryStore(InMemorySessionStore):
+class _RewriteDurableExpiryStore(_TemporarySQLiteSessionStore):
     def __init__(self) -> None:
         super().__init__()
         self.rewrite_mode: str | None = None
@@ -261,7 +272,7 @@ class _RewriteDurableExpiryStore(InMemorySessionStore):
         return record
 
 
-class _FailReconciliationLoadStore(InMemorySessionStore):
+class _FailReconciliationLoadStore(_TemporarySQLiteSessionStore):
     supports_owned_off_thread_session_commit_guards = True
 
     def __init__(self) -> None:
@@ -332,7 +343,7 @@ class _DelayedCreatingGuardStore(_RedirectLoadedPrivateRootStore):
         return await super().publish_session_operation_guarded(session_id, **kwargs)
 
 
-class _MissingTerminalEvidenceStore(InMemorySessionStore):
+class _MissingTerminalEvidenceStore(_TemporarySQLiteSessionStore):
     def __init__(self) -> None:
         super().__init__()
         self.terminal_state: str | None = None
@@ -352,7 +363,7 @@ class _MissingTerminalEvidenceStore(InMemorySessionStore):
         return record
 
 
-class _ContradictoryTerminalEvidenceStore(InMemorySessionStore):
+class _ContradictoryTerminalEvidenceStore(_TemporarySQLiteSessionStore):
     def __init__(self) -> None:
         super().__init__()
         self.inject_rollback = False
@@ -372,7 +383,7 @@ class _ContradictoryTerminalEvidenceStore(InMemorySessionStore):
         return record
 
 
-class _RewritePublicationAuthorityStore(InMemorySessionStore):
+class _RewritePublicationAuthorityStore(_TemporarySQLiteSessionStore):
     def __init__(self) -> None:
         super().__init__()
         self.rewrite_publication_authority = False
@@ -400,7 +411,7 @@ class _RewritePublicationAuthorityStore(InMemorySessionStore):
         return record
 
 
-class _DriftGuardedCurrentRecordStore(InMemorySessionStore):
+class _DriftGuardedCurrentRecordStore(_TemporarySQLiteSessionStore):
     supports_owned_off_thread_session_commit_guards = True
 
     def __init__(self) -> None:
@@ -430,7 +441,7 @@ class _DriftGuardedCurrentRecordStore(InMemorySessionStore):
         )
 
 
-class _CrashInsideGuardStore(InMemorySessionStore):
+class _CrashInsideGuardStore(_TemporarySQLiteSessionStore):
     supports_owned_off_thread_session_commit_guards = True
 
     def __init__(self) -> None:
@@ -560,7 +571,15 @@ def _binding_authority(
     )
 
 
-class _NonReentrantAuthorityProvider(WorkspaceBranchBindingAuthorityRegistry):
+class _DurableAuthorityProvider(WorkspaceBranchBindingAuthorityRegistry):
+    """Test owner standing in for a cross-process authority provider."""
+
+    @property
+    def claim_scope(self) -> WorkspaceBranchBindingAuthorityClaimScope:
+        return WorkspaceBranchBindingAuthorityClaimScope.DURABLE
+
+
+class _NonReentrantAuthorityProvider(_DurableAuthorityProvider):
     """Test provider that rejects every callback while one claim is active."""
 
     def __init__(self, authority: WorkspaceBranchBindingAuthority) -> None:
@@ -601,7 +620,7 @@ class _NonReentrantAuthorityProvider(WorkspaceBranchBindingAuthorityRegistry):
         return _Claim()
 
 
-class _FailOnceReleaseAuthorityProvider(WorkspaceBranchBindingAuthorityRegistry):
+class _FailOnceReleaseAuthorityProvider(_DurableAuthorityProvider):
     """Test provider whose claim remains active across one release failure."""
 
     def __init__(self, authority: WorkspaceBranchBindingAuthority) -> None:
@@ -641,11 +660,11 @@ class _FailOnceReleaseAuthorityProvider(WorkspaceBranchBindingAuthorityRegistry)
 
 def _workspace(root: Path, store, *, resolver=None) -> LocalWorkspace:
     if resolver is None:
-        authority_provider = WorkspaceBranchBindingAuthorityRegistry(_binding_authority())
+        authority_provider = _DurableAuthorityProvider(_binding_authority())
     elif isinstance(resolver, WorkspaceBranchBindingAuthorityProvider):
         authority_provider = resolver
     else:
-        authority_provider = WorkspaceBranchBindingAuthorityRegistry(resolver())
+        authority_provider = _DurableAuthorityProvider(resolver())
     return LocalWorkspace(
         root,
         workspace_id="workspace-alpha",
@@ -781,7 +800,7 @@ def test_exact_durable_attachments_share_one_active_branch_slot(
         import cayu.workspaces._local_branch as branch_module
 
         _isolate_retained_branch_state(monkeypatch, branch_module)
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -822,7 +841,7 @@ def test_exact_durable_attachments_share_terminal_lifecycle_during_failed_cleanu
         import cayu.workspaces._local_branch as branch_module
 
         _isolate_retained_branch_state(monkeypatch, branch_module)
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -877,7 +896,7 @@ def test_terminal_recovery_retires_surviving_process_attachment(
         import cayu.workspaces._local_branch as branch_module
 
         _isolate_retained_branch_state(monkeypatch, branch_module)
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -1091,17 +1110,11 @@ async def _assert_terminal_handle_released_capacity(root: Path, store) -> None:
     )
 
 
-@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
 def test_durable_branch_never_reenters_binding_authority_provider(
     tmp_path: Path,
-    store_kind: str,
 ) -> None:
     async def scenario() -> None:
-        store = (
-            InMemorySessionStore()
-            if store_kind == "memory"
-            else SQLiteSessionStore(tmp_path / "child-cancellation.sqlite3")
-        )
+        store = SQLiteSessionStore(tmp_path / "child-cancellation.sqlite3")
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -1143,14 +1156,12 @@ def test_durable_branch_never_reenters_binding_authority_provider(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
 def test_fresh_owner_recovers_open_branch_and_private_changes(
     tmp_path: Path,
-    store_kind: str,
 ) -> None:
     async def scenario() -> None:
         database = tmp_path / "branches.sqlite3"
-        store = InMemorySessionStore() if store_kind == "memory" else SQLiteSessionStore(database)
+        store = SQLiteSessionStore(database)
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -1161,7 +1172,7 @@ def test_fresh_owner_recovers_open_branch_and_private_changes(
         await branch.write_bytes("created.txt", b"created")
         await branch.delete("deleted.txt")
 
-        reopened_store = store if store_kind == "memory" else SQLiteSessionStore(database)
+        reopened_store = SQLiteSessionStore(database)
         fresh = _workspace(root, reopened_store)
         recovered = await fresh.recover_branch(_recovery_request())
 
@@ -1845,7 +1856,7 @@ def test_concurrent_terminal_recovery_converges_during_private_cleanup(
 
 def test_durable_rollback_is_terminal_before_private_cleanup(tmp_path: Path) -> None:
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -1893,7 +1904,7 @@ def test_durable_rollback_is_terminal_before_private_cleanup(tmp_path: Path) -> 
 
 def test_durable_operations_reject_stale_and_conflicting_authority(tmp_path: Path) -> None:
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -1913,7 +1924,7 @@ def test_durable_operations_reject_stale_and_conflicting_authority(tmp_path: Pat
 
 def test_durable_create_requires_an_atomic_branch_store(tmp_path: Path) -> None:
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -1937,6 +1948,203 @@ def test_durable_create_requires_an_atomic_branch_store(tmp_path: Path) -> None:
         with pytest.raises(RuntimeError, match="branch_authority_resolver"):
             await without_live_authority.create_branch(
                 request.model_copy(update={"branch_id": "branch-gamma"})
+            )
+
+    asyncio.run(scenario())
+
+
+def test_local_workspace_durable_capabilities_require_cross_process_claims_and_store(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    development_store = SessionWorkspaceBranchStore(InMemorySessionStore())
+    in_memory_sqlite_store = SessionWorkspaceBranchStore(SQLiteSessionStore(":memory:"))
+    durable_store = SessionWorkspaceBranchStore(SQLiteSessionStore(tmp_path / "branches.sqlite3"))
+    process_local_claims = LocalWorkspace(
+        root,
+        workspace_id="workspace-alpha",
+        branch_store=durable_store,
+        branch_authority_resolver=WorkspaceBranchBindingAuthorityRegistry(_binding_authority()),
+    )
+    process_local_store = LocalWorkspace(
+        root,
+        workspace_id="workspace-alpha",
+        branch_store=development_store,
+        branch_authority_resolver=_DurableAuthorityProvider(_binding_authority()),
+    )
+    durable = LocalWorkspace(
+        root,
+        workspace_id="workspace-alpha",
+        branch_store=durable_store,
+        branch_authority_resolver=_DurableAuthorityProvider(_binding_authority()),
+    )
+
+    assert development_store.durability is WorkspaceBranchStoreDurability.DEVELOPMENT
+    assert in_memory_sqlite_store.durability is WorkspaceBranchStoreDurability.DEVELOPMENT
+    assert durable_store.durability is WorkspaceBranchStoreDurability.DURABLE
+    for workspace in (process_local_claims, process_local_store):
+        capabilities = workspace.branch_capabilities()
+        assert capabilities.recovery.value == "process_local"
+        assert capabilities.retention.value == "process_local"
+        assert capabilities.lifecycle_inspection.value == "attached"
+        assert capabilities.detail_code == "process_local_workspace_branches"
+    durable_capabilities = durable.branch_capabilities()
+    assert durable_capabilities.recovery.value == "durable"
+    assert durable_capabilities.retention.value == "durable"
+    assert durable_capabilities.lifecycle_inspection.value == "recoverable_by_id"
+    assert durable_capabilities.detail_code == "durable_local_workspace_branches"
+
+
+def test_local_workspace_validates_branch_claim_scope_at_construction(
+    tmp_path: Path,
+) -> None:
+    class InvalidClaimScopeProvider(WorkspaceBranchBindingAuthorityRegistry):
+        @property
+        def claim_scope(self):
+            return "cross_process_if_lucky"
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+
+    with pytest.raises(TypeError, match="declare its claim scope"):
+        LocalWorkspace(
+            root,
+            branch_authority_resolver=InvalidClaimScopeProvider(_binding_authority()),
+        )
+
+
+def test_local_workspace_validates_branch_store_durability_at_construction(
+    tmp_path: Path,
+) -> None:
+    class MissingDurabilityStore:
+        async def load_workspace_branch_record(self, *_args, **_kwargs):
+            return None
+
+        async def publish_workspace_branch_record(self, *_args, **_kwargs):
+            return None
+
+    class InvalidDurabilityStore(MissingDurabilityStore):
+        @property
+        def durability(self):
+            return "durable_if_this_process_survives"
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+
+    with pytest.raises(TypeError, match="implement WorkspaceBranchStore"):
+        LocalWorkspace(
+            root,
+            branch_store=MissingDurabilityStore(),  # type: ignore[arg-type]
+        )
+    with pytest.raises(TypeError, match="declare its durability"):
+        LocalWorkspace(
+            root,
+            branch_store=InvalidDurabilityStore(),  # type: ignore[arg-type]
+        )
+
+
+def test_local_workspace_rejects_durable_admission_with_process_local_claims(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store = _TemporarySQLiteSessionStore()
+        await _create_session(store)
+        root = tmp_path / "workspace"
+        root.mkdir()
+        source = LocalWorkspace(
+            root,
+            workspace_id="workspace-alpha",
+            branch_store=SessionWorkspaceBranchStore(store),
+            branch_authority_resolver=WorkspaceBranchBindingAuthorityRegistry(_binding_authority()),
+        )
+        baseline = await observe_deterministic_workspace(
+            source,
+            observer="process-local-authority-test",
+            limits=WorkspaceRevisionObservationLimits(),
+        )
+        authority = WorkspaceBranchAuthority(
+            session_id="branch-session",
+            expected_run_epoch=0,
+            environment_name="local",
+            binding_generation="binding-1",
+            binding_identity="workspace-alpha@binding-1",
+            creating_authority="process-local-test",
+            resource_policy="bounded-local-cow-v1",
+        )
+
+        with pytest.raises(RuntimeError, match="claim_scope='durable'"):
+            await source.create_branch(
+                WorkspaceBranchRequest(
+                    baseline=baseline,
+                    branch_id="process-local-create",
+                    idempotency_key="process-local-create-key",
+                    authority=authority,
+                )
+            )
+        with pytest.raises(RuntimeError, match="claim_scope='durable'"):
+            await source.recover_branch(
+                WorkspaceBranchRecoveryRequest(
+                    branch_id="process-local-create",
+                    session_id=authority.session_id,
+                    expected_run_epoch=authority.expected_run_epoch,
+                    binding_generation=authority.binding_generation,
+                    binding_identity=authority.binding_identity,
+                    recovery_id="process-local-recovery",
+                )
+            )
+
+    asyncio.run(scenario())
+
+
+def test_local_workspace_rejects_durable_admission_with_process_local_store(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        await _create_session(store)
+        root = tmp_path / "workspace"
+        root.mkdir()
+        source = LocalWorkspace(
+            root,
+            workspace_id="workspace-alpha",
+            branch_store=SessionWorkspaceBranchStore(store),
+            branch_authority_resolver=_DurableAuthorityProvider(_binding_authority()),
+        )
+        baseline = await observe_deterministic_workspace(
+            source,
+            observer="process-local-store-test",
+            limits=WorkspaceRevisionObservationLimits(),
+        )
+        authority = WorkspaceBranchAuthority(
+            session_id="branch-session",
+            expected_run_epoch=0,
+            environment_name="local",
+            binding_generation="binding-1",
+            binding_identity="workspace-alpha@binding-1",
+            creating_authority="process-local-store-test",
+            resource_policy="bounded-local-cow-v1",
+        )
+
+        with pytest.raises(RuntimeError, match="durability='durable'"):
+            await source.create_branch(
+                WorkspaceBranchRequest(
+                    baseline=baseline,
+                    branch_id="process-local-create",
+                    idempotency_key="process-local-create-key",
+                    authority=authority,
+                )
+            )
+        with pytest.raises(RuntimeError, match="durability='durable'"):
+            await source.recover_branch(
+                WorkspaceBranchRecoveryRequest(
+                    branch_id="process-local-create",
+                    session_id=authority.session_id,
+                    expected_run_epoch=authority.expected_run_epoch,
+                    binding_generation=authority.binding_generation,
+                    binding_identity=authority.binding_identity,
+                    recovery_id="process-local-recovery",
+                )
             )
 
     asyncio.run(scenario())
@@ -1989,6 +2197,29 @@ def test_session_workspace_branch_store_rejects_missing_owned_guard_capability()
     SessionWorkspaceBranchStore(runtime_checkpoint_session_store(InMemorySessionStore()))
 
 
+def test_session_workspace_branch_store_requires_declared_store_durability() -> None:
+    class MissingDurabilityStore:
+        def _supports_owned_off_thread_session_commit_guard_protocol(self) -> bool:
+            return True
+
+        async def load_session_operation(self, *_args, **_kwargs):
+            return None
+
+        async def publish_session_operation(self, *_args, **_kwargs):
+            return None
+
+        async def publish_session_operation_guarded(self, *_args, **_kwargs):
+            return None
+
+    class InvalidDurabilityStore(MissingDurabilityStore):
+        service_durability = "durable_if_this_process_survives"
+
+    with pytest.raises(TypeError, match="declared SessionStore durability"):
+        SessionWorkspaceBranchStore(MissingDurabilityStore())  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="declared SessionStore durability"):
+        SessionWorkspaceBranchStore(InvalidDurabilityStore())  # type: ignore[arg-type]
+
+
 def test_session_workspace_branch_store_is_a_public_runtime_adapter() -> None:
     import cayu
     import cayu.runtime as runtime
@@ -1996,6 +2227,8 @@ def test_session_workspace_branch_store_is_a_public_runtime_adapter() -> None:
     assert cayu.SessionWorkspaceBranchStore is runtime.SessionWorkspaceBranchStore
     assert "SessionWorkspaceBranchStore" in cayu.__all__
     assert "SessionWorkspaceBranchStore" in runtime.__all__
+    assert cayu.WorkspaceBranchStoreDurability is WorkspaceBranchStoreDurability
+    assert "WorkspaceBranchStoreDurability" in cayu.__all__
 
 
 def test_creation_failure_is_durable_and_exactly_replayed(
@@ -2005,7 +2238,7 @@ def test_creation_failure_is_durable_and_exactly_replayed(
     import cayu.workspaces._local_branch as branch_module
 
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -2138,7 +2371,7 @@ def test_failed_creation_recovery_settles_staging_after_cleanup_owner_loss(
     async def scenario() -> None:
         import cayu.workspaces._local_branch as branch_module
 
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -2261,7 +2494,7 @@ def test_durable_create_retry_is_exact_and_conflicting_identity_is_rejected(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -2281,7 +2514,7 @@ def test_durable_create_retry_is_exact_and_conflicting_identity_is_rejected(
 
 def test_stale_owner_cannot_publish_or_discard_newer_private_work(tmp_path: Path) -> None:
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -2315,7 +2548,7 @@ def test_stale_owner_cannot_publish_or_discard_newer_private_work(tmp_path: Path
 
 def test_private_storage_identity_includes_creating_authority(tmp_path: Path) -> None:
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store, session_id="branch-session-a")
         await _create_session(store, session_id="branch-session-b")
         root = tmp_path / "workspace"
@@ -2365,11 +2598,11 @@ def test_private_storage_identity_includes_creating_authority(tmp_path: Path) ->
 
 def test_live_binding_authority_fences_stale_handle_before_mutation(tmp_path: Path) -> None:
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
-        live = WorkspaceBranchBindingAuthorityRegistry(_binding_authority())
+        live = _DurableAuthorityProvider(_binding_authority())
         _source, branch, _request = await _durable_branch(
             root,
             store,
@@ -2402,7 +2635,7 @@ def test_binding_replacement_is_rejected_until_publication_settles(
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
-        authority_provider = WorkspaceBranchBindingAuthorityRegistry(_binding_authority())
+        authority_provider = _DurableAuthorityProvider(_binding_authority())
         _source, branch, _request = await _durable_branch(
             root,
             store,
@@ -2455,7 +2688,7 @@ def test_publication_conflict_does_not_overwrite_external_source_change(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -2485,7 +2718,7 @@ def test_conflicted_publication_key_stays_bound_to_its_first_change_set(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -2514,7 +2747,7 @@ def test_pre_mutation_publication_failure_is_durable_and_replayable(
     import cayu.workspaces._local_branch as branch_module
 
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -2560,7 +2793,7 @@ def test_inspection_failure_after_started_publication_is_ambiguous(
     import cayu.workspaces._local_branch as branch_module
 
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         proxy = _StoreFaultProxy(store)
         root = tmp_path / "workspace"
@@ -2595,7 +2828,7 @@ def test_new_run_epoch_fences_private_branch_mutation_before_filesystem_change(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -2616,7 +2849,7 @@ def test_new_run_epoch_fences_private_branch_mutation_before_filesystem_change(
 
 def test_concurrent_exact_publication_attempts_converge_once(tmp_path: Path) -> None:
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -2644,7 +2877,7 @@ def test_concurrent_exact_publication_attempts_converge_once(tmp_path: Path) -> 
 
 def test_exact_committed_replay_retires_recovered_handle(tmp_path: Path) -> None:
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -2670,7 +2903,7 @@ def test_exact_committed_replay_retires_recovered_handle(tmp_path: Path) -> None
 
 def test_exact_rollback_replay_retires_recovered_handle(tmp_path: Path) -> None:
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -2701,7 +2934,7 @@ def test_exact_rollback_replay_retires_recovered_handle(tmp_path: Path) -> None:
 
 def test_concurrent_commit_and_rollback_choose_one_terminal_result(tmp_path: Path) -> None:
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -2739,7 +2972,7 @@ def test_concurrent_commit_and_rollback_choose_one_terminal_result(tmp_path: Pat
 
 def test_concurrent_commit_retires_losing_rollback_handle(tmp_path: Path) -> None:
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         proxy = _StoreFaultProxy(store)
         await _create_session(store)
         root = tmp_path / "workspace"
@@ -2785,7 +3018,7 @@ def test_recovery_finishes_partially_applied_publication(
     import cayu.workspaces._local_branch as branch_module
 
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -2829,7 +3062,7 @@ def test_recovery_settles_persisted_source_staging_before_commit(
 
     async def scenario() -> None:
         _isolate_retained_branch_state(monkeypatch, branch_module)
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -2884,7 +3117,7 @@ def test_publication_cancellation_retains_simultaneous_source_staging_cleanup(
 
     async def scenario() -> None:
         _isolate_retained_branch_state(monkeypatch, branch_module)
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         source, branch, _request = await _durable_branch(tmp_path, store)
         await branch.write_bytes("answer.txt", b"candidate")
@@ -2968,7 +3201,7 @@ def test_recovery_settles_rollback_intent_before_cleanup(tmp_path: Path) -> None
 
 def test_recovery_expires_open_branch_durably(tmp_path: Path) -> None:
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -2992,7 +3225,7 @@ def test_recovery_expires_open_branch_durably(tmp_path: Path) -> None:
 
 def test_expiry_authority_cannot_be_forged_before_deadline(tmp_path: Path) -> None:
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -3190,7 +3423,7 @@ def test_recovery_records_ambiguous_mixed_source_state_without_guessing(
     import cayu.workspaces._local_branch as branch_module
 
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -3588,9 +3821,7 @@ def test_terminal_dual_failure_retains_owner_until_assisted_reconciliation(
             root,
             store,
             limits=WorkspaceBranchLimits(max_active_branches=1),
-            resolver=(
-                live_binding := WorkspaceBranchBindingAuthorityRegistry(_binding_authority())
-            ),
+            resolver=(live_binding := _DurableAuthorityProvider(_binding_authority())),
         )
         if terminal_action == "publish":
             await branch.write_bytes("answer.txt", b"candidate")
@@ -3650,7 +3881,7 @@ def test_fresh_process_terminal_cleanup_failure_retains_binding_claim(
         import cayu.workspaces._local_branch as branch_module
 
         _isolate_retained_branch_state(monkeypatch, branch_module)
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -3728,7 +3959,7 @@ def test_binding_claim_release_failure_is_retained_and_retried(
         import cayu.workspaces._local_branch as branch_module
 
         _isolate_retained_branch_state(monkeypatch, branch_module)
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -3793,7 +4024,7 @@ def test_transferred_binding_claim_release_failure_remains_assistable(
         import cayu.workspaces._local_branch as branch_module
 
         _isolate_retained_branch_state(monkeypatch, branch_module)
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -3942,7 +4173,7 @@ def test_attached_terminal_cleanup_settles_capacity_before_propagating_cancellat
     async def scenario() -> None:
         import cayu.workspaces._local_branch as branch_module
 
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -4000,7 +4231,7 @@ def test_attached_terminal_cleanup_dual_failure_retains_owner_until_assisted(
         import cayu.workspaces._local_branch as branch_module
 
         _isolate_retained_branch_state(monkeypatch, branch_module)
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -4096,7 +4327,7 @@ def test_recovery_does_not_follow_private_file_replaced_after_inspection(
     async def scenario() -> None:
         import cayu.workspaces._local_branch as branch_module
 
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -4140,7 +4371,7 @@ def test_recovery_bounds_private_file_growth_after_inspection(
     async def scenario() -> None:
         import cayu.workspaces._local_branch as branch_module
 
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -4190,7 +4421,7 @@ def test_recovery_reconstructs_private_tree_off_event_loop(
     async def scenario() -> None:
         import cayu.workspaces._local_branch as branch_module
 
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -4324,7 +4555,7 @@ def test_binding_replacement_is_rejected_while_exact_creating_retry_owns_claim(
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
-        live_binding = WorkspaceBranchBindingAuthorityRegistry(_binding_authority())
+        live_binding = _DurableAuthorityProvider(_binding_authority())
         source, request = await _interrupted_durable_creating_branch(
             root,
             store,
@@ -4388,7 +4619,7 @@ def test_binding_replacement_is_rejected_during_guarded_capture(
         root = tmp_path / "workspace"
         root.mkdir()
         (root / "answer.txt").write_bytes(b"baseline")
-        live_binding = WorkspaceBranchBindingAuthorityRegistry(_binding_authority())
+        live_binding = _DurableAuthorityProvider(_binding_authority())
         source = _workspace(root, store, resolver=live_binding)
         baseline = await observe_deterministic_workspace(
             source,
@@ -4689,7 +4920,7 @@ def test_terminal_recovery_does_not_delete_reused_private_root(
     terminal_state: str,
 ) -> None:
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -4739,7 +4970,7 @@ def test_terminal_cleanup_restores_path_replacement_raced_after_open(
         import cayu.workspaces._local_branch as branch_module
 
         _isolate_retained_branch_state(monkeypatch, branch_module)
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -4841,7 +5072,7 @@ def test_durable_authority_copy_suppresses_serializer_diagnostics(
         __str__ = __repr__
 
     async def scenario() -> None:
-        store = InMemorySessionStore()
+        store = _TemporarySQLiteSessionStore()
         await _create_session(store)
         root = tmp_path / "workspace"
         root.mkdir()
@@ -5539,16 +5770,10 @@ async def assert_durable_workspace_branch_store_conformance(store, root: Path) -
         ).recover_branch(corrupt_recovery)
 
 
-@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
 def test_durable_workspace_branch_store_conformance(
     tmp_path: Path,
-    store_kind: str,
 ) -> None:
-    store = (
-        InMemorySessionStore()
-        if store_kind == "memory"
-        else SQLiteSessionStore(tmp_path / "conformance.sqlite3")
-    )
+    store = SQLiteSessionStore(tmp_path / "conformance.sqlite3")
     asyncio.run(
         assert_durable_workspace_branch_store_conformance(
             store,

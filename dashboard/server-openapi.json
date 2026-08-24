@@ -736,6 +736,12 @@
             ],
             "title": "Vault Type"
           },
+          "workspace_branch_capabilities": {
+            "$ref": "#/components/schemas/ApiWorkspaceBranchCapabilities"
+          },
+          "workspace_branch_lifecycle": {
+            "$ref": "#/components/schemas/ApiWorkspaceBranchLifecycle"
+          },
           "workspace_id": {
             "anyOf": [
               {
@@ -764,6 +770,8 @@
           "metadata",
           "is_factory",
           "workspace_id",
+          "workspace_branch_capabilities",
+          "workspace_branch_lifecycle",
           "artifact_store_id",
           "runner_type",
           "binding_type",
@@ -4085,6 +4093,107 @@
         "title": "ApiTranscriptMessage",
         "type": "object"
       },
+      "ApiWorkspaceBranchCapabilities": {
+        "additionalProperties": false,
+        "properties": {
+          "detail_code": {
+            "title": "Detail Code",
+            "type": "string"
+          },
+          "isolation": {
+            "title": "Isolation",
+            "type": "boolean"
+          },
+          "lifecycle_inspection": {
+            "enum": [
+              "unsupported",
+              "attached",
+              "recoverable_by_id"
+            ],
+            "title": "Lifecycle Inspection",
+            "type": "string"
+          },
+          "net_changes": {
+            "title": "Net Changes",
+            "type": "boolean"
+          },
+          "publication": {
+            "enum": [
+              "unsupported",
+              "cooperative_atomic"
+            ],
+            "title": "Publication",
+            "type": "string"
+          },
+          "recovery": {
+            "enum": [
+              "unsupported",
+              "process_local",
+              "durable"
+            ],
+            "title": "Recovery",
+            "type": "string"
+          },
+          "retention": {
+            "enum": [
+              "unsupported",
+              "process_local",
+              "durable"
+            ],
+            "title": "Retention",
+            "type": "string"
+          }
+        },
+        "required": [
+          "isolation",
+          "net_changes",
+          "publication",
+          "recovery",
+          "retention",
+          "lifecycle_inspection",
+          "detail_code"
+        ],
+        "title": "ApiWorkspaceBranchCapabilities",
+        "type": "object"
+      },
+      "ApiWorkspaceBranchLifecycle": {
+        "additionalProperties": false,
+        "properties": {
+          "attached_count": {
+            "maximum": 256.0,
+            "minimum": 0.0,
+            "title": "Attached Count",
+            "type": "integer"
+          },
+          "statuses": {
+            "items": {
+              "enum": [
+                "active",
+                "publishing",
+                "rolling_back",
+                "committed",
+                "rolled_back",
+                "fenced"
+              ],
+              "type": "string"
+            },
+            "maxItems": 256,
+            "title": "Statuses",
+            "type": "array"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "attached_count",
+          "statuses",
+          "truncated"
+        ],
+        "title": "ApiWorkspaceBranchLifecycle",
+        "type": "object"
+      },
       "AppManifest": {
         "additionalProperties": false,
         "properties": {
@@ -4127,8 +4236,8 @@
             "$ref": "#/components/schemas/RuntimeManifest"
           },
           "schema_version": {
-            "const": "9",
-            "default": "9",
+            "const": "11",
+            "default": "11",
             "title": "Schema Version",
             "type": "string"
           },
@@ -6944,6 +7053,16 @@
               }
             ],
             "title": "Workspace"
+          },
+          "workspace_branch_capabilities": {
+            "additionalProperties": true,
+            "title": "Workspace Branch Capabilities",
+            "type": "object"
+          },
+          "workspace_branch_lifecycle": {
+            "additionalProperties": true,
+            "title": "Workspace Branch Lifecycle",
+            "type": "object"
           }
         },
         "required": [
@@ -6951,6 +7070,8 @@
           "is_default",
           "factory_backed",
           "workspace",
+          "workspace_branch_capabilities",
+          "workspace_branch_lifecycle",
           "runner",
           "artifact_store",
           "vault",
@@ -13975,7 +14096,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "22",
+            "default": "24",
             "title": "Contract Version",
             "type": "string"
           },
@@ -17651,7 +17772,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "22",
+            "default": "24",
             "title": "Contract Version",
             "type": "string"
           }

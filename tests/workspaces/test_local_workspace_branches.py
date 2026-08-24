@@ -51,9 +51,12 @@ from cayu.workspaces.revisions import (
 )
 
 _BRANCH_PUBLIC_EXPORTS = (
+    "RemoteWorkspaceBranchAuthorityProvider",
     "WorkspaceBranch",
     "WorkspaceBranchAuthority",
     "WorkspaceBranchBindingAuthority",
+    "WorkspaceBranchBindingAuthorityClaimScope",
+    "WorkspaceBranchCapabilities",
     "WorkspaceBranchChange",
     "WorkspaceBranchChangeSet",
     "WorkspaceBranchClosedError",
@@ -63,20 +66,26 @@ _BRANCH_PUBLIC_EXPORTS = (
     "WorkspaceBranchDurableState",
     "WorkspaceBranchEvidence",
     "WorkspaceBranchFencedError",
+    "WorkspaceBranchLifecycleInspection",
     "WorkspaceBranchLifecycleStatus",
+    "WorkspaceBranchLifecycleSummary",
     "WorkspaceBranchLimits",
     "WorkspaceBranchOperationConflict",
     "WorkspaceBranchOutcomeStatus",
     "WorkspaceBranchPublicationError",
     "WorkspaceBranchPublicationRequest",
     "WorkspaceBranchPublicationResult",
+    "WorkspaceBranchPublicationStrength",
+    "WorkspaceBranchRecoveryStrength",
     "WorkspaceBranchRecoveryRequest",
     "WorkspaceBranchRecoveryResult",
     "WorkspaceBranchRequest",
     "WorkspaceBranchResourceExhaustedError",
     "WorkspaceBranchRollbackRequest",
     "WorkspaceBranchRollbackResult",
+    "WorkspaceBranchRetentionStrength",
     "WorkspaceBranchStore",
+    "WorkspaceBranchStoreDurability",
 )
 
 
@@ -109,6 +118,32 @@ async def _created_branch(
     assert result.status is WorkspaceBranchOutcomeStatus.CREATED
     assert isinstance(result.branch, LocalWorkspaceBranch)
     return result.branch
+
+
+def test_local_workspace_reports_actual_attached_branch_lifecycle(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        source, request = await _source_and_request(tmp_path)
+        assert source.branch_lifecycle_summary().model_dump(mode="json") == {
+            "attached_count": 0,
+            "statuses": [],
+            "truncated": False,
+        }
+        branch = await _created_branch(source, request)
+        assert source.branch_lifecycle_summary().model_dump(mode="json") == {
+            "attached_count": 1,
+            "statuses": ["active"],
+            "truncated": False,
+        }
+
+        await branch.rollback()
+
+        assert source.branch_lifecycle_summary().model_dump(mode="json") == {
+            "attached_count": 1,
+            "statuses": ["rolled_back"],
+            "truncated": False,
+        }
+
+    asyncio.run(scenario())
 
 
 def _filesystem_is_case_insensitive(root: Path) -> bool:
@@ -3474,6 +3509,7 @@ def test_local_workspace_subclass_must_prove_branching(populated_root: Path) -> 
         exact = LocalWorkspace(populated_root, workspace_id="extension")
         observation = await _observation(exact)
         extension = ExtensionWorkspace(populated_root, workspace_id="extension")
+        assert extension.branch_capabilities().isolation is False
         result = await extension.create_branch(WorkspaceBranchRequest(baseline=observation))
         assert result.status is WorkspaceBranchOutcomeStatus.UNSUPPORTED
 

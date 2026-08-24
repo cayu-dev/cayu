@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import weakref
 from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictInt,
     field_validator,
     model_validator,
@@ -40,9 +42,22 @@ WorkspaceBranchRecordTransform = Callable[
 ]
 
 
+class WorkspaceBranchStoreDurability(StrEnum):
+    """Persistence evidence declared by a workspace branch journal."""
+
+    DEVELOPMENT = "development"
+    DURABLE = "durable"
+    READ_ONLY = "read_only"
+    UNVERIFIED = "unverified"
+
+
 @runtime_checkable
 class WorkspaceBranchStore(Protocol):
     """Narrow durable journal required by local workspace branches."""
+
+    @property
+    def durability(self) -> WorkspaceBranchStoreDurability:
+        """Declare whether journal records survive loss of the owning process."""
 
     async def load_workspace_branch_record(
         self,
@@ -80,6 +95,129 @@ class WorkspaceBranchOutcomeStatus(StrEnum):
     EXPIRED = "expired"
 
 
+class WorkspaceBranchPublicationStrength(StrEnum):
+    """Truthful multi-path publication strength advertised by an adapter."""
+
+    UNSUPPORTED = "unsupported"
+    COOPERATIVE_ATOMIC = "cooperative_atomic"
+
+
+class WorkspaceBranchRecoveryStrength(StrEnum):
+    """How far an adapter can reconstruct a branch after owner loss."""
+
+    UNSUPPORTED = "unsupported"
+    PROCESS_LOCAL = "process_local"
+    DURABLE = "durable"
+
+
+class WorkspaceBranchRetentionStrength(StrEnum):
+    """Where branch contents and lifecycle evidence are retained."""
+
+    UNSUPPORTED = "unsupported"
+    PROCESS_LOCAL = "process_local"
+    DURABLE = "durable"
+
+
+class WorkspaceBranchLifecycleInspection(StrEnum):
+    """How callers can inspect lifecycle without exposing branch contents."""
+
+    UNSUPPORTED = "unsupported"
+    ATTACHED = "attached"
+    RECOVERABLE_BY_ID = "recoverable_by_id"
+
+
+class WorkspaceBranchBindingAuthorityClaimScope(StrEnum):
+    """Where a binding-generation provider keeps exclusion authority."""
+
+    PROCESS_LOCAL = "process_local"
+    DURABLE = "durable"
+
+
+class WorkspaceBranchCapabilities(BaseModel):
+    """Bounded, provider-neutral branch guarantees for one workspace adapter.
+
+    Capability evidence is declarative. Callers must not infer support from a
+    runner, filesystem access, snapshots, reconnectability, sync bindings, or
+    Git availability.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    isolation: StrictBool = False
+    net_changes: StrictBool = False
+    publication: WorkspaceBranchPublicationStrength = WorkspaceBranchPublicationStrength.UNSUPPORTED
+    recovery: WorkspaceBranchRecoveryStrength = WorkspaceBranchRecoveryStrength.UNSUPPORTED
+    retention: WorkspaceBranchRetentionStrength = WorkspaceBranchRetentionStrength.UNSUPPORTED
+    lifecycle_inspection: WorkspaceBranchLifecycleInspection = (
+        WorkspaceBranchLifecycleInspection.UNSUPPORTED
+    )
+    detail_code: str = Field(default="workspace_branching_unsupported", max_length=256)
+
+    @field_validator("detail_code")
+    @classmethod
+    def validate_detail_code(cls, value: str) -> str:
+        return require_durable_clean_nonblank(value, "detail_code")
+
+    @model_validator(mode="after")
+    def validate_capability_shape(self) -> WorkspaceBranchCapabilities:
+        any_supported = (
+            self.isolation
+            or self.net_changes
+            or self.publication is not WorkspaceBranchPublicationStrength.UNSUPPORTED
+            or self.recovery is not WorkspaceBranchRecoveryStrength.UNSUPPORTED
+            or self.retention is not WorkspaceBranchRetentionStrength.UNSUPPORTED
+            or self.lifecycle_inspection is not WorkspaceBranchLifecycleInspection.UNSUPPORTED
+        )
+        if any_supported and not self.isolation:
+            raise ValueError("Workspace branch capabilities require an isolated branch view.")
+        if self.net_changes and not self.isolation:
+            raise ValueError("Workspace branch net changes require isolated branch views.")
+        if self.publication is not WorkspaceBranchPublicationStrength.UNSUPPORTED and not (
+            self.isolation and self.net_changes
+        ):
+            raise ValueError("Workspace branch publication requires isolation and net changes.")
+        if self.recovery is WorkspaceBranchRecoveryStrength.DURABLE and (
+            self.retention is not WorkspaceBranchRetentionStrength.DURABLE
+        ):
+            raise ValueError("Durable workspace branch recovery requires durable retention.")
+        if self.retention is WorkspaceBranchRetentionStrength.DURABLE and (
+            self.recovery is not WorkspaceBranchRecoveryStrength.DURABLE
+        ):
+            raise ValueError("Durable workspace branch retention requires durable recovery.")
+        if (
+            self.lifecycle_inspection is WorkspaceBranchLifecycleInspection.RECOVERABLE_BY_ID
+            and self.recovery is not WorkspaceBranchRecoveryStrength.DURABLE
+        ):
+            raise ValueError("Recoverable lifecycle inspection requires durable recovery.")
+        return self
+
+
+def _copy_workspace_branch_capabilities(value: object) -> WorkspaceBranchCapabilities:
+    """Defensively own one extension-provided capability declaration."""
+
+    if type(value) is not WorkspaceBranchCapabilities:
+        raise TypeError("Workspace branch capability evidence is invalid.")
+    if type(value.isolation) is not bool or type(value.net_changes) is not bool:
+        raise TypeError("Workspace branch capability controls are invalid.")
+    if (
+        type(value.publication) is not WorkspaceBranchPublicationStrength
+        or type(value.recovery) is not WorkspaceBranchRecoveryStrength
+        or type(value.retention) is not WorkspaceBranchRetentionStrength
+        or type(value.lifecycle_inspection) is not WorkspaceBranchLifecycleInspection
+        or type(value.detail_code) is not str
+    ):
+        raise TypeError("Workspace branch capability controls are invalid.")
+    return WorkspaceBranchCapabilities(
+        isolation=value.isolation,
+        net_changes=value.net_changes,
+        publication=value.publication,
+        recovery=value.recovery,
+        retention=value.retention,
+        lifecycle_inspection=value.lifecycle_inspection,
+        detail_code=value.detail_code,
+    )
+
+
 class WorkspaceBranchLifecycleStatus(StrEnum):
     ACTIVE = "active"
     PUBLISHING = "publishing"
@@ -87,6 +225,77 @@ class WorkspaceBranchLifecycleStatus(StrEnum):
     COMMITTED = "committed"
     ROLLED_BACK = "rolled_back"
     FENCED = "fenced"
+
+
+MAX_ATTACHED_WORKSPACE_BRANCH_LIFECYCLES = 256
+
+
+class WorkspaceBranchLifecycleSummary(BaseModel):
+    """Bounded, content-free lifecycle states for branches attached here."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    attached_count: StrictInt = Field(ge=0, le=MAX_ATTACHED_WORKSPACE_BRANCH_LIFECYCLES)
+    statuses: tuple[WorkspaceBranchLifecycleStatus, ...] = Field(
+        max_length=MAX_ATTACHED_WORKSPACE_BRANCH_LIFECYCLES
+    )
+    truncated: StrictBool = False
+
+    @model_validator(mode="after")
+    def validate_attached_count(self) -> WorkspaceBranchLifecycleSummary:
+        if self.attached_count != len(self.statuses):
+            raise ValueError("Workspace branch lifecycle count must match its statuses.")
+        return self
+
+
+def _copy_workspace_branch_lifecycle_summary(value: object) -> WorkspaceBranchLifecycleSummary:
+    """Defensively own one extension-provided attached lifecycle summary."""
+
+    if type(value) is not WorkspaceBranchLifecycleSummary:
+        raise TypeError("Workspace branch lifecycle evidence is invalid.")
+    if type(value.attached_count) is not int or type(value.truncated) is not bool:
+        raise TypeError("Workspace branch lifecycle controls are invalid.")
+    if type(value.statuses) is not tuple or any(
+        type(status) is not WorkspaceBranchLifecycleStatus for status in value.statuses
+    ):
+        raise TypeError("Workspace branch lifecycle statuses are invalid.")
+    return WorkspaceBranchLifecycleSummary(
+        attached_count=value.attached_count,
+        statuses=value.statuses,
+        truncated=value.truncated,
+    )
+
+
+class _WorkspaceBranchLifecycleRegistry:
+    """Weak, bounded ownership of attached branch handles for inspection."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._branches: weakref.WeakSet[WorkspaceBranch] = weakref.WeakSet()
+        self._truncated = False
+
+    def attach(self, branch: WorkspaceBranch | None) -> None:
+        if branch is None:
+            return
+        if not isinstance(branch, WorkspaceBranch):
+            raise TypeError("Attached workspace branch evidence is invalid.")
+        with self._lock:
+            if branch in self._branches:
+                return
+            if len(self._branches) >= MAX_ATTACHED_WORKSPACE_BRANCH_LIFECYCLES:
+                self._truncated = True
+                return
+            self._branches.add(branch)
+
+    def summary(self) -> WorkspaceBranchLifecycleSummary:
+        with self._lock:
+            statuses = tuple(sorted(branch.lifecycle_status for branch in self._branches))
+            truncated = self._truncated
+        return WorkspaceBranchLifecycleSummary(
+            attached_count=len(statuses),
+            statuses=statuses,
+            truncated=truncated,
+        )
 
 
 class WorkspaceBranchDurableState(StrEnum):
@@ -169,6 +378,10 @@ class WorkspaceBranchBindingAuthorityProvider(Protocol):
     the claim is released.
     """
 
+    @property
+    def claim_scope(self) -> WorkspaceBranchBindingAuthorityClaimScope:
+        """Declare whether claims exclude owners only locally or across processes."""
+
     def __call__(self) -> WorkspaceBranchBindingAuthority:
         """Return the current binding authority."""
 
@@ -182,6 +395,32 @@ class WorkspaceBranchBindingAuthorityProvider(Protocol):
         method may be called by a later settlement task and must retain
         ownership when it raises so Cayu can retry it.
         """
+
+
+@runtime_checkable
+class RemoteWorkspaceBranchAuthorityProvider(
+    WorkspaceBranchBindingAuthorityProvider,
+    Protocol,
+):
+    """Own the complete live invocation authority for a remote branch.
+
+    Binding identity alone cannot fence a replaced session worker when an
+    environment allocation remains attached across run epochs. Durable remote
+    branch implementations therefore require one atomic claim over both the
+    binding generation and the session/run authority.
+    """
+
+    def current_operation_authority(
+        self,
+        session_id: str,
+    ) -> WorkspaceBranchAuthority:
+        """Return the complete currently admitted authority for ``session_id``."""
+
+    def claim_operation(
+        self,
+        expected: WorkspaceBranchAuthority,
+    ) -> WorkspaceBranchBindingAuthorityClaim:
+        """Keep the exact invocation and binding authority current until release."""
 
 
 class WorkspaceBranchLimits(BaseModel):
@@ -608,7 +847,12 @@ class WorkspaceBranchBindingAuthorityRegistry:
     def __init__(self, authority: WorkspaceBranchBindingAuthority) -> None:
         self._lock = threading.Lock()
         self._authority = _copy_workspace_branch_binding_authority(authority)
+        self._operation_authorities: dict[str, WorkspaceBranchAuthority] = {}
         self._active_claims = 0
+
+    @property
+    def claim_scope(self) -> WorkspaceBranchBindingAuthorityClaimScope:
+        return WorkspaceBranchBindingAuthorityClaimScope.PROCESS_LOCAL
 
     def __call__(self) -> WorkspaceBranchBindingAuthority:
         with self._lock:
@@ -623,6 +867,69 @@ class WorkspaceBranchBindingAuthorityRegistry:
             if self._authority != expected:
                 raise WorkspaceBranchOperationConflict(
                     "Workspace branch creation binding authority is no longer current."
+                )
+            self._active_claims += 1
+        return _WorkspaceBranchBindingAuthorityRegistryClaim(self)
+
+    def authorize_operation(self, authority: WorkspaceBranchAuthority) -> None:
+        """Make one complete invocation authority current for its session.
+
+        This process-local registry is primarily a deterministic owner and
+        test/reference implementation. Cross-process implementations must make
+        the same update and subsequent claims atomic in their durable domain.
+        """
+
+        replacement = _copy_workspace_branch_authority(authority)
+        replacement_binding = WorkspaceBranchBindingAuthority(
+            environment_name=replacement.environment_name,
+            binding_generation=replacement.binding_generation,
+            binding_identity=replacement.binding_identity,
+        )
+        with self._lock:
+            if replacement_binding != self._authority:
+                raise WorkspaceBranchOperationConflict(
+                    "Workspace branch operation authority uses a different binding."
+                )
+            current = self._operation_authorities.get(replacement.session_id)
+            if current == replacement:
+                return
+            if self._active_claims:
+                raise WorkspaceBranchOperationConflict(
+                    "Workspace branch operation authority replacement conflicts with an "
+                    "active claim."
+                )
+            self._operation_authorities[replacement.session_id] = replacement
+
+    def current_operation_authority(
+        self,
+        session_id: str,
+    ) -> WorkspaceBranchAuthority:
+        session_id = require_durable_clean_nonblank(session_id, "session_id")
+        with self._lock:
+            authority = self._operation_authorities.get(session_id)
+            if authority is None:
+                raise WorkspaceBranchOperationConflict(
+                    "Workspace branch operation authority is unavailable."
+                )
+            return _copy_workspace_branch_authority(authority)
+
+    def claim_operation(
+        self,
+        expected: WorkspaceBranchAuthority,
+    ) -> WorkspaceBranchBindingAuthorityClaim:
+        expected = _copy_workspace_branch_authority(expected)
+        expected_binding = WorkspaceBranchBindingAuthority(
+            environment_name=expected.environment_name,
+            binding_generation=expected.binding_generation,
+            binding_identity=expected.binding_identity,
+        )
+        with self._lock:
+            if (
+                self._authority != expected_binding
+                or self._operation_authorities.get(expected.session_id) != expected
+            ):
+                raise WorkspaceBranchOperationConflict(
+                    "Workspace branch invocation authority is no longer current."
                 )
             self._active_claims += 1
         return _WorkspaceBranchBindingAuthorityRegistryClaim(self)
@@ -644,6 +951,7 @@ class WorkspaceBranchBindingAuthorityRegistry:
                     "claim."
                 )
             self._authority = replacement
+            self._operation_authorities.clear()
 
 
 class WorkspaceBranchResourceExhaustedError(RuntimeError):
@@ -698,6 +1006,22 @@ class _WorkspaceBranchRequestEnvelope:
     authority: WorkspaceBranchAuthority | None
 
 
+def _copy_workspace_branch_authority(
+    authority: object,
+) -> WorkspaceBranchAuthority:
+    if type(authority) is not WorkspaceBranchAuthority:
+        raise TypeError("Workspace branch authority is invalid.")
+    return WorkspaceBranchAuthority(
+        session_id=authority.session_id,
+        expected_run_epoch=authority.expected_run_epoch,
+        environment_name=authority.environment_name,
+        binding_generation=authority.binding_generation,
+        binding_identity=authority.binding_identity,
+        creating_authority=authority.creating_authority,
+        resource_policy=authority.resource_policy,
+    )
+
+
 def _copy_workspace_branch_request_envelope(
     request: object,
 ) -> _WorkspaceBranchRequestEnvelope:
@@ -722,6 +1046,10 @@ def _copy_workspace_branch_request_envelope(
         raise ValueError("Workspace branch baseline must contain a complete path inventory.")
     if type(request.baseline.revision) is not str:
         raise ValueError("Workspace branch baseline must define a revision.")
+    if request.branch_id is not None and type(request.branch_id) is not str:
+        raise TypeError("Workspace branch request branch_id is invalid.")
+    if request.idempotency_key is not None and type(request.idempotency_key) is not str:
+        raise TypeError("Workspace branch request idempotency_key is invalid.")
     return _WorkspaceBranchRequestEnvelope(
         source=WorkspaceIdentity(
             workspace_id=request.baseline.identity.workspace_id,
@@ -736,9 +1064,7 @@ def _copy_workspace_branch_request_envelope(
         authority=(
             None
             if request.authority is None
-            else WorkspaceBranchAuthority.model_validate(
-                request.authority.model_dump(mode="python", warnings=False)
-            )
+            else _copy_workspace_branch_authority(request.authority)
         ),
     )
 
@@ -995,6 +1321,53 @@ def _workspace_branch_empty_change_set_json_size(
             1,
         )
     )
+
+
+def _workspace_branch_fixed_authority_evidence_limit_violation(
+    *,
+    source: WorkspaceIdentity,
+    baseline_revision: str,
+    branch_id: str,
+    limits: WorkspaceBranchLimits,
+    created_detail_code: str,
+) -> str | None:
+    digest = "sha256:" + "0" * 64
+    if (
+        _workspace_branch_empty_change_set_json_size(
+            branch_id=branch_id,
+            source=source,
+            baseline_revision=baseline_revision,
+        )
+        > limits.max_evidence_bytes
+    ):
+        return "change_evidence_limit_exceeded"
+    for outcome, change_set_digest, detail_code in (
+        (WorkspaceBranchOutcomeStatus.CREATED, None, created_detail_code),
+        (
+            WorkspaceBranchOutcomeStatus.COMMITTED,
+            digest,
+            "workspace_branch_committed",
+        ),
+        (
+            WorkspaceBranchOutcomeStatus.RESOURCE_EXHAUSTED,
+            digest,
+            "result_evidence_limit_exceeded",
+        ),
+    ):
+        if (
+            _workspace_branch_evidence_json_size(
+                source=source,
+                outcome=outcome,
+                baseline_revision=baseline_revision,
+                branch_id=branch_id,
+                change_set_digest=change_set_digest,
+                affected_path_count=0,
+                detail_code=detail_code,
+            )
+            > limits.max_evidence_bytes
+        ):
+            return "result_evidence_limit_exceeded"
+    return None
 
 
 def _optional_json_text_size(value: str | None) -> int:

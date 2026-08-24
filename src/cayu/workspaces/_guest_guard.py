@@ -192,11 +192,16 @@ def open_guarded_directory(name, dir_fd, create, readable=False):
         raise
 
 
-def open_guarded_parent(root_fd, parts, create):
+def open_guarded_parent(root_fd, parts, create, readable=False):
     current_fd = os.dup(root_fd)
     try:
         for name in parts[:-1]:
-            next_fd = open_guarded_directory(name, current_fd, create)
+            next_fd = open_guarded_directory(
+                name,
+                current_fd,
+                create,
+                readable,
+            )
             os.close(current_fd)
             current_fd = next_fd
         return current_fd, parts[-1]
@@ -391,6 +396,27 @@ def workspace_path_lock(root_fd, rel_path):
         os.close(lock_fd)
 
 
+@contextlib.contextmanager
+def workspace_source_lock(root_fd, exclusive):
+    # Cooperate with guest-side multi-path branch capture/publication.
+    root_info = os.fstat(root_fd)
+    identity = f"{root_info.st_dev}:{root_info.st_ino}".encode()
+    lock_name = hashlib.sha256(identity).hexdigest()
+    lock_root = os.path.join(tempfile.gettempdir(), "cayu-workspace-source-locks")
+    os.makedirs(lock_root, mode=0o700, exist_ok=True)
+    lock_fd = os.open(
+        os.path.join(lock_root, lock_name),
+        os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+    )
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
 def _temporary_name(name):
     return "." + name + ".cayu-" + os.urandom(12).hex()
 
@@ -571,7 +597,7 @@ def main():
     try:
         parts = guarded_parts(rel_path)
         root_fd = open_guard_root(root)
-        with workspace_path_lock(root_fd, rel_path):
+        with workspace_source_lock(root_fd, False), workspace_path_lock(root_fd, rel_path):
             parent_fd, leaf_name = open_guarded_parent(
                 root_fd, parts, mode in ("write", "create")
             )

@@ -31,12 +31,18 @@ from cayu.runtime.tool_result_projection import (
     ArtifactExternalizingToolResultPolicy,
     ToolResultProjectionPolicy,
 )
+from cayu.workspaces.branches import (
+    WorkspaceBranchCapabilities,
+    WorkspaceBranchLifecycleSummary,
+    _copy_workspace_branch_capabilities,
+    _copy_workspace_branch_lifecycle_summary,
+)
 
 if TYPE_CHECKING:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime.app import CayuApp
 
-APP_MANIFEST_SCHEMA_VERSION = "9"
+APP_MANIFEST_SCHEMA_VERSION = "11"
 _ABSOLUTE_PATH_PLACEHOLDER = "[ABSOLUTE_PATH]"
 _MEMORY_ADDRESS_PLACEHOLDER = "[MEMORY_ADDRESS]"
 _OBJECT_REPRESENTATION_PLACEHOLDER = "[OBJECT_REPRESENTATION]"
@@ -212,6 +218,8 @@ class EnvironmentManifest(_ManifestModel):
     is_default: bool
     factory_backed: bool
     workspace: str | None
+    workspace_branch_capabilities: FrozenJsonObject
+    workspace_branch_lifecycle: FrozenJsonObject
     runner: str | None
     artifact_store: str | None
     vault: str | None
@@ -273,7 +281,7 @@ class RuntimeManifest(_ManifestModel):
 
 
 class AppManifest(_ManifestModel):
-    schema_version: Literal["9"] = APP_MANIFEST_SCHEMA_VERSION
+    schema_version: Literal["11"] = APP_MANIFEST_SCHEMA_VERSION
     fingerprint: str
     agents: tuple[AgentManifest, ...]
     providers: tuple[ProviderManifest, ...]
@@ -282,6 +290,29 @@ class AppManifest(_ManifestModel):
     defaults: ApplicationDefaultsManifest
     runtime: RuntimeManifest
     capabilities: tuple[CapabilityManifest, ...]
+
+
+def _app_manifest_fingerprint(payload: dict[str, object]) -> str:
+    structural_payload = {key: value for key, value in payload.items() if key != "fingerprint"}
+    environments = structural_payload.get("environments")
+    if type(environments) is list:
+        structural_payload["environments"] = [
+            {
+                key: value
+                for key, value in environment.items()
+                if key != "workspace_branch_lifecycle"
+            }
+            if type(environment) is dict
+            else environment
+            for environment in environments
+        ]
+    canonical = json.dumps(
+        structural_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> AppManifest:
@@ -370,19 +401,40 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
         "capabilities": [item.model_dump(mode="json") for item in capabilities],
     }
     redacted_payload = app.redact_json(payload)
+    if type(redacted_payload) is dict:
+        redacted_environments = redacted_payload.get("environments")
+        if type(redacted_environments) is list and len(redacted_environments) == len(environments):
+            for redacted_environment, environment in zip(
+                redacted_environments,
+                environments,
+                strict=True,
+            ):
+                if type(redacted_environment) is dict:
+                    owned_redacted_environment = cast(
+                        "dict[str, object]",
+                        redacted_environment,
+                    )
+                    owned_redacted_environment["workspace_branch_capabilities"] = dict(
+                        environment.workspace_branch_capabilities
+                    )
+                    lifecycle = environment.workspace_branch_lifecycle
+                    lifecycle_statuses = cast(
+                        "tuple[object, ...]",
+                        lifecycle["statuses"],
+                    )
+                    owned_redacted_environment["workspace_branch_lifecycle"] = {
+                        "attached_count": lifecycle["attached_count"],
+                        "statuses": list(lifecycle_statuses),
+                        "truncated": lifecycle["truncated"],
+                    }
     normalized_payload = _normalize_manifest_unstable_values(redacted_payload)
     if type(normalized_payload) is not dict:
         raise TypeError("Application manifest redaction must preserve the JSON object shape.")
-    canonical = json.dumps(
-        normalized_payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
+    structural_payload = cast("dict[str, object]", normalized_payload)
     return AppManifest.model_validate(
         {
             **normalized_payload,
-            "fingerprint": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            "fingerprint": _app_manifest_fingerprint(structural_payload),
         }
     )
 
@@ -497,6 +549,8 @@ def _describe_environment(
         is_default=name == app._default_environment_name,
         factory_backed=registration.factory is not None,
         workspace=_optional_type_name(environment.workspace),
+        workspace_branch_capabilities=_workspace_branch_capabilities(app, environment.workspace),
+        workspace_branch_lifecycle=_workspace_branch_lifecycle(environment.workspace),
         runner=_optional_type_name(environment.runner),
         artifact_store=_optional_type_name(environment.artifact_store),
         vault=_optional_type_name(environment.vault),
@@ -512,6 +566,69 @@ def _describe_environment(
         ),
         implementation_provenance=_provenance(described_object, project_root),
     )
+
+
+def _workspace_branch_capabilities(
+    app: CayuApp,
+    workspace: object | None,
+) -> dict[str, object]:
+    if workspace is None:
+        capabilities = WorkspaceBranchCapabilities()
+    else:
+        inspect_capabilities = getattr(workspace, "branch_capabilities", None)
+        if not callable(inspect_capabilities):
+            capabilities = WorkspaceBranchCapabilities()
+        else:
+            try:
+                candidate = inspect_capabilities()
+            except Exception:
+                capabilities = WorkspaceBranchCapabilities(
+                    detail_code="workspace_branch_capability_inspection_failed"
+                )
+            else:
+                try:
+                    capabilities = _copy_workspace_branch_capabilities(candidate)
+                except (TypeError, ValueError):
+                    capabilities = WorkspaceBranchCapabilities(
+                        detail_code="workspace_branch_capability_evidence_invalid"
+                    )
+    projected = capabilities.model_dump(mode="json", warnings=False)
+    redacted_detail = app.redact_json(projected["detail_code"])
+    projected["detail_code"] = (
+        redacted_detail
+        if type(redacted_detail) is str
+        else "workspace_branch_capability_detail_unavailable"
+    )
+    return projected
+
+
+def _workspace_branch_lifecycle(workspace: object | None) -> dict[str, object]:
+    unavailable = WorkspaceBranchLifecycleSummary(
+        attached_count=0,
+        statuses=(),
+        truncated=True,
+    )
+    if workspace is None:
+        summary = WorkspaceBranchLifecycleSummary(
+            attached_count=0,
+            statuses=(),
+            truncated=False,
+        )
+    else:
+        inspect_lifecycle = getattr(workspace, "branch_lifecycle_summary", None)
+        if not callable(inspect_lifecycle):
+            summary = unavailable
+        else:
+            try:
+                candidate = inspect_lifecycle()
+            except Exception:
+                summary = unavailable
+            else:
+                try:
+                    summary = _copy_workspace_branch_lifecycle_summary(candidate)
+                except (TypeError, ValueError):
+                    summary = unavailable
+    return summary.model_dump(mode="json", warnings=False)
 
 
 def _capabilities(
