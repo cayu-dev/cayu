@@ -522,6 +522,7 @@ Start with the document that matches the job:
 | Run GitHub CLI without giving the runner a real token | [GitHub CLI through virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/github-cli-virtual-egress.md) |
 | Design assertions and trajectory evals | [Evals](https://github.com/cayu-dev/cayu/blob/main/docs/evals.md) |
 | Understand knowledge authorization, retrieval fusion, and memory baselines | [Memory foundation contracts](docs/memory-foundation.md) |
+| Reproduce bounded stateful agent evaluations | [Portable agent snapshots](docs/runtime-contracts.md#portable-agent-snapshots) |
 | Estimate and govern cost | [Cost optimization](https://github.com/cayu-dev/cayu/blob/main/docs/cost-optimization.md) |
 | Use the application console | [Console](https://github.com/cayu-dev/cayu/blob/main/docs/console.md) |
 | Start a configured server process | [Project server](docs/project-server.md) |

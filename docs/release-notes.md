@@ -89,6 +89,41 @@ guard.
 
 ## Unreleased
 
+### Portable AgentSnapshot manifests bind stateful evaluation lineage
+
+Applications can now capture a strict, versioned, content-addressed
+`AgentSnapshot` over exact logical component identities, then verify and
+materialize isolated candidate trials through component-owned adapters. The
+typed `MemoryStateRef` keeps knowledge, transcript/artifact evidence, work
+context, recall/admission/projection policies, receipt/exposure frontiers, index
+readiness, and learning disposition distinct. Strong capture requests fail
+closed instead of presenting partial or inconsistent state as complete.
+
+Restorable memory and workspace components require candidate-private overlays;
+trial reset versus candidate-local accumulation is explicit. Trial and result
+bindings connect the starting snapshot and overlays to ordinary Cayu sessions,
+hidden-case/evaluator aliases, terminal evidence, eval revisions, usage, and
+cost without embedding credentials, private content, hidden truth, provider
+continuations, or activation authority. The SQLite snapshot journal supports
+fresh-process recovery without repeating materialization effects. This is a
+logical reproducibility envelope, not a database, VM, process, or production
+activation snapshot, and it adds no runtime storage migration.
+
+Snapshot schema v2 now includes component provider identity and transactional
+consistency group in the content address. Materialization also writes a durable
+scope plan and stable per-component operation identity before provider effects,
+then compare-and-set checkpoints each result. A provider-owned recovery seam
+reconciles an acknowledgement-lost or process-interrupted operation by that
+exact identity without blindly redispatching it. Same-scope coordinators
+converge in both stores, completed components are never replayed after a later
+failure, and invalid same-key documents or forged same-revision progress fail
+closed while relocation-only references remain portable. Content-addressed
+loads and SQLite scope indexes are cross-validated before use, provider effects
+require the exact returned durable claim, recovery rebinds every component to
+the verified snapshot plan, and trials reject reset-scope, evaluator, or overlay
+kind drift. Conflict refreshes also reject revision rollback, removed completed
+evidence, or a final pointer to a foreign same-scope progress identity.
+
 ### Production sessions can be captured as scenario-v2 stimuli
 
 Authenticated captured-evaluation previews now independently reconstruct an

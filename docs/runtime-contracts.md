@@ -8478,3 +8478,115 @@ remembering workers, or agent-led mutation of existing knowledge. Those layers
 should build on the same `KnowledgeEntry` / `KnowledgeChunk` / `KnowledgeQuery`
 / `KnowledgeIndexer` / `TextEmbeddingProvider` contracts rather than
 introducing separate memory, skill, or document-store APIs.
+
+## Portable agent snapshots
+
+`AgentSnapshot` is Cayu's strict logical reproducibility envelope for a bounded
+agent state. It is not a VM or process snapshot, database export, repository
+copy, hidden evaluator package, provider continuation, or production activation
+request. Its schema-versioned fingerprint binds the continuing agent,
+application, and project identities; the body release; the redacted immutable
+execution profile; the requested memory, session, workspace, artifact,
+environment, and policy component identities; evaluator and promotion-authority
+identities when declared; and every component's provider identity, consistency
+group, consistency, completeness, redaction, materialization capability, and
+limitation codes. Schema version 2 adds provider identity and consistency group
+to the content address, so changing either authority or transactional grouping
+always produces a new fingerprint. Capture time, request identity, and a
+bounded `cayu-ref:` drill-down alias do not participate in the fingerprint, so
+recapture and physical package relocation preserve the same logical identity
+when the exact content and frontiers are equivalent.
+
+Components are application- or subsystem-owned
+`AgentSnapshotComponentProvider` adapters. A provider captures an exact logical
+revision/frontier/digest, verifies it again before the manifest is accepted or
+materialized, and reports one independent capability: `reference_only`,
+`replayable`, `restorable`, or `unavailable`. Completeness and consistency are
+separate from that capability. A complete reference-only session remains
+reference-only, and redacted or truncated evidence remains explicitly limited.
+Transactional consistency requires every component to name the same declared
+consistency group. Otherwise the coordinator reports the weakest truthful
+component class: `frontier_consistent`, `best_effort`, or `inconsistent`.
+Requests for a stronger class, missing required providers, unavailable required
+components, broadened authority scope, changed provider identity, corrupt
+fingerprints, or failed re-verification fail before candidate execution.
+
+`MemoryStateRef` does not collapse Cayu knowledge and memory into one database
+or `KnowledgeStore` revision. It separately binds the authorized knowledge
+view, transcript and artifact evidence, work context/checkpoint, recall,
+admission and context-projection policies, interaction focus, recall receipts,
+context exposures, index readiness, and reviewed-learning disposition when each
+was requested. Component packages remain provider-owned behind bounded aliases;
+portable JSON contains no raw transcript or artifact content, credentials,
+tokens, hidden cases or expected answers, judge prompts, provider-owned
+continuation state, unrelated records, or production activation authority.
+`app_body_snapshot_ref`, `execution_profile_snapshot_ref`,
+`trajectory_snapshot_ref`, and `workspace_snapshot_ref` project existing Cayu
+contracts into this logical identity layer without making physical paths part
+of identity.
+
+`AgentSnapshotCoordinator.materialize()` verifies the immutable starting
+manifest and every required component, derives a stable provider operation for
+each component, and durably binds the complete operation plan to the candidate
+state scope before calling any owner. Each component claim is an exact-state
+compare-and-set transition persisted before its provider effect, and each
+completed provider result is appended before the next operation can start.
+Restorable memory and workspace components must return private overlays bound
+to the exact snapshot, candidate, and state scope, and the overlay kind must
+match the owning memory or workspace component. `reset_each_trial` derives a
+distinct scope for every trial; `accumulate_within_candidate` deliberately
+reuses only one candidate-local scope. State never accumulates implicitly
+across candidates.
+The returned `AgentSnapshotTrialBinding` binds snapshot, materialization,
+candidate, overlay, hidden-case alias, trial, and evaluator identities and can
+be placed in ordinary Cayu `RunRequest.metadata` with `session_metadata()`.
+Beginning a trial reloads and validates the exact starting snapshot and
+materialization, re-derives a reset scope from the supplied trial id, and
+requires the evaluator identity declared by the snapshot; an absent or changed
+evaluator fails closed.
+`AgentSnapshotResultBinding` then binds the durable trial to its Cayu session,
+terminal disposition, runtime and memory evidence, eval result, usage, and cost
+fingerprints. These records recommend or compare successors only; they cannot
+activate code, profiles, policies, knowledge, or permissions.
+
+`SQLiteAgentSnapshotStore` and `InMemoryAgentSnapshotStore` retain manifests,
+materializations, trial bindings, and result bindings by stable fingerprint.
+They also bind each snapshot/candidate/state scope to exactly one immutable
+operation plan and one final materialization identity. In-memory and SQLite
+progress updates compare the entire expected state as well as its revision, so
+a stale or forged same-revision writer cannot replace active or completed
+component evidence. Competing coordinators converge through those durable
+claims rather than relying on an in-process lock. A compare-and-set conflict
+can refresh only to a strictly newer state that preserves every completed
+component, final identity, and active-operation outcome; rollback evidence is
+rejected before another provider call. Retrying an incomplete scope
+skips completed components. An operation that was active when an acknowledgement
+or process was lost is passed only to the provider's
+`recover_materialization_operation()` hook with its previously persisted
+`operation_id`; the coordinator never blindly dispatches it again. Providers
+must durably make that operation id idempotent, safely finish or recover the
+same result, and fail closed when its outcome cannot be proven. A different
+operation plan for an occupied scope fails as a store conflict.
+Every content-addressed load revalidates the document and requires its internal
+fingerprint to match the requested store key. SQLite additionally cross-checks
+the scope, progress id, revision, and final-materialization pointer columns
+against the validated progress document, then binds the final record back to
+that exact scope, progress id, and component plan. Coordinator trust boundaries revalidate
+store save/load and transition results before capture return, provider dispatch,
+trial creation, or result publication; a no-op or substituted claim cannot
+authorize an effect.
+After restart, `recover_materialization()` loads the exact durable record and
+uses component recovery hooks rather than dispatching materialization again.
+Recovery rejects missing or extra components, changed baselines or capabilities,
+changed providers, mismatched overlay kinds, failed integrity checks, or any
+changed recovered overlay identity. Losing and outcome-unknown overlays
+remain the application/provider owner's responsibility to discard or
+quarantine; the snapshot contract never mutates the baseline or production
+state on their behalf.
+
+Run `uv run python examples/agent_snapshot_stateful_evaluation.py` for the
+credential-free reference workflow. It captures body/profile, typed memory,
+session/trajectory, workspace, and environment-fixture identities; applies
+separate body-policy and recall-policy mutations in private overlays; runs two
+identical hidden-case schedules; starts a fresh interpreter for recovery; and
+emits machine-readable lineage plus a review-only recommendation.

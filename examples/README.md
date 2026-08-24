@@ -62,6 +62,9 @@ corresponding credentials or service.
   [`knowledge_embedding_live.py`](knowledge_embedding_live.py) — provider-backed retrieval.
 - [`cross_source_recall.py`](cross_source_recall.py) — credential-free bounded
   knowledge/transcript recall with calibrated focus/offer/silent admission.
+- [`agent_snapshot_stateful_evaluation.py`](agent_snapshot_stateful_evaluation.py) —
+  API-key-free capture, isolated candidate overlays, exact result lineage, and
+  fresh-process recovery from one portable agent snapshot.
 - [`postgres_knowledge_embedding.py`](postgres_knowledge_embedding.py) — durable PostgreSQL knowledge.
 
 ## Operations and advanced strategies
