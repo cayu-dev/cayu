@@ -89,6 +89,36 @@ guard.
 
 ## Unreleased
 
+## v0.4.0
+
+`v0.4.0` turns Cayu's evaluation, memory, durable task, provider, and workspace
+foundations into portable, independently recoverable runtime contracts. It also
+adds first-class OpenRouter support and expands the Control Plane path from
+captured production evidence to bounded fresh evaluation.
+
+### Upgrade from v0.3.0
+
+Pin the complete application to `cayu==0.4.0`, refresh its lockfile, and run
+its own tests. Stop all `v0.3.0` workers and take an application-consistent
+backup before changing any durable store. Do not run mixed `v0.3.0` and
+`v0.4.0` workers.
+
+The storage schema advances from revision 45 to revision 55. Follow the
+revision-specific boundaries below: revisions 46 through 55 include multiple
+breaking contracts, and populated prerelease session or task stores may require
+the documented recreation procedure rather than an in-place migration. Run
+`cayu storage status` and `cayu storage migrate` against every explicitly
+configured SQLite or PostgreSQL store, then confirm revision 55 with no pending
+migrations before starting `v0.4.0` workers.
+
+The server contract advances from version 16 to version 24, while the public
+application manifest and generator plan advance from schema version 9 to
+version 11. Regenerate committed manifests, plans, API clients, and dashboard
+assets, and upgrade independently deployed servers, workers, generated clients,
+and dashboards together. After deployment, verify `cayu version`, run
+`cayu check --json`, execute the application's test suite, and exercise its
+durable recovery and evaluation paths through a process restart.
+
 ### Portable AgentSnapshot manifests bind stateful evaluation lineage
 
 Applications can now capture a strict, versioned, content-addressed
@@ -625,6 +655,95 @@ measures recall, false results, stale revisions, authorization leaks, locator
 correctness, honest partial coverage, candidate/byte overhead, multilingual
 queries, duplicate provenance, and short follow-ups without provider calls.
 
+### Generated Evals targets and immutable baseline indices
+
+Generated project serving now publishes a bounded, stable evaluation target for
+every registered agent while retaining executable authority only in process.
+Revision 47 adds the origin-aware immutable Evals result index,
+actor-attributed baseline pointers, and idempotent baseline mutation audit. It
+indexes existing fresh results without copying or fabricating execution
+documents. Every fresh-result writer must maintain that index atomically, so
+revision-46 workers must be stopped before migration and cannot share the
+migrated database.
+
+### Tool exposure remains continuous across durable interactions
+
+Ordinary same-session resumes and queued dispatches now seed the next policy
+request from the latest runtime-attested durable exposure profile. This keeps
+phase selection and `profile_changed` evidence continuous across process
+reconstruction; malformed or caller-authored lookalike evidence fails closed.
+
+Tool exposure now emits the typed, content-minimized `tool.exposure.recorded`
+evidence reserved by the public contract: profile and resolved fingerprint,
+registered/ceiling/exposed counts, provider/model/step identity, and profile
+transition state, with no separate tool-name list, tool definitions, arguments,
+or policy reasoning. Application-selected profile ids are public and must be
+stable non-secret labels. Conversational request footprints advance to schema
+version 3 and bind the same exposure summary to their keyed tool-manifest and
+cache-prefix identities. `LLMJudge` now runs under a durable zero-tool
+capability ceiling even when its registered agent has tools; adversarial
+candidate content cannot expose or execute them. The paired tool-exposure
+economics fixture reports requests, retries, cache categories, provider usage,
+quality, and cost without claiming a universal winning strategy.
+
+### Local workspace branches survive process replacement
+
+An exact `LocalWorkspace` can create an isolated branch from a complete
+observed workspace revision. Branches expose the ordinary workspace API,
+deterministic content-free net changes, explicit rollback, and conflict-checked
+publication. Source snapshots, overlays, evidence, lifetime, and active branch
+count are bounded; unsafe paths, symlinks, special files, stale baselines, and
+publication conflicts fail closed. Other workspace backends remain explicitly
+unsupported.
+
+Local branches can opt into durable recovery by supplying a
+`WorkspaceBranchStore`, such as the runtime's `SessionWorkspaceBranchStore`
+adapter for `SessionStore`, together with stable branch, idempotency, run-epoch,
+and binding authority. Creation, publication intent and progress, commit,
+rollback intent, rollback, conflict, expiry, failure, and ambiguity survive
+process replacement across bundled file-backed SQLite and PostgreSQL stores.
+Recovery mutates only source paths that still match an exact recorded before
+state, recognizes already-applied paths, and reports durable ambiguity instead
+of guessing when external content appears. Stale run owners remain fenced
+through mutation and terminal settlement, and publication keys stay bound to
+their first bounded change-set attempt.
+
+### Deterministic completion verifiers publish independently owned decisions
+
+Applications can register a side-effect-free deterministic completion verifier
+under the exact durable verifier identity carried by a work contract, then ask
+`CayuApp.verify_completion_proposal(...)` to evaluate a persisted proposal. The
+runtime resolves and invokes the adapter with bounded immutable context, binds
+its outcome to the live durable claim and frozen contract, and publishes the
+decision without applying it to task or session state. Exact completed retries
+reconcile from the store without requiring the process-local adapter, while
+missing registrations, provider verifier kinds, malformed outcomes, conflicting
+identity, and capacity exhaustion before claim mutation fail closed.
+
+The complete contract, task binding, attempt, proposal, verifier claim,
+decision, and decision-application receipt lifecycle persists with matching
+semantics in `InMemoryTaskStore`, `SQLiteTaskStore`, and `PostgresTaskStore`.
+Session execution authority is also durable: an ordinary admission and a
+contracted task attachment race to one database-owned decision, and neither
+process restart nor task terminalization weakens the winner.
+
+Breaking storage revision 49 adds those task-store records and the task's
+immutable contract reference. Stop all revision-48 and older task workers, take
+an application-consistent backup, run `cayu storage migrate`, and confirm
+revision 49 before starting current workers. Existing ordinary tasks migrate
+with no contract binding. Mixed-version task workers and application-only
+rollback are unsupported because older workers can complete contracted tasks
+through an ordinary terminal entrance.
+
+`CayuApp.apply_completion_decision(...)` owns the public transition from a
+durable verifier decision to task state. It validates the immutable authority
+chain, applies the bounded exact request through the cancellation-quiescent
+store boundary, and requires the atomic application receipt before returning
+the applied task. Exact retries replay the receipt snapshot, including after
+later task progress, while accepted results remain application-owned and must
+be reconstructed from a durable result reference whose digest matches the
+accepted proposal.
+
 ## v0.3.0
 
 `v0.3.0` hardens Cayu's durable runtime contracts while extending the
@@ -639,21 +758,14 @@ workers together. The server contract advances from version 10 to version 16,
 and the public application manifest and generator plan advance from schema 7
 to schema 9.
 
-The storage schema advances from revision 36 to revision 55. Follow the
-revision-specific migration boundaries below: revisions 39 through 55 include
+The storage schema advances from revision 36 to revision 45. Follow the
+revision-specific migration boundaries below: revisions 39 through 45 contain
 breaking durable contracts, and populated legacy knowledge or task stores may
 require the explicitly documented rebuild or drain procedure. Run `cayu storage
 status` followed by `cayu storage migrate` against every configured SQLite or
-PostgreSQL store, and confirm revision 55 with no pending migrations before
+PostgreSQL store, and confirm revision 45 with no pending migrations before
 starting `v0.3.0` workers. Mixed-version deployment and application-only
 rollback across these boundaries are unsupported.
-
-Revision 47 adds the origin-aware immutable Evals result index,
-actor-attributed baseline pointers, and idempotent baseline mutation audit. It
-indexes existing fresh results without copying or fabricating execution
-documents. Every fresh-result writer must maintain that index atomically, so
-revision-46 workers must be stopped before migration and cannot share the
-migrated database.
 
 ### Project serving assembles the durable Evals foundation
 
@@ -670,8 +782,9 @@ Generated maintained-service factories carry an opaque
 remain source-compatible and receive an actionable `cayu check` warning plus a
 conservative, idempotent `cayu generate service-context` migration. Explicit
 `EvalsConfig` remains authoritative and is never field-merged with automatic
-state. Generated project serving now publishes a bounded, stable target for
-every registered agent while retaining executable authority only in process.
+state. Execution-target assembly is a later slice, so automatically assembled
+projects currently report `eval_target_not_configured` and do not mount Evals
+mutation routes or workers.
 
 ### Control Plane Evals now publishes operation-level readiness
 
@@ -719,25 +832,6 @@ arguments and appends a provider-valid error result. Compact snapshot authority
 survives ordinary tool-round recovery and approval or user-input interruption,
 while exposed calls continue through every existing authorization and execution
 control.
-
-Ordinary same-session resumes and queued dispatches now seed the next policy
-request from the latest runtime-attested durable exposure profile. This keeps
-phase selection and `profile_changed` evidence continuous across process
-reconstruction; malformed or caller-authored lookalike evidence fails closed.
-
-Tool exposure now emits the typed, content-minimized `tool.exposure.recorded`
-evidence reserved by the public contract: profile and resolved fingerprint,
-registered/ceiling/exposed counts, provider/model/step identity, and profile
-transition state, with no separate tool-name list, tool definitions, arguments,
-or policy reasoning. Application-selected profile ids are public and must be
-stable non-secret labels.
-Conversational request footprints advance to schema version 3 and bind the same
-exposure summary to their keyed tool-manifest and cache-prefix identities.
-`LLMJudge` now runs under a durable zero-tool capability ceiling even when its
-registered agent has tools; adversarial candidate content cannot expose or
-execute them. The paired tool-exposure economics fixture reports requests,
-retries, cache categories, provider usage, quality, and cost without claiming a
-universal winning strategy.
 
 ### Bounded fork groups are durable public runtime operations
 
@@ -977,34 +1071,14 @@ request-body change.
 
 ### Local workspaces support bounded speculative branches
 
-An exact `LocalWorkspace` can create an isolated branch from a complete observed
-workspace revision. Branches expose the ordinary workspace API, deterministic
-content-free net changes, explicit rollback, and conflict-checked publication.
-Source snapshots, overlays, evidence, lifetime, and active branch count are
-bounded; unsafe paths, symlinks, special files, stale baselines, and publication
-conflicts fail closed. Other workspace backends remain explicitly unsupported.
-
-Local branches can now opt into durable recovery by supplying a
-`WorkspaceBranchStore`, such as the runtime's `SessionWorkspaceBranchStore`
-adapter for `SessionStore`, together with stable branch, idempotency, run-epoch,
-and binding authority. Custom session stores must explicitly support owned,
-off-thread guarded commits before the adapter accepts them. Creation,
-publication intent/progress, commit, rollback intent, rollback, conflict,
-expiry, failure, and ambiguity survive process replacement across bundled
-file-backed SQLite and PostgreSQL stores. Development-only in-memory stores do
-not advertise or admit that durable lifecycle. Recovery finishes only source
-paths
-that still match an exact recorded before state, recognizes already-applied
-paths, and reports durable ambiguity instead of guessing when external content
-appears. Commit and rollback become terminal in the store before cleanup, and
-stale run owners are fenced at the store boundary while a live binding resolver
-holds an exact generation claim through mutation and terminal settlement;
-binding replacement is rejected while that claim remains active. Custom claims
-are transferable to later settlement tasks, and a failed release remains owned
-and retryable instead of silently reopening the binding generation.
-Publication keys remain permanently bound to their first bounded change-set
-attempt, and provably pre-mutation inspection failures settle as replayable
-failed results.
+An exact `LocalWorkspace` can now create an isolated, process-local branch from
+a complete observed workspace revision. Branches expose the ordinary workspace
+API, deterministic content-free net changes, explicit rollback, and
+conflict-checked all-or-none publication. Source snapshots, overlays, evidence,
+lifetime, and active branch count are bounded; unsafe paths, symlinks, special
+files, stale baselines, and publication conflicts fail closed. Other workspace
+backends remain explicitly unsupported, and durable reconstruction after
+process loss is not part of this first slice.
 
 ### Queued dispatch is bound to durable execution profiles
 
@@ -1060,88 +1134,6 @@ canonical durable fingerprint domain rather than accepting a configuration that
 can fail only after fusion work. Its weight maps are deeply immutable, and
 `model_copy(update=...)` revalidates updated values before returning a new
 configuration.
-
-### Deterministic completion verifiers publish independently owned decisions
-
-Applications can register a side-effect-free deterministic completion verifier
-under the exact durable verifier identity carried by a work contract, then ask
-`CayuApp.verify_completion_proposal(...)` to evaluate a persisted proposal. The
-runtime resolves and invokes the adapter with bounded immutable context, binds
-its outcome to the live durable claim and frozen contract, and publishes the
-decision without applying it to task or session state. Exact completed retries
-reconcile from the store without requiring the process-local adapter, while
-missing registrations, provider verifier kinds, malformed outcomes, conflicting
-identity, and capacity exhaustion before claim mutation fail closed. A retained
-cancellation-resistant adapter blocks overlap in the same app, while its live
-renewed claim blocks other app instances. Runtime-minted execution-owner
-generations prevent that live claim from dispatching the same verifier
-concurrently elsewhere. A quiescent coordinator inherited through a process
-fork mints a fresh owner generation before use; inherited active execution
-state fails closed and requires rebuilding the app in that worker. The
-execution timeout is bound into the exact claim,
-and the owner renews its lease before dispatch and through execution,
-cancellation-resistant draining, and publication. Process or renewal loss stops
-that protection, so expiry permits at-least-once deterministic evaluation under
-a fresh claim while fencing the stale owner from publication. Completed retries
-continue to reconcile from convergent durable claim and decision indexes,
-including revision-1 claims whose absent execution-owner field retains its
-historical request digest.
-
-This is the deterministic execution-to-decision slice of verified work. The
-complete contract, task binding, attempt, proposal, verifier claim, decision,
-and decision-application receipt lifecycle now persists with matching semantics
-in `InMemoryTaskStore`, `SQLiteTaskStore`, and `PostgresTaskStore`. Session
-execution authority is also durable: an ordinary admission and a contracted
-task attachment race to one database-owned decision, and neither process
-restart nor task terminalization weakens the winner.
-
-Breaking storage revision 49 adds those task-store records and the task's
-immutable contract reference. Stop all revision-48 and older task workers,
-take an application-consistent backup, run `cayu storage migrate`, and confirm
-revision 49 before starting current workers. Existing ordinary tasks migrate
-with no contract binding. Mixed-version task workers and application-only
-rollback are unsupported because older workers can complete contracted tasks
-through an ordinary terminal entrance.
-
-Every concrete `InMemoryTaskStore`, `SQLiteTaskStore`, and `PostgresTaskStore`
-subclass must explicitly re-establish the documented
-`verified_work_mutations_are_cancellation_quiescent` proof, including when its
-public verified-work mutations are inherited unchanged. This prevents an
-extension from inheriting settlement authority after replacing a readiness
-hook, wrapper, or other dynamically resolved dependency.
-Externally managed pools supplied to `PostgresTaskStore` must likewise retain
-the exact built-in `AsyncConnectionPool` and psycopg async connection classes;
-custom pool or connection subclasses, pool callbacks, callable configuration,
-and custom row/cursor behavior cannot establish the built-in mutation
-settlement proof and are rejected before database dispatch.
-PostgreSQL worker-lease attachment, heartbeat, release, retry settlement, and
-terminalization now sample PostgreSQL's current clock after the authoritative
-row-lock wait. Reclamation uses one PostgreSQL clock value in its single
-`FOR UPDATE SKIP LOCKED` statement, so locked rows are skipped and newly expired
-leases become eligible on the next poll. Process-clock skew and a transaction
-timestamp captured before contention can no longer renew, settle, or reclaim the
-wrong lease. If caller cancellation encounters rollback, abort, or unwind
-failures, the public `CancelledError` remains authoritative and carries one
-bounded, redacted cause with that ordered settlement evidence through the runtime
-API.
-
-`CayuApp.apply_completion_decision(...)` now owns the public transition from a
-durable verifier decision to task state. It validates the immutable authority
-chain, including a decision-bound canonical digest of the complete final durable
-verification claim (execution-owner generation, execution timeout, request
-digest, attempt number, and final lease timestamps included), applies the
-bounded exact request through the cancellation-quiescent store boundary, and
-requires the atomic application receipt before returning the applied `Task`.
-Exact retries replay the receipt snapshot, including after later task progress,
-while checking that its immutable task fields and invocation provenance still
-agree with the durable task authority. Ordinary acknowledgement loss reconciles
-from that receipt; cancellation and process-control remain authoritative and
-require a later exact retry. Accepted results remain application-owned and must
-be reconstructed from a durable result reference whose digest matches the
-accepted proposal.
-
-This slice still does not add provider-backed judges, automatic result
-resolution, or an automatic continuation worker.
 
 ### Durable tasks retain immutable invocation provenance
 
