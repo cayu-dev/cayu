@@ -363,6 +363,7 @@ from cayu.runtime.tasks import (
     TaskOperationalSnapshot,
     TaskOrder,
     TaskQuery,
+    TaskRetryCancellationReconciliationRequest,
     TaskRetrySeriesDisposition,
     TaskRetrySettlementRequest,
     TaskRetrySettlementResult,
@@ -395,16 +396,25 @@ from cayu.runtime.tasks import (
     _ensure_retry_series_queue_attempt,
     _expired_task_retry_settlement,
     _raise_task_claim_attach_error,
+    _reconciled_task_retry_cancellation,
+    _rejected_task_retry_cancellation_reconciliation,
+    _replay_task_retry_cancellation_reconciliation,
+    _replay_task_retry_cancellation_reconciliation_rejection,
     _replay_task_retry_settlement,
     _replay_task_terminalization_receipt,
     _running_task_from_create,
     _settled_task_retry_attempt,
     _task_from_create,
     _task_invocation_for_attachment,
+    _task_retry_cancellation_reconciliation_conflict,
+    _task_retry_cancellation_reconciliation_rejection_record,
     _task_retry_cancellation_requested_task,
     _task_retry_events,
+    _task_retry_reconciliation_identity_is_bounded,
     _task_session_id_for_start,
+    _TaskRetryCancellationReconciliationRejectionRecord,
     _validate_task_topology_ancestry,
+    _validated_task_retry_cancellation,
     _validated_task_retry_terminal_accounting,
     build_task_topology_result,
     copy_task,
@@ -412,6 +422,7 @@ from cayu.runtime.tasks import (
     copy_task_create,
     copy_task_query,
     decode_task_topology_cursor,
+    prepare_task_retry_cancellation_reconciliation,
     prepare_task_retry_settlement,
     prepare_task_terminalization,
     prepare_task_terminalization_receipt_lookup,
@@ -493,7 +504,7 @@ from cayu.storage import migrations as schema
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
 _SQLITE_SESSION_MIN_REQUIRED_REVISION = 54
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 49
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 55
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -13516,6 +13527,146 @@ class SQLiteTaskStore(TaskStore):
                 return None
             return TaskRetrySettlementResult.model_validate(json.loads(row["receipt_json"]))
 
+    async def reconcile_task_retry_cancellation(
+        self,
+        request: TaskRetryCancellationReconciliationRequest,
+    ) -> TaskRetrySettlementResult:
+        request, request_sha256 = prepare_task_retry_cancellation_reconciliation(request)
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                now = datetime.now(UTC)
+                rejection_row = self._connection.execute(
+                    "SELECT request_sha256, record_json "
+                    "FROM cayu_task_retry_reconciliation_rejections "
+                    "WHERE task_id = ? AND reconciliation_idempotency_key = ?",
+                    (request.task_id, request.reconciliation_idempotency_key),
+                ).fetchone()
+                if rejection_row is not None:
+                    rejection = _TaskRetryCancellationReconciliationRejectionRecord.model_validate(
+                        json.loads(rejection_row["record_json"])
+                    )
+                    if rejection.request_sha256 != rejection_row["request_sha256"]:
+                        raise RuntimeError(
+                            "SQLite retry reconciliation rejection contains invalid "
+                            "durable material."
+                        )
+                    raise _replay_task_retry_cancellation_reconciliation_rejection(
+                        request,
+                        request_sha256=request_sha256,
+                        record=rejection,
+                    )
+                row = self._connection.execute(
+                    "SELECT request_sha256, receipt_json "
+                    "FROM cayu_task_retry_settlements "
+                    "WHERE task_id = ? AND idempotency_key = ?",
+                    (request.task_id, request.cancellation_idempotency_key),
+                ).fetchone()
+                if row is not None:
+                    receipt = TaskRetrySettlementResult.model_validate(
+                        json.loads(row["receipt_json"])
+                    )
+                    replayed = _replay_task_retry_cancellation_reconciliation(
+                        request=request,
+                        request_sha256=request_sha256,
+                        receipt=receipt,
+                        current_task=self._load_task_unlocked(request.task_id),
+                    )
+                    self._connection.commit()
+                    return replayed
+
+                task = self._load_task_unlocked(request.task_id)
+                if task is None:
+                    raise _task_retry_cancellation_reconciliation_conflict(
+                        request,
+                        "Task retry cancellation reconciliation task was not found.",
+                    )
+                rejection = _task_retry_cancellation_reconciliation_rejection_record(
+                    request,
+                    request_sha256=request_sha256,
+                    recorded_at=now,
+                )
+                if rejection is not None:
+                    _validated_task_retry_cancellation(
+                        task,
+                        request,
+                        now=now,
+                        require_owner_lost=False,
+                    )
+                    self._connection.execute(
+                        "INSERT INTO cayu_task_retry_reconciliation_rejections "
+                        "(task_id, reconciliation_idempotency_key, request_sha256, "
+                        "record_json, recorded_at) VALUES (?, ?, ?, ?, ?)",
+                        (
+                            rejection.task_id,
+                            rejection.reconciliation_idempotency_key,
+                            rejection.request_sha256,
+                            sqlite_support.json_dumps(rejection.model_dump(mode="json")),
+                            sqlite_support.format_datetime(rejection.recorded_at),
+                        ),
+                    )
+                    self._connection.commit()
+                    raise _rejected_task_retry_cancellation_reconciliation(rejection)
+                receipt = _reconciled_task_retry_cancellation(
+                    task,
+                    request,
+                    request_sha256=request_sha256,
+                    committed_at=now,
+                )
+                settled = receipt.task
+                assert settled.retry_series is not None
+                cursor = self._connection.execute(
+                    """
+                    UPDATE cayu_tasks
+                    SET status = ?, status_reason = ?, status_payload_json = ?,
+                        result_json = NULL, error_json = ?, worker_id = NULL,
+                        lease_expires_at = NULL, started_at = ?, completed_at = ?,
+                        updated_at = ?, retry_series_json = ?
+                    WHERE id = ? AND status IN (?, ?) AND status_reason = ?
+                      AND worker_id = ? AND lease_expires_at = ?
+                      AND lease_expires_at <= ?
+                    """,
+                    (
+                        str(settled.status),
+                        settled.status_reason,
+                        sqlite_support.json_dumps(settled.status_payload),
+                        sqlite_support.json_dumps(settled.error),
+                        sqlite_support.format_optional_datetime(settled.started_at),
+                        sqlite_support.format_optional_datetime(settled.completed_at),
+                        sqlite_support.format_datetime(settled.updated_at),
+                        sqlite_support.json_dumps(settled.retry_series.model_dump(mode="json")),
+                        request.task_id,
+                        str(TaskStatus.CLAIMED),
+                        str(TaskStatus.RUNNING),
+                        request.expected_status_reason,
+                        request.original_worker_id,
+                        sqlite_support.format_datetime(request.original_lease_expires_at),
+                        sqlite_support.format_datetime(now),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise _task_retry_cancellation_reconciliation_conflict(
+                        request,
+                        "Task retry cancellation reconciliation lost its fenced transition.",
+                    )
+                self._connection.execute(
+                    "INSERT INTO cayu_task_retry_settlements "
+                    "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        request.task_id,
+                        request.cancellation_idempotency_key,
+                        request_sha256,
+                        sqlite_support.json_dumps(receipt.model_dump(mode="json")),
+                        sqlite_support.format_datetime(receipt.committed_at),
+                    ),
+                )
+                self._connection.commit()
+                return receipt.model_copy(deep=True)
+            except BaseException:
+                self._connection.rollback()
+                raise
+
     async def enforce_task_retry_deadline(
         self,
         task_id: str,
@@ -13713,6 +13864,7 @@ class SQLiteTaskStore(TaskStore):
         lease_seconds: int = 300,
     ) -> Task | None:
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        retry_worker_id_is_bounded = _task_retry_reconciliation_identity_is_bounded(worker_id)
         query = copy_task_query(query)
         _ensure_claim_query_supported(query)
         lease_seconds = _validate_task_positive_int(lease_seconds, "lease_seconds")
@@ -13720,10 +13872,14 @@ class SQLiteTaskStore(TaskStore):
             return None
         clauses, params = self._task_filter_clauses(query)
         retry_deadline_clause = (
-            "(retry_series_json IS NULL "
-            "OR json_extract(retry_series_json, '$.elapsed_deadline') IS NULL "
-            "OR julianday(json_extract(retry_series_json, '$.elapsed_deadline')) "
-            "> julianday(?))"
+            (
+                "(retry_series_json IS NULL "
+                "OR json_extract(retry_series_json, '$.elapsed_deadline') IS NULL "
+                "OR julianday(json_extract(retry_series_json, '$.elapsed_deadline')) "
+                "> julianday(?))"
+            )
+            if retry_worker_id_is_bounded
+            else "retry_series_json IS NULL"
         )
         where_sql = " AND ".join(
             [
@@ -13822,7 +13978,11 @@ class SQLiteTaskStore(TaskStore):
                     [
                         str(TaskStatus.PENDING),
                         sqlite_support.format_datetime(availability_now),
-                        sqlite_support.format_datetime(availability_now),
+                        *(
+                            [sqlite_support.format_datetime(availability_now)]
+                            if retry_worker_id_is_bounded
+                            else []
+                        ),
                         *params,
                     ],
                 ).fetchone()

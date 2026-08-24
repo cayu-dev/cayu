@@ -2317,7 +2317,10 @@ def test_sqlite_profiled_dispatch_stores_reject_revision_thirty_nine(tmp_path) -
         match=rf"requires >= {sqlite_storage._SQLITE_SESSION_MIN_REQUIRED_REVISION}",
     ):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 49"):
+    with pytest.raises(
+        schema_migrations.SchemaTooOld,
+        match=rf"requires >= {sqlite_storage._SQLITE_TASK_MIN_REQUIRED_REVISION}",
+    ):
         SQLiteTaskStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
 
@@ -3173,6 +3176,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (52, 52),
         (53, 52),
         (54, 54),
+        (55, 55),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

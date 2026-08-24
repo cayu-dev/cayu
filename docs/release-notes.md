@@ -186,6 +186,34 @@ this build. Migration rejects populated pre-52 session stores without mutation;
 there is no fork-evidence backfill or legacy replay path. Do not run mixed
 revision-51/revision-52 fleets.
 
+### Owner-lost retry cancellations can be reconciled from positive evidence
+
+Applications can now call `reconcile_task_retry_cancellation(...)` when a
+retry-series worker dies after durable cancellation has won. The typed request
+binds the exact task, series, attempt, causal budget, original worker and lease,
+cancellation marker, reconciliation identity, actor, and bounded validator
+receipt. Lease or deadline expiry alone remains insufficient; inconclusive or
+stale evidence leaves the attempt fenced.
+
+Validated quiescence, completed-effect, or failed-effect evidence atomically
+writes the ordinary cancellation settlement receipt, clears ownership, keeps
+the series disposition `cancelled`, and creates no successor. Identical calls
+replay that receipt, while changed evidence and late-worker races produce typed,
+bounded conflict evidence. In-memory, SQLite, and PostgreSQL share the contract,
+and a subprocess SIGKILL test proves fresh-process SQLite reconciliation without
+handler replay. Retry-task and claim-worker identities are now capped at 1,024
+UTF-8 bytes before work ownership, and reconciliation actors must carry an
+explicit provenance source.
+
+Rejected reconciliation evidence now atomically binds the task-scoped
+reconciliation idempotency key in a separate durable registry without changing
+the fenced task. Exact rejected calls replay the same bounded rejection event;
+changed evidence under the key fails with a typed conflict. Breaking storage
+revision 55 creates the empty registry. Stop revision-54 task workers, back up
+each SQLite or PostgreSQL store, run `cayu storage migrate`, and confirm revision
+55 before starting current task workers. No legacy reader or synthesized
+rejection backfill is provided.
+
 ### Captured and fresh Evals share one release gate
 
 The Control Plane now compares immutable captured-session and fresh-execution
@@ -289,6 +317,11 @@ honest across complete session trees. Historical trajectory promotion remains
 read-only. A checked hermetic baseline and dedicated no-coverage current-code regression
 lane record preparation, persistence, zero-record and populated public projection
 latency, SQLite storage, and serialized-size ceilings without provider calls.
+
+Storage revision 55 is a breaking task-store boundary that creates the empty
+retry-cancellation reconciliation rejection registry. It does not mutate tasks
+or fabricate historical rejection records. Revision-54 task workers must be
+quiesced before migration and cannot share the migrated database.
 
 ### OpenAI subscription retries are bounded with migration-explicit authority
 
@@ -541,12 +574,12 @@ workers together. The server contract advances from version 10 to version 16,
 and the public application manifest and generator plan advance from schema 7
 to schema 9.
 
-The storage schema advances from revision 36 to revision 54. Follow the
-revision-specific migration boundaries below: revisions 39 through 54 include
+The storage schema advances from revision 36 to revision 55. Follow the
+revision-specific migration boundaries below: revisions 39 through 55 include
 breaking durable contracts, and populated legacy knowledge or task stores may
 require the explicitly documented rebuild or drain procedure. Run `cayu storage
 status` followed by `cayu storage migrate` against every configured SQLite or
-PostgreSQL store, and confirm revision 54 with no pending migrations before
+PostgreSQL store, and confirm revision 55 with no pending migrations before
 starting `v0.3.0` workers. Mixed-version deployment and application-only
 rollback across these boundaries are unsupported.
 

@@ -312,6 +312,11 @@ REVISIONS: tuple[Revision, ...] = (
     # independent durable provenance bit. Mixed-version readers and session
     # writers are therefore unsafe.
     Revision(revision=54, kind=RevisionKind.BREAKING, compatible_from=54),
+    # Rejected retry-cancellation reconciliation requests now bind their
+    # idempotency keys durably without mutating the fenced task. Revision-54
+    # task workers do not maintain that registry, so mixed-version task writers
+    # could accept changed evidence under a previously rejected key.
+    Revision(revision=55, kind=RevisionKind.BREAKING, compatible_from=55),
 )
 
 #: The revision an empty database is initialized to.

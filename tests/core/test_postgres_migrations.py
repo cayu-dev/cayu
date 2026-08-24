@@ -213,6 +213,73 @@ def test_revision_forty_nine_migrates_existing_ordinary_tasks(postgres_dsn: str)
     asyncio.run(runner())
 
 
+def test_revision_fifty_five_migrates_reconciliation_rejection_registry(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.create_task(TaskCreate(task_id="pre-53-task", type="ordinary"))
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP TABLE cayu_task_retry_reconciliation_rejections")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 55")
+            await conn.commit()
+
+        migrated = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            assert await migrated.load_task("pre-53-task") is not None
+        finally:
+            await migrated.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 55"
+            )
+            assert await cur.fetchone() == ("breaking", 55)
+            await cur.execute("SELECT to_regclass('cayu_task_retry_reconciliation_rejections')")
+            assert await cur.fetchone() == ("cayu_task_retry_reconciliation_rejections",)
+
+    asyncio.run(runner())
+
+
+def test_revision_fifty_five_rejects_missing_reconciliation_rejection_registry(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP TABLE cayu_task_retry_reconciliation_rejections")
+            await conn.commit()
+
+        validator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            with pytest.raises(RuntimeError, match="retry-reconciliation schema"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+    asyncio.run(runner())
+
+
 def test_revision_forty_nine_rejects_weakened_authority_index(postgres_dsn: str) -> None:
     async def runner() -> None:
         import psycopg
@@ -622,6 +689,7 @@ _TABLES = (
     "cayu_knowledge_index_readiness_events",
     "cayu_budget_settlements",
     "cayu_budget_reservations",
+    "cayu_task_retry_reconciliation_rejections",
     "cayu_task_retry_settlements",
     "cayu_task_terminalization_receipts",
     "cayu_completion_decision_application_receipts",
@@ -1712,6 +1780,8 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
             assert await cur.fetchone() == ("jsonb", "YES")
             await cur.execute("SELECT to_regclass('cayu_task_retry_settlements')")
             assert (await cur.fetchone())[0] == "cayu_task_retry_settlements"
+            await cur.execute("SELECT to_regclass('cayu_task_retry_reconciliation_rejections')")
+            assert (await cur.fetchone())[0] == "cayu_task_retry_reconciliation_rejections"
             await cur.execute(
                 "SELECT data_type, is_nullable FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "

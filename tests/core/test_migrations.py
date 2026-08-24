@@ -218,6 +218,20 @@ def test_revision_fifty_four_rejects_readers_that_expose_private_input_attestati
         )
 
 
+def test_revision_fifty_five_breaks_for_rejected_reconciliation_idempotency() -> None:
+    state = m.SchemaState(revision=55, compatible_from=55)
+
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 55"):
+        m.validate(state, app_latest=54, app_min_supported=54)
+    m.validate(state, app_latest=55, app_min_supported=55)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 55"):
+        m.validate(
+            m.SchemaState(revision=54, compatible_from=54),
+            app_latest=55,
+            app_min_supported=55,
+        )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

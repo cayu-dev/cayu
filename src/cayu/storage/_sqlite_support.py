@@ -498,6 +498,15 @@ _BASELINE_DDL = """
         PRIMARY KEY (task_id, idempotency_key)
     );
 
+    CREATE TABLE IF NOT EXISTS cayu_task_retry_reconciliation_rejections (
+        task_id TEXT NOT NULL,
+        reconciliation_idempotency_key TEXT NOT NULL,
+        request_sha256 TEXT NOT NULL,
+        record_json TEXT NOT NULL CHECK (json_valid(record_json)),
+        recorded_at TEXT NOT NULL,
+        PRIMARY KEY (task_id, reconciliation_idempotency_key)
+    );
+
     CREATE TABLE IF NOT EXISTS cayu_recall_receipts (
         receipt_id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
@@ -2607,6 +2616,16 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_eval_scenarios_id_catalog
             ON cayu_eval_scenarios(scenario_id, created_at DESC, revision ASC);
     """,
+    55: """
+        CREATE TABLE IF NOT EXISTS cayu_task_retry_reconciliation_rejections (
+            task_id TEXT NOT NULL,
+            reconciliation_idempotency_key TEXT NOT NULL,
+            request_sha256 TEXT NOT NULL,
+            record_json TEXT NOT NULL CHECK (json_valid(record_json)),
+            recorded_at TEXT NOT NULL,
+            PRIMARY KEY (task_id, reconciliation_idempotency_key)
+        );
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -3779,6 +3798,8 @@ def reconcile_schema(
         _validate_targeted_tool_grant_schema(connection)
     if app_min_supported >= 53:
         _validate_eval_scenario_schema(connection)
+    if app_min_supported >= 55:
+        _validate_task_retry_reconciliation_schema(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -4763,6 +4784,27 @@ def _validate_task_retry_series_schema(connection: sqlite3.Connection) -> None:
             "SQLite task retry-series schema conflicts with Cayu's revision-45 "
             "durability contract. Run `cayu storage migrate` or restore the "
             "database from a known-good backup."
+        )
+
+
+def _validate_task_retry_reconciliation_schema(connection: sqlite3.Connection) -> None:
+    rejection_columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute(
+            "PRAGMA table_info(cayu_task_retry_reconciliation_rejections)"
+        )
+    )
+    if rejection_columns != (
+        ("task_id", "TEXT", 1, 1),
+        ("reconciliation_idempotency_key", "TEXT", 1, 2),
+        ("request_sha256", "TEXT", 1, 0),
+        ("record_json", "TEXT", 1, 0),
+        ("recorded_at", "TEXT", 1, 0),
+    ):
+        raise RuntimeError(
+            "SQLite task retry-reconciliation schema conflicts with Cayu's "
+            "revision-55 durability contract. Run `cayu storage migrate` or "
+            "restore the database from a known-good backup."
         )
 
 
@@ -5868,6 +5910,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_targeted_tool_grant_schema(connection)
         if rev.revision == 53:
             _validate_eval_scenario_schema(connection)
+        if rev.revision == 55:
+            _validate_task_retry_reconciliation_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

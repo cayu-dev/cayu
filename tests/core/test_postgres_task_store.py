@@ -50,6 +50,8 @@ from cayu import (
     InvocationOrigin,
     InvocationOriginClaim,
     InvocationOriginTrust,
+    ResolutionActor,
+    ResolutionActorSource,
     Task,
     TaskClaimLost,
     TaskCompletionDecisionRequired,
@@ -59,6 +61,11 @@ from cayu import (
     TaskOrder,
     TaskQuery,
     TaskRetryAttemptDisposition,
+    TaskRetryCancellationReconciliationConflict,
+    TaskRetryCancellationReconciliationEvidence,
+    TaskRetryCancellationReconciliationOutcome,
+    TaskRetryCancellationReconciliationRejected,
+    TaskRetryCancellationReconciliationRequest,
     TaskRetryPolicy,
     TaskRetrySeriesDisposition,
     TaskRetrySettlementRequest,
@@ -88,6 +95,7 @@ _TABLES = (
     "cayu_knowledge_embeddings",
     "cayu_knowledge_index_readiness_current",
     "cayu_knowledge_index_readiness_events",
+    "cayu_task_retry_reconciliation_rejections",
     "cayu_task_retry_settlements",
     "cayu_task_terminalization_receipts",
     "cayu_completion_decision_application_receipts",
@@ -1119,6 +1127,50 @@ def _retry_causal_budget_id(task: Task) -> str:
     return task.retry_series.causal_budget_id
 
 
+def _postgres_retry_cancellation_reconciliation_request(
+    task: Task,
+) -> TaskRetryCancellationReconciliationRequest:
+    assert task.retry_series is not None
+    assert task.worker_id is not None
+    assert task.lease_expires_at is not None
+    assert task.status_payload is not None
+    cancellation_key = task.status_payload["settlement_idempotency_key"]
+    event = task.status_payload["event"]
+    assert isinstance(cancellation_key, str)
+    assert isinstance(event, dict)
+    requested_at = event["occurred_at"]
+    assert isinstance(requested_at, str)
+    # Use the store-authored cancellation timestamp so the test does not assume
+    # the host and Dockerized PostgreSQL clocks are perfectly synchronized.
+    reconciliation_requested_at = task.updated_at
+    return TaskRetryCancellationReconciliationRequest(
+        task_id=task.id,
+        series_id=task.retry_series.series_id,
+        attempt=task.retry_series.attempt,
+        causal_budget_id=task.retry_series.causal_budget_id,
+        original_worker_id=task.worker_id,
+        original_lease_expires_at=task.lease_expires_at,
+        cancellation_requested_at=datetime.fromisoformat(requested_at),
+        cancellation_idempotency_key=cancellation_key,
+        reconciliation_idempotency_key="postgres-reconciliation-1",
+        reconciliation_requested_at=reconciliation_requested_at,
+        reconciled_by=ResolutionActor(
+            subject="operator:postgres-reconciler",
+            source=ResolutionActorSource.REQUEST,
+        ),
+        evidence=TaskRetryCancellationReconciliationEvidence(
+            outcome=TaskRetryCancellationReconciliationOutcome.EFFECT_COMPLETED,
+            validator_id="postgres.effect-receipt",
+            validator_version="1",
+            evidence_id="effect-receipt-1",
+            evidence_sha256="a" * 64,
+            validated_at=reconciliation_requested_at,
+            effect_fingerprint="b" * 64,
+        ),
+        expected_effect_fingerprint="b" * 64,
+    )
+
+
 def test_postgres_task_store_replays_terminalization_and_receipt(postgres_dsn):
     async def ops(store):
         await store.create_task(TaskCreate(task_id="task_terminal", type="review"))
@@ -1401,6 +1453,183 @@ def test_postgres_task_retry_active_cancellation_retains_owner_until_settlement(
             assert receipt.task.worker_id is None
             assert receipt.task.retry_series is not None
             assert receipt.task.retry_series.disposition is TaskRetrySeriesDisposition.CANCELLED
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_task_retry_owner_lost_cancellation_reconciliation_and_late_worker_race(
+    postgres_dsn,
+) -> None:
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        reconciler = _new_store(postgres_dsn)
+        late_worker = _new_store(postgres_dsn)
+        try:
+            await reconciler.create_task(
+                TaskCreate(
+                    task_id="postgres-owner-lost-reconciliation",
+                    type="job",
+                    retry_policy=TaskRetryPolicy(max_attempts=2),
+                )
+            )
+            claimed = await reconciler.claim_task("lost-worker", lease_seconds=1)
+            assert claimed is not None
+            requested = await reconciler.cancel_task(
+                claimed.id,
+                {"code": "operator"},
+            )
+            request = _postgres_retry_cancellation_reconciliation_request(requested)
+            await asyncio.sleep(1.05)
+
+            async def settle_late_worker():
+                await asyncio.sleep(0.05)
+                return await late_worker.settle_task_retry_attempt(
+                    TaskRetrySettlementRequest(
+                        task_id=request.task_id,
+                        worker_id=request.original_worker_id,
+                        idempotency_key=request.cancellation_idempotency_key,
+                        causal_budget_id=request.causal_budget_id,
+                        disposition=TaskRetryAttemptDisposition.CANCELLED,
+                        error={"code": "operator"},
+                    )
+                )
+
+            reconciled, worker_result = await asyncio.gather(
+                reconciler.reconcile_task_retry_cancellation(request),
+                settle_late_worker(),
+                return_exceptions=True,
+            )
+            assert not isinstance(reconciled, BaseException)
+            assert isinstance(worker_result, TaskTerminalizationConflict)
+            assert reconciled.task.status is TaskStatus.CANCELLED
+            assert reconciled.task.retry_series is not None
+            assert reconciled.task.retry_series.disposition is TaskRetrySeriesDisposition.CANCELLED
+            assert reconciled.successor is None
+            assert await late_worker.reconcile_task_retry_cancellation(request) == reconciled
+
+            changed = request.model_copy(
+                update={
+                    "evidence": request.evidence.model_copy(update={"evidence_sha256": "c" * 64})
+                }
+            )
+            with pytest.raises(TaskRetryCancellationReconciliationConflict):
+                await late_worker.reconcile_task_retry_cancellation(changed)
+            assert (
+                await reconciler.load_task_retry_settlement(
+                    request.task_id,
+                    request.cancellation_idempotency_key,
+                )
+                == reconciled
+            )
+
+            await reconciler.create_task(
+                TaskCreate(
+                    task_id="postgres-worker-wins-reconciliation-race",
+                    type="job",
+                    retry_policy=TaskRetryPolicy(max_attempts=2),
+                )
+            )
+            worker_claim = await reconciler.claim_task("live-worker", lease_seconds=5)
+            assert worker_claim is not None
+            worker_cancel = await reconciler.cancel_task(
+                worker_claim.id,
+                {"code": "operator"},
+            )
+            losing_reconciliation = _postgres_retry_cancellation_reconciliation_request(
+                worker_cancel
+            )
+            worker_receipt = await late_worker.settle_task_retry_attempt(
+                TaskRetrySettlementRequest(
+                    task_id=worker_claim.id,
+                    worker_id="live-worker",
+                    idempotency_key=(losing_reconciliation.cancellation_idempotency_key),
+                    causal_budget_id=losing_reconciliation.causal_budget_id,
+                    disposition=TaskRetryAttemptDisposition.CANCELLED,
+                    error={"code": "operator"},
+                )
+            )
+            with pytest.raises(TaskRetryCancellationReconciliationConflict):
+                await reconciler.reconcile_task_retry_cancellation(losing_reconciliation)
+            assert worker_receipt.reconciliation is None
+            assert (
+                await reconciler.load_task_retry_settlement(
+                    worker_claim.id,
+                    losing_reconciliation.cancellation_idempotency_key,
+                )
+                == worker_receipt
+            )
+
+            await reconciler.create_task(
+                TaskCreate(
+                    task_id="postgres-rejected-reconciliation",
+                    type="job",
+                    retry_policy=TaskRetryPolicy(max_attempts=2),
+                )
+            )
+            rejected_claim = await reconciler.claim_task(
+                "rejected-worker",
+                lease_seconds=5,
+            )
+            assert rejected_claim is not None
+            rejected_cancel = await reconciler.cancel_task(
+                rejected_claim.id,
+                {"code": "operator"},
+            )
+            valid_request = _postgres_retry_cancellation_reconciliation_request(rejected_cancel)
+            unsupported_request = valid_request.model_copy(
+                update={
+                    "evidence": valid_request.evidence.model_copy(
+                        update={"outcome": (TaskRetryCancellationReconciliationOutcome.UNSUPPORTED)}
+                    )
+                }
+            )
+            with pytest.raises(TaskRetryCancellationReconciliationRejected):
+                await reconciler.reconcile_task_retry_cancellation(unsupported_request)
+            with pytest.raises(TaskRetryCancellationReconciliationRejected):
+                await late_worker.reconcile_task_retry_cancellation(unsupported_request)
+            changed_request = unsupported_request.model_copy(
+                update={
+                    "evidence": unsupported_request.evidence.model_copy(
+                        update={"outcome": TaskRetryCancellationReconciliationOutcome.QUIESCENT}
+                    )
+                }
+            )
+            with pytest.raises(TaskRetryCancellationReconciliationConflict):
+                await late_worker.reconcile_task_retry_cancellation(changed_request)
+            stale_request = valid_request.model_copy(update={"original_worker_id": "stale-worker"})
+            with pytest.raises(TaskRetryCancellationReconciliationConflict):
+                await reconciler.reconcile_task_retry_cancellation(stale_request)
+            assert await reconciler.load_task(rejected_claim.id) == rejected_cancel
+        finally:
+            await reconciler.close()
+            await late_worker.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_task_retry_worker_identity_bound_precedes_claim(postgres_dsn) -> None:
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        try:
+            created = await store.create_task(
+                TaskCreate(
+                    task_id="postgres-bounded-retry-worker",
+                    type="job",
+                    retry_policy=TaskRetryPolicy(max_attempts=2),
+                )
+            )
+            ordinary = await store.create_task(
+                TaskCreate(task_id="postgres-ordinary-long-worker", type="job")
+            )
+            long_worker_id = "w" * 1025
+            claimed = await store.claim_task(long_worker_id)
+            assert claimed is not None
+            assert claimed.id == ordinary.id
+            assert await store.claim_task(long_worker_id) is None
+            assert await store.load_task(created.id) == created
         finally:
             await store.close()
 

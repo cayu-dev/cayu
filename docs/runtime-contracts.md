@@ -3375,6 +3375,57 @@ cancellation request has won that release race. Expired reclaim does not make a
 cancellation-requested attempt runnable; if its owner is lost while effects
 remain uncertain, the attempt stays fenced for explicit operator reconciliation
 rather than risking stale work beside a replacement.
+
+`reconcile_task_retry_cancellation(...)` is that operator/application boundary.
+It accepts a `TaskRetryCancellationReconciliationRequest` only for the exact
+`retry_cancellation_requested` task, series, attempt, causal budget, original
+worker, original lease expiry, cancellation-request timestamp, and deterministic
+cancellation settlement key. The store must first observe that exact lease as
+expired, but expiry is only owner-loss eligibility: it is never quiescence or
+external-effect evidence. The application must supply a typed
+`TaskRetryCancellationReconciliationEvidence` produced by its domain validator,
+plus a separate reconciliation idempotency key, reconciliation-request
+timestamp, and `ResolutionActor` provenance. Evidence carries only a bounded validator/version/receipt identity,
+SHA-256 receipt fingerprint, validation timestamp, and optional execution-profile
+and effect fingerprints. It has no raw payload, prose, LLM assertion, process
+absence claim, or caller-selected terminal result. If a task stores
+`execution_profile_fingerprint` or `effect_fingerprint` in metadata, Cayu also
+requires the request's expected fingerprint to match it exactly.
+The actor's provenance `source` is mandatory. Retry-task identifiers and every
+built-in claim worker identifier are limited to 1,024 UTF-8 bytes before the
+task or worker can own retry work, so cancellation and reconciliation can always
+project the accepted identity into bounded durable evidence.
+
+Only `quiescent`, `effect_completed`, and `effect_failed` are positive validator
+outcomes. All three atomically write the ordinary immutable cancellation
+settlement receipt, clear the worker and lease, retain `cancelled` as the task and
+series disposition, create no successor, and attach the bounded reconciliation
+projection. Completed or failed external-effect evidence is diagnostic; it
+cannot reverse cancellation or select a different task result. `unresolved`,
+`not_found`, `conflict`, and `unsupported` raise
+`TaskRetryCancellationReconciliationRejected` and leave the task unchanged.
+The rejection transaction separately binds
+`(task_id, reconciliation_idempotency_key)` to the exact request and bounded
+rejection event. An identical rejected request replays the same event after
+restart; changed evidence or a positive outcome under that key raises
+`TaskRetryCancellationReconciliationConflict` while the task remains unchanged.
+Stale identity, an active lease, a changed request under the same cancellation
+key, or a worker/reconciler race raises the typed
+`TaskRetryCancellationReconciliationConflict`. Identical requests replay the
+same receipt. The first worker settlement or reconciliation transaction wins;
+the loser cannot append another terminal result or successor.
+
+The cancellation request stores a stable, hashed-identity
+`task.retry.cancellation_requested` event. A successful reconciliation receipt
+adds bounded `task.retry.cancellation_reconciliation_started` and
+`task.retry.cancellation_reconciled` events alongside the ordinary
+`task.retry.attempt_settled` and `task.retry.series_terminal` events. Rejected
+and conflicting calls expose corresponding bounded events on their typed
+exceptions. Reconciliation events carry hashes of worker, actor, and
+idempotency identities rather than raw external evidence or cancellation error
+payloads; the receipt retains the validated public actor projection without its
+authorization claims.
+
 Attempt reports that exceed the remaining token or cost limit atomically
 terminalize the series as exhausted and create no successor. The full reported
 usage remains durable so accounting does not hide an overage; remaining values
@@ -3433,7 +3484,10 @@ claim-fenced atomic attempt/receipt/successor operation, and supports exact
 receipt readback for acknowledgement reconciliation. It must also implement
 `task_retry_deadline_elapsed(...)` as an owned, store-clock-authoritative probe
 and `enforce_task_retry_deadline(...)` as the later atomic terminalization
-boundary. The terminalization operation accepts the already-quiescent handler's
+boundary. It must implement `reconcile_task_retry_cancellation(...)` with the
+same expired-owner, exact-identity, ordinary-receipt, and first-writer-wins
+semantics; opting into retry series does not imply that the base class's
+unsupported reconciliation operation is safe. The terminalization operation accepts the already-quiescent handler's
 bounded token and cost usage and must commit those values in the same receipt.
 `release_task(...)` must atomically reject a retry attempt carrying a durable
 cancellation request. `CayuApp.create_task`
@@ -3442,7 +3496,11 @@ rejects a retry policy before calling a store that has not opted in. Breaking sc
 Pre-45 task workers could ignore cumulative authority, so old task workers must
 be quiesced before migration and cannot share the migrated database. The
 in-memory, SQLite, and PostgreSQL implementations provide the complete
-capability. `examples/task_retry_worker.py` starts a new process for each attempt
+capability. Breaking schema revision 55 adds the separate rejected-reconciliation
+idempotency registry. Pre-55 task workers do not maintain that registry, so they
+must be quiesced before migration and cannot share the migrated database. No
+task payload is rewritten and no historical rejection is inferred.
+`examples/task_retry_worker.py` starts a new process for each attempt
 and proves that the same series continues and no worker can claim work after its
 successful attempt.
 

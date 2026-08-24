@@ -42,6 +42,11 @@ from cayu._validation import (
     require_durable_nonblank as require_nonblank,
 )
 from cayu.runtime.aggregates import EXACT_AGGREGATE, AggregateAccuracy, AggregateCount
+from cayu.runtime.approvals import (
+    ResolutionActor,
+    copy_resolution_actor,
+    resolution_actor_payload,
+)
 from cayu.runtime.invocation import (
     InvocationOrigin,
     InvocationOriginClaim,
@@ -106,6 +111,9 @@ _TASK_RETRY_TOTAL_COST_MAX_DIGITS = 128
 _TASK_RETRY_COST_MAX_DECIMAL_PLACES = 64
 _TASK_RETRY_MAX_ATTEMPT_TOKEN_REPORT = MAX_DURABLE_JSON_INTEGER // 100
 _TASK_RETRY_CANCELLATION_REQUESTED_REASON = "retry_cancellation_requested"
+_TASK_RETRY_RECONCILIATION_IDENTITY_MAX_BYTES = 1024
+_TASK_RETRY_RECONCILIATION_EVIDENCE_ID_MAX_BYTES = 256
+_TASK_RETRY_RECONCILIATION_VERSION_MAX_BYTES = 64
 
 
 def _bounded_task_retry_decimal(
@@ -183,6 +191,37 @@ class TaskRetryEventType(StrEnum):
     ATTEMPT_SETTLED = "task.retry.attempt_settled"
     RETRY_SCHEDULED = "task.retry.scheduled"
     SERIES_TERMINAL = "task.retry.series_terminal"
+
+
+class TaskRetryCancellationReconciliationOutcome(StrEnum):
+    """Application-validated state of the cancelled attempt's external effect."""
+
+    QUIESCENT = "quiescent"
+    EFFECT_COMPLETED = "effect_completed"
+    EFFECT_FAILED = "effect_failed"
+    UNRESOLVED = "unresolved"
+    NOT_FOUND = "not_found"
+    CONFLICT = "conflict"
+    UNSUPPORTED = "unsupported"
+
+
+class TaskRetryCancellationReconciliationEventType(StrEnum):
+    """Stable bounded lifecycle evidence for cancellation reconciliation."""
+
+    CANCELLATION_REQUESTED = "task.retry.cancellation_requested"
+    STARTED = "task.retry.cancellation_reconciliation_started"
+    RECONCILED = "task.retry.cancellation_reconciled"
+    REJECTED = "task.retry.cancellation_reconciliation_rejected"
+    CONFLICT = "task.retry.cancellation_reconciliation_conflict"
+
+
+_POSITIVE_TASK_RETRY_CANCELLATION_RECONCILIATION_OUTCOMES = frozenset(
+    {
+        TaskRetryCancellationReconciliationOutcome.QUIESCENT,
+        TaskRetryCancellationReconciliationOutcome.EFFECT_COMPLETED,
+        TaskRetryCancellationReconciliationOutcome.EFFECT_FAILED,
+    }
+)
 
 
 def _validate_task_retry_cost_currency(value: str) -> str:
@@ -434,6 +473,461 @@ class TaskRetryEvent(BaseModel):
         )
 
 
+def _validate_task_retry_reconciliation_identity(
+    value: str,
+    field_name: str,
+    *,
+    max_bytes: int = _TASK_RETRY_RECONCILIATION_IDENTITY_MAX_BYTES,
+) -> str:
+    value = require_clean_nonblank(value, field_name)
+    if len(value.encode("utf-8")) > max_bytes:
+        raise ValueError(f"{field_name} must be at most {max_bytes} UTF-8 bytes.")
+    return value
+
+
+def _task_retry_reconciliation_identity_is_bounded(value: str) -> bool:
+    return len(value.encode("utf-8")) <= _TASK_RETRY_RECONCILIATION_IDENTITY_MAX_BYTES
+
+
+def _validate_lowercase_sha256(value: str, field_name: str) -> str:
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise ValueError(f"{field_name} must be a lowercase SHA-256 digest.")
+    return value
+
+
+class TaskRetryCancellationReconciliationEvidence(BaseModel):
+    """Bounded application-validated evidence; raw external payloads are excluded."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    outcome: TaskRetryCancellationReconciliationOutcome
+    validator_id: str
+    validator_version: str
+    evidence_id: str
+    evidence_sha256: str
+    validated_at: datetime
+    execution_profile_fingerprint: str | None = None
+    effect_fingerprint: str | None = None
+
+    @field_validator("validator_id", "evidence_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _validate_task_retry_reconciliation_identity(
+            value,
+            info.field_name,
+            max_bytes=_TASK_RETRY_RECONCILIATION_EVIDENCE_ID_MAX_BYTES,
+        )
+
+    @field_validator("validator_version")
+    @classmethod
+    def validate_version(cls, value: str) -> str:
+        return _validate_task_retry_reconciliation_identity(
+            value,
+            "validator_version",
+            max_bytes=_TASK_RETRY_RECONCILIATION_VERSION_MAX_BYTES,
+        )
+
+    @field_validator(
+        "evidence_sha256",
+        "execution_profile_fingerprint",
+        "effect_fingerprint",
+    )
+    @classmethod
+    def validate_sha256(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _validate_lowercase_sha256(value, info.field_name)
+
+    @field_validator("validated_at")
+    @classmethod
+    def normalize_validated_at(cls, value: datetime) -> datetime:
+        return normalize_utc_datetime(value, "validated_at")
+
+
+class TaskRetryCancellationReconciliationEvent(BaseModel):
+    """Secret-free event projection for one owner-lost cancellation transition."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    id: str
+    type: TaskRetryCancellationReconciliationEventType
+    task_id: str
+    series_id: str
+    attempt: StrictInt = Field(ge=1, le=100)
+    causal_budget_id: str
+    original_worker_id_sha256: str
+    cancellation_idempotency_key_sha256: str
+    request_sha256: str | None = None
+    reconciliation_idempotency_key_sha256: str | None = None
+    evidence_sha256: str | None = None
+    actor_sha256: str | None = None
+    outcome: TaskRetryCancellationReconciliationOutcome | None = None
+    occurred_at: datetime
+
+    @field_validator("id", "task_id", "series_id", "causal_budget_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _validate_task_retry_reconciliation_identity(value, info.field_name)
+
+    @field_validator(
+        "original_worker_id_sha256",
+        "cancellation_idempotency_key_sha256",
+        "request_sha256",
+        "reconciliation_idempotency_key_sha256",
+        "evidence_sha256",
+        "actor_sha256",
+    )
+    @classmethod
+    def validate_sha256(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _validate_lowercase_sha256(value, info.field_name)
+
+    @field_validator("occurred_at")
+    @classmethod
+    def normalize_occurred_at(cls, value: datetime) -> datetime:
+        return normalize_utc_datetime(value, "occurred_at")
+
+    @model_validator(mode="after")
+    def validate_event_shape(self) -> TaskRetryCancellationReconciliationEvent:
+        requested = self.type is TaskRetryCancellationReconciliationEventType.CANCELLATION_REQUESTED
+        reconciliation_fields = (
+            self.request_sha256,
+            self.reconciliation_idempotency_key_sha256,
+            self.evidence_sha256,
+            self.actor_sha256,
+            self.outcome,
+        )
+        if requested and any(value is not None for value in reconciliation_fields):
+            raise ValueError("Cancellation-requested events cannot claim reconciliation evidence.")
+        if not requested and any(value is None for value in reconciliation_fields):
+            raise ValueError("Reconciliation events require bounded request evidence.")
+        return self
+
+
+class TaskRetryCancellationReconciliationRequest(BaseModel):
+    """Exact owner-lost cancellation identity plus application-validated evidence."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    task_id: str
+    series_id: str
+    attempt: StrictInt = Field(ge=1, le=100)
+    causal_budget_id: str
+    original_worker_id: str
+    original_lease_expires_at: datetime
+    cancellation_requested_at: datetime
+    cancellation_idempotency_key: str
+    expected_status_reason: Literal["retry_cancellation_requested"] = (
+        _TASK_RETRY_CANCELLATION_REQUESTED_REASON
+    )
+    reconciliation_idempotency_key: str
+    reconciliation_requested_at: datetime
+    reconciled_by: ResolutionActor
+    evidence: TaskRetryCancellationReconciliationEvidence
+    expected_execution_profile_fingerprint: str | None = None
+    expected_effect_fingerprint: str | None = None
+
+    @field_validator(
+        "task_id",
+        "series_id",
+        "causal_budget_id",
+        "original_worker_id",
+    )
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _validate_task_retry_reconciliation_identity(value, info.field_name)
+
+    @field_validator("cancellation_idempotency_key", "reconciliation_idempotency_key")
+    @classmethod
+    def validate_idempotency_key(cls, value: str) -> str:
+        return _validate_task_terminalization_idempotency_key(value)
+
+    @field_validator(
+        "original_lease_expires_at",
+        "cancellation_requested_at",
+        "reconciliation_requested_at",
+    )
+    @classmethod
+    def normalize_identity_datetime(cls, value: datetime, info) -> datetime:
+        return normalize_utc_datetime(value, info.field_name)
+
+    @field_validator("reconciled_by", mode="before")
+    @classmethod
+    def copy_actor(cls, value: object) -> object:
+        return revalidate_model_input(value, ResolutionActor)
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def copy_evidence(cls, value: object) -> object:
+        return revalidate_model_input(value, TaskRetryCancellationReconciliationEvidence)
+
+    @field_validator(
+        "expected_execution_profile_fingerprint",
+        "expected_effect_fingerprint",
+    )
+    @classmethod
+    def validate_expected_fingerprint(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _validate_lowercase_sha256(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_evidence_identity(self) -> TaskRetryCancellationReconciliationRequest:
+        if self.reconciled_by.source is None:
+            raise ValueError("Task retry reconciliation requires an actor provenance source.")
+        if (
+            self.expected_execution_profile_fingerprint
+            != self.evidence.execution_profile_fingerprint
+        ):
+            raise ValueError("Reconciliation evidence conflicts with the expected profile.")
+        if self.expected_effect_fingerprint != self.evidence.effect_fingerprint:
+            raise ValueError("Reconciliation evidence conflicts with the expected effect.")
+        if self.evidence.validated_at < self.cancellation_requested_at:
+            raise ValueError("Reconciliation evidence predates the cancellation request.")
+        if self.reconciliation_requested_at < self.evidence.validated_at:
+            raise ValueError("Reconciliation request predates its validated evidence.")
+        for field_name, value in (
+            ("reconciled_by.subject", self.reconciled_by.subject),
+            ("reconciled_by.tenant", self.reconciled_by.tenant),
+        ):
+            if value is not None:
+                _validate_task_retry_reconciliation_identity(value, field_name)
+        return self
+
+
+class TaskRetryCancellationReconciliation(BaseModel):
+    """Durable positive evidence attached to the ordinary cancellation receipt."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    request_sha256: str
+    task_id: str
+    series_id: str
+    attempt: StrictInt = Field(ge=1, le=100)
+    causal_budget_id: str
+    original_worker_id: str
+    original_lease_expires_at: datetime
+    cancellation_requested_at: datetime
+    cancellation_idempotency_key: str
+    reconciliation_idempotency_key: str
+    reconciliation_requested_at: datetime
+    reconciled_by: ResolutionActor
+    evidence: TaskRetryCancellationReconciliationEvidence
+    events: tuple[TaskRetryCancellationReconciliationEvent, ...] = Field(
+        min_length=3,
+        max_length=3,
+    )
+
+    @field_validator("request_sha256")
+    @classmethod
+    def validate_request_sha256(cls, value: str) -> str:
+        return _validate_lowercase_sha256(value, "request_sha256")
+
+    @field_validator(
+        "task_id",
+        "series_id",
+        "causal_budget_id",
+        "original_worker_id",
+    )
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _validate_task_retry_reconciliation_identity(value, info.field_name)
+
+    @field_validator("cancellation_idempotency_key", "reconciliation_idempotency_key")
+    @classmethod
+    def validate_idempotency_key(cls, value: str) -> str:
+        return _validate_task_terminalization_idempotency_key(value)
+
+    @field_validator(
+        "original_lease_expires_at",
+        "cancellation_requested_at",
+        "reconciliation_requested_at",
+    )
+    @classmethod
+    def normalize_identity_datetime(cls, value: datetime, info) -> datetime:
+        return normalize_utc_datetime(value, info.field_name)
+
+    @field_validator("reconciled_by", mode="before")
+    @classmethod
+    def copy_actor(cls, value: object) -> object:
+        return revalidate_model_input(value, ResolutionActor)
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def copy_evidence(cls, value: object) -> object:
+        return revalidate_model_input(value, TaskRetryCancellationReconciliationEvidence)
+
+    @field_validator("events", mode="before")
+    @classmethod
+    def copy_events(cls, value: object) -> object:
+        if isinstance(value, (str, bytes, bytearray, Mapping, BaseModel)):
+            return value
+        return tuple(
+            revalidate_model_input(event, TaskRetryCancellationReconciliationEvent)
+            for event in cast("Iterable[object]", value)
+        )
+
+    @model_validator(mode="after")
+    def validate_projection(self) -> TaskRetryCancellationReconciliation:
+        if self.reconciled_by.claims:
+            raise ValueError("Durable reconciliation actors cannot retain authorization claims.")
+        for field_name, value in (
+            ("reconciled_by.subject", self.reconciled_by.subject),
+            ("reconciled_by.tenant", self.reconciled_by.tenant),
+        ):
+            if value is not None:
+                _validate_task_retry_reconciliation_identity(value, field_name)
+        expected_types = (
+            TaskRetryCancellationReconciliationEventType.CANCELLATION_REQUESTED,
+            TaskRetryCancellationReconciliationEventType.STARTED,
+            TaskRetryCancellationReconciliationEventType.RECONCILED,
+        )
+        original_worker_sha256 = _task_retry_reconciliation_identity_sha256(
+            self.original_worker_id,
+            "original_worker_id",
+        )
+        cancellation_sha256 = _task_retry_reconciliation_identity_sha256(
+            self.cancellation_idempotency_key,
+            "cancellation_idempotency_key",
+        )
+        reconciliation_sha256 = _task_retry_reconciliation_identity_sha256(
+            self.reconciliation_idempotency_key,
+            "reconciliation_idempotency_key",
+        )
+        actor_sha256 = _task_retry_reconciliation_actor_sha256(self.reconciled_by)
+        for index, (event, event_type) in enumerate(zip(self.events, expected_types, strict=True)):
+            requested = index == 0
+            if (
+                event.type is not event_type
+                or event.task_id != self.task_id
+                or event.series_id != self.series_id
+                or event.attempt != self.attempt
+                or event.causal_budget_id != self.causal_budget_id
+                or event.original_worker_id_sha256 != original_worker_sha256
+                or event.cancellation_idempotency_key_sha256 != cancellation_sha256
+                or event.request_sha256 != (None if requested else self.request_sha256)
+                or event.reconciliation_idempotency_key_sha256
+                != (None if requested else reconciliation_sha256)
+                or event.evidence_sha256 != (None if requested else self.evidence.evidence_sha256)
+                or event.actor_sha256 != (None if requested else actor_sha256)
+                or event.outcome != (None if requested else self.evidence.outcome)
+                or event.occurred_at
+                != (
+                    self.cancellation_requested_at
+                    if requested
+                    else (
+                        self.reconciliation_requested_at
+                        if event_type is TaskRetryCancellationReconciliationEventType.STARTED
+                        else self.events[2].occurred_at
+                    )
+                )
+                or event.id
+                != _task_retry_cancellation_reconciliation_event_id(
+                    event_type=event_type,
+                    task_id=self.task_id,
+                    series_id=self.series_id,
+                    attempt=self.attempt,
+                    cancellation_idempotency_key=self.cancellation_idempotency_key,
+                    request_sha256=None if requested else self.request_sha256,
+                    reconciliation_idempotency_key=(
+                        None if requested else self.reconciliation_idempotency_key
+                    ),
+                    evidence_sha256=(None if requested else self.evidence.evidence_sha256),
+                )
+            ):
+                raise ValueError("Reconciliation event conflicts with its durable projection.")
+        return self
+
+
+class TaskRetryCancellationReconciliationConflict(TaskTerminalizationConflict):
+    """A reconciliation request lost an exact identity or settlement race."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        event: TaskRetryCancellationReconciliationEvent,
+    ) -> None:
+        super().__init__(message)
+        self.event = TaskRetryCancellationReconciliationEvent.model_validate(
+            event.model_dump(mode="python")
+        )
+
+
+class TaskRetryCancellationReconciliationRejected(ValueError):
+    """Application evidence was non-positive, so the attempt remains fenced."""
+
+    def __init__(
+        self,
+        *,
+        outcome: TaskRetryCancellationReconciliationOutcome,
+        event: TaskRetryCancellationReconciliationEvent,
+    ) -> None:
+        super().__init__(f"Task retry cancellation reconciliation is {outcome.value}.")
+        self.outcome = outcome
+        self.event = TaskRetryCancellationReconciliationEvent.model_validate(
+            event.model_dump(mode="python")
+        )
+
+
+class _TaskRetryCancellationReconciliationRejectionRecord(BaseModel):
+    """Durable binding for one non-positive reconciliation request."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    task_id: str
+    reconciliation_idempotency_key: str
+    request_sha256: str
+    outcome: TaskRetryCancellationReconciliationOutcome
+    event: TaskRetryCancellationReconciliationEvent
+    recorded_at: datetime
+
+    @field_validator("task_id")
+    @classmethod
+    def validate_task_id(cls, value: str) -> str:
+        return _validate_task_retry_reconciliation_identity(value, "task_id")
+
+    @field_validator("reconciliation_idempotency_key")
+    @classmethod
+    def validate_reconciliation_idempotency_key(cls, value: str) -> str:
+        return _validate_task_terminalization_idempotency_key(value)
+
+    @field_validator("request_sha256")
+    @classmethod
+    def validate_request_sha256(cls, value: str) -> str:
+        return _validate_lowercase_sha256(value, "request_sha256")
+
+    @field_validator("event", mode="before")
+    @classmethod
+    def copy_event(cls, value: object) -> object:
+        return revalidate_model_input(value, TaskRetryCancellationReconciliationEvent)
+
+    @field_validator("recorded_at")
+    @classmethod
+    def normalize_recorded_at(cls, value: datetime) -> datetime:
+        return normalize_utc_datetime(value, "recorded_at")
+
+    @model_validator(mode="after")
+    def validate_rejection(self) -> _TaskRetryCancellationReconciliationRejectionRecord:
+        event = self.event
+        if (
+            self.outcome in _POSITIVE_TASK_RETRY_CANCELLATION_RECONCILIATION_OUTCOMES
+            or event.type is not TaskRetryCancellationReconciliationEventType.REJECTED
+            or event.task_id != self.task_id
+            or event.request_sha256 != self.request_sha256
+            or event.reconciliation_idempotency_key_sha256
+            != _task_retry_reconciliation_identity_sha256(
+                self.reconciliation_idempotency_key,
+                "reconciliation_idempotency_key",
+            )
+            or event.outcome is not self.outcome
+            or event.occurred_at > self.recorded_at
+        ):
+            raise ValueError("Reconciliation rejection conflicts with its request binding.")
+        return self
+
+
 TASK_TERMINALIZATION_IDEMPOTENCY_KEY_MAX_BYTES = 256
 _CONTRACT_TASK_JSON_FIELDS = ("input", "metadata", "status_payload", "result", "error")
 
@@ -569,6 +1063,9 @@ class Task(BaseModel):
     @model_validator(mode="after")
     def validate_retry_and_work_contract_authority(self) -> Task:
         if self.retry_series is not None:
+            _validate_task_retry_reconciliation_identity(self.id, "id")
+            if self.worker_id is not None:
+                _validate_task_retry_reconciliation_identity(self.worker_id, "worker_id")
             expected = _task_retry_attempt_authority_sha256(
                 task_id=self.id,
                 task_type=self.type,
@@ -713,6 +1210,8 @@ class TaskCreate(BaseModel):
     @model_validator(mode="after")
     def validate_retry_and_work_contract_shape(self) -> TaskCreate:
         if self.retry_policy is not None:
+            if self.task_id is not None:
+                _validate_task_retry_reconciliation_identity(self.task_id, "task_id")
             if self.session_id is not None:
                 raise ValueError("Retry-series tasks must start as unattached queue work.")
             if self.work_contract is not None:
@@ -922,6 +1421,7 @@ class TaskRetrySettlementResult(BaseModel):
     request_sha256: str
     task: Task
     successor: Task | None = None
+    reconciliation: TaskRetryCancellationReconciliation | None = None
     events: tuple[TaskRetryEvent, ...] = Field(min_length=2, max_length=2)
     committed_at: datetime
 
@@ -960,6 +1460,31 @@ class TaskRetrySettlementResult(BaseModel):
         }.get(series.disposition, TaskStatus.FAILED)
         if self.task.status is not expected_status:
             raise ValueError("Task retry receipt conflicts with its series disposition.")
+
+        if self.reconciliation is not None:
+            reconciliation = self.reconciliation
+            status_payload = self.task.status_payload
+            if (
+                series.disposition is not TaskRetrySeriesDisposition.CANCELLED
+                or self.successor is not None
+                or reconciliation.request_sha256 != self.request_sha256
+                or reconciliation.task_id != self.task_id
+                or reconciliation.series_id != series.series_id
+                or reconciliation.attempt != series.attempt
+                or reconciliation.causal_budget_id != series.causal_budget_id
+                or reconciliation.cancellation_idempotency_key != self.idempotency_key
+                or reconciliation.original_lease_expires_at > self.committed_at
+                or reconciliation.reconciliation_requested_at > self.committed_at
+                or reconciliation.events[1].occurred_at
+                != reconciliation.reconciliation_requested_at
+                or reconciliation.events[2].occurred_at != self.committed_at
+                or type(status_payload) is not dict
+                or status_payload.get("cancellation_reconciliation")
+                != reconciliation.model_dump(mode="json", warnings=False)
+            ):
+                raise ValueError(
+                    "Task retry cancellation reconciliation conflicts with its receipt."
+                )
 
         scheduled = series.disposition is TaskRetrySeriesDisposition.RETRY_SCHEDULED
         if scheduled != (self.successor is not None):
@@ -2079,6 +2604,22 @@ class TaskStore(ABC):
 
         raise NotImplementedError("This TaskStore does not support task retry series.")
 
+    async def reconcile_task_retry_cancellation(
+        self,
+        request: TaskRetryCancellationReconciliationRequest,
+    ) -> TaskRetrySettlementResult:
+        """Settle an exact owner-lost cancellation from positive application evidence.
+
+        Lease expiry establishes only that the original owner is lost. The request's
+        typed evidence remains the application's positive quiescence/effect proof.
+        Custom retry-capable stores must implement the transition atomically with the
+        ordinary retry settlement receipt.
+        """
+
+        raise NotImplementedError(
+            "This TaskStore does not support task retry cancellation reconciliation."
+        )
+
     async def enforce_task_retry_deadline(
         self,
         task_id: str,
@@ -2215,6 +2756,10 @@ class InMemoryTaskStore(TaskStore):
         self._tasks: dict[str, Task] = {}
         self._terminalization_receipts: dict[tuple[str, str], TaskTerminalizationReceipt] = {}
         self._retry_settlements: dict[tuple[str, str], TaskRetrySettlementResult] = {}
+        self._retry_reconciliation_rejections: dict[
+            tuple[str, str],
+            _TaskRetryCancellationReconciliationRejectionRecord,
+        ] = {}
         self._work_contracts: dict[tuple[str, int], WorkContract] = {}
         self._work_attempts: dict[str, WorkAttempt] = {}
         self._attempt_ids_by_task: dict[str, list[str]] = {}
@@ -3238,6 +3783,60 @@ class InMemoryTaskStore(TaskStore):
             receipt = self._retry_settlements.get((task_id, idempotency_key))
             return None if receipt is None else receipt.model_copy(deep=True)
 
+    async def reconcile_task_retry_cancellation(
+        self,
+        request: TaskRetryCancellationReconciliationRequest,
+    ) -> TaskRetrySettlementResult:
+        request, request_sha256 = prepare_task_retry_cancellation_reconciliation(request)
+        receipt_key = (request.task_id, request.cancellation_idempotency_key)
+        rejection_key = (request.task_id, request.reconciliation_idempotency_key)
+        async with self._lock:
+            now = datetime.now(UTC)
+            rejection = self._retry_reconciliation_rejections.get(rejection_key)
+            if rejection is not None:
+                raise _replay_task_retry_cancellation_reconciliation_rejection(
+                    request,
+                    request_sha256=request_sha256,
+                    record=rejection,
+                )
+            existing = self._retry_settlements.get(receipt_key)
+            if existing is not None:
+                return _replay_task_retry_cancellation_reconciliation(
+                    request=request,
+                    request_sha256=request_sha256,
+                    receipt=existing,
+                    current_task=self._tasks.get(request.task_id),
+                )
+            task = self._tasks.get(request.task_id)
+            if task is None:
+                raise _task_retry_cancellation_reconciliation_conflict(
+                    request,
+                    "Task retry cancellation reconciliation task was not found.",
+                )
+            rejection = _task_retry_cancellation_reconciliation_rejection_record(
+                request,
+                request_sha256=request_sha256,
+                recorded_at=now,
+            )
+            if rejection is not None:
+                _validated_task_retry_cancellation(
+                    task,
+                    request,
+                    now=now,
+                    require_owner_lost=False,
+                )
+                self._retry_reconciliation_rejections[rejection_key] = rejection
+                raise _rejected_task_retry_cancellation_reconciliation(rejection)
+            receipt = _reconciled_task_retry_cancellation(
+                task,
+                request,
+                request_sha256=request_sha256,
+                committed_at=now,
+            )
+            self._store_task(receipt.task)
+            self._retry_settlements[receipt_key] = receipt
+            return receipt.model_copy(deep=True)
+
     async def cancel_task(
         self,
         task_id: str,
@@ -3322,6 +3921,7 @@ class InMemoryTaskStore(TaskStore):
         lease_seconds: int = 300,
     ) -> Task | None:
         worker_id = require_clean_nonblank(worker_id, "worker_id")
+        retry_worker_id_is_bounded = _task_retry_reconciliation_identity_is_bounded(worker_id)
         query = copy_task_query(query)
         _ensure_claim_query_supported(query)
         lease_seconds = _validate_positive_int(lease_seconds, "lease_seconds")
@@ -3346,6 +3946,7 @@ class InMemoryTaskStore(TaskStore):
                 and task.session_id is None
                 and (task.available_at is None or task.available_at <= availability_now)
                 and not _task_retry_attempt_elapsed(task, series_now=availability_now)
+                and (task.retry_series is None or retry_worker_id_is_bounded)
                 and _task_matches_claim_filter(task, query)
             ]
             if not candidates:
@@ -4416,6 +5017,13 @@ def _copy_task_retry_settlement_result(
         request_sha256=receipt.request_sha256,
         task=copy_task(receipt.task),
         successor=None if receipt.successor is None else copy_task(receipt.successor),
+        reconciliation=(
+            None
+            if receipt.reconciliation is None
+            else TaskRetryCancellationReconciliation.model_validate(
+                receipt.reconciliation.model_dump(mode="python")
+            )
+        ),
         events=tuple(_copy_task_retry_event(event) for event in receipt.events),
         committed_at=receipt.committed_at,
     )
@@ -4468,6 +5076,37 @@ def prepare_task_retry_settlement(
     return copied, request_sha256
 
 
+def prepare_task_retry_cancellation_reconciliation(
+    request: TaskRetryCancellationReconciliationRequest,
+) -> tuple[TaskRetryCancellationReconciliationRequest, str]:
+    """Detach and digest one evidence-bound owner-lost reconciliation request."""
+
+    if type(request) is not TaskRetryCancellationReconciliationRequest:
+        raise TypeError(
+            "Task retry cancellation reconciliations require a "
+            "TaskRetryCancellationReconciliationRequest."
+        )
+    copied = TaskRetryCancellationReconciliationRequest.model_validate(
+        request.model_dump(mode="python", warnings=False)
+    )
+    request_material = copied.model_dump(
+        mode="json",
+        warnings=False,
+        exclude={"reconciled_by"},
+    )
+    request_material["reconciled_by"] = resolution_actor_payload(copied.reconciled_by)
+    request_sha256 = sha256(
+        canonical_durable_json_bytes(
+            {
+                "schema": "cayu.task-retry-cancellation-reconciliation.v1",
+                **request_material,
+            },
+            "task_retry_cancellation_reconciliation",
+        )
+    ).hexdigest()
+    return copied, request_sha256
+
+
 def _replay_task_retry_settlement(
     *,
     request_sha256: str,
@@ -4483,6 +5122,35 @@ def _replay_task_retry_settlement(
     if current_task != receipt.task:
         raise TaskTerminalizationConflict(
             "Task retry settlement receipt conflicts with the current terminal attempt."
+        )
+    return receipt
+
+
+def _replay_task_retry_cancellation_reconciliation(
+    *,
+    request: TaskRetryCancellationReconciliationRequest,
+    request_sha256: str,
+    receipt: TaskRetrySettlementResult,
+    current_task: Task | None,
+) -> TaskRetrySettlementResult:
+    receipt = _copy_task_retry_settlement_result(receipt)
+    current_task = None if current_task is None else copy_task(current_task)
+    reconciliation = receipt.reconciliation
+    if (
+        reconciliation is None
+        or receipt.idempotency_key != request.cancellation_idempotency_key
+        or receipt.request_sha256 != request_sha256
+        or reconciliation.request_sha256 != request_sha256
+        or reconciliation.reconciliation_idempotency_key != request.reconciliation_idempotency_key
+    ):
+        raise _task_retry_cancellation_reconciliation_conflict(
+            request,
+            "Task retry cancellation settlement idempotency key is bound to another intent.",
+        )
+    if current_task != receipt.task:
+        raise _task_retry_cancellation_reconciliation_conflict(
+            request,
+            "Task retry cancellation receipt conflicts with the current terminal attempt.",
         )
     return receipt
 
@@ -4595,6 +5263,212 @@ def _task_retry_runtime_idempotency_key(task: Task, operation: str) -> str:
     return f"task-retry-{operation}:v1:{sha256(material).hexdigest()}"
 
 
+def _task_retry_reconciliation_identity_sha256(value: str, field_name: str) -> str:
+    value = _validate_task_retry_reconciliation_identity(value, field_name)
+    return sha256(value.encode("utf-8")).hexdigest()
+
+
+def _task_retry_reconciliation_actor_sha256(actor: ResolutionActor) -> str:
+    projected = resolution_actor_payload(actor)
+    if projected is None:  # pragma: no cover - required request invariant
+        raise AssertionError("Task retry reconciliation requires actor provenance.")
+    return sha256(
+        canonical_durable_json_bytes(projected, "task_retry_reconciliation_actor")
+    ).hexdigest()
+
+
+def _task_retry_cancellation_reconciliation_event_id(
+    *,
+    event_type: TaskRetryCancellationReconciliationEventType,
+    task_id: str,
+    series_id: str,
+    attempt: int,
+    cancellation_idempotency_key: str,
+    request_sha256: str | None,
+    reconciliation_idempotency_key: str | None,
+    evidence_sha256: str | None,
+) -> str:
+    material = canonical_durable_json_bytes(
+        {
+            "schema": "cayu.task-retry-cancellation-reconciliation-event.v1",
+            "type": event_type.value,
+            "task_id": task_id,
+            "series_id": series_id,
+            "attempt": attempt,
+            "cancellation_idempotency_key": cancellation_idempotency_key,
+            "request_sha256": request_sha256,
+            "reconciliation_idempotency_key": reconciliation_idempotency_key,
+            "evidence_sha256": evidence_sha256,
+        },
+        "task_retry_cancellation_reconciliation_event_id",
+    )
+    return f"task-retry-reconciliation-event:v1:{sha256(material).hexdigest()}"
+
+
+def _task_retry_cancellation_requested_event(
+    task: Task,
+    *,
+    occurred_at: datetime,
+) -> TaskRetryCancellationReconciliationEvent:
+    series = task.retry_series
+    if series is None or task.worker_id is None:
+        raise TaskTerminalizationConflict(
+            "Task retry cancellation request lacks active attempt identity."
+        )
+    cancellation_idempotency_key = _task_retry_runtime_idempotency_key(
+        task,
+        "cancellation",
+    )
+    return TaskRetryCancellationReconciliationEvent(
+        id=_task_retry_cancellation_reconciliation_event_id(
+            event_type=(TaskRetryCancellationReconciliationEventType.CANCELLATION_REQUESTED),
+            task_id=task.id,
+            series_id=series.series_id,
+            attempt=series.attempt,
+            cancellation_idempotency_key=cancellation_idempotency_key,
+            request_sha256=None,
+            reconciliation_idempotency_key=None,
+            evidence_sha256=None,
+        ),
+        type=TaskRetryCancellationReconciliationEventType.CANCELLATION_REQUESTED,
+        task_id=task.id,
+        series_id=series.series_id,
+        attempt=series.attempt,
+        causal_budget_id=series.causal_budget_id,
+        original_worker_id_sha256=_task_retry_reconciliation_identity_sha256(
+            task.worker_id,
+            "worker_id",
+        ),
+        cancellation_idempotency_key_sha256=(
+            _task_retry_reconciliation_identity_sha256(
+                cancellation_idempotency_key,
+                "cancellation_idempotency_key",
+            )
+        ),
+        occurred_at=occurred_at,
+    )
+
+
+def _task_retry_cancellation_reconciliation_event(
+    request: TaskRetryCancellationReconciliationRequest,
+    *,
+    event_type: TaskRetryCancellationReconciliationEventType,
+    occurred_at: datetime,
+) -> TaskRetryCancellationReconciliationEvent:
+    if event_type is TaskRetryCancellationReconciliationEventType.CANCELLATION_REQUESTED:
+        raise ValueError("Reconciliation requests cannot fabricate cancellation events.")
+    _, request_sha256 = prepare_task_retry_cancellation_reconciliation(request)
+    return TaskRetryCancellationReconciliationEvent(
+        id=_task_retry_cancellation_reconciliation_event_id(
+            event_type=event_type,
+            task_id=request.task_id,
+            series_id=request.series_id,
+            attempt=request.attempt,
+            cancellation_idempotency_key=request.cancellation_idempotency_key,
+            request_sha256=request_sha256,
+            reconciliation_idempotency_key=request.reconciliation_idempotency_key,
+            evidence_sha256=request.evidence.evidence_sha256,
+        ),
+        type=event_type,
+        task_id=request.task_id,
+        series_id=request.series_id,
+        attempt=request.attempt,
+        causal_budget_id=request.causal_budget_id,
+        original_worker_id_sha256=_task_retry_reconciliation_identity_sha256(
+            request.original_worker_id,
+            "original_worker_id",
+        ),
+        cancellation_idempotency_key_sha256=(
+            _task_retry_reconciliation_identity_sha256(
+                request.cancellation_idempotency_key,
+                "cancellation_idempotency_key",
+            )
+        ),
+        request_sha256=request_sha256,
+        reconciliation_idempotency_key_sha256=(
+            _task_retry_reconciliation_identity_sha256(
+                request.reconciliation_idempotency_key,
+                "reconciliation_idempotency_key",
+            )
+        ),
+        evidence_sha256=request.evidence.evidence_sha256,
+        actor_sha256=_task_retry_reconciliation_actor_sha256(request.reconciled_by),
+        outcome=request.evidence.outcome,
+        occurred_at=occurred_at,
+    )
+
+
+def _task_retry_cancellation_reconciliation_conflict(
+    request: TaskRetryCancellationReconciliationRequest,
+    message: str,
+) -> TaskRetryCancellationReconciliationConflict:
+    return TaskRetryCancellationReconciliationConflict(
+        message,
+        event=_task_retry_cancellation_reconciliation_event(
+            request,
+            event_type=TaskRetryCancellationReconciliationEventType.CONFLICT,
+            occurred_at=request.reconciliation_requested_at,
+        ),
+    )
+
+
+def _task_retry_cancellation_reconciliation_rejection_record(
+    request: TaskRetryCancellationReconciliationRequest,
+    *,
+    request_sha256: str,
+    recorded_at: datetime,
+) -> _TaskRetryCancellationReconciliationRejectionRecord | None:
+    """Build the durable idempotency binding for a non-positive outcome."""
+
+    if request.evidence.outcome in (_POSITIVE_TASK_RETRY_CANCELLATION_RECONCILIATION_OUTCOMES):
+        return None
+    return _TaskRetryCancellationReconciliationRejectionRecord(
+        task_id=request.task_id,
+        reconciliation_idempotency_key=request.reconciliation_idempotency_key,
+        request_sha256=request_sha256,
+        outcome=request.evidence.outcome,
+        event=_task_retry_cancellation_reconciliation_event(
+            request,
+            event_type=TaskRetryCancellationReconciliationEventType.REJECTED,
+            occurred_at=request.reconciliation_requested_at,
+        ),
+        recorded_at=recorded_at,
+    )
+
+
+def _rejected_task_retry_cancellation_reconciliation(
+    record: _TaskRetryCancellationReconciliationRejectionRecord,
+) -> TaskRetryCancellationReconciliationRejected:
+    return TaskRetryCancellationReconciliationRejected(
+        outcome=record.outcome,
+        event=record.event,
+    )
+
+
+def _replay_task_retry_cancellation_reconciliation_rejection(
+    request: TaskRetryCancellationReconciliationRequest,
+    *,
+    request_sha256: str,
+    record: _TaskRetryCancellationReconciliationRejectionRecord,
+) -> TaskRetryCancellationReconciliationRejected:
+    """Replay one exact rejection or fail a changed idempotency-key intent."""
+
+    durable = _TaskRetryCancellationReconciliationRejectionRecord.model_validate(
+        record.model_dump(mode="python")
+    )
+    expected = _task_retry_cancellation_reconciliation_rejection_record(
+        request,
+        request_sha256=request_sha256,
+        recorded_at=durable.recorded_at,
+    )
+    if expected is None or expected != durable:
+        raise _task_retry_cancellation_reconciliation_conflict(
+            request,
+            "Reconciliation idempotency key is already bound to another request.",
+        )
+    return _rejected_task_retry_cancellation_reconciliation(durable)
+
+
 def _task_retry_cancellation_requested(task: Task) -> bool:
     """Return whether an owned retry attempt carries a durable cancel request."""
 
@@ -4619,11 +5493,50 @@ def _task_retry_cancellation_requested_task(
     ):
         raise TaskTerminalizationConflict("Task retry attempt cannot drain cancellation.")
     if _task_retry_cancellation_requested(task):
-        return task.model_copy(deep=True)
+        payload = task.status_payload
+        if type(payload) is dict and set(payload) == {
+            "settlement_idempotency_key",
+            "error",
+            "event",
+        }:
+            return task.model_copy(deep=True)
+        # Cayu 0.3.0 persisted the same fenced cancellation intent before the
+        # bounded cancellation event was added. Replaying that exact request is
+        # the only supported upgrade path: preserve its original occurrence
+        # time and identities, then let the public reconciliation API validate
+        # and settle it normally.
+        expected_key = _task_retry_runtime_idempotency_key(task, "cancellation")
+        if (
+            type(payload) is not dict
+            or set(payload) != {"settlement_idempotency_key", "error"}
+            or payload.get("settlement_idempotency_key") != expected_key
+            or type(payload.get("error")) is not dict
+        ):
+            raise TaskTerminalizationConflict(
+                "Task retry cancellation request conflicts with active ownership."
+            )
+        requested_event = _task_retry_cancellation_requested_event(
+            task,
+            occurred_at=task.updated_at,
+        )
+        return task.model_copy(
+            update={
+                "status_payload": {
+                    "settlement_idempotency_key": expected_key,
+                    "error": copy_durable_json_object(payload["error"], "error"),
+                    "event": requested_event.model_dump(mode="json", warnings=False),
+                }
+            },
+            deep=True,
+        )
     cancellation_error = (
         {"code": TaskRetrySeriesDisposition.CANCELLED.value}
         if error is None
         else copy_durable_json_object(error, "error")
+    )
+    requested_event = _task_retry_cancellation_requested_event(
+        task,
+        occurred_at=updated_at,
     )
     return task.model_copy(
         update={
@@ -4634,6 +5547,7 @@ def _task_retry_cancellation_requested_task(
                     "cancellation",
                 ),
                 "error": cancellation_error,
+                "event": requested_event.model_dump(mode="json", warnings=False),
             },
             "updated_at": normalize_utc_datetime(updated_at, "updated_at"),
         },
@@ -4660,9 +5574,10 @@ def _task_retry_requested_cancellation_settlement(
         or series.disposition is not TaskRetrySeriesDisposition.ACTIVE
         or task.worker_id != worker_id
         or type(payload) is not dict
-        or set(payload) != {"settlement_idempotency_key", "error"}
+        or set(payload) != {"settlement_idempotency_key", "error", "event"}
         or type(payload.get("settlement_idempotency_key")) is not str
         or type(payload.get("error")) is not dict
+        or type(payload.get("event")) is not dict
     ):
         raise TaskTerminalizationConflict(
             "Task retry cancellation request conflicts with active ownership."
@@ -4671,6 +5586,14 @@ def _task_retry_requested_cancellation_settlement(
     if payload["settlement_idempotency_key"] != expected_key:
         raise TaskTerminalizationConflict(
             "Task retry cancellation request conflicts with its attempt identity."
+        )
+    requested_event = TaskRetryCancellationReconciliationEvent.model_validate(payload["event"])
+    if requested_event != _task_retry_cancellation_requested_event(
+        task,
+        occurred_at=requested_event.occurred_at,
+    ):
+        raise TaskTerminalizationConflict(
+            "Task retry cancellation request conflicts with its event identity."
         )
     return TaskRetrySettlementRequest(
         task_id=task.id,
@@ -4681,6 +5604,187 @@ def _task_retry_requested_cancellation_settlement(
         error=copy_durable_json_object(payload["error"], "error"),
         token_count=token_count,
         estimated_cost=estimated_cost,
+    )
+
+
+def _validated_owner_lost_task_retry_cancellation(
+    task: Task,
+    request: TaskRetryCancellationReconciliationRequest,
+    *,
+    now: datetime,
+) -> tuple[dict[str, Any], TaskRetryCancellationReconciliationEvent]:
+    """Fence reconciliation to the exact expired owner and cancellation marker."""
+
+    return _validated_task_retry_cancellation(
+        task,
+        request,
+        now=now,
+        require_owner_lost=True,
+    )
+
+
+def _validated_task_retry_cancellation(
+    task: Task,
+    request: TaskRetryCancellationReconciliationRequest,
+    *,
+    now: datetime,
+    require_owner_lost: bool,
+) -> tuple[dict[str, Any], TaskRetryCancellationReconciliationEvent]:
+    """Fence reconciliation to the exact task and optionally an expired owner."""
+
+    now = normalize_utc_datetime(now, "now")
+    series = task.retry_series
+    payload = task.status_payload
+    conflict: str | None = None
+    if (
+        task.status not in {TaskStatus.CLAIMED, TaskStatus.RUNNING}
+        or task.status_reason != request.expected_status_reason
+        or series is None
+        or series.disposition is not TaskRetrySeriesDisposition.ACTIVE
+        or type(payload) is not dict
+        or set(payload) != {"settlement_idempotency_key", "error", "event"}
+        or type(payload.get("settlement_idempotency_key")) is not str
+        or type(payload.get("error")) is not dict
+        or type(payload.get("event")) is not dict
+    ):
+        conflict = "Task is not the expected cancellation-requested retry attempt."
+    elif (
+        task.id != request.task_id
+        or series.series_id != request.series_id
+        or series.attempt != request.attempt
+        or series.causal_budget_id != request.causal_budget_id
+        or task.worker_id != request.original_worker_id
+        or task.lease_expires_at != request.original_lease_expires_at
+        or payload["settlement_idempotency_key"] != request.cancellation_idempotency_key
+        or request.cancellation_idempotency_key
+        != _task_retry_runtime_idempotency_key(task, "cancellation")
+    ):
+        conflict = "Task retry cancellation reconciliation identity is stale."
+    elif require_owner_lost and (task.lease_expires_at is None or task.lease_expires_at > now):
+        conflict = "Task retry cancellation owner lease is still active."
+    elif request.reconciliation_requested_at > now:
+        conflict = "Task retry cancellation reconciliation request is from the future."
+
+    for metadata_key, expected in (
+        (
+            "execution_profile_fingerprint",
+            request.expected_execution_profile_fingerprint,
+        ),
+        ("effect_fingerprint", request.expected_effect_fingerprint),
+    ):
+        if conflict is None and metadata_key in task.metadata:
+            stored = task.metadata[metadata_key]
+            if type(stored) is not str or stored != expected:
+                conflict = (
+                    "Task retry cancellation reconciliation conflicts with the "
+                    f"stored {metadata_key}."
+                )
+
+    if conflict is not None:
+        raise _task_retry_cancellation_reconciliation_conflict(
+            request,
+            conflict,
+        )
+
+    assert task.lease_expires_at is not None
+    assert type(payload) is dict
+    assert type(payload["error"]) is dict
+    requested_event = TaskRetryCancellationReconciliationEvent.model_validate(payload["event"])
+    expected_event = _task_retry_cancellation_requested_event(
+        task,
+        occurred_at=requested_event.occurred_at,
+    )
+    if (
+        requested_event != expected_event
+        or requested_event.occurred_at != request.cancellation_requested_at
+    ):
+        raise _task_retry_cancellation_reconciliation_conflict(
+            request,
+            "Task retry cancellation request event identity is stale.",
+        )
+    return (
+        copy_durable_json_object(payload["error"], "error"),
+        requested_event,
+    )
+
+
+def _reconciled_task_retry_cancellation(
+    task: Task,
+    request: TaskRetryCancellationReconciliationRequest,
+    *,
+    request_sha256: str,
+    committed_at: datetime,
+) -> TaskRetrySettlementResult:
+    """Build an ordinary cancelled receipt with bounded reconciliation evidence."""
+
+    cancellation_error, requested_event = _validated_owner_lost_task_retry_cancellation(
+        task,
+        request,
+        now=committed_at,
+    )
+    base = _cancelled_task_retry_settlement(
+        task,
+        error=cancellation_error,
+        committed_at=committed_at,
+    )
+    durable_actor = copy_resolution_actor(request.reconciled_by)
+    if durable_actor is None:  # pragma: no cover - required request invariant
+        raise AssertionError("Task retry reconciliation lost actor provenance.")
+    durable_actor = ResolutionActor(
+        subject=durable_actor.subject,
+        tenant=durable_actor.tenant,
+        source=durable_actor.source,
+        claims={},
+    )
+    evidence = TaskRetryCancellationReconciliationEvidence.model_validate(
+        request.evidence.model_dump(mode="python")
+    )
+    reconciliation = TaskRetryCancellationReconciliation(
+        request_sha256=request_sha256,
+        task_id=request.task_id,
+        series_id=request.series_id,
+        attempt=request.attempt,
+        causal_budget_id=request.causal_budget_id,
+        original_worker_id=request.original_worker_id,
+        original_lease_expires_at=request.original_lease_expires_at,
+        cancellation_requested_at=request.cancellation_requested_at,
+        cancellation_idempotency_key=request.cancellation_idempotency_key,
+        reconciliation_idempotency_key=request.reconciliation_idempotency_key,
+        reconciliation_requested_at=request.reconciliation_requested_at,
+        reconciled_by=durable_actor,
+        evidence=evidence,
+        events=(
+            requested_event,
+            _task_retry_cancellation_reconciliation_event(
+                request,
+                event_type=TaskRetryCancellationReconciliationEventType.STARTED,
+                occurred_at=request.reconciliation_requested_at,
+            ),
+            _task_retry_cancellation_reconciliation_event(
+                request,
+                event_type=TaskRetryCancellationReconciliationEventType.RECONCILED,
+                occurred_at=committed_at,
+            ),
+        ),
+    )
+    status_payload = copy_durable_json_object(base.task.status_payload, "status_payload")
+    status_payload["cancellation_reconciliation"] = reconciliation.model_dump(
+        mode="json",
+        warnings=False,
+    )
+    settled = base.task.model_copy(
+        update={"status_payload": status_payload},
+        deep=True,
+    )
+    return TaskRetrySettlementResult(
+        task_id=request.task_id,
+        idempotency_key=request.cancellation_idempotency_key,
+        request_sha256=request_sha256,
+        task=settled,
+        successor=None,
+        reconciliation=reconciliation,
+        events=_task_retry_events(settled, occurred_at=committed_at),
+        committed_at=committed_at,
     )
 
 

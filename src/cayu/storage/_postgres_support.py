@@ -331,6 +331,16 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS cayu_task_retry_reconciliation_rejections (
+        task_id TEXT NOT NULL,
+        reconciliation_idempotency_key TEXT NOT NULL,
+        request_sha256 TEXT NOT NULL,
+        record_json JSONB NOT NULL,
+        recorded_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (task_id, reconciliation_idempotency_key)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS cayu_recall_receipts (
         receipt_id TEXT COLLATE "C" PRIMARY KEY,
         session_id TEXT COLLATE "C" NOT NULL

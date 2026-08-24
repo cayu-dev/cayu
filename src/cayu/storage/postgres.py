@@ -436,6 +436,7 @@ from cayu.runtime.tasks import (
     TaskOperationalSnapshot,
     TaskOrder,
     TaskQuery,
+    TaskRetryCancellationReconciliationRequest,
     TaskRetrySeriesDisposition,
     TaskRetrySettlementRequest,
     TaskRetrySettlementResult,
@@ -468,22 +469,32 @@ from cayu.runtime.tasks import (
     _ensure_retry_series_queue_attempt,
     _expired_task_retry_settlement,
     _raise_task_claim_attach_error,
+    _reconciled_task_retry_cancellation,
+    _rejected_task_retry_cancellation_reconciliation,
+    _replay_task_retry_cancellation_reconciliation,
+    _replay_task_retry_cancellation_reconciliation_rejection,
     _replay_task_retry_settlement,
     _replay_task_terminalization_receipt,
     _running_task_from_create,
     _settled_task_retry_attempt,
     _task_from_create,
     _task_invocation_for_attachment,
+    _task_retry_cancellation_reconciliation_conflict,
+    _task_retry_cancellation_reconciliation_rejection_record,
     _task_retry_cancellation_requested_task,
     _task_retry_events,
+    _task_retry_reconciliation_identity_is_bounded,
     _task_session_id_for_start,
+    _TaskRetryCancellationReconciliationRejectionRecord,
     _validate_task_topology_ancestry,
+    _validated_task_retry_cancellation,
     _validated_task_retry_terminal_accounting,
     build_task_topology_result,
     copy_task_aggregate_filter,
     copy_task_create,
     copy_task_query,
     decode_task_topology_cursor,
+    prepare_task_retry_cancellation_reconciliation,
     prepare_task_retry_settlement,
     prepare_task_terminalization,
     prepare_task_terminalization_receipt_lookup,
@@ -658,7 +669,7 @@ _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
 _POSTGRES_SESSION_MIN_REQUIRED_REVISION = 54
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 49
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 55
 
 
 async def _postgres_lock_memory_evidence_id(cur: Any, lock_id: str) -> None:
@@ -2534,6 +2545,18 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "CREATE INDEX IF NOT EXISTS idx_cayu_eval_scenarios_id_catalog "
         "ON cayu_eval_scenarios(scenario_id, created_at DESC, revision ASC)",
     ),
+    55: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_task_retry_reconciliation_rejections (
+            task_id TEXT NOT NULL,
+            reconciliation_idempotency_key TEXT NOT NULL,
+            request_sha256 TEXT NOT NULL,
+            record_json JSONB NOT NULL,
+            recorded_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (task_id, reconciliation_idempotency_key)
+        )
+        """,
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -3947,6 +3970,8 @@ class _PostgresStoreBase:
                             await self._validate_targeted_tool_grant_schema(cur)
                         if self._min_required_revision >= 53:
                             await self._validate_eval_scenario_schema(cur)
+                        if self._min_required_revision >= 55:
+                            await self._validate_task_retry_reconciliation_schema(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -4123,6 +4148,8 @@ class _PostgresStoreBase:
             await self._validate_targeted_tool_grant_schema(cur)
         if self._min_required_revision >= 53:
             await self._validate_eval_scenario_schema(cur)
+        if self._min_required_revision >= 55:
+            await self._validate_task_retry_reconciliation_schema(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -4217,6 +4244,8 @@ class _PostgresStoreBase:
             await self._validate_targeted_tool_grant_schema(cur)
         if revision.revision == 53:
             await self._validate_eval_scenario_schema(cur)
+        if revision.revision == 55:
+            await self._validate_task_retry_reconciliation_schema(cur)
 
     async def _validate_transcript_search_document_column(self, cur: Any) -> None:
         await cur.execute(
@@ -5266,6 +5295,44 @@ class _PostgresStoreBase:
                 "Postgres task retry-series schema conflicts with Cayu's revision-45 "
                 "durability contract. Run `cayu storage migrate` or restore the "
                 "database from a known-good backup."
+            )
+
+    async def _validate_task_retry_reconciliation_schema(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_task_retry_reconciliation_rejections'
+            ORDER BY ordinal_position
+            """
+        )
+        rejection_columns = tuple(await cur.fetchall())
+        await cur.execute(
+            """
+            SELECT pg_get_constraintdef(constraint_record.oid)
+            FROM pg_catalog.pg_constraint AS constraint_record
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = constraint_record.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = 'cayu_task_retry_reconciliation_rejections'
+              AND constraint_record.contype = 'p'
+            """
+        )
+        primary_keys = tuple(row[0] for row in await cur.fetchall())
+        if rejection_columns != (
+            ("task_id", "text", "NO"),
+            ("reconciliation_idempotency_key", "text", "NO"),
+            ("request_sha256", "text", "NO"),
+            ("record_json", "jsonb", "NO"),
+            ("recorded_at", "timestamp with time zone", "NO"),
+        ) or primary_keys != ("PRIMARY KEY (task_id, reconciliation_idempotency_key)",):
+            raise RuntimeError(
+                "Postgres task retry-reconciliation schema conflicts with Cayu's "
+                "revision-55 durability contract. Run `cayu storage migrate` or "
+                "restore the database from a known-good backup."
             )
 
     async def _validate_eval_result_baseline_schema(self, cur: Any) -> None:
@@ -24638,6 +24705,170 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             return None
         return TaskRetrySettlementResult.model_validate(_json_obj(row[0]))
 
+    async def reconcile_task_retry_cancellation(
+        self,
+        request: TaskRetryCancellationReconciliationRequest,
+    ) -> TaskRetrySettlementResult:
+        request, request_sha256 = prepare_task_retry_cancellation_reconciliation(request)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        f"SELECT {pg_support.TASK_COLUMNS} FROM cayu_tasks "
+                        "WHERE id = %s FOR UPDATE",
+                        (request.task_id,),
+                    )
+                    task_row = await cur.fetchone()
+                    task = None if task_row is None else pg_support.task_from_row(task_row)
+                    await cur.execute(
+                        "SELECT request_sha256, record_json "
+                        "FROM cayu_task_retry_reconciliation_rejections "
+                        "WHERE task_id = %s AND reconciliation_idempotency_key = %s",
+                        (request.task_id, request.reconciliation_idempotency_key),
+                    )
+                    rejection_row = await cur.fetchone()
+                    await cur.execute(
+                        "SELECT request_sha256, receipt_json "
+                        "FROM cayu_task_retry_settlements "
+                        "WHERE task_id = %s AND idempotency_key = %s",
+                        (request.task_id, request.cancellation_idempotency_key),
+                    )
+                    receipt_row = await cur.fetchone()
+                    now = await self._database_now(cur)
+                    if rejection_row is not None:
+                        rejection = (
+                            _TaskRetryCancellationReconciliationRejectionRecord.model_validate(
+                                _json_obj(rejection_row[1])
+                            )
+                        )
+                        if rejection.request_sha256 != rejection_row[0]:
+                            raise RuntimeError(
+                                "Postgres retry reconciliation rejection contains invalid "
+                                "durable material."
+                            )
+                        raise _replay_task_retry_cancellation_reconciliation_rejection(
+                            request,
+                            request_sha256=request_sha256,
+                            record=rejection,
+                        )
+                    if receipt_row is not None:
+                        receipt = TaskRetrySettlementResult.model_validate(
+                            _json_obj(receipt_row[1])
+                        )
+                        replayed = _replay_task_retry_cancellation_reconciliation(
+                            request=request,
+                            request_sha256=request_sha256,
+                            receipt=receipt,
+                            current_task=task,
+                        )
+                        await conn.commit()
+                        return replayed
+                    if task is None:
+                        raise _task_retry_cancellation_reconciliation_conflict(
+                            request,
+                            "Task retry cancellation reconciliation task was not found.",
+                        )
+                    rejection = _task_retry_cancellation_reconciliation_rejection_record(
+                        request,
+                        request_sha256=request_sha256,
+                        recorded_at=now,
+                    )
+                    if rejection is not None:
+                        _validated_task_retry_cancellation(
+                            task,
+                            request,
+                            now=now,
+                            require_owner_lost=False,
+                        )
+                        await cur.execute(
+                            "INSERT INTO cayu_task_retry_reconciliation_rejections "
+                            "(task_id, reconciliation_idempotency_key, request_sha256, "
+                            "record_json, recorded_at) VALUES (%s, %s, %s, %s, %s)",
+                            (
+                                rejection.task_id,
+                                rejection.reconciliation_idempotency_key,
+                                rejection.request_sha256,
+                                _dumps(rejection.model_dump(mode="json")),
+                                rejection.recorded_at,
+                            ),
+                        )
+                        await conn.commit()
+                        raise _rejected_task_retry_cancellation_reconciliation(rejection)
+
+                    receipt = _reconciled_task_retry_cancellation(
+                        task,
+                        request,
+                        request_sha256=request_sha256,
+                        committed_at=now,
+                    )
+                    settled = receipt.task
+                    assert settled.retry_series is not None
+                    await cur.execute(
+                        f"""
+                        UPDATE cayu_tasks
+                        SET status = %s, status_reason = %s, status_payload = %s,
+                            result = NULL, error = %s, worker_id = NULL,
+                            lease_expires_at = NULL, started_at = %s,
+                            completed_at = %s, updated_at = %s, retry_series = %s
+                        WHERE id = %s AND status IN (%s, %s) AND status_reason = %s
+                          AND worker_id = %s AND lease_expires_at = %s
+                          AND lease_expires_at <= %s
+                        RETURNING {pg_support.TASK_COLUMNS}
+                        """,
+                        (
+                            str(settled.status),
+                            settled.status_reason,
+                            _dumps(settled.status_payload),
+                            _dumps(settled.error),
+                            settled.started_at,
+                            settled.completed_at,
+                            settled.updated_at,
+                            _dumps(settled.retry_series.model_dump(mode="json")),
+                            request.task_id,
+                            str(TaskStatus.CLAIMED),
+                            str(TaskStatus.RUNNING),
+                            request.expected_status_reason,
+                            request.original_worker_id,
+                            request.original_lease_expires_at,
+                            now,
+                        ),
+                    )
+                    durable_row = await cur.fetchone()
+                    if durable_row is None:
+                        raise _task_retry_cancellation_reconciliation_conflict(
+                            request,
+                            "Task retry cancellation reconciliation lost its fenced transition.",
+                        )
+                    durable_task = pg_support.task_from_row(durable_row)
+                    receipt = TaskRetrySettlementResult(
+                        task_id=request.task_id,
+                        idempotency_key=request.cancellation_idempotency_key,
+                        request_sha256=request_sha256,
+                        task=durable_task,
+                        successor=None,
+                        reconciliation=receipt.reconciliation,
+                        events=_task_retry_events(durable_task, occurred_at=now),
+                        committed_at=now,
+                    )
+                    await cur.execute(
+                        "INSERT INTO cayu_task_retry_settlements "
+                        "(task_id, idempotency_key, request_sha256, receipt_json, committed_at) "
+                        "VALUES (%s, %s, %s, %s, %s)",
+                        (
+                            request.task_id,
+                            request.cancellation_idempotency_key,
+                            request_sha256,
+                            _dumps(receipt.model_dump(mode="json")),
+                            receipt.committed_at,
+                        ),
+                    )
+                await conn.commit()
+                return receipt.model_copy(deep=True)
+            except BaseException:
+                await conn.rollback()
+                raise
+
     async def enforce_task_retry_deadline(
         self,
         task_id: str,
@@ -24902,6 +25133,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         connection_owner: _PostgresMutationConnectionOwner,
     ) -> Task | None:
         clauses, params = self._task_filter_clauses(query)
+        retry_worker_id_is_bounded = _task_retry_reconciliation_identity_is_bounded(worker_id)
         if self._clock_is_injected:
             series_now = self._clock()
             availability_clause = "(available_at IS NULL OR available_at <= %s)"
@@ -24933,6 +25165,9 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 "(retry_series->>'elapsed_deadline')::timestamptz <= transaction_timestamp()"
             )
             expiration_deadline_params = []
+        if not retry_worker_id_is_bounded:
+            retry_deadline_clause = "retry_series IS NULL"
+            retry_deadline_params = []
         lease_expires_sql = "transaction_timestamp() + (%s * INTERVAL '1 second')"
         updated_at_sql = "transaction_timestamp()"
         mutation_params = [lease_seconds]
