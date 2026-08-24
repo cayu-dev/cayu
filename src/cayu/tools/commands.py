@@ -178,18 +178,32 @@ class ExecCommandTool(Tool):
     def _execution_profile_material(self) -> dict[str, object]:
         """Return Cayu-owned behavior inputs; command policy is profiled separately."""
 
-        return {}
+        return {"default_timeout_seconds": self._default_timeout_seconds}
 
     def __init__(
         self,
         spec: ToolSpec | None = None,
         *,
         policy: CommandPolicy | None = None,
+        default_timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
-        super().__init__(spec)
+        if (
+            isinstance(default_timeout_seconds, bool)
+            or not isinstance(default_timeout_seconds, int)
+            or not 1 <= default_timeout_seconds <= MAX_TIMEOUT_SECONDS
+        ):
+            raise ValueError(
+                "default_timeout_seconds must be an integer between 1 and "
+                f"{MAX_TIMEOUT_SECONDS}"
+            )
+        base_spec = type(self).spec if spec is None else spec
+        schema = base_spec.input_schema
+        schema["properties"]["timeout_s"]["default"] = default_timeout_seconds
+        super().__init__(base_spec.model_copy(update={"input_schema": schema}))
         if policy is not None and not isinstance(policy, CommandPolicy):
             raise TypeError("ExecCommandTool policy must implement CommandPolicy.")
         self._policy = policy
+        self._default_timeout_seconds = default_timeout_seconds
 
     @property
     def command_policy(self) -> CommandPolicy | None:
@@ -215,7 +229,7 @@ class ExecCommandTool(Tool):
             timeout_s = _optional_limited_int(
                 args,
                 "timeout_s",
-                default=DEFAULT_TIMEOUT_SECONDS,
+                default=self._default_timeout_seconds,
                 maximum=MAX_TIMEOUT_SECONDS,
             )
             command = _command_from_args(args)

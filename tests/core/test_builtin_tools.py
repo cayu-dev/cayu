@@ -3924,6 +3924,40 @@ def test_exec_command_tool_applies_default_and_max_timeout(tmp_path):
     assert "at most 600" in over_limit_result.content
 
 
+def test_exec_command_tool_applies_configured_default_timeout(tmp_path):
+    runner = RecordingRunner()
+    ctx = ToolContext(session_id="sess_1", runner=runner)
+    tool = ExecCommandTool(default_timeout_seconds=420)
+
+    result = asyncio.run(
+        tool.run(ctx, {"argv": [sys.executable, "-c", "print('ok')"]})
+    )
+    assert result.is_error is False
+    assert runner.timeout_s == 420
+    assert tool.schema["properties"]["timeout_s"]["default"] == 420
+
+    override = asyncio.run(
+        tool.run(
+            ctx,
+            {"argv": [sys.executable, "-c", "print('ok')"], "timeout_s": 7},
+        )
+    )
+    assert override.is_error is False
+    assert runner.timeout_s == 7
+
+
+@pytest.mark.parametrize("value", [0, 601, True, 1.5, "60"])
+def test_exec_command_tool_rejects_invalid_configured_default_timeout(value):
+    with pytest.raises(ValueError, match="default_timeout_seconds"):
+        ExecCommandTool(default_timeout_seconds=value)
+
+
+def test_exec_command_tool_default_timeout_is_execution_profile_material():
+    assert ExecCommandTool()._execution_profile_material() != ExecCommandTool(
+        default_timeout_seconds=600
+    )._execution_profile_material()
+
+
 def test_exec_command_tool_reports_timeout_and_cancellation():
     timed_out_runner = RecordingRunner(ExecResult(exit_code=-9, timed_out=True))
     cancelled_runner = RecordingRunner(ExecResult(exit_code=-9, cancelled=True))
