@@ -193,8 +193,7 @@ class ExecCommandTool(Tool):
             or not 1 <= default_timeout_seconds <= MAX_TIMEOUT_SECONDS
         ):
             raise ValueError(
-                "default_timeout_seconds must be an integer between 1 and "
-                f"{MAX_TIMEOUT_SECONDS}"
+                f"default_timeout_seconds must be an integer between 1 and {MAX_TIMEOUT_SECONDS}"
             )
         base_spec = type(self).spec if spec is None else spec
         schema = base_spec.input_schema

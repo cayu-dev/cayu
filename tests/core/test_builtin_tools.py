@@ -3929,9 +3929,7 @@ def test_exec_command_tool_applies_configured_default_timeout(tmp_path):
     ctx = ToolContext(session_id="sess_1", runner=runner)
     tool = ExecCommandTool(default_timeout_seconds=420)
 
-    result = asyncio.run(
-        tool.run(ctx, {"argv": [sys.executable, "-c", "print('ok')"]})
-    )
+    result = asyncio.run(tool.run(ctx, {"argv": [sys.executable, "-c", "print('ok')"]}))
     assert result.is_error is False
     assert runner.timeout_s == 420
     assert tool.schema["properties"]["timeout_s"]["default"] == 420
@@ -3953,9 +3951,10 @@ def test_exec_command_tool_rejects_invalid_configured_default_timeout(value):
 
 
 def test_exec_command_tool_default_timeout_is_execution_profile_material():
-    assert ExecCommandTool()._execution_profile_material() != ExecCommandTool(
-        default_timeout_seconds=600
-    )._execution_profile_material()
+    assert (
+        ExecCommandTool()._execution_profile_material()
+        != ExecCommandTool(default_timeout_seconds=600)._execution_profile_material()
+    )
 
 
 def test_exec_command_tool_reports_timeout_and_cancellation():
