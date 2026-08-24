@@ -1198,7 +1198,7 @@ async def test_sqlite_store_materializes_distinct_trials_concurrently(tmp_path) 
 
     assert len({item.fingerprint for item in materializations}) == 10
     assert len({item.state_scope_id for item in materializations}) == 10
-    with store._connect() as connection:
+    with store._connection() as connection:
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 30_000
 
 
