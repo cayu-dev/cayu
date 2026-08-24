@@ -500,12 +500,12 @@ def test_remember_knowledge_timeout_returns_while_owned_publication_finishes() -
         assert knowledge_store.dispatched.is_set()
         assert knowledge_store.settled.is_set() is False
         assert knowledge_store.publish_calls == 1
-        assert len(tool._owned_publications) == 1
+        assert len(tool._publication_owner) == 1
         knowledge_store.release.set()
         await asyncio.wait_for(knowledge_store.settled.wait(), timeout=2)
 
         async def wait_for_owner_release() -> None:
-            while tool._owned_publications:
+            while tool._publication_owner:
                 await asyncio.sleep(0)
 
         await asyncio.wait_for(wait_for_owner_release(), timeout=2)
@@ -570,12 +570,12 @@ def test_remember_knowledge_operator_interrupt_returns_while_publication_finishe
         run_events = await asyncio.wait_for(run_task, timeout=1)
         assert knowledge_store.settled.is_set() is False
         assert knowledge_store.publish_calls == 1
-        assert len(tool._owned_publications) == 1
+        assert len(tool._publication_owner) == 1
         knowledge_store.release.set()
         await asyncio.wait_for(knowledge_store.settled.wait(), timeout=2)
 
         async def wait_for_owner_release() -> None:
-            while tool._owned_publications:
+            while tool._publication_owner:
                 await asyncio.sleep(0)
 
         await asyncio.wait_for(wait_for_owner_release(), timeout=2)
@@ -589,6 +589,120 @@ def test_remember_knowledge_operator_interrupt_returns_while_publication_finishe
     assert any(event.type is EventType.SESSION_INTERRUPTED for event in run_events)
     assert [event.type for event in interrupt_events] == [EventType.SESSION_INTERRUPTED]
     assert receipt is not None
+
+
+def test_app_shutdown_seals_and_bounds_registered_knowledge_publications() -> None:
+    class ShutdownStalledStore(_StalledKnowledgePublicationStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stopped = asyncio.Event()
+            self.receipt_reads = 0
+
+        async def load_entry_publication_receipt(self, operation_id):
+            self.receipt_reads += 1
+            return await super().load_entry_publication_receipt(operation_id)
+
+        async def publish_entry_revision(
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+        ):
+            try:
+                return await super().publish_entry_revision(
+                    entry,
+                    chunks,
+                    operation_id=operation_id,
+                    expected_revision=expected_revision,
+                )
+            finally:
+                self.stopped.set()
+
+    async def run():
+        store = ShutdownStalledStore()
+        tool = RememberKnowledgeTool()
+        app = CayuApp(enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[tool],
+        )
+        context = ToolContext(
+            session_id="shutdown-publication",
+            idempotency_key="shutdown-publication-operation",
+            knowledge_store=store,
+        )
+        invocation = asyncio.create_task(tool.run(context, {"text": "Retained knowledge."}))
+        await asyncio.wait_for(store.dispatched.wait(), timeout=1)
+        invocation.cancel("caller left")
+        with pytest.raises(asyncio.CancelledError, match="caller left"):
+            await invocation
+
+        first_close = asyncio.create_task(app.drain_knowledge_publications(timeout_s=0.01))
+        await asyncio.sleep(0)
+        second_close = asyncio.create_task(app.drain_knowledge_publications(timeout_s=1))
+        first_result, second_result = await asyncio.gather(first_close, second_close)
+        await asyncio.wait_for(store.stopped.wait(), timeout=1)
+        while tool._publication_owner:
+            await asyncio.sleep(0)
+
+        receipt_reads_before_rejection = store.receipt_reads
+        rejected = await tool.run(
+            context.model_copy(update={"idempotency_key": "post-shutdown-operation"}),
+            {"text": "New knowledge after shutdown."},
+        )
+        late_tool = RememberKnowledgeTool()
+        app.register_agent(
+            AgentSpec(name="late-agent", model="fake-model"),
+            tools=[late_tool],
+        )
+        late_rejected = await late_tool.run(
+            context.model_copy(update={"idempotency_key": "late-registration-operation"}),
+            {"text": "Late registered knowledge."},
+        )
+        return (
+            first_result,
+            second_result,
+            rejected,
+            late_rejected,
+            store.publish_calls,
+            receipt_reads_before_rejection,
+            store.receipt_reads,
+        )
+
+    (
+        first_result,
+        second_result,
+        rejected,
+        late_rejected,
+        publish_calls,
+        receipt_reads_before_rejection,
+        receipt_reads,
+    ) = asyncio.run(run())
+
+    assert first_result is False
+    assert second_result is False
+    assert rejected.is_error is True
+    assert rejected.structured["outcome"] == "publication_owner_closed"
+    assert late_rejected.is_error is True
+    assert late_rejected.structured["outcome"] == "publication_owner_closed"
+    assert publish_calls == 1
+    assert receipt_reads == receipt_reads_before_rejection
+
+
+def test_failed_registration_after_shutdown_does_not_seal_an_unregistered_tool() -> None:
+    app = CayuApp(enable_logging=False)
+    app.seal_knowledge_publications()
+    tool = RememberKnowledgeTool()
+
+    with pytest.raises(ValueError, match="Duplicate tool registered for agent"):
+        app.register_agent(
+            AgentSpec(name="rejected-agent", model="fake-model"),
+            tools=[tool, tool],
+        )
+
+    assert tool._publication_owner.sealed is False
 
 
 @pytest.mark.parametrize("read_phase", ["receipt", "entry"])

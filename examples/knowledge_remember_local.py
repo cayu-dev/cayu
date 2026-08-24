@@ -33,20 +33,21 @@ async def main() -> None:
         knowledge_store=store,
     )
 
-    pending_write = await RememberKnowledgeTool(
+    async with RememberKnowledgeTool(
         policy=RememberKnowledgePolicy(
             default_namespace="project:cayu",
             require_labels={"project": "cayu", "tenant": "trusted"},
         )
-    ).run(
-        ctx,
-        {
-            "text": "Remote sandbox Git pushes should use a brokered credential proxy.",
-            "title": "Remote sandbox Git credentials",
-            "kind": "procedure",
-            "aspects": ["git", "credentials"],
-        },
-    )
+    ) as remember:
+        pending_write = await remember.run(
+            ctx,
+            {
+                "text": "Remote sandbox Git pushes should use a brokered credential proxy.",
+                "title": "Remote sandbox Git credentials",
+                "kind": "procedure",
+                "aspects": ["git", "credentials"],
+            },
+        )
     print_json("pending_write", _write_summary(pending_write.structured))
 
     normal_search = await SearchKnowledgeTool().run(
@@ -82,22 +83,23 @@ async def main() -> None:
     )
     print_json("normal_tool_search_after_review", _tool_hit_ids(approved_search.structured))
 
-    active_write = await RememberKnowledgeTool(
+    async with RememberKnowledgeTool(
         policy=RememberKnowledgePolicy(
             default_status=KnowledgeStatus.ACTIVE,
             allow_active_writes=True,
             default_namespace="project:cayu",
             require_labels={"project": "cayu", "tenant": "trusted"},
         )
-    ).run(
-        ctx,
-        {
-            "text": "Invoice refunds require approval and audit logging before payment.",
-            "title": "Invoice refund approvals",
-            "kind": "procedure",
-            "aspects": ["invoices", "approvals"],
-        },
-    )
+    ) as remember:
+        active_write = await remember.run(
+            ctx,
+            {
+                "text": "Invoice refunds require approval and audit logging before payment.",
+                "title": "Invoice refund approvals",
+                "kind": "procedure",
+                "aspects": ["invoices", "approvals"],
+            },
+        )
     print_json("active_write", _write_summary(active_write.structured))
 
     active_search = await SearchKnowledgeTool().run(

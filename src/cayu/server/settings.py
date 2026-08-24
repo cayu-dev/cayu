@@ -45,6 +45,7 @@ from cayu.server.config import (
     DEFAULT_DASHBOARD_PATH,
     DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS,
     DEFAULT_INTERRUPTION_SHUTDOWN_GRACE_SECONDS,
+    DEFAULT_KNOWLEDGE_PUBLICATION_SHUTDOWN_GRACE_SECONDS,
     DEFAULT_RECOVERY_INACTIVE_AFTER_SECONDS,
     DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS,
     DEFAULT_SERVER_DEPLOYMENT_NAME,
@@ -216,6 +217,9 @@ class ServerLifecycleSettings(BaseModel):
         DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS
     )
     interruption_shutdown_grace_seconds: float = DEFAULT_INTERRUPTION_SHUTDOWN_GRACE_SECONDS
+    knowledge_publication_shutdown_grace_seconds: float = (
+        DEFAULT_KNOWLEDGE_PUBLICATION_SHUTDOWN_GRACE_SECONDS
+    )
 
 
 class _ServerSettingsSource(PydanticBaseSettingsSource):
@@ -738,6 +742,9 @@ class ServerSettings(BaseSettings):
                 ),
                 interruption_shutdown_grace_seconds=(
                     self.lifecycle.interruption_shutdown_grace_seconds
+                ),
+                knowledge_publication_shutdown_grace_seconds=(
+                    self.lifecycle.knowledge_publication_shutdown_grace_seconds
                 ),
             ),
             evaluation_promotion=self.evaluation_promotion,

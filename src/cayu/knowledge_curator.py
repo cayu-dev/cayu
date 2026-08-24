@@ -31,6 +31,12 @@ from pydantic import (
 )
 
 from cayu._clock import utc_clock
+from cayu._knowledge_publication_owner import (
+    KnowledgePublicationCapacityExhausted,
+    KnowledgePublicationOperationConflict,
+    KnowledgePublicationOwnerClosed,
+    RetainedKnowledgePublicationOwner,
+)
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
@@ -1031,12 +1037,6 @@ class _EvaluationState(_CuratorModel):
 
 
 @dataclass(frozen=True)
-class _OwnedPublication:
-    proposal_fingerprint: str
-    task: asyncio.Task[KnowledgePublicationReceipt]
-
-
-@dataclass(frozen=True)
 class _PublicationExpectation:
     operation_id: str
     entry_id: str
@@ -1099,11 +1099,24 @@ class KnowledgeCurator:
         _validate_curator_access_scope(self._config, self._access_scope)
         self._clock = utc_clock(clock)
         self._evaluator_semaphore = asyncio.Semaphore(self._config.max_evaluator_concurrency)
-        self._owned_publications: dict[str, _OwnedPublication] = {}
+        self._publication_owner = RetainedKnowledgePublicationOwner[KnowledgePublicationReceipt](
+            max_publications=self._config.max_in_flight_publications
+        )
 
     @property
     def config(self) -> KnowledgeCuratorConfig:
         return KnowledgeCuratorConfig.model_validate(self._config.model_dump(mode="python"))
+
+    async def aclose(self, *, timeout_s: float = 10.0) -> bool:
+        """Seal and drain publications retained beyond their curation callers."""
+
+        return await self._publication_owner.aclose(timeout_s=timeout_s)
+
+    async def __aenter__(self) -> KnowledgeCurator:
+        return self
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        await self.aclose()
 
     async def curate(self, batch: LearningBatch) -> LearningBatchResult:
         """Generate, independently evaluate, and persist pending knowledge."""
@@ -1655,6 +1668,13 @@ class KnowledgeCurator:
                 code="publication_capacity_exhausted",
                 decision=decision,
             )
+        except KnowledgePublicationOwnerClosed:
+            return _candidate_result(
+                candidate,
+                outcome=LearningCandidateOutcome.FAILED,
+                code="publication_owner_closed",
+                decision=decision,
+            )
         except (KnowledgePublicationConflict, KnowledgeRevisionConflict):
             return await self._reconcile_after_publication_error(
                 candidate,
@@ -1707,49 +1727,27 @@ class KnowledgeCurator:
         chunks: list[KnowledgeChunk],
         evidence: list[KnowledgeEvidence],
     ) -> KnowledgePublicationReceipt:
-        owned = self._owned_publications.get(operation_id)
-        joined = owned is not None
-        if owned is not None and owned.proposal_fingerprint != proposal_fingerprint:
-            raise KnowledgePublicationConflict("in_flight_operation_mismatch")
-        if owned is None:
-            if len(self._owned_publications) >= self._config.max_in_flight_publications:
-                raise _PublicationCapacityExhausted
-            task = asyncio.create_task(
-                self._store.publish_entry_revision(
+        try:
+            publication = await self._publication_owner.run(
+                operation_id,
+                proposal_fingerprint,
+                lambda: self._store.publish_entry_revision(
                     entry,
                     chunks,
                     evidence=evidence,
                     access_scope=self._access_scope,
                     operation_id=operation_id,
                     expected_revision=None,
-                )
+                ),
             )
-            owned = _OwnedPublication(
-                proposal_fingerprint=proposal_fingerprint,
-                task=task,
-            )
-            self._owned_publications[operation_id] = owned
-            task.add_done_callback(
-                lambda completed, operation_id=operation_id, owned=owned: (
-                    self._release_owned_publication(operation_id, owned, completed)
-                )
-            )
-        receipt = await asyncio.shield(owned.task)
-        copied = _copy_publication_receipt(receipt)
-        if joined and not copied.replayed:
+        except KnowledgePublicationCapacityExhausted:
+            raise _PublicationCapacityExhausted from None
+        except KnowledgePublicationOperationConflict:
+            raise KnowledgePublicationConflict("in_flight_operation_mismatch") from None
+        copied = _copy_publication_receipt(publication.value)
+        if publication.joined and not copied.replayed:
             copied = copied.model_copy(update={"replayed": True})
         return copied
-
-    def _release_owned_publication(
-        self,
-        operation_id: str,
-        owned: _OwnedPublication,
-        completed: asyncio.Task[KnowledgePublicationReceipt],
-    ) -> None:
-        if self._owned_publications.get(operation_id) is owned:
-            self._owned_publications.pop(operation_id, None)
-        if not completed.cancelled():
-            completed.exception()
 
     async def _reconcile_after_publication_error(
         self,

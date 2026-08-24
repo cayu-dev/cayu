@@ -10,6 +10,13 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._exception_groups import exception_group_children
+from cayu._knowledge_publication_owner import (
+    KnowledgePublicationCapacityExhausted,
+    KnowledgePublicationLifecycle,
+    KnowledgePublicationOperationConflict,
+    KnowledgePublicationOwnerClosed,
+    RetainedKnowledgePublicationOwner,
+)
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_json_value,
@@ -111,6 +118,71 @@ _REMEMBER_KNOWLEDGE_STORE_METHODS = (
     "publish_entry_revision",
     "load_entry_publication_receipt",
 )
+
+
+class _RememberKnowledgePublicationLifecycle:
+    """Close publication ownership and its retained reconciliation reads together."""
+
+    def __init__(
+        self,
+        publication_owner: RetainedKnowledgePublicationOwner[ToolResult],
+        read_operations: BoundedInvocationOperationRegistry,
+    ) -> None:
+        self._publication_owner = publication_owner
+        self._read_operations = read_operations
+        self._close_task: asyncio.Task[bool] | None = None
+        self._close_result: bool | None = None
+
+    def seal(self) -> None:
+        """Stop new writes while allowing already-owned receipt work during grace."""
+
+        self._publication_owner.seal()
+
+    async def aclose(self, *, timeout_s: float = 10.0) -> bool:
+        """Drain publications and reconciliation reads under one shared deadline."""
+
+        timeout = _remember_lifecycle_timeout(timeout_s)
+        self.seal()
+        if self._close_result is not None:
+            return self._close_result
+        close_task = self._close_task
+        if close_task is None:
+            close_task = asyncio.create_task(self._close_started(timeout))
+            close_task.add_done_callback(_observe_remember_lifecycle_close)
+            self._close_task = close_task
+        return await asyncio.shield(close_task)
+
+    async def _close_started(self, timeout_s: float) -> bool:
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        drained = False
+        try:
+            try:
+                publication_drained = await self._publication_owner.aclose(timeout_s=timeout_s)
+            finally:
+                remaining = max(deadline - asyncio.get_running_loop().time(), 0.0)
+                reads_drained = await self._read_operations.aclose(timeout_s=remaining)
+            drained = publication_drained and reads_drained
+            return drained
+        finally:
+            self._close_result = drained
+
+
+def _observe_remember_lifecycle_close(task: asyncio.Task[bool]) -> None:
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except BaseException:
+        return
+
+
+def _remember_lifecycle_timeout(value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
+        raise ValueError("timeout_s must be a finite positive number.")
+    timeout = require_finite(float(value), "timeout_s")
+    if timeout <= 0:
+        raise ValueError("timeout_s must be a finite positive number.")
+    return timeout
 
 
 class RememberKnowledgePolicy(BaseModel):
@@ -613,12 +685,20 @@ class RememberKnowledgeTool(Tool):
         # caller timeout/cancellation can finish without abandoning ownership,
         # and so an identical retry joins the original mutation instead of
         # dispatching a competing write.
-        self._owned_publications: dict[str, _OwnedKnowledgePublication] = {}
+        self._publication_owner = RetainedKnowledgePublicationOwner[ToolResult](
+            max_publications=MAX_RETAINED_REMEMBER_KNOWLEDGE_PUBLICATIONS
+        )
         # Read-only receipt and entry lookups may be abandoned after authentic
         # caller cancellation even when an opaque adapter ignores cancellation.
         # Retain every dispatched lookup in a bounded registry until it settles.
         self._read_operations = BoundedInvocationOperationRegistry(
             max_operations=MAX_RETAINED_REMEMBER_KNOWLEDGE_READS
+        )
+        self._knowledge_publication_lifecycle: KnowledgePublicationLifecycle = (
+            _RememberKnowledgePublicationLifecycle(
+                self._publication_owner,
+                self._read_operations,
+            )
         )
 
     @property
@@ -666,14 +746,23 @@ class RememberKnowledgeTool(Tool):
                 chunk_target_bytes=self._chunk_target_bytes,
                 max_chunks=self._max_chunks,
             )
-        owned = self._owned_publications.get(operation_id)
-        if owned is not None:
-            if owned.intent_sha256 != intent_sha256:
-                return _knowledge_write_failed_result(
-                    entry_id=None,
-                    outcome="operation_conflict",
-                )
-            return await asyncio.shield(owned.task)
+        try:
+            joined = await self._publication_owner.join_existing(
+                operation_id,
+                intent_sha256,
+            )
+        except KnowledgePublicationOperationConflict:
+            return _knowledge_write_failed_result(
+                entry_id=None,
+                outcome="operation_conflict",
+            )
+        except KnowledgePublicationOwnerClosed:
+            return _knowledge_write_failed_result(
+                entry_id=None,
+                outcome="publication_owner_closed",
+            )
+        if joined is not None:
+            return joined.value
         if not _remember_store_supports_owned_publication(store):
             return _knowledge_write_failed_result(
                 entry_id=None,
@@ -820,20 +909,11 @@ class RememberKnowledgeTool(Tool):
         required_labels: dict[str, str],
         intent_sha256: str,
     ) -> ToolResult:
-        owned = self._owned_publications.get(operation_id)
-        if owned is not None and owned.intent_sha256 != intent_sha256:
-            return _knowledge_write_failed_result(
-                entry_id=None,
-                outcome="operation_conflict",
-            )
-        if owned is None:
-            if len(self._owned_publications) >= MAX_RETAINED_REMEMBER_KNOWLEDGE_PUBLICATIONS:
-                return _knowledge_write_failed_result(
-                    entry_id=None,
-                    outcome="publication_capacity_exhausted",
-                )
-            task = asyncio.create_task(
-                _remember_publish_owned(
+        try:
+            publication = await self._publication_owner.run(
+                operation_id,
+                intent_sha256,
+                lambda: _remember_publish_owned(
                     store,
                     result=result,
                     operation_id=operation_id,
@@ -843,51 +923,40 @@ class RememberKnowledgeTool(Tool):
                     visibility=visibility,
                     required_labels=required_labels,
                     operation_registry=self._read_operations,
-                )
+                ),
             )
-            owned = _OwnedKnowledgePublication(
-                intent_sha256=intent_sha256,
-                task=task,
+        except KnowledgePublicationOperationConflict:
+            return _knowledge_write_failed_result(
+                entry_id=None,
+                outcome="operation_conflict",
             )
-            self._owned_publications[operation_id] = owned
-            task.add_done_callback(
-                lambda completed, operation_id=operation_id, owned=owned: (
-                    self._release_owned_publication(
-                        operation_id,
-                        owned,
-                        completed,
-                    )
-                )
+        except KnowledgePublicationCapacityExhausted:
+            return _knowledge_write_failed_result(
+                entry_id=None,
+                outcome="publication_capacity_exhausted",
             )
-        # Shield only the retained task. The invoking task remains normally
-        # cancellable, while the exact store operation keeps one owner until it
-        # settles and consumes its result through the completion callback.
-        return await asyncio.shield(owned.task)
+        except KnowledgePublicationOwnerClosed:
+            return _knowledge_write_failed_result(
+                entry_id=None,
+                outcome="publication_owner_closed",
+            )
+        return publication.value
 
-    def _release_owned_publication(
-        self,
-        operation_id: str,
-        owned: _OwnedKnowledgePublication,
-        completed: asyncio.Task[ToolResult],
-    ) -> None:
-        if self._owned_publications.get(operation_id) is owned:
-            self._owned_publications.pop(operation_id, None)
-        # An invocation may have timed out or been cancelled. Always observe a
-        # detached task's terminal state so extension failures do not become
-        # unhandled event-loop diagnostics.
-        if not completed.cancelled():
-            completed.exception()
+    async def aclose(self, *, timeout_s: float = 10.0) -> bool:
+        """Seal and drain publications retained beyond their invoking callers."""
+
+        return await self._knowledge_publication_lifecycle.aclose(timeout_s=timeout_s)
+
+    async def __aenter__(self) -> RememberKnowledgeTool:
+        return self
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        await self.aclose()
 
     def _validate_kind(self, kind: str, *, policy: RememberKnowledgePolicy) -> None:
         if policy.allowed_kinds is not None and kind not in policy.allowed_kinds:
             allowed = ", ".join(policy.allowed_kinds)
             raise ValueError(f"`kind` must be one of: {allowed}.")
-
-
-@dataclass(frozen=True)
-class _OwnedKnowledgePublication:
-    intent_sha256: str
-    task: asyncio.Task[ToolResult]
 
 
 @dataclass(frozen=True)
@@ -1114,7 +1183,11 @@ async def _remember_publish_owned(
 
     pending = await_invocation_operation(
         operation_factory,
-        request_child_cancellation=False,
+        # Invoking callers only await the outer retained publication through a
+        # shield. Cancellation reaching this owner is therefore lifecycle
+        # shutdown, where its exact extension child must receive the same stop
+        # request so cooperative adapters cannot outlive the event loop.
+        request_child_cancellation=True,
     )
     del operation_factory
     outcome = await pending
@@ -1123,15 +1196,12 @@ async def _remember_publish_owned(
     if uncontainable_failure is not None:
         raise uncontainable_failure
     if outcome.cancellation is not None:
-        settled, cancellation = await _remember_confirm_owned_publication_after_cancellation(
-            store,
-            result=result,
-            operation_id=operation_id,
-            cancellation=outcome.cancellation,
-            operation_registry=operation_registry,
-        )
-        cause = _remember_cancellation_cause(outcome.error, settled=settled)
-        raise cancellation from cause
+        # Invoking callers cannot cancel this retained owner through its shield.
+        # Cancellation here is lifecycle shutdown: do not dispatch fresh reads
+        # after the event loop has begun cancelling its task snapshot. A later
+        # process reconciles any remote commit through the durable receipt.
+        cause = _remember_cancellation_cause(outcome.error, settled=False)
+        raise outcome.cancellation from cause
 
     failure = (
         RuntimeError("Knowledge publication reported multiple failures.")
@@ -1201,18 +1271,11 @@ async def _remember_publish_owned(
                 if confirmed:
                     result = reconciled_result
     except asyncio.CancelledError as cancellation:
-        (
-            settled,
-            retained_cancellation,
-        ) = await _remember_confirm_owned_publication_after_cancellation(
-            store,
-            result=result,
-            operation_id=operation_id,
-            cancellation=cancellation,
-            operation_registry=operation_registry,
-        )
-        cause = _remember_cancellation_cause(failure, settled=settled)
-        raise retained_cancellation from cause
+        # This task is the retained owner, so only lifecycle shutdown can
+        # cancel it. Leave acknowledgement-loss reconciliation to the durable
+        # operation identity instead of starting another shutdown-time read.
+        cause = _remember_cancellation_cause(failure, settled=False)
+        raise cancellation from cause
     if confirmed:
         replayed_publication = (returned_receipt is not None and returned_receipt.replayed) or (
             failure_is_conflict and conflict_reason == "operation_mismatch"
@@ -1339,83 +1402,6 @@ async def _remember_observe_owned_publication(
         raise
     except Exception:
         return _RememberPublicationObservation(receipt_present=True)
-
-
-async def _remember_confirm_owned_publication_after_cancellation(
-    store: Any,
-    *,
-    result: Any,
-    operation_id: str,
-    cancellation: asyncio.CancelledError,
-    operation_registry: BoundedInvocationOperationRegistry,
-) -> tuple[bool, asyncio.CancelledError]:
-    """Finish receipt reconciliation while retaining the first caller signal."""
-
-    def operation_factory(
-        store: Any = store,
-        result: Any = result,
-        operation_id: str = operation_id,
-    ):
-        return _remember_reconcile_owned_publication(
-            store,
-            result=result,
-            operation_id=operation_id,
-            operation_registry=operation_registry,
-        )
-
-    pending = await_invocation_operation(
-        operation_factory,
-        request_child_cancellation=False,
-        cancellation=cancellation,
-    )
-    del operation_factory
-    outcome = await pending
-    del pending
-    uncontainable_failure = _remember_uncontainable_store_failure(outcome.error)
-    if uncontainable_failure is not None:
-        raise uncontainable_failure
-    retained_cancellation = outcome.cancellation or cancellation
-    if outcome.error is not None or type(outcome.result) is not bool:
-        return False, retained_cancellation
-    return outcome.result, retained_cancellation
-
-
-async def _remember_reconcile_owned_publication(
-    store: Any,
-    *,
-    result: Any,
-    operation_id: str,
-    operation_registry: BoundedInvocationOperationRegistry,
-) -> bool:
-    """Confirm current or receipt-reconstructed publication authority."""
-
-    if await _remember_confirm_owned_publication(
-        store,
-        result=result,
-        operation_id=operation_id,
-        operation_registry=operation_registry,
-    ):
-        return True
-    try:
-        durable_receipt = await _remember_load_publication_receipt(
-            store,
-            operation_id,
-            operation_registry=operation_registry,
-        )
-        if durable_receipt is None:
-            return False
-        reconciled_result = _remember_result_with_receipt_identity(result, durable_receipt)
-        return await _remember_confirm_owned_publication(
-            store,
-            result=reconciled_result,
-            operation_id=operation_id,
-            receipt=durable_receipt,
-            operation_registry=operation_registry,
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        return False
 
 
 def _remember_uncontainable_store_failure(

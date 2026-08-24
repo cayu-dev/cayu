@@ -326,6 +326,7 @@ def test_cors_and_lifecycle_configuration_are_finite_and_immutable() -> None:
             recovery_inactive_after_seconds=20,
             event_side_effect_startup_timeout_seconds=4,
             interruption_shutdown_grace_seconds=3,
+            knowledge_publication_shutdown_grace_seconds=2,
         ),
     )
 
@@ -333,6 +334,7 @@ def test_cors_and_lifecycle_configuration_are_finite_and_immutable() -> None:
     assert config.cors.allow_methods == ("GET", "POST")
     assert config.safe_summary()["cors"]["allow_methods"] == ["GET", "POST"]
     assert config.lifecycle.startup_recovery_statuses == frozenset({SessionStatus.INTERRUPTING})
+    assert config.safe_summary()["lifecycle"]["knowledge_publication_shutdown_grace_seconds"] == 2
     with pytest.raises(ValidationError, match="finite positive"):
         ServerLifecycleConfig(replay_idle_timeout_s=float("inf"))
     with pytest.raises(ValidationError, match="non-negative integer"):

@@ -700,6 +700,136 @@ def test_remember_knowledge_reconciles_acknowledgement_loss_without_exposing_err
     assert receipt is not None
 
 
+def test_remember_knowledge_next_owner_reconciles_commit_cut_off_by_shutdown() -> None:
+    class CommitThenStallStore(_TestKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.committed = asyncio.Event()
+            self.stopped = asyncio.Event()
+            self.publish_calls = 0
+
+        async def publish_entry_revision(
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+        ):
+            self.publish_calls += 1
+            receipt = await super().publish_entry_revision(
+                entry,
+                chunks,
+                operation_id=operation_id,
+                expected_revision=expected_revision,
+            )
+            self.committed.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.stopped.set()
+            return receipt
+
+    async def run():
+        store = CommitThenStallStore()
+        context = ToolContext(
+            session_id="session_1",
+            idempotency_key="shutdown-acknowledgement-loss",
+            knowledge_store=store,
+        )
+        arguments = {"text": "Reconcile a commit after its owner shuts down."}
+        first_owner = RememberKnowledgeTool()
+        invocation = asyncio.create_task(first_owner.run(context, arguments))
+        await asyncio.wait_for(store.committed.wait(), timeout=1)
+        invocation.cancel("caller left after commit")
+        with pytest.raises(asyncio.CancelledError, match="caller left after commit"):
+            await invocation
+        assert await first_owner.aclose(timeout_s=0.01) is False
+        await asyncio.wait_for(store.stopped.wait(), timeout=1)
+
+        replay = await RememberKnowledgeTool().run(context, arguments)
+        receipt = await store.load_entry_publication_receipt("shutdown-acknowledgement-loss")
+        return replay, receipt, store.publish_calls
+
+    replay, receipt, publish_calls = asyncio.run(run())
+
+    assert replay.is_error is False
+    assert replay.structured["written"] is False
+    assert replay.structured["publication_replayed"] is True
+    assert receipt is not None
+    assert publish_calls == 1
+
+
+def test_remember_knowledge_close_caller_cancellation_preserves_complete_drain() -> None:
+    class CommitThenPauseReceiptStore(_TestKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.publication_returned = False
+            self.read_started = asyncio.Event()
+            self.read_release = asyncio.Event()
+            self.read_stopped = asyncio.Event()
+
+        async def publish_entry_revision(
+            self,
+            entry,
+            chunks,
+            *,
+            operation_id,
+            expected_revision=None,
+        ):
+            receipt = await super().publish_entry_revision(
+                entry,
+                chunks,
+                operation_id=operation_id,
+                expected_revision=expected_revision,
+            )
+            self.publication_returned = True
+            return receipt
+
+        async def load_entry_publication_receipt(self, operation_id):
+            if self.publication_returned:
+                self.read_started.set()
+                try:
+                    await self.read_release.wait()
+                finally:
+                    self.read_stopped.set()
+            return await super().load_entry_publication_receipt(operation_id)
+
+    async def run() -> tuple[bool, int]:
+        store = CommitThenPauseReceiptStore()
+        tool = RememberKnowledgeTool()
+        invocation = asyncio.create_task(
+            tool.run(
+                ToolContext(
+                    session_id="session_1",
+                    idempotency_key="cancelled-close-caller",
+                    knowledge_store=store,
+                ),
+                {"text": "A cancelled close caller must not cancel shared shutdown."},
+            )
+        )
+        await asyncio.wait_for(store.read_started.wait(), timeout=1)
+        invocation.cancel("caller left after commit")
+        with pytest.raises(asyncio.CancelledError, match="caller left after commit"):
+            await invocation
+
+        close_caller = asyncio.create_task(tool.aclose(timeout_s=1))
+        await asyncio.sleep(0)
+        close_caller.cancel("shutdown caller left")
+        with pytest.raises(asyncio.CancelledError, match="shutdown caller left"):
+            await close_caller
+
+        store.read_release.set()
+        drained = await tool.aclose(timeout_s=0.01)
+        await asyncio.wait_for(store.read_stopped.wait(), timeout=1)
+        return drained, len(tool._read_operations)
+
+    drained, remaining_reads = asyncio.run(run())
+
+    assert drained is True
+    assert remaining_reads == 0
+
+
 def test_remember_knowledge_never_dispatches_legacy_upsert_over_competing_winner() -> None:
     async def run():
         text = "Concurrent publication must survive unsupported legacy writes."

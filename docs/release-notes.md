@@ -108,6 +108,11 @@ optimizer, paired report, or Compound dependency.
   per-candidate outcomes, deterministic cross-process retries, exact evidence,
   cancellation-safe owned publication, and the existing review workflow keep proposals
   auditable and unavailable to normal recall until approval.
+- Added one bounded retained-publication lifecycle shared by `RememberKnowledgeTool` and
+  `KnowledgeCurator`. Direct SDK components can now seal and drain with `aclose()`, while
+  `CayuApp` and server shutdown automatically seal registered knowledge writers and apply
+  a dedicated publication grace period before leaving durable receipt reconciliation to
+  the next process.
 
 ### Controlled scenarios run end to end from the Control Plane
 

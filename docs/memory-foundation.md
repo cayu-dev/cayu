@@ -452,7 +452,7 @@ cancellation are bounded separately. Timeouts, chunk sizes, and chunk counts are
 explicit configuration rather than unbounded component behavior.
 
 ```python
-curator = KnowledgeCurator(
+async with KnowledgeCurator(
     knowledge_store,
     candidate_generator=my_generator,
     evaluator=my_evaluator,
@@ -462,8 +462,8 @@ curator = KnowledgeCurator(
         namespace="acme",
         labels={"tenant": "acme"},
     ),
-)
-result = await curator.curate(LearningBatch(id="build-42", signals=(signal,)))
+) as curator:
+    result = await curator.curate(LearningBatch(id="build-42", signals=(signal,)))
 
 reviewer = KnowledgeReviewWorkflow(
     knowledge_store,
@@ -473,6 +473,23 @@ reviewer = KnowledgeReviewWorkflow(
 pending = await reviewer.list_pending()
 approved = await reviewer.approve(pending.entries[0].entry.id)
 ```
+
+`KnowledgeCurator` and `RememberKnowledgeTool` share the same bounded retained-publication
+lifecycle. Caller timeout or cancellation leaves the exact dispatched publication owned so an
+in-process retry joins it rather than racing a second write. Directly constructed components
+should be used as async context managers or closed with `await component.aclose(timeout_s=...)`.
+A `CayuApp` owns this lifecycle for registered tools; server shutdown seals publication before
+draining it for `knowledge_publication_shutdown_grace_seconds`. The same deadline covers
+receipt-reconciliation reads already retained by a publication, so a mounted Cayu application
+does not leave cooperative store tasks behind in a host event loop that remains alive.
+
+Grace expiry requests cancellation from the local store awaiter but does not claim that a remote
+transaction failed or was rolled back. A later process uses the same operation ID and durable
+publication receipt to reconcile a commit whose acknowledgement was lost. Custom in-process store
+adapters must let lifecycle cancellation unwind their local coroutine and must not perform
+unbounded blocking work on the event-loop/default-executor shutdown path. Python cannot forcibly
+stop arbitrary extension code that suppresses every cancellation; deployments still need their
+normal process-supervisor hard shutdown deadline for a broken adapter.
 
 The existing `remember_knowledge` tool remains the explicit foreground write primitive
 for an agent or application. The curator is a higher-level evidence-to-proposal workflow;

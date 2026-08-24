@@ -22,6 +22,7 @@ from cayu._exception_groups import (
     exception_tree_contains,
     set_exception_cause,
 )
+from cayu._knowledge_publication_owner import KnowledgePublicationLifecycle
 from cayu._task_wait import capture_awaitable_outcome, unexpected_child_cancellation_error
 from cayu._validation import (
     copy_json_value,
@@ -1052,6 +1053,7 @@ class CayuApp:
             clock=self._clock,
         )
         self._agents: dict[str, runtime_records.RegisteredAgentState] = {}
+        self._knowledge_publications_sealed = False
         self._fork_group_evaluator_agents: dict[str, str] = {}
         self._providers: dict[str, runtime_records.RegisteredProvider] = {}
         self._environments: dict[str, runtime_records.RegisteredEnvironment] = {}
@@ -1687,6 +1689,48 @@ class CayuApp:
         )
         return retained_drained and parked_drained
 
+    def seal_knowledge_publications(self) -> None:
+        """Reject new retained knowledge writes before application shutdown drains."""
+
+        self._knowledge_publications_sealed = True
+        for lifecycle in self._registered_knowledge_publication_lifecycles():
+            lifecycle.seal()
+
+    async def drain_knowledge_publications(self, *, timeout_s: float = 10.0) -> bool:
+        """Seal and concurrently drain publications owned by registered tools."""
+
+        if type(timeout_s) not in {int, float} or not isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("timeout_s must be a finite positive number.")
+        self.seal_knowledge_publications()
+        lifecycles = self._registered_knowledge_publication_lifecycles()
+        if not lifecycles:
+            return True
+        results = await asyncio.gather(
+            *(lifecycle.aclose(timeout_s=float(timeout_s)) for lifecycle in lifecycles)
+        )
+        return all(results)
+
+    def _registered_knowledge_publication_lifecycles(
+        self,
+    ) -> tuple[KnowledgePublicationLifecycle, ...]:
+        lifecycles: list[KnowledgePublicationLifecycle] = []
+        seen: set[int] = set()
+        for agent in self._agents.values():
+            for registered in agent.tools.values():
+                lifecycle = getattr(
+                    registered.tool,
+                    "_knowledge_publication_lifecycle",
+                    None,
+                )
+                if not isinstance(lifecycle, KnowledgePublicationLifecycle):
+                    continue
+                identity = id(lifecycle)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                lifecycles.append(lifecycle)
+        return tuple(lifecycles)
+
     async def discard_parked_egress_allocations(
         self,
         session_id: str,
@@ -1889,7 +1933,7 @@ class CayuApp:
         # Keep one frozen exposure graph for registration/profile admission and
         # the expose-all snapshot; the catalogue remains its canonical source.
         tool_capabilities = all_registered_tool_exposure.tools
-        self._agents[stored_spec.name] = runtime_records.RegisteredAgentState(
+        registered_agent = runtime_records.RegisteredAgentState(
             spec=stored_spec,
             tools=MappingProxyType(tools_by_name),
             tool_catalogue=tool_catalogue,
@@ -1952,6 +1996,16 @@ class CayuApp:
             registration_source=registration_source,
             registration_symbol=registration_symbol,
         )
+        if self._knowledge_publications_sealed:
+            for registered_tool in tools_by_name.values():
+                lifecycle = getattr(
+                    registered_tool.tool,
+                    "_knowledge_publication_lifecycle",
+                    None,
+                )
+                if isinstance(lifecycle, KnowledgePublicationLifecycle):
+                    lifecycle.seal()
+        self._agents[stored_spec.name] = registered_agent
         return spec
 
     def register_completion_verifier(

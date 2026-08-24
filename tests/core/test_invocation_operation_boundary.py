@@ -81,6 +81,60 @@ def test_abandonable_operation_registry_tracks_executor_work_until_physical_comp
     asyncio.run(run())
 
 
+def test_abandonable_operation_registry_shutdown_cancels_cooperative_children() -> None:
+    async def run() -> tuple[bool, bool, int, InvocationOperationCapacityError | None]:
+        registry = BoundedInvocationOperationRegistry(max_operations=1)
+        started = asyncio.Event()
+        stopped = asyncio.Event()
+
+        async def cooperative_read() -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+
+        caller = asyncio.create_task(
+            await_invocation_operation(
+                cooperative_read,
+                request_child_cancellation=False,
+                abandon_on_caller_cancellation=True,
+                operation_registry=registry,
+            )
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        caller.cancel("caller stopped waiting")
+        outcome = await caller
+        assert isinstance(outcome.cancellation, asyncio.CancelledError)
+        assert len(registry) == 1
+
+        drained = await registry.aclose(timeout_s=0)
+        await asyncio.wait_for(stopped.wait(), timeout=1)
+        rejected = await await_invocation_operation(
+            lambda: asyncio.sleep(0),
+            request_child_cancellation=False,
+            abandon_on_caller_cancellation=True,
+            operation_registry=registry,
+        )
+        return (
+            drained,
+            registry.closed,
+            len(registry),
+            (
+                rejected.error
+                if isinstance(rejected.error, InvocationOperationCapacityError)
+                else None
+            ),
+        )
+
+    drained, closed, remaining, rejection = asyncio.run(run())
+
+    assert drained is False
+    assert closed is True
+    assert remaining == 0
+    assert isinstance(rejection, InvocationOperationCapacityError)
+
+
 def test_pending_cancellation_proves_operation_was_not_started() -> None:
     async def run():
         calls = 0

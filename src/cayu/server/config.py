@@ -46,6 +46,7 @@ DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS = 300.0
 DEFAULT_RECOVERY_INACTIVE_AFTER_SECONDS = 300
 DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS = 30.0
 DEFAULT_INTERRUPTION_SHUTDOWN_GRACE_SECONDS = 10.0
+DEFAULT_KNOWLEDGE_PUBLICATION_SHUTDOWN_GRACE_SECONDS = 10.0
 DEFAULT_EVAL_LEASE_SECONDS = 300
 DEFAULT_EVAL_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_EVAL_SHUTDOWN_GRACE_SECONDS = 30.0
@@ -470,11 +471,15 @@ class ServerLifecycleConfig(BaseModel):
         DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS
     )
     interruption_shutdown_grace_seconds: float = DEFAULT_INTERRUPTION_SHUTDOWN_GRACE_SECONDS
+    knowledge_publication_shutdown_grace_seconds: float = (
+        DEFAULT_KNOWLEDGE_PUBLICATION_SHUTDOWN_GRACE_SECONDS
+    )
 
     @field_validator(
         "replay_idle_timeout_s",
         "event_side_effect_startup_timeout_seconds",
         "interruption_shutdown_grace_seconds",
+        "knowledge_publication_shutdown_grace_seconds",
         mode="before",
     )
     @classmethod
@@ -669,6 +674,9 @@ class ServerConfig(BaseModel):
                 ),
                 "interruption_shutdown_grace_seconds": (
                     self.lifecycle.interruption_shutdown_grace_seconds
+                ),
+                "knowledge_publication_shutdown_grace_seconds": (
+                    self.lifecycle.knowledge_publication_shutdown_grace_seconds
                 ),
             },
         }

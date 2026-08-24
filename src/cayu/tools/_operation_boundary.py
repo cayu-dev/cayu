@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any, Generic, TypeVar
 
 from cayu._exception_groups import exception_tree_contains
@@ -142,14 +143,31 @@ class BoundedInvocationOperationRegistry:
         self._max_operations = max_operations
         self._reservations = 0
         self._operations: set[asyncio.Future[Any]] = set()
+        self._sealed = False
+        self._closed = False
+        self._close_task: asyncio.Task[bool] | None = None
+        self._close_result: bool | None = None
 
     def __len__(self) -> int:
         return len(self._operations) + self._reservations
 
+    @property
+    def sealed(self) -> bool:
+        return self._sealed
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def seal(self) -> None:
+        """Synchronously reject new extension-operation reservations."""
+
+        self._sealed = True
+
     def reserve(self) -> bool:
         """Reserve capacity synchronously before an extension can be dispatched."""
 
-        if len(self) >= self._max_operations:
+        if self._sealed or len(self) >= self._max_operations:
             return False
         self._reservations += 1
         return True
@@ -171,6 +189,49 @@ class BoundedInvocationOperationRegistry:
 
         self._operations.discard(operation)
 
+    async def aclose(self, *, timeout_s: float) -> bool:
+        """Seal and drain retained operations once under a non-negative deadline."""
+
+        timeout = _nonnegative_seconds(timeout_s)
+        self.seal()
+        if self._close_result is not None:
+            return self._close_result
+        close_task = self._close_task
+        if close_task is None:
+            close_task = asyncio.create_task(self._close_started(timeout))
+            close_task.add_done_callback(_observe_invocation_registry_close)
+            self._close_task = close_task
+        return await asyncio.shield(close_task)
+
+    async def _close_started(self, timeout_s: float) -> bool:
+        operations = tuple(self._operations)
+        drained = True
+        try:
+            if operations:
+                if timeout_s > 0:
+                    _, pending = await asyncio.wait(operations, timeout=timeout_s)
+                else:
+                    pending = {operation for operation in operations if not operation.done()}
+                drained = not pending
+                if pending:
+                    await _request_bounded_invocation_operation_stop(pending)
+        except asyncio.CancelledError:
+            drained = False
+            await _request_bounded_invocation_operation_stop(
+                operation for operation in operations if not operation.done()
+            )
+            raise
+        except BaseException:
+            drained = False
+            await _request_bounded_invocation_operation_stop(
+                operation for operation in operations if not operation.done()
+            )
+            raise
+        finally:
+            self._closed = True
+            self._close_result = drained
+        return drained
+
     def _operation_done(self, operation: asyncio.Future[Any]) -> None:
         self._operations.discard(operation)
         if operation.cancelled():
@@ -179,6 +240,41 @@ class BoundedInvocationOperationRegistry:
         # for extension failures. Still consume an unexpected task exception so
         # a detached read cannot produce an unhandled event-loop diagnostic.
         operation.exception()
+
+
+def _observe_invocation_registry_close(task: asyncio.Task[bool]) -> None:
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except BaseException:
+        return
+
+
+async def _request_bounded_invocation_operation_stop(
+    operations: Iterable[asyncio.Future[Any]],
+) -> None:
+    pending = tuple(operation for operation in operations if not operation.done())
+    for operation in pending:
+        operation.cancel("Invocation operation registry is shutting down.")
+    # Cooperative coroutine adapters unwind in a fixed number of Cayu wrapper
+    # turns. Opaque executor or extension work remains subject to the documented
+    # process-supervisor hard-stop contract rather than extending this deadline.
+    for _ in range(8):
+        if all(operation.done() for operation in pending):
+            break
+        await asyncio.sleep(0)
+
+
+def _nonnegative_seconds(value: float) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not isfinite(value)
+        or value < 0
+    ):
+        raise ValueError("timeout_s must be a finite non-negative number.")
+    return float(value)
 
 
 async def await_invocation_cancellation_checkpoint() -> asyncio.CancelledError | None:

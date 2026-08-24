@@ -8675,6 +8675,8 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
     cayu_app = CayuApp()
     drain_timeouts = []
     environment_drain_timeouts = []
+    knowledge_drain_timeouts = []
+    knowledge_seals = 0
     resume_calls = []
 
     async def resume_pending_interruption_cascades(*, interrupting_inactive_before):
@@ -8689,8 +8691,18 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
         environment_drain_timeouts.append(timeout_s)
         return True
 
+    def seal_knowledge_publications():
+        nonlocal knowledge_seals
+        knowledge_seals += 1
+
+    async def drain_knowledge_publications(*, timeout_s):
+        knowledge_drain_timeouts.append(timeout_s)
+        return True
+
     cayu_app.drain_background_interruptions = drain_background_interruptions
     cayu_app.drain_environment_cleanups = drain_environment_cleanups
+    cayu_app.seal_knowledge_publications = seal_knowledge_publications
+    cayu_app.drain_knowledge_publications = drain_knowledge_publications
     cayu_app.resume_pending_interruption_cascades = resume_pending_interruption_cascades
     mount_cayu(
         server,
@@ -8699,6 +8711,7 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
         dashboard=False,
         access=OpenAccess(),
         interruption_shutdown_grace_seconds=2.5,
+        knowledge_publication_shutdown_grace_seconds=1.5,
     )
 
     with TestClient(server):
@@ -8706,6 +8719,8 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
 
     assert drain_timeouts == [2.5]
     assert environment_drain_timeouts == [2.5]
+    assert knowledge_seals == 1
+    assert knowledge_drain_timeouts == [1.5]
     assert len(resume_calls) == 1
     assert resume_calls[0] < datetime.now(UTC)
 
@@ -13917,6 +13932,17 @@ def test_create_server_rejects_invalid_interruption_shutdown_grace(value) -> Non
             CayuApp(),
             config=ServerConfig.local_development(
                 lifecycle=ServerLifecycleConfig(interruption_shutdown_grace_seconds=value)
+            ),
+        )
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, float("inf")])
+def test_create_server_rejects_invalid_knowledge_publication_shutdown_grace(value) -> None:
+    with pytest.raises(ValueError, match="knowledge_publication_shutdown_grace_seconds"):
+        create_server(
+            CayuApp(),
+            config=ServerConfig.local_development(
+                lifecycle=ServerLifecycleConfig(knowledge_publication_shutdown_grace_seconds=value)
             ),
         )
 

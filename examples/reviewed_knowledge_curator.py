@@ -119,7 +119,7 @@ async def main() -> None:
         allowed_statuses=[KnowledgeStatus.PENDING, KnowledgeStatus.ACTIVE],
     )
     knowledge = InMemoryKnowledgeStore(access_scope=access_scope)
-    curator = KnowledgeCurator(
+    async with KnowledgeCurator(
         knowledge,
         candidate_generator=DeploymentCandidateGenerator(),
         evaluator=DeploymentEvidenceEvaluator(),
@@ -129,8 +129,8 @@ async def main() -> None:
             namespace=_NAMESPACE,
             labels=_LABELS,
         ),
-    )
-    curation = await curator.curate(LearningBatch(id="deployment-run-17", signals=(signal,)))
+    ) as curator:
+        curation = await curator.curate(LearningBatch(id="deployment-run-17", signals=(signal,)))
     pending = await KnowledgeReviewWorkflow(
         knowledge,
         namespace=_NAMESPACE,

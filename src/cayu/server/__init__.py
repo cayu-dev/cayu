@@ -60,6 +60,7 @@ try:
     from cayu.server.config import (
         DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS,
         DEFAULT_INTERRUPTION_SHUTDOWN_GRACE_SECONDS,
+        DEFAULT_KNOWLEDGE_PUBLICATION_SHUTDOWN_GRACE_SECONDS,
         DEFAULT_RECOVERY_INACTIVE_AFTER_SECONDS,
         DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS,
         AuthenticatedAccess,
@@ -279,19 +280,15 @@ def create_server(
                 side_effect_recovery_task = _start_persisted_event_side_effect_recovery(app)
                 yield
             finally:
+                app.seal_knowledge_publications()
                 try:
-                    await _stop_incomplete_session_startup_recovery(
-                        incomplete_session_recovery_task
-                    )
-                    await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
-                    await _drain_background_interruptions(
-                        app,
-                        timeout_s=lifecycle.interruption_shutdown_grace_seconds,
-                    )
-                    await _drain_environment_cleanups(
-                        app,
-                        timeout_s=lifecycle.interruption_shutdown_grace_seconds,
-                    )
+                    try:
+                        await _stop_incomplete_session_startup_recovery(
+                            incomplete_session_recovery_task
+                        )
+                        await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
+                    finally:
+                        await _drain_server_owned_work(app, lifecycle=lifecycle)
                 finally:
                     await _close_project_control_plane_context(resolved_project_context)
             return
@@ -305,19 +302,15 @@ def create_server(
                 side_effect_recovery_task = _start_persisted_event_side_effect_recovery(app)
                 yield state
             finally:
+                app.seal_knowledge_publications()
                 try:
-                    await _stop_incomplete_session_startup_recovery(
-                        incomplete_session_recovery_task
-                    )
-                    await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
-                    await _drain_background_interruptions(
-                        app,
-                        timeout_s=lifecycle.interruption_shutdown_grace_seconds,
-                    )
-                    await _drain_environment_cleanups(
-                        app,
-                        timeout_s=lifecycle.interruption_shutdown_grace_seconds,
-                    )
+                    try:
+                        await _stop_incomplete_session_startup_recovery(
+                            incomplete_session_recovery_task
+                        )
+                        await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
+                    finally:
+                        await _drain_server_owned_work(app, lifecycle=lifecycle)
                 finally:
                     await _close_project_control_plane_context(resolved_project_context)
 
@@ -464,6 +457,9 @@ def mount_cayu(
         DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS
     ),
     interruption_shutdown_grace_seconds: float = DEFAULT_INTERRUPTION_SHUTDOWN_GRACE_SECONDS,
+    knowledge_publication_shutdown_grace_seconds: float = (
+        DEFAULT_KNOWLEDGE_PUBLICATION_SHUTDOWN_GRACE_SECONDS
+    ),
     interruption_recovery_inactive_after_seconds: int = DEFAULT_RECOVERY_INACTIVE_AFTER_SECONDS,
     continuation_loop_policy_provider: (
         Callable[[str], Awaitable[tuple[LoopPolicy, ...]]] | None
@@ -479,7 +475,9 @@ def mount_cayu(
     lifespan recovers persisted event side effects, then cascade parents
     inactive for at least ``interruption_recovery_inactive_after_seconds``, and
     drains accepted background interruption cascades for up to
-    ``interruption_shutdown_grace_seconds`` before the host shuts down.
+    ``interruption_shutdown_grace_seconds`` before the host shuts down. Registered
+    knowledge-publication owners are sealed first and drained independently for
+    ``knowledge_publication_shutdown_grace_seconds``.
 
     ``access`` explicitly selects authenticated or deliberately open access to
     the complete mounted surface. ``AuthenticatedAccess`` wraps the existing
@@ -527,6 +525,10 @@ def mount_cayu(
     interruption_shutdown_grace_seconds = _validate_positive_seconds(
         interruption_shutdown_grace_seconds,
         "interruption_shutdown_grace_seconds",
+    )
+    knowledge_publication_shutdown_grace_seconds = _validate_positive_seconds(
+        knowledge_publication_shutdown_grace_seconds,
+        "knowledge_publication_shutdown_grace_seconds",
     )
     if (
         type(interruption_recovery_inactive_after_seconds) is not int
@@ -579,6 +581,7 @@ def mount_cayu(
         server,
         app,
         timeout_s=interruption_shutdown_grace_seconds,
+        knowledge_publication_timeout_s=knowledge_publication_shutdown_grace_seconds,
         recovery_inactive_after_seconds=interruption_recovery_inactive_after_seconds,
         side_effect_startup_timeout_s=event_side_effect_startup_timeout_seconds,
         project_context=resolved_project_context,
@@ -772,6 +775,40 @@ async def _drain_environment_cleanups(app: CayuApp, *, timeout_s: float) -> None
         )
 
 
+async def _drain_knowledge_publications(app: CayuApp, *, timeout_s: float) -> None:
+    try:
+        drained = await app.drain_knowledge_publications(timeout_s=timeout_s)
+    except Exception:
+        logger.exception("Failed to drain retained knowledge publications during shutdown.")
+        return
+    if not drained:
+        logger.warning(
+            "Retained knowledge publications exceeded the %.3fs shutdown grace period.",
+            timeout_s,
+        )
+
+
+async def _drain_server_owned_work(
+    app: CayuApp,
+    *,
+    lifecycle: ServerLifecycleConfig,
+) -> None:
+    try:
+        await _drain_background_interruptions(
+            app,
+            timeout_s=lifecycle.interruption_shutdown_grace_seconds,
+        )
+        await _drain_environment_cleanups(
+            app,
+            timeout_s=lifecycle.interruption_shutdown_grace_seconds,
+        )
+    finally:
+        await _drain_knowledge_publications(
+            app,
+            timeout_s=lifecycle.knowledge_publication_shutdown_grace_seconds,
+        )
+
+
 async def _recover_persisted_event_side_effects_until_idle(app: CayuApp) -> None:
     while True:
         recovered = await app.recover_persisted_event_side_effects(
@@ -893,6 +930,7 @@ def _compose_interruption_drain_lifespan(
     app: CayuApp,
     *,
     timeout_s: float,
+    knowledge_publication_timeout_s: float,
     recovery_inactive_after_seconds: int,
     side_effect_startup_timeout_s: float,
     project_context: ResolvedProjectControlPlaneContext | None,
@@ -915,10 +953,19 @@ def _compose_interruption_drain_lifespan(
                 side_effect_recovery_task = _start_persisted_event_side_effect_recovery(app)
                 yield state
             finally:
+                app.seal_knowledge_publications()
                 try:
-                    await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
-                    await _drain_background_interruptions(app, timeout_s=timeout_s)
-                    await _drain_environment_cleanups(app, timeout_s=timeout_s)
+                    try:
+                        await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
+                    finally:
+                        try:
+                            await _drain_background_interruptions(app, timeout_s=timeout_s)
+                            await _drain_environment_cleanups(app, timeout_s=timeout_s)
+                        finally:
+                            await _drain_knowledge_publications(
+                                app,
+                                timeout_s=knowledge_publication_timeout_s,
+                            )
                 finally:
                     await _close_project_control_plane_context(project_context)
 

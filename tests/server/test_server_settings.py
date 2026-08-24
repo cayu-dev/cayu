@@ -38,6 +38,10 @@ def test_settings_load_nested_environment_configuration(monkeypatch) -> None:
         '["https://control.example.com"]',
     )
     monkeypatch.setenv("CAYU_SERVER_LIFECYCLE__REPLAY_IDLE_TIMEOUT_S", "45")
+    monkeypatch.setenv(
+        "CAYU_SERVER_LIFECYCLE__KNOWLEDGE_PUBLICATION_SHUTDOWN_GRACE_SECONDS",
+        "7.5",
+    )
 
     config = ServerSettings(_env_file=None).to_config()
 
@@ -46,6 +50,7 @@ def test_settings_load_nested_environment_configuration(monkeypatch) -> None:
     assert config.docs.enabled is True
     assert config.cors.allowed_origins == ("https://control.example.com",)
     assert config.lifecycle.replay_idle_timeout_s == 45.0
+    assert config.lifecycle.knowledge_publication_shutdown_grace_seconds == 7.5
 
 
 def test_settings_load_complete_default_off_evaluation_promotion(monkeypatch) -> None:

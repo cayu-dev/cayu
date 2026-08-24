@@ -908,6 +908,60 @@ def test_curator_keeps_an_owned_publication_alive_after_caller_cancellation() ->
     assert publish_calls == 1
 
 
+def test_curator_next_owner_reconciles_commit_cut_off_by_shutdown() -> None:
+    class CommitThenStallStore(InMemoryKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__(access_scope=_ACCESS_SCOPE)
+            self.committed = asyncio.Event()
+            self.stopped = asyncio.Event()
+            self.publish_calls = 0
+
+        async def publish_entry_revision(
+            self,
+            entry,
+            chunks,
+            *,
+            evidence=None,
+            access_scope=None,
+            operation_id,
+            expected_revision=None,
+        ):
+            self.publish_calls += 1
+            receipt = await super().publish_entry_revision(
+                entry,
+                chunks,
+                evidence=evidence,
+                access_scope=access_scope,
+                operation_id=operation_id,
+                expected_revision=expected_revision,
+            )
+            self.committed.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.stopped.set()
+            return receipt
+
+    async def run():
+        store = CommitThenStallStore()
+        first_owner = _curator(store)
+        invocation = asyncio.create_task(first_owner.curate(_batch(_signal())))
+        await asyncio.wait_for(store.committed.wait(), timeout=1)
+        invocation.cancel("caller left after commit")
+        with pytest.raises(asyncio.CancelledError, match="caller left after commit"):
+            await invocation
+        assert await first_owner.aclose(timeout_s=0.01) is False
+        await asyncio.wait_for(store.stopped.wait(), timeout=1)
+
+        replay = await _curator(store).curate(_batch(_signal()))
+        return replay, store.publish_calls
+
+    replay, publish_calls = asyncio.run(run())
+
+    assert replay.candidates[0].outcome is LearningCandidateOutcome.EXISTING_PENDING
+    assert publish_calls == 1
+
+
 def test_curator_bounds_publications_that_outlive_their_callers() -> None:
     class CandidatePerBatchGenerator:
         async def generate_candidates(self, batch):
@@ -969,6 +1023,113 @@ def test_curator_bounds_publications_that_outlive_their_callers() -> None:
     assert first.candidates[0].outcome is LearningCandidateOutcome.PENDING_PERSISTED
     assert second.candidates[0].outcome is LearningCandidateOutcome.FAILED
     assert second.candidates[0].code == "publication_capacity_exhausted"
+
+
+def test_curator_shutdown_seals_and_bounds_retained_publications() -> None:
+    class PausingStore(InMemoryKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__(access_scope=_ACCESS_SCOPE)
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.stopped = asyncio.Event()
+            self.publish_calls = 0
+
+        async def publish_entry_revision(
+            self,
+            entry,
+            chunks,
+            *,
+            evidence=None,
+            access_scope=None,
+            operation_id,
+            expected_revision=None,
+        ):
+            self.publish_calls += 1
+            self.started.set()
+            try:
+                await self.release.wait()
+                return await super().publish_entry_revision(
+                    entry,
+                    chunks,
+                    evidence=evidence,
+                    access_scope=access_scope,
+                    operation_id=operation_id,
+                    expected_revision=expected_revision,
+                )
+            finally:
+                self.stopped.set()
+
+    async def run():
+        store = PausingStore()
+        curator = _curator(store)
+        invocation = asyncio.create_task(curator.curate(_batch(_signal())))
+        await asyncio.wait_for(store.started.wait(), timeout=1)
+        invocation.cancel("curation caller left")
+        with pytest.raises(asyncio.CancelledError, match="curation caller left"):
+            await invocation
+
+        first_close = asyncio.create_task(curator.aclose(timeout_s=0.01))
+        await asyncio.sleep(0)
+        second_close = asyncio.create_task(curator.aclose(timeout_s=1))
+        first_result, second_result = await asyncio.gather(first_close, second_close)
+        await asyncio.wait_for(store.stopped.wait(), timeout=1)
+        while curator._publication_owner:
+            await asyncio.sleep(0)
+
+        rejected = await curator.curate(LearningBatch(id="after-close", signals=(_signal(),)))
+        return first_result, second_result, rejected, store.publish_calls
+
+    first_result, second_result, rejected, publish_calls = asyncio.run(run())
+
+    assert first_result is False
+    assert second_result is False
+    assert rejected.candidates[0].outcome is LearningCandidateOutcome.FAILED
+    assert rejected.candidates[0].code == "publication_owner_closed"
+    assert publish_calls == 1
+
+
+def test_curator_shutdown_drains_a_publication_that_settles_within_grace() -> None:
+    class PausingStore(InMemoryKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__(access_scope=_ACCESS_SCOPE)
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def publish_entry_revision(
+            self,
+            entry,
+            chunks,
+            *,
+            evidence=None,
+            access_scope=None,
+            operation_id,
+            expected_revision=None,
+        ):
+            self.started.set()
+            await self.release.wait()
+            return await super().publish_entry_revision(
+                entry,
+                chunks,
+                evidence=evidence,
+                access_scope=access_scope,
+                operation_id=operation_id,
+                expected_revision=expected_revision,
+            )
+
+    async def run():
+        store = PausingStore()
+        curator = _curator(store)
+        invocation = asyncio.create_task(curator.curate(_batch(_signal())))
+        await asyncio.wait_for(store.started.wait(), timeout=1)
+        close = asyncio.create_task(curator.aclose(timeout_s=1))
+        await asyncio.sleep(0)
+        store.release.set()
+        return await close, await invocation
+
+    drained, result = asyncio.run(run())
+
+    assert drained is True
+    assert result.candidates[0].outcome is LearningCandidateOutcome.PENDING_PERSISTED
 
 
 def test_curator_isolates_store_failure_between_candidates() -> None:
