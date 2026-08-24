@@ -15,6 +15,16 @@ from psycopg.rows import tuple_row
 from psycopg_pool import AsyncConnectionPool
 
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
+from cayu.runtime.completion_verifier_profiles import (
+    CompletionVerifierProfilePreparationRequest,
+    CompletionVerifierProfileRecord,
+    completion_verifier_profile_preparation_request_sha256,
+    completion_verifier_profile_record_from_document,
+    completion_verifier_profile_record_from_preparation,
+    copy_completion_verifier_profile_preparation_request,
+    copy_completion_verifier_profile_record,
+    require_completion_verifier_profile_transition,
+)
 from cayu.runtime.tasks import (
     CompletionDecisionApplicationReceipt,
     Task,
@@ -550,15 +560,112 @@ class PostgresVerifiedWorkMixin:
             )
         return proposal
 
+    async def _load_verifier_profile_row(
+        self,
+        cur: Any,
+        proposal_id: str,
+        *,
+        for_update: bool = False,
+    ) -> CompletionVerifierProfileRecord | None:
+        await cur.execute(
+            "SELECT proposal_id, task_id, attempt_id, profile_fingerprint, "
+            "request_sha256, prepared_at, profile_json "
+            "FROM cayu_completion_verifier_profiles WHERE proposal_id = %s"
+            + (" FOR UPDATE" if for_update else ""),
+            (proposal_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        profile = completion_verifier_profile_record_from_document(_json_document(row[6]))
+        if (
+            profile.proposal_id != row[0]
+            or profile.task_id != row[1]
+            or profile.attempt_id != row[2]
+            or profile.profile.fingerprint != row[3]
+            or profile.request_sha256 != row[4]
+            or profile.prepared_at != pg_support.to_utc(row[5])
+        ):
+            raise WorkCompletionConflict(
+                "Stored completion-verifier profile indexes conflict with canonical content."
+            )
+        return profile
+
+    async def _load_verifier_profile_adoption_row(
+        self,
+        cur: Any,
+        *,
+        task_id: str,
+        idempotency_key: str,
+    ) -> CompletionVerifierProfileRecord | None:
+        await cur.execute(
+            "SELECT proposal_id FROM cayu_completion_verifier_profiles "
+            "WHERE task_id = %s "
+            "AND profile_json #>> '{adoption,idempotency_key}' = %s "
+            "ORDER BY proposal_id LIMIT 2",
+            (task_id, idempotency_key),
+        )
+        rows = await cur.fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise WorkCompletionConflict(
+                "Stored completion-verifier adoption idempotency authority is ambiguous."
+            )
+        profile = await self._load_verifier_profile_row(cur, rows[0][0], for_update=True)
+        if (
+            profile is None
+            or profile.task_id != task_id
+            or profile.adoption is None
+            or profile.adoption.idempotency_key != idempotency_key
+        ):
+            raise WorkCompletionConflict(
+                "Stored completion-verifier adoption idempotency authority is invalid."
+            )
+        return profile
+
+    async def _load_prior_verifier_profile_row(
+        self,
+        cur: Any,
+        proposal: CompletionProposal,
+        *,
+        for_update: bool = False,
+    ) -> CompletionVerifierProfileRecord | None:
+        await cur.execute(
+            "SELECT prior_proposal.proposal_id "
+            "FROM cayu_work_attempts AS current_attempt "
+            "JOIN cayu_work_attempts AS prior_attempt "
+            "ON prior_attempt.task_id = current_attempt.task_id "
+            "AND prior_attempt.ordinal = current_attempt.ordinal - 1 "
+            "LEFT JOIN cayu_completion_proposals AS prior_proposal "
+            "ON prior_proposal.attempt_id = prior_attempt.attempt_id "
+            "WHERE current_attempt.attempt_id = %s",
+            (proposal.attempt_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        if row[0] is None:
+            raise WorkCompletionConflict("Prior work attempt has no completion proposal authority.")
+        profile = await self._load_verifier_profile_row(
+            cur,
+            row[0],
+            for_update=for_update,
+        )
+        if profile is None:
+            raise WorkCompletionConflict("Prior work attempt has no verifier-profile authority.")
+        return profile
+
     @staticmethod
     def _claim_from_row(row: Any) -> CompletionVerificationClaim:
-        claim = CompletionVerificationClaim.model_validate(_json_document(row[5]))
+        claim = CompletionVerificationClaim.model_validate(_json_document(row[6]))
         if (
             claim.claim_id != row[0]
             or claim.proposal_id != row[1]
             or claim.attempt_number != row[2]
-            or claim.request_sha256 != row[3]
-            or claim.lease_expires_at != pg_support.to_utc(row[4])
+            or claim.verifier_profile_fingerprint != row[3]
+            or claim.request_sha256 != row[4]
+            or claim.lease_expires_at != pg_support.to_utc(row[5])
         ):
             raise WorkCompletionConflict(
                 "Stored verification-claim indexes conflict with canonical content."
@@ -573,7 +680,7 @@ class PostgresVerifiedWorkMixin:
         for_update: bool = False,
     ) -> CompletionVerificationClaim | None:
         await cur.execute(
-            "SELECT claim_id, proposal_id, attempt_number, request_sha256, "
+            "SELECT claim_id, proposal_id, attempt_number, verifier_profile_fingerprint, request_sha256, "
             "lease_expires_at, claim_json FROM cayu_completion_verification_claims "
             "WHERE proposal_id = %s AND is_current" + (" FOR UPDATE" if for_update else ""),
             (proposal_id,),
@@ -589,7 +696,7 @@ class PostgresVerifiedWorkMixin:
         for_update: bool = False,
     ) -> CompletionVerificationClaim | None:
         await cur.execute(
-            "SELECT claim_id, proposal_id, attempt_number, request_sha256, "
+            "SELECT claim_id, proposal_id, attempt_number, verifier_profile_fingerprint, request_sha256, "
             "lease_expires_at, claim_json FROM cayu_completion_verification_claims "
             "WHERE claim_id = %s" + (" FOR UPDATE" if for_update else ""),
             (claim_id,),
@@ -599,17 +706,18 @@ class PostgresVerifiedWorkMixin:
 
     @staticmethod
     def _decision_from_row(row: Any) -> CompletionDecision:
-        decision = CompletionDecision.model_validate(_json_document(row[9]))
+        decision = CompletionDecision.model_validate(_json_document(row[10]))
         if (
             decision.decision_id != row[0]
             or decision.proposal_id != row[1]
             or decision.task_id != row[2]
             or decision.attempt_id != row[3]
             or decision.claim_id != row[4]
-            or decision.verdict.value != row[5]
-            or decision.gap_fingerprint != row[6]
-            or decision.request_sha256 != row[7]
-            or decision.decided_at != pg_support.to_utc(row[8])
+            or decision.verifier_profile_fingerprint != row[5]
+            or decision.verdict.value != row[6]
+            or decision.gap_fingerprint != row[7]
+            or decision.request_sha256 != row[8]
+            or decision.decided_at != pg_support.to_utc(row[9])
         ):
             raise WorkCompletionConflict(
                 "Stored completion-decision indexes conflict with canonical content."
@@ -624,7 +732,8 @@ class PostgresVerifiedWorkMixin:
         for_update: bool = False,
     ) -> CompletionDecision | None:
         await cur.execute(
-            "SELECT decision_id, proposal_id, task_id, attempt_id, claim_id, verdict, "
+            "SELECT decision_id, proposal_id, task_id, attempt_id, claim_id, "
+            "verifier_profile_fingerprint, verdict, "
             "gap_fingerprint, request_sha256, decided_at, decision_json "
             "FROM cayu_completion_decisions WHERE decision_id = %s"
             + (" FOR UPDATE" if for_update else ""),
@@ -641,7 +750,8 @@ class PostgresVerifiedWorkMixin:
         for_update: bool = False,
     ) -> CompletionDecision | None:
         await cur.execute(
-            "SELECT decision_id, proposal_id, task_id, attempt_id, claim_id, verdict, "
+            "SELECT decision_id, proposal_id, task_id, attempt_id, claim_id, "
+            "verifier_profile_fingerprint, verdict, "
             "gap_fingerprint, request_sha256, decided_at, decision_json "
             "FROM cayu_completion_decisions WHERE proposal_id = %s"
             + (" FOR UPDATE" if for_update else ""),
@@ -1072,6 +1182,125 @@ class PostgresVerifiedWorkMixin:
             proposal = await self._load_proposal_row(cur, proposal_id)
             return None if proposal is None else proposal.model_copy(deep=True)
 
+    async def prepare_completion_verifier_profile(
+        self,
+        request: CompletionVerifierProfilePreparationRequest,
+    ) -> CompletionVerifierProfileRecord:
+        request = copy_completion_verifier_profile_preparation_request(request)
+        request_sha256 = completion_verifier_profile_preparation_request_sha256(request)
+        await self._ensure_ready()
+
+        async def operation(conn: Any, cur: Any) -> CompletionVerifierProfileRecord:
+            del conn
+            await self._lock_verified_work_identity(cur, "verifier-profile", request.proposal_id)
+            proposal_snapshot = await self._load_proposal_row(cur, request.proposal_id)
+            if proposal_snapshot is None:
+                raise KeyError(f"Completion proposal not found: {request.proposal_id}")
+            await self._lock_verified_work_task(cur, proposal_snapshot.task_id)
+            existing = await self._load_verifier_profile_row(
+                cur,
+                request.proposal_id,
+                for_update=True,
+            )
+            if existing is not None:
+                if existing.request_sha256 != request_sha256:
+                    raise WorkCompletionConflict(
+                        "Completion-verifier profile is already bound to another request."
+                    )
+                return copy_completion_verifier_profile_record(existing)
+            proposal = await self._load_proposal_row(
+                cur,
+                request.proposal_id,
+                for_update=True,
+            )
+            if proposal is None:
+                raise KeyError(f"Completion proposal not found: {request.proposal_id}")
+            attempt = await self._load_attempt_row(cur, proposal.attempt_id, for_update=True)
+            if attempt is None:
+                raise WorkCompletionConflict("Completion proposal has no durable work attempt.")
+            contract = verified_work_support.require_contract_reference(
+                await self._load_work_contract_row(cur, proposal.contract, for_update=True),
+                proposal.contract,
+            )
+            if (
+                request.task_id != proposal.task_id
+                or request.attempt_id != attempt.attempt_id
+                or request.attempt_request_sha256 != attempt.request_sha256
+                or request.source_execution_profile_fingerprint
+                != attempt.execution_profile_fingerprint
+                or request.proposal_request_sha256 != proposal.request_sha256
+                or request.contract != contract.reference()
+                or request.profile.verifier != contract.verifier
+            ):
+                raise WorkCompletionConflict(
+                    "Completion-verifier profile conflicts with its durable proposal authority."
+                )
+            prior = await self._load_prior_verifier_profile_row(
+                cur,
+                proposal,
+                for_update=True,
+            )
+            require_completion_verifier_profile_transition(request, prior)
+            adoption = request.adoption
+            if (
+                adoption is not None
+                and await self._load_verifier_profile_adoption_row(
+                    cur,
+                    task_id=request.task_id,
+                    idempotency_key=adoption.idempotency_key,
+                )
+                is not None
+            ):
+                raise WorkCompletionConflict(
+                    "Completion-verifier profile adoption idempotency key is already "
+                    "bound to another proposal."
+                )
+            record = completion_verifier_profile_record_from_preparation(
+                request,
+                request_sha256=request_sha256,
+                prepared_at=await self._verified_now(cur),
+            )
+            await cur.execute(
+                "INSERT INTO cayu_completion_verifier_profiles "
+                "(proposal_id, task_id, attempt_id, profile_fingerprint, request_sha256, "
+                "prepared_at, profile_json) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (
+                    record.proposal_id,
+                    record.task_id,
+                    record.attempt_id,
+                    record.profile.fingerprint,
+                    record.request_sha256,
+                    record.prepared_at,
+                    json.dumps(record.model_dump(mode="json", warnings=False)),
+                ),
+            )
+            return copy_completion_verifier_profile_record(record)
+
+        return await self._run_verified_work_mutation(operation)
+
+    async def load_completion_verifier_profile(
+        self,
+        proposal_id: str,
+    ) -> CompletionVerifierProfileRecord | None:
+        proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            profile = await self._load_verifier_profile_row(cur, proposal_id)
+            return None if profile is None else copy_completion_verifier_profile_record(profile)
+
+    async def load_prior_completion_verifier_profile(
+        self,
+        proposal_id: str,
+    ) -> CompletionVerifierProfileRecord | None:
+        proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            proposal = await self._load_proposal_row(cur, proposal_id)
+            if proposal is None:
+                raise KeyError(f"Completion proposal not found: {proposal_id}")
+            profile = await self._load_prior_verifier_profile_row(cur, proposal)
+            return None if profile is None else copy_completion_verifier_profile_record(profile)
+
     async def claim_completion_verification(
         self,
         request: CompletionVerificationClaimRequest,
@@ -1118,6 +1347,18 @@ class PostgresVerifiedWorkMixin:
             if request.verifier != contract.verifier:
                 raise WorkCompletionConflict(
                     "Verification claim uses a verifier other than the frozen contract verifier."
+                )
+            profile = await self._load_verifier_profile_row(
+                cur,
+                request.proposal_id,
+                for_update=True,
+            )
+            if (
+                profile is None
+                or profile.profile.fingerprint != request.verifier_profile_fingerprint
+            ):
+                raise WorkCompletionConflict(
+                    "Verification claim requires the exact prepared verifier profile."
                 )
             current = await self._load_current_claim(
                 cur,
@@ -1170,6 +1411,7 @@ class PostgresVerifiedWorkMixin:
                 execution_owner_id=request.execution_owner_id,
                 execution_timeout_seconds=request.execution_timeout_seconds,
                 verifier=request.verifier,
+                verifier_profile_fingerprint=request.verifier_profile_fingerprint,
                 attempt_number=attempt_number,
                 request_sha256=request_sha256,
                 claimed_at=now,
@@ -1182,12 +1424,14 @@ class PostgresVerifiedWorkMixin:
             )
             await cur.execute(
                 "INSERT INTO cayu_completion_verification_claims "
-                "(claim_id, proposal_id, attempt_number, request_sha256, lease_expires_at, "
-                "is_current, claim_json) VALUES (%s, %s, %s, %s, %s, TRUE, %s)",
+                "(claim_id, proposal_id, attempt_number, verifier_profile_fingerprint, "
+                "request_sha256, lease_expires_at, is_current, claim_json) "
+                "VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s)",
                 (
                     claim.claim_id,
                     claim.proposal_id,
                     claim.attempt_number,
+                    claim.verifier_profile_fingerprint,
                     claim.request_sha256,
                     claim.lease_expires_at,
                     json.dumps(claim.model_dump(mode="json", warnings=False)),
@@ -1241,6 +1485,7 @@ class PostgresVerifiedWorkMixin:
                 or current.execution_owner_id != request.execution_owner_id
                 or current.execution_timeout_seconds != request.execution_timeout_seconds
                 or current.verifier != request.verifier
+                or current.verifier_profile_fingerprint != request.verifier_profile_fingerprint
                 or current.request_sha256 != request_sha256
             ):
                 raise CompletionVerificationClaimLost(
@@ -1345,11 +1590,19 @@ class PostgresVerifiedWorkMixin:
                 proposal.proposal_id,
                 for_update=True,
             )
+            profile = await self._load_verifier_profile_row(
+                cur,
+                request.proposal_id,
+                for_update=True,
+            )
             if (
                 claim is None
                 or claim.claim_id != request.claim_id
                 or claim.worker_id != request.worker_id
                 or claim.verifier != request.verifier
+                or claim.verifier_profile_fingerprint != request.verifier_profile_fingerprint
+                or profile is None
+                or profile.profile.fingerprint != request.verifier_profile_fingerprint
             ):
                 raise CompletionVerificationClaimLost(
                     "Completion decision requires the current live verifier claim."
@@ -1382,6 +1635,7 @@ class PostgresVerifiedWorkMixin:
                 claim_id=request.claim_id,
                 worker_id=request.worker_id,
                 verifier=request.verifier,
+                verifier_profile_fingerprint=request.verifier_profile_fingerprint,
                 decision_version=request.decision_version,
                 verdict=request.verdict,
                 criterion_outcomes=request.criterion_outcomes,
@@ -1398,15 +1652,17 @@ class PostgresVerifiedWorkMixin:
             )
             await cur.execute(
                 "INSERT INTO cayu_completion_decisions "
-                "(decision_id, proposal_id, task_id, attempt_id, claim_id, verdict, "
+                "(decision_id, proposal_id, task_id, attempt_id, claim_id, "
+                "verifier_profile_fingerprint, verdict, "
                 "gap_fingerprint, request_sha256, decided_at, decision_json) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     decision.decision_id,
                     decision.proposal_id,
                     decision.task_id,
                     decision.attempt_id,
                     decision.claim_id,
+                    decision.verifier_profile_fingerprint,
                     decision.verdict.value,
                     decision.gap_fingerprint,
                     decision.request_sha256,
@@ -1526,6 +1782,18 @@ class PostgresVerifiedWorkMixin:
             )
             if proposal is None:
                 raise WorkCompletionConflict("Completion decision has no completion proposal.")
+            profile = await self._load_verifier_profile_row(
+                cur,
+                proposal.proposal_id,
+                for_update=True,
+            )
+            if (
+                profile is None
+                or profile.profile.fingerprint != decision.verifier_profile_fingerprint
+            ):
+                raise WorkCompletionConflict(
+                    "Completion decision has no exact verifier-profile authority."
+                )
             await cur.execute(
                 "SELECT COUNT(*) FROM cayu_completion_decisions "
                 "WHERE task_id = %s AND verdict = %s AND gap_fingerprint = %s",

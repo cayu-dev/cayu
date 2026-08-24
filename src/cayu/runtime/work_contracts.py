@@ -964,6 +964,7 @@ class CompletionVerificationClaimRequest(FrozenWorkContractModel):
     worker_id: str
     execution_owner_id: str | None = None
     verifier: CompletionVerifierRef
+    verifier_profile_fingerprint: str
     lease_seconds: StrictInt = Field(default=300, ge=1, le=WORK_VERIFICATION_LEASE_MAX_SECONDS)
     execution_timeout_seconds: StrictFloat | None = Field(
         default=None,
@@ -988,6 +989,11 @@ class CompletionVerificationClaimRequest(FrozenWorkContractModel):
     def copy_verifier(cls, value: object) -> object:
         return revalidate_model_input(value, CompletionVerifierRef)
 
+    @field_validator("verifier_profile_fingerprint")
+    @classmethod
+    def validate_verifier_profile_fingerprint(cls, value: str) -> str:
+        return _sha256_digest(value, "verifier_profile_fingerprint")
+
     @model_validator(mode="after")
     def validate_execution_timeout_within_lease(self) -> CompletionVerificationClaimRequest:
         if (
@@ -1009,6 +1015,7 @@ class CompletionVerificationClaim(FrozenWorkContractModel):
         le=WORK_VERIFICATION_LEASE_MAX_SECONDS,
     )
     verifier: CompletionVerifierRef
+    verifier_profile_fingerprint: str
     attempt_number: StrictInt = Field(ge=1)
     request_sha256: str
     claimed_at: datetime
@@ -1030,6 +1037,11 @@ class CompletionVerificationClaim(FrozenWorkContractModel):
     @classmethod
     def copy_verifier(cls, value: object) -> object:
         return revalidate_model_input(value, CompletionVerifierRef)
+
+    @field_validator("verifier_profile_fingerprint")
+    @classmethod
+    def validate_verifier_profile_fingerprint(cls, value: str) -> str:
+        return _sha256_digest(value, "verifier_profile_fingerprint")
 
     @field_validator("request_sha256")
     @classmethod
@@ -1338,6 +1350,7 @@ class CompletionDecisionCreate(FrozenWorkContractModel):
     claim_id: str
     worker_id: str
     verifier: CompletionVerifierRef
+    verifier_profile_fingerprint: str
     decision_version: Literal[1] = 1
     verdict: CompletionVerdict
     criterion_outcomes: tuple[CompletionCriterionOutcome, ...] = Field(
@@ -1373,6 +1386,11 @@ class CompletionDecisionCreate(FrozenWorkContractModel):
     @classmethod
     def copy_verifier(cls, value: object) -> object:
         return revalidate_model_input(value, CompletionVerifierRef)
+
+    @field_validator("verifier_profile_fingerprint")
+    @classmethod
+    def validate_verifier_profile_fingerprint(cls, value: str) -> str:
+        return _sha256_digest(value, "verifier_profile_fingerprint")
 
     @field_validator("criterion_outcomes", mode="before")
     @classmethod
@@ -1719,6 +1737,7 @@ def copy_completion_verification_claim(
             "execution_owner_id": value.execution_owner_id,
             "execution_timeout_seconds": value.execution_timeout_seconds,
             "verifier": _copy_bounded_model_input(value.verifier, CompletionVerifierRef, 4),
+            "verifier_profile_fingerprint": value.verifier_profile_fingerprint,
             "attempt_number": value.attempt_number,
             "request_sha256": value.request_sha256,
             "claimed_at": value.claimed_at,
@@ -1737,6 +1756,7 @@ def _copy_completion_verification_claim_definition(
         "execution_owner_id": value.execution_owner_id,
         "execution_timeout_seconds": value.execution_timeout_seconds,
         "verifier": _copy_bounded_model_input(value.verifier, CompletionVerifierRef, 4),
+        "verifier_profile_fingerprint": value.verifier_profile_fingerprint,
         "lease_seconds": value.lease_seconds,
     }
 
@@ -1909,6 +1929,7 @@ def _copy_completion_decision_definition(
         "claim_id": value.claim_id,
         "worker_id": value.worker_id,
         "verifier": _copy_bounded_model_input(value.verifier, CompletionVerifierRef, 4),
+        "verifier_profile_fingerprint": value.verifier_profile_fingerprint,
         "decision_version": value.decision_version,
         "verdict": value.verdict,
         "criterion_outcomes": _copy_bounded_items(

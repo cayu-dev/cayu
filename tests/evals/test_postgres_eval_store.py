@@ -113,7 +113,7 @@ def test_postgres_eval_store_shared_conformance(postgres_dsn) -> None:
     asyncio.run(exercise())
 
 
-def test_postgres_eval_store_creates_revision_fifty_six_schema(postgres_dsn) -> None:
+def test_postgres_eval_store_creates_revision_fifty_eight_schema(postgres_dsn) -> None:
     async def exercise() -> None:
         import psycopg
 
@@ -133,7 +133,7 @@ def test_postgres_eval_store_creates_revision_fifty_six_schema(postgres_dsn) -> 
         ):
             await cur.execute(
                 "SELECT revision, kind, compatible_from FROM cayu_schema_migrations "
-                "WHERE revision IN (47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57) "
+                "WHERE revision IN (47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58) "
                 "ORDER BY revision"
             )
             assert await cur.fetchall() == [
@@ -148,6 +148,7 @@ def test_postgres_eval_store_creates_revision_fifty_six_schema(postgres_dsn) -> 
                 (55, "breaking", 55),
                 (56, "additive", 55),
                 (57, "breaking", 57),
+                (58, "breaking", 58),
             ]
             await cur.execute(
                 "SELECT data_type, is_nullable, column_default "

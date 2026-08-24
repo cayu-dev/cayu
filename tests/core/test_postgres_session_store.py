@@ -97,6 +97,7 @@ _TABLES = (
     "cayu_completion_decision_application_receipts",
     "cayu_completion_decisions",
     "cayu_completion_verification_claims",
+    "cayu_completion_verifier_profiles",
     "cayu_completion_proposals",
     "cayu_work_attempts",
     "cayu_task_session_execution_authority",

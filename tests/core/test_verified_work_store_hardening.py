@@ -5,6 +5,9 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 
 import pytest
+from tests.core.completion_verifier_profile_fixtures import (
+    prepare_test_completion_verifier_profile,
+)
 from tests.core.task_invocation_fixtures import (
     task_backed_session_invocation,
     unattributed_session_invocation_binding,
@@ -134,12 +137,17 @@ async def _prepare_decision(
             result=result_reference,
         )
     )
+    verifier_profile = await prepare_test_completion_verifier_profile(
+        store,
+        proposal.proposal_id,
+    )
     claim = await store.claim_completion_verification(
         CompletionVerificationClaimRequest(
             claim_id=f"claim-{suffix}",
             proposal_id=proposal.proposal_id,
             worker_id=f"verifier-{suffix}",
             verifier=contract.verifier,
+            verifier_profile_fingerprint=verifier_profile.profile.fingerprint,
         )
     )
     accepted = verdict is CompletionVerdict.ACCEPTED
@@ -150,6 +158,7 @@ async def _prepare_decision(
             claim_id=claim.claim_id,
             worker_id=claim.worker_id,
             verifier=contract.verifier,
+            verifier_profile_fingerprint=verifier_profile.profile.fingerprint,
             verdict=verdict,
             criterion_outcomes=(
                 CompletionCriterionOutcome(

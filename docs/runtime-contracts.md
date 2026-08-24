@@ -2997,10 +2997,28 @@ verification must reconstruct the exact registration during application
 startup. Provider-backed verifier references remain reserved and fail closed in
 this slice.
 
+Each deterministic registration must also declare a stable, application-versioned
+`execution_profile_identity`. Decision-bearing dependencies that are not part of
+the adapter itself are declared as bounded, uniquely named
+`CompletionVerifierProfileComponentDeclaration` values. Cayu snapshots those
+identities at registration, persists only their typed fingerprints, and compares
+the live declarations again before profile preparation, after all preparation
+and adoption-policy awaits but before a claim, and immediately before adapter
+dispatch. Missing, secret-bearing, malformed, duplicate, or changed identity
+material fails before a claim or verifier call. The verifier profile is
+purpose-built authority: it does not invent provider, model, prompt, tool, or
+agent components that a deterministic verifier does not use.
+
 `CayuApp.verify_completion_proposal(CompletionVerifierExecutionRequest(...))`
 is the runtime-owned deterministic execution boundary. It loads and validates
-the durable proposal, attempt, and frozen contract chain, then resolves the
-exact registered adapter before claiming verification. The adapter receives an
+the durable proposal, source attempt/profile, and frozen contract chain, resolves
+the exact registered adapter, and inserts one immutable proposal-scoped
+`CompletionVerifierProfileRecord` before claiming verification. The record binds
+the task and candidate proposal, exact work contract and verifier reference,
+source worker attempt and execution-profile fingerprint, and the bounded verifier
+component fingerprints. It remains separate from renewable claims: claim replay,
+lease expiry, worker replacement, and process restart cannot rewrite it. The
+adapter receives an
 immutable `CompletionVerifierRequest` containing detached copies of that
 bounded context and returns only a `CompletionVerifierDecision`. It cannot
 choose proposal, claim, worker, verifier, decision, task, attempt, or contract
@@ -3009,6 +3027,20 @@ gap, and evidence coverage against the frozen contract before mutation, and
 persists the resulting `CompletionDecision` through the store's live-claim
 fence. A custom supporting store must repeat those checks atomically with its
 decision write.
+
+Every verification claim, renewal, decision, exact replay, and decision
+application carries the exact verifier-profile fingerprint. A changed verifier
+profile is permitted only before a later task attempt begins verifier work and
+only when the execution request supplies an `ExecutionProfileAdoptionIntent`
+that an application-provided `CompletionVerifierProfilePolicy` explicitly
+authorizes. The durable adoption record binds the prior and candidate profile,
+the exact changed component set, policy identity, decision and bounded redacted
+reason, caller reason and task-scoped idempotency identity, and a claims-free
+audit actor. One task cannot bind the same adoption identity to another proposal
+or transition. Exact retries reconcile the original proposal record without
+rerunning policy; conflicting adoption input fails closed. An
+already prepared live attempt can only resolve the recorded profile and cannot
+adopt current registration defaults.
 
 Adapters must be deterministic and side-effect-free. An external check that
 requires mutation belongs behind Cayu's ordinary effect, idempotency, approval,
@@ -3164,6 +3196,15 @@ the completion gate or maintain the new records. Operators must take an
 application-consistent backup, run `cayu storage migrate`, confirm revision 49,
 and deploy only revision-49-aware workers. Mixed-version operation and
 application-only rollback are unsupported.
+
+Breaking schema revision 58 adds immutable completion-verifier profiles and
+requires their fingerprint on verification claims and decisions. Because no
+safe historical profile can be inferred, migration rejects a prerelease SQLite
+or PostgreSQL database containing existing verification claims or decisions.
+Stop older task/verifier workers, take an application-consistent backup, recreate
+such populated prerelease stores, run `cayu storage migrate`, and confirm revision
+58 before current workers start. Mixed revision-57/revision-58 verifier workers
+and application-only rollback are unsupported.
 
 `terminalize_task(...)` is the claim-fenced, replay-safe completion/failure
 boundary for worker-owned tasks. A request carries the exact task and worker,

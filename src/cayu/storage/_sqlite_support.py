@@ -2630,6 +2630,27 @@ _MIGRATION_STEPS: dict[int, str] = {
     """,
     56: "",
     57: "",
+    58: """
+        CREATE TABLE IF NOT EXISTS cayu_completion_verifier_profiles (
+            proposal_id TEXT NOT NULL PRIMARY KEY
+                REFERENCES cayu_completion_proposals(proposal_id) ON DELETE RESTRICT,
+            task_id TEXT NOT NULL REFERENCES cayu_tasks(id) ON DELETE RESTRICT,
+            attempt_id TEXT NOT NULL UNIQUE
+                REFERENCES cayu_work_attempts(attempt_id) ON DELETE RESTRICT,
+            profile_fingerprint TEXT NOT NULL CHECK (
+                length(profile_fingerprint) = 64
+                AND profile_fingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+            request_sha256 TEXT NOT NULL CHECK (
+                length(request_sha256) = 64
+                AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            prepared_at TEXT NOT NULL,
+            profile_json TEXT NOT NULL CHECK (json_valid(profile_json))
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_completion_verifier_profiles_task
+            ON cayu_completion_verifier_profiles(task_id, attempt_id);
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -2656,6 +2677,22 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
         ),
     ),
     46: (("cayu_transcript_messages", "transcript_search_document", "TEXT NOT NULL"),),
+    58: (
+        (
+            "cayu_completion_verification_claims",
+            "verifier_profile_fingerprint",
+            "TEXT CHECK (verifier_profile_fingerprint IS NOT NULL AND "
+            "(length(verifier_profile_fingerprint) = 64 AND "
+            "verifier_profile_fingerprint NOT GLOB '*[^0-9a-f]*'))",
+        ),
+        (
+            "cayu_completion_decisions",
+            "verifier_profile_fingerprint",
+            "TEXT CHECK (verifier_profile_fingerprint IS NOT NULL AND "
+            "(length(verifier_profile_fingerprint) = 64 AND "
+            "verifier_profile_fingerprint NOT GLOB '*[^0-9a-f]*'))",
+        ),
+    ),
     14: (
         (
             "cayu_sessions",
@@ -3809,7 +3846,10 @@ def reconcile_schema(
     if app_min_supported >= 48:
         _validate_captured_eval_case_schema(connection)
     if app_min_supported >= 49:
-        _validate_verified_work_schema(connection)
+        _validate_verified_work_schema(
+            connection,
+            require_verifier_profiles=current.revision >= 58,
+        )
     if app_min_supported >= 50:
         _validate_eval_run_invocation_column(connection)
     if app_min_supported >= 51:
@@ -5207,7 +5247,11 @@ def _validate_eval_scenario_schema(connection: sqlite3.Connection) -> None:
             )
 
 
-def _validate_verified_work_schema(connection: sqlite3.Connection) -> None:
+def _validate_verified_work_schema(
+    connection: sqlite3.Connection,
+    *,
+    require_verifier_profiles: bool,
+) -> None:
     task_columns = {
         str(row[1]): (str(row[2]).upper(), int(row[3]))
         for row in connection.execute("PRAGMA table_info(cayu_tasks)")
@@ -5274,6 +5318,23 @@ def _validate_verified_work_schema(connection: sqlite3.Connection) -> None:
             ("receipt_json", "TEXT", 1, 0),
         ),
     }
+    if require_verifier_profiles:
+        required_columns["cayu_completion_verification_claims"] += (
+            ("verifier_profile_fingerprint", "TEXT", 0, 0),
+        )
+        required_columns["cayu_completion_decisions"] += (
+            ("verifier_profile_fingerprint", "TEXT", 0, 0),
+        )
+        required_columns["cayu_completion_verifier_profiles"] = (
+            ("proposal_id", "TEXT", 1, 1),
+            ("task_id", "TEXT", 1, 0),
+            ("attempt_id", "TEXT", 1, 0),
+            ("profile_fingerprint", "TEXT", 1, 0),
+            ("request_sha256", "TEXT", 1, 0),
+            ("prepared_at", "TEXT", 1, 0),
+            ("profile_json", "TEXT", 1, 0),
+        )
+    contract_revision = 58 if require_verifier_profiles else 49
     for table, expected in required_columns.items():
         actual = tuple(
             (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
@@ -5282,7 +5343,7 @@ def _validate_verified_work_schema(connection: sqlite3.Connection) -> None:
         if actual != expected:
             raise RuntimeError(
                 f"SQLite schema object {table!r} conflicts with Cayu's "
-                "revision-49 verified-work contract."
+                f"revision-{contract_revision} verified-work contract."
             )
 
     def normalized_sql(name: str, object_type: str) -> str:
@@ -5357,12 +5418,34 @@ def _validate_verified_work_schema(connection: sqlite3.Connection) -> None:
             "check (json_valid(receipt_json))",
         ),
     }
+    if require_verifier_profiles:
+        required_table_fragments["cayu_completion_verification_claims"] += (
+            "verifier_profile_fingerprint is not null",
+            "length(verifier_profile_fingerprint) = 64",
+            "verifier_profile_fingerprint not glob '*[^0-9a-f]*'",
+        )
+        required_table_fragments["cayu_completion_decisions"] += (
+            "verifier_profile_fingerprint is not null",
+            "length(verifier_profile_fingerprint) = 64",
+            "verifier_profile_fingerprint not glob '*[^0-9a-f]*'",
+        )
+        required_table_fragments["cayu_completion_verifier_profiles"] = (
+            "proposal_id text not null primary key",
+            "references cayu_completion_proposals(proposal_id) on delete restrict",
+            "task_id text not null references cayu_tasks(id) on delete restrict",
+            "attempt_id text not null unique references cayu_work_attempts(attempt_id) on delete restrict",
+            "length(profile_fingerprint) = 64",
+            "profile_fingerprint not glob '*[^0-9a-f]*'",
+            "length(request_sha256) = 64",
+            "request_sha256 not glob '*[^0-9a-f]*'",
+            "check (json_valid(profile_json))",
+        )
     for table, fragments in required_table_fragments.items():
         definition = normalized_sql(table, "table")
         if any(fragment not in definition for fragment in fragments):
             raise RuntimeError(
                 f"SQLite schema object {table!r} conflicts with Cayu's "
-                "revision-49 verified-work contract."
+                f"revision-{contract_revision} verified-work contract."
             )
     required_indexes = {
         "idx_cayu_completion_claim_current": (
@@ -5390,6 +5473,13 @@ def _validate_verified_work_schema(connection: sqlite3.Connection) -> None:
             None,
         ),
     }
+    if require_verifier_profiles:
+        required_indexes["idx_cayu_completion_verifier_profiles_task"] = (
+            "cayu_completion_verifier_profiles",
+            ("task_id", "attempt_id"),
+            False,
+            None,
+        )
     for index, (table, columns, unique, predicate) in required_indexes.items():
         index_rows = {str(row[1]): row for row in connection.execute(f"PRAGMA index_list({table})")}
         row = index_rows.get(index)
@@ -5814,6 +5904,24 @@ def _drop_column_if_present(connection: sqlite3.Connection, table: str, column: 
         connection.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
 
 
+def _reject_unprofiled_verified_work_records(connection: sqlite3.Connection) -> None:
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN "
+            "('cayu_completion_verification_claims', 'cayu_completion_decisions')"
+        )
+    }
+    for table in sorted(tables):
+        row = connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+        if row is not None:
+            raise RuntimeError(
+                "SQLite migration revision 58 cannot attribute existing completion-"
+                "verification records to immutable verifier profiles. Recreate the pre-release "
+                "database before migrating."
+            )
+
+
 def _apply_baseline(connection: sqlite3.Connection) -> None:
     with _transaction(connection):
         for statement in _iter_statements(_BASELINE_DDL):
@@ -5863,6 +5971,8 @@ def _apply_pending(connection: sqlite3.Connection, state: schema.SchemaState) ->
         and any(revision.revision == 52 for revision in schema.pending(current))
     ):
         _reject_populated_pre_targeted_tool_grant_database(connection)
+    if current < 58 and any(revision.revision == 58 for revision in schema.pending(current)):
+        _reject_unprofiled_verified_work_records(connection)
     if current == schema.UNINITIALIZED:
         _apply_baseline(connection)
         current = schema.BASELINE_REVISION
@@ -5952,8 +6062,6 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_eval_result_baseline_schema(connection)
         if rev.revision == 48:
             _validate_captured_eval_case_schema(connection)
-        if rev.revision == 49:
-            _validate_verified_work_schema(connection)
         if rev.revision == 50:
             _validate_eval_run_invocation_column(connection)
         if rev.revision == 51:
@@ -5968,6 +6076,11 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_eval_run_scenario_progress_column(connection)
         if rev.revision == 57:
             _validate_session_message_queue_typed_message_column(connection)
+        if rev.revision == 58:
+            _validate_verified_work_schema(
+                connection,
+                require_verifier_profiles=True,
+            )
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

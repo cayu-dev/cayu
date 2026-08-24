@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from cayu.runtime.completion_verifier_profiles import (
+    CompletionVerifierProfilePreparationRequest,
+    CompletionVerifierProfileRecord,
+    completion_verifier_profile_preparation_request_sha256,
+)
 from cayu.runtime.invocation import SessionInvocation, TaskInvocation
 from cayu.runtime.work_contracts import (
     CompletionDecision,
@@ -52,6 +57,7 @@ def completion_decision_request_from_record(
             claim_id=decision.claim_id,
             worker_id=decision.worker_id,
             verifier=decision.verifier,
+            verifier_profile_fingerprint=decision.verifier_profile_fingerprint,
             decision_version=decision.decision_version,
             verdict=decision.verdict,
             criterion_outcomes=decision.criterion_outcomes,
@@ -109,6 +115,47 @@ def require_completion_proposal_integrity(
         del proposal, attempt, attempt_request, proposal_request
         raise WorkCompletionConflict(
             "Durable completion proposal conflicts with its work attempt."
+        ) from None
+
+
+def require_completion_verifier_profile_integrity(
+    *,
+    profile: CompletionVerifierProfileRecord,
+    proposal: CompletionProposal,
+    attempt: WorkAttempt,
+    contract: WorkContract,
+) -> None:
+    """Require one verifier profile to bind a canonical proposal authority chain."""
+
+    require_completion_proposal_integrity(proposal=proposal, attempt=attempt)
+    preparation = CompletionVerifierProfilePreparationRequest(
+        proposal_id=profile.proposal_id,
+        task_id=profile.task_id,
+        attempt_id=profile.attempt_id,
+        attempt_request_sha256=profile.attempt_request_sha256,
+        source_execution_profile_fingerprint=profile.source_execution_profile_fingerprint,
+        proposal_request_sha256=profile.proposal_request_sha256,
+        contract=profile.contract,
+        profile=profile.profile,
+        expected_prior_proposal_id=profile.expected_prior_proposal_id,
+        expected_prior_profile_fingerprint=profile.expected_prior_profile_fingerprint,
+        adoption=profile.adoption,
+    )
+    if (
+        profile.proposal_id != proposal.proposal_id
+        or profile.task_id != proposal.task_id
+        or profile.attempt_id != attempt.attempt_id
+        or profile.attempt_request_sha256 != attempt.request_sha256
+        or profile.source_execution_profile_fingerprint != attempt.execution_profile_fingerprint
+        or profile.proposal_request_sha256 != proposal.request_sha256
+        or profile.contract != contract.reference()
+        or proposal.contract != contract.reference()
+        or profile.profile.verifier != contract.verifier
+        or profile.request_sha256
+        != completion_verifier_profile_preparation_request_sha256(preparation)
+    ):
+        raise WorkCompletionConflict(
+            "Durable completion-verifier profile conflicts with proposal authority."
         ) from None
 
 
@@ -173,6 +220,7 @@ def completion_decision_claim_authority_matches(
         and claim.proposal_id == proposal.proposal_id
         and decision.worker_id == claim.worker_id
         and decision.verifier == claim.verifier
+        and decision.verifier_profile_fingerprint == claim.verifier_profile_fingerprint
         and claim.verifier == contract.verifier
         and decision.decided_at >= claim.claimed_at
         and decision.decided_at < claim.lease_expires_at
@@ -186,4 +234,5 @@ __all__ = [
     "invocation_contains_secret_public_identity",
     "require_completion_decision_integrity",
     "require_completion_proposal_integrity",
+    "require_completion_verifier_profile_integrity",
 ]

@@ -151,6 +151,29 @@ store, run `cayu storage migrate`, confirm revision 57, and then start this
 build. Do not run mixed revision-56/revision-57 session fleets: older workers
 would silently deliver only the text projection.
 
+### Completion-verifier attempts carry immutable execution profiles
+
+Deterministic completion verification now persists a verifier-specific execution
+profile before claiming or dispatching the adapter. The record binds the frozen
+work contract, candidate proposal, source attempt/profile, verifier reference,
+and bounded application-versioned adapter/component identities. Claims,
+renewals, decisions, replay, and decision application carry the same profile
+fingerprint, while registration drift and missing components fail before verifier
+work.
+
+Later attempts may change verifier behavior only through an explicit
+`ExecutionProfileAdoptionIntent` authorized by an application
+`CompletionVerifierProfilePolicy`. Exact retries reuse the durable authorization
+without rerunning policy. Provider-backed verifier dispatch remains reserved for
+the downstream provider-verifier executor.
+
+Breaking storage revision 58 adds the profile registry and required claim and
+decision attribution. Migration rejects prerelease SQLite or PostgreSQL stores
+that already contain verification claims or decisions because their historical
+profile cannot be reconstructed safely. Stop revision-57 and older verifier/task
+workers, back up and recreate affected stores, migrate, and confirm revision 58
+before starting the new verifier workers.
+
 ## v0.4.0
 
 `v0.4.0` turns Cayu's evaluation, memory, durable task, provider, and workspace

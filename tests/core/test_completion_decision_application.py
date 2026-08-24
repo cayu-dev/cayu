@@ -6,6 +6,10 @@ from datetime import timedelta
 from hashlib import sha256
 
 import pytest
+from tests.core.completion_verifier_profile_fixtures import (
+    prepare_test_completion_verifier_profile,
+    retask_test_completion_verifier_profile,
+)
 from tests.core.task_invocation_fixtures import unattributed_session_invocation_binding
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
@@ -111,6 +115,7 @@ def _decision_request(
     proposal_id: str,
     claim_id: str,
     decision_id: str,
+    verifier_profile_fingerprint: str,
 ) -> CompletionDecisionCreate:
     if verdict is CompletionVerdict.ACCEPTED:
         outcome = CompletionCriterionOutcome(
@@ -139,6 +144,7 @@ def _decision_request(
         claim_id=claim_id,
         worker_id="verifier-worker",
         verifier=_verifier(),
+        verifier_profile_fingerprint=verifier_profile_fingerprint,
         verdict=verdict,
         criterion_outcomes=(outcome,),
         gaps=gaps,
@@ -171,12 +177,17 @@ async def _persist_decision(
             result=proposal_result,
         )
     )
+    verifier_profile = await prepare_test_completion_verifier_profile(
+        store,
+        proposal.proposal_id,
+    )
     claim = await store.claim_completion_verification(
         CompletionVerificationClaimRequest(
             claim_id=f"claim-{suffix}",
             proposal_id=proposal.proposal_id,
             worker_id="verifier-worker",
             verifier=_verifier(),
+            verifier_profile_fingerprint=verifier_profile.profile.fingerprint,
         )
     )
     decision = await store.record_completion_decision(
@@ -185,6 +196,7 @@ async def _persist_decision(
             proposal_id=proposal.proposal_id,
             claim_id=claim.claim_id,
             decision_id=f"decision-{suffix}",
+            verifier_profile_fingerprint=verifier_profile.profile.fingerprint,
         )
     )
     assert decision.claim_authority_sha256 == (
@@ -313,6 +325,70 @@ def test_sqlite_app_applies_accepted_decision_and_exactly_replays_receipt() -> N
     asyncio.run(scenario())
 
 
+def test_application_rejects_incoherent_prior_profile_authority_before_mutation() -> None:
+    forged_task_id = "unrelated-prior-application-task"
+
+    class CorruptPriorAuthorityStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+        corrupt_prior = False
+
+        async def load_prior_completion_verifier_profile(self, proposal_id):
+            profile = await super().load_prior_completion_verifier_profile(proposal_id)
+            if not self.corrupt_prior or profile is None:
+                return profile
+            return retask_test_completion_verifier_profile(
+                profile,
+                task_id=forged_task_id,
+            )
+
+        async def load_completion_proposal(self, proposal_id):
+            proposal = await super().load_completion_proposal(proposal_id)
+            if self.corrupt_prior and proposal is not None and proposal.proposal_id == "proposal-1":
+                return proposal.model_copy(update={"task_id": forged_task_id})
+            return proposal
+
+    async def scenario() -> None:
+        store = CorruptPriorAuthorityStore()
+        app = _app(store)
+        task = await _running_task(store)
+        first_decision_id, _ = await _persist_decision(
+            store,
+            task=task,
+            ordinal=1,
+            verdict=CompletionVerdict.REJECTED,
+        )
+        continued = await app.apply_completion_decision(
+            CompletionDecisionApplicationRequest(
+                task_id=task.id,
+                decision_id=first_decision_id,
+                idempotency_key="apply-prior-authority-first",
+            )
+        )
+        second_decision_id, _ = await _persist_decision(
+            store,
+            task=continued,
+            ordinal=2,
+            verdict=CompletionVerdict.ACCEPTED,
+        )
+        before = await store.load_task(task.id)
+        store.corrupt_prior = True
+
+        with pytest.raises(WorkCompletionConflict, match="work attempt"):
+            await app.apply_completion_decision(
+                CompletionDecisionApplicationRequest(
+                    task_id=task.id,
+                    decision_id=second_decision_id,
+                    idempotency_key="apply-prior-authority-second",
+                    result=_result("2"),
+                    result_reference=_result_reference("2"),
+                )
+            )
+        store.corrupt_prior = False
+        assert await store.load_task(task.id) == before
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("verdict", "contract", "expected_status", "expected_reason"),
     [
@@ -371,6 +447,14 @@ def test_app_applies_explicit_nonaccepted_transition_semantics(
         assert applied.status_reason == expected_reason
         assert applied.worker_id is None
         assert applied.lease_expires_at is None
+        decision = await store.load_completion_decision(decision_id)
+        assert decision is not None
+        assert applied.status_payload == {
+            "completion_decision_id": decision.decision_id,
+            "gap_fingerprint": decision.gap_fingerprint,
+            "verifier_profile_fingerprint": decision.verifier_profile_fingerprint,
+            "verdict": decision.verdict.value,
+        }
 
     asyncio.run(scenario())
 
@@ -493,6 +577,9 @@ def test_app_rejects_conflicting_application_tuple_without_mutation() -> None:
             request.idempotency_key,
         )
         assert receipt is not None
+        decision = await store.load_completion_decision(decision_id)
+        assert decision is not None
+        assert receipt.verifier_profile_fingerprint == decision.verifier_profile_fingerprint
         assert receipt.task.result == _result("1")
 
     asyncio.run(scenario())
@@ -775,6 +862,7 @@ def test_app_detaches_sensitive_malformed_loaded_authority(
             claim_id=durable.claim_id,
             worker_id=durable.worker_id,
             verifier=durable.verifier,
+            verifier_profile_fingerprint=durable.verifier_profile_fingerprint,
             verdict=durable.verdict,
             criterion_outcomes=(malformed_outcome,),
         )
@@ -1628,6 +1716,56 @@ def test_app_rejects_exact_receipt_with_semantically_forged_task_snapshot(
 
         persisted = await store.load_task(task.id)
         assert persisted == completed
+
+    asyncio.run(scenario())
+
+
+def test_app_rejects_exact_receipt_with_forged_verifier_profile_fingerprint() -> None:
+    class ForgedProfileReceiptStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.forge_receipts = False
+
+        async def load_completion_decision_application_receipt(
+            self,
+            task_id: str,
+            idempotency_key: str,
+        ) -> CompletionDecisionApplicationReceipt | None:
+            receipt = await super().load_completion_decision_application_receipt(
+                task_id,
+                idempotency_key,
+            )
+            if receipt is None or not self.forge_receipts:
+                return receipt
+            return receipt.model_copy(
+                update={"verifier_profile_fingerprint": _digest("forged-profile")}
+            )
+
+    async def scenario() -> None:
+        store = ForgedProfileReceiptStore()
+        app = _app(store)
+        task = await _running_task(store)
+        decision_id, reference = await _persist_decision(
+            store,
+            task=task,
+            ordinal=1,
+            verdict=CompletionVerdict.ACCEPTED,
+        )
+        request = CompletionDecisionApplicationRequest(
+            task_id=task.id,
+            decision_id=decision_id,
+            idempotency_key="application-forged-profile-receipt",
+            result=_result("1"),
+            result_reference=reference,
+        )
+        completed = await app.apply_completion_decision(request)
+        store.forge_receipts = True
+
+        with pytest.raises(WorkCompletionConflict, match="verifier-profile authority"):
+            await app.apply_completion_decision(request)
+        assert await store.load_task(task.id) == completed
 
     asyncio.run(scenario())
 

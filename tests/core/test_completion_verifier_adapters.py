@@ -9,16 +9,23 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 
 import pytest
+from tests.core.completion_verifier_profile_fixtures import (
+    prepare_test_completion_verifier_profile,
+    retask_test_completion_verifier_profile,
+)
 from tests.core.task_invocation_fixtures import unattributed_session_invocation_binding
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 from cayu import (
     CayuApp,
+    CompletionContinuationPolicy,
     CompletionCriterionOutcome,
     CompletionDecision,
+    CompletionDecisionApplicationRequest,
     CompletionDecisionCreate,
     CompletionGap,
     CompletionProposalCreate,
+    CompletionRejectionAction,
     CompletionResultReference,
     CompletionSatisfactionBasis,
     CompletionVerdict,
@@ -28,13 +35,25 @@ from cayu import (
     CompletionVerifierExecutionError,
     CompletionVerifierExecutionRequest,
     CompletionVerifierKind,
+    CompletionVerifierProfileAdoptionDecision,
+    CompletionVerifierProfileComponentDeclaration,
+    CompletionVerifierProfilePolicy,
+    CompletionVerifierProfilePolicyRequest,
     CompletionVerifierRef,
     CompletionVerifierRequest,
     CompletionVerifierUnavailable,
     CriterionOutcomeStatus,
     DeterministicCompletionVerifier,
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfileBehaviorIdentity,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyResult,
     InMemoryTaskStore,
+    ResolutionActor,
+    ResolutionActorSource,
     SecretRedactor,
+    SQLiteTaskStore,
     TaskCreate,
     WorkAttemptCreate,
     WorkCompletionConflict,
@@ -48,6 +67,13 @@ from cayu.runtime._diagnostics import (
     MAX_DIAGNOSTIC_EXCEPTION_GROUP_NODES,
     MAX_DIAGNOSTIC_UTF8_BYTES,
 )
+from cayu.runtime.completion_verifier_profiles import (
+    COMPLETION_VERIFIER_PROFILE_COMPONENT_MAX_ITEMS,
+    COMPLETION_VERIFIER_PROFILE_TEXT_MAX_CHARS,
+    build_completion_verifier_execution_profile,
+    changed_completion_verifier_profile_components,
+)
+from cayu.runtime.execution_profiles import EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS
 from cayu.runtime.work_contracts import (
     WORK_COMPLETION_OUTCOME_MAX_EVIDENCE_REFERENCES,
     WORK_COMPLETION_VERIFIER_DECISION_MAX_BYTES,
@@ -60,6 +86,16 @@ from cayu.runtime.work_contracts import (
 
 def _digest(value: str) -> str:
     return sha256(value.encode()).hexdigest()
+
+
+class _TestCompletionVerifier(DeterministicCompletionVerifier):
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name=type(self).__name__,
+            behavior_version="v1",
+            implementation_version="test-v1",
+        )
 
 
 def _verifier_reference(
@@ -79,6 +115,7 @@ def _contract(
     *,
     verifier: CompletionVerifierRef | None = None,
     objective: str = "Publish a ready bid package.",
+    continuation_policy: CompletionContinuationPolicy | None = None,
 ) -> WorkContract:
     return work_contract_from_draft(
         WorkContractDraft(
@@ -93,6 +130,7 @@ def _contract(
                 ),
             ),
             verifier=verifier or _verifier_reference(),
+            continuation_policy=continuation_policy or CompletionContinuationPolicy(),
         )
     )
 
@@ -130,7 +168,7 @@ def _rejected_decision() -> CompletionVerifierDecision:
     )
 
 
-class RecordingVerifier(DeterministicCompletionVerifier):
+class RecordingVerifier(_TestCompletionVerifier):
     def __init__(self, decision: CompletionVerifierDecision) -> None:
         self.decision = decision
         self.requests: list[CompletionVerifierRequest] = []
@@ -226,6 +264,7 @@ def _execution_request(
     suffix: str = "1",
     lease_seconds: int = 30,
     timeout_seconds: float = 5.0,
+    profile_adoption: ExecutionProfileAdoptionIntent | None = None,
 ) -> CompletionVerifierExecutionRequest:
     return CompletionVerifierExecutionRequest(
         proposal_id=proposal_id,
@@ -234,6 +273,7 @@ def _execution_request(
         worker_id="verifier-worker",
         lease_seconds=lease_seconds,
         execution_timeout_seconds=timeout_seconds,
+        profile_adoption=profile_adoption,
     )
 
 
@@ -267,6 +307,722 @@ def test_public_adapter_persists_decision_and_replays_after_restart() -> None:
         restarted = CayuApp(task_store=store, enable_logging=False)
         assert await restarted.verify_completion_proposal(request) == decision
         assert len(verifier.requests) == 1
+
+    asyncio.run(scenario())
+
+
+def test_profile_is_durable_before_adapter_dispatch_and_bound_to_public_evidence() -> None:
+    class ProfileObservingVerifier(_TestCompletionVerifier):
+        def __init__(self, store: InMemoryTaskStore) -> None:
+            self.store = store
+            self.profile_seen = None
+
+        async def verify(
+            self,
+            request: CompletionVerifierRequest,
+        ) -> CompletionVerifierDecision:
+            self.profile_seen = await self.store.load_completion_verifier_profile(
+                request.proposal.proposal_id
+            )
+            assert self.profile_seen is not None
+            return _accepted_decision()
+
+    async def scenario() -> None:
+        store = InMemoryTaskStore()
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        verifier = ProfileObservingVerifier(store)
+        app = CayuApp(task_store=store, enable_logging=False)
+        app.register_completion_verifier(contract.verifier, verifier)
+
+        decision = await app.verify_completion_proposal(_execution_request(proposal_id))
+        profile = verifier.profile_seen
+        assert profile is not None
+        claim = await store.load_completion_verification_claim(proposal_id)
+        assert claim is not None
+        assert claim.verifier_profile_fingerprint == profile.profile.fingerprint
+        assert decision.verifier_profile_fingerprint == profile.profile.fingerprint
+        assert profile.profile.verifier == contract.verifier
+        assert profile.source_execution_profile_fingerprint == _digest("worker-profile")
+        durable_profile_json = profile.model_dump_json()
+        assert contract.objective not in durable_profile_json
+        assert contract.criteria[0].description not in durable_profile_json
+        assert "task.result" not in durable_profile_json
+
+    asyncio.run(scenario())
+
+
+def test_registered_verifier_profile_is_snapshotted_and_live_drift_fails_before_claim() -> None:
+    class MutableIdentityVerifier(RecordingVerifier):
+        def __init__(self) -> None:
+            super().__init__(_accepted_decision())
+            self.behavior_version = "v1"
+
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return ExecutionProfileBehaviorIdentity(
+                name="tests:mutable-completion-verifier",
+                behavior_version=self.behavior_version,
+                implementation_version="1",
+            )
+
+    async def scenario() -> None:
+        store = InMemoryTaskStore()
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        verifier = MutableIdentityVerifier()
+        app = CayuApp(task_store=store, enable_logging=False)
+        app.register_completion_verifier(contract.verifier, verifier)
+        verifier.behavior_version = "v2"
+
+        # Repeated pre-dispatch profile failures must not consume the bounded
+        # adapter-dispatch capacity. The 65th retry crosses the runtime's
+        # capacity bound and would expose a leaked reservation.
+        for _ in range(65):
+            with pytest.raises(CompletionVerifierUnavailable, match="identity changed"):
+                await app.verify_completion_proposal(_execution_request(proposal_id))
+        assert verifier.requests == []
+        assert await store.load_completion_verifier_profile(proposal_id) is None
+        assert await store.load_completion_verification_claim(proposal_id) is None
+
+    asyncio.run(scenario())
+
+
+def test_live_verifier_profile_drift_during_preparation_fails_before_claim() -> None:
+    class BlockingProfileStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.preparation_started = asyncio.Event()
+            self.release_preparation = asyncio.Event()
+
+        async def prepare_completion_verifier_profile(self, request):
+            self.preparation_started.set()
+            await self.release_preparation.wait()
+            return await super().prepare_completion_verifier_profile(request)
+
+    class MutableIdentityVerifier(RecordingVerifier):
+        def __init__(self) -> None:
+            super().__init__(_accepted_decision())
+            self.behavior_version = "v1"
+
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return ExecutionProfileBehaviorIdentity(
+                name="tests:preparation-race-completion-verifier",
+                behavior_version=self.behavior_version,
+                implementation_version="1",
+            )
+
+    async def scenario() -> None:
+        store = BlockingProfileStore()
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        verifier = MutableIdentityVerifier()
+        app = CayuApp(task_store=store, enable_logging=False)
+        app.register_completion_verifier(contract.verifier, verifier)
+
+        execution = asyncio.create_task(
+            app.verify_completion_proposal(_execution_request(proposal_id))
+        )
+        await store.preparation_started.wait()
+        verifier.behavior_version = "v2"
+        store.release_preparation.set()
+
+        with pytest.raises(CompletionVerifierUnavailable, match="identity changed"):
+            await execution
+        assert verifier.requests == []
+        assert await store.load_completion_verification_claim(proposal_id) is None
+
+    asyncio.run(scenario())
+
+
+def test_duplicate_verifier_component_identity_is_rejected_at_registration() -> None:
+    component = CompletionVerifierProfileComponentDeclaration(
+        component_id="rules",
+        identity=ExecutionProfileBehaviorIdentity(
+            name="tests:verifier-rules",
+            behavior_version="1",
+            implementation_version="1",
+        ),
+    )
+
+    class DuplicateComponentVerifier(RecordingVerifier):
+        @property
+        def execution_profile_components(
+            self,
+        ) -> tuple[CompletionVerifierProfileComponentDeclaration, ...]:
+            return (component, component)
+
+    app = CayuApp(task_store=InMemoryTaskStore(), enable_logging=False)
+    verifier = DuplicateComponentVerifier(_accepted_decision())
+    assert verifier.execution_profile_components == (component, component)
+    with pytest.raises(ValueError, match="component identities are invalid"):
+        app.register_completion_verifier(
+            _verifier_reference(),
+            verifier,
+        )
+
+
+def test_adoption_evidence_accepts_the_complete_bounded_component_union() -> None:
+    adapter_identity = ExecutionProfileBehaviorIdentity(
+        name="tests:maximum-component-union",
+        behavior_version="1",
+        implementation_version="1",
+    )
+
+    def declarations(prefix: str) -> tuple[CompletionVerifierProfileComponentDeclaration, ...]:
+        return tuple(
+            CompletionVerifierProfileComponentDeclaration(
+                component_id=f"{prefix}-{index:02d}",
+                identity=ExecutionProfileBehaviorIdentity(
+                    name=f"tests:{prefix}:{index:02d}",
+                    behavior_version="1",
+                    implementation_version="1",
+                ),
+            )
+            for index in range(COMPLETION_VERIFIER_PROFILE_COMPONENT_MAX_ITEMS)
+        )
+
+    expected = build_completion_verifier_execution_profile(
+        verifier=_verifier_reference(),
+        adapter_identity=adapter_identity,
+        component_declarations=declarations("expected"),
+    )
+    candidate = build_completion_verifier_execution_profile(
+        verifier=_verifier_reference(),
+        adapter_identity=adapter_identity,
+        component_declarations=declarations("candidate"),
+    )
+    changed = changed_completion_verifier_profile_components(expected, candidate)
+
+    assert len(changed) == COMPLETION_VERIFIER_PROFILE_COMPONENT_MAX_ITEMS * 2
+    adoption = CompletionVerifierProfileAdoptionDecision(
+        expected_profile_fingerprint=expected.fingerprint,
+        candidate_profile_fingerprint=candidate.fingerprint,
+        changed_component_ids=changed,
+        policy_identity="tests:maximum-component-union-policy:v1",
+        authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+        idempotency_key="maximum-component-union-adoption",
+        requested_by=ResolutionActor(
+            subject="operator-1",
+            source=ResolutionActorSource.REQUEST,
+        ),
+        reason="Adopt the expanded verifier component profile.",
+        policy_reason="The expanded verifier component profile is authorized.",
+        request_sha256=_digest("maximum-component-union-adoption"),
+    )
+    assert adoption.changed_component_ids == changed
+
+    with pytest.raises(ValueError, match="must not exceed"):
+        CompletionVerifierProfileAdoptionDecision(
+            expected_profile_fingerprint=adoption.expected_profile_fingerprint,
+            candidate_profile_fingerprint=adoption.candidate_profile_fingerprint,
+            changed_component_ids=("x" * (COMPLETION_VERIFIER_PROFILE_TEXT_MAX_CHARS + 1),),
+            policy_identity=adoption.policy_identity,
+            authority_decision=adoption.authority_decision,
+            idempotency_key=adoption.idempotency_key,
+            requested_by=adoption.requested_by,
+            reason=adoption.reason,
+            policy_reason=adoption.policy_reason,
+            request_sha256=adoption.request_sha256,
+        )
+
+
+def test_verifier_registration_requires_nonsecret_stable_component_authority(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class UnidentifiedVerifier(DeterministicCompletionVerifier):
+        async def verify(
+            self,
+            request: CompletionVerifierRequest,
+        ) -> CompletionVerifierDecision:
+            del request
+            return _accepted_decision()
+
+    app = CayuApp(task_store=InMemoryTaskStore(), enable_logging=False)
+    with pytest.raises(ValueError, match="stable execution-profile identity"):
+        app.register_completion_verifier(_verifier_reference(), UnidentifiedVerifier())
+
+    secret = "private-verifier-component"
+    component = CompletionVerifierProfileComponentDeclaration(
+        component_id=secret,
+        identity=ExecutionProfileBehaviorIdentity(
+            name="tests:verifier-component",
+            behavior_version="1",
+            implementation_version="1",
+        ),
+    )
+
+    class SecretComponentVerifier(RecordingVerifier):
+        @property
+        def execution_profile_components(
+            self,
+        ) -> tuple[CompletionVerifierProfileComponentDeclaration, ...]:
+            return (component,)
+
+    secret_app = CayuApp(
+        task_store=InMemoryTaskStore(),
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        with pytest.raises(ValueError, match="component identities are invalid") as exc:
+            secret_app.register_completion_verifier(
+                _verifier_reference(),
+                SecretComponentVerifier(_accepted_decision()),
+            )
+    _assert_secret_absent_from_cayu_error(exc.value, secret)
+    captured = capsys.readouterr()
+    assert secret not in caplog.text
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert all(secret not in str(item.message) for item in caught_warnings)
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_changed_profile_requires_adoption_and_exact_adoption_replay_is_durable(
+    store_kind: str,
+    tmp_path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    policy_reason_canary = "~"
+    policy_reason = policy_reason_canary * 300
+    adoption_secret = "PRIVATE_VERIFIER_ADOPTION_SECRET_CANARY"
+
+    class VersionedVerifier(RecordingVerifier):
+        def __init__(
+            self,
+            decision: CompletionVerifierDecision,
+            *,
+            behavior_version: str,
+        ) -> None:
+            super().__init__(decision)
+            self.behavior_version = behavior_version
+
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return ExecutionProfileBehaviorIdentity(
+                name="tests:versioned-completion-verifier",
+                behavior_version=self.behavior_version,
+                implementation_version="1",
+            )
+
+    class AdoptionPolicy(CompletionVerifierProfilePolicy):
+        def __init__(self) -> None:
+            self.requests: list[CompletionVerifierProfilePolicyRequest] = []
+
+        @property
+        def identity(self) -> str:
+            return "tests:completion-verifier-adoption:v1"
+
+        async def decide(
+            self,
+            request: CompletionVerifierProfilePolicyRequest,
+        ) -> ExecutionProfilePolicyResult:
+            self.requests.append(request)
+            return ExecutionProfilePolicyResult(
+                action=ExecutionProfilePolicyAction.ADOPT,
+                reason=policy_reason,
+                authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+            )
+
+    async def scenario() -> None:
+        sqlite_path = tmp_path / "verifier-profile-adoption.sqlite"
+        store = InMemoryTaskStore() if store_kind == "memory" else SQLiteTaskStore(sqlite_path)
+        contract = _contract(
+            continuation_policy=CompletionContinuationPolicy(
+                rejection_action=CompletionRejectionAction.CONTINUE,
+            )
+        )
+        first_proposal_id = await _proposal(store, contract)
+        first = VersionedVerifier(_rejected_decision(), behavior_version="v1")
+        first_app = CayuApp(task_store=store, enable_logging=False)
+        first_app.register_completion_verifier(contract.verifier, first)
+        first_decision = await first_app.verify_completion_proposal(
+            _execution_request(first_proposal_id)
+        )
+        await store.apply_completion_decision(
+            CompletionDecisionApplicationRequest(
+                task_id="task-1",
+                decision_id=first_decision.decision_id,
+                idempotency_key="apply-first-rejection",
+            )
+        )
+
+        second_attempt = await store.begin_work_attempt(
+            WorkAttemptCreate(
+                attempt_id="attempt-2",
+                task_id="task-1",
+                session_id="session-1",
+                contract=contract.reference(),
+                execution_profile_fingerprint=_digest("worker-profile-2"),
+            )
+        )
+        second_proposal = await store.submit_completion_proposal(
+            CompletionProposalCreate(
+                proposal_id="proposal-2",
+                attempt_id=second_attempt.attempt_id,
+                result=CompletionResultReference(
+                    kind="task.result",
+                    reference_id="result-2",
+                    digest=_digest("result-2"),
+                ),
+            )
+        )
+        changed = VersionedVerifier(_rejected_decision(), behavior_version="v2")
+        without_policy = CayuApp(task_store=store, enable_logging=False)
+        without_policy.register_completion_verifier(contract.verifier, changed)
+        request = _execution_request(second_proposal.proposal_id, suffix="2")
+        with pytest.raises(WorkCompletionConflict, match="explicit authorized adoption"):
+            await without_policy.verify_completion_proposal(request)
+        assert changed.requests == []
+        assert await store.load_completion_verifier_profile("proposal-2") is None
+
+        policy = AdoptionPolicy()
+        adopting_app = CayuApp(
+            task_store=store,
+            completion_verifier_profile_policy=policy,
+            secret_redactor=SecretRedactor([adoption_secret, policy_reason_canary]),
+            enable_logging=False,
+        )
+        adopting_app.register_completion_verifier(contract.verifier, changed)
+        secret_intent = ExecutionProfileAdoptionIntent(
+            idempotency_key="reject-secret-verifier-adoption",
+            reason=f"Use verifier v2 with {adoption_secret} authority.",
+            requested_by=ResolutionActor(
+                subject="operator-1",
+                source=ResolutionActorSource.REQUEST,
+            ),
+        )
+        with (
+            warnings.catch_warnings(record=True) as secret_warnings,
+            pytest.raises(WorkCompletionConflict, match="workload secret") as raised,
+        ):
+            warnings.simplefilter("always")
+            await adopting_app.verify_completion_proposal(
+                _execution_request(
+                    second_proposal.proposal_id,
+                    suffix="2",
+                    profile_adoption=secret_intent,
+                )
+            )
+        _assert_secret_absent_from_cayu_error(raised.value, adoption_secret)
+        secret_output = capsys.readouterr()
+        assert adoption_secret not in caplog.text
+        assert adoption_secret not in secret_output.out
+        assert adoption_secret not in secret_output.err
+        assert all(adoption_secret not in str(item.message) for item in secret_warnings)
+        assert policy.requests == []
+        assert changed.requests == []
+        assert await store.load_completion_verifier_profile("proposal-2") is None
+        assert await store.load_completion_verification_claim("proposal-2") is None
+
+        intent = ExecutionProfileAdoptionIntent(
+            idempotency_key="adopt-verifier-v2",
+            reason="Use verifier v2 for the next attempt.",
+            requested_by=ResolutionActor(
+                subject="operator-1",
+                source=ResolutionActorSource.REQUEST,
+            ),
+        )
+        adopted_request = _execution_request(
+            second_proposal.proposal_id,
+            suffix="2",
+            profile_adoption=intent,
+        )
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.simplefilter("always")
+            decision = await adopting_app.verify_completion_proposal(adopted_request)
+        assert len(policy.requests) == 1
+        profile = await store.load_completion_verifier_profile("proposal-2")
+        assert profile is not None
+        assert profile.adoption is not None
+        assert profile.adoption.changed_component_ids == ("adapter",)
+        assert profile.adoption.reason == intent.reason
+        assert "[REDACTED_SECRET]" in profile.adoption.policy_reason
+        assert (
+            len(profile.adoption.policy_reason.encode("utf-8"))
+            <= EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS
+        )
+        assert policy_reason_canary not in profile.model_dump_json()
+        assert policy_reason_canary not in decision.model_dump_json()
+        captured = capsys.readouterr()
+        assert policy_reason_canary not in caplog.text
+        assert policy_reason_canary not in captured.out
+        assert policy_reason_canary not in captured.err
+        assert all(policy_reason_canary not in str(item.message) for item in caught_warnings)
+
+        # For SQLite, cross the actual durable reconstruction boundary instead
+        # of merely creating another app over the same live store object.
+        replay_store = store
+        if isinstance(store, SQLiteTaskStore):
+            await store.close()
+            replay_store = SQLiteTaskStore(sqlite_path)
+        try:
+            # Exact decision replay is authorized by the durable adoption record
+            # and neither needs nor re-runs the application policy.
+            restarted = CayuApp(task_store=replay_store, enable_logging=False)
+            assert await restarted.verify_completion_proposal(adopted_request) == decision
+            assert len(policy.requests) == 1
+            reconstructed = await replay_store.load_completion_verifier_profile("proposal-2")
+            assert reconstructed is not None
+            assert reconstructed.adoption == profile.adoption
+            conflicting = _execution_request(
+                second_proposal.proposal_id,
+                suffix="2",
+                profile_adoption=ExecutionProfileAdoptionIntent(
+                    idempotency_key=intent.idempotency_key,
+                    reason="A different adoption request.",
+                    requested_by=intent.requested_by,
+                ),
+            )
+            with pytest.raises(WorkCompletionConflict, match="adoption retry conflicts"):
+                await restarted.verify_completion_proposal(conflicting)
+
+            await replay_store.apply_completion_decision(
+                CompletionDecisionApplicationRequest(
+                    task_id="task-1",
+                    decision_id=decision.decision_id,
+                    idempotency_key="apply-second-rejection",
+                )
+            )
+            third_attempt = await replay_store.begin_work_attempt(
+                WorkAttemptCreate(
+                    attempt_id="attempt-3",
+                    task_id="task-1",
+                    session_id="session-1",
+                    contract=contract.reference(),
+                    execution_profile_fingerprint=_digest("worker-profile-3"),
+                )
+            )
+            third_proposal = await replay_store.submit_completion_proposal(
+                CompletionProposalCreate(
+                    proposal_id="proposal-3",
+                    attempt_id=third_attempt.attempt_id,
+                    result=CompletionResultReference(
+                        kind="task.result",
+                        reference_id="result-3",
+                        digest=_digest("result-3"),
+                    ),
+                )
+            )
+            third_policy = AdoptionPolicy()
+            third_verifier = VersionedVerifier(_accepted_decision(), behavior_version="v3")
+            third_app = CayuApp(
+                task_store=replay_store,
+                completion_verifier_profile_policy=third_policy,
+                secret_redactor=SecretRedactor([adoption_secret, policy_reason_canary]),
+                enable_logging=False,
+            )
+            third_app.register_completion_verifier(contract.verifier, third_verifier)
+            reused_identity = ExecutionProfileAdoptionIntent(
+                idempotency_key=intent.idempotency_key,
+                reason="Use verifier v3 for the next attempt.",
+                requested_by=intent.requested_by,
+            )
+            with pytest.raises(WorkCompletionConflict, match="idempotency key"):
+                await third_app.verify_completion_proposal(
+                    _execution_request(
+                        third_proposal.proposal_id,
+                        suffix="3",
+                        profile_adoption=reused_identity,
+                    )
+                )
+            assert len(third_policy.requests) == 1
+            assert third_verifier.requests == []
+            assert await replay_store.load_completion_verifier_profile("proposal-3") is None
+        finally:
+            if replay_store is not store:
+                await replay_store.close()
+
+    asyncio.run(scenario())
+
+
+def test_prior_profile_requires_one_canonical_proposal_attempt_chain() -> None:
+    forged_task_id = "unrelated-prior-task"
+
+    class CorruptPriorAuthorityStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+        corrupt_prior = False
+
+        async def load_prior_completion_verifier_profile(self, proposal_id):
+            profile = await super().load_prior_completion_verifier_profile(proposal_id)
+            if not self.corrupt_prior or profile is None:
+                return profile
+            return retask_test_completion_verifier_profile(
+                profile,
+                task_id=forged_task_id,
+            )
+
+        async def load_completion_proposal(self, proposal_id):
+            proposal = await super().load_completion_proposal(proposal_id)
+            if self.corrupt_prior and proposal is not None and proposal.proposal_id == "proposal-1":
+                return proposal.model_copy(update={"task_id": forged_task_id})
+            return proposal
+
+    async def scenario() -> None:
+        store = CorruptPriorAuthorityStore()
+        contract = _contract(
+            continuation_policy=CompletionContinuationPolicy(
+                rejection_action=CompletionRejectionAction.CONTINUE,
+            )
+        )
+        first_proposal_id = await _proposal(store, contract)
+        first_verifier = RecordingVerifier(_rejected_decision())
+        first_app = CayuApp(task_store=store, enable_logging=False)
+        first_app.register_completion_verifier(contract.verifier, first_verifier)
+        first_decision = await first_app.verify_completion_proposal(
+            _execution_request(first_proposal_id)
+        )
+        await store.apply_completion_decision(
+            CompletionDecisionApplicationRequest(
+                task_id="task-1",
+                decision_id=first_decision.decision_id,
+                idempotency_key="apply-prior-chain-rejection",
+            )
+        )
+        second_attempt = await store.begin_work_attempt(
+            WorkAttemptCreate(
+                attempt_id="attempt-2",
+                task_id="task-1",
+                session_id="session-1",
+                contract=contract.reference(),
+                execution_profile_fingerprint=_digest("worker-profile-2"),
+            )
+        )
+        second_proposal = await store.submit_completion_proposal(
+            CompletionProposalCreate(
+                proposal_id="proposal-2",
+                attempt_id=second_attempt.attempt_id,
+                result=CompletionResultReference(
+                    kind="task.result",
+                    reference_id="result-2",
+                    digest=_digest("result-2"),
+                ),
+            )
+        )
+        second_verifier = RecordingVerifier(_accepted_decision())
+        second_app = CayuApp(task_store=store, enable_logging=False)
+        second_app.register_completion_verifier(contract.verifier, second_verifier)
+        store.corrupt_prior = True
+
+        with pytest.raises(WorkCompletionConflict, match="work attempt"):
+            await second_app.verify_completion_proposal(
+                _execution_request(second_proposal.proposal_id, suffix="2")
+            )
+        assert second_verifier.requests == []
+        assert await store.load_completion_verification_claim("proposal-2") is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_restart_requires_the_exact_profile_before_replacement_dispatch(
+    store_kind: str,
+    tmp_path,
+) -> None:
+    class VersionedVerifier(RecordingVerifier):
+        def __init__(
+            self,
+            decision: CompletionVerifierDecision,
+            *,
+            behavior_version: str,
+            fail: bool = False,
+        ) -> None:
+            super().__init__(decision)
+            self.behavior_version = behavior_version
+            self.fail = fail
+
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return ExecutionProfileBehaviorIdentity(
+                name="tests:restart-completion-verifier",
+                behavior_version=self.behavior_version,
+                implementation_version="1",
+            )
+
+        async def verify(
+            self,
+            request: CompletionVerifierRequest,
+        ) -> CompletionVerifierDecision:
+            self.requests.append(request)
+            if self.fail:
+                raise RuntimeError("first verifier worker failed")
+            return self.decision
+
+    async def scenario() -> None:
+        now = [datetime(2026, 1, 1, tzinfo=UTC)]
+        sqlite_path = tmp_path / "verifier-profile-replacement.sqlite"
+        store = (
+            InMemoryTaskStore(clock=lambda: now[0])
+            if store_kind == "memory"
+            else SQLiteTaskStore(sqlite_path, clock=lambda: now[0])
+        )
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        initial = VersionedVerifier(
+            _accepted_decision(),
+            behavior_version="v1",
+            fail=True,
+        )
+        first_app = CayuApp(task_store=store, enable_logging=False)
+        first_app.register_completion_verifier(contract.verifier, initial)
+        original = _execution_request(
+            proposal_id,
+            lease_seconds=1,
+            timeout_seconds=0.5,
+        )
+        with pytest.raises(CompletionVerifierExecutionError):
+            await first_app.verify_completion_proposal(original)
+
+        profile = await store.load_completion_verifier_profile(proposal_id)
+        original_claim = await store.load_completion_verification_claim(proposal_id)
+        assert profile is not None
+        assert original_claim is not None
+        assert original_claim.verifier_profile_fingerprint == profile.profile.fingerprint
+
+        if isinstance(store, SQLiteTaskStore):
+            await store.close()
+            store = SQLiteTaskStore(sqlite_path, clock=lambda: now[0])
+
+        missing = CayuApp(task_store=store, enable_logging=False)
+        with pytest.raises(CompletionVerifierUnavailable, match="not registered"):
+            await missing.verify_completion_proposal(original)
+        assert await store.load_completion_verification_claim(proposal_id) == original_claim
+
+        changed = VersionedVerifier(_accepted_decision(), behavior_version="v2")
+        changed_app = CayuApp(task_store=store, enable_logging=False)
+        changed_app.register_completion_verifier(contract.verifier, changed)
+        with pytest.raises(CompletionVerifierUnavailable, match="durable profile"):
+            await changed_app.verify_completion_proposal(original)
+        assert changed.requests == []
+        assert await store.load_completion_verification_claim(proposal_id) == original_claim
+
+        now[0] += timedelta(seconds=2)
+        exact = VersionedVerifier(_accepted_decision(), behavior_version="v1")
+        exact_app = CayuApp(task_store=store, enable_logging=False)
+        exact_app.register_completion_verifier(contract.verifier, exact)
+        replacement = _execution_request(
+            proposal_id,
+            suffix="replacement",
+            lease_seconds=1,
+            timeout_seconds=0.5,
+        )
+        decision = await exact_app.verify_completion_proposal(replacement)
+        replacement_claim = await store.load_completion_verification_claim(proposal_id)
+        assert replacement_claim is not None
+        assert replacement_claim.attempt_number == original_claim.attempt_number + 1
+        assert replacement_claim.verifier_profile_fingerprint == profile.profile.fingerprint
+        assert decision.verifier_profile_fingerprint == profile.profile.fingerprint
+        assert len(exact.requests) == 1
+
+        if isinstance(store, SQLiteTaskStore):
+            await store.close()
 
     asyncio.run(scenario())
 
@@ -333,7 +1089,7 @@ def test_rejected_adapter_outcome_is_bound_without_applying_task_state() -> None
 
 
 def test_identical_concurrent_execution_is_single_flight() -> None:
-    class BarrierVerifier(DeterministicCompletionVerifier):
+    class BarrierVerifier(_TestCompletionVerifier):
         def __init__(self) -> None:
             self.started = asyncio.Event()
             self.release = asyncio.Event()
@@ -377,7 +1133,7 @@ def test_single_flight_waiter_cancellation_is_secret_safe(
 ) -> None:
     secret = "completion-verifier-lock-cancellation-secret"
 
-    class BarrierVerifier(DeterministicCompletionVerifier):
+    class BarrierVerifier(_TestCompletionVerifier):
         def __init__(self) -> None:
             self.started = asyncio.Event()
             self.release = asyncio.Event()
@@ -440,7 +1196,7 @@ def test_single_flight_waiter_cancellation_is_secret_safe(
 
 
 def test_separate_apps_cannot_dispatch_from_the_same_live_claim() -> None:
-    class BarrierVerifier(DeterministicCompletionVerifier):
+    class BarrierVerifier(_TestCompletionVerifier):
         def __init__(self) -> None:
             self.started = asyncio.Event()
             self.release = asyncio.Event()
@@ -520,7 +1276,7 @@ def test_preforked_app_mints_process_local_execution_owners_and_dispatches_once(
                     )
             return await super().claim_completion_verification(request)
 
-    class ProcessBarrierVerifier(DeterministicCompletionVerifier):
+    class ProcessBarrierVerifier(_TestCompletionVerifier):
         async def verify(
             self,
             request: CompletionVerifierRequest,
@@ -611,7 +1367,7 @@ def test_inherited_active_verifier_state_fails_before_store_mutation() -> None:
 
 
 def test_proposal_scoped_single_flight_rejects_a_second_decision_identity() -> None:
-    class BarrierVerifier(DeterministicCompletionVerifier):
+    class BarrierVerifier(_TestCompletionVerifier):
         def __init__(self) -> None:
             self.started = asyncio.Event()
             self.release = asyncio.Event()
@@ -657,7 +1413,7 @@ def test_proposal_scoped_single_flight_rejects_a_second_decision_identity() -> N
 
 
 def test_proposal_scoped_drain_blocks_replacement_claim_after_lease_expiry() -> None:
-    class ResistantVerifier(DeterministicCompletionVerifier):
+    class ResistantVerifier(_TestCompletionVerifier):
         def __init__(self) -> None:
             self.started = asyncio.Event()
             self.cancelled = asyncio.Event()
@@ -722,7 +1478,7 @@ def test_proposal_scoped_drain_blocks_replacement_claim_after_lease_expiry() -> 
 
 
 def test_retry_cannot_steal_a_completed_adapter_drain_before_its_callback() -> None:
-    class ResistantVerifier(DeterministicCompletionVerifier):
+    class ResistantVerifier(_TestCompletionVerifier):
         def __init__(self) -> None:
             self.cancelled = asyncio.Event()
             self.release = asyncio.Event()
@@ -821,7 +1577,7 @@ def test_retry_cannot_steal_a_completed_adapter_drain_before_its_callback() -> N
 
 
 def test_caller_cancellation_cancels_adapter_and_publishes_no_decision() -> None:
-    class CancellableVerifier(DeterministicCompletionVerifier):
+    class CancellableVerifier(_TestCompletionVerifier):
         def __init__(self) -> None:
             self.started = asyncio.Event()
             self.cancelled = asyncio.Event()
@@ -860,7 +1616,7 @@ def test_caller_cancellation_cancels_adapter_and_publishes_no_decision() -> None
 
 
 def test_concurrent_caller_cancellation_and_adapter_fatal_signal_are_both_preserved() -> None:
-    class ConcurrentFatalVerifier(DeterministicCompletionVerifier):
+    class ConcurrentFatalVerifier(_TestCompletionVerifier):
         def __init__(self) -> None:
             self.owner: asyncio.Task[CompletionDecision] | None = None
 
@@ -909,7 +1665,7 @@ def test_adapter_and_claim_renewal_failures_are_both_preserved() -> None:
                 return await super().renew_completion_verification_claim(request)
             raise ConnectionError("claim renewal failed")
 
-    class FatalAfterRenewalFailureVerifier(DeterministicCompletionVerifier):
+    class FatalAfterRenewalFailureVerifier(_TestCompletionVerifier):
         async def verify(
             self,
             request: CompletionVerifierRequest,
@@ -960,12 +1716,17 @@ def test_in_memory_claim_renewal_is_nondecreasing_across_backward_clock_steps() 
             lease_seconds=300,
             timeout_seconds=30.0,
         )
+        verifier_profile = await prepare_test_completion_verifier_profile(
+            store,
+            proposal_id,
+        )
         claim_request = CompletionVerificationClaimRequest(
             claim_id=request.claim_id,
             proposal_id=request.proposal_id,
             worker_id=request.worker_id,
             execution_owner_id="cver_test_owner",
             verifier=contract.verifier,
+            verifier_profile_fingerprint=verifier_profile.profile.fingerprint,
             lease_seconds=request.lease_seconds,
             execution_timeout_seconds=request.execution_timeout_seconds,
         )
@@ -1029,7 +1790,7 @@ def test_nonextending_heartbeat_renewal_cancels_adapter_before_publication() -> 
                 update={"lease_expires_at": renewed.lease_expires_at - timedelta(milliseconds=100)}
             )
 
-    class CancellableVerifier(DeterministicCompletionVerifier):
+    class CancellableVerifier(_TestCompletionVerifier):
         def __init__(self) -> None:
             self.started = asyncio.Event()
             self.cancelled = asyncio.Event()
@@ -1085,7 +1846,7 @@ def test_renewal_adapter_and_caller_cancellation_failures_are_all_preserved() ->
                 return await super().renew_completion_verification_claim(request)
             raise ConnectionError("claim renewal failed during cancellation")
 
-    class CancellingFatalVerifier(DeterministicCompletionVerifier):
+    class CancellingFatalVerifier(_TestCompletionVerifier):
         def __init__(self) -> None:
             self.owner: asyncio.Task[CompletionDecision] | None = None
 
@@ -1150,7 +1911,7 @@ def test_claim_renewal_failure_does_not_duplicate_its_adapter_cancellation() -> 
                 return await super().renew_completion_verification_claim(request)
             raise ConnectionError("claim renewal failed")
 
-    class CancellationRespectingVerifier(DeterministicCompletionVerifier):
+    class CancellationRespectingVerifier(_TestCompletionVerifier):
         async def verify(
             self,
             request: CompletionVerifierRequest,
@@ -1196,7 +1957,7 @@ def test_claim_renewal_and_real_caller_cancellation_remain_distinct() -> None:
                 return await super().renew_completion_verification_claim(request)
             raise ConnectionError("claim renewal failed during cancellation")
 
-    class CallerCancellingVerifier(DeterministicCompletionVerifier):
+    class CallerCancellingVerifier(_TestCompletionVerifier):
         def __init__(self) -> None:
             self.owner: asyncio.Task[CompletionDecision] | None = None
 
@@ -1247,7 +2008,7 @@ def test_claim_renewal_and_real_caller_cancellation_remain_distinct() -> None:
 
 
 def test_adapter_timeout_retains_cancellation_resistant_child_without_publication() -> None:
-    class ResistantVerifier(DeterministicCompletionVerifier):
+    class ResistantVerifier(_TestCompletionVerifier):
         def __init__(self) -> None:
             self.started = asyncio.Event()
             self.cancelled = asyncio.Event()
@@ -1297,6 +2058,46 @@ def test_adapter_timeout_retains_cancellation_resistant_child_without_publicatio
         assert verifier.calls == 2
 
     asyncio.run(scenario())
+
+
+def test_profile_preparation_and_reconciliation_failures_remain_ordered() -> None:
+    class ReconciliationFailureStore(InMemoryTaskStore):
+        verified_work_mutations_are_cancellation_quiescent = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_reconciliation = False
+
+        async def prepare_completion_verifier_profile(self, request):
+            await super().prepare_completion_verifier_profile(request)
+            self.fail_reconciliation = True
+            raise ConnectionError("profile preparation acknowledgement lost")
+
+        async def load_completion_verifier_profile(self, proposal_id):
+            if self.fail_reconciliation:
+                raise RuntimeError("profile reconciliation unavailable")
+            return await super().load_completion_verifier_profile(proposal_id)
+
+    async def scenario() -> BaseExceptionGroup:
+        store = ReconciliationFailureStore()
+        contract = _contract()
+        proposal_id = await _proposal(store, contract)
+        verifier = RecordingVerifier(_accepted_decision())
+        app = CayuApp(task_store=store, enable_logging=False)
+        app.register_completion_verifier(contract.verifier, verifier)
+
+        with pytest.raises(ExceptionGroup) as captured:
+            await app.verify_completion_proposal(_execution_request(proposal_id))
+        assert verifier.requests == []
+        assert await store.load_completion_verification_claim(proposal_id) is None
+        durable = await InMemoryTaskStore.load_completion_verifier_profile(store, proposal_id)
+        assert durable is not None
+        return captured.value
+
+    failure = asyncio.run(scenario())
+    assert len(failure.exceptions) == 2
+    assert isinstance(failure.exceptions[0], ConnectionError)
+    assert isinstance(failure.exceptions[1], RuntimeError)
 
 
 def test_decision_publication_acknowledgement_loss_reconciles_without_second_call() -> None:
@@ -1738,7 +2539,7 @@ def test_claim_cancellation_retains_store_settlement_evidence_through_coordinato
 
 
 def test_invalid_adapter_result_publishes_no_decision() -> None:
-    class InvalidVerifier(DeterministicCompletionVerifier):
+    class InvalidVerifier(_TestCompletionVerifier):
         async def verify(self, request):
             del request
             return object()
@@ -1767,7 +2568,7 @@ def test_malformed_exact_adapter_result_is_item_bounded_before_copying() -> None
                 self.iterated += 1
                 yield _accepted_decision().criterion_outcomes[0]
 
-    class MalformedVerifier(DeterministicCompletionVerifier):
+    class MalformedVerifier(_TestCompletionVerifier):
         def __init__(self, outcome: CompletionVerifierDecision) -> None:
             self.outcome = outcome
 
@@ -1803,7 +2604,7 @@ def test_malformed_nested_adapter_result_is_item_bounded_before_copying() -> Non
                 self.iterated += 1
                 yield object()
 
-    class MalformedVerifier(DeterministicCompletionVerifier):
+    class MalformedVerifier(_TestCompletionVerifier):
         def __init__(self, outcome: CompletionVerifierDecision) -> None:
             self.outcome = outcome
 
@@ -1990,6 +2791,7 @@ def test_verifier_decision_headroom_covers_worst_case_authority_escaping() -> No
         claim_id=maximally_escaped_identity,
         worker_id=maximally_escaped_identity,
         verifier=verifier,
+        verifier_profile_fingerprint=_digest("escaped-verifier-profile"),
         verdict=outcome.verdict,
         criterion_outcomes=outcome.criterion_outcomes,
     )
@@ -1999,6 +2801,7 @@ def test_verifier_decision_headroom_covers_worst_case_authority_escaping() -> No
         claim_id=publication.claim_id,
         worker_id=publication.worker_id,
         verifier=publication.verifier,
+        verifier_profile_fingerprint=publication.verifier_profile_fingerprint,
         verdict=publication.verdict,
         criterion_outcomes=publication.criterion_outcomes,
         task_id="\x01" * 2047 + "a",
@@ -2177,7 +2980,7 @@ def test_adapter_failure_is_detached_and_secret_safe(
 ) -> None:
     secret = "completion-verifier-adapter-secret-canary"
 
-    class FailingVerifier(DeterministicCompletionVerifier):
+    class FailingVerifier(_TestCompletionVerifier):
         async def verify(
             self,
             request: CompletionVerifierRequest,
@@ -2219,7 +3022,7 @@ def test_adapter_failure_final_composition_is_bounded_and_split_secret_safe(
 ) -> None:
     secret = "CompletionVerifierExecutionError('RuntimeError: token"
 
-    class FailingVerifier(DeterministicCompletionVerifier):
+    class FailingVerifier(_TestCompletionVerifier):
         async def verify(
             self,
             request: CompletionVerifierRequest,
@@ -2262,7 +3065,7 @@ def test_adapter_failure_traceback_composition_is_split_secret_safe(
 ) -> None:
     secret = "CompletionVerifierExecutionError: RuntimeError: token"
 
-    class FailingVerifier(DeterministicCompletionVerifier):
+    class FailingVerifier(_TestCompletionVerifier):
         async def verify(
             self,
             request: CompletionVerifierRequest,
@@ -2307,7 +3110,7 @@ def test_adapter_failure_group_is_bounded_and_final_composition_is_secret_safe(
         "[CompletionVerifierExecutionError('RuntimeError: token-0')"
     )
 
-    class GroupingVerifier(DeterministicCompletionVerifier):
+    class GroupingVerifier(_TestCompletionVerifier):
         async def verify(
             self,
             request: CompletionVerifierRequest,
@@ -2355,7 +3158,7 @@ def test_adapter_failure_group_traceback_composition_is_split_secret_safe(
 ) -> None:
     secret = "| CompletionVerifierExecutionError: RuntimeError: token"
 
-    class GroupingVerifier(DeterministicCompletionVerifier):
+    class GroupingVerifier(_TestCompletionVerifier):
         async def verify(
             self,
             request: CompletionVerifierRequest,
@@ -2673,7 +3476,7 @@ def test_rejected_public_verifier_inputs_are_detached_and_secret_safe(
 ) -> None:
     secret = "completion-verifier-public-input-secret-canary"
 
-    class SecretVerifier(DeterministicCompletionVerifier):
+    class SecretVerifier(_TestCompletionVerifier):
         def __repr__(self) -> str:
             return f"SecretVerifier({secret})"
 
@@ -2749,7 +3552,7 @@ def test_capacity_exhaustion_precedes_claim_and_is_secret_safe(
 ) -> None:
     secret = "completion-verifier-capacity-secret-canary"
 
-    class CapacityVerifier(DeterministicCompletionVerifier):
+    class CapacityVerifier(_TestCompletionVerifier):
         def __init__(self) -> None:
             self.all_started = asyncio.Event()
             self.release = asyncio.Event()
@@ -2832,7 +3635,7 @@ def test_conflicting_exact_replay_rejects_changed_claim_tuple() -> None:
 
 
 def test_unfinished_exact_retry_rejects_changed_execution_timeout() -> None:
-    class CooperativelyTimedOutVerifier(DeterministicCompletionVerifier):
+    class CooperativelyTimedOutVerifier(_TestCompletionVerifier):
         def __init__(self) -> None:
             self.calls = 0
             self.finished = asyncio.Event()
@@ -2892,7 +3695,7 @@ def test_cross_app_drain_renews_claim_until_the_original_adapter_settles() -> No
                 self.background_renewed.set()
             return renewed
 
-    class ResistantVerifier(DeterministicCompletionVerifier):
+    class ResistantVerifier(_TestCompletionVerifier):
         def __init__(self) -> None:
             self.cancelled = asyncio.Event()
             self.release = asyncio.Event()
@@ -2986,7 +3789,7 @@ def test_grouped_live_claim_loss_keeps_its_public_classification(
                 return await super().renew_completion_verification_claim(request)
             raise CompletionVerificationClaimLost("another live verifier claim owns renewal")
 
-    class FatalAfterClaimLossVerifier(DeterministicCompletionVerifier):
+    class FatalAfterClaimLossVerifier(_TestCompletionVerifier):
         async def verify(
             self,
             request: CompletionVerifierRequest,
@@ -3050,7 +3853,7 @@ def test_cross_app_takeover_after_renewal_loss_discards_the_stale_result() -> No
                 raise ConnectionError("claim renewal authority was lost")
             return await super().renew_completion_verification_claim(request)
 
-    class FirstCallResistsCancellationVerifier(DeterministicCompletionVerifier):
+    class FirstCallResistsCancellationVerifier(_TestCompletionVerifier):
         def __init__(self) -> None:
             self.first_cancelled = asyncio.Event()
             self.first_release = asyncio.Event()
@@ -3093,6 +3896,8 @@ def test_cross_app_takeover_after_renewal_loss_discards_the_stale_result() -> No
             await first_app.verify_completion_proposal(original)
         await verifier.first_cancelled.wait()
         await store.background_renewal_failed.wait()
+        profile_before_takeover = await store.load_completion_verifier_profile(proposal_id)
+        assert profile_before_takeover is not None
         assert verifier.calls == 1
         assert not verifier.first_finished.is_set()
 
@@ -3105,6 +3910,17 @@ def test_cross_app_takeover_after_renewal_loss_discards_the_stale_result() -> No
         )
         decision = await second_app.verify_completion_proposal(replacement)
         assert decision.decision_id == replacement.decision_id
+        replacement_claim = await store.load_completion_verification_claim(proposal_id)
+        assert replacement_claim is not None
+        assert replacement_claim.verifier_profile_fingerprint == (
+            profile_before_takeover.profile.fingerprint
+        )
+        assert decision.verifier_profile_fingerprint == (
+            profile_before_takeover.profile.fingerprint
+        )
+        assert await store.load_completion_verifier_profile(proposal_id) == (
+            profile_before_takeover
+        )
         assert verifier.calls == 2
 
         verifier.first_release.set()
@@ -3181,7 +3997,7 @@ class _CountingMapping(Mapping[str, object]):
 
 
 def test_raw_nested_adapter_outcome_is_field_bounded_before_copying() -> None:
-    class MalformedVerifier(DeterministicCompletionVerifier):
+    class MalformedVerifier(_TestCompletionVerifier):
         def __init__(self, outcome: CompletionVerifierDecision) -> None:
             self.outcome = outcome
 
@@ -3267,12 +4083,17 @@ def test_pre_owner_claim_decision_replays_without_process_local_registration() -
         contract = _contract()
         proposal_id = await _proposal(store, contract)
         request = _execution_request(proposal_id)
+        verifier_profile = await prepare_test_completion_verifier_profile(
+            store,
+            proposal_id,
+        )
         claim = await store.claim_completion_verification(
             CompletionVerificationClaimRequest(
                 claim_id=request.claim_id,
                 proposal_id=request.proposal_id,
                 worker_id=request.worker_id,
                 verifier=contract.verifier,
+                verifier_profile_fingerprint=verifier_profile.profile.fingerprint,
                 lease_seconds=request.lease_seconds,
             )
         )
@@ -3285,6 +4106,7 @@ def test_pre_owner_claim_decision_replays_without_process_local_registration() -
                 claim_id=request.claim_id,
                 worker_id=request.worker_id,
                 verifier=contract.verifier,
+                verifier_profile_fingerprint=verifier_profile.profile.fingerprint,
                 verdict=outcome.verdict,
                 criterion_outcomes=outcome.criterion_outcomes,
             )
@@ -3319,7 +4141,7 @@ def test_completed_verifier_settles_an_inflight_claim_renewal_before_return() ->
                 await self.cleanup_release.wait()
                 raise
 
-    class CompleteDuringRenewalVerifier(DeterministicCompletionVerifier):
+    class CompleteDuringRenewalVerifier(_TestCompletionVerifier):
         def __init__(self, store: BlockingRenewalStore) -> None:
             self.store = store
 
@@ -3388,7 +4210,7 @@ def test_claim_renewal_failure_after_publication_is_observable_and_secret_safe(
             except asyncio.CancelledError:
                 raise ConnectionError("renewal failed during heartbeat shutdown") from None
 
-    class CompleteDuringRenewalVerifier(DeterministicCompletionVerifier):
+    class CompleteDuringRenewalVerifier(_TestCompletionVerifier):
         def __init__(self, store: FailingShutdownRenewalStore) -> None:
             self.store = store
 
@@ -3490,7 +4312,7 @@ def test_claim_renewal_cancellation_retains_settlement_evidence_after_publicatio
                     ],
                 )
 
-    class CompleteDuringRenewalVerifier(DeterministicCompletionVerifier):
+    class CompleteDuringRenewalVerifier(_TestCompletionVerifier):
         def __init__(self, store: SettlementFailureStore) -> None:
             self.store = store
 
@@ -3561,7 +4383,7 @@ def test_grouped_adapter_failure_prunes_only_heartbeat_cancellation() -> None:
                 return await super().renew_completion_verification_claim(request)
             raise ConnectionError("grouped claim renewal failure")
 
-    class GroupingVerifier(DeterministicCompletionVerifier):
+    class GroupingVerifier(_TestCompletionVerifier):
         async def verify(
             self,
             request: CompletionVerifierRequest,
@@ -3648,7 +4470,7 @@ def test_fatal_verifier_wrapper_cannot_reconstruct_a_registered_secret(
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    class FatalVerifier(DeterministicCompletionVerifier):
+    class FatalVerifier(_TestCompletionVerifier):
         async def verify(
             self,
             request: CompletionVerifierRequest,
@@ -3687,7 +4509,7 @@ def test_caller_cancellation_wrapper_cannot_reconstruct_a_registered_secret(
 ) -> None:
     secret = "CancelledError('token')"
 
-    class BlockingVerifier(DeterministicCompletionVerifier):
+    class BlockingVerifier(_TestCompletionVerifier):
         def __init__(self) -> None:
             self.started = asyncio.Event()
 

@@ -108,6 +108,16 @@ from cayu.runtime.checks import (
     ServiceCheckEvidence,
     check_manifest,
 )
+from cayu.runtime.completion_verifier_profiles import (
+    CompletionVerifierExecutionProfile,
+    CompletionVerifierProfileAdoptionDecision,
+    CompletionVerifierProfileComponentDeclaration,
+    CompletionVerifierProfileComponentIdentity,
+    CompletionVerifierProfilePolicy,
+    CompletionVerifierProfilePolicyRequest,
+    CompletionVerifierProfilePreparationRequest,
+    CompletionVerifierProfileRecord,
+)
 from cayu.runtime.completion_verifiers import (
     CompletionVerifierExecutionError,
     CompletionVerifierExecutionRequest,
@@ -1047,8 +1057,16 @@ __all__ = [
     "CompletionVerificationClaimRequest",
     "CompletionVerifierDecision",
     "CompletionVerifierExecutionError",
+    "CompletionVerifierExecutionProfile",
     "CompletionVerifierExecutionRequest",
     "CompletionVerifierKind",
+    "CompletionVerifierProfileAdoptionDecision",
+    "CompletionVerifierProfileComponentDeclaration",
+    "CompletionVerifierProfileComponentIdentity",
+    "CompletionVerifierProfilePolicy",
+    "CompletionVerifierProfilePolicyRequest",
+    "CompletionVerifierProfilePreparationRequest",
+    "CompletionVerifierProfileRecord",
     "CompletionVerifierRef",
     "CompletionVerifierRequest",
     "CompletionVerifierUnavailable",

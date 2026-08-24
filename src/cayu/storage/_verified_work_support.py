@@ -184,6 +184,7 @@ def _held_task(
             "status_payload": {
                 "completion_decision_id": decision.decision_id,
                 "gap_fingerprint": decision.gap_fingerprint,
+                "verifier_profile_fingerprint": decision.verifier_profile_fingerprint,
                 "verdict": decision.verdict.value,
             },
             "worker_id": None,
@@ -297,6 +298,7 @@ def plan_decision_application(
     receipt = CompletionDecisionApplicationReceipt(
         task_id=updated.id,
         decision_id=decision.decision_id,
+        verifier_profile_fingerprint=decision.verifier_profile_fingerprint,
         idempotency_key=request.idempotency_key,
         request_sha256=request_sha256,
         task=updated,

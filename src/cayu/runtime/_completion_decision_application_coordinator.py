@@ -32,6 +32,14 @@ from cayu.runtime._verified_work_authority import (
     completion_decision_claim_authority_matches,
     invocation_contains_secret_public_identity,
     require_completion_decision_integrity,
+    require_completion_verifier_profile_integrity,
+)
+from cayu.runtime.completion_verifier_profiles import (
+    CompletionVerifierProfilePreparationRequest,
+    CompletionVerifierProfileRecord,
+    changed_completion_verifier_profile_components,
+    completion_verifier_profile_preparation_request_sha256,
+    copy_completion_verifier_profile_record,
 )
 from cayu.runtime.tasks import (
     CompletionDecisionApplicationReceipt,
@@ -113,6 +121,8 @@ def _copy_exact_model(
         copier = cast("Callable[[object], object]", copy_completion_decision)
     elif model_type is CompletionVerificationClaim:
         copier = cast("Callable[[object], object]", copy_completion_verification_claim)
+    elif model_type is CompletionVerifierProfileRecord:
+        copier = cast("Callable[[object], object]", copy_completion_verifier_profile_record)
     elif model_type is Task:
         copier = cast("Callable[[object], object]", copy_task)
     else:
@@ -383,6 +393,7 @@ class CompletionDecisionApplicationCoordinator:
         proposal: CompletionProposal | None = None
         attempt: WorkAttempt | None = None
         contract: WorkContract | None = None
+        verifier_profile: CompletionVerifierProfileRecord | None = None
         authority_task: Task | None = None
         outcome: TaskStoreOperationOutcome[Task] | None = None
         dispatch_validation: (
@@ -415,6 +426,7 @@ class CompletionDecisionApplicationCoordinator:
                     proposal,
                     attempt,
                     contract,
+                    verifier_profile,
                     authority_task,
                 ) = await self._load_authority(store, request)
                 self._require_application_binding(
@@ -437,6 +449,7 @@ class CompletionDecisionApplicationCoordinator:
                 proposal,
                 attempt,
                 contract,
+                verifier_profile,
                 authority_task,
             ) = await self._load_authority(store, request)
             self._require_application_binding(
@@ -532,6 +545,7 @@ class CompletionDecisionApplicationCoordinator:
             return receipt_task
         except BaseException:
             del request, store, existing, decision, claim, proposal, attempt, contract
+            del verifier_profile
             del authority_task
             del dispatch_validation, dispatched_request, outcome
             del returned_validation, returned, receipt, receipt_task
@@ -619,6 +633,7 @@ class CompletionDecisionApplicationCoordinator:
         CompletionProposal,
         WorkAttempt,
         WorkContract,
+        CompletionVerifierProfileRecord,
         Task,
     ]:
         decision: CompletionDecision | None = None
@@ -627,6 +642,10 @@ class CompletionDecisionApplicationCoordinator:
         proposal: CompletionProposal | None = None
         attempt: WorkAttempt | None = None
         contract: WorkContract | None = None
+        verifier_profile: CompletionVerifierProfileRecord | None = None
+        prior_verifier_profile: CompletionVerifierProfileRecord | None = None
+        prior_proposal: CompletionProposal | None = None
+        prior_attempt: WorkAttempt | None = None
         authority_task: Task | None = None
         try:
             decision = await self._load_required(
@@ -666,6 +685,30 @@ class CompletionDecisionApplicationCoordinator:
                 WorkContract,
                 operation_name="Work contract lookup",
             )
+            verifier_profile = await self._load_required(
+                lambda: store.load_completion_verifier_profile(decision.proposal_id),
+                CompletionVerifierProfileRecord,
+                operation_name="Completion verifier profile lookup",
+                missing_conflict_message=(
+                    "Durable completion decision has no verifier-profile authority."
+                ),
+            )
+            prior_verifier_profile = await self._load_optional(
+                lambda: store.load_prior_completion_verifier_profile(decision.proposal_id),
+                CompletionVerifierProfileRecord,
+                operation_name="Prior completion verifier profile lookup",
+            )
+            if prior_verifier_profile is not None:
+                prior_proposal = await self._load_required(
+                    lambda: store.load_completion_proposal(prior_verifier_profile.proposal_id),
+                    CompletionProposal,
+                    operation_name="Prior completion proposal lookup",
+                )
+                prior_attempt = await self._load_required(
+                    lambda: store.load_work_attempt(prior_proposal.attempt_id),
+                    WorkAttempt,
+                    operation_name="Prior work attempt lookup",
+                )
             authority_task = await self._load_required(
                 lambda: store.load_task(decision.task_id),
                 Task,
@@ -682,6 +725,7 @@ class CompletionDecisionApplicationCoordinator:
                 proposal=proposal,
                 attempt=attempt,
                 contract=contract,
+                verifier_profile=verifier_profile,
                 authority_task=authority_task,
             )
             self._require_loaded_authority_integrity(
@@ -690,11 +734,25 @@ class CompletionDecisionApplicationCoordinator:
                 proposal=proposal,
                 attempt=attempt,
                 contract=contract,
+                verifier_profile=verifier_profile,
+                prior_verifier_profile=prior_verifier_profile,
+                prior_proposal=prior_proposal,
+                prior_attempt=prior_attempt,
                 authority_task=authority_task,
             )
-            return decision, claim, proposal, attempt, contract, authority_task
+            return (
+                decision,
+                claim,
+                proposal,
+                attempt,
+                contract,
+                verifier_profile,
+                authority_task,
+            )
         except BaseException:
             del store, request, decision, indexed, claim, proposal, attempt, contract
+            del verifier_profile
+            del prior_verifier_profile, prior_proposal, prior_attempt
             del authority_task
             raise
 
@@ -706,6 +764,10 @@ class CompletionDecisionApplicationCoordinator:
         proposal: CompletionProposal,
         attempt: WorkAttempt,
         contract: WorkContract,
+        verifier_profile: CompletionVerifierProfileRecord,
+        prior_verifier_profile: CompletionVerifierProfileRecord | None,
+        prior_proposal: CompletionProposal | None,
+        prior_attempt: WorkAttempt | None,
         authority_task: Task,
     ) -> None:
         validation = capture_sensitive_validation(
@@ -726,7 +788,7 @@ class CompletionDecisionApplicationCoordinator:
             raise_task_store_operation_failure(failure)
         del failure
         if validated is None:
-            del decision, claim, proposal, attempt, contract, authority_task
+            del decision, claim, proposal, attempt, contract, verifier_profile, authority_task
             raise WorkCompletionConflict(
                 "Durable completion-decision authority has invalid integrity evidence."
             ) from None
@@ -754,6 +816,50 @@ class CompletionDecisionApplicationCoordinator:
                 "Durable completion decision conflicts with its verification-claim authority."
             ) from None
         del claim_matches
+        expected_profile_request = CompletionVerifierProfilePreparationRequest(
+            proposal_id=verifier_profile.proposal_id,
+            task_id=verifier_profile.task_id,
+            attempt_id=verifier_profile.attempt_id,
+            attempt_request_sha256=verifier_profile.attempt_request_sha256,
+            source_execution_profile_fingerprint=(
+                verifier_profile.source_execution_profile_fingerprint
+            ),
+            proposal_request_sha256=verifier_profile.proposal_request_sha256,
+            contract=verifier_profile.contract,
+            profile=verifier_profile.profile,
+            expected_prior_proposal_id=verifier_profile.expected_prior_proposal_id,
+            expected_prior_profile_fingerprint=(
+                verifier_profile.expected_prior_profile_fingerprint
+            ),
+            adoption=verifier_profile.adoption,
+        )
+        if (
+            verifier_profile.proposal_id != proposal.proposal_id
+            or verifier_profile.task_id != proposal.task_id
+            or verifier_profile.attempt_id != attempt.attempt_id
+            or verifier_profile.attempt_request_sha256 != attempt.request_sha256
+            or verifier_profile.source_execution_profile_fingerprint
+            != attempt.execution_profile_fingerprint
+            or verifier_profile.proposal_request_sha256 != proposal.request_sha256
+            or verifier_profile.contract != contract.reference()
+            or verifier_profile.profile.verifier != contract.verifier
+            or verifier_profile.request_sha256
+            != completion_verifier_profile_preparation_request_sha256(expected_profile_request)
+            or claim.verifier_profile_fingerprint != verifier_profile.profile.fingerprint
+            or decision.verifier_profile_fingerprint != verifier_profile.profile.fingerprint
+        ):
+            raise WorkCompletionConflict(
+                "Durable completion decision conflicts with verifier-profile authority."
+            ) from None
+        self._require_prior_profile_integrity(
+            verifier_profile=verifier_profile,
+            prior_verifier_profile=prior_verifier_profile,
+            proposal=proposal,
+            attempt=attempt,
+            contract=contract,
+            prior_proposal=prior_proposal,
+            prior_attempt=prior_attempt,
+        )
         if (
             authority_task.id != decision.task_id
             or authority_task.work_contract != decision.contract
@@ -763,6 +869,102 @@ class CompletionDecisionApplicationCoordinator:
                 "Durable task authority conflicts with the completion decision."
             ) from None
         del validated
+
+    def _require_prior_profile_integrity(
+        self,
+        *,
+        verifier_profile: CompletionVerifierProfileRecord,
+        prior_verifier_profile: CompletionVerifierProfileRecord | None,
+        proposal: CompletionProposal,
+        attempt: WorkAttempt,
+        contract: WorkContract,
+        prior_proposal: CompletionProposal | None,
+        prior_attempt: WorkAttempt | None,
+    ) -> None:
+        if prior_verifier_profile is None:
+            if (
+                attempt.ordinal != 1
+                or verifier_profile.expected_prior_proposal_id is not None
+                or verifier_profile.expected_prior_profile_fingerprint is not None
+                or verifier_profile.adoption is not None
+            ):
+                raise WorkCompletionConflict(
+                    "Durable verifier profile has no valid prior-profile authority."
+                ) from None
+            return
+        if prior_proposal is None or prior_attempt is None:
+            raise WorkCompletionConflict(
+                "Durable verifier profile has incomplete prior-profile authority."
+            ) from None
+        require_completion_verifier_profile_integrity(
+            profile=prior_verifier_profile,
+            proposal=prior_proposal,
+            attempt=prior_attempt,
+            contract=contract,
+        )
+        adoption = verifier_profile.adoption
+        if (
+            prior_verifier_profile.task_id != proposal.task_id
+            or prior_attempt.ordinal != attempt.ordinal - 1
+            or verifier_profile.expected_prior_proposal_id != prior_verifier_profile.proposal_id
+            or verifier_profile.expected_prior_profile_fingerprint
+            != prior_verifier_profile.profile.fingerprint
+        ):
+            raise WorkCompletionConflict(
+                "Durable completion decision conflicts with prior verifier-profile authority."
+            ) from None
+        if prior_verifier_profile.profile == verifier_profile.profile:
+            if adoption is not None:
+                raise WorkCompletionConflict(
+                    "Exact verifier-profile reuse has unexpected adoption authority."
+                ) from None
+            return
+        if adoption is None or adoption.changed_component_ids != (
+            changed_completion_verifier_profile_components(
+                prior_verifier_profile.profile,
+                verifier_profile.profile,
+            )
+        ):
+            raise WorkCompletionConflict(
+                "Changed verifier profile has invalid adoption authority."
+            ) from None
+
+    async def _load_optional(
+        self,
+        operation,
+        model_type: type[_ModelT],
+        *,
+        operation_name: str,
+    ) -> _ModelT | None:
+        outcome = await capture_task_store_operation(
+            operation,
+            operation_name=operation_name,
+            redactor=self._secret_redactor,
+        )
+        if outcome.failure is not None:
+            if isinstance(outcome.failure, BaseExceptionGroup) and (
+                workspace_observation_pending_cancellation_requests(outcome.failure) > 0
+            ):
+                _raise_authenticated_store_cancellation(
+                    outcome.failure,
+                    redactor=self._secret_redactor,
+                )
+            raise_task_store_operation_failure(outcome.failure)
+        if outcome.result is None:
+            return None
+        validation = _copy_exact_model(
+            outcome.result,
+            model_type,
+            operation_name=f"{operation_name} result validation",
+            redactor=self._secret_redactor,
+        )
+        if validation.failure is not None:
+            raise_task_store_operation_failure(validation.failure)
+        if validation.result is None:
+            raise WorkCompletionConflict(
+                f"Task store returned an invalid {operation_name.lower()} result."
+            ) from None
+        return validation.result
 
     async def _load_required(
         self,
@@ -815,6 +1017,7 @@ class CompletionDecisionApplicationCoordinator:
         proposal: CompletionProposal,
         attempt: WorkAttempt,
         contract: WorkContract,
+        verifier_profile: CompletionVerifierProfileRecord,
         authority_task: Task,
     ) -> None:
         contract_references = (
@@ -863,6 +1066,23 @@ class CompletionDecisionApplicationCoordinator:
             contract.contract_id,
             contract.fingerprint,
             authority_task.id,
+            verifier_profile.proposal_id,
+            verifier_profile.task_id,
+            verifier_profile.attempt_id,
+            verifier_profile.request_sha256,
+            verifier_profile.profile.fingerprint,
+            *(component.component_id for component in verifier_profile.profile.components),
+            *(component.fingerprint for component in verifier_profile.profile.components),
+            *(
+                ()
+                if verifier_profile.adoption is None
+                else (
+                    verifier_profile.adoption.policy_identity,
+                    verifier_profile.adoption.idempotency_key,
+                    verifier_profile.adoption.requested_by.subject,
+                    verifier_profile.adoption.requested_by.tenant or "",
+                )
+            ),
             *(reference.contract_id for reference in contract_references),
             *(reference.fingerprint for reference in contract_references),
             *(reference.verifier_id for reference in verifier_references),
@@ -930,7 +1150,7 @@ class CompletionDecisionApplicationCoordinator:
             authority_task.invocation,
             self._secret_redactor,
         ):
-            del decision, claim, proposal, attempt, contract, authority_task
+            del decision, claim, proposal, attempt, contract, verifier_profile, authority_task
             del contract_references, verifier_references, evidence_references, identities
             raise ValueError(
                 "Durable completion-decision authority contains a workload secret in public "
@@ -1008,6 +1228,10 @@ class CompletionDecisionApplicationCoordinator:
             if task is None or task.id != request.task_id:
                 raise WorkCompletionConflict(
                     "Decision-application receipt contains an invalid task snapshot."
+                ) from None
+            if receipt.verifier_profile_fingerprint != decision.verifier_profile_fingerprint:
+                raise WorkCompletionConflict(
+                    "Decision-application receipt conflicts with verifier-profile authority."
                 ) from None
             if invocation_contains_secret_public_identity(
                 task.invocation,
@@ -1114,6 +1338,7 @@ class CompletionDecisionApplicationCoordinator:
         expected_payload = {
             "completion_decision_id": decision.decision_id,
             "gap_fingerprint": decision.gap_fingerprint,
+            "verifier_profile_fingerprint": decision.verifier_profile_fingerprint,
             "verdict": decision.verdict.value,
         }
         if decision.verdict is CompletionVerdict.BLOCKED:

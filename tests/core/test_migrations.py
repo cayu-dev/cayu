@@ -263,6 +263,22 @@ def test_revision_fifty_seven_breaks_for_typed_queued_messages() -> None:
         )
 
 
+def test_revision_fifty_eight_breaks_for_completion_verifier_profiles() -> None:
+    state = m.SchemaState(revision=58, compatible_from=58)
+
+    # Pre-58 task workers cannot preserve immutable verifier-profile authority
+    # across claims, decisions, replacement, or restart.
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 58"):
+        m.validate(state, app_latest=57, app_min_supported=57)
+    m.validate(state, app_latest=58, app_min_supported=58)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 58"):
+        m.validate(
+            m.SchemaState(revision=57, compatible_from=57),
+            app_latest=58,
+            app_min_supported=58,
+        )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

@@ -99,7 +99,7 @@ def test_sqlite_eval_store_shared_conformance(tmp_path) -> None:
     asyncio.run(exercise())
 
 
-def test_sqlite_eval_store_creates_revision_fifty_seven_schema(tmp_path) -> None:
+def test_sqlite_eval_store_creates_revision_fifty_eight_schema(tmp_path) -> None:
     path = tmp_path / "evals.db"
 
     async def initialize() -> None:
@@ -111,7 +111,7 @@ def test_sqlite_eval_store_creates_revision_fifty_seven_schema(tmp_path) -> None
     try:
         revisions = connection.execute(
             "SELECT revision, kind, compatible_from FROM cayu_schema_migrations "
-            "WHERE revision IN (47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57) "
+            "WHERE revision IN (47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58) "
             "ORDER BY revision"
         ).fetchall()
         invocation_column = connection.execute("PRAGMA table_info(cayu_eval_runs)").fetchall()
@@ -148,6 +148,7 @@ def test_sqlite_eval_store_creates_revision_fifty_seven_schema(tmp_path) -> None
         (55, "breaking", 55),
         (56, "additive", 55),
         (57, "breaking", 57),
+        (58, "breaking", 58),
     ]
     assert next(row for row in invocation_column if row[1] == "invocation_json")[2:4] == (
         "TEXT",
@@ -181,6 +182,40 @@ def test_sqlite_eval_store_creates_revision_fifty_seven_schema(tmp_path) -> None
         "idx_cayu_eval_scenarios_id_catalog",
         "idx_cayu_eval_scenarios_target_catalog",
     }
+
+
+def test_sqlite_eval_store_accepts_revision_fifty_six_without_verifier_profiles(
+    tmp_path,
+) -> None:
+    path = tmp_path / "evals-revision-56.db"
+
+    async def initialize() -> None:
+        store = SQLiteEvalStore(path)
+        await store.close()
+
+    asyncio.run(initialize())
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            DROP TABLE cayu_completion_verifier_profiles;
+            ALTER TABLE cayu_completion_verification_claims
+                DROP COLUMN verifier_profile_fingerprint;
+            ALTER TABLE cayu_completion_decisions
+                DROP COLUMN verifier_profile_fingerprint;
+            DELETE FROM cayu_schema_migrations WHERE revision >= 57;
+            PRAGMA user_version = 56;
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    async def validate() -> None:
+        store = SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
+        await store.close()
+
+    asyncio.run(validate())
 
 
 def test_sqlite_revision_fifty_three_adds_scenarios_without_rewriting_corpora(

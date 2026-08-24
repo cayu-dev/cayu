@@ -326,6 +326,10 @@ REVISIONS: tuple[Revision, ...] = (
     # durable delivery. Pre-57 workers would ignore that payload and deliver
     # only its text projection, so mixed-version session workers are unsafe.
     Revision(revision=57, kind=RevisionKind.BREAKING, compatible_from=57),
+    # Completion-verifier claims and decisions now require a proposal-scoped
+    # immutable verifier profile prepared before dispatch. Older task workers
+    # cannot maintain that authority chain, so mixed-version operation is unsafe.
+    Revision(revision=58, kind=RevisionKind.BREAKING, compatible_from=58),
 )
 
 #: The revision an empty database is initialized to.

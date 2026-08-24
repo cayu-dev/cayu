@@ -47,6 +47,15 @@ from cayu.runtime.approvals import (
     copy_resolution_actor,
     resolution_actor_payload,
 )
+from cayu.runtime.completion_verifier_profiles import (
+    CompletionVerifierProfilePreparationRequest,
+    CompletionVerifierProfileRecord,
+    completion_verifier_profile_preparation_request_sha256,
+    completion_verifier_profile_record_from_preparation,
+    copy_completion_verifier_profile_preparation_request,
+    copy_completion_verifier_profile_record,
+    require_completion_verifier_profile_transition,
+)
 from cayu.runtime.invocation import (
     InvocationOrigin,
     InvocationOriginClaim,
@@ -1565,6 +1574,7 @@ class CompletionDecisionApplicationReceipt(BaseModel):
 
     task_id: str
     decision_id: str
+    verifier_profile_fingerprint: str
     idempotency_key: str
     request_sha256: str
     task: Task
@@ -1577,11 +1587,11 @@ class CompletionDecisionApplicationReceipt(BaseModel):
             return validate_work_completion_idempotency_key(value)
         return require_clean_nonblank(value, info.field_name)
 
-    @field_validator("request_sha256")
+    @field_validator("verifier_profile_fingerprint", "request_sha256")
     @classmethod
-    def validate_request_sha256(cls, value: str) -> str:
+    def validate_sha256(cls, value: str, info) -> str:
         if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
-            raise ValueError("request_sha256 must be a lowercase SHA-256 digest.")
+            raise ValueError(f"{info.field_name} must be a lowercase SHA-256 digest.")
         return value
 
     @field_validator("task", mode="before")
@@ -2402,6 +2412,32 @@ class TaskStore(ABC):
         """Load one completion proposal by stable identity."""
         raise NotImplementedError("This TaskStore does not support verified work contracts.")
 
+    async def prepare_completion_verifier_profile(
+        self,
+        request: CompletionVerifierProfilePreparationRequest,
+    ) -> CompletionVerifierProfileRecord:
+        """Insert or exactly replay immutable verifier-profile authority.
+
+        Implementations must atomically bind an adoption idempotency key to at
+        most one proposal within its task. A later proposal cannot reuse that
+        task-scoped transition identity.
+        """
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def load_completion_verifier_profile(
+        self,
+        proposal_id: str,
+    ) -> CompletionVerifierProfileRecord | None:
+        """Load the immutable verifier profile prepared for one proposal."""
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def load_prior_completion_verifier_profile(
+        self,
+        proposal_id: str,
+    ) -> CompletionVerifierProfileRecord | None:
+        """Load the immediately preceding task attempt's verifier profile."""
+        raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
     async def claim_completion_verification(
         self,
         request: CompletionVerificationClaimRequest,
@@ -2765,6 +2801,7 @@ class InMemoryTaskStore(TaskStore):
         self._attempt_ids_by_task: dict[str, list[str]] = {}
         self._completion_proposals: dict[str, CompletionProposal] = {}
         self._proposal_id_by_attempt: dict[str, str] = {}
+        self._completion_verifier_profiles: dict[str, CompletionVerifierProfileRecord] = {}
         self._completion_verification_claims: dict[str, CompletionVerificationClaim] = {}
         self._verification_claims_by_id: dict[str, CompletionVerificationClaim] = {}
         self._completion_decisions: dict[str, CompletionDecision] = {}
@@ -2976,6 +3013,117 @@ class InMemoryTaskStore(TaskStore):
             proposal = self._completion_proposals.get(proposal_id)
             return None if proposal is None else proposal.model_copy(deep=True)
 
+    async def prepare_completion_verifier_profile(
+        self,
+        request: CompletionVerifierProfilePreparationRequest,
+    ) -> CompletionVerifierProfileRecord:
+        request = copy_completion_verifier_profile_preparation_request(request)
+        request_sha256 = completion_verifier_profile_preparation_request_sha256(request)
+        async with self._lock:
+            existing = self._completion_verifier_profiles.get(request.proposal_id)
+            if existing is not None:
+                if existing.request_sha256 != request_sha256:
+                    raise WorkCompletionConflict(
+                        "Completion-verifier profile is already bound to another request."
+                    )
+                return copy_completion_verifier_profile_record(existing)
+
+            proposal = self._require_completion_proposal(request.proposal_id)
+            attempt = self._require_work_attempt(proposal.attempt_id)
+            contract = self._require_work_contract(proposal.contract)
+            if (
+                request.task_id != proposal.task_id
+                or request.attempt_id != attempt.attempt_id
+                or request.attempt_request_sha256 != attempt.request_sha256
+                or request.source_execution_profile_fingerprint
+                != attempt.execution_profile_fingerprint
+                or request.proposal_request_sha256 != proposal.request_sha256
+                or request.contract != contract.reference()
+                or request.profile.verifier != contract.verifier
+            ):
+                raise WorkCompletionConflict(
+                    "Completion-verifier profile conflicts with its durable proposal authority."
+                )
+
+            attempt_ids = self._attempt_ids_by_task.get(request.task_id, [])
+            try:
+                attempt_index = attempt_ids.index(attempt.attempt_id)
+            except ValueError:
+                raise WorkCompletionConflict(
+                    "Completion-verifier profile refers to an unindexed work attempt."
+                ) from None
+            prior_profile: CompletionVerifierProfileRecord | None = None
+            if attempt_index > 0:
+                prior_attempt_id = attempt_ids[attempt_index - 1]
+                prior_proposal_id = self._proposal_id_by_attempt.get(prior_attempt_id)
+                if prior_proposal_id is None:
+                    raise WorkCompletionConflict(
+                        "Prior work attempt has no completion proposal authority."
+                    )
+                prior_profile = self._completion_verifier_profiles.get(prior_proposal_id)
+                if prior_profile is None:
+                    raise WorkCompletionConflict(
+                        "Prior work attempt has no verifier-profile authority."
+                    )
+            require_completion_verifier_profile_transition(request, prior_profile)
+
+            adoption = request.adoption
+            if adoption is not None and any(
+                profile.task_id == request.task_id
+                and profile.adoption is not None
+                and profile.adoption.idempotency_key == adoption.idempotency_key
+                for profile in self._completion_verifier_profiles.values()
+            ):
+                raise WorkCompletionConflict(
+                    "Completion-verifier profile adoption idempotency key is already "
+                    "bound to another proposal."
+                )
+
+            record = completion_verifier_profile_record_from_preparation(
+                request,
+                request_sha256=request_sha256,
+                prepared_at=self._clock(),
+            )
+            self._completion_verifier_profiles[request.proposal_id] = record
+            return copy_completion_verifier_profile_record(record)
+
+    async def load_completion_verifier_profile(
+        self,
+        proposal_id: str,
+    ) -> CompletionVerifierProfileRecord | None:
+        proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
+        async with self._lock:
+            profile = self._completion_verifier_profiles.get(proposal_id)
+            return None if profile is None else copy_completion_verifier_profile_record(profile)
+
+    async def load_prior_completion_verifier_profile(
+        self,
+        proposal_id: str,
+    ) -> CompletionVerifierProfileRecord | None:
+        proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
+        async with self._lock:
+            proposal = self._require_completion_proposal(proposal_id)
+            attempt_ids = self._attempt_ids_by_task.get(proposal.task_id, [])
+            try:
+                attempt_index = attempt_ids.index(proposal.attempt_id)
+            except ValueError:
+                raise WorkCompletionConflict(
+                    "Completion proposal refers to an unindexed work attempt."
+                ) from None
+            if attempt_index == 0:
+                return None
+            prior_proposal_id = self._proposal_id_by_attempt.get(attempt_ids[attempt_index - 1])
+            if prior_proposal_id is None:
+                raise WorkCompletionConflict(
+                    "Prior work attempt has no completion proposal authority."
+                )
+            profile = self._completion_verifier_profiles.get(prior_proposal_id)
+            if profile is None:
+                raise WorkCompletionConflict(
+                    "Prior work attempt has no verifier-profile authority."
+                )
+            return copy_completion_verifier_profile_record(profile)
+
     async def claim_completion_verification(
         self,
         request: CompletionVerificationClaimRequest,
@@ -2993,9 +3141,17 @@ class InMemoryTaskStore(TaskStore):
                 )
             proposal = self._require_completion_proposal(request.proposal_id)
             contract = self._require_work_contract(proposal.contract)
+            profile = self._completion_verifier_profiles.get(request.proposal_id)
             if request.verifier != contract.verifier:
                 raise WorkCompletionConflict(
                     "Verification claim uses a verifier other than the frozen contract verifier."
+                )
+            if (
+                profile is None
+                or request.verifier_profile_fingerprint != profile.profile.fingerprint
+            ):
+                raise WorkCompletionConflict(
+                    "Verification claim requires the exact prepared verifier profile."
                 )
             now = self._clock()
             current = self._completion_verification_claims.get(request.proposal_id)
@@ -3031,6 +3187,7 @@ class InMemoryTaskStore(TaskStore):
                 execution_owner_id=request.execution_owner_id,
                 execution_timeout_seconds=request.execution_timeout_seconds,
                 verifier=request.verifier,
+                verifier_profile_fingerprint=request.verifier_profile_fingerprint,
                 attempt_number=attempt_number,
                 request_sha256=request_sha256,
                 claimed_at=now,
@@ -3067,6 +3224,7 @@ class InMemoryTaskStore(TaskStore):
                 or current.execution_owner_id != request.execution_owner_id
                 or current.execution_timeout_seconds != request.execution_timeout_seconds
                 or current.verifier != request.verifier
+                or current.verifier_profile_fingerprint != request.verifier_profile_fingerprint
                 or current.request_sha256 != request_sha256
                 or current.lease_expires_at <= now
                 or proposal.proposal_id in self._decision_id_by_proposal
@@ -3082,6 +3240,7 @@ class InMemoryTaskStore(TaskStore):
                 execution_owner_id=current.execution_owner_id,
                 execution_timeout_seconds=current.execution_timeout_seconds,
                 verifier=current.verifier,
+                verifier_profile_fingerprint=current.verifier_profile_fingerprint,
                 attempt_number=current.attempt_number,
                 request_sha256=current.request_sha256,
                 claimed_at=current.claimed_at,
@@ -3114,6 +3273,7 @@ class InMemoryTaskStore(TaskStore):
                     "Completion proposal already has a different durable decision."
                 )
             proposal = self._require_completion_proposal(request.proposal_id)
+            profile = self._completion_verifier_profiles.get(request.proposal_id)
             claim = self._completion_verification_claims.get(proposal.proposal_id)
             now = self._clock()
             if (
@@ -3121,6 +3281,9 @@ class InMemoryTaskStore(TaskStore):
                 or claim.claim_id != request.claim_id
                 or claim.worker_id != request.worker_id
                 or claim.verifier != request.verifier
+                or claim.verifier_profile_fingerprint != request.verifier_profile_fingerprint
+                or profile is None
+                or profile.profile.fingerprint != request.verifier_profile_fingerprint
                 or claim.lease_expires_at <= now
             ):
                 raise CompletionVerificationClaimLost(
@@ -3135,6 +3298,7 @@ class InMemoryTaskStore(TaskStore):
                 claim_id=request.claim_id,
                 worker_id=request.worker_id,
                 verifier=request.verifier,
+                verifier_profile_fingerprint=request.verifier_profile_fingerprint,
                 decision_version=request.decision_version,
                 verdict=request.verdict,
                 criterion_outcomes=request.criterion_outcomes,
@@ -3209,6 +3373,14 @@ class InMemoryTaskStore(TaskStore):
             # independent verifier was running.
             self._ensure_decision_attempt_is_current(task, attempt)
             proposal = self._require_completion_proposal(decision.proposal_id)
+            profile = self._completion_verifier_profiles.get(proposal.proposal_id)
+            if (
+                profile is None
+                or profile.profile.fingerprint != decision.verifier_profile_fingerprint
+            ):
+                raise WorkCompletionConflict(
+                    "Completion decision has no exact verifier-profile authority."
+                )
             applied_at = _task_lifecycle_now(task)
             task_changed = False
             if decision.verdict is CompletionVerdict.ACCEPTED:
@@ -3280,6 +3452,7 @@ class InMemoryTaskStore(TaskStore):
             receipt = CompletionDecisionApplicationReceipt(
                 task_id=task.id,
                 decision_id=decision.decision_id,
+                verifier_profile_fingerprint=decision.verifier_profile_fingerprint,
                 idempotency_key=request.idempotency_key,
                 request_sha256=request_sha256,
                 task=task,
@@ -4323,6 +4496,7 @@ class InMemoryTaskStore(TaskStore):
                 "status_payload": {
                     "completion_decision_id": decision.decision_id,
                     "gap_fingerprint": decision.gap_fingerprint,
+                    "verifier_profile_fingerprint": decision.verifier_profile_fingerprint,
                     "verdict": decision.verdict.value,
                 },
                 "worker_id": None,

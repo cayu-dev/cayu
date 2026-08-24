@@ -65,6 +65,16 @@ from cayu.runtime._provider_operation_cancellation_claim import (
 )
 from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
 from cayu.runtime.approvals import ResolutionActor, resolution_actor_payload
+from cayu.runtime.completion_verifier_profiles import (
+    CompletionVerifierProfilePreparationRequest,
+    CompletionVerifierProfileRecord,
+    completion_verifier_profile_preparation_request_sha256,
+    completion_verifier_profile_record_from_document,
+    completion_verifier_profile_record_from_preparation,
+    copy_completion_verifier_profile_preparation_request,
+    copy_completion_verifier_profile_record,
+    require_completion_verifier_profile_transition,
+)
 from cayu.runtime.execution_profiles import (
     ExecutionProfileDecision,
     ExecutionProfileIdentity,
@@ -506,7 +516,7 @@ from cayu.storage import migrations as schema
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
 _SQLITE_SESSION_MIN_REQUIRED_REVISION = 54
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 55
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 58
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -11897,19 +11907,76 @@ class SQLiteTaskStore(TaskStore):
         proposal_id: str,
     ) -> CompletionVerificationClaim | None:
         row = self._connection.execute(
-            "SELECT claim_id, proposal_id, attempt_number, request_sha256, "
+            "SELECT claim_id, proposal_id, attempt_number, verifier_profile_fingerprint, request_sha256, "
             "lease_expires_at, claim_json FROM cayu_completion_verification_claims "
             "WHERE proposal_id = ? AND is_current = 1",
             (proposal_id,),
         ).fetchone()
         return None if row is None else self._completion_claim_from_row(row)
 
+    def _load_completion_verifier_profile_unlocked(
+        self,
+        proposal_id: str,
+    ) -> CompletionVerifierProfileRecord | None:
+        row = self._connection.execute(
+            "SELECT proposal_id, task_id, attempt_id, profile_fingerprint, "
+            "request_sha256, prepared_at, profile_json "
+            "FROM cayu_completion_verifier_profiles WHERE proposal_id = ?",
+            (proposal_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        profile = completion_verifier_profile_record_from_document(json.loads(row["profile_json"]))
+        if (
+            profile.proposal_id != row["proposal_id"]
+            or profile.task_id != row["task_id"]
+            or profile.attempt_id != row["attempt_id"]
+            or profile.profile.fingerprint != row["profile_fingerprint"]
+            or profile.request_sha256 != row["request_sha256"]
+            or profile.prepared_at != sqlite_support.parse_datetime(row["prepared_at"])
+        ):
+            raise WorkCompletionConflict(
+                "Stored completion-verifier profile indexes conflict with canonical content."
+            )
+        return profile
+
+    def _load_completion_verifier_adoption_unlocked(
+        self,
+        *,
+        task_id: str,
+        idempotency_key: str,
+    ) -> CompletionVerifierProfileRecord | None:
+        rows = self._connection.execute(
+            "SELECT proposal_id FROM cayu_completion_verifier_profiles "
+            "WHERE task_id = ? "
+            "AND json_extract(profile_json, '$.adoption.idempotency_key') = ? "
+            "ORDER BY proposal_id LIMIT 2",
+            (task_id, idempotency_key),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise WorkCompletionConflict(
+                "Stored completion-verifier adoption idempotency authority is ambiguous."
+            )
+        profile = self._load_completion_verifier_profile_unlocked(rows[0]["proposal_id"])
+        if (
+            profile is None
+            or profile.task_id != task_id
+            or profile.adoption is None
+            or profile.adoption.idempotency_key != idempotency_key
+        ):
+            raise WorkCompletionConflict(
+                "Stored completion-verifier adoption idempotency authority is invalid."
+            )
+        return profile
+
     def _load_completion_claim_by_id_unlocked(
         self,
         claim_id: str,
     ) -> CompletionVerificationClaim | None:
         row = self._connection.execute(
-            "SELECT claim_id, proposal_id, attempt_number, request_sha256, "
+            "SELECT claim_id, proposal_id, attempt_number, verifier_profile_fingerprint, request_sha256, "
             "lease_expires_at, claim_json FROM cayu_completion_verification_claims "
             "WHERE claim_id = ?",
             (claim_id,),
@@ -11923,6 +11990,7 @@ class SQLiteTaskStore(TaskStore):
             claim.claim_id != row["claim_id"]
             or claim.proposal_id != row["proposal_id"]
             or claim.attempt_number != row["attempt_number"]
+            or claim.verifier_profile_fingerprint != row["verifier_profile_fingerprint"]
             or claim.request_sha256 != row["request_sha256"]
             or claim.lease_expires_at != sqlite_support.parse_datetime(row["lease_expires_at"])
         ):
@@ -11936,7 +12004,7 @@ class SQLiteTaskStore(TaskStore):
         decision_id: str,
     ) -> CompletionDecision | None:
         row = self._connection.execute(
-            "SELECT decision_id, proposal_id, task_id, attempt_id, claim_id, verdict, "
+            "SELECT decision_id, proposal_id, task_id, attempt_id, claim_id, verifier_profile_fingerprint, verdict, "
             "gap_fingerprint, request_sha256, decided_at, decision_json "
             "FROM cayu_completion_decisions WHERE decision_id = ?",
             (decision_id,),
@@ -11948,7 +12016,7 @@ class SQLiteTaskStore(TaskStore):
         proposal_id: str,
     ) -> CompletionDecision | None:
         row = self._connection.execute(
-            "SELECT decision_id, proposal_id, task_id, attempt_id, claim_id, verdict, "
+            "SELECT decision_id, proposal_id, task_id, attempt_id, claim_id, verifier_profile_fingerprint, verdict, "
             "gap_fingerprint, request_sha256, decided_at, decision_json "
             "FROM cayu_completion_decisions WHERE proposal_id = ?",
             (proposal_id,),
@@ -11964,6 +12032,7 @@ class SQLiteTaskStore(TaskStore):
             or decision.task_id != row["task_id"]
             or decision.attempt_id != row["attempt_id"]
             or decision.claim_id != row["claim_id"]
+            or decision.verifier_profile_fingerprint != row["verifier_profile_fingerprint"]
             or decision.verdict.value != row["verdict"]
             or decision.gap_fingerprint != row["gap_fingerprint"]
             or decision.request_sha256 != row["request_sha256"]
@@ -12333,6 +12402,125 @@ class SQLiteTaskStore(TaskStore):
             proposal = self._load_completion_proposal_unlocked(proposal_id)
             return None if proposal is None else proposal.model_copy(deep=True)
 
+    def _load_prior_completion_verifier_profile_unlocked(
+        self,
+        proposal: CompletionProposal,
+    ) -> CompletionVerifierProfileRecord | None:
+        row = self._connection.execute(
+            "SELECT prior_proposal.proposal_id "
+            "FROM cayu_work_attempts AS current_attempt "
+            "JOIN cayu_work_attempts AS prior_attempt "
+            "ON prior_attempt.task_id = current_attempt.task_id "
+            "AND prior_attempt.ordinal = current_attempt.ordinal - 1 "
+            "LEFT JOIN cayu_completion_proposals AS prior_proposal "
+            "ON prior_proposal.attempt_id = prior_attempt.attempt_id "
+            "WHERE current_attempt.attempt_id = ?",
+            (proposal.attempt_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row["proposal_id"] is None:
+            raise WorkCompletionConflict("Prior work attempt has no completion proposal authority.")
+        profile = self._load_completion_verifier_profile_unlocked(row["proposal_id"])
+        if profile is None:
+            raise WorkCompletionConflict("Prior work attempt has no verifier-profile authority.")
+        return profile
+
+    async def prepare_completion_verifier_profile(
+        self,
+        request: CompletionVerifierProfilePreparationRequest,
+    ) -> CompletionVerifierProfileRecord:
+        request = copy_completion_verifier_profile_preparation_request(request)
+        request_sha256 = completion_verifier_profile_preparation_request_sha256(request)
+        async with self._lock:
+            with self._verified_transaction_unlocked():
+                existing = self._load_completion_verifier_profile_unlocked(request.proposal_id)
+                if existing is not None:
+                    if existing.request_sha256 != request_sha256:
+                        raise WorkCompletionConflict(
+                            "Completion-verifier profile is already bound to another request."
+                        )
+                    return copy_completion_verifier_profile_record(existing)
+                proposal = self._load_completion_proposal_unlocked(request.proposal_id)
+                if proposal is None:
+                    raise KeyError(f"Completion proposal not found: {request.proposal_id}")
+                attempt = self._load_work_attempt_unlocked(proposal.attempt_id)
+                if attempt is None:
+                    raise WorkCompletionConflict("Completion proposal has no durable work attempt.")
+                contract = verified_work_support.require_contract_reference(
+                    self._load_work_contract_unlocked(proposal.contract),
+                    proposal.contract,
+                )
+                if (
+                    request.task_id != proposal.task_id
+                    or request.attempt_id != attempt.attempt_id
+                    or request.attempt_request_sha256 != attempt.request_sha256
+                    or request.source_execution_profile_fingerprint
+                    != attempt.execution_profile_fingerprint
+                    or request.proposal_request_sha256 != proposal.request_sha256
+                    or request.contract != contract.reference()
+                    or request.profile.verifier != contract.verifier
+                ):
+                    raise WorkCompletionConflict(
+                        "Completion-verifier profile conflicts with its durable proposal authority."
+                    )
+                prior = self._load_prior_completion_verifier_profile_unlocked(proposal)
+                require_completion_verifier_profile_transition(request, prior)
+                adoption = request.adoption
+                if (
+                    adoption is not None
+                    and self._load_completion_verifier_adoption_unlocked(
+                        task_id=request.task_id,
+                        idempotency_key=adoption.idempotency_key,
+                    )
+                    is not None
+                ):
+                    raise WorkCompletionConflict(
+                        "Completion-verifier profile adoption idempotency key is already "
+                        "bound to another proposal."
+                    )
+                record = completion_verifier_profile_record_from_preparation(
+                    request,
+                    request_sha256=request_sha256,
+                    prepared_at=self._clock(),
+                )
+                self._connection.execute(
+                    "INSERT INTO cayu_completion_verifier_profiles "
+                    "(proposal_id, task_id, attempt_id, profile_fingerprint, "
+                    "request_sha256, prepared_at, profile_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        record.proposal_id,
+                        record.task_id,
+                        record.attempt_id,
+                        record.profile.fingerprint,
+                        record.request_sha256,
+                        sqlite_support.format_datetime(record.prepared_at),
+                        sqlite_support.json_dumps(record.model_dump(mode="json", warnings=False)),
+                    ),
+                )
+                return copy_completion_verifier_profile_record(record)
+
+    async def load_completion_verifier_profile(
+        self,
+        proposal_id: str,
+    ) -> CompletionVerifierProfileRecord | None:
+        proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
+        async with self._lock:
+            profile = self._load_completion_verifier_profile_unlocked(proposal_id)
+            return None if profile is None else copy_completion_verifier_profile_record(profile)
+
+    async def load_prior_completion_verifier_profile(
+        self,
+        proposal_id: str,
+    ) -> CompletionVerifierProfileRecord | None:
+        proposal_id = require_clean_nonblank(proposal_id, "proposal_id")
+        async with self._lock:
+            proposal = self._load_completion_proposal_unlocked(proposal_id)
+            if proposal is None:
+                raise KeyError(f"Completion proposal not found: {proposal_id}")
+            profile = self._load_prior_completion_verifier_profile_unlocked(proposal)
+            return None if profile is None else copy_completion_verifier_profile_record(profile)
+
     async def claim_completion_verification(
         self,
         request: CompletionVerificationClaimRequest,
@@ -12360,6 +12548,14 @@ class SQLiteTaskStore(TaskStore):
                 if request.verifier != contract.verifier:
                     raise WorkCompletionConflict(
                         "Verification claim uses a verifier other than the frozen contract verifier."
+                    )
+                profile = self._load_completion_verifier_profile_unlocked(request.proposal_id)
+                if (
+                    profile is None
+                    or profile.profile.fingerprint != request.verifier_profile_fingerprint
+                ):
+                    raise WorkCompletionConflict(
+                        "Verification claim requires the exact prepared verifier profile."
                     )
                 now = self._clock()
                 current = self._load_completion_claim_unlocked(request.proposal_id)
@@ -12405,6 +12601,7 @@ class SQLiteTaskStore(TaskStore):
                     execution_owner_id=request.execution_owner_id,
                     execution_timeout_seconds=request.execution_timeout_seconds,
                     verifier=request.verifier,
+                    verifier_profile_fingerprint=request.verifier_profile_fingerprint,
                     attempt_number=attempt_number,
                     request_sha256=request_sha256,
                     claimed_at=now,
@@ -12417,12 +12614,14 @@ class SQLiteTaskStore(TaskStore):
                 )
                 self._connection.execute(
                     "INSERT INTO cayu_completion_verification_claims "
-                    "(claim_id, proposal_id, attempt_number, request_sha256, "
-                    "lease_expires_at, is_current, claim_json) VALUES (?, ?, ?, ?, ?, 1, ?)",
+                    "(claim_id, proposal_id, attempt_number, verifier_profile_fingerprint, "
+                    "request_sha256, lease_expires_at, is_current, claim_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
                     (
                         claim.claim_id,
                         claim.proposal_id,
                         claim.attempt_number,
+                        claim.verifier_profile_fingerprint,
                         claim.request_sha256,
                         sqlite_support.format_datetime(claim.lease_expires_at),
                         sqlite_support.json_dumps(claim.model_dump(mode="json", warnings=False)),
@@ -12459,6 +12658,7 @@ class SQLiteTaskStore(TaskStore):
                     or current.execution_owner_id != request.execution_owner_id
                     or current.execution_timeout_seconds != request.execution_timeout_seconds
                     or current.verifier != request.verifier
+                    or current.verifier_profile_fingerprint != request.verifier_profile_fingerprint
                     or current.request_sha256 != request_sha256
                     or current.lease_expires_at <= now
                     or self._load_completion_decision_for_proposal_unlocked(proposal.proposal_id)
@@ -12523,12 +12723,16 @@ class SQLiteTaskStore(TaskStore):
                 if proposal is None:
                     raise KeyError(f"Completion proposal not found: {request.proposal_id}")
                 claim = self._load_completion_claim_unlocked(proposal.proposal_id)
+                profile = self._load_completion_verifier_profile_unlocked(proposal.proposal_id)
                 now = self._clock()
                 if (
                     claim is None
                     or claim.claim_id != request.claim_id
                     or claim.worker_id != request.worker_id
                     or claim.verifier != request.verifier
+                    or claim.verifier_profile_fingerprint != request.verifier_profile_fingerprint
+                    or profile is None
+                    or profile.profile.fingerprint != request.verifier_profile_fingerprint
                     or claim.lease_expires_at <= now
                 ):
                     raise CompletionVerificationClaimLost(
@@ -12553,6 +12757,7 @@ class SQLiteTaskStore(TaskStore):
                     claim_id=request.claim_id,
                     worker_id=request.worker_id,
                     verifier=request.verifier,
+                    verifier_profile_fingerprint=request.verifier_profile_fingerprint,
                     decision_version=request.decision_version,
                     verdict=request.verdict,
                     criterion_outcomes=request.criterion_outcomes,
@@ -12569,15 +12774,17 @@ class SQLiteTaskStore(TaskStore):
                 )
                 self._connection.execute(
                     "INSERT INTO cayu_completion_decisions "
-                    "(decision_id, proposal_id, task_id, attempt_id, claim_id, verdict, "
+                    "(decision_id, proposal_id, task_id, attempt_id, claim_id, "
+                    "verifier_profile_fingerprint, verdict, "
                     "gap_fingerprint, request_sha256, decided_at, decision_json) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         decision.decision_id,
                         decision.proposal_id,
                         decision.task_id,
                         decision.attempt_id,
                         decision.claim_id,
+                        decision.verifier_profile_fingerprint,
                         decision.verdict.value,
                         decision.gap_fingerprint,
                         decision.request_sha256,
@@ -12657,6 +12864,14 @@ class SQLiteTaskStore(TaskStore):
                 proposal = self._load_completion_proposal_unlocked(decision.proposal_id)
                 if proposal is None:
                     raise WorkCompletionConflict("Completion decision has no completion proposal.")
+                profile = self._load_completion_verifier_profile_unlocked(proposal.proposal_id)
+                if (
+                    profile is None
+                    or profile.profile.fingerprint != decision.verifier_profile_fingerprint
+                ):
+                    raise WorkCompletionConflict(
+                        "Completion decision has no exact verifier-profile authority."
+                    )
                 row = self._connection.execute(
                     "SELECT COUNT(*) AS matching FROM cayu_completion_decisions "
                     "WHERE task_id = ? AND verdict = ? AND gap_fingerprint = ?",

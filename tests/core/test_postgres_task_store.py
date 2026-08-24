@@ -15,6 +15,9 @@ from uuid import uuid4
 import pytest
 from psycopg import errors as psycopg_errors
 from pydantic import ValidationError
+from tests.core.completion_verifier_profile_fixtures import (
+    prepare_test_completion_verifier_profile,
+)
 from tests.core.task_invocation_fixtures import (
     task_backed_session_invocation,
     unattributed_session_invocation_binding,
@@ -39,14 +42,27 @@ from tests.core.test_verified_work_contracts import (
     _rejected_decision,
     _result_reference,
     _task_result,
+    _verifier_profile_fingerprint,
 )
 
 from cayu import (
     CayuApp,
+    CompletionContinuationPolicy,
     CompletionDecisionApplicationRequest,
     CompletionProposalCreate,
+    CompletionRejectionAction,
     CompletionVerificationClaimLost,
     CompletionVerificationClaimRequest,
+    CompletionVerifierDecision,
+    CompletionVerifierExecutionError,
+    CompletionVerifierExecutionRequest,
+    CompletionVerifierProfileAdoptionDecision,
+    CompletionVerifierProfilePreparationRequest,
+    CompletionVerifierRequest,
+    CompletionVerifierUnavailable,
+    DeterministicCompletionVerifier,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfileBehaviorIdentity,
     InvocationOrigin,
     InvocationOriginClaim,
     InvocationOriginTrust,
@@ -86,6 +102,10 @@ from cayu._validation import (
     DurableValueError,
     extract_durable_value_error,
 )
+from cayu.runtime.completion_verifier_profiles import (
+    build_completion_verifier_execution_profile,
+    changed_completion_verifier_profile_components,
+)
 from cayu.runtime.sessions import InMemorySessionStore
 from cayu.runtime.work_contracts import completion_verification_claim_authority_sha256
 
@@ -101,6 +121,7 @@ _TABLES = (
     "cayu_completion_decision_application_receipts",
     "cayu_completion_decisions",
     "cayu_completion_verification_claims",
+    "cayu_completion_verifier_profiles",
     "cayu_completion_proposals",
     "cayu_work_attempts",
     "cayu_task_session_execution_authority",
@@ -149,6 +170,15 @@ _TABLES = (
 )
 
 
+async def _claim_completion_verification(store, request):
+    profile = await prepare_test_completion_verifier_profile(
+        store,
+        request.proposal_id,
+    )
+    assert request.verifier_profile_fingerprint == profile.profile.fingerprint
+    return await store.claim_completion_verification(request)
+
+
 def test_postgres_verified_work_lifecycle_survives_restart(postgres_dsn):
     async def run() -> None:
         await _truncate(postgres_dsn)
@@ -189,8 +219,12 @@ def test_postgres_verified_work_lifecycle_survives_restart(postgres_dsn):
                 proposal_id=proposal.proposal_id,
                 worker_id="postgres-verifier",
                 verifier=contract.verifier,
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
             )
-            claim = await store.claim_completion_verification(claim_request)
+            claim = await _claim_completion_verification(store, claim_request)
+            verifier_profile = await store.load_completion_verifier_profile(proposal.proposal_id)
+            assert verifier_profile is not None
+            assert claim.verifier_profile_fingerprint == verifier_profile.profile.fingerprint
             decision_request = _rejected_decision(
                 proposal_id=proposal.proposal_id,
                 claim_id=claim.claim_id,
@@ -219,6 +253,10 @@ def test_postgres_verified_work_lifecycle_survives_restart(postgres_dsn):
             assert await reopened.load_completion_proposal(proposal.proposal_id) == proposal
             assert await reopened.load_completion_verification_claim(proposal.proposal_id) == claim
             assert await reopened.load_completion_decision(decision.decision_id) == decision
+            assert (
+                await reopened.load_completion_verifier_profile(proposal.proposal_id)
+                == verifier_profile
+            )
             assert await reopened.record_completion_decision(decision_request) == decision
             assert await reopened.apply_completion_decision(rejection_application) == still_running
             with pytest.raises(
@@ -247,13 +285,70 @@ def test_postgres_verified_work_lifecycle_survives_restart(postgres_dsn):
                     evidence_references=(_artifact_evidence(), _approval_evidence()),
                 )
             )
-            claim_two = await reopened.claim_completion_verification(
+            changed_profile = build_completion_verifier_execution_profile(
+                verifier=contract.verifier,
+                adapter_identity=ExecutionProfileBehaviorIdentity(
+                    name="tests:postgres-completion-verifier-v2",
+                    behavior_version="2",
+                    implementation_version="1",
+                ),
+            )
+            inexact_adoption = CompletionVerifierProfileAdoptionDecision(
+                expected_profile_fingerprint=verifier_profile.profile.fingerprint,
+                candidate_profile_fingerprint=changed_profile.fingerprint,
+                changed_component_ids=("unrelated-component",),
+                policy_identity="tests:postgres-completion-verifier-policy:v1",
+                authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+                idempotency_key="postgres-adopt-verifier-v2",
+                requested_by=ResolutionActor(
+                    subject="postgres-operator",
+                    source=ResolutionActorSource.REQUEST,
+                ),
+                reason="Adopt the PostgreSQL verifier profile.",
+                policy_reason="The PostgreSQL verifier transition is authorized.",
+                request_sha256=_digest("postgres-adopt-verifier-v2-request"),
+            )
+            with pytest.raises(WorkCompletionConflict, match="exact durable adoption"):
+                await reopened.prepare_completion_verifier_profile(
+                    CompletionVerifierProfilePreparationRequest(
+                        proposal_id=proposal_two.proposal_id,
+                        task_id=proposal_two.task_id,
+                        attempt_id=attempt_two.attempt_id,
+                        attempt_request_sha256=attempt_two.request_sha256,
+                        source_execution_profile_fingerprint=(
+                            attempt_two.execution_profile_fingerprint
+                        ),
+                        proposal_request_sha256=proposal_two.request_sha256,
+                        contract=contract.reference(),
+                        profile=changed_profile,
+                        expected_prior_proposal_id=proposal.proposal_id,
+                        expected_prior_profile_fingerprint=(verifier_profile.profile.fingerprint),
+                        adoption=inexact_adoption,
+                    )
+                )
+            assert await reopened.load_completion_verifier_profile(proposal_two.proposal_id) is None
+            claim_two = await _claim_completion_verification(
+                reopened,
                 CompletionVerificationClaimRequest(
                     claim_id="postgres-claim-2",
                     proposal_id=proposal_two.proposal_id,
                     worker_id="postgres-verifier",
                     verifier=contract.verifier,
-                )
+                    verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
+                ),
+            )
+            verifier_profile_two = await reopened.load_completion_verifier_profile(
+                proposal_two.proposal_id
+            )
+            assert verifier_profile_two is not None
+            assert verifier_profile_two.profile == verifier_profile.profile
+            assert verifier_profile_two.expected_prior_proposal_id == proposal.proposal_id
+            assert (
+                verifier_profile_two.expected_prior_profile_fingerprint
+                == verifier_profile.profile.fingerprint
+            )
+            assert claim_two.verifier_profile_fingerprint == (
+                verifier_profile_two.profile.fingerprint
             )
             accepted_request = _accepted_decision(
                 proposal_id=proposal_two.proposal_id,
@@ -281,6 +376,7 @@ def test_postgres_verified_work_lifecycle_survives_restart(postgres_dsn):
                 application.idempotency_key,
             )
             assert receipt is not None
+            assert receipt.verifier_profile_fingerprint == (accepted.verifier_profile_fingerprint)
             assert receipt.task == completed
             assert (
                 await reopened.load_active_work_contract_task_for_session(
@@ -292,6 +388,475 @@ def test_postgres_verified_work_lifecycle_survives_restart(postgres_dsn):
                 await reopened.admit_ordinary_session_execution("session:postgres:verified")
         finally:
             await reopened.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_verifier_profile_adoption_identity_is_task_scoped(postgres_dsn):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        contract = _contract(
+            contract_id="postgres-verifier-adoption-contract",
+            continuation_policy=CompletionContinuationPolicy(
+                rejection_action=CompletionRejectionAction.CONTINUE,
+                max_attempts=4,
+                max_repeated_gap_count=4,
+            ),
+        )
+        store = _new_store(postgres_dsn)
+        try:
+            await store.publish_work_contract(contract)
+            task = await store.create_running_task(
+                TaskCreate(
+                    task_id="postgres-verifier-adoption-task",
+                    type="bid",
+                    session_id="session:postgres:verifier-adoption",
+                    work_contract=contract.reference(),
+                ),
+                session_invocation=unattributed_session_invocation_binding(
+                    "session:postgres:verifier-adoption"
+                ),
+            )
+            first_attempt = await store.begin_work_attempt(
+                WorkAttemptCreate(
+                    attempt_id="postgres-verifier-adoption-attempt-1",
+                    task_id=task.id,
+                    session_id=task.session_id or "missing-session",
+                    contract=contract.reference(),
+                    execution_profile_fingerprint=_digest("postgres-adoption-worker-1"),
+                )
+            )
+            first_proposal = await store.submit_completion_proposal(
+                CompletionProposalCreate(
+                    proposal_id="postgres-verifier-adoption-proposal-1",
+                    attempt_id=first_attempt.attempt_id,
+                    result=_result_reference("postgres-adoption-1"),
+                )
+            )
+            first_profile = await prepare_test_completion_verifier_profile(
+                store,
+                first_proposal.proposal_id,
+                identity_name="tests:postgres-verifier-adoption-v1",
+            )
+            first_claim = await store.claim_completion_verification(
+                CompletionVerificationClaimRequest(
+                    claim_id="postgres-verifier-adoption-claim-1",
+                    proposal_id=first_proposal.proposal_id,
+                    worker_id="postgres-verifier-adoption-worker",
+                    verifier=contract.verifier,
+                    verifier_profile_fingerprint=first_profile.profile.fingerprint,
+                )
+            )
+            first_decision = await store.record_completion_decision(
+                _rejected_decision(
+                    proposal_id=first_proposal.proposal_id,
+                    claim_id=first_claim.claim_id,
+                    worker_id=first_claim.worker_id,
+                    decision_id="postgres-verifier-adoption-decision-1",
+                ).model_copy(
+                    update={"verifier_profile_fingerprint": first_profile.profile.fingerprint}
+                )
+            )
+            await store.apply_completion_decision(
+                CompletionDecisionApplicationRequest(
+                    task_id=task.id,
+                    decision_id=first_decision.decision_id,
+                    idempotency_key="postgres-apply-verifier-adoption-1",
+                )
+            )
+
+            second_attempt = await store.begin_work_attempt(
+                WorkAttemptCreate(
+                    attempt_id="postgres-verifier-adoption-attempt-2",
+                    task_id=task.id,
+                    session_id=task.session_id or "missing-session",
+                    contract=contract.reference(),
+                    execution_profile_fingerprint=_digest("postgres-adoption-worker-2"),
+                )
+            )
+            second_proposal = await store.submit_completion_proposal(
+                CompletionProposalCreate(
+                    proposal_id="postgres-verifier-adoption-proposal-2",
+                    attempt_id=second_attempt.attempt_id,
+                    result=_result_reference("postgres-adoption-2"),
+                )
+            )
+            second_profile_value = build_completion_verifier_execution_profile(
+                verifier=contract.verifier,
+                adapter_identity=ExecutionProfileBehaviorIdentity(
+                    name="tests:postgres-verifier-adoption-v2",
+                    behavior_version="2",
+                    implementation_version="1",
+                ),
+            )
+            adoption_key = "postgres-verifier-adoption-key"
+            second_adoption = CompletionVerifierProfileAdoptionDecision(
+                expected_profile_fingerprint=first_profile.profile.fingerprint,
+                candidate_profile_fingerprint=second_profile_value.fingerprint,
+                changed_component_ids=changed_completion_verifier_profile_components(
+                    first_profile.profile,
+                    second_profile_value,
+                ),
+                policy_identity="tests:postgres-verifier-adoption-policy:v1",
+                authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+                idempotency_key=adoption_key,
+                requested_by=ResolutionActor(
+                    subject="postgres-operator",
+                    source=ResolutionActorSource.REQUEST,
+                ),
+                reason="Adopt PostgreSQL verifier profile v2.",
+                policy_reason="PostgreSQL verifier profile v2 is authorized.",
+                request_sha256=_digest("postgres-verifier-adoption-request-2"),
+            )
+            second_profile = await store.prepare_completion_verifier_profile(
+                CompletionVerifierProfilePreparationRequest(
+                    proposal_id=second_proposal.proposal_id,
+                    task_id=second_proposal.task_id,
+                    attempt_id=second_attempt.attempt_id,
+                    attempt_request_sha256=second_attempt.request_sha256,
+                    source_execution_profile_fingerprint=(
+                        second_attempt.execution_profile_fingerprint
+                    ),
+                    proposal_request_sha256=second_proposal.request_sha256,
+                    contract=contract.reference(),
+                    profile=second_profile_value,
+                    expected_prior_proposal_id=first_profile.proposal_id,
+                    expected_prior_profile_fingerprint=first_profile.profile.fingerprint,
+                    adoption=second_adoption,
+                )
+            )
+            assert second_profile.adoption == second_adoption
+            second_claim = await store.claim_completion_verification(
+                CompletionVerificationClaimRequest(
+                    claim_id="postgres-verifier-adoption-claim-2",
+                    proposal_id=second_proposal.proposal_id,
+                    worker_id="postgres-verifier-adoption-worker",
+                    verifier=contract.verifier,
+                    verifier_profile_fingerprint=second_profile.profile.fingerprint,
+                )
+            )
+            second_decision = await store.record_completion_decision(
+                _rejected_decision(
+                    proposal_id=second_proposal.proposal_id,
+                    claim_id=second_claim.claim_id,
+                    worker_id=second_claim.worker_id,
+                    decision_id="postgres-verifier-adoption-decision-2",
+                ).model_copy(
+                    update={"verifier_profile_fingerprint": second_profile.profile.fingerprint}
+                )
+            )
+            await store.apply_completion_decision(
+                CompletionDecisionApplicationRequest(
+                    task_id=task.id,
+                    decision_id=second_decision.decision_id,
+                    idempotency_key="postgres-apply-verifier-adoption-2",
+                )
+            )
+        finally:
+            await store.close()
+
+        reopened = _new_store(postgres_dsn)
+        try:
+            assert (
+                await reopened.load_completion_verifier_profile(second_proposal.proposal_id)
+                == second_profile
+            )
+            third_attempt = await reopened.begin_work_attempt(
+                WorkAttemptCreate(
+                    attempt_id="postgres-verifier-adoption-attempt-3",
+                    task_id=task.id,
+                    session_id=task.session_id or "missing-session",
+                    contract=contract.reference(),
+                    execution_profile_fingerprint=_digest("postgres-adoption-worker-3"),
+                )
+            )
+            third_proposal = await reopened.submit_completion_proposal(
+                CompletionProposalCreate(
+                    proposal_id="postgres-verifier-adoption-proposal-3",
+                    attempt_id=third_attempt.attempt_id,
+                    result=_result_reference("postgres-adoption-3"),
+                )
+            )
+            third_profile_value = build_completion_verifier_execution_profile(
+                verifier=contract.verifier,
+                adapter_identity=ExecutionProfileBehaviorIdentity(
+                    name="tests:postgres-verifier-adoption-v3",
+                    behavior_version="3",
+                    implementation_version="1",
+                ),
+            )
+            reused_adoption = CompletionVerifierProfileAdoptionDecision(
+                expected_profile_fingerprint=second_profile.profile.fingerprint,
+                candidate_profile_fingerprint=third_profile_value.fingerprint,
+                changed_component_ids=changed_completion_verifier_profile_components(
+                    second_profile.profile,
+                    third_profile_value,
+                ),
+                policy_identity="tests:postgres-verifier-adoption-policy:v1",
+                authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+                idempotency_key=adoption_key,
+                requested_by=second_adoption.requested_by,
+                reason="Adopt PostgreSQL verifier profile v3.",
+                policy_reason="PostgreSQL verifier profile v3 is authorized.",
+                request_sha256=_digest("postgres-verifier-adoption-request-3"),
+            )
+            with pytest.raises(WorkCompletionConflict, match="idempotency key"):
+                await reopened.prepare_completion_verifier_profile(
+                    CompletionVerifierProfilePreparationRequest(
+                        proposal_id=third_proposal.proposal_id,
+                        task_id=third_proposal.task_id,
+                        attempt_id=third_attempt.attempt_id,
+                        attempt_request_sha256=third_attempt.request_sha256,
+                        source_execution_profile_fingerprint=(
+                            third_attempt.execution_profile_fingerprint
+                        ),
+                        proposal_request_sha256=third_proposal.request_sha256,
+                        contract=contract.reference(),
+                        profile=third_profile_value,
+                        expected_prior_proposal_id=second_profile.proposal_id,
+                        expected_prior_profile_fingerprint=second_profile.profile.fingerprint,
+                        adoption=reused_adoption,
+                    )
+                )
+            assert (
+                await reopened.load_completion_verifier_profile(third_proposal.proposal_id) is None
+            )
+        finally:
+            await reopened.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_verifier_profile_restart_requires_exact_registration_for_replacement(
+    postgres_dsn,
+) -> None:
+    class VersionedVerifier(DeterministicCompletionVerifier):
+        def __init__(self, *, behavior_version: str, fail: bool = False) -> None:
+            self.behavior_version = behavior_version
+            self.fail = fail
+            self.requests: list[CompletionVerifierRequest] = []
+
+        @property
+        def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+            return ExecutionProfileBehaviorIdentity(
+                name="tests:postgres-restart-completion-verifier",
+                behavior_version=self.behavior_version,
+                implementation_version="1",
+            )
+
+        async def verify(
+            self,
+            request: CompletionVerifierRequest,
+        ) -> CompletionVerifierDecision:
+            self.requests.append(request)
+            if self.fail:
+                raise RuntimeError("first postgres verifier worker failed")
+            complete = _accepted_decision(
+                proposal_id=request.proposal.proposal_id,
+                claim_id="adapter-outcome-has-no-claim-authority",
+                worker_id="adapter-outcome-has-no-worker-authority",
+            )
+            return CompletionVerifierDecision(
+                verdict=complete.verdict,
+                criterion_outcomes=complete.criterion_outcomes,
+                constraint_outcomes=complete.constraint_outcomes,
+                gaps=complete.gaps,
+                evidence_references=complete.evidence_references,
+            )
+
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        clock = _MutableClock(datetime(2026, 1, 1, tzinfo=UTC))
+        contract = _contract(contract_id="postgres-profile-replacement-contract")
+        store = _new_store(postgres_dsn, clock=clock)
+        try:
+            await store.publish_work_contract(contract)
+            task = await store.create_running_task(
+                TaskCreate(
+                    task_id="postgres-profile-replacement-task",
+                    type="verified-work",
+                    session_id="session:postgres:profile-replacement",
+                    work_contract=contract.reference(),
+                ),
+                session_invocation=unattributed_session_invocation_binding(
+                    "session:postgres:profile-replacement"
+                ),
+            )
+            attempt = await store.begin_work_attempt(
+                WorkAttemptCreate(
+                    attempt_id="postgres-profile-replacement-attempt",
+                    task_id=task.id,
+                    session_id=task.session_id or "missing-session",
+                    contract=contract.reference(),
+                    execution_profile_fingerprint=_digest("postgres-profile-replacement-worker"),
+                )
+            )
+            proposal = await store.submit_completion_proposal(
+                CompletionProposalCreate(
+                    proposal_id="postgres-profile-replacement-proposal",
+                    attempt_id=attempt.attempt_id,
+                    result=_result_reference("postgres-profile-replacement"),
+                )
+            )
+            initial = VersionedVerifier(behavior_version="v1", fail=True)
+            first_app = CayuApp(task_store=store, enable_logging=False)
+            first_app.register_completion_verifier(contract.verifier, initial)
+            original = CompletionVerifierExecutionRequest(
+                proposal_id=proposal.proposal_id,
+                claim_id="postgres-profile-replacement-claim",
+                decision_id="postgres-profile-replacement-decision",
+                worker_id="postgres-profile-replacement-verifier",
+                lease_seconds=1,
+                execution_timeout_seconds=0.5,
+            )
+            with pytest.raises(CompletionVerifierExecutionError):
+                await first_app.verify_completion_proposal(original)
+            profile = await store.load_completion_verifier_profile(proposal.proposal_id)
+            original_claim = await store.load_completion_verification_claim(proposal.proposal_id)
+            assert profile is not None
+            assert original_claim is not None
+            assert original_claim.verifier_profile_fingerprint == profile.profile.fingerprint
+        finally:
+            await store.close()
+
+        reopened = _new_store(postgres_dsn, clock=clock)
+        try:
+            missing_app = CayuApp(task_store=reopened, enable_logging=False)
+            with pytest.raises(CompletionVerifierUnavailable, match="not registered"):
+                await missing_app.verify_completion_proposal(original)
+            assert (
+                await reopened.load_completion_verification_claim(proposal.proposal_id)
+                == original_claim
+            )
+
+            changed = VersionedVerifier(behavior_version="v2")
+            changed_app = CayuApp(task_store=reopened, enable_logging=False)
+            changed_app.register_completion_verifier(contract.verifier, changed)
+            with pytest.raises(CompletionVerifierUnavailable, match="durable profile"):
+                await changed_app.verify_completion_proposal(original)
+            assert changed.requests == []
+            assert (
+                await reopened.load_completion_verification_claim(proposal.proposal_id)
+                == original_claim
+            )
+
+            clock.value += timedelta(seconds=2)
+            exact = VersionedVerifier(behavior_version="v1")
+            exact_app = CayuApp(task_store=reopened, enable_logging=False)
+            exact_app.register_completion_verifier(contract.verifier, exact)
+            replacement = original.model_copy(
+                update={
+                    "claim_id": "postgres-profile-replacement-claim-2",
+                    "decision_id": "postgres-profile-replacement-decision-2",
+                }
+            )
+            decision = await exact_app.verify_completion_proposal(replacement)
+            replacement_claim = await reopened.load_completion_verification_claim(
+                proposal.proposal_id
+            )
+            assert replacement_claim is not None
+            assert replacement_claim.attempt_number == original_claim.attempt_number + 1
+            assert replacement_claim.verifier_profile_fingerprint == profile.profile.fingerprint
+            assert decision.verifier_profile_fingerprint == profile.profile.fingerprint
+            assert await reopened.load_completion_verifier_profile(proposal.proposal_id) == profile
+            assert len(exact.requests) == 1
+        finally:
+            await reopened.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_revision_58_rejects_unprofiled_verification_records(postgres_dsn):
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresTaskStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        contract = _contract(contract_id="postgres-revision-58-contract")
+        try:
+            await store.publish_work_contract(contract)
+            await store.create_running_task(
+                TaskCreate(
+                    task_id="postgres-revision-58-task",
+                    type="verified-work",
+                    session_id="session:postgres:revision-58",
+                    work_contract=contract.reference(),
+                ),
+                session_invocation=unattributed_session_invocation_binding(
+                    "session:postgres:revision-58"
+                ),
+            )
+            attempt = await store.begin_work_attempt(
+                WorkAttemptCreate(
+                    attempt_id="postgres-revision-58-attempt",
+                    task_id="postgres-revision-58-task",
+                    session_id="session:postgres:revision-58",
+                    contract=contract.reference(),
+                    execution_profile_fingerprint=_digest("postgres-revision-58-worker"),
+                )
+            )
+            proposal = await store.submit_completion_proposal(
+                CompletionProposalCreate(
+                    proposal_id="postgres-revision-58-proposal",
+                    attempt_id=attempt.attempt_id,
+                    result=_result_reference("postgres-revision-58"),
+                )
+            )
+            await _claim_completion_verification(
+                store,
+                CompletionVerificationClaimRequest(
+                    claim_id="postgres-revision-58-claim",
+                    proposal_id=proposal.proposal_id,
+                    worker_id="postgres-revision-58-verifier",
+                    verifier=contract.verifier,
+                    verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
+                ),
+            )
+        finally:
+            await store.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                with pytest.raises(psycopg.Error):
+                    await cur.execute(
+                        "UPDATE cayu_completion_verification_claims "
+                        "SET verifier_profile_fingerprint = NULL"
+                    )
+                await conn.rollback()
+                await cur.execute("DROP TABLE cayu_completion_verifier_profiles")
+                await cur.execute(
+                    "ALTER TABLE cayu_completion_verification_claims "
+                    "DROP COLUMN verifier_profile_fingerprint"
+                )
+                await cur.execute(
+                    "ALTER TABLE cayu_completion_decisions DROP COLUMN verifier_profile_fingerprint"
+                )
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 58")
+            await conn.commit()
+
+        migrator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(RuntimeError, match="cannot attribute existing completion"):
+                await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT 1 FROM cayu_schema_migrations WHERE revision = 58")
+            assert await cur.fetchone() is None
+            await cur.execute(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'cayu_completion_verification_claims' "
+                "AND column_name = 'verifier_profile_fingerprint'"
+            )
+            assert await cur.fetchone() is None
 
     asyncio.run(run())
 
@@ -370,13 +935,17 @@ def test_postgres_verified_work_authority_races_are_single_winner(postgres_dsn):
 
             async def claim(store, suffix: str):
                 try:
-                    return await store.claim_completion_verification(
+                    return await _claim_completion_verification(
+                        store,
                         CompletionVerificationClaimRequest(
                             claim_id=f"postgres-claim-race-{suffix}",
                             proposal_id=proposal.proposal_id,
                             worker_id=f"verifier-{suffix}",
                             verifier=contract.verifier,
-                        )
+                            verifier_profile_fingerprint=_verifier_profile_fingerprint(
+                                contract.verifier
+                            ),
+                        ),
                     )
                 except CompletionVerificationClaimLost as exc:
                     return exc
@@ -745,8 +1314,10 @@ def test_postgres_verified_work_lease_checks_use_post_lock_time(postgres_dsn):
                 proposal_id=proposal.proposal_id,
                 worker_id="postgres-post-lock-verifier",
                 verifier=contract.verifier,
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
                 lease_seconds=1,
             )
+            await prepare_test_completion_verifier_profile(store, proposal.proposal_id)
             await lock_connection.execute(
                 "SELECT id FROM cayu_tasks WHERE id = %s FOR UPDATE",
                 (verifier_task.id,),
@@ -773,8 +1344,8 @@ def test_postgres_verified_work_lease_checks_use_post_lock_time(postgres_dsn):
             task_row_renewal_request = claim_request.model_copy(
                 update={"claim_id": "postgres-post-lock-task-row-renewal-claim"}
             )
-            task_row_renewal_claim = await store.claim_completion_verification(
-                task_row_renewal_request
+            task_row_renewal_claim = await _claim_completion_verification(
+                store, task_row_renewal_request
             )
             await lock_connection.execute(
                 "SELECT id FROM cayu_tasks WHERE id = %s FOR UPDATE",
@@ -795,7 +1366,7 @@ def test_postgres_verified_work_lease_checks_use_post_lock_time(postgres_dsn):
             decision_claim_request = claim_request.model_copy(
                 update={"claim_id": "postgres-post-lock-decision-claim"}
             )
-            decision_claim = await store.claim_completion_verification(decision_claim_request)
+            decision_claim = await _claim_completion_verification(store, decision_claim_request)
             decision_request = _rejected_decision(
                 proposal_id=proposal.proposal_id,
                 claim_id=decision_claim.claim_id,
@@ -948,8 +1519,13 @@ def test_postgres_verified_work_global_identity_races_remain_typed(postgres_dsn)
                     proposal_id=chain[1].proposal_id,
                     worker_id=f"postgres-global-claim-worker-{index}",
                     verifier=contract.verifier,
+                    verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
                 )
                 for index, chain in enumerate(claim_chains)
+            )
+            await asyncio.gather(
+                prepare_test_completion_verifier_profile(first, claim_chains[0][1].proposal_id),
+                prepare_test_completion_verifier_profile(second, claim_chains[1][1].proposal_id),
             )
             claim_outcomes = await asyncio.gather(
                 first.claim_completion_verification(claim_requests[0]),
@@ -963,6 +1539,10 @@ def test_postgres_verified_work_global_identity_races_remain_typed(postgres_dsn)
                 unique_proposal("decision-a"),
                 unique_proposal("decision-b"),
             )
+            await asyncio.gather(
+                prepare_test_completion_verifier_profile(first, decision_chains[0][1].proposal_id),
+                prepare_test_completion_verifier_profile(second, decision_chains[1][1].proposal_id),
+            )
             decision_claims = await asyncio.gather(
                 first.claim_completion_verification(
                     CompletionVerificationClaimRequest(
@@ -970,6 +1550,9 @@ def test_postgres_verified_work_global_identity_races_remain_typed(postgres_dsn)
                         proposal_id=decision_chains[0][1].proposal_id,
                         worker_id="postgres-global-decision-worker-a",
                         verifier=contract.verifier,
+                        verifier_profile_fingerprint=_verifier_profile_fingerprint(
+                            contract.verifier
+                        ),
                     )
                 ),
                 second.claim_completion_verification(
@@ -978,6 +1561,9 @@ def test_postgres_verified_work_global_identity_races_remain_typed(postgres_dsn)
                         proposal_id=decision_chains[1][1].proposal_id,
                         worker_id="postgres-global-decision-worker-b",
                         verifier=contract.verifier,
+                        verifier_profile_fingerprint=_verifier_profile_fingerprint(
+                            contract.verifier
+                        ),
                     )
                 ),
             )
@@ -1025,13 +1611,20 @@ def test_postgres_verified_work_global_identity_races_remain_typed(postgres_dsn)
                     )
                 )
             with pytest.raises(WorkCompletionConflict):
+                # This deliberately omits the parent proposal so the store's
+                # global claim-identity conflict remains the authoritative
+                # failure. The normal helper prepares profile authority and
+                # therefore cannot represent this malformed-parent case.
                 await first.claim_completion_verification(
                     CompletionVerificationClaimRequest(
                         claim_id="postgres-global-shared-claim",
                         proposal_id="missing-global-identity-proposal",
                         worker_id="missing-global-identity-verifier",
                         verifier=contract.verifier,
-                    )
+                        verifier_profile_fingerprint=_verifier_profile_fingerprint(
+                            contract.verifier
+                        ),
+                    ),
                 )
             with pytest.raises(WorkCompletionConflict):
                 await first.record_completion_decision(
@@ -1090,8 +1683,9 @@ def test_postgres_decision_application_and_claim_replay_do_not_deadlock(postgres
                 proposal_id=proposal.proposal_id,
                 worker_id="postgres-application-lock-order-verifier",
                 verifier=contract.verifier,
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
             )
-            claim = await first.claim_completion_verification(claim_request)
+            claim = await _claim_completion_verification(first, claim_request)
             decision = await first.record_completion_decision(
                 _rejected_decision(
                     proposal_id=proposal.proposal_id,

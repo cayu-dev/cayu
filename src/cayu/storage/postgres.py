@@ -671,7 +671,7 @@ _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
 _POSTGRES_SESSION_MIN_REQUIRED_REVISION = 54
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 55
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 58
 
 
 async def _postgres_lock_memory_evidence_id(cur: Any, lock_id: str) -> None:
@@ -2568,6 +2568,36 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "scenario_progress_json::jsonb IS NOT NULL))",
     ),
     57: ("ALTER TABLE cayu_session_message_queue ADD COLUMN IF NOT EXISTS message_json JSONB",),
+    58: (
+        "ALTER TABLE cayu_completion_verification_claims "
+        "ADD COLUMN IF NOT EXISTS verifier_profile_fingerprint TEXT "
+        "CHECK (verifier_profile_fingerprint IS NOT NULL AND "
+        "verifier_profile_fingerprint ~ '^[0-9a-f]{64}$')",
+        "ALTER TABLE cayu_completion_decisions "
+        "ADD COLUMN IF NOT EXISTS verifier_profile_fingerprint TEXT "
+        "CHECK (verifier_profile_fingerprint IS NOT NULL AND "
+        "verifier_profile_fingerprint ~ '^[0-9a-f]{64}$')",
+        "ALTER TABLE cayu_completion_verification_claims "
+        "ALTER COLUMN verifier_profile_fingerprint SET NOT NULL",
+        "ALTER TABLE cayu_completion_decisions "
+        "ALTER COLUMN verifier_profile_fingerprint SET NOT NULL",
+        """
+        CREATE TABLE IF NOT EXISTS cayu_completion_verifier_profiles (
+            proposal_id TEXT PRIMARY KEY
+                REFERENCES cayu_completion_proposals(proposal_id) ON DELETE RESTRICT,
+            task_id TEXT NOT NULL REFERENCES cayu_tasks(id) ON DELETE RESTRICT,
+            attempt_id TEXT NOT NULL UNIQUE
+                REFERENCES cayu_work_attempts(attempt_id) ON DELETE RESTRICT,
+            profile_fingerprint TEXT NOT NULL
+                CHECK (profile_fingerprint ~ '^[0-9a-f]{64}$'),
+            request_sha256 TEXT NOT NULL CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
+            prepared_at TIMESTAMPTZ NOT NULL,
+            profile_json JSONB NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_completion_verifier_profiles_task "
+        "ON cayu_completion_verifier_profiles(task_id, attempt_id)",
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -3672,6 +3702,27 @@ async def _reject_populated_pre_transcript_search_database(cur: Any) -> None:
         )
 
 
+async def _reject_populated_pre_verifier_profile_database(cur: Any) -> None:
+    for table in (
+        "cayu_completion_verification_claims",
+        "cayu_completion_decisions",
+    ):
+        await cur.execute("SELECT to_regclass(current_schema() || %s)", (f".{table}",))
+        registered = await cur.fetchone()
+        if registered is None or registered[0] is None:
+            continue
+        await cur.execute(
+            sql.SQL("SELECT EXISTS(SELECT 1 FROM {} LIMIT 1)").format(sql.Identifier(table))
+        )
+        row = await cur.fetchone()
+        if row is not None and row[0] is True:
+            raise RuntimeError(
+                "Postgres migration revision 58 cannot attribute existing completion-"
+                "verification records to immutable verifier profiles. Recreate the "
+                "pre-release database before migrating."
+            )
+
+
 async def _reject_revision_43_knowledge_identity_overflow(cur: Any) -> None:
     await cur.execute(
         """
@@ -3935,6 +3986,14 @@ class _PostgresStoreBase:
                         and any(revision.revision == 52 for revision in schema.pending(current))
                     ):
                         await _reject_populated_pre_targeted_tool_grant_database(cur)
+                    if (
+                        current != schema.UNINITIALIZED
+                        and current < 58
+                        and any(revision.revision == 58 for revision in schema.pending(current))
+                    ):
+                        # Reject before applying any earlier pending revision so the
+                        # clean break cannot leave a database half-migrated.
+                        await _reject_populated_pre_verifier_profile_database(cur)
                     if current == schema.UNINITIALIZED:
                         await self._apply_baseline(cur)
                         current = schema.BASELINE_REVISION
@@ -3972,7 +4031,10 @@ class _PostgresStoreBase:
                         if self._min_required_revision >= 48:
                             await self._validate_captured_eval_case_schema(cur)
                         if self._min_required_revision >= 49:
-                            await self._validate_verified_work_schema(cur)
+                            await self._validate_verified_work_schema(
+                                cur,
+                                require_verifier_profiles=current_state.revision >= 58,
+                            )
                         if self._min_required_revision >= 50:
                             await self._validate_eval_run_invocation_column(cur)
                         if self._min_required_revision >= 51:
@@ -4154,7 +4216,10 @@ class _PostgresStoreBase:
         if self._min_required_revision >= 48:
             await self._validate_captured_eval_case_schema(cur)
         if self._min_required_revision >= 49:
-            await self._validate_verified_work_schema(cur)
+            await self._validate_verified_work_schema(
+                cur,
+                require_verifier_profiles=state.revision >= 58,
+            )
         if self._min_required_revision >= 50:
             await self._validate_eval_run_invocation_column(cur)
         if self._min_required_revision >= 51:
@@ -4253,8 +4318,6 @@ class _PostgresStoreBase:
             await self._validate_eval_result_baseline_schema(cur)
         if revision.revision == 48:
             await self._validate_captured_eval_case_schema(cur)
-        if revision.revision == 49:
-            await self._validate_verified_work_schema(cur)
         if revision.revision == 50:
             await self._validate_eval_run_invocation_column(cur)
         if revision.revision == 51:
@@ -4269,6 +4332,11 @@ class _PostgresStoreBase:
             await self._validate_eval_run_scenario_progress_column(cur)
         if revision.revision == 57:
             await self._validate_session_message_queue_typed_message_column(cur)
+        if revision.revision == 58:
+            await self._validate_verified_work_schema(
+                cur,
+                require_verifier_profiles=True,
+            )
 
     async def _validate_transcript_search_document_column(self, cur: Any) -> None:
         await cur.execute(
@@ -6186,7 +6254,12 @@ class _PostgresStoreBase:
             "restore the database from a known-good backup."
         )
 
-    async def _validate_verified_work_schema(self, cur: Any) -> None:
+    async def _validate_verified_work_schema(
+        self,
+        cur: Any,
+        *,
+        require_verifier_profiles: bool,
+    ) -> None:
         await cur.execute(
             """
             SELECT data_type, is_nullable
@@ -6256,6 +6329,23 @@ class _PostgresStoreBase:
                 ("receipt_json", "jsonb", "NO"),
             ),
         }
+        if require_verifier_profiles:
+            required_columns["cayu_completion_verification_claims"] += (
+                ("verifier_profile_fingerprint", "text", "NO"),
+            )
+            required_columns["cayu_completion_decisions"] += (
+                ("verifier_profile_fingerprint", "text", "NO"),
+            )
+            required_columns["cayu_completion_verifier_profiles"] = (
+                ("proposal_id", "text", "NO"),
+                ("task_id", "text", "NO"),
+                ("attempt_id", "text", "NO"),
+                ("profile_fingerprint", "text", "NO"),
+                ("request_sha256", "text", "NO"),
+                ("prepared_at", "timestamp with time zone", "NO"),
+                ("profile_json", "jsonb", "NO"),
+            )
+        contract_revision = 58 if require_verifier_profiles else 49
         for table, expected in required_columns.items():
             await cur.execute(
                 """
@@ -6267,9 +6357,15 @@ class _PostgresStoreBase:
                 (table,),
             )
             if tuple(await cur.fetchall()) != expected:
-                self._raise_verified_work_schema_error(table)
+                self._raise_verified_work_schema_error(
+                    table,
+                    contract_revision=contract_revision,
+                )
 
-        required_constraints = {
+        required_constraints: dict[
+            str,
+            tuple[tuple[str, tuple[str, ...]], ...],
+        ] = {
             "cayu_work_contracts": (
                 ("p", ("primary key (contract_id, version)",)),
                 ("c", ("version >= 1",)),
@@ -6355,6 +6451,34 @@ class _PostgresStoreBase:
                 ("c", ("request_sha256", "[0-9a-f]{64}")),
             ),
         }
+        if require_verifier_profiles:
+            required_constraints["cayu_completion_verification_claims"] += (
+                ("c", ("verifier_profile_fingerprint", "[0-9a-f]{64}")),
+            )
+            required_constraints["cayu_completion_decisions"] += (
+                ("c", ("verifier_profile_fingerprint", "[0-9a-f]{64}")),
+            )
+            required_constraints["cayu_completion_verifier_profiles"] = (
+                ("p", ("primary key (proposal_id)",)),
+                ("u", ("unique (attempt_id)",)),
+                (
+                    "f",
+                    (
+                        "foreign key (proposal_id)",
+                        "references cayu_completion_proposals(proposal_id)",
+                    ),
+                ),
+                ("f", ("foreign key (task_id)", "references cayu_tasks(id)")),
+                (
+                    "f",
+                    (
+                        "foreign key (attempt_id)",
+                        "references cayu_work_attempts(attempt_id)",
+                    ),
+                ),
+                ("c", ("profile_fingerprint", "[0-9a-f]{64}")),
+                ("c", ("request_sha256", "[0-9a-f]{64}")),
+            )
         await cur.execute(
             """
             SELECT table_record.relname,
@@ -6385,7 +6509,10 @@ class _PostgresStoreBase:
                 )
                 for constraint_type, fragments in expected_constraints
             ):
-                self._raise_verified_work_schema_error(table)
+                self._raise_verified_work_schema_error(
+                    table,
+                    contract_revision=contract_revision,
+                )
 
         required_indexes = {
             "idx_cayu_completion_claim_current": (
@@ -6413,6 +6540,13 @@ class _PostgresStoreBase:
                 None,
             ),
         }
+        if require_verifier_profiles:
+            required_indexes["idx_cayu_completion_verifier_profiles_task"] = (
+                "cayu_completion_verifier_profiles",
+                False,
+                "(task_id, attempt_id)",
+                None,
+            )
         await cur.execute(
             """
             SELECT index_record.relname,
@@ -6457,12 +6591,20 @@ class _PostgresStoreBase:
                 or (predicate is None and actual[5] is not None)
                 or (predicate is not None and predicate not in (actual[5] or ""))
             ):
-                self._raise_verified_work_schema_error(index)
+                self._raise_verified_work_schema_error(
+                    index,
+                    contract_revision=contract_revision,
+                )
 
     @staticmethod
-    def _raise_verified_work_schema_error(name: str) -> NoReturn:
+    def _raise_verified_work_schema_error(
+        name: str,
+        *,
+        contract_revision: int = 49,
+    ) -> NoReturn:
         raise RuntimeError(
-            f"Postgres schema object {name!r} conflicts with Cayu's revision-49 "
+            f"Postgres schema object {name!r} conflicts with Cayu's "
+            f"revision-{contract_revision} "
             "verified-work contract. Run `cayu storage migrate` or restore the "
             "database from a known-good backup."
         )
@@ -6769,6 +6911,8 @@ class _PostgresStoreBase:
             and any(revision.revision == 52 for revision in schema.pending(current))
         ):
             await _reject_populated_pre_targeted_tool_grant_database(cur)
+        if current < 58 and any(revision.revision == 58 for revision in schema.pending(current)):
+            await _reject_populated_pre_verifier_profile_database(cur)
         if current == schema.UNINITIALIZED:
             await self._apply_baseline(cur)
             current = schema.BASELINE_REVISION

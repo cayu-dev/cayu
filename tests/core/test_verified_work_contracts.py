@@ -13,6 +13,9 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 from tests.core._execution_profile_fixtures import profiled_session_identity
+from tests.core.completion_verifier_profile_fixtures import (
+    prepare_test_completion_verifier_profile,
+)
 from tests.core.task_invocation_fixtures import (
     task_backed_session_invocation,
     unattributed_session_invocation_binding,
@@ -39,6 +42,8 @@ from cayu import (
     CompletionVerdict,
     CompletionVerificationClaimLost,
     CompletionVerificationClaimRequest,
+    CompletionVerifierProfileAdoptionDecision,
+    CompletionVerifierProfilePreparationRequest,
     CompletionVerifierRef,
     CriterionOutcomeStatus,
     Dispatcher,
@@ -127,6 +132,9 @@ from cayu.core.tools import Tool, ToolContext
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import tasks as tasks_module
 from cayu.runtime import work_contracts as work_contracts_module
+from cayu.runtime.completion_verifier_profiles import (
+    build_completion_verifier_execution_profile,
+)
 from cayu.runtime.sessions import (
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     ModelCompletionStageRequest,
@@ -254,6 +262,31 @@ def _verifier() -> CompletionVerifierRef:
         version="v1",
         configuration_fingerprint=_digest("bid-readiness-v1"),
     )
+
+
+def _verifier_profile_fingerprint(
+    verifier: CompletionVerifierRef | None = None,
+) -> str:
+    return build_completion_verifier_execution_profile(
+        verifier=verifier or _verifier(),
+        adapter_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:completion-verifier",
+            behavior_version="1",
+            implementation_version="1",
+        ),
+    ).fingerprint
+
+
+async def _claim_completion_verification(
+    store: TaskStore,
+    request: CompletionVerificationClaimRequest,
+):
+    profile = await prepare_test_completion_verifier_profile(
+        store,
+        request.proposal_id,
+    )
+    assert request.verifier_profile_fingerprint == profile.profile.fingerprint
+    return await store.claim_completion_verification(request)
 
 
 def _contract(
@@ -401,6 +434,7 @@ def _shared_evidence_decision(
         claim_id=claim_id,
         worker_id=worker_id,
         verifier=_verifier(),
+        verifier_profile_fingerprint=_verifier_profile_fingerprint(),
         verdict=CompletionVerdict.ACCEPTED,
         criterion_outcomes=(
             CompletionCriterionOutcome(
@@ -457,6 +491,7 @@ def _rejected_decision(
         claim_id=claim_id,
         worker_id=worker_id,
         verifier=_verifier(),
+        verifier_profile_fingerprint=_verifier_profile_fingerprint(),
         verdict=CompletionVerdict.REJECTED,
         criterion_outcomes=(
             CompletionCriterionOutcome(
@@ -509,6 +544,7 @@ def _accepted_decision(
         claim_id=claim_id,
         worker_id=worker_id,
         verifier=_verifier(),
+        verifier_profile_fingerprint=_verifier_profile_fingerprint(),
         verdict=CompletionVerdict.ACCEPTED,
         criterion_outcomes=(
             CompletionCriterionOutcome(
@@ -552,6 +588,7 @@ def _held_decision(
         claim_id=claim_id,
         worker_id=worker_id,
         verifier=_verifier(),
+        verifier_profile_fingerprint=_verifier_profile_fingerprint(),
         verdict=verdict,
         criterion_outcomes=(
             CompletionCriterionOutcome(
@@ -1023,6 +1060,7 @@ def test_exact_operation_digests_cover_every_decision_bearing_field() -> None:
         proposal_id=proposal.proposal_id,
         worker_id="verifier-worker",
         verifier=contract.verifier,
+        verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
         lease_seconds=60,
     )
     other_verifier = CompletionVerifierRef(
@@ -1411,6 +1449,7 @@ def test_contract_bound_task_and_application_receipt_are_bounded_together() -> N
     receipt = CompletionDecisionApplicationReceipt(
         task_id=exact.id,
         decision_id="bounded-representation-decision",
+        verifier_profile_fingerprint=_digest("bounded-representation-verifier-profile"),
         idempotency_key="bounded-representation-application",
         request_sha256=_digest("bounded-representation-application"),
         task=exact,
@@ -1718,9 +1757,25 @@ def test_verified_work_store_lifecycle_rejects_then_accepts_exactly(store_factor
             proposal_id=first_proposal.proposal_id,
             worker_id="verifier-worker",
             verifier=contract.verifier,
+            verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
         )
-        first_claim = await store.claim_completion_verification(first_claim_request)
-        assert await store.claim_completion_verification(first_claim_request) == first_claim
+        first_claim = await _claim_completion_verification(store, first_claim_request)
+        first_verifier_profile = await store.load_completion_verifier_profile(
+            first_proposal.proposal_id
+        )
+        assert first_verifier_profile is not None
+        assert (
+            first_claim.verifier_profile_fingerprint == first_verifier_profile.profile.fingerprint
+        )
+        assert first_verifier_profile.expected_prior_proposal_id is None
+        assert await _claim_completion_verification(store, first_claim_request) == first_claim
+        assert (
+            await prepare_test_completion_verifier_profile(
+                store,
+                first_proposal.proposal_id,
+            )
+            == first_verifier_profile
+        )
         renewed_claim = await store.renew_completion_verification_claim(first_claim_request)
         assert renewed_claim.claimed_at == first_claim.claimed_at
         assert renewed_claim.attempt_number == first_claim.attempt_number
@@ -1734,8 +1789,8 @@ def test_verified_work_store_lifecycle_rejects_then_accepts_exactly(store_factor
             )
 
         with pytest.raises(WorkCompletionConflict, match="another request"):
-            await store.claim_completion_verification(
-                first_claim_request.model_copy(update={"worker_id": "other-verifier"})
+            await _claim_completion_verification(
+                store, first_claim_request.model_copy(update={"worker_id": "other-verifier"})
             )
 
         rejected_request = _rejected_decision(
@@ -1745,7 +1800,7 @@ def test_verified_work_store_lifecycle_rejects_then_accepts_exactly(store_factor
         )
         rejected = await store.record_completion_decision(rejected_request)
         assert await store.record_completion_decision(rejected_request) == rejected
-        assert await store.claim_completion_verification(first_claim_request) == renewed_claim
+        assert await _claim_completion_verification(store, first_claim_request) == renewed_claim
         with pytest.raises(CompletionVerificationClaimLost, match="exact current live authority"):
             await store.renew_completion_verification_claim(first_claim_request)
 
@@ -1797,13 +1852,29 @@ def test_verified_work_store_lifecycle_rejects_then_accepts_exactly(store_factor
                 evidence_references=(_artifact_evidence(), _approval_evidence()),
             )
         )
-        second_claim = await store.claim_completion_verification(
+        second_claim = await _claim_completion_verification(
+            store,
             CompletionVerificationClaimRequest(
                 claim_id="claim-2",
                 proposal_id=second_proposal.proposal_id,
                 worker_id="verifier-worker",
                 verifier=contract.verifier,
-            )
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
+            ),
+        )
+        second_verifier_profile = await store.load_completion_verifier_profile(
+            second_proposal.proposal_id
+        )
+        assert second_verifier_profile is not None
+        assert second_verifier_profile.profile == first_verifier_profile.profile
+        assert second_verifier_profile.expected_prior_proposal_id == first_proposal.proposal_id
+        assert (
+            second_verifier_profile.expected_prior_profile_fingerprint
+            == first_verifier_profile.profile.fingerprint
+        )
+        assert second_verifier_profile.adoption is None
+        assert (
+            second_claim.verifier_profile_fingerprint == second_verifier_profile.profile.fingerprint
         )
         accepted_request = _accepted_decision(
             proposal_id=second_proposal.proposal_id,
@@ -1869,6 +1940,7 @@ def test_verified_work_store_lifecycle_rejects_then_accepts_exactly(store_factor
         )
         assert receipt is not None
         assert receipt.decision_id == accepted.decision_id
+        assert receipt.verifier_profile_fingerprint == accepted.verifier_profile_fingerprint
         assert receipt.task == completed
         assert await store.load_active_work_contract_task_for_session("session:bid:1") == completed
         with pytest.raises(TaskCompletionDecisionRequired):
@@ -1883,6 +1955,210 @@ def test_verified_work_store_lifecycle_rejects_then_accepts_exactly(store_factor
                     }
                 )
             )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "store_factory",
+    [InMemoryTaskStore, lambda: SQLiteTaskStore(":memory:")],
+    ids=("memory", "sqlite"),
+)
+def test_verifier_profile_store_rejects_inexact_adoption_components(store_factory) -> None:
+    async def scenario() -> None:
+        store = store_factory()
+        contract = _contract(
+            continuation_policy=CompletionContinuationPolicy(
+                rejection_action=CompletionRejectionAction.CONTINUE,
+            )
+        )
+        await store.publish_work_contract(contract)
+        await store.create_running_task(
+            TaskCreate(
+                task_id="profile-transition-task",
+                type="verified-work",
+                session_id="session:profile-transition",
+                work_contract=contract.reference(),
+            ),
+            session_invocation=unattributed_session_invocation_binding(
+                "session:profile-transition"
+            ),
+        )
+        first_attempt = await store.begin_work_attempt(
+            WorkAttemptCreate(
+                attempt_id="profile-transition-attempt-1",
+                task_id="profile-transition-task",
+                session_id="session:profile-transition",
+                contract=contract.reference(),
+                execution_profile_fingerprint=_digest("profile-transition-worker-1"),
+            )
+        )
+        first_proposal = await store.submit_completion_proposal(
+            CompletionProposalCreate(
+                proposal_id="profile-transition-proposal-1",
+                attempt_id=first_attempt.attempt_id,
+                result=_result_reference("profile-transition-1"),
+            )
+        )
+        first_profile = await prepare_test_completion_verifier_profile(
+            store,
+            first_proposal.proposal_id,
+            identity_name="tests:profile-transition-v1",
+        )
+        first_claim = await store.claim_completion_verification(
+            CompletionVerificationClaimRequest(
+                claim_id="profile-transition-claim-1",
+                proposal_id=first_proposal.proposal_id,
+                worker_id="profile-transition-worker",
+                verifier=contract.verifier,
+                verifier_profile_fingerprint=first_profile.profile.fingerprint,
+            )
+        )
+        first_decision = await store.record_completion_decision(
+            _rejected_decision(
+                proposal_id=first_proposal.proposal_id,
+                claim_id=first_claim.claim_id,
+                worker_id=first_claim.worker_id,
+            ).model_copy(
+                update={
+                    "verifier_profile_fingerprint": first_profile.profile.fingerprint,
+                }
+            )
+        )
+        await store.apply_completion_decision(
+            CompletionDecisionApplicationRequest(
+                task_id="profile-transition-task",
+                decision_id=first_decision.decision_id,
+                idempotency_key="profile-transition-apply-1",
+            )
+        )
+        second_attempt = await store.begin_work_attempt(
+            WorkAttemptCreate(
+                attempt_id="profile-transition-attempt-2",
+                task_id="profile-transition-task",
+                session_id="session:profile-transition",
+                contract=contract.reference(),
+                execution_profile_fingerprint=_digest("profile-transition-worker-2"),
+            )
+        )
+        second_proposal = await store.submit_completion_proposal(
+            CompletionProposalCreate(
+                proposal_id="profile-transition-proposal-2",
+                attempt_id=second_attempt.attempt_id,
+                result=_result_reference("profile-transition-2"),
+            )
+        )
+        candidate = build_completion_verifier_execution_profile(
+            verifier=contract.verifier,
+            adapter_identity=ExecutionProfileBehaviorIdentity(
+                name="tests:profile-transition-v2",
+                behavior_version="2",
+                implementation_version="1",
+            ),
+        )
+        adoption = CompletionVerifierProfileAdoptionDecision(
+            expected_profile_fingerprint=first_profile.profile.fingerprint,
+            candidate_profile_fingerprint=candidate.fingerprint,
+            changed_component_ids=("unrelated-component",),
+            policy_identity="tests:profile-transition-policy:v1",
+            authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+            idempotency_key="profile-transition-adoption",
+            requested_by=ResolutionActor(
+                subject="operator-1",
+                source=ResolutionActorSource.REQUEST,
+            ),
+            reason="Adopt the verifier profile for the next attempt.",
+            policy_reason="The verifier-profile transition is authorized.",
+            request_sha256=_digest("profile-transition-adoption-request"),
+        )
+        preparation = CompletionVerifierProfilePreparationRequest(
+            proposal_id=second_proposal.proposal_id,
+            task_id=second_proposal.task_id,
+            attempt_id=second_attempt.attempt_id,
+            attempt_request_sha256=second_attempt.request_sha256,
+            source_execution_profile_fingerprint=(second_attempt.execution_profile_fingerprint),
+            proposal_request_sha256=second_proposal.request_sha256,
+            contract=contract.reference(),
+            profile=candidate,
+            expected_prior_proposal_id=first_profile.proposal_id,
+            expected_prior_profile_fingerprint=first_profile.profile.fingerprint,
+            adoption=adoption,
+        )
+        with pytest.raises(WorkCompletionConflict, match="exact durable adoption"):
+            await store.prepare_completion_verifier_profile(preparation)
+        assert await store.load_completion_verifier_profile(second_proposal.proposal_id) is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "store_factory",
+    [InMemoryTaskStore, lambda: SQLiteTaskStore(":memory:")],
+    ids=("memory", "sqlite"),
+)
+def test_verifier_profile_and_claim_concurrency_converge_on_one_authority(
+    store_factory,
+) -> None:
+    async def scenario() -> None:
+        store = store_factory()
+        contract = _contract(contract_id="concurrent-verifier-profile-contract")
+        await store.publish_work_contract(contract)
+        task = await store.create_running_task(
+            TaskCreate(
+                task_id="concurrent-verifier-profile-task",
+                type="verified-work",
+                session_id="session:concurrent-verifier-profile",
+                work_contract=contract.reference(),
+            ),
+            session_invocation=unattributed_session_invocation_binding(
+                "session:concurrent-verifier-profile"
+            ),
+        )
+        attempt = await store.begin_work_attempt(
+            WorkAttemptCreate(
+                attempt_id="concurrent-verifier-profile-attempt",
+                task_id=task.id,
+                session_id=task.session_id or "missing-session",
+                contract=contract.reference(),
+                execution_profile_fingerprint=_digest("concurrent-worker-profile"),
+            )
+        )
+        proposal = await store.submit_completion_proposal(
+            CompletionProposalCreate(
+                proposal_id="concurrent-verifier-profile-proposal",
+                attempt_id=attempt.attempt_id,
+                result=_result_reference("concurrent-verifier-profile"),
+            )
+        )
+
+        prepared = await asyncio.gather(
+            prepare_test_completion_verifier_profile(store, proposal.proposal_id),
+            prepare_test_completion_verifier_profile(store, proposal.proposal_id),
+        )
+        assert prepared[0] == prepared[1]
+        requests = tuple(
+            CompletionVerificationClaimRequest(
+                claim_id=f"concurrent-verifier-profile-claim-{suffix}",
+                proposal_id=proposal.proposal_id,
+                worker_id=f"concurrent-verifier-{suffix}",
+                verifier=contract.verifier,
+                verifier_profile_fingerprint=prepared[0].profile.fingerprint,
+            )
+            for suffix in ("a", "b")
+        )
+        outcomes = await asyncio.gather(
+            store.claim_completion_verification(requests[0]),
+            store.claim_completion_verification(requests[1]),
+            return_exceptions=True,
+        )
+        assert sum(not isinstance(outcome, BaseException) for outcome in outcomes) == 1
+        assert (
+            sum(isinstance(outcome, CompletionVerificationClaimLost) for outcome in outcomes) == 1
+        )
+        durable_claim = await store.load_completion_verification_claim(proposal.proposal_id)
+        assert durable_claim is not None
+        assert durable_claim.verifier_profile_fingerprint == prepared[0].profile.fingerprint
+        assert await store.load_completion_verifier_profile(proposal.proposal_id) == prepared[0]
 
     asyncio.run(scenario())
 
@@ -1918,13 +2194,15 @@ def test_verified_work_lifecycle_rejects_conflicting_shared_evidence_authority()
                 result=_result_reference("shared-evidence", result=result),
             )
         )
-        claim = await store.claim_completion_verification(
+        claim = await _claim_completion_verification(
+            store,
             CompletionVerificationClaimRequest(
                 claim_id="shared-evidence-claim",
                 proposal_id=proposal.proposal_id,
                 worker_id="shared-evidence-worker",
                 verifier=contract.verifier,
-            )
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
+            ),
         )
         decision = _shared_evidence_decision(
             proposal_id=proposal.proposal_id,
@@ -2011,13 +2289,15 @@ def test_verified_work_lifecycle_preserves_valid_inherited_task_and_session_iden
                 evidence_references=(_artifact_evidence(), _approval_evidence()),
             )
         )
-        claim = await store.claim_completion_verification(
+        claim = await _claim_completion_verification(
+            store,
             CompletionVerificationClaimRequest(
                 claim_id="long-inherited-identities-claim",
                 proposal_id=proposal.proposal_id,
                 worker_id="verifier-worker",
                 verifier=contract.verifier,
-            )
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
+            ),
         )
         decision = await store.record_completion_decision(
             _accepted_decision(
@@ -2244,13 +2524,15 @@ def test_durable_decision_applies_after_originating_task_lease_expires() -> None
                 evidence_references=(_artifact_evidence(), _approval_evidence()),
             )
         )
-        claim = await store.claim_completion_verification(
+        claim = await _claim_completion_verification(
+            store,
             CompletionVerificationClaimRequest(
                 claim_id="decision-after-worker-expiry-claim",
                 proposal_id=proposal.proposal_id,
                 worker_id="verifier-worker",
                 verifier=contract.verifier,
-            )
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
+            ),
         )
         decision = await store.record_completion_decision(
             _accepted_decision(
@@ -2326,13 +2608,15 @@ def test_rejected_continue_decision_fences_live_attempt_worker() -> None:
                 result=_result_reference("continue-fences-worker-1"),
             )
         )
-        claim = await store.claim_completion_verification(
+        claim = await _claim_completion_verification(
+            store,
             CompletionVerificationClaimRequest(
                 claim_id="continue-fences-attempt-worker-claim-1",
                 proposal_id=proposal.proposal_id,
                 worker_id="verifier-worker",
                 verifier=contract.verifier,
-            )
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
+            ),
         )
         decision = await store.record_completion_decision(
             _rejected_decision(
@@ -2405,13 +2689,15 @@ def test_accepted_decision_requires_exact_constraint_and_available_evidence_cove
                 evidence_references=(_artifact_evidence(), _approval_evidence()),
             )
         )
-        claim = await store.claim_completion_verification(
+        claim = await _claim_completion_verification(
+            store,
             CompletionVerificationClaimRequest(
                 claim_id="evidence-gated-claim",
                 proposal_id=proposal.proposal_id,
                 worker_id="verifier-worker",
                 verifier=contract.verifier,
-            )
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
+            ),
         )
         accepted = _accepted_decision(
             proposal_id=proposal.proposal_id,
@@ -2564,13 +2850,15 @@ def test_explicit_verifier_assertions_cover_outcomes_without_evidence_requiremen
                 result=_result_reference("assertion"),
             )
         )
-        claim = await store.claim_completion_verification(
+        claim = await _claim_completion_verification(
+            store,
             CompletionVerificationClaimRequest(
                 claim_id="assertion-claim",
                 proposal_id=proposal.proposal_id,
                 worker_id="verifier-worker",
                 verifier=contract.verifier,
-            )
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
+            ),
         )
         decision = await store.record_completion_decision(
             CompletionDecisionCreate(
@@ -2579,6 +2867,7 @@ def test_explicit_verifier_assertions_cover_outcomes_without_evidence_requiremen
                 claim_id=claim.claim_id,
                 worker_id=claim.worker_id,
                 verifier=contract.verifier,
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
                 verdict=CompletionVerdict.ACCEPTED,
                 criterion_outcomes=(
                     CompletionCriterionOutcome(
@@ -2635,13 +2924,15 @@ def test_rejection_policy_interrupts_and_enforces_attempt_and_repeated_gap_limit
                 result=_result_reference(f"{task.id}-{ordinal}"),
             )
         )
-        claim = await store.claim_completion_verification(
+        claim = await _claim_completion_verification(
+            store,
             CompletionVerificationClaimRequest(
                 claim_id=f"{task.id}-claim-{ordinal}",
                 proposal_id=proposal.proposal_id,
                 worker_id="verifier-worker",
                 verifier=contract.verifier,
-            )
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
+            ),
         )
         decision = await store.record_completion_decision(
             _rejected_decision(
@@ -2825,13 +3116,15 @@ def test_decision_application_prepares_receipt_before_publishing_task_transition
                 evidence_references=(_artifact_evidence(), _approval_evidence()),
             )
         )
-        claim = await store.claim_completion_verification(
+        claim = await _claim_completion_verification(
+            store,
             CompletionVerificationClaimRequest(
                 claim_id="atomic-application-claim",
                 proposal_id=proposal.proposal_id,
                 worker_id="verifier-worker",
                 verifier=contract.verifier,
-            )
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
+            ),
         )
         decision = await store.record_completion_decision(
             _accepted_decision(
@@ -2913,13 +3206,15 @@ def test_oversized_completed_task_rejects_before_task_or_receipt_mutation(
                 evidence_references=(_artifact_evidence(), _approval_evidence()),
             )
         )
-        claim = await store.claim_completion_verification(
+        claim = await _claim_completion_verification(
+            store,
             CompletionVerificationClaimRequest(
                 claim_id="bounded-application-transition-claim",
                 proposal_id=proposal.proposal_id,
                 worker_id="bounded-application-verifier",
                 verifier=contract.verifier,
-            )
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
+            ),
         )
         decision = await store.record_completion_decision(
             _accepted_decision(
@@ -2968,6 +3263,7 @@ def test_decision_application_receipt_requires_exact_embedded_task_identity() ->
             CompletionDecisionApplicationReceipt(
                 task_id=expected.id,
                 decision_id="receipt-decision",
+                verifier_profile_fingerprint=_digest("receipt-verifier-profile"),
                 idempotency_key="receipt-task-mismatch",
                 request_sha256=_digest("receipt-task-mismatch"),
                 task=substituted,
@@ -2977,6 +3273,7 @@ def test_decision_application_receipt_requires_exact_embedded_task_identity() ->
             CompletionDecisionApplicationReceipt(
                 task_id=expected.id,
                 decision_id="receipt-decision",
+                verifier_profile_fingerprint=_digest("receipt-verifier-profile"),
                 idempotency_key="receipt-uncontracted-task",
                 request_sha256=_digest("receipt-uncontracted-task"),
                 task=expected,
@@ -3053,13 +3350,15 @@ def test_decision_application_holds_attached_tasks(
                 result=_result_reference(verdict.value),
             )
         )
-        claim = await store.claim_completion_verification(
+        claim = await _claim_completion_verification(
+            store,
             CompletionVerificationClaimRequest(
                 claim_id=f"claim-{verdict.value}",
                 proposal_id=proposal.proposal_id,
                 worker_id="verifier-worker",
                 verifier=contract.verifier,
-            )
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
+            ),
         )
         decision = await store.record_completion_decision(
             _held_decision(
@@ -3084,6 +3383,7 @@ def test_decision_application_holds_attached_tasks(
         assert held.status_payload == {
             "completion_decision_id": decision.decision_id,
             "gap_fingerprint": decision.gap_fingerprint,
+            "verifier_profile_fingerprint": decision.verifier_profile_fingerprint,
             "verdict": verdict.value,
         }
 
@@ -3147,13 +3447,15 @@ def test_decision_application_holds_attached_tasks(
                 result=accepted_reference,
             )
         )
-        next_claim = await store.claim_completion_verification(
+        next_claim = await _claim_completion_verification(
+            store,
             CompletionVerificationClaimRequest(
                 claim_id=f"claim-{verdict.value}-after-resume",
                 proposal_id=next_proposal.proposal_id,
                 worker_id="verifier-worker-after-resume",
                 verifier=contract.verifier,
-            )
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
+            ),
         )
         accepted_decision = await store.record_completion_decision(
             _accepted_decision(
@@ -3208,24 +3510,28 @@ def test_decision_requires_complete_contract_coverage_and_current_claim() -> Non
                 result=_result_reference("claim"),
             )
         )
-        expired_claim = await store.claim_completion_verification(
+        expired_claim = await _claim_completion_verification(
+            store,
             CompletionVerificationClaimRequest(
                 claim_id="expired-claim",
                 proposal_id=proposal.proposal_id,
                 worker_id="verifier-a",
                 verifier=contract.verifier,
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
                 lease_seconds=1,
-            )
+            ),
         )
         now[0] += timedelta(seconds=2)
-        replacement = await store.claim_completion_verification(
+        replacement = await _claim_completion_verification(
+            store,
             CompletionVerificationClaimRequest(
                 claim_id="replacement-claim",
                 proposal_id=proposal.proposal_id,
                 worker_id="verifier-b",
                 verifier=contract.verifier,
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
                 lease_seconds=30,
-            )
+            ),
         )
         assert replacement.attempt_number == 2
 
@@ -3342,9 +3648,10 @@ def test_terminal_task_rejects_new_verifier_authority_but_preserves_exact_replay
             proposal_id=unclaimed_proposal.proposal_id,
             worker_id="verifier-fresh",
             verifier=contract.verifier,
+            verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
         )
         with pytest.raises(WorkCompletionConflict, match="live task session"):
-            await store.claim_completion_verification(fresh_request)
+            await _claim_completion_verification(store, fresh_request)
         assert (
             await store.load_completion_verification_claim(unclaimed_proposal.proposal_id) is None
         )
@@ -3355,14 +3662,15 @@ def test_terminal_task_rejects_new_verifier_authority_but_preserves_exact_replay
             proposal_id=claimed_proposal.proposal_id,
             worker_id="verifier-existing",
             verifier=contract.verifier,
+            verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
             lease_seconds=30,
         )
-        claim = await store.claim_completion_verification(claim_request)
+        claim = await _claim_completion_verification(store, claim_request)
         await store.cancel_task(claimed_task.id)
 
         # A live exact retry remains an immutable audit replay, but it cannot
         # authorize a new decision after the attempt loses its running task.
-        assert await store.claim_completion_verification(claim_request) == claim
+        assert await _claim_completion_verification(store, claim_request) == claim
         decision_request = _accepted_decision(
             proposal_id=claimed_proposal.proposal_id,
             claim_id=claim.claim_id,
@@ -3380,7 +3688,7 @@ def test_terminal_task_rejects_new_verifier_authority_but_preserves_exact_replay
             }
         )
         with pytest.raises(WorkCompletionConflict, match="live task session"):
-            await store.claim_completion_verification(replacement_request)
+            await _claim_completion_verification(store, replacement_request)
         assert await store.load_completion_verification_claim(claimed_proposal.proposal_id) == claim
 
     asyncio.run(scenario())
@@ -5938,8 +6246,12 @@ def test_sqlite_store_persists_contract_binding_and_keeps_ordinary_work_compatib
                 proposal_id=proposal.proposal_id,
                 worker_id="persistent-contract-verifier",
                 verifier=contract.verifier,
+                verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
             )
-            claim = await store.claim_completion_verification(claim_request)
+            claim = await _claim_completion_verification(store, claim_request)
+            verifier_profile = await store.load_completion_verifier_profile(proposal.proposal_id)
+            assert verifier_profile is not None
+            assert claim.verifier_profile_fingerprint == (verifier_profile.profile.fingerprint)
             decision_request = _rejected_decision(
                 proposal_id=proposal.proposal_id,
                 claim_id=claim.claim_id,
@@ -5967,6 +6279,10 @@ def test_sqlite_store_persists_contract_binding_and_keeps_ordinary_work_compatib
             assert await reopened.load_completion_proposal(proposal.proposal_id) == proposal
             assert await reopened.load_completion_verification_claim(proposal.proposal_id) == claim
             assert await reopened.load_completion_decision(decision.decision_id) == decision
+            assert (
+                await reopened.load_completion_verifier_profile(proposal.proposal_id)
+                == verifier_profile
+            )
             assert await reopened.record_completion_decision(decision_request) == decision
             assert await reopened.apply_completion_decision(application) == applied
             receipt = await reopened.load_completion_decision_application_receipt(
@@ -5974,6 +6290,7 @@ def test_sqlite_store_persists_contract_binding_and_keeps_ordinary_work_compatib
                 application.idempotency_key,
             )
             assert receipt is not None
+            assert receipt.verifier_profile_fingerprint == decision.verifier_profile_fingerprint
             assert receipt.task == applied
             provider = _RecordingProvider()
             app = CayuApp(
@@ -6206,6 +6523,7 @@ def test_sqlite_revision_49_migrates_existing_ordinary_tasks(tmp_path) -> None:
             "cayu_completion_decision_application_receipts",
             "cayu_completion_decisions",
             "cayu_completion_verification_claims",
+            "cayu_completion_verifier_profiles",
             "cayu_completion_proposals",
             "cayu_work_attempts",
             "cayu_task_session_execution_authority",
@@ -6257,8 +6575,91 @@ def test_sqlite_revision_49_validation_rejects_missing_authority_table(tmp_path)
     finally:
         connection.close()
 
-    with pytest.raises(RuntimeError, match="revision-49 verified-work contract"):
+    with pytest.raises(RuntimeError, match="revision-58 verified-work contract"):
         SQLiteTaskStore(path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
+
+
+def test_sqlite_revision_58_rejects_unprofiled_verification_records(tmp_path) -> None:
+    path = tmp_path / "populated-revision-57.sqlite"
+
+    async def seed() -> None:
+        store = SQLiteTaskStore(path)
+        try:
+            contract = _contract(contract_id="revision-58-contract")
+            await store.publish_work_contract(contract)
+            await store.create_running_task(
+                TaskCreate(
+                    task_id="revision-58-task",
+                    type="verified-work",
+                    session_id="session:revision-58",
+                    work_contract=contract.reference(),
+                ),
+                session_invocation=unattributed_session_invocation_binding("session:revision-58"),
+            )
+            attempt = await store.begin_work_attempt(
+                WorkAttemptCreate(
+                    attempt_id="revision-58-attempt",
+                    task_id="revision-58-task",
+                    session_id="session:revision-58",
+                    contract=contract.reference(),
+                    execution_profile_fingerprint=_digest("revision-58-worker"),
+                )
+            )
+            proposal = await store.submit_completion_proposal(
+                CompletionProposalCreate(
+                    proposal_id="revision-58-proposal",
+                    attempt_id=attempt.attempt_id,
+                    result=_result_reference("revision-58"),
+                )
+            )
+            await _claim_completion_verification(
+                store,
+                CompletionVerificationClaimRequest(
+                    claim_id="revision-58-claim",
+                    proposal_id=proposal.proposal_id,
+                    worker_id="revision-58-verifier",
+                    verifier=contract.verifier,
+                    verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
+                ),
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    connection = sqlite3.connect(path)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE cayu_completion_verification_claims SET verifier_profile_fingerprint = NULL"
+            )
+        connection.rollback()
+        connection.execute("DROP TABLE cayu_completion_verifier_profiles")
+        connection.execute(
+            "ALTER TABLE cayu_completion_verification_claims "
+            "DROP COLUMN verifier_profile_fingerprint"
+        )
+        connection.execute(
+            "ALTER TABLE cayu_completion_decisions DROP COLUMN verifier_profile_fingerprint"
+        )
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 58")
+        connection.execute("PRAGMA user_version = 57")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="cannot attribute existing completion"):
+        SQLiteTaskStore(path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone() == (57,)
+        assert (
+            connection.execute(
+                "SELECT 1 FROM cayu_schema_migrations WHERE revision = 58"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
 
 
 def test_contract_publication_requires_exact_content_and_lineage() -> None:

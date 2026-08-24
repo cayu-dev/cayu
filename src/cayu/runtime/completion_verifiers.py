@@ -8,6 +8,14 @@ from typing import cast
 from pydantic import Field, StrictFloat, StrictInt, field_validator, model_validator
 
 from cayu._validation import require_durable_clean_nonblank, revalidate_model_input
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.runtime.completion_verifier_profiles import (
+    CompletionVerifierProfileComponentDeclaration,
+)
+from cayu.runtime.execution_profiles import (
+    ExecutionProfileAdoptionIntent,
+    copy_execution_profile_adoption_intent,
+)
 from cayu.runtime.work_contracts import (
     WORK_CONTRACT_IDENTIFIER_MAX_BYTES,
     WORK_VERIFICATION_LEASE_MAX_SECONDS,
@@ -90,6 +98,7 @@ class CompletionVerifierExecutionRequest(FrozenWorkContractModel):
         gt=0,
         le=WORK_VERIFICATION_LEASE_MAX_SECONDS,
     )
+    profile_adoption: ExecutionProfileAdoptionIntent | None = None
 
     @field_validator("proposal_id", "claim_id", "decision_id", "worker_id")
     @classmethod
@@ -102,6 +111,15 @@ class CompletionVerifierExecutionRequest(FrozenWorkContractModel):
             raise ValueError("execution_timeout_seconds must be shorter than lease_seconds.")
         return self
 
+    @field_validator("profile_adoption", mode="before")
+    @classmethod
+    def copy_profile_adoption(cls, value: object) -> ExecutionProfileAdoptionIntent | None:
+        if value is None:
+            return None
+        if type(value) is not ExecutionProfileAdoptionIntent:
+            raise TypeError("profile_adoption must be an ExecutionProfileAdoptionIntent or None.")
+        return copy_execution_profile_adoption_intent(value)
+
 
 class DeterministicCompletionVerifier(ABC):
     """Read-only application policy resolved from a durable verifier reference.
@@ -110,6 +128,20 @@ class DeterministicCompletionVerifier(ABC):
     Implementations must therefore be deterministic and side-effect-free. Any
     necessary external mutation belongs behind Cayu's ordinary effect contracts.
     """
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
+        """Return stable application-versioned identity for verifier behavior."""
+
+        return None
+
+    @property
+    def execution_profile_components(
+        self,
+    ) -> tuple[CompletionVerifierProfileComponentDeclaration, ...]:
+        """Return stable identities for other decision-bearing dependencies."""
+
+        return ()
 
     @abstractmethod
     async def verify(self, request: CompletionVerifierRequest) -> CompletionVerifierDecision:
@@ -132,9 +164,18 @@ def copy_completion_verifier_execution_request(
 ) -> CompletionVerifierExecutionRequest:
     if type(value) is not CompletionVerifierExecutionRequest:
         raise TypeError("Verifier execution requires a CompletionVerifierExecutionRequest.")
-    return cast(
-        "CompletionVerifierExecutionRequest",
-        revalidate_model_input(value, CompletionVerifierExecutionRequest),
+    return CompletionVerifierExecutionRequest(
+        proposal_id=value.proposal_id,
+        claim_id=value.claim_id,
+        decision_id=value.decision_id,
+        worker_id=value.worker_id,
+        lease_seconds=value.lease_seconds,
+        execution_timeout_seconds=value.execution_timeout_seconds,
+        profile_adoption=(
+            None
+            if value.profile_adoption is None
+            else copy_execution_profile_adoption_intent(value.profile_adoption)
+        ),
     )
 
 

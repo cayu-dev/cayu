@@ -199,6 +199,7 @@ from cayu.runtime.budgets import (
     SessionBudgetStore,
     copy_budget_policy,
 )
+from cayu.runtime.completion_verifier_profiles import CompletionVerifierProfilePolicy
 from cayu.runtime.completion_verifiers import (
     CompletionVerifierExecutionRequest,
     DeterministicCompletionVerifier,
@@ -796,6 +797,7 @@ class CayuApp:
         mcp_manifest_policy: McpManifestPolicy | None = None,
         tool_result_projection_policy: ToolResultProjectionPolicy | None = None,
         execution_profile_policy: ExecutionProfilePolicy | None = None,
+        completion_verifier_profile_policy: CompletionVerifierProfilePolicy | None = None,
         egress_authority_adoption_handler: EgressAuthorityAdoptionHandler | None = None,
         context_counting: ContextCountingConfig | None = None,
         request_footprint: RequestFootprintConfig | None = None,
@@ -857,6 +859,13 @@ class CayuApp:
             ExecutionProfilePolicy,
         ):
             raise TypeError("execution_profile_policy must be an ExecutionProfilePolicy.")
+        if completion_verifier_profile_policy is not None and not isinstance(
+            completion_verifier_profile_policy,
+            CompletionVerifierProfilePolicy,
+        ):
+            raise TypeError(
+                "completion_verifier_profile_policy must be a CompletionVerifierProfilePolicy."
+            )
         if egress_authority_adoption_handler is not None and not isinstance(
             egress_authority_adoption_handler,
             EgressAuthorityAdoptionHandler,
@@ -1014,6 +1023,7 @@ class CayuApp:
         self._completion_verifier_coordinator = CompletionVerifierCoordinator(
             task_store=self.task_store,
             secret_redactor=self._secret_redactor,
+            profile_policy=completion_verifier_profile_policy,
         )
         self._completion_decision_application_coordinator = (
             CompletionDecisionApplicationCoordinator(

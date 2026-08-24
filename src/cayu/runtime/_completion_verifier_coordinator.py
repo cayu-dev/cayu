@@ -19,12 +19,15 @@ from cayu._task_wait import (
     capture_awaitable_outcome,
     restore_task_cancellation_requests,
 )
-from cayu._validation import revalidate_model_input
+from cayu._validation import require_durable_clean_nonblank, revalidate_model_input
 from cayu.runtime._diagnostics import (
     MAX_DIAGNOSTIC_UTF8_BYTES,
     credential_safe_runtime_exception,
     credential_safe_runtime_exception_group,
     exception_diagnostic,
+)
+from cayu.runtime._execution_profile_identity_validation import (
+    copy_secret_free_execution_profile_behavior_identity,
 )
 from cayu.runtime._task_store_operation_boundary import (
     TaskStoreOperationOutcome,
@@ -37,6 +40,22 @@ from cayu.runtime._verified_work_authority import (
     completion_decision_request_from_record,
     require_completion_decision_integrity,
     require_completion_proposal_integrity,
+    require_completion_verifier_profile_integrity,
+)
+from cayu.runtime.approvals import ResolutionActor
+from cayu.runtime.completion_verifier_profiles import (
+    CompletionVerifierExecutionProfile,
+    CompletionVerifierProfileAdoptionDecision,
+    CompletionVerifierProfileComponentDeclaration,
+    CompletionVerifierProfilePolicy,
+    CompletionVerifierProfilePolicyRequest,
+    CompletionVerifierProfilePreparationRequest,
+    CompletionVerifierProfileRecord,
+    build_completion_verifier_execution_profile,
+    changed_completion_verifier_profile_components,
+    completion_verifier_profile_adoption_request_sha256,
+    completion_verifier_profile_preparation_request_sha256,
+    copy_completion_verifier_profile_record,
 )
 from cayu.runtime.completion_verifiers import (
     CompletionVerifierExecutionError,
@@ -45,6 +64,14 @@ from cayu.runtime.completion_verifiers import (
     CompletionVerifierUnavailable,
     DeterministicCompletionVerifier,
     copy_completion_verifier_execution_request,
+)
+from cayu.runtime.execution_profiles import (
+    EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS,
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAuthorityDecision,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyResult,
+    copy_execution_profile_policy_result,
 )
 from cayu.runtime.tasks import TaskClaimLost, TaskStore
 from cayu.runtime.work_contracts import (
@@ -120,6 +147,12 @@ class _VerifierAuthority:
     attempt: WorkAttempt = field(repr=False)
     contract: WorkContract = field(repr=False)
     adapter_request: CompletionVerifierRequest = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _RegisteredVerifier:
+    adapter: DeterministicCompletionVerifier = field(repr=False)
+    profile: CompletionVerifierExecutionProfile
 
 
 @dataclass(frozen=True, slots=True)
@@ -557,16 +590,40 @@ class CompletionVerifierCoordinator:
         *,
         task_store: TaskStore | None,
         secret_redactor: SecretRedactor,
+        profile_policy: CompletionVerifierProfilePolicy | None = None,
     ) -> None:
         if task_store is not None and not isinstance(task_store, TaskStore):
             raise TypeError("Completion verifier coordinator requires a TaskStore.")
         if not isinstance(secret_redactor, SecretRedactor):
             raise TypeError("Completion verifier coordinator requires a SecretRedactor.")
+        if profile_policy is not None and not isinstance(
+            profile_policy,
+            CompletionVerifierProfilePolicy,
+        ):
+            raise TypeError(
+                "Completion verifier profile policy must be a CompletionVerifierProfilePolicy."
+            )
         self._task_store = task_store
         self._secret_redactor = secret_redactor
+        self._profile_policy = profile_policy
+        self._profile_policy_identity: str | None = None
+        if profile_policy is not None:
+            policy_identity_validation = capture_sensitive_validation(
+                lambda policy=profile_policy: self._copy_profile_policy_identity(policy),
+                operation_name="Completion verifier profile-policy identity validation",
+                redactor=self._secret_redactor,
+            )
+            if policy_identity_validation.failure is not None:
+                raise_task_store_operation_failure(policy_identity_validation.failure)
+            profile_policy_identity = policy_identity_validation.result
+            if profile_policy_identity is None:
+                raise ValueError(
+                    "Completion verifier profile-policy identity is invalid."
+                ) from None
+            self._profile_policy_identity = profile_policy_identity
         self._execution_owner_process_id = os.getpid()
         self._execution_owner_id = f"cver_{uuid4().hex}"
-        self._verifiers: dict[tuple[str, str, str, str], DeterministicCompletionVerifier] = {}
+        self._verifiers: dict[tuple[str, str, str, str], _RegisteredVerifier] = {}
         self._locks: dict[_ExecutionKey, _SingleFlightLock] = {}
         self._adapter_tasks: set[
             asyncio.Task[CapturedAwaitableOutcome[CompletionVerifierDecision]]
@@ -574,6 +631,24 @@ class CompletionVerifierCoordinator:
         self._adapter_capacity_reservations: set[object] = set()
         self._draining_adapter_tasks: dict[_ExecutionKey, _DrainingAdapter] = {}
         self._claim_heartbeat_tasks: set[asyncio.Task[None]] = set()
+
+    def _copy_profile_policy_identity(
+        self,
+        policy: CompletionVerifierProfilePolicy,
+    ) -> str:
+        identity = require_durable_clean_nonblank(
+            policy.identity,
+            "completion_verifier_profile_policy.identity",
+        )
+        if len(identity.encode("utf-8")) > 256:
+            raise ValueError(
+                "completion_verifier_profile_policy.identity must be at most 256 UTF-8 bytes."
+            )
+        if self._secret_redactor.redact_text(identity) != identity:
+            raise ValueError(
+                "completion_verifier_profile_policy.identity contains a workload secret."
+            )
+        return identity
 
     def _ensure_process_local_generation(self) -> None:
         """Refresh quiescent runtime ownership after a process fork."""
@@ -609,6 +684,8 @@ class CompletionVerifierCoordinator:
             raise TypeError(
                 "Completion verifier registration requires a DeterministicCompletionVerifier."
             )
+        verifier_value = verifier
+        del verifier
         reference_value = reference
         del reference
         validation = capture_sensitive_validation(
@@ -622,15 +699,15 @@ class CompletionVerifierCoordinator:
         del reference_value
         if validation.failure is not None:
             failure = validation.failure
-            del validation, verifier
+            del validation, verifier_value
             raise_task_store_operation_failure(failure)
         copied = validation.result
         del validation
         if copied is None:
-            del verifier
+            del verifier_value
             raise ValueError("Completion verifier reference is invalid.") from None
         if copied.kind is not CompletionVerifierKind.DETERMINISTIC:
-            del copied, verifier
+            del copied, verifier_value
             raise ValueError("Only deterministic completion verifiers can be registered.")
         if _contains_workload_secret(
             (
@@ -640,23 +717,137 @@ class CompletionVerifierCoordinator:
             ),
             redactor=self._secret_redactor,
         ):
-            del copied, verifier
+            del copied, verifier_value
             raise ValueError(
                 "Completion verifier identity contains a workload secret and cannot be "
                 "registered as durable authority."
             ) from None
         key = _verifier_key(copied)
         if key in self._verifiers:
-            del copied, key, verifier
+            del copied, key, verifier_value
             raise credential_safe_runtime_exception(
                 ValueError,
                 "Completion verifier identity is already registered.",
                 redactor=self._secret_redactor,
                 fallback_message="Completion verifier registration conflict.",
             ) from None
-        self._verifiers[key] = verifier
-        del verifier
+        identity_validation = capture_sensitive_validation(
+            lambda value=verifier_value: copy_secret_free_execution_profile_behavior_identity(
+                value.execution_profile_identity,
+                redactor=self._secret_redactor,
+                field_name="completion_verifier.execution_profile_identity",
+            ),
+            operation_name="Completion verifier execution-profile identity validation",
+            redactor=self._secret_redactor,
+        )
+        if identity_validation.failure is not None:
+            failure = identity_validation.failure
+            del copied, key, verifier_value, identity_validation
+            raise_task_store_operation_failure(failure)
+        adapter_identity = identity_validation.result
+        del identity_validation
+        if adapter_identity is None:
+            del copied, key, verifier_value
+            raise ValueError(
+                "Completion verifier registration requires stable execution-profile identity."
+            ) from None
+        component_validation = capture_sensitive_validation(
+            lambda value=verifier_value: self._copy_registration_components(
+                value.execution_profile_components
+            ),
+            operation_name="Completion verifier component identity validation",
+            redactor=self._secret_redactor,
+        )
+        if component_validation.failure is not None:
+            failure = component_validation.failure
+            del copied, key, verifier_value, adapter_identity, component_validation
+            raise_task_store_operation_failure(failure)
+        components = component_validation.result
+        del component_validation
+        if components is None:
+            del copied, key, verifier_value, adapter_identity
+            raise ValueError("Completion verifier component identities are invalid.") from None
+        profile = build_completion_verifier_execution_profile(
+            verifier=copied,
+            adapter_identity=adapter_identity,
+            component_declarations=components,
+        )
+        self._verifiers[key] = _RegisteredVerifier(adapter=verifier_value, profile=profile)
+        del verifier_value
         return copied
+
+    def _copy_registration_components(
+        self,
+        value: object,
+    ) -> tuple[CompletionVerifierProfileComponentDeclaration, ...]:
+        if type(value) is not tuple:
+            raise TypeError("execution_profile_components must be a tuple.")
+        if len(value) > 64:
+            raise ValueError("execution_profile_components contains too many values.")
+        copied: list[CompletionVerifierProfileComponentDeclaration] = []
+        for index, component in enumerate(value):
+            if type(component) is not CompletionVerifierProfileComponentDeclaration:
+                raise TypeError(
+                    f"execution_profile_components[{index}] must be a "
+                    "CompletionVerifierProfileComponentDeclaration."
+                )
+            component_id = component.component_id
+            if self._secret_redactor.redact_text(component_id) != component_id:
+                raise ValueError(
+                    "Completion verifier component identity contains a workload secret."
+                )
+            identity = copy_secret_free_execution_profile_behavior_identity(
+                component.identity,
+                redactor=self._secret_redactor,
+                field_name=f"completion_verifier.execution_profile_components[{index}].identity",
+            )
+            if identity is None:  # pragma: no cover - exact declaration requires it
+                raise ValueError("Completion verifier component identity is required.")
+            copied.append(
+                CompletionVerifierProfileComponentDeclaration(
+                    component_id=component_id,
+                    identity=identity,
+                )
+            )
+        copied.sort(key=lambda item: item.component_id)
+        if len({item.component_id for item in copied}) != len(copied):
+            raise ValueError("Completion verifier component IDs must be unique.")
+        return tuple(copied)
+
+    def _require_live_registered_profile(
+        self,
+        registered: _RegisteredVerifier,
+    ) -> None:
+        validation = capture_sensitive_validation(
+            lambda adapter=registered.adapter: (
+                copy_secret_free_execution_profile_behavior_identity(
+                    adapter.execution_profile_identity,
+                    redactor=self._secret_redactor,
+                    field_name="completion_verifier.execution_profile_identity",
+                ),
+                self._copy_registration_components(adapter.execution_profile_components),
+            ),
+            operation_name="Completion verifier live-profile validation",
+            redactor=self._secret_redactor,
+        )
+        if validation.failure is not None:
+            raise CompletionVerifierUnavailable(
+                "Completion verifier live execution-profile identity is invalid."
+            ) from None
+        live_profile = validation.result
+        if live_profile is None or live_profile[0] is None:
+            raise CompletionVerifierUnavailable(
+                "Completion verifier execution-profile identity is unavailable."
+            ) from None
+        candidate = build_completion_verifier_execution_profile(
+            verifier=registered.profile.verifier,
+            adapter_identity=live_profile[0],
+            component_declarations=live_profile[1],
+        )
+        if candidate != registered.profile:
+            raise CompletionVerifierUnavailable(
+                "Completion verifier execution-profile identity changed after registration."
+            ) from None
 
     async def verify(
         self,
@@ -677,6 +868,22 @@ class CompletionVerifierCoordinator:
         del validation
         if copied is None:
             raise ValueError("Completion verifier execution request is invalid.") from None
+        if copied.profile_adoption is not None:
+            adoption_validation = capture_sensitive_validation(
+                lambda intent=copied.profile_adoption: self._require_safe_adoption_intent(intent),
+                operation_name="Completion verifier profile-adoption validation",
+                redactor=self._secret_redactor,
+            )
+            if adoption_validation.failure is not None:
+                failure = adoption_validation.failure
+                del adoption_validation, copied
+                raise_task_store_operation_failure(failure)
+            if adoption_validation.result is not True:
+                del adoption_validation, copied
+                raise WorkCompletionConflict(
+                    "Completion-verifier profile adoption audit fields contain a workload secret."
+                ) from None
+            del adoption_validation
         if _contains_workload_secret(
             (
                 copied.proposal_id,
@@ -731,8 +938,23 @@ class CompletionVerifierCoordinator:
         )
         if existing is not None:
             claim: CompletionVerificationClaim | None = None
+            profile: CompletionVerifierProfileRecord | None = None
             existing_validation = None
             try:
+                profile = await self._load_profile(store_owner, request.proposal_id)
+                if profile is None:
+                    raise WorkCompletionConflict(
+                        "Durable completion decision has no verifier-profile authority."
+                    ) from None
+                self._require_profile_authority(profile, authority)
+                prior_profile = await self._load_prior_profile(store_owner, authority)
+                self._require_profile_transition(profile, prior_profile)
+                self._require_profile_adoption_replay(
+                    request=request,
+                    authority=authority,
+                    profile=profile,
+                    prior=prior_profile,
+                )
                 claim = await self._load_required_claim(
                     store_owner,
                     request.proposal_id,
@@ -742,6 +964,7 @@ class CompletionVerifierCoordinator:
                     request,
                     authority.contract.verifier,
                     execution_owner_id=claim.execution_owner_id,
+                    verifier_profile_fingerprint=profile.profile.fingerprint,
                     accept_legacy_timeout=True,
                 )
                 existing_validation = capture_sensitive_validation(
@@ -765,7 +988,7 @@ class CompletionVerifierCoordinator:
                 return existing
             except BaseException as failure:
                 del existing
-                del claim, existing_validation, authority, store_owner
+                del claim, profile, existing_validation, authority, store_owner
                 raise_task_store_operation_failure(failure)
 
         if authority.contract.verifier.kind is not CompletionVerifierKind.DETERMINISTIC:
@@ -809,8 +1032,17 @@ class CompletionVerifierCoordinator:
                     "The prior exact completion-verifier execution is still draining."
                 ) from None
 
+        registered = self._verifiers[verifier_key]
+        self._require_live_registered_profile(registered)
+        profile = await self._prepare_profile(
+            store_owner,
+            request,
+            authority,
+            registered,
+        )
+        self._require_live_registered_profile(registered)
+        verifier = registered.adapter
         capacity_reservation = self._reserve_adapter_capacity()
-        verifier = self._verifiers[verifier_key]
         heartbeat: _ClaimHeartbeat | None = None
         try:
             claim_request = CompletionVerificationClaimRequest(
@@ -819,6 +1051,7 @@ class CompletionVerifierCoordinator:
                 worker_id=request.worker_id,
                 execution_owner_id=self._execution_owner_id,
                 verifier=authority.contract.verifier,
+                verifier_profile_fingerprint=profile.profile.fingerprint,
                 lease_seconds=request.lease_seconds,
                 execution_timeout_seconds=request.execution_timeout_seconds,
             )
@@ -851,6 +1084,7 @@ class CompletionVerifierCoordinator:
                 request,
                 authority.contract.verifier,
                 execution_owner_id=self._execution_owner_id,
+                verifier_profile_fingerprint=profile.profile.fingerprint,
             )
             claim = await self._renew_claim(
                 store_owner,
@@ -864,6 +1098,8 @@ class CompletionVerifierCoordinator:
                 request,
                 claim,
             )
+
+            self._require_live_registered_profile(registered)
 
             outcome = await self._invoke_adapter(
                 verifier,
@@ -886,7 +1122,7 @@ class CompletionVerifierCoordinator:
                 del settlement
             else:
                 propagated = failure
-            del verifier, authority, store_owner
+            del verifier, registered, profile, authority, store_owner
             if propagated is None:  # pragma: no cover - primary failure is authoritative
                 raise AssertionError("Completion verifier failure was lost.") from None
             raise_task_store_operation_failure(propagated)
@@ -899,6 +1135,7 @@ class CompletionVerifierCoordinator:
                 proposal=authority.proposal,
                 attempt=authority.attempt,
                 contract=authority.contract,
+                verifier_profile_fingerprint=profile.profile.fingerprint,
                 outcome=outcome,
             )
         except BaseException as failure:
@@ -914,7 +1151,7 @@ class CompletionVerifierCoordinator:
                 del settlement
             else:
                 propagated = failure
-            del outcome, verifier, claim, claim_request, authority, store_owner
+            del outcome, verifier, registered, profile, claim, claim_request, authority, store_owner
             if propagated is None:  # pragma: no cover - primary failure is authoritative
                 raise AssertionError("Completion decision publication failure was lost.") from None
             raise_task_store_operation_failure(propagated)
@@ -927,7 +1164,17 @@ class CompletionVerifierCoordinator:
             )
             del settlement
             if propagated is not None:
-                del decision, outcome, verifier, claim, claim_request, authority, store_owner
+                del (
+                    decision,
+                    outcome,
+                    verifier,
+                    registered,
+                    profile,
+                    claim,
+                    claim_request,
+                    authority,
+                    store_owner,
+                )
                 raise_task_store_operation_failure(propagated)
         return decision
 
@@ -1018,6 +1265,447 @@ class CompletionVerifierCoordinator:
             del proposal, attempt, contract, context_validation, adapter_request, store_owner
             raise_task_store_operation_failure(failure)
 
+    async def _load_optional_profile(
+        self,
+        operation: Callable[[], Awaitable[object]],
+        *,
+        proposal_id: str,
+        operation_name: str,
+    ) -> CompletionVerifierProfileRecord | None:
+        outcome = await capture_task_store_operation(
+            operation,
+            operation_name=operation_name,
+            redactor=self._secret_redactor,
+        )
+        if outcome.failure is not None:
+            raise_task_store_operation_failure(outcome.failure)
+        if outcome.result is None:
+            return None
+        raw_result = outcome.result
+        del outcome
+        validation = capture_sensitive_validation(
+            lambda value=raw_result: copy_completion_verifier_profile_record(
+                cast("CompletionVerifierProfileRecord", value)
+            ),
+            operation_name=f"{operation_name} result validation",
+            redactor=self._secret_redactor,
+        )
+        del raw_result
+        if validation.failure is not None:
+            raise validation.failure from None
+        profile = validation.result
+        del validation
+        if profile is None or profile.proposal_id != proposal_id:
+            raise WorkCompletionConflict(
+                "Task store returned completion-verifier profile authority for another proposal."
+            ) from None
+        return profile
+
+    async def _load_profile(
+        self,
+        store_owner: _TaskStoreOwner,
+        proposal_id: str,
+    ) -> CompletionVerifierProfileRecord | None:
+        return await self._load_optional_profile(
+            lambda: store_owner.store.load_completion_verifier_profile(proposal_id),
+            proposal_id=proposal_id,
+            operation_name="Completion-verifier profile lookup",
+        )
+
+    async def _load_prior_profile(
+        self,
+        store_owner: _TaskStoreOwner,
+        authority: _VerifierAuthority,
+    ) -> CompletionVerifierProfileRecord | None:
+        outcome = await capture_task_store_operation(
+            lambda: store_owner.store.load_prior_completion_verifier_profile(
+                authority.proposal.proposal_id
+            ),
+            operation_name="Prior completion-verifier profile lookup",
+            redactor=self._secret_redactor,
+        )
+        if outcome.failure is not None:
+            raise_task_store_operation_failure(outcome.failure)
+        if outcome.result is None:
+            if authority.attempt.ordinal != 1:
+                raise WorkCompletionConflict(
+                    "Prior work attempt has no verifier-profile authority."
+                ) from None
+            return None
+        raw_result = outcome.result
+        del outcome
+        validation = capture_sensitive_validation(
+            lambda value=raw_result: copy_completion_verifier_profile_record(
+                cast("CompletionVerifierProfileRecord", value)
+            ),
+            operation_name="Prior completion-verifier profile result validation",
+            redactor=self._secret_redactor,
+        )
+        del raw_result
+        if validation.failure is not None:
+            raise validation.failure from None
+        profile = validation.result
+        if profile is None:
+            raise WorkCompletionConflict(
+                "Task store returned invalid prior verifier-profile authority."
+            ) from None
+        prior_proposal = await self._load_required(
+            lambda: store_owner.store.load_completion_proposal(profile.proposal_id),
+            CompletionProposal,
+            identity=profile.proposal_id,
+            identity_field="proposal_id",
+            operation_name="Prior completion proposal lookup",
+        )
+        prior_attempt = await self._load_required(
+            lambda: store_owner.store.load_work_attempt(profile.attempt_id),
+            WorkAttempt,
+            identity=profile.attempt_id,
+            identity_field="attempt_id",
+            operation_name="Prior work attempt lookup",
+        )
+        prior_contract = await self._load_required(
+            lambda: store_owner.store.load_work_contract(profile.contract),
+            WorkContract,
+            identity=profile.contract.contract_id,
+            identity_field="contract_id",
+            operation_name="Prior work contract lookup",
+        )
+        require_completion_verifier_profile_integrity(
+            profile=profile,
+            proposal=prior_proposal,
+            attempt=prior_attempt,
+            contract=prior_contract,
+        )
+        if (
+            prior_attempt.task_id != authority.attempt.task_id
+            or prior_attempt.ordinal != authority.attempt.ordinal - 1
+            or prior_proposal.attempt_id != prior_attempt.attempt_id
+            or prior_contract.reference() != authority.contract.reference()
+        ):
+            raise WorkCompletionConflict(
+                "Task store returned a non-preceding verifier profile as adoption authority."
+            ) from None
+        return profile
+
+    def _require_profile_authority(
+        self,
+        profile: CompletionVerifierProfileRecord,
+        authority: _VerifierAuthority,
+    ) -> None:
+        require_completion_verifier_profile_integrity(
+            profile=profile,
+            proposal=authority.proposal,
+            attempt=authority.attempt,
+            contract=authority.contract,
+        )
+
+    async def _prepare_profile(
+        self,
+        store_owner: _TaskStoreOwner,
+        request: CompletionVerifierExecutionRequest,
+        authority: _VerifierAuthority,
+        registered: _RegisteredVerifier,
+    ) -> CompletionVerifierProfileRecord:
+        existing = await self._load_profile(store_owner, request.proposal_id)
+        if existing is not None:
+            self._require_profile_authority(existing, authority)
+            prior = await self._load_prior_profile(store_owner, authority)
+            self._require_profile_transition(existing, prior)
+            if existing.profile != registered.profile:
+                raise CompletionVerifierUnavailable(
+                    "The registered completion verifier does not match the durable profile."
+                ) from None
+            self._require_profile_adoption_replay(
+                request=request,
+                authority=authority,
+                profile=existing,
+                prior=prior,
+            )
+            return existing
+
+        prior = await self._load_prior_profile(store_owner, authority)
+        adoption: CompletionVerifierProfileAdoptionDecision | None = None
+        expected_prior_proposal_id = None if prior is None else prior.proposal_id
+        expected_prior = None if prior is None else prior.profile.fingerprint
+        if prior is None:
+            if request.profile_adoption is not None:
+                raise WorkCompletionConflict(
+                    "Initial completion-verifier profile cannot carry adoption intent."
+                ) from None
+        elif prior.profile == registered.profile:
+            if request.profile_adoption is not None:
+                raise WorkCompletionConflict(
+                    "Exact completion-verifier profile reuse cannot carry adoption intent."
+                ) from None
+        else:
+            intent = request.profile_adoption
+            policy = self._profile_policy
+            if intent is None or policy is None:
+                raise WorkCompletionConflict(
+                    "Changed completion-verifier profile requires explicit authorized adoption."
+                ) from None
+            policy_identity = self._profile_policy_identity
+            if policy_identity is None:
+                raise WorkCompletionConflict(
+                    "Completion-verifier profile policy identity is unavailable."
+                ) from None
+            changed_components = changed_completion_verifier_profile_components(
+                prior.profile,
+                registered.profile,
+            )
+            policy_request = CompletionVerifierProfilePolicyRequest(
+                task_id=authority.proposal.task_id,
+                proposal_id=authority.proposal.proposal_id,
+                attempt_id=authority.attempt.attempt_id,
+                expected_profile=prior.profile,
+                candidate_profile=registered.profile,
+                changed_component_ids=changed_components,
+                intent=intent,
+            )
+            policy_outcome = await capture_task_store_operation(
+                lambda: policy.decide(policy_request),
+                operation_name="Completion verifier profile-policy decision",
+                redactor=self._secret_redactor,
+            )
+            if policy_outcome.failure is not None:
+                raise_task_store_operation_failure(policy_outcome.failure)
+            raw_policy_result = policy_outcome.result
+            del policy_outcome
+            result_validation = capture_sensitive_validation(
+                lambda value=raw_policy_result: copy_execution_profile_policy_result(
+                    cast("ExecutionProfilePolicyResult", value)
+                ),
+                operation_name="Completion verifier profile-policy result validation",
+                redactor=self._secret_redactor,
+            )
+            del raw_policy_result
+            if result_validation.failure is not None:
+                raise result_validation.failure from None
+            result = result_validation.result
+            del result_validation
+            if result is None:
+                raise WorkCompletionConflict(
+                    "Completion-verifier profile policy returned an invalid decision."
+                ) from None
+            adoption_rejected = (
+                result.action is not ExecutionProfilePolicyAction.ADOPT
+                or result.authority_decision is not ExecutionProfileAuthorityDecision.AUTHORIZED
+            )
+            policy_reason = self._secret_redactor.redact_text_bounded(
+                result.reason,
+                max_bytes=EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS,
+            )
+            del result
+            current_policy_identity = capture_sensitive_validation(
+                lambda: self._copy_profile_policy_identity(policy),
+                operation_name="Completion verifier profile-policy identity revalidation",
+                redactor=self._secret_redactor,
+            )
+            if current_policy_identity.failure is not None:
+                raise current_policy_identity.failure from None
+            if current_policy_identity.result != policy_identity:
+                raise WorkCompletionConflict(
+                    "Completion-verifier profile policy identity changed during authorization."
+                ) from None
+            if adoption_rejected:
+                raise WorkCompletionConflict(
+                    "Completion-verifier profile adoption was not explicitly authorized."
+                ) from None
+            adoption_request_sha256 = completion_verifier_profile_adoption_request_sha256(
+                policy_request,
+                policy_identity=policy_identity,
+            )
+            adoption = CompletionVerifierProfileAdoptionDecision(
+                expected_profile_fingerprint=prior.profile.fingerprint,
+                candidate_profile_fingerprint=registered.profile.fingerprint,
+                changed_component_ids=changed_components,
+                policy_identity=policy_identity,
+                authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+                idempotency_key=intent.idempotency_key,
+                requested_by=ResolutionActor(
+                    subject=intent.requested_by.subject,
+                    tenant=intent.requested_by.tenant,
+                    source=intent.requested_by.source,
+                ),
+                reason=intent.reason,
+                policy_reason=policy_reason,
+                request_sha256=adoption_request_sha256,
+            )
+
+        preparation = CompletionVerifierProfilePreparationRequest(
+            proposal_id=authority.proposal.proposal_id,
+            task_id=authority.proposal.task_id,
+            attempt_id=authority.attempt.attempt_id,
+            attempt_request_sha256=authority.attempt.request_sha256,
+            source_execution_profile_fingerprint=(authority.attempt.execution_profile_fingerprint),
+            proposal_request_sha256=authority.proposal.request_sha256,
+            contract=authority.contract.reference(),
+            profile=registered.profile,
+            expected_prior_proposal_id=expected_prior_proposal_id,
+            expected_prior_profile_fingerprint=expected_prior,
+            adoption=adoption,
+        )
+        outcome = await capture_task_store_operation(
+            lambda: store_owner.store.prepare_completion_verifier_profile(preparation),
+            operation_name="Completion-verifier profile preparation",
+            redactor=self._secret_redactor,
+            mutation_store=store_owner.store,
+            mutation_method_name="prepare_completion_verifier_profile",
+        )
+        if outcome.failure is not None:
+            failure = outcome.failure
+            if isinstance(failure, Exception):
+                try:
+                    reconciled = await self._load_profile(store_owner, request.proposal_id)
+                    if reconciled is not None:
+                        self._require_profile_authority(reconciled, authority)
+                        self._require_profile_transition(reconciled, prior)
+                        if reconciled.request_sha256 == (
+                            completion_verifier_profile_preparation_request_sha256(preparation)
+                        ):
+                            return reconciled
+                except BaseException as reconciliation_failure:
+                    combined = _ordered_failure_group(
+                        "Completion-verifier profile preparation and reconciliation failed.",
+                        failure,
+                        reconciliation_failure,
+                        redactor=self._secret_redactor,
+                    )
+                    del failure, reconciliation_failure
+                    raise combined from None
+            raise_task_store_operation_failure(failure)
+        raw_result = outcome.result
+        del outcome
+        validation = capture_sensitive_validation(
+            lambda value=raw_result: copy_completion_verifier_profile_record(
+                cast("CompletionVerifierProfileRecord", value)
+            ),
+            operation_name="Completion-verifier profile preparation result validation",
+            redactor=self._secret_redactor,
+        )
+        del raw_result
+        if validation.failure is not None:
+            raise validation.failure from None
+        profile = validation.result
+        if profile is None:
+            raise WorkCompletionConflict(
+                "Task store returned invalid completion-verifier profile authority."
+            ) from None
+        self._require_profile_authority(profile, authority)
+        self._require_profile_transition(profile, prior)
+        if profile.request_sha256 != completion_verifier_profile_preparation_request_sha256(
+            preparation
+        ):
+            raise WorkCompletionConflict(
+                "Task store returned a different completion-verifier profile preparation."
+            ) from None
+        return profile
+
+    def _require_profile_adoption_replay(
+        self,
+        *,
+        request: CompletionVerifierExecutionRequest,
+        authority: _VerifierAuthority,
+        profile: CompletionVerifierProfileRecord,
+        prior: CompletionVerifierProfileRecord | None,
+    ) -> None:
+        """Accept only an exact replay of already-authorized adoption intent."""
+
+        intent = request.profile_adoption
+        adoption = profile.adoption
+        if adoption is None:
+            if intent is not None:
+                raise WorkCompletionConflict(
+                    "Exact verifier-profile replay cannot introduce adoption intent."
+                ) from None
+            return
+
+        policy_identity = adoption.policy_identity
+        if prior is None:
+            raise WorkCompletionConflict(
+                "Verifier-profile adoption has no prior profile authority."
+            ) from None
+        if intent is None:
+            return
+        changed_components = changed_completion_verifier_profile_components(
+            prior.profile,
+            profile.profile,
+        )
+        policy_request = CompletionVerifierProfilePolicyRequest(
+            task_id=authority.proposal.task_id,
+            proposal_id=authority.proposal.proposal_id,
+            attempt_id=authority.attempt.attempt_id,
+            expected_profile=prior.profile,
+            candidate_profile=profile.profile,
+            changed_component_ids=changed_components,
+            intent=intent,
+        )
+        replay_actor = ResolutionActor(
+            subject=intent.requested_by.subject,
+            tenant=intent.requested_by.tenant,
+            source=intent.requested_by.source,
+        )
+        if (
+            adoption.idempotency_key != intent.idempotency_key
+            or adoption.requested_by != replay_actor
+            or adoption.reason != intent.reason
+            or adoption.request_sha256
+            != completion_verifier_profile_adoption_request_sha256(
+                policy_request,
+                policy_identity=policy_identity,
+            )
+        ):
+            raise WorkCompletionConflict(
+                "Verifier-profile adoption retry conflicts with durable authority."
+            ) from None
+
+    def _require_profile_transition(
+        self,
+        profile: CompletionVerifierProfileRecord,
+        prior: CompletionVerifierProfileRecord | None,
+    ) -> None:
+        expected_proposal_id = None if prior is None else prior.proposal_id
+        expected_fingerprint = None if prior is None else prior.profile.fingerprint
+        if (
+            profile.expected_prior_proposal_id != expected_proposal_id
+            or profile.expected_prior_profile_fingerprint != expected_fingerprint
+        ):
+            raise WorkCompletionConflict(
+                "Durable completion-verifier profile conflicts with prior profile authority."
+            ) from None
+        adoption = profile.adoption
+        if prior is None or prior.profile == profile.profile:
+            if adoption is not None:
+                raise WorkCompletionConflict(
+                    "Verifier-profile reuse has unexpected adoption authority."
+                ) from None
+            return
+        if adoption is None or adoption.changed_component_ids != (
+            changed_completion_verifier_profile_components(
+                prior.profile,
+                profile.profile,
+            )
+        ):
+            raise WorkCompletionConflict(
+                "Changed verifier profile has invalid adoption authority."
+            ) from None
+
+    def _require_safe_adoption_intent(
+        self,
+        intent: ExecutionProfileAdoptionIntent,
+    ) -> bool:
+        document = intent.model_dump(mode="json", warnings=False)
+        self._secret_redactor.require_no_secret_keys(
+            document,
+            field_name="completion_verifier_profile_adoption",
+            match_short_substrings=True,
+        )
+        if self._secret_redactor.redact_json_values(document) != document:
+            raise WorkCompletionConflict(
+                "Completion-verifier profile adoption audit fields contain a workload secret."
+            ) from None
+        return True
+
     async def _publish_adapter_outcome(
         self,
         *,
@@ -1026,6 +1714,7 @@ class CompletionVerifierCoordinator:
         proposal: CompletionProposal,
         attempt: WorkAttempt,
         contract: WorkContract,
+        verifier_profile_fingerprint: str,
         outcome: CompletionVerifierDecision,
     ) -> CompletionDecision:
         decision_request = CompletionDecisionCreate(
@@ -1034,6 +1723,7 @@ class CompletionVerifierCoordinator:
             claim_id=request.claim_id,
             worker_id=request.worker_id,
             verifier=contract.verifier,
+            verifier_profile_fingerprint=verifier_profile_fingerprint,
             verdict=outcome.verdict,
             criterion_outcomes=outcome.criterion_outcomes,
             constraint_outcomes=outcome.constraint_outcomes,
@@ -1337,6 +2027,7 @@ class CompletionVerifierCoordinator:
         verifier: CompletionVerifierRef,
         *,
         execution_owner_id: str | None,
+        verifier_profile_fingerprint: str,
         accept_legacy_timeout: bool = False,
     ) -> None:
         if execution_owner_id is not None and _contains_workload_secret(
@@ -1358,6 +2049,7 @@ class CompletionVerifierCoordinator:
             worker_id=request.worker_id,
             execution_owner_id=execution_owner_id,
             verifier=verifier,
+            verifier_profile_fingerprint=verifier_profile_fingerprint,
             lease_seconds=request.lease_seconds,
             execution_timeout_seconds=expected_timeout,
         )
@@ -1368,6 +2060,7 @@ class CompletionVerifierCoordinator:
             or claim.execution_owner_id != execution_owner_id
             or claim.execution_timeout_seconds != expected_timeout
             or claim.verifier != verifier
+            or claim.verifier_profile_fingerprint != verifier_profile_fingerprint
             or claim.request_sha256 != completion_verification_claim_request_sha256(expected)
         ):
             del claim, request, verifier, expected, expected_timeout
@@ -1488,6 +2181,7 @@ class CompletionVerifierCoordinator:
             execution_request,
             claim_request.verifier,
             execution_owner_id=claim_request.execution_owner_id,
+            verifier_profile_fingerprint=claim_request.verifier_profile_fingerprint,
         )
         if (
             renewed.attempt_number != prior_claim.attempt_number
