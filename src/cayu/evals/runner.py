@@ -6,7 +6,7 @@ import inspect
 import math
 import traceback
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -621,6 +621,7 @@ async def _run_case_once_with_public_projection(
     retain_final_output: bool = True,
     timeout_seconds: float | None = None,
     public_output_preview_bytes: int | None = None,
+    run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None = None,
 ) -> tuple[EvalTrialResult, _EvalTrialPublicData | None]:
     started_at = datetime.now(UTC)
     trial_request = _isolated_trial_request(case.request)
@@ -650,7 +651,8 @@ async def _run_case_once_with_public_projection(
     try:
         async with asyncio.timeout(timeout_seconds) as deadline:
             try:
-                async for event in app.run(trial_request):
+                stream = app.run(trial_request) if run_stream is None else run_stream(trial_request)
+                async for event in stream:
                     # Anchor the trial to the first emitted session. If app.run() ever forwards
                     # child-session events, they must not replace the root trial identity.
                     observed_session_id = observed_session_id or event.session_id

@@ -148,6 +148,7 @@ class DashboardContractProvider(ModelProvider):
         self.recovery_requests: list[ModelRequest] = []
         self.replay_markers: list[str] = []
         self._approval_seeded = False
+        self._scenario_approval_seeded = False
         self._direct_started = asyncio.Condition()
         self._direct_releases: asyncio.Queue[None] = asyncio.Queue()
         self._replay_releases: asyncio.Queue[str] = asyncio.Queue()
@@ -180,6 +181,18 @@ class DashboardContractProvider(ModelProvider):
                 self.block_next_promotion_run = False
                 self.blocked_promotion_run_started.set()
                 await asyncio.Event().wait()
+            if (
+                "verify the queued production follow-up" in request_text.lower()
+                and not self._scenario_approval_seeded
+            ):
+                self._scenario_approval_seeded = True
+                yield ModelStreamEvent.tool_call(
+                    id="dashboard-scenario-approval-call",
+                    name="dashboard_contract_tool",
+                    arguments={"operation": "verify-scenario"},
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
             yield ModelStreamEvent.text_delta("dashboard eval promotion output")
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
             return
@@ -1164,7 +1177,7 @@ async def _run_browser_contract(
             "sessions_list",
             "session_detail",
             "captured_evaluation_preview_and_assertion_authoring",
-            "scenario_authoring_and_launch_preflight",
+            "scenario_authoring_and_controlled_execution",
             "captured_result_save_and_baseline",
             "eval_result_catalog_navigation",
             "eval_catalog_import_and_download",
@@ -1379,6 +1392,12 @@ async def _exercise_captured_evaluation(
         "a newly queued scenario event must expose exactly one text-part editor",
     )
     await queued_text.fill("Verify the queued production follow-up.")
+    await scenario_editor.get_by_role("button", name="Approval", exact=True).click()
+    approval_event = scenario_editor.get_by_test_id("scenario-event-2")
+    await expect(approval_event).to_be_visible()
+    await approval_event.get_by_label("Current tool name", exact=True).fill(
+        "dashboard_contract_tool"
+    )
     await scenario_editor.get_by_role(
         "spinbutton",
         name="Max tool calls per trial",
@@ -1396,6 +1415,34 @@ async def _exercise_captured_evaluation(
     ).to_be_visible()
     await scenario_editor.get_by_role("button", name="Save scenario", exact=True).click()
     await expect(scenario_editor.get_by_text(re.compile(r"Saved scenario .+\."))).to_be_visible()
+    # A later cancellation check intentionally blocks the next promoted run.
+    # Keep this scenario run deterministic, then re-arm that one-shot fixture.
+    provider.block_next_promotion_run = False
+    await scenario_editor.get_by_role("button", name="Run scenario", exact=True).click()
+    await expect(
+        scenario_editor.get_by_text(
+            re.compile(r"Opened eval run .+ \((queued|running)\)\. Follow it in the Runs tab\."),
+        )
+    ).to_be_visible()
+    scenario_runs_response = await page.request.get(
+        f"{base_url}/api/evals/runs?target_key=dashboard.regressions&limit=100"
+    )
+    require_equal(
+        scenario_runs_response.status,
+        200,
+        "the admitted scenario must be discoverable in the durable run catalog",
+    )
+    scenario_runs = [
+        run
+        for run in (await scenario_runs_response.json())["items"]
+        if run["spec"]["invocation"].get("scenario") is not None
+    ]
+    require_equal(
+        len(scenario_runs),
+        1,
+        "the explicit Run scenario action must admit exactly one scenario run",
+    )
+    scenario_run_id = scenario_runs[0]["spec"]["run_id"]
 
     async with page.expect_download() as download_info:
         await export.click()
@@ -1446,6 +1493,67 @@ async def _exercise_captured_evaluation(
     )
     await expect(page.get_by_text("Immutable score evidence", exact=True)).to_be_visible()
     await expect(page.get_by_text("Baseline", exact=True)).to_be_visible()
+
+    await page.get_by_role("tab", name="Runs", exact=True).click()
+    retained_corpus_filter = page.get_by_role("tabpanel", name="Runs").get_by_role(
+        "button", name=re.compile(r"^Corpus ")
+    )
+    if await retained_corpus_filter.count() == 1:
+        await retained_corpus_filter.click()
+    scenario_run_button = page.get_by_title(scenario_run_id, exact=True)
+    await expect(scenario_run_button).to_be_visible()
+    await scenario_run_button.click()
+    scenario_progress = page.get_by_test_id("scenario-run-progress")
+    await expect(scenario_progress).to_contain_text("awaiting approval", timeout=20_000)
+    await expect(scenario_progress).to_contain_text(
+        "Fresh approval required for dashboard_contract_tool."
+    )
+    await scenario_progress.get_by_role("button", name="Approve", exact=True).click()
+    await expect(
+        page.get_by_text("Approved trial 1's fresh tool request.", exact=True)
+    ).to_be_visible()
+    await expect(page.get_by_test_id("eval-run-status-announcement")).to_have_text(
+        "Eval run status: completed.",
+        timeout=20_000,
+    )
+    await expect(scenario_progress).to_contain_text("completed")
+    await expect(
+        page.locator('[data-slot="card-title"]').filter(has_text="Published result")
+    ).to_be_visible()
+    async with page.expect_download() as scenario_json_download_info:
+        await page.get_by_role("button", name="JSON", exact=True).click()
+    scenario_json_download = await scenario_json_download_info.value
+    require_equal(
+        scenario_json_download.suggested_filename,
+        f"{scenario_run_id}.eval-result.json",
+        "the scenario result must retain the ordinary eval-result filename",
+    )
+    scenario_result_path_text = await scenario_json_download.path()
+    require(
+        scenario_result_path_text is not None,
+        "the downloaded scenario result must be readable by the installed CLI",
+    )
+    scenario_result_path = Path(scenario_result_path_text)
+    scenario_result = json.loads(scenario_result_path.read_text(encoding="utf-8"))
+    require_equal(
+        scenario_result["run"]["status"],
+        "passed",
+        "the queued-input and fresh-approval scenario must publish an ordinary passing result",
+    )
+    async with page.expect_download() as scenario_html_download_info:
+        await page.get_by_role("button", name="HTML", exact=True).click()
+    scenario_html_download = await scenario_html_download_info.value
+    require_equal(
+        scenario_html_download.suggested_filename,
+        f"{scenario_run_id}.eval-report.html",
+        "the scenario run must publish the ordinary HTML report",
+    )
+    provider.block_next_promotion_run = True
+
+    await page.get_by_role("tab", name="Results", exact=True).click()
+    captured_result_row = page.get_by_role("row").filter(has_text="Captured")
+    await expect(captured_result_row).to_have_count(1)
+    await captured_result_row.get_by_role("button").click()
     await page.get_by_role("button", name="Open corpus", exact=True).click()
     scenario_row = (
         page.get_by_test_id("scenario-catalog")
@@ -1453,7 +1561,7 @@ async def _exercise_captured_evaluation(
         .filter(has_text="Captured dashboard regression")
     )
     await expect(scenario_row).to_be_visible()
-    await expect(scenario_row.get_by_text("2 events")).to_be_visible()
+    await expect(scenario_row.get_by_text("3 events")).to_be_visible()
 
     runnable_preview_response = await page.request.post(
         f"{base_url}/api/evals/promotion/sessions/{PROMOTION_SESSION_ID}/preview",
@@ -1634,6 +1742,7 @@ async def _exercise_captured_evaluation(
     await _exercise_local_eval_acceptance(
         corpus=corpus,
         dashboard_result_path=Path(json_result_path),
+        scenario_result_path=scenario_result_path,
     )
 
     await reopen_catalog()
@@ -1722,6 +1831,7 @@ async def _exercise_local_eval_acceptance(
     *,
     corpus: dict[str, object],
     dashboard_result_path: Path,
+    scenario_result_path: Path,
 ) -> None:
     """Prove that dashboard exports are the exact local reporting and CI inputs."""
 
@@ -1755,6 +1865,8 @@ async def _exercise_local_eval_acceptance(
         local_result_path = output_root / "local-result.json"
         local_report_path = output_root / "local-report.html"
         dashboard_report_path = output_root / "dashboard-report.html"
+        scenario_report_path = output_root / "scenario-report.html"
+        scenario_comparison_path = output_root / "scenario-comparison.json"
         comparison_path = output_root / "comparison.json"
         target = "dashboard_behavior_live:build_release_acceptance_eval_plan"
 
@@ -1787,6 +1899,21 @@ async def _exercise_local_eval_acceptance(
         )
         await asyncio.to_thread(
             run_command,
+            ["report", str(scenario_result_path), "--output", str(scenario_report_path)],
+        )
+        await asyncio.to_thread(
+            run_command,
+            [
+                "compare",
+                str(scenario_result_path),
+                str(scenario_result_path),
+                "--json",
+                "--output",
+                str(scenario_comparison_path),
+            ],
+        )
+        await asyncio.to_thread(
+            run_command,
             [
                 "compare",
                 str(dashboard_result_path),
@@ -1799,6 +1926,7 @@ async def _exercise_local_eval_acceptance(
 
         inspection = json.loads(inspection_path.read_text(encoding="utf-8"))
         comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
+        scenario_comparison = json.loads(scenario_comparison_path.read_text(encoding="utf-8"))
         require_equal(
             inspection["target_key"],
             "dashboard.regressions",
@@ -1822,6 +1950,15 @@ async def _exercise_local_eval_acceptance(
         require(
             "Cayu Eval Report" in dashboard_report_path.read_text(encoding="utf-8"),
             "the local CLI must render a downloaded dashboard result",
+        )
+        require(
+            "Cayu Eval Report" in scenario_report_path.read_text(encoding="utf-8"),
+            "the local CLI must render a downloaded scenario result",
+        )
+        require_equal(
+            scenario_comparison["regressions"],
+            [],
+            "the downloaded scenario result must pass the stable CLI comparison gate",
         )
 
 
@@ -2589,7 +2726,7 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
         ).to_be_visible()
         await expect(
             page.get_by_text(
-                "Multi-stage production scenarios are planned for a future Cayu release.",
+                "Scenario-v2 conversion is unavailable in this deployment.",
                 exact=True,
             )
         ).to_be_visible()

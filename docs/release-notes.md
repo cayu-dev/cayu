@@ -109,6 +109,43 @@ optimizer, paired report, or Compound dependency.
   cancellation-safe owned publication, and the existing review workflow keep proposals
   auditable and unavailable to normal recall until approval.
 
+### Controlled scenarios run end to end from the Control Plane
+
+Operators can now save an immutable scenario-v2 revision, review its current
+launch binding, and start it directly with **Run scenario**. The durable worker
+executes ordered initial and queued input, explicit session resumes, typed
+`ask_user` answers, portable JSON, file references, and fresh approval
+checkpoints through the target's ordinary `CayuApp`. The Runs view publishes
+per-trial phase and cursor state and presents actor-attributed approve/deny
+controls only for a current authored checkpoint. Cancellation works while a
+trial is executing or awaiting approval.
+
+Approval, user-input, and explicit-resume checkpoints retain the same durable
+runtime session across coordinator and store restart. Claim epochs fence every
+progress transition and final result publication; other interrupted stages
+restart as a fresh attempt. Provider calls or external tool effects dispatched
+immediately before lease loss may still repeat unless their underlying system
+honors Cayu's idempotency or reconciliation identity.
+
+Scenario output uses the existing corpus result, JSON, HTML, SDK, CLI report,
+comparison, and stable CI-exit contracts. Typed queued messages now preserve
+file parts across durable delivery rather than reducing them to their text
+projection. Captured ordinary `resume(...)` interactions are projected to the
+matching scenario resume kind instead of being mistaken for an `ask_user`
+answer.
+
+Server contract version 25 adds scenario launch, durable trial progress, and
+fresh scenario-approval operations. Upgrade independently deployed servers,
+dashboards, and generated clients together.
+
+Storage revision 56 additively adds the bounded scenario-progress document to
+eval runs; scenario-aware `SQLiteEvalStore` and `PostgresEvalStore` instances
+require it. Storage revision 57 is a breaking session-worker boundary for exact
+typed queued messages. Stop revision-56 and older session workers, back up the
+store, run `cayu storage migrate`, confirm revision 57, and then start this
+build. Do not run mixed revision-56/revision-57 session fleets: older workers
+would silently deliver only the text projection.
+
 ## v0.4.0
 
 `v0.4.0` turns Cayu's evaluation, memory, durable task, provider, and workspace
@@ -190,8 +227,9 @@ input, missing/inaccessible artifacts, contradictory evidence, limit failures,
 and a source that changes during capture produce stable factual diagnostics.
 They do not disable captured scoring, saving, export, or baseline comparison.
 The Control Plane reports the scenario result beside runnable corpus-v1
-conversion; scenario editing and controlled multi-stage execution remain later
-workflow layers.
+conversion. At that delivery slice, scenario editing and controlled multi-stage
+execution remained later workflow layers; both are included in the current
+unreleased build above.
 
 Server contract version 21 adds the required `scenario_conversion` result to
 captured-evaluation preview responses and marks scenario conversion ready when
@@ -222,8 +260,9 @@ Storage revision 53 is an additive migration that creates the independent
 scenario catalog. Run `cayu storage migrate` and confirm revision 53 before
 using scenario persistence. Revision-52 workers may coexist because they do not
 write this table, but scenario-aware `SQLiteEvalStore` and `PostgresEvalStore`
-instances require revision 53. This release establishes portable authoring and
-durable storage; target binding and execution remain separate launch-time work.
+instances require revision 53. That delivery slice established portable
+authoring and durable storage; the current unreleased build above adds
+target-bound execution.
 
 ### Targeted grants can execute through the portable `call_tool` gateway
 

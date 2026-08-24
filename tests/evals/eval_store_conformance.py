@@ -51,7 +51,12 @@ from cayu.evals.store import (
     EvalRunRequest,
     EvalRunStateConflict,
     EvalRunStatus,
+    EvalScenarioApprovalSubmission,
     EvalScenarioCatalogQuery,
+    EvalScenarioRunInvocation,
+    EvalScenarioRunProgress,
+    EvalScenarioTrialPhase,
+    EvalScenarioTrialProgress,
     EvalStore,
     EvalStorePublicationRejected,
     EvalStoreResultTooLarge,
@@ -273,6 +278,159 @@ def _request(
         max_concurrency=concurrency,
         invocation=EvalRunInvocation() if invocation is None else invocation,
     )
+
+
+async def assert_scenario_progress_conformance(
+    store: EvalStore,
+    *,
+    corpus: EvalCorpusDocument,
+) -> None:
+    """Exercise fenced progress, approval CAS, and restart checkpoint recovery."""
+
+    scenario = _scenario(corpus, text="Execute a controlled checkout.")
+    await store.save_scenario(scenario, redact_json=_NO_SECRETS.redact_json)
+    await store.save_corpus(corpus, redact_json=_NO_SECRETS.redact_json)
+    binding_revision = "sha256:" + "b" * 64
+    suite = corpus.suites[0]
+    request = EvalRunRequest(
+        run_id="scenario-progress-run",
+        idempotency_key="sha256:" + "9" * 64,
+        corpus_revision=corpus.revision,
+        target_key=corpus.target_key,
+        suite_id=suite.id,
+        suite_revision=suite.revision,
+        max_concurrency=1,
+        invocation=EvalRunInvocation(
+            scenario=EvalScenarioRunInvocation(
+                scenario_revision=scenario.revision,
+                binding_revision=binding_revision,
+                trials=1,
+                timeout_seconds=30,
+            )
+        ),
+    )
+    await store.admit_run(request, redact_json=_NO_SECRETS.redact_json)
+    first = await store.claim_run(target_key=corpus.target_key, lease_seconds=30)
+    assert first is not None
+    progress = EvalScenarioRunProgress.create(
+        scenario_revision=scenario.revision,
+        binding_revision=binding_revision,
+        attempt=first.claim.epoch,
+        trials=(
+            EvalScenarioTrialProgress(
+                trial_number=1,
+                phase=EvalScenarioTrialPhase.PENDING,
+                next_event_sequence=0,
+            ),
+        ),
+    )
+    await store.initialize_scenario_progress(first.claim, progress)
+    waiting = await store.update_scenario_trial(
+        first.claim,
+        EvalScenarioTrialProgress(
+            trial_number=1,
+            phase=EvalScenarioTrialPhase.AWAITING_APPROVAL,
+            session_id="scenario-session-1",
+            next_event_sequence=2,
+            pending_event_id="approve-payment",
+            pending_tool_name="charge-card",
+        ),
+    )
+    assert waiting.scenario_progress is not None
+    with pytest.raises(EvalRunStateConflict, match="progress changed"):
+        await store.submit_scenario_approval(
+            request.run_id,
+            EvalScenarioApprovalSubmission(
+                expected_progress_revision="sha256:" + "0" * 64,
+                trial_number=1,
+                event_id="approve-payment",
+                decision="approve",
+                actor_id="reviewer",
+            ),
+        )
+    approved = await store.submit_scenario_approval(
+        request.run_id,
+        EvalScenarioApprovalSubmission(
+            expected_progress_revision=waiting.scenario_progress.revision,
+            trial_number=1,
+            event_id="approve-payment",
+            decision="approve",
+            actor_id="reviewer",
+        ),
+    )
+    assert approved.scenario_progress is not None
+    assert approved.scenario_progress.trials[0].approval is not None
+    stale_revision = approved.scenario_progress.revision
+
+    await store.release_run(first.claim)
+    second = await store.claim_run(target_key=corpus.target_key, lease_seconds=30)
+    assert second is not None
+    assert second.claim.epoch == first.claim.epoch + 1
+    resumed = second.run.scenario_progress
+    assert resumed is not None
+    assert resumed.attempt == second.claim.epoch
+    assert resumed.revision != stale_revision
+    assert resumed.trials[0].phase is EvalScenarioTrialPhase.AWAITING_APPROVAL
+    assert resumed.trials[0].session_id == "scenario-session-1"
+    assert resumed.trials[0].approval is not None
+    with pytest.raises(EvalRunStateConflict, match="progress"):
+        await store.submit_scenario_approval(
+            request.run_id,
+            EvalScenarioApprovalSubmission(
+                expected_progress_revision=stale_revision,
+                trial_number=1,
+                event_id="approve-payment",
+                decision="approve",
+                actor_id="reviewer",
+            ),
+        )
+    await store.update_scenario_trial(
+        second.claim,
+        EvalScenarioTrialProgress(
+            trial_number=1,
+            phase=EvalScenarioTrialPhase.RUNNING,
+            session_id="scenario-session-1",
+            next_event_sequence=2,
+        ),
+    )
+    await store.release_run(second.claim)
+    third = await store.claim_run(target_key=corpus.target_key, lease_seconds=30)
+    assert third is not None
+    restarted = third.run.scenario_progress
+    assert restarted is not None
+    assert restarted.attempt == third.claim.epoch
+    assert restarted.trials == (
+        EvalScenarioTrialProgress(
+            trial_number=1,
+            phase=EvalScenarioTrialPhase.PENDING,
+            next_event_sequence=0,
+        ),
+    )
+    await store.release_run(third.claim)
+    fourth = await store.claim_run(target_key=corpus.target_key, lease_seconds=30)
+    assert fourth is not None
+    await store.update_scenario_trial(
+        fourth.claim,
+        EvalScenarioTrialProgress(
+            trial_number=1,
+            phase=EvalScenarioTrialPhase.AWAITING_RESUME,
+            session_id="scenario-session-2",
+            next_event_sequence=3,
+            pending_event_id="resume-environment",
+            pending_input_id="input-1",
+            pending_resume_kind="user_input",
+        ),
+    )
+    await store.release_run(fourth.claim)
+    fifth = await store.claim_run(target_key=corpus.target_key, lease_seconds=30)
+    assert fifth is not None
+    resume_progress = fifth.run.scenario_progress
+    assert resume_progress is not None
+    assert resume_progress.attempt == fifth.claim.epoch
+    assert resume_progress.trials[0].phase is EvalScenarioTrialPhase.AWAITING_RESUME
+    assert resume_progress.trials[0].session_id == "scenario-session-2"
+    assert resume_progress.trials[0].pending_input_id == "input-1"
+    await store.release_run(fifth.claim)
 
 
 async def assert_eval_store_reconstruction_releases_heartbeat_capacity(

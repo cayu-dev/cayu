@@ -25,16 +25,12 @@ const REASON_TEXT: Record<EvalsReadinessReasonCode, string> = {
   eval_target_not_configured: "No server-owned eval target is available in this deployment.",
   captured_result_persistence_not_available:
     "The configured eval store cannot persist captured results.",
-  scenario_v2_not_available:
-    "Multi-stage production scenarios are planned for a future Cayu release.",
+  scenario_v2_not_available: "Scenario-v2 conversion is unavailable in this deployment.",
 }
 
 export function evalsReadinessStateLabel(readiness: EvalsOperationReadiness): string {
   if (readiness.state === "ready") return "Ready"
   if (readiness.state === "gated") return "Not ready"
-  if (readiness.reason_code === "scenario_v2_not_available") {
-    return "Planned"
-  }
   return "Unavailable"
 }
 

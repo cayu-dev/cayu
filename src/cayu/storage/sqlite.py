@@ -31,7 +31,7 @@ from cayu.core.events import (
     EventType,
     event_with_runtime_payload_authority,
 )
-from cayu.core.messages import Message, MessageRole
+from cayu.core.messages import Message
 from cayu.core.runtime_authority import CheckpointValueAuthority
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.memory_evidence import (
@@ -333,8 +333,10 @@ from cayu.runtime.sessions import (
     encode_session_lineage_cursor,
     encode_transcript_search_cursor,
     enforce_pending_action_result_size,
+    enqueue_session_message_input,
     filter_transcript_records,
     fork_transcript_is_accepted,
+    queued_session_message_input,
     replace_session_user_metadata,
     resolve_interaction_attribution,
     restore_persisted_event_authority,
@@ -1432,11 +1434,15 @@ def _append_event_once_in_transaction(
 
 def _queued_session_message_from_row(row: sqlite3.Row) -> SessionQueuedMessage:
     requested_by = row["requested_by_json"]
+    message_json = row["message_json"]
     return SessionQueuedMessage(
         queue_id=row["queue_id"],
         session_id=row["session_id"],
         idempotency_key=row["idempotency_key"],
         content=row["content"],
+        message=(
+            None if message_json is None else Message.model_validate(json.loads(message_json))
+        ),
         delivery_mode=row["delivery_mode"],
         status=row["status"],
         ordering_key=row["ordering_key"],
@@ -6098,18 +6104,23 @@ class SQLiteSessionStore(SessionStore):
                 cursor = connection.execute(
                     """
                     INSERT INTO cayu_session_message_queue (
-                        queue_id, session_id, idempotency_key, content,
+                        queue_id, session_id, idempotency_key, content, message_json,
                         delivery_mode, status, requested_by_json,
                         accepted_run_epoch, accepted_transcript_cursor,
                         accepted_event_id, accepted_at
                     )
-                    VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
                     """,
                     (
                         queue_id,
                         request.session_id,
                         request.idempotency_key,
                         request.content,
+                        (
+                            None
+                            if request.message is None
+                            else sqlite_support.json_dumps(request.message.model_dump(mode="json"))
+                        ),
                         str(request.delivery_mode),
                         (
                             None
@@ -6127,7 +6138,7 @@ class SQLiteSessionStore(SessionStore):
                 ordering_key = cursor.lastrowid
                 if type(ordering_key) is not int:
                     raise RuntimeError("SQLite queue insert did not return an ordering key.")
-                accepted_message = Message.text(MessageRole.USER, request.content)
+                accepted_message = enqueue_session_message_input(request)
                 accepted_event = event_with_runtime_payload_authority(
                     Event(
                         id=accepted_event_id,
@@ -6370,10 +6381,7 @@ class SQLiteSessionStore(SessionStore):
                 for offset, row in enumerate(rows, start=1):
                     queued_message = _queued_session_message_from_row(row)
                     delivered_cursor = transcript_cursor + offset
-                    delivered_message = Message.text(
-                        MessageRole.USER,
-                        queued_message.content,
-                    )
+                    delivered_message = queued_session_message_input(queued_message)
                     delivery_event = event_with_runtime_payload_authority(
                         Event(
                             type=EventType.SESSION_MESSAGE_DELIVERED,

@@ -11,6 +11,7 @@ from tests.evals.eval_store_conformance import (
     assert_captured_eval_store_conformance,
     assert_eval_store_conformance,
     assert_eval_store_reconstruction_releases_heartbeat_capacity,
+    assert_scenario_progress_conformance,
     captured_result_for_corpus,
 )
 from tests.evals.test_corpus_execution import _corpus, _provider, _target
@@ -91,13 +92,14 @@ def test_sqlite_eval_store_shared_conformance(tmp_path) -> None:
                 corpus=corpus,
                 result=result,
             )
+            await assert_scenario_progress_conformance(store, corpus=corpus)
         finally:
             await store.close()
 
     asyncio.run(exercise())
 
 
-def test_sqlite_eval_store_creates_revision_fifty_three_schema(tmp_path) -> None:
+def test_sqlite_eval_store_creates_revision_fifty_seven_schema(tmp_path) -> None:
     path = tmp_path / "evals.db"
 
     async def initialize() -> None:
@@ -109,7 +111,8 @@ def test_sqlite_eval_store_creates_revision_fifty_three_schema(tmp_path) -> None
     try:
         revisions = connection.execute(
             "SELECT revision, kind, compatible_from FROM cayu_schema_migrations "
-            "WHERE revision IN (47, 48, 49, 50, 51, 52, 53) ORDER BY revision"
+            "WHERE revision IN (47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57) "
+            "ORDER BY revision"
         ).fetchall()
         invocation_column = connection.execute("PRAGMA table_info(cayu_eval_runs)").fetchall()
         case_table = connection.execute(
@@ -141,10 +144,18 @@ def test_sqlite_eval_store_creates_revision_fifty_three_schema(tmp_path) -> None
         (51, "additive", 50),
         (52, "breaking", 52),
         (53, "additive", 52),
+        (54, "breaking", 54),
+        (55, "breaking", 55),
+        (56, "additive", 55),
+        (57, "breaking", 57),
     ]
     assert next(row for row in invocation_column if row[1] == "invocation_json")[2:4] == (
         "TEXT",
         1,
+    )
+    assert next(row for row in invocation_column if row[1] == "scenario_progress_json")[2:4] == (
+        "TEXT",
+        0,
     )
     assert case_table is not None
     normalized_case_table = "".join(case_table[0].lower().split())

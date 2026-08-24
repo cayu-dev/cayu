@@ -24,7 +24,7 @@ test("Evals readiness exposes every operation in a stable product order", () => 
   )
 })
 
-test("Evals readiness copy distinguishes ready, deployment-gated, and planned operations", () => {
+test("Evals readiness copy distinguishes ready, deployment-gated, and unavailable operations", () => {
   assert.equal(evalsReadinessStateLabel({ state: "ready", reason_code: null }), "Ready")
   assert.equal(
     evalsReadinessReasonText({ state: "ready", reason_code: null }),
@@ -63,13 +63,13 @@ test("Evals readiness copy distinguishes ready, deployment-gated, and planned op
       state: "unsupported",
       reason_code: "scenario_v2_not_available",
     }),
-    "Planned",
+    "Unavailable",
   )
   assert.equal(
     evalsReadinessReasonText({
       state: "unsupported",
       reason_code: "scenario_v2_not_available",
     }),
-    "Multi-stage production scenarios are planned for a future Cayu release.",
+    "Scenario-v2 conversion is unavailable in this deployment.",
   )
 })

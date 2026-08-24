@@ -4716,8 +4716,11 @@ adds scenario conversion to captured-evaluation previews. Server contract versio
 contract version 23 adds the required typed workspace-branch capability projection
 to configured and bound environment inventory. Server contract version 24 adds
 the required bounded, content-free lifecycle projection for branches actually
-attached to those workspace instances. Clients generated against contract version
-1 through 23 must regenerate from the current OpenAPI document.
+attached to those workspace instances. Server contract version 25 adds controlled
+scenario launch, live scenario progress and approval mutation,
+plus the optional typed queued-message body needed by file-backed scenario input.
+Clients generated against contract versions 1 through 24 must regenerate from the
+current OpenAPI document.
 Version 1 and 2 clients must also treat all aggregate
 counter fields as strings. Independently hosted dashboards must not render
 control-plane routes against a server reporting a different contract version.
@@ -4785,8 +4788,9 @@ Production-session scenario capture consumes bounded terminal evidence and
 these runtime-owned input contracts. It accepts only exact initial, delivered
 queue, and ordinary resume boundaries whose transcript positions and digests
 agree; all other caller-role transcript material must be accounted for.
-An `ask_user` continuation is not silently omitted: until scenario execution has
-a typed user-input checkpoint, capture returns a closed unavailable diagnostic.
+An `ask_user` continuation is not silently omitted: capture returns a closed
+unavailable diagnostic until an operator authors its typed `user_input`
+continuation in the scenario editor.
 Approval-request history is reduced to a named fresh-decision checkpoint, so
 approval ids, actors, decisions, and historical grants remain outside the
 portable document. File references are resolved through the source
@@ -4797,11 +4801,52 @@ reloads the terminal snapshot after those reads and rejects a changed source. It
 invokes no provider, tool, environment lifecycle, hook, recovery, or mutation
 path.
 
+Controlled scenario execution consumes only an immutable stored scenario and
+the exact current binding returned by preflight. The launch route derives one
+ordinary corpus-v1 case, persists its scenario/binding identity and execution
+contractions in the normal eval-run admission record, and lets the existing
+fenced coordinator claim it. Every trial runs through the target's registered
+`CayuApp`; there is no scenario-specific provider, tool, environment, policy,
+budget, assertion, result-publication, or retry engine. Initial and resumed
+messages preserve text, portable JSON, and file parts. Queued messages carry
+both a bounded text projection and the exact typed user `Message`, so a file
+reference is not flattened before delivery.
+
+Each claimed run stores one bounded `EvalScenarioRunProgress` with a revision,
+claim attempt, trial phase, session id, event cursor, and the minimum pending
+checkpoint identity. Approval decisions are fresh, authenticated operator
+mutations compare-and-set against that progress revision and exact authored
+event; no historical decision or private runtime approval id enters scenario
+storage. The worker re-queries the current runtime pending action, verifies the
+tool name and its distinct durable occurrence, then invokes the ordinary
+approval API. Typed `ask_user` continuations use the ordinary user-input API.
+The scenario-v2 `manual_recovery` wire value denotes an ordinary explicit
+`CayuApp.resume(...)` interaction; it does not reconcile or invent the outcome
+of an unknown external tool effect.
+
+Approval, user-input, and explicit-resume checkpoints keep their durable
+session and cursor when an eval claim is released or expires. A new claim
+re-fences that checkpoint to its own epoch and reconstructs continuation from
+the runtime store; other in-flight phases reset to a fresh session attempt.
+Cancellation remains authoritative while a trial is paused. Claim epochs gate
+every progress transition and the final ordinary `CorpusExecutionResult`
+publication, preventing stale-worker publication. Provider work or external
+tool effects dispatched immediately before lease loss can still repeat unless
+their own idempotency or reconciliation boundary collapses them.
+
 Breaking storage revision 54 extends the private `input_contract` payload to
 resume and queued-input events and adds a separate runtime-owned file-attestation
 proof column. It does not backfill historical events. Its compatibility floor
 prevents pre-54 readers—which would expose new markers or lose their provenance—
 from sharing a migrated session store.
+
+Additive storage revision 56 adds the bounded nullable scenario-progress
+document to durable eval runs. Revision-55 writers ignore it, but
+scenario-aware eval stores require revision 56 before launch. Breaking revision
+57 adds the exact typed-message column to the durable session-message queue.
+Pre-57 workers would ignore that value and deliver only its text projection, so
+all older session workers must stop before migration and mixed revision-56/57
+session fleets are unsupported.
 
 Failure is reported as a closed factual diagnostic—such as redacted or
 unattested source input, a missing/inaccessible artifact, contradictory

@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   FileCheck2,
   LoaderCircle,
+  Play,
   Plus,
   Save,
   Trash2,
@@ -17,17 +18,28 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Textarea } from "@/components/ui/textarea"
 import {
+  ApiClientError,
+  type EvalRun,
   type EvalScenario,
   type EvalScenarioDraft,
   type EvalScenarioPreview,
   type EvalTarget,
   fetchEnvironments,
   fetchEvalTargets,
+  launchEvalScenario,
   materializeEvalScenarioArtifact,
   previewEvalScenario,
   saveEvalScenario,
 } from "@/lib/api"
-import { evalErrorMessage, shortEvalIdentity } from "@/lib/evals-dashboard"
+import { dashboardConfig } from "@/lib/config"
+import {
+  EvalLaunchIdempotencyRegistry,
+  evalErrorMessage,
+  evalLaunchFailureIsDefinitive,
+  evalLaunchNotice,
+  scenarioEvalLaunchRequestIdentity,
+  shortEvalIdentity,
+} from "@/lib/evals-dashboard"
 import type {
   ScenarioInputV2,
   ScenarioJsonPartV2,
@@ -231,9 +243,11 @@ function settingsContract(
 export function ScenarioAuthoring({
   captured,
   disabled = false,
+  saved = false,
 }: {
   captured: EvalScenario
   disabled?: boolean
+  saved?: boolean
 }) {
   const queryClient = useQueryClient()
   const formId = useId()
@@ -247,8 +261,12 @@ export function ScenarioAuthoring({
   const [pending, setPending] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [savedRevision, setSavedRevision] = useState<string | null>(
+    saved ? captured.revision : null,
+  )
   const [invalidJsonEditors, setInvalidJsonEditors] = useState(0)
   const controllerRef = useRef<AbortController | null>(null)
+  const launchRegistryRef = useRef<EvalLaunchIdempotencyRegistry | null>(null)
   const environments = useQuery({
     queryKey: ["environments"],
     queryFn: fetchEnvironments,
@@ -276,7 +294,8 @@ export function ScenarioAuthoring({
     setPreviewIdentity(null)
     setError(null)
     setNotice(null)
-  }, [captured])
+    setSavedRevision(saved ? captured.revision : null)
+  }, [captured, saved])
   useEffect(() => {
     if (!selectedTarget) return
     setSettings((current) => {
@@ -353,8 +372,61 @@ export function ScenarioAuthoring({
       if (signal.aborted) return
       setPreview({ scenario: saved.scenario, preflight: saved.preflight })
       setPreviewIdentity(currentIdentity)
+      setSavedRevision(saved.scenario.revision)
       setNotice(`Saved scenario ${shortEvalIdentity(saved.entry.revision)}.`)
       await queryClient.invalidateQueries({ queryKey: ["evals", "scenarios"] })
+    })
+  }
+
+  const launch = () => {
+    const binding = preview?.preflight.binding
+    if (
+      !previewCurrent ||
+      preview === null ||
+      !preview.preflight.ready ||
+      binding === null ||
+      binding === undefined ||
+      settingsValue === null ||
+      savedRevision !== preview.scenario.revision
+    ) {
+      return
+    }
+    const requestIdentity = scenarioEvalLaunchRequestIdentity(
+      preview.scenario.revision,
+      binding.revision,
+    )
+    void run("launch", async (signal) => {
+      const registry =
+        launchRegistryRef.current ??
+        new EvalLaunchIdempotencyRegistry(window.sessionStorage, dashboardConfig.apiBaseUrl)
+      launchRegistryRef.current = registry
+      const idempotencyKey = registry.keyFor(requestIdentity)
+      let launched: EvalRun
+      try {
+        launched = await launchEvalScenario(
+          preview.scenario.revision,
+          {
+            expected_binding_revision: binding.revision,
+            settings: settingsValue,
+          },
+          idempotencyKey,
+          signal,
+        )
+      } catch (launchError) {
+        if (
+          launchError instanceof ApiClientError &&
+          evalLaunchFailureIsDefinitive(launchError.status)
+        ) {
+          registry.resolve(requestIdentity)
+        }
+        throw launchError
+      }
+      if (signal.aborted) return
+      queryClient.setQueryData(["evals", "run", launched.spec.run_id], launched)
+      await queryClient.invalidateQueries({ queryKey: ["evals", "runs"] })
+      if (signal.aborted) return
+      registry.resolve(requestIdentity)
+      setNotice(`${evalLaunchNotice(launched)} Follow it in the Runs tab.`)
     })
   }
 
@@ -779,6 +851,21 @@ export function ScenarioAuthoring({
             {pending === "save" ? <LoaderCircle className="animate-spin" /> : <Save />}
             {pending === "save" ? "Saving..." : "Save scenario"}
           </Button>
+          <Button
+            type="button"
+            disabled={
+              disabled ||
+              pending !== null ||
+              !previewCurrent ||
+              !preview?.preflight.ready ||
+              preview.preflight.binding == null ||
+              savedRevision !== preview.scenario.revision
+            }
+            onClick={launch}
+          >
+            {pending === "launch" ? <LoaderCircle className="animate-spin" /> : <Play />}
+            {pending === "launch" ? "Starting..." : "Run scenario"}
+          </Button>
         </div>
       </CardContent>
     </Card>
@@ -943,7 +1030,7 @@ function ScenarioInputEditor({
             }
           >
             <option value="user_input">User input</option>
-            <option value="manual_recovery">Manual recovery</option>
+            <option value="manual_recovery">Session resume</option>
           </select>
         </label>
       )}

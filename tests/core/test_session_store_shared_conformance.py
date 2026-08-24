@@ -62,7 +62,12 @@ from cayu._validation import (
     DurableValueError,
     extract_durable_value_error,
 )
-from cayu.artifacts import LocalArtifactStore, file_attachment
+from cayu.artifacts import (
+    FileAttachment,
+    FileAttachmentKind,
+    LocalArtifactStore,
+    file_attachment,
+)
 from cayu.core import (
     AgentSpec,
     CitationPart,
@@ -70,6 +75,7 @@ from cayu.core import (
     Event,
     EventType,
     ExecutionProfileBehaviorIdentity,
+    FilePart,
     HostedToolCallPart,
     Message,
     MessageRole,
@@ -18067,6 +18073,63 @@ def test_session_store_conformance_durable_session_message_queue(session_store_c
                 delivery.status is PersistedEventSideEffectStatus.PENDING for delivery in deliveries
             )
         finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_preserves_typed_queued_messages(session_store_case) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = f"sess_typed_queue_{session_store_case[0]}"
+            await store.create(
+                RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+                identity=_identity(),
+            )
+            message = Message(
+                role=MessageRole.USER,
+                content=(
+                    FilePart(
+                        attachment=FileAttachment(
+                            artifact_id="artifact:queued-conformance-document",
+                            kind=FileAttachmentKind.DOCUMENT,
+                            filename="contract.pdf",
+                            content_type="application/pdf",
+                            size_bytes=128,
+                        ).model_dump(mode="json")
+                    ),
+                ),
+            )
+            request = EnqueueSessionMessageRequest(
+                session_id=session_id,
+                idempotency_key="typed-queue-conformance",
+                content="Attached file: contract.pdf",
+                message=message,
+                delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+            )
+            accepted = await store.enqueue_session_message(request)
+
+            store = await _reopen_store(session_store_case, store)
+            replay = await store.enqueue_session_message(request)
+            assert replay.replayed is True
+            assert replay.message == accepted.message
+            assert replay.message.message == message
+
+            await store.transition_status(
+                session_id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            delivered = await store.deliver_queued_session_messages(
+                session_id,
+                include_on_idle=False,
+            )
+            assert len(delivered.messages) == 1
+            assert delivered.messages[0].message == message
+            assert (await store.load_transcript(session_id)) == [message]
+        finally:
+            await store.release_run_fence(f"sess_typed_queue_{session_store_case[0]}")
             await _close_store(store)
 
     asyncio.run(run())

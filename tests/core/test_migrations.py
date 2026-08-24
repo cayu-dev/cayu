@@ -232,6 +232,37 @@ def test_revision_fifty_five_breaks_for_rejected_reconciliation_idempotency() ->
         )
 
 
+def test_revision_fifty_six_adds_compatible_scenario_progress() -> None:
+    state = m.SchemaState(revision=56, compatible_from=55)
+
+    # Revision-55 writers ignore the nullable progress document, while
+    # scenario-aware eval stores require the column before admitting work.
+    m.validate(state, app_latest=55, app_min_supported=55)
+    m.validate(state, app_latest=56, app_min_supported=56)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 56"):
+        m.validate(
+            m.SchemaState(revision=55, compatible_from=55),
+            app_latest=56,
+            app_min_supported=56,
+        )
+
+
+def test_revision_fifty_seven_breaks_for_typed_queued_messages() -> None:
+    state = m.SchemaState(revision=57, compatible_from=57)
+
+    # Pre-57 session workers would ignore message_json and deliver only the
+    # compatibility text projection, so they cannot share the migrated store.
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 57"):
+        m.validate(state, app_latest=56, app_min_supported=55)
+    m.validate(state, app_latest=57, app_min_supported=57)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 57"):
+        m.validate(
+            m.SchemaState(revision=56, compatible_from=55),
+            app_latest=57,
+            app_min_supported=57,
+        )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

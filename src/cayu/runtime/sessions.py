@@ -1593,7 +1593,12 @@ class EnqueueSessionMessageRequest(BaseModel):
 
     session_id: str
     idempotency_key: str = Field(max_length=256)
+    # ``content`` remains the bounded human-readable projection used by
+    # existing clients and audit surfaces. ``message`` is the authoritative
+    # typed input when present, allowing queued multimodal user messages to
+    # retain their artifact references across durable delivery.
     content: str = Field(max_length=SESSION_MESSAGE_CONTENT_MAX_BYTES)
+    message: Message | None = None
     delivery_mode: SessionMessageDeliveryMode
     requested_by: ResolutionActor | None = None
     _input_redactions_applied: bool = PrivateAttr(default=False)
@@ -1613,6 +1618,23 @@ class EnqueueSessionMessageRequest(BaseModel):
                 f"{SESSION_MESSAGE_CONTENT_MAX_BYTES} bytes."
             )
         return value
+
+    @field_validator("message")
+    @classmethod
+    def copy_typed_message(cls, value: Message | None) -> Message | None:
+        if value is None:
+            return None
+        message = detach_message(value)
+        if message.role is not MessageRole.USER:
+            raise ValueError("Queued session messages must have the user role.")
+        if compact_json_utf8_size(message.model_dump(mode="json")) > (
+            SESSION_MESSAGE_CONTENT_MAX_BYTES
+        ):
+            raise ValueError(
+                "message exceeds the maximum encoded size of "
+                f"{SESSION_MESSAGE_CONTENT_MAX_BYTES} bytes."
+            )
+        return message
 
     @field_validator("requested_by")
     @classmethod
@@ -1642,6 +1664,7 @@ class SessionQueuedMessage(BaseModel):
     session_id: str
     idempotency_key: str
     content: str
+    message: Message | None = None
     delivery_mode: SessionMessageDeliveryMode
     status: SessionMessageQueueStatus
     ordering_key: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
@@ -1675,6 +1698,16 @@ class SessionQueuedMessage(BaseModel):
     @classmethod
     def copy_requested_by(cls, value: ResolutionActor | None) -> ResolutionActor | None:
         return copy_resolution_actor(value)
+
+    @field_validator("message")
+    @classmethod
+    def copy_typed_message(cls, value: Message | None) -> Message | None:
+        if value is None:
+            return None
+        message = detach_message(value)
+        if message.role is not MessageRole.USER:
+            raise ValueError("Queued session messages must have the user role.")
+        return message
 
 
 class EnqueueSessionMessageResult(BaseModel):
@@ -12820,7 +12853,7 @@ class InMemorySessionStore(SessionStore):
             queue_id = str(uuid4())
             ordering_key = self._next_session_message_ordering_key
             accepted_transcript_cursor = len(self._transcripts.get(session.id, []))
-            accepted_message = Message.text(MessageRole.USER, request.content)
+            accepted_message = enqueue_session_message_input(request)
             accepted_event = event_with_runtime_payload_authority(
                 Event(
                     type=EventType.SESSION_MESSAGE_QUEUED,
@@ -12854,6 +12887,7 @@ class InMemorySessionStore(SessionStore):
                 session_id=session.id,
                 idempotency_key=request.idempotency_key,
                 content=request.content,
+                message=request.message,
                 delivery_mode=request.delivery_mode,
                 status=SessionMessageQueueStatus.QUEUED,
                 ordering_key=ordering_key,
@@ -12984,9 +13018,7 @@ class InMemorySessionStore(SessionStore):
             transcript_messages: list[Message] = []
             for offset, queued_message in enumerate(selected, start=1):
                 delivered_cursor = transcript_cursor + offset
-                delivered_message = detach_message(
-                    Message.text(MessageRole.USER, queued_message.content)
-                )
+                delivered_message = queued_session_message_input(queued_message)
                 delivery_event = event_with_runtime_payload_authority(
                     Event(
                         type=EventType.SESSION_MESSAGE_DELIVERED,
@@ -16942,6 +16974,7 @@ def copy_enqueue_session_message_request(
         session_id=request.session_id,
         idempotency_key=request.idempotency_key,
         content=request.content,
+        message=(None if request.message is None else detach_message(request.message)),
         delivery_mode=request.delivery_mode,
         requested_by=copy_resolution_actor(request.requested_by),
     )
@@ -17534,6 +17567,7 @@ def _validate_equivalent_queued_session_message(
 ) -> None:
     if (
         existing.content != request.content
+        or existing.message != request.message
         or existing.delivery_mode != request.delivery_mode
         or resolution_actor_payload(existing.requested_by)
         != resolution_actor_payload(request.requested_by)
@@ -17541,6 +17575,26 @@ def _validate_equivalent_queued_session_message(
         raise ValueError(
             "Session message idempotency key was already used for a different request."
         )
+
+
+def queued_session_message_input(message: SessionQueuedMessage) -> Message:
+    """Return the authoritative detached user input for a queued record."""
+
+    if type(message) is not SessionQueuedMessage:
+        raise TypeError("message must be a SessionQueuedMessage.")
+    if message.message is not None:
+        return detach_message(message.message)
+    return Message.text(MessageRole.USER, message.content)
+
+
+def enqueue_session_message_input(request: EnqueueSessionMessageRequest) -> Message:
+    """Return the authoritative detached user input for an enqueue request."""
+
+    if type(request) is not EnqueueSessionMessageRequest:
+        raise TypeError("request must be an EnqueueSessionMessageRequest.")
+    if request.message is not None:
+        return detach_message(request.message)
+    return Message.text(MessageRole.USER, request.content)
 
 
 def _prepare_session_fork_request(

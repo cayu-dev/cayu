@@ -210,6 +210,13 @@ export function evalLaunchRequestIdentity(
   return JSON.stringify([corpusRevision, suiteId, maxConcurrency])
 }
 
+export function scenarioEvalLaunchRequestIdentity(
+  scenarioRevision: string,
+  bindingRevision: string,
+): string {
+  return JSON.stringify(["scenario-v2", scenarioRevision, bindingRevision])
+}
+
 export function capturedEvalLaunchRequestIdentity(
   sessionId: string,
   candidateRevision: string,

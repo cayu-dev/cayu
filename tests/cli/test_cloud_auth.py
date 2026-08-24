@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import os
@@ -1815,48 +1816,69 @@ def test_workos_refresh_replays_a_lost_rotation_with_the_default_cloud_timeout(
     assert monotonic_now[0] < cloud_auth._REFRESH_RETRY_WINDOW_SECONDS
 
 
-def test_workos_refresh_request_has_an_absolute_attempt_deadline() -> None:
-    client_disconnected = threading.Event()
+def test_workos_refresh_request_has_an_absolute_attempt_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_started = threading.Event()
+    request_cancelled = threading.Event()
+    client_exited = threading.Event()
+    client_options: list[tuple[bool, float]] = []
+    requests: list[tuple[str, str, dict[str, str] | None]] = []
 
-    class Handler(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:
-            length = int(self.headers.get("Content-Length", "0"))
-            self.rfile.read(length)
-            payload = b'{"value":"' + (b"x" * 100) + b'"}'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
+    class BlockingAsyncClient:
+        def __init__(self, *, follow_redirects: bool, timeout: float) -> None:
+            client_options.append((follow_redirects, timeout))
+
+        async def __aenter__(self) -> BlockingAsyncClient:
+            return self
+
+        async def __aexit__(
+            self,
+            exc_type: object,
+            exc_value: object,
+            traceback: object,
+        ) -> None:
+            client_exited.set()
+
+        async def request(
+            self,
+            method: str,
+            url: str,
+            *,
+            data: dict[str, str] | None,
+        ) -> httpx.Response:
+            requests.append((method, url, data))
+            request_started.set()
             try:
-                for byte in payload:
-                    self.wfile.write(bytes((byte,)))
-                    self.wfile.flush()
-                    time.sleep(0.005)
-            except OSError:
-                client_disconnected.set()
+                await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                request_cancelled.set()
+                raise
+            return httpx.Response(200)
 
-        def log_message(self, format: str, *args: object) -> None:
-            return
+    monkeypatch.setattr(cloud_auth.httpx, "AsyncClient", BlockingAsyncClient)
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        with pytest.raises(CloudAuthError) as raised:
-            WorkOSDeviceAuthClient(api_url="https://cloud.cayu.dev")._request(
-                "POST",
-                f"http://127.0.0.1:{server.server_port}/user_management/authenticate",
-                form={"refresh_token": "refresh-token-current"},
-                timeout_seconds=1.0,
-                total_timeout_seconds=0.05,
-            )
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join()
+    with pytest.raises(CloudAuthError) as raised:
+        WorkOSDeviceAuthClient(api_url="https://cloud.cayu.dev")._request(
+            "POST",
+            "https://auth.example.test/user_management/authenticate",
+            form={"refresh_token": "refresh-token-current"},
+            timeout_seconds=1.0,
+            total_timeout_seconds=0.05,
+        )
 
     assert raised.value.category == "login_unavailable"
-    assert client_disconnected.wait(timeout=1.0)
+    assert request_started.is_set()
+    assert request_cancelled.is_set()
+    assert client_exited.is_set()
+    assert client_options == [(False, 1.0)]
+    assert requests == [
+        (
+            "POST",
+            "https://auth.example.test/user_management/authenticate",
+            {"refresh_token": "refresh-token-current"},
+        )
+    ]
 
 
 def test_workos_refresh_rechecks_the_replay_window_after_system_suspension(

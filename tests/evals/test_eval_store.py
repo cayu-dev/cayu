@@ -4,7 +4,11 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from tests.evals.eval_store_conformance import _scenario, assert_eval_store_conformance
+from tests.evals.eval_store_conformance import (
+    _scenario,
+    assert_eval_store_conformance,
+    assert_scenario_progress_conformance,
+)
 from tests.evals.test_corpus_execution import (
     _corpus,
     _model_judge_corpus,
@@ -80,6 +84,10 @@ def test_memory_eval_store_shared_conformance() -> None:
             InMemoryEvalStore(),
             corpus=corpus,
             result=result,
+        )
+        await assert_scenario_progress_conformance(
+            InMemoryEvalStore(),
+            corpus=corpus,
         )
 
     asyncio.run(exercise())

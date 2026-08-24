@@ -20,12 +20,14 @@ const {
   fetchEvalResults,
   fetchEvalTargets,
   importEvalCorpus,
+  launchEvalScenario,
   materializeEvalScenarioArtifact,
   previewCapturedEvaluation,
   previewEvalScenario,
   saveCapturedEvaluation,
   saveEvalScenario,
   selectEvalBaseline,
+  submitEvalScenarioApproval,
 } = await import("../src/lib/api.ts")
 const { preflightEvalCorpusFile } = await import("../src/lib/evals-dashboard.ts")
 
@@ -337,6 +339,22 @@ test("scenario adapters preserve reviewed revisions, bindings, target scope, and
     await fetchEvalScenario(revision, controller.signal)
     const downloaded = await downloadEvalScenario(revision, controller.signal)
     assert.equal(downloaded.filename, "production.scenario.json")
+    await launchEvalScenario(
+      revision,
+      { expected_binding_revision: revision, settings },
+      "scenario-idempotency-key",
+      controller.signal,
+    )
+    await submitEvalScenarioApproval(
+      "run/scenario",
+      {
+        expected_progress_revision: revision,
+        trial_number: 1,
+        event_id: "approval-1",
+        decision: "approve",
+      },
+      controller.signal,
+    )
   } finally {
     globalThis.fetch = originalFetch
   }
@@ -356,5 +374,21 @@ test("scenario adapters preserve reviewed revisions, bindings, target scope, and
   )
   assert.equal(calls[4].input, `/api/evals/scenarios/${encodeURIComponent(revision)}`)
   assert.equal(calls[5].input, `/api/evals/scenarios/${encodeURIComponent(revision)}/download`)
+  assert.equal(calls[6].input, `/api/evals/scenarios/${encodeURIComponent(revision)}/runs`)
+  assert.equal(
+    new Headers(calls[6].init.headers).get("Idempotency-Key"),
+    "scenario-idempotency-key",
+  )
+  assert.deepEqual(JSON.parse(calls[6].init.body), {
+    expected_binding_revision: revision,
+    settings,
+  })
+  assert.equal(calls[7].input, "/api/evals/runs/run%2Fscenario/scenario-approval")
+  assert.deepEqual(JSON.parse(calls[7].init.body), {
+    expected_progress_revision: revision,
+    trial_number: 1,
+    event_id: "approval-1",
+    decision: "approve",
+  })
   assert.ok(calls.every((call) => call.init.signal === controller.signal))
 })

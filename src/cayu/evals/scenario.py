@@ -214,7 +214,12 @@ class ScenarioQueuedInputEventV2(_ScenarioEventBaseV2):
 
 
 class ScenarioResumedInputEventV2(_ScenarioEventBaseV2):
-    """Fresh caller input supplied when a scenario session is paused."""
+    """Fresh caller input supplied when a scenario session is paused.
+
+    ``manual_recovery`` is the scenario-v2 wire name for an ordinary explicit
+    ``CayuApp.resume(...)`` interaction. It does not assert or synthesize the
+    outcome of a runtime tool call whose external effect is unknown.
+    """
 
     kind: Literal["resumed"] = "resumed"
     resume_kind: Literal["user_input", "manual_recovery"] = "user_input"

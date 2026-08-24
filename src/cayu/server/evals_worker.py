@@ -16,6 +16,13 @@ from cayu.evals.execution import (
     compile_corpus_suite,
     evaluation_target_identity,
 )
+from cayu.evals.scenario import EvalScenarioDocumentV2
+from cayu.evals.scenario_execution import (
+    corpus_for_eval_scenario,
+    run_compiled_eval_scenario,
+    scenario_launch_settings_from_invocation,
+)
+from cayu.evals.scenario_preflight import ScenarioLaunchBindingV2, preflight_eval_scenario
 from cayu.evals.store import (
     EvalRunClaim,
     EvalRunClaimLost,
@@ -39,6 +46,8 @@ logger = logging.getLogger(__name__)
 class _PreparedEvalRun:
     target: CorpusTarget
     compiled: CompiledCorpusSuite
+    scenario: EvalScenarioDocumentV2 | None = None
+    scenario_binding: ScenarioLaunchBindingV2 | None = None
 
 
 class _ClaimMonitorOutcome(StrEnum):
@@ -228,6 +237,54 @@ class EvalRunCoordinator:
         if corpus is None:
             return EvalRunFailureCode.CORPUS_UNAVAILABLE
 
+        scenario_invocation = lease.run.spec.invocation.scenario
+        if scenario_invocation is not None:
+            try:
+                scenario = await self._config.store.load_scenario(
+                    scenario_invocation.scenario_revision
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return EvalRunFailureCode.CORPUS_UNAVAILABLE
+            if scenario is None:
+                return EvalRunFailureCode.CORPUS_UNAVAILABLE
+            try:
+                settings = scenario_launch_settings_from_invocation(
+                    scenario_invocation,
+                    max_concurrency=lease.run.spec.max_concurrency,
+                    max_steps=lease.run.spec.invocation.max_steps,
+                    limits=lease.run.spec.invocation.limits,
+                    cost_budget=lease.run.spec.invocation.cost_budget,
+                )
+                preflight = await preflight_eval_scenario(
+                    scenario,
+                    registration.target,
+                    settings,
+                    actor_authorized=True,
+                    project_root=registration.manifest_project_root,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return EvalRunFailureCode.TARGET_UNAVAILABLE
+            binding = preflight.binding
+            if (
+                not preflight.ready
+                or binding is None
+                or binding.revision != scenario_invocation.binding_revision
+            ):
+                return EvalRunFailureCode.TARGET_UNAVAILABLE
+            prepared = await asyncio.to_thread(
+                self._compile_loaded_scenario,
+                corpus,
+                scenario,
+                binding,
+                lease,
+                registration,
+            )
+            return prepared
+
         return await asyncio.to_thread(
             self._compile_loaded_corpus,
             corpus,
@@ -273,6 +330,42 @@ class EvalRunCoordinator:
             return EvalRunFailureCode.CORPUS_UNAVAILABLE
         return _PreparedEvalRun(target=target, compiled=compiled)
 
+    def _compile_loaded_scenario(
+        self,
+        corpus: EvalCorpusDocument,
+        scenario: EvalScenarioDocumentV2,
+        binding: ScenarioLaunchBindingV2,
+        lease: EvalRunLease,
+        registration: EvalTargetRegistration,
+    ) -> _PreparedEvalRun | EvalRunFailureCode:
+        try:
+            target = target_for_eval_invocation(
+                registration.target,
+                lease.run.spec.invocation,
+            )
+            expected_corpus = corpus_for_eval_scenario(
+                scenario,
+                binding,
+                target,
+                project_root=registration.manifest_project_root,
+            )
+            if expected_corpus != corpus:
+                return EvalRunFailureCode.CORPUS_UNAVAILABLE
+            compiled = compile_corpus_suite(corpus, target, lease.run.spec.suite_id)
+            if (
+                compiled.run_contract.corpus_revision != lease.run.spec.corpus_revision
+                or compiled.run_contract.suite_revision != lease.run.spec.suite_revision
+            ):
+                return EvalRunFailureCode.CORPUS_UNAVAILABLE
+        except Exception:
+            return EvalRunFailureCode.CORPUS_UNAVAILABLE
+        return _PreparedEvalRun(
+            target=target,
+            compiled=compiled,
+            scenario=scenario,
+            scenario_binding=binding,
+        )
+
     async def _execute_compiled_lease(
         self,
         lease: EvalRunLease,
@@ -281,8 +374,8 @@ class EvalRunCoordinator:
         monitor: asyncio.Task[_ClaimMonitorOutcome],
     ) -> None:
         target = prepared.target
-        execution = asyncio.create_task(
-            _run_compiled_corpus_suite(
+        if prepared.scenario is None:
+            execution_coro = _run_compiled_corpus_suite(
                 target,
                 prepared.compiled,
                 max_concurrency=lease.run.spec.max_concurrency,
@@ -290,7 +383,26 @@ class EvalRunCoordinator:
                 expected_app_manifest_fingerprint=(
                     registration.catalog_entry.app_manifest_fingerprint
                 ),
-            ),
+            )
+        else:
+            if prepared.scenario_binding is None:
+                raise RuntimeError("Prepared scenario execution lost its launch binding.")
+            execution_coro = run_compiled_eval_scenario(
+                target,
+                prepared.compiled,
+                prepared.scenario,
+                prepared.scenario_binding,
+                store=self._config.store,
+                claim=lease.claim,
+                max_concurrency=lease.run.spec.max_concurrency,
+                poll_seconds=self._config.poll_interval_seconds,
+                manifest_project_root=registration.manifest_project_root,
+                expected_app_manifest_fingerprint=(
+                    registration.catalog_entry.app_manifest_fingerprint
+                ),
+            )
+        execution = asyncio.create_task(
+            execution_coro,
             name=f"cayu-eval-run-{lease.run.id}",
         )
         try:

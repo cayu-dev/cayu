@@ -109,6 +109,7 @@ from cayu.evals.scenario_authoring import (
     validate_expected_scenario_revision,
 )
 from cayu.evals.scenario_capture import capture_eval_scenario_from_session
+from cayu.evals.scenario_execution import corpus_for_eval_scenario
 from cayu.evals.scenario_preflight import (
     ScenarioArtifactMaterializationError,
     ScenarioLaunchSettingsV2,
@@ -142,10 +143,14 @@ from cayu.evals.store import (
     EvalRunQuery,
     EvalRunRecord,
     EvalRunRequest,
+    EvalRunStateConflict,
     EvalRunStatus,
+    EvalScenarioApprovalSubmission,
+    EvalScenarioArtifactReference,
     EvalScenarioCatalogPage,
     EvalScenarioCatalogQuery,
     EvalScenarioConflict,
+    EvalScenarioRunInvocation,
     EvalStorePublicationRejected,
     EvalStoreResultTooLarge,
     EvalSuiteCatalogPage,
@@ -348,10 +353,12 @@ from cayu.server.contracts import (
     EvalResultDetailResponse,
     EvalResultResponse,
     EvalRunCreateRequest,
+    EvalScenarioApprovalRequest,
     EvalScenarioArtifactMaterializationRequest,
     EvalScenarioArtifactMaterializationResponse,
     EvalScenarioPreviewRequest,
     EvalScenarioPreviewResponse,
+    EvalScenarioRunCreateRequest,
     EvalScenarioSaveRequest,
     EvalScenarioSaveResponse,
     EvalTargetCatalogResponse,
@@ -1735,6 +1742,7 @@ class EnqueueSessionMessageBody(BaseModel):
 
     idempotency_key: NonBlankString = Field(max_length=256)
     content: NonBlankString = Field(max_length=SESSION_MESSAGE_CONTENT_MAX_BYTES)
+    message: Message | None = None
     delivery_mode: SessionMessageDeliveryMode
     requested_by: ResolutionActor | None = None
 
@@ -1745,6 +1753,22 @@ class EnqueueSessionMessageBody(BaseModel):
         if len(value.encode("utf-8")) > SESSION_MESSAGE_CONTENT_MAX_BYTES:
             raise ValueError(
                 "content exceeds the maximum encoded size of "
+                f"{SESSION_MESSAGE_CONTENT_MAX_BYTES} bytes."
+            )
+        return value
+
+    @field_validator("message")
+    @classmethod
+    def validate_typed_message(cls, value: Message | None) -> Message | None:
+        if value is None:
+            return None
+        if value.role is not MessageRole.USER:
+            raise ValueError("Queued session messages must have the user role.")
+        if compact_json_utf8_size(value.model_dump(mode="json")) > (
+            SESSION_MESSAGE_CONTENT_MAX_BYTES
+        ):
+            raise ValueError(
+                "message exceeds the maximum encoded size of "
                 f"{SESSION_MESSAGE_CONTENT_MAX_BYTES} bytes."
             )
         return value
@@ -5183,6 +5207,7 @@ def create_router(
             max_steps: int | None,
             limits: RunLimits | None,
             cost_budget: EvalRunCostBudget | None,
+            scenario: EvalScenarioRunInvocation | None = None,
         ) -> EvalRunInvocation:
             try:
                 origin = (
@@ -5200,6 +5225,7 @@ def create_router(
                     max_steps=max_steps,
                     limits=limits,
                     cost_budget=cost_budget,
+                    scenario=scenario,
                 )
             except (TypeError, ValueError) as exc:
                 raise HTTPException(
@@ -5752,6 +5778,110 @@ def create_router(
             )
 
         @bounded_evals_router.post(
+            "/evals/scenarios/{scenario_revision}/runs",
+            response_model=EvalRunRecord,
+            status_code=202,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def launch_eval_scenario(
+            scenario_revision: str,
+            body: EvalScenarioRunCreateRequest,
+            idempotency_key: Annotated[
+                str,
+                Header(alias="Idempotency-Key", min_length=1, max_length=512),
+            ],
+            auth_context: AuthContext | None = optional_auth_context,
+        ) -> EvalRunRecord:
+            if not eval_store.scenario_execution:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Durable scenario execution is not available.",
+                )
+            scenario = await _load_eval_scenario(scenario_revision)
+            registration, preflight = await _preflight_scenario(scenario, body.settings)
+            binding = preflight.binding
+            if not preflight.ready or binding is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Eval scenario launch requirements are not currently ready.",
+                )
+            if binding.revision != body.expected_binding_revision:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Eval scenario launch binding changed after review.",
+                )
+            scenario_invocation = EvalScenarioRunInvocation(
+                scenario_revision=scenario.revision,
+                binding_revision=binding.revision,
+                environment_name=binding.environment_name,
+                trials=binding.trials,
+                timeout_seconds=binding.timeout_seconds,
+                artifact_references=tuple(
+                    EvalScenarioArtifactReference(
+                        requirement_id=item.requirement_id,
+                        artifact_id=item.artifact_id,
+                    )
+                    for item in binding.artifacts
+                ),
+            )
+            invocation = _eval_run_invocation(
+                auth_context,
+                max_steps=binding.max_steps,
+                limits=binding.operator_run_limits,
+                cost_budget=binding.cost_budget,
+                scenario=scenario_invocation,
+            )
+            try:
+                effective_target = target_for_eval_invocation(registration.target, invocation)
+                corpus = await asyncio.to_thread(
+                    corpus_for_eval_scenario,
+                    scenario,
+                    binding,
+                    effective_target,
+                    project_root=registration.manifest_project_root,
+                )
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Eval scenario no longer matches its current target binding.",
+                ) from exc
+            eval_target, compiled = await _prepare_eval_run(
+                corpus=corpus,
+                suite_id="scenario",
+                max_concurrency=binding.max_concurrency,
+                invocation=invocation,
+            )
+            try:
+                await eval_store.save_corpus(
+                    corpus,
+                    redact_json=eval_target.app.redact_json,
+                )
+            except EvalCorpusConflict as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Derived scenario result contract conflicts with stored content.",
+                ) from exc
+            except EvalStorePublicationRejected as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Derived scenario result contract contains unsafe public data.",
+                ) from exc
+            except EvalStoreResultTooLarge as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Derived scenario result contract exceeds the server byte limit.",
+                ) from exc
+            return await _admit_eval_run(
+                corpus=corpus,
+                max_concurrency=binding.max_concurrency,
+                invocation=invocation,
+                idempotency_key=idempotency_key,
+                eval_target=eval_target,
+                compiled=compiled,
+            )
+
+        @bounded_evals_router.post(
             "/evals/corpora",
             response_model=EvalCorpusCatalogEntry,
             status_code=201,
@@ -6051,6 +6181,43 @@ def create_router(
         )
         async def get_eval_run(run_id: str):
             return await _load_eval_run(run_id)
+
+        @bounded_evals_router.post(
+            "/evals/runs/{run_id}/scenario-approval",
+            response_model=EvalRunRecord,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def submit_eval_scenario_approval(
+            run_id: str,
+            body: EvalScenarioApprovalRequest,
+            auth_context: AuthContext | None = optional_auth_context,
+        ) -> EvalRunRecord:
+            run = await _load_eval_run(run_id)
+            if run.spec.invocation.scenario is None:
+                raise HTTPException(status_code=409, detail="Eval run is not a scenario run.")
+            actor_id = (
+                "cayu:trusted-local-development" if auth_context is None else auth_context.subject
+            )
+            try:
+                return await eval_store.submit_scenario_approval(
+                    run_id,
+                    EvalScenarioApprovalSubmission(
+                        expected_progress_revision=body.expected_progress_revision,
+                        trial_number=body.trial_number,
+                        event_id=body.event_id,
+                        decision=body.decision,
+                        reason=body.reason,
+                        actor_id=actor_id,
+                    ),
+                )
+            except EvalRunStateConflict as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Scenario approval checkpoint changed before submission.",
+                ) from exc
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="Invalid scenario approval.") from exc
 
         @bounded_evals_router.post(
             "/evals/runs/{run_id}/cancel",
@@ -6917,6 +7084,7 @@ def create_router(
                     session_id=session_id,
                     idempotency_key=body.idempotency_key,
                     content=body.content,
+                    message=body.message,
                     delivery_mode=body.delivery_mode,
                     requested_by=_request_interruption_actor(
                         auth_context,

@@ -57,6 +57,30 @@ profile dimension; this slice publishes only the normal-authority `default`
 profile. Additional application-owned profiles are reserved for cases that
 deliberately substitute fixtures, environments, or authority.
 
+## Controlled scenario execution
+
+The bundled Evals workflow can save and run a scenario without constructing an
+Evals-specific Python object in the browser or project. After **Check
+readiness** succeeds, **Run scenario** admits the exact saved scenario revision
+and reviewed binding to the durable eval worker. The Runs view shows each
+trial's current phase and presents approve/deny controls only when that exact
+trial reaches an authored fresh-approval checkpoint.
+
+Initial input, queued follow-ups, ordinary session resumes, typed `ask_user`
+answers, portable JSON, and file references execute through the registered
+application's normal runtime. Approval and resume checkpoints retain their
+session and event cursor across process restart. Cancellation, result JSON/HTML,
+baseline comparison, `cayu eval report`, and `cayu eval compare` use the same
+contracts as ordinary corpus runs.
+
+This availability is not limited to `--dev`. Trusted loopback development may
+assemble local storage automatically; production must supply its normal durable
+store, authentication, and executable application target explicitly or through
+the maintained project-service assembly. Readiness remains a factual gate for
+missing current providers, tools, policies, environments, secrets, fixtures,
+pricing, or execution limits—it is not a requirement to write Evals-specific
+runtime configuration.
+
 ## Eject and customize the matching source
 
 Every wheel and source distribution carries one deterministic dashboard-source bundle tied to
@@ -121,6 +145,10 @@ captured-result persistence, scenario conversion, fresh execution, cancellation,
 and reports. An unready Evals page renders those states without requesting unavailable Evals
 endpoints. Readiness is explanatory metadata only; authenticated API routes continue to enforce
 operator identity, mutation policy, and execution preconditions.
+
+Server contract version 25 adds durable scenario launch, per-trial progress,
+and fresh scenario-approval mutations. Independently deployed dashboards,
+servers, and generated clients must be upgraded together.
 
 The extracted project includes Cayu's `LICENSE` and `NOTICE`, third-party license inputs, a
 reviewed license baseline, and production-build license finalization. Its normal build retains

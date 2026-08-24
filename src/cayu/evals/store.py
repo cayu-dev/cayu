@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import re
 from abc import ABC, abstractmethod
@@ -25,7 +26,7 @@ from pydantic import (
     model_validator,
 )
 
-from cayu._validation import json_utf8_size_within_limit
+from cayu._validation import canonical_durable_json_bytes, json_utf8_size_within_limit
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_BYTES,
@@ -88,6 +89,7 @@ EVAL_STORE_MAX_LEASE_SECONDS = 3_600
 EVAL_STORE_MAX_CLAIM_TARGETS = 128
 _EVAL_STORE_MAX_BIGINT = 2**63 - 1
 EVAL_RUN_INVOCATION_MAX_BYTES = 64 << 10
+EVAL_SCENARIO_PROGRESS_MAX_BYTES = 256 << 10
 
 _STORE_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _CURSOR_VERSION = 1
@@ -865,6 +867,371 @@ class EvalRunCostBudget(_EvalStoreModel):
         )
 
 
+class EvalScenarioArtifactReference(_EvalStoreModel):
+    """One immutable scenario requirement-to-artifact launch selection."""
+
+    requirement_id: StrictStr
+    artifact_id: StrictStr
+
+    @field_validator("requirement_id")
+    @classmethod
+    def validate_requirement_id(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("artifact_id")
+    @classmethod
+    def validate_artifact_id(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=512,
+            nonblank=True,
+            clean=True,
+        )
+
+
+class EvalScenarioRunInvocation(_EvalStoreModel):
+    """Authority-free scenario launch facts frozen into one durable run."""
+
+    schema_version: Literal[1] = 1
+    scenario_revision: StrictStr
+    binding_revision: StrictStr
+    environment_name: StrictStr | None = None
+    trials: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
+    timeout_seconds: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TIMEOUT_SECONDS)
+    artifact_references: tuple[EvalScenarioArtifactReference, ...] = Field(
+        default_factory=tuple,
+        max_length=EVAL_SCENARIO_MAX_ARTIFACT_REQUIREMENTS,
+    )
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be the integer 1.")
+        return value
+
+    @field_validator("scenario_revision", "binding_revision")
+    @classmethod
+    def validate_revisions(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("environment_name")
+    @classmethod
+    def validate_environment_name(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=256,
+            nonblank=True,
+            clean=True,
+        )
+
+    @model_validator(mode="after")
+    def validate_artifact_references(self) -> EvalScenarioRunInvocation:
+        requirement_ids = tuple(item.requirement_id for item in self.artifact_references)
+        if requirement_ids != tuple(sorted(set(requirement_ids))):
+            raise ValueError("Scenario artifact references must be unique and sorted.")
+        return self
+
+
+class EvalScenarioTrialPhase(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    AWAITING_APPROVAL = "awaiting_approval"
+    AWAITING_RESUME = "awaiting_resume"
+    COMPLETED = "completed"
+    ERROR = "error"
+
+
+class EvalScenarioTrialFailureCode(StrEnum):
+    EXECUTION_FAILED = "execution_failed"
+    UNEXPECTED_SESSION_STATE = "unexpected_session_state"
+    EXPECTED_APPROVAL_UNAVAILABLE = "expected_approval_unavailable"
+    EXPECTED_USER_INPUT_UNAVAILABLE = "expected_user_input_unavailable"
+
+
+class EvalScenarioApprovalDecisionRecord(_EvalStoreModel):
+    decision: Literal["approve", "deny"]
+    reason: StrictStr | None = Field(default=None, max_length=2_048)
+    actor_id: StrictStr = Field(max_length=512)
+    submitted_at: datetime
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=2_048,
+            nonblank=True,
+            clean=False,
+        )
+
+    @field_validator("actor_id")
+    @classmethod
+    def validate_actor_id(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=512,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("submitted_at")
+    @classmethod
+    def validate_submitted_at(cls, value: datetime, info) -> datetime:
+        return _aware_utc(value, info.field_name)
+
+
+class EvalScenarioTrialProgress(_EvalStoreModel):
+    trial_number: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
+    phase: EvalScenarioTrialPhase
+    session_id: StrictStr | None = None
+    next_event_sequence: StrictInt = Field(ge=0, le=EVAL_SCENARIO_MAX_EVENTS)
+    pending_event_id: StrictStr | None = None
+    pending_tool_name: StrictStr | None = None
+    pending_input_id: StrictStr | None = None
+    pending_resume_kind: Literal["user_input", "manual_recovery"] | None = None
+    approval: EvalScenarioApprovalDecisionRecord | None = None
+    failure_code: EvalScenarioTrialFailureCode | None = None
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _store_identifier(value, info.field_name)
+
+    @field_validator("pending_event_id")
+    @classmethod
+    def validate_pending_event_id(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _portable_id(value, info.field_name)
+
+    @field_validator("pending_tool_name")
+    @classmethod
+    def validate_pending_tool_name(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=256,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("pending_input_id")
+    @classmethod
+    def validate_pending_input_id(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=512,
+            nonblank=True,
+            clean=True,
+        )
+
+    @model_validator(mode="after")
+    def validate_phase(self) -> EvalScenarioTrialProgress:
+        awaiting_approval = self.phase is EvalScenarioTrialPhase.AWAITING_APPROVAL
+        awaiting_resume = self.phase is EvalScenarioTrialPhase.AWAITING_RESUME
+        if awaiting_approval != (
+            self.pending_event_id is not None
+            and self.pending_tool_name is not None
+            and self.pending_input_id is None
+            and self.pending_resume_kind is None
+        ):
+            raise ValueError("Approval-waiting scenario progress is inconsistent.")
+        if awaiting_resume != (
+            self.pending_event_id is not None
+            and self.pending_tool_name is None
+            and self.pending_resume_kind is not None
+            and ((self.pending_resume_kind == "user_input") == (self.pending_input_id is not None))
+        ):
+            raise ValueError("Resume-waiting scenario progress is inconsistent.")
+        if self.approval is not None and not awaiting_approval:
+            raise ValueError("Only an approval-waiting trial may retain a decision.")
+        if (self.phase is EvalScenarioTrialPhase.ERROR) != (self.failure_code is not None):
+            raise ValueError("Scenario trial failure state is inconsistent.")
+        if self.phase is not EvalScenarioTrialPhase.PENDING and self.session_id is None:
+            raise ValueError("Started scenario trials require a concrete session id.")
+        return self
+
+
+def _scenario_progress_revision(document: Mapping[str, Any]) -> str:
+    material = dict(document)
+    material.pop("revision", None)
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            canonical_durable_json_bytes(material, "eval scenario progress")
+        ).hexdigest()
+    )
+
+
+class EvalScenarioRunProgress(_EvalStoreModel):
+    schema_version: Literal[1] = 1
+    revision: StrictStr
+    scenario_revision: StrictStr
+    binding_revision: StrictStr
+    attempt: StrictInt = Field(ge=1, le=_EVAL_STORE_MAX_BIGINT)
+    trials: tuple[EvalScenarioTrialProgress, ...] = Field(
+        min_length=1,
+        max_length=EVAL_CORPUS_MAX_TRIALS,
+    )
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be the integer 1.")
+        return value
+
+    @field_validator("revision", "scenario_revision", "binding_revision")
+    @classmethod
+    def validate_revisions(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_progress(self) -> EvalScenarioRunProgress:
+        expected_numbers = tuple(range(1, len(self.trials) + 1))
+        if tuple(item.trial_number for item in self.trials) != expected_numbers:
+            raise ValueError("Scenario trial progress must be contiguous and ordered.")
+        if self.revision != _scenario_progress_revision(self.model_dump(mode="json")):
+            raise ValueError("Scenario progress revision does not match its content.")
+        if not json_utf8_size_within_limit(self, EVAL_SCENARIO_PROGRESS_MAX_BYTES):
+            raise ValueError(
+                f"Scenario progress exceeds {EVAL_SCENARIO_PROGRESS_MAX_BYTES} JSON bytes."
+            )
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        scenario_revision: str,
+        binding_revision: str,
+        attempt: int,
+        trials: tuple[EvalScenarioTrialProgress, ...],
+    ) -> EvalScenarioRunProgress:
+        document = {
+            "schema_version": 1,
+            "scenario_revision": scenario_revision,
+            "binding_revision": binding_revision,
+            "attempt": attempt,
+            "trials": [item.model_dump(mode="json") for item in trials],
+        }
+        return cls(
+            revision=_scenario_progress_revision(document),
+            schema_version=1,
+            scenario_revision=scenario_revision,
+            binding_revision=binding_revision,
+            attempt=attempt,
+            trials=trials,
+        )
+
+    def replace_trial(self, trial: EvalScenarioTrialProgress) -> EvalScenarioRunProgress:
+        if type(trial) is not EvalScenarioTrialProgress:
+            raise TypeError("trial must be an exact EvalScenarioTrialProgress.")
+        if not 1 <= trial.trial_number <= len(self.trials):
+            raise ValueError("Scenario trial number is outside this run.")
+        values = list(self.trials)
+        values[trial.trial_number - 1] = EvalScenarioTrialProgress.model_validate(
+            trial.model_dump(mode="python")
+        )
+        return EvalScenarioRunProgress.create(
+            scenario_revision=self.scenario_revision,
+            binding_revision=self.binding_revision,
+            attempt=self.attempt,
+            trials=tuple(values),
+        )
+
+
+def _scenario_progress_for_claim(
+    progress: EvalScenarioRunProgress | None,
+    *,
+    scenario: EvalScenarioRunInvocation | None,
+    attempt: int,
+) -> EvalScenarioRunProgress | None:
+    """Fence resumable checkpoints into a new claim and reset unsafe work.
+
+    Approval, user-input, and explicit session-resume pauses retain enough durable
+    identity to continue after claim loss. Other stages may have lost their worker
+    between any two provider/tool effects, so a new claim restarts those trials
+    under a new session id and publication fence.
+    """
+
+    if progress is None or scenario is None:
+        return None
+    if (
+        progress.scenario_revision != scenario.scenario_revision
+        or progress.binding_revision != scenario.binding_revision
+        or len(progress.trials) != scenario.trials
+    ):
+        raise EvalRunStateConflict("Scenario progress does not match its durable invocation.")
+    trials = tuple(
+        trial.model_copy(deep=True)
+        if trial.phase
+        in {
+            EvalScenarioTrialPhase.AWAITING_APPROVAL,
+            EvalScenarioTrialPhase.AWAITING_RESUME,
+        }
+        else EvalScenarioTrialProgress(
+            trial_number=trial.trial_number,
+            phase=EvalScenarioTrialPhase.PENDING,
+            next_event_sequence=0,
+        )
+        for trial in progress.trials
+    )
+    return EvalScenarioRunProgress.create(
+        scenario_revision=scenario.scenario_revision,
+        binding_revision=scenario.binding_revision,
+        attempt=attempt,
+        trials=trials,
+    )
+
+
+class EvalScenarioApprovalSubmission(_EvalStoreModel):
+    expected_progress_revision: StrictStr
+    trial_number: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
+    event_id: StrictStr
+    decision: Literal["approve", "deny"]
+    reason: StrictStr | None = Field(default=None, max_length=2_048)
+    actor_id: StrictStr = Field(max_length=512)
+
+    @field_validator("expected_progress_revision")
+    @classmethod
+    def validate_expected_revision(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("event_id")
+    @classmethod
+    def validate_event_id(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return EvalScenarioApprovalDecisionRecord.validate_reason(value, info)
+
+    @field_validator("actor_id")
+    @classmethod
+    def validate_actor_id(cls, value: str, info) -> str:
+        return EvalScenarioApprovalDecisionRecord.validate_actor_id(value, info)
+
+
 class EvalRunInvocation(_EvalStoreModel):
     """Durable, authority-free execution contractions and trusted caller provenance.
 
@@ -880,6 +1247,10 @@ class EvalRunInvocation(_EvalStoreModel):
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
     limits: RunLimits | None = None
     cost_budget: EvalRunCostBudget | None = None
+    scenario: EvalScenarioRunInvocation | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -913,6 +1284,15 @@ class EvalRunInvocation(_EvalStoreModel):
             return None
         if type(value) is EvalRunCostBudget:
             return EvalRunCostBudget.model_validate(value.model_dump(mode="python"))
+        return value
+
+    @field_validator("scenario", mode="before")
+    @classmethod
+    def copy_scenario(cls, value: object) -> object:
+        if value is None:
+            return None
+        if type(value) is EvalScenarioRunInvocation:
+            return EvalScenarioRunInvocation.model_validate(value.model_dump(mode="python"))
         return value
 
     @model_validator(mode="after")
@@ -1046,6 +1426,10 @@ class EvalRunRecord(_EvalStoreModel):
     ownership: EvalRunOwnership | None = None
     result: EvalRunResultSummary | None = None
     failure_code: EvalRunFailureCode | None = None
+    scenario_progress: EvalScenarioRunProgress | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @field_validator(
         "created_at",
@@ -1105,6 +1489,24 @@ class EvalRunRecord(_EvalStoreModel):
                 raise ValueError("Failed eval runs require a safe failure code.")
         elif self.failure_code is not None:
             raise ValueError("Only failed eval runs may carry a failure code.")
+        scenario = self.spec.invocation.scenario
+        if scenario is None:
+            if self.scenario_progress is not None:
+                raise ValueError("Corpus eval runs cannot expose scenario progress.")
+        elif self.scenario_progress is not None:
+            progress = self.scenario_progress
+            if (
+                progress.scenario_revision != scenario.scenario_revision
+                or progress.binding_revision != scenario.binding_revision
+                or len(progress.trials) != scenario.trials
+                or progress.attempt > self.attempt_count
+            ):
+                raise ValueError("Scenario progress does not match its durable run invocation.")
+            if (
+                self.status in {EvalRunStatus.RUNNING, EvalRunStatus.CANCELLING}
+                and progress.attempt != self.attempt_count
+            ):
+                raise ValueError("Active scenario progress must belong to the current claim epoch.")
         return self
 
     @property
@@ -1855,6 +2257,7 @@ class EvalStore(ABC):
     durable: ClassVar[bool] = False
     captured_results: ClassVar[bool] = False
     scenarios: ClassVar[bool] = False
+    scenario_execution: ClassVar[bool] = False
 
     @abstractmethod
     async def close(self) -> None:
@@ -1986,6 +2389,36 @@ class EvalStore(ABC):
     async def request_cancel(self, run_id: str) -> EvalRunRecord:
         """Persist cancellation intent, terminalizing unclaimed queued work."""
 
+    async def initialize_scenario_progress(
+        self,
+        claim: EvalRunClaim,
+        progress: EvalScenarioRunProgress,
+    ) -> EvalRunRecord:
+        """Replace scenario progress for a newly claimed execution attempt."""
+
+        del claim, progress
+        raise NotImplementedError("Scenario execution progress is not supported.")
+
+    async def update_scenario_trial(
+        self,
+        claim: EvalRunClaim,
+        trial: EvalScenarioTrialProgress,
+    ) -> EvalRunRecord:
+        """Fenced update of one trial inside the current scenario attempt."""
+
+        del claim, trial
+        raise NotImplementedError("Scenario execution progress is not supported.")
+
+    async def submit_scenario_approval(
+        self,
+        run_id: str,
+        submission: EvalScenarioApprovalSubmission,
+    ) -> EvalRunRecord:
+        """CAS one fresh operator decision into the exact pending checkpoint."""
+
+        del run_id, submission
+        raise NotImplementedError("Scenario approval submission is not supported.")
+
     @abstractmethod
     async def publish_result(
         self,
@@ -2101,6 +2534,7 @@ class _MemoryRunState:
     lease_expires_at: datetime | None = None
     result: CorpusExecutionResult | None = None
     failure_code: EvalRunFailureCode | None = None
+    scenario_progress: EvalScenarioRunProgress | None = None
 
 
 @dataclass
@@ -2115,6 +2549,7 @@ class InMemoryEvalStore(EvalStore):
     durable: ClassVar[bool] = False
     captured_results: ClassVar[bool] = True
     scenarios: ClassVar[bool] = True
+    scenario_execution: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -2463,6 +2898,11 @@ class InMemoryEvalStore(EvalStore):
             state.claim_id = _store_identifier(self._claim_id_factory(), "claim_id")
             state.epoch += 1
             state.lease_expires_at = now + timedelta(seconds=lease_seconds)
+            state.scenario_progress = _scenario_progress_for_claim(
+                state.scenario_progress,
+                scenario=state.request.invocation.scenario,
+                attempt=state.epoch,
+            )
             record = self._record(state)
             return EvalRunLease(
                 run=record,
@@ -2511,6 +2951,11 @@ class InMemoryEvalStore(EvalStore):
             state.claim_id = _store_identifier(self._claim_id_factory(), "claim_id")
             state.epoch += 1
             state.lease_expires_at = now + timedelta(seconds=lease_seconds)
+            state.scenario_progress = _scenario_progress_for_claim(
+                state.scenario_progress,
+                scenario=state.request.invocation.scenario,
+                attempt=state.epoch,
+            )
             record = self._record(state)
             return EvalRunLease(
                 run=record,
@@ -2557,6 +3002,83 @@ class InMemoryEvalStore(EvalStore):
                 state.lease_expires_at = None
             else:
                 state.status = EvalRunStatus.CANCELLING
+            return self._record(state)
+
+    async def initialize_scenario_progress(
+        self,
+        claim: EvalRunClaim,
+        progress: EvalScenarioRunProgress,
+    ) -> EvalRunRecord:
+        claim = _exact_model(claim, EvalRunClaim, "claim")
+        progress = _exact_model(progress, EvalScenarioRunProgress, "progress")
+        async with self._lock:
+            state = self._require_live_claim(claim)
+            scenario = state.request.invocation.scenario
+            if scenario is None:
+                raise EvalRunStateConflict("Only scenario runs may initialize scenario progress.")
+            if (
+                progress.attempt != claim.epoch
+                or progress.scenario_revision != scenario.scenario_revision
+                or progress.binding_revision != scenario.binding_revision
+                or len(progress.trials) != scenario.trials
+            ):
+                raise EvalRunStateConflict("Scenario progress does not match the claimed run.")
+            state.scenario_progress = progress.model_copy(deep=True)
+            state.updated_at = self._now()
+            return self._record(state)
+
+    async def update_scenario_trial(
+        self,
+        claim: EvalRunClaim,
+        trial: EvalScenarioTrialProgress,
+    ) -> EvalRunRecord:
+        claim = _exact_model(claim, EvalRunClaim, "claim")
+        trial = _exact_model(trial, EvalScenarioTrialProgress, "trial")
+        async with self._lock:
+            state = self._require_live_claim(claim)
+            progress = state.scenario_progress
+            if progress is None or progress.attempt != claim.epoch:
+                raise EvalRunStateConflict("Scenario progress is absent for this claim.")
+            state.scenario_progress = progress.replace_trial(trial)
+            state.updated_at = self._now()
+            return self._record(state)
+
+    async def submit_scenario_approval(
+        self,
+        run_id: str,
+        submission: EvalScenarioApprovalSubmission,
+    ) -> EvalRunRecord:
+        run_id = _store_identifier(run_id, "run_id")
+        submission = _exact_model(submission, EvalScenarioApprovalSubmission, "submission")
+        async with self._lock:
+            state = self._require_run(run_id)
+            if state.status is not EvalRunStatus.RUNNING:
+                raise EvalRunStateConflict("Scenario approval requires an active run.")
+            progress = state.scenario_progress
+            if progress is None or progress.revision != submission.expected_progress_revision:
+                raise EvalRunStateConflict("Scenario progress changed before approval submission.")
+            if submission.trial_number > len(progress.trials):
+                raise EvalRunStateConflict("Scenario trial does not exist.")
+            trial = progress.trials[submission.trial_number - 1]
+            if (
+                trial.phase is not EvalScenarioTrialPhase.AWAITING_APPROVAL
+                or trial.pending_event_id != submission.event_id
+                or trial.approval is not None
+            ):
+                raise EvalRunStateConflict("Scenario approval checkpoint is no longer pending.")
+            updated_trial = trial.model_copy(
+                update={
+                    "approval": EvalScenarioApprovalDecisionRecord(
+                        decision=submission.decision,
+                        reason=submission.reason,
+                        actor_id=submission.actor_id,
+                        submitted_at=self._now(),
+                    )
+                },
+                deep=True,
+            )
+            state.scenario_progress = progress.replace_trial(updated_trial)
+            state.updated_at = self._now()
             return self._record(state)
 
     async def publish_result(
@@ -2931,6 +3453,11 @@ class InMemoryEvalStore(EvalStore):
             ownership=ownership,
             result=None if state.result is None else result_summary(state.result),
             failure_code=state.failure_code,
+            scenario_progress=(
+                None
+                if state.scenario_progress is None
+                else state.scenario_progress.model_copy(deep=True)
+            ),
         )
 
 
@@ -3081,6 +3608,7 @@ def _bounded_result_page(
 
 __all__ = [
     "EVAL_RUN_INVOCATION_MAX_BYTES",
+    "EVAL_SCENARIO_PROGRESS_MAX_BYTES",
     "EVAL_STORE_DEFAULT_PAGE_BYTES",
     "EVAL_STORE_DEFAULT_PAGE_SIZE",
     "EVAL_STORE_MAX_CLAIM_TARGETS",
@@ -3115,10 +3643,18 @@ __all__ = [
     "EvalRunSpec",
     "EvalRunStateConflict",
     "EvalRunStatus",
+    "EvalScenarioApprovalDecisionRecord",
+    "EvalScenarioApprovalSubmission",
+    "EvalScenarioArtifactReference",
     "EvalScenarioCatalogEntry",
     "EvalScenarioCatalogPage",
     "EvalScenarioCatalogQuery",
     "EvalScenarioConflict",
+    "EvalScenarioRunInvocation",
+    "EvalScenarioRunProgress",
+    "EvalScenarioTrialFailureCode",
+    "EvalScenarioTrialPhase",
+    "EvalScenarioTrialProgress",
     "EvalStore",
     "EvalStorePublicationRejected",
     "EvalStoreResultTooLarge",

@@ -776,10 +776,20 @@ def prepare_enqueue_message_request(
             authority_kind="durable queued-message authority",
         )
     redacted_content = redactor.redact_text(request.content)
+    redacted_message = (
+        None
+        if request.message is None
+        else redact_untrusted_message_for_boundary(
+            request.message,
+            redactor=redactor,
+            field_name="message",
+        )
+    )
     prepared = EnqueueSessionMessageRequest(
         session_id=request.session_id,
         idempotency_key=request.idempotency_key,
         content=redacted_content,
+        message=redacted_message,
         delivery_mode=request.delivery_mode,
         requested_by=redact_resolution_actor(
             request.requested_by,
@@ -788,7 +798,9 @@ def prepare_enqueue_message_request(
         ),
     )
     prepared._input_redactions_applied = (
-        request._input_redactions_applied or redacted_content != request.content
+        request._input_redactions_applied
+        or redacted_content != request.content
+        or redacted_message != request.message
     )
     return prepared
 

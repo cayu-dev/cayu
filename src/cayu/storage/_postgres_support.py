@@ -272,6 +272,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
         idempotency_key TEXT NOT NULL,
         content TEXT NOT NULL,
+        message_json JSONB,
         delivery_mode TEXT NOT NULL,
         status TEXT NOT NULL,
         requested_by JSONB,

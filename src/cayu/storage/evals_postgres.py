@@ -59,10 +59,15 @@ from cayu.evals.store import (
     EvalRunSpec,
     EvalRunStateConflict,
     EvalRunStatus,
+    EvalScenarioApprovalDecisionRecord,
+    EvalScenarioApprovalSubmission,
     EvalScenarioCatalogEntry,
     EvalScenarioCatalogPage,
     EvalScenarioCatalogQuery,
     EvalScenarioConflict,
+    EvalScenarioRunProgress,
+    EvalScenarioTrialPhase,
+    EvalScenarioTrialProgress,
     EvalStore,
     EvalStoreResultTooLarge,
     EvalSuiteCatalogEntry,
@@ -85,6 +90,7 @@ from cayu.evals.store import (
     _prepare_run_request_for_store,
     _prepare_scenario_catalog_for_store,
     _read_limit,
+    _scenario_progress_for_claim,
     _store_identifier,
     _validate_baseline_result,
     decode_case_cursor,
@@ -100,7 +106,7 @@ from cayu.evals.store import (
 )
 from cayu.storage.postgres import _PostgresStoreBase
 
-_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 53
+_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 56
 
 _RUN_COLUMNS = """
     run_id,
@@ -124,7 +130,8 @@ _RUN_COLUMNS = """
     result_status,
     result_score,
     result_duration_ms,
-    failure_code
+    failure_code,
+    scenario_progress_json
 """
 
 _RESULT_RECORD_COLUMNS = """
@@ -206,6 +213,9 @@ def _run_record_from_row(row: Any) -> EvalRunRecord:
         ownership=ownership,
         result=result,
         failure_code=None if row[21] is None else EvalRunFailureCode(row[21]),
+        scenario_progress=(
+            None if row[22] is None else EvalScenarioRunProgress.model_validate_json(row[22])
+        ),
     )
 
 
@@ -270,6 +280,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
     durable: ClassVar[bool] = True
     captured_results: ClassVar[bool] = True
     scenarios: ClassVar[bool] = True
+    scenario_execution: ClassVar[bool] = True
     _min_required_revision = _POSTGRES_EVAL_MIN_REQUIRED_REVISION
 
     async def save_corpus(
@@ -768,6 +779,16 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                     status = (
                         EvalRunStatus.CANCELLING if row[13] is not None else EvalRunStatus.RUNNING
                     )
+                    next_epoch = row[15] + 1
+                    progress = _scenario_progress_for_claim(
+                        (
+                            None
+                            if row[22] is None
+                            else EvalScenarioRunProgress.model_validate_json(row[22])
+                        ),
+                        scenario=_request_from_row(row).invocation.scenario,
+                        attempt=next_epoch,
+                    )
                     await cur.execute(
                         """
                         UPDATE cayu_eval_runs
@@ -775,7 +796,8 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                             started_at = COALESCE(started_at, %s),
                             claim_id = %s,
                             ownership_epoch = ownership_epoch + 1,
-                            lease_expires_at = %s
+                            lease_expires_at = %s,
+                            scenario_progress_json = %s
                         WHERE run_id = %s
                         """,
                         (
@@ -784,6 +806,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                             now,
                             str(uuid4()),
                             now + timedelta(seconds=lease_seconds),
+                            None if progress is None else progress.model_dump_json(),
                             row[0],
                         ),
                     )
@@ -845,6 +868,16 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                         EvalRunStatus.CANCELLING if row[13] is not None else EvalRunStatus.RUNNING
                     )
                     claim_id = str(uuid4())
+                    next_epoch = row[15] + 1
+                    progress = _scenario_progress_for_claim(
+                        (
+                            None
+                            if row[22] is None
+                            else EvalScenarioRunProgress.model_validate_json(row[22])
+                        ),
+                        scenario=_request_from_row(row).invocation.scenario,
+                        attempt=next_epoch,
+                    )
                     await cur.execute(
                         """
                         UPDATE cayu_eval_runs
@@ -852,7 +885,8 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                             started_at = COALESCE(started_at, %s),
                             claim_id = %s,
                             ownership_epoch = ownership_epoch + 1,
-                            lease_expires_at = %s
+                            lease_expires_at = %s,
+                            scenario_progress_json = %s
                         WHERE run_id = %s
                         """,
                         (
@@ -861,6 +895,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                             now,
                             claim_id,
                             now + timedelta(seconds=lease_seconds),
+                            None if progress is None else progress.model_dump_json(),
                             row[0],
                         ),
                     )
@@ -962,6 +997,144 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                             str(EvalRunStatus.CANCELLED),
                             run_id,
                         ),
+                    )
+                    updated = await self._require_run_row(cur, run_id)
+                await conn.commit()
+                return _run_record_from_row(updated)
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def initialize_scenario_progress(
+        self,
+        claim: EvalRunClaim,
+        progress: EvalScenarioRunProgress,
+    ) -> EvalRunRecord:
+        claim = _exact_model(claim, EvalRunClaim, "claim")
+        progress = _exact_model(progress, EvalScenarioRunProgress, "progress")
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    row = await self._require_run_row(cur, claim.run_id, for_update=True)
+                    now = await _database_now(cur)
+                    self._require_live_claim(row, claim, now)
+                    scenario = _request_from_row(row).invocation.scenario
+                    if scenario is None:
+                        raise EvalRunStateConflict(
+                            "Only scenario runs may initialize scenario progress."
+                        )
+                    if (
+                        progress.attempt != claim.epoch
+                        or progress.scenario_revision != scenario.scenario_revision
+                        or progress.binding_revision != scenario.binding_revision
+                        or len(progress.trials) != scenario.trials
+                    ):
+                        raise EvalRunStateConflict(
+                            "Scenario progress does not match the claimed run."
+                        )
+                    await cur.execute(
+                        """
+                        UPDATE cayu_eval_runs
+                        SET scenario_progress_json = %s, updated_at = %s
+                        WHERE run_id = %s
+                        """,
+                        (progress.model_dump_json(), now, claim.run_id),
+                    )
+                    updated = await self._require_run_row(cur, claim.run_id)
+                await conn.commit()
+                return _run_record_from_row(updated)
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def update_scenario_trial(
+        self,
+        claim: EvalRunClaim,
+        trial: EvalScenarioTrialProgress,
+    ) -> EvalRunRecord:
+        claim = _exact_model(claim, EvalRunClaim, "claim")
+        trial = _exact_model(trial, EvalScenarioTrialProgress, "trial")
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    row = await self._require_run_row(cur, claim.run_id, for_update=True)
+                    now = await _database_now(cur)
+                    self._require_live_claim(row, claim, now)
+                    if row[22] is None:
+                        raise EvalRunStateConflict("Scenario progress is absent for this claim.")
+                    progress = EvalScenarioRunProgress.model_validate_json(row[22])
+                    if progress.attempt != claim.epoch:
+                        raise EvalRunStateConflict("Scenario progress belongs to another claim.")
+                    updated_progress = progress.replace_trial(trial)
+                    await cur.execute(
+                        """
+                        UPDATE cayu_eval_runs
+                        SET scenario_progress_json = %s, updated_at = %s
+                        WHERE run_id = %s
+                        """,
+                        (updated_progress.model_dump_json(), now, claim.run_id),
+                    )
+                    updated = await self._require_run_row(cur, claim.run_id)
+                await conn.commit()
+                return _run_record_from_row(updated)
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def submit_scenario_approval(
+        self,
+        run_id: str,
+        submission: EvalScenarioApprovalSubmission,
+    ) -> EvalRunRecord:
+        run_id = _store_identifier(run_id, "run_id")
+        submission = _exact_model(submission, EvalScenarioApprovalSubmission, "submission")
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    row = await self._require_run_row(cur, run_id, for_update=True)
+                    if EvalRunStatus(row[8]) is not EvalRunStatus.RUNNING:
+                        raise EvalRunStateConflict("Scenario approval requires an active run.")
+                    if row[22] is None:
+                        raise EvalRunStateConflict("Scenario progress is unavailable.")
+                    progress = EvalScenarioRunProgress.model_validate_json(row[22])
+                    if progress.revision != submission.expected_progress_revision:
+                        raise EvalRunStateConflict(
+                            "Scenario progress changed before approval submission."
+                        )
+                    if submission.trial_number > len(progress.trials):
+                        raise EvalRunStateConflict("Scenario trial does not exist.")
+                    trial = progress.trials[submission.trial_number - 1]
+                    if (
+                        trial.phase is not EvalScenarioTrialPhase.AWAITING_APPROVAL
+                        or trial.pending_event_id != submission.event_id
+                        or trial.approval is not None
+                    ):
+                        raise EvalRunStateConflict(
+                            "Scenario approval checkpoint is no longer pending."
+                        )
+                    now = await _database_now(cur)
+                    updated_trial = trial.model_copy(
+                        update={
+                            "approval": EvalScenarioApprovalDecisionRecord(
+                                decision=submission.decision,
+                                reason=submission.reason,
+                                actor_id=submission.actor_id,
+                                submitted_at=now,
+                            )
+                        },
+                        deep=True,
+                    )
+                    updated_progress = progress.replace_trial(updated_trial)
+                    await cur.execute(
+                        """
+                        UPDATE cayu_eval_runs
+                        SET scenario_progress_json = %s, updated_at = %s
+                        WHERE run_id = %s
+                        """,
+                        (updated_progress.model_dump_json(), now, run_id),
                     )
                     updated = await self._require_run_row(cur, run_id)
                 await conn.commit()

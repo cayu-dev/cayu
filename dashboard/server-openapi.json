@@ -5980,6 +5980,112 @@
         "title": "ChildStatusAssertionSpec",
         "type": "object"
       },
+      "CitationPart": {
+        "additionalProperties": false,
+        "description": "Provider-neutral citation annotation over assistant text.",
+        "properties": {
+          "citation_type": {
+            "const": "url_citation",
+            "default": "url_citation",
+            "title": "Citation Type",
+            "type": "string"
+          },
+          "end_index": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End Index"
+          },
+          "model_attempt_id": {
+            "title": "Model Attempt Id",
+            "type": "string"
+          },
+          "model_step_id": {
+            "title": "Model Step Id",
+            "type": "string"
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/CitationProvenance"
+          },
+          "start_index": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Index"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "type": {
+            "const": "citation",
+            "default": "citation",
+            "title": "Type",
+            "type": "string"
+          },
+          "url": {
+            "maxLength": 4096,
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "provenance",
+          "model_step_id",
+          "model_attempt_id"
+        ],
+        "title": "CitationPart",
+        "type": "object"
+      },
+      "CitationProvenance": {
+        "additionalProperties": false,
+        "description": "Trust label for provider-hosted citation evidence.",
+        "properties": {
+          "hosted_tool": {
+            "const": "web_search",
+            "default": "web_search",
+            "title": "Hosted Tool",
+            "type": "string"
+          },
+          "provider_name": {
+            "maxLength": 128,
+            "title": "Provider Name",
+            "type": "string"
+          },
+          "untrusted_external_evidence": {
+            "const": true,
+            "default": true,
+            "title": "Untrusted External Evidence",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "provider_name"
+        ],
+        "title": "CitationProvenance",
+        "type": "object"
+      },
       "ClientGenerationContract": {
         "additionalProperties": false,
         "properties": {
@@ -6929,6 +7035,16 @@
             "minLength": 1,
             "title": "Idempotency Key",
             "type": "string"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Message"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "requested_by": {
             "anyOf": [
@@ -8033,6 +8149,16 @@
               }
             ]
           },
+          "scenario": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalScenarioRunInvocation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "schema_version": {
             "const": 1,
             "default": 1,
@@ -8165,6 +8291,16 @@
             "anyOf": [
               {
                 "$ref": "#/components/schemas/EvalRunResultSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "scenario_progress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalScenarioRunProgress"
               },
               {
                 "type": "null"
@@ -8306,6 +8442,103 @@
         "title": "EvalRunStatus",
         "type": "string"
       },
+      "EvalScenarioApprovalDecisionRecord": {
+        "additionalProperties": false,
+        "properties": {
+          "actor_id": {
+            "maxLength": 512,
+            "title": "Actor Id",
+            "type": "string"
+          },
+          "decision": {
+            "enum": [
+              "approve",
+              "deny"
+            ],
+            "title": "Decision",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "submitted_at": {
+            "format": "date-time",
+            "title": "Submitted At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision",
+          "actor_id",
+          "submitted_at"
+        ],
+        "title": "EvalScenarioApprovalDecisionRecord",
+        "type": "object"
+      },
+      "EvalScenarioApprovalRequest": {
+        "additionalProperties": false,
+        "description": "Fresh operator decision CAS-bound to one live scenario checkpoint.",
+        "properties": {
+          "decision": {
+            "enum": [
+              "approve",
+              "deny"
+            ],
+            "title": "Decision",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+            "title": "Event Id",
+            "type": "string"
+          },
+          "expected_progress_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Expected Progress Revision",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "trial_number": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Trial Number",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_progress_revision",
+          "trial_number",
+          "event_id",
+          "decision"
+        ],
+        "title": "EvalScenarioApprovalRequest",
+        "type": "object"
+      },
       "EvalScenarioArtifactMaterializationRequest": {
         "additionalProperties": false,
         "description": "Explicit immutable fixture preparation bound to one reviewed revision.",
@@ -8346,6 +8579,26 @@
           "preflight"
         ],
         "title": "EvalScenarioArtifactMaterializationResponse",
+        "type": "object"
+      },
+      "EvalScenarioArtifactReference": {
+        "additionalProperties": false,
+        "description": "One immutable scenario requirement-to-artifact launch selection.",
+        "properties": {
+          "artifact_id": {
+            "title": "Artifact Id",
+            "type": "string"
+          },
+          "requirement_id": {
+            "title": "Requirement Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "requirement_id",
+          "artifact_id"
+        ],
+        "title": "EvalScenarioArtifactReference",
         "type": "object"
       },
       "EvalScenarioCatalogEntry": {
@@ -8717,6 +8970,133 @@
         "title": "EvalScenarioPreviewResponse",
         "type": "object"
       },
+      "EvalScenarioRunCreateRequest": {
+        "additionalProperties": false,
+        "description": "Launch one stored scenario only from the exact reviewed current binding.",
+        "properties": {
+          "expected_binding_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Expected Binding Revision",
+            "type": "string"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/ScenarioLaunchSettingsV2"
+          }
+        },
+        "required": [
+          "expected_binding_revision"
+        ],
+        "title": "EvalScenarioRunCreateRequest",
+        "type": "object"
+      },
+      "EvalScenarioRunInvocation": {
+        "additionalProperties": false,
+        "description": "Authority-free scenario launch facts frozen into one durable run.",
+        "properties": {
+          "artifact_references": {
+            "items": {
+              "$ref": "#/components/schemas/EvalScenarioArtifactReference"
+            },
+            "maxItems": 128,
+            "title": "Artifact References",
+            "type": "array"
+          },
+          "binding_revision": {
+            "title": "Binding Revision",
+            "type": "string"
+          },
+          "environment_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Environment Name"
+          },
+          "scenario_revision": {
+            "title": "Scenario Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "timeout_seconds": {
+            "maximum": 3600.0,
+            "minimum": 1.0,
+            "title": "Timeout Seconds",
+            "type": "integer"
+          },
+          "trials": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Trials",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "scenario_revision",
+          "binding_revision",
+          "trials",
+          "timeout_seconds"
+        ],
+        "title": "EvalScenarioRunInvocation",
+        "type": "object"
+      },
+      "EvalScenarioRunProgress": {
+        "additionalProperties": false,
+        "properties": {
+          "attempt": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "binding_revision": {
+            "title": "Binding Revision",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "scenario_revision": {
+            "title": "Scenario Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "trials": {
+            "items": {
+              "$ref": "#/components/schemas/EvalScenarioTrialProgress"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Trials",
+            "type": "array"
+          }
+        },
+        "required": [
+          "revision",
+          "scenario_revision",
+          "binding_revision",
+          "attempt",
+          "trials"
+        ],
+        "title": "EvalScenarioRunProgress",
+        "type": "object"
+      },
       "EvalScenarioSaveRequest": {
         "additionalProperties": false,
         "description": "One reviewed immutable revision; settings affect only returned preflight.",
@@ -8761,6 +9141,134 @@
           "preflight"
         ],
         "title": "EvalScenarioSaveResponse",
+        "type": "object"
+      },
+      "EvalScenarioTrialFailureCode": {
+        "enum": [
+          "execution_failed",
+          "unexpected_session_state",
+          "expected_approval_unavailable",
+          "expected_user_input_unavailable"
+        ],
+        "title": "EvalScenarioTrialFailureCode",
+        "type": "string"
+      },
+      "EvalScenarioTrialPhase": {
+        "enum": [
+          "pending",
+          "running",
+          "awaiting_approval",
+          "awaiting_resume",
+          "completed",
+          "error"
+        ],
+        "title": "EvalScenarioTrialPhase",
+        "type": "string"
+      },
+      "EvalScenarioTrialProgress": {
+        "additionalProperties": false,
+        "properties": {
+          "approval": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalScenarioApprovalDecisionRecord"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "failure_code": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalScenarioTrialFailureCode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "next_event_sequence": {
+            "maximum": 1024.0,
+            "minimum": 0.0,
+            "title": "Next Event Sequence",
+            "type": "integer"
+          },
+          "pending_event_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pending Event Id"
+          },
+          "pending_input_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pending Input Id"
+          },
+          "pending_resume_kind": {
+            "anyOf": [
+              {
+                "enum": [
+                  "user_input",
+                  "manual_recovery"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pending Resume Kind"
+          },
+          "pending_tool_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pending Tool Name"
+          },
+          "phase": {
+            "$ref": "#/components/schemas/EvalScenarioTrialPhase"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "trial_number": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Trial Number",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "trial_number",
+          "phase",
+          "next_event_sequence"
+        ],
+        "title": "EvalScenarioTrialProgress",
         "type": "object"
       },
       "EvalSuiteCatalogEntry": {
@@ -9779,6 +10287,28 @@
         "title": "ExecutionRequirements",
         "type": "object"
       },
+      "FilePart": {
+        "additionalProperties": false,
+        "description": "User-supplied file input (image or document) for a multimodal request.\n\n`attachment` carries a JSON-safe `cayu.file_attachment.v1` payload\nreferencing a stored artifact \u2014 never file bytes. The runtime resolves the\nartifact from the active ArtifactStore immediately before each provider\nrequest, exactly like tool-result attachments.",
+        "properties": {
+          "attachment": {
+            "additionalProperties": true,
+            "title": "Attachment",
+            "type": "object"
+          },
+          "type": {
+            "const": "file",
+            "default": "file",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attachment"
+        ],
+        "title": "FilePart",
+        "type": "object"
+      },
       "FinalOutputContainsAssertionSpec": {
         "additionalProperties": false,
         "properties": {
@@ -9876,6 +10406,77 @@
           "ok"
         ],
         "title": "HealthResponse",
+        "type": "object"
+      },
+      "HostedToolCallPart": {
+        "additionalProperties": false,
+        "description": "Terminal provider-hosted execution evidence in an assistant transcript.",
+        "properties": {
+          "action": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WebSearchAction"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "call_id": {
+            "maxLength": 512,
+            "title": "Call Id",
+            "type": "string"
+          },
+          "hosted_tool": {
+            "const": "web_search",
+            "default": "web_search",
+            "title": "Hosted Tool",
+            "type": "string"
+          },
+          "model": {
+            "maxLength": 512,
+            "title": "Model",
+            "type": "string"
+          },
+          "model_attempt_id": {
+            "title": "Model Attempt Id",
+            "type": "string"
+          },
+          "model_step_id": {
+            "title": "Model Step Id",
+            "type": "string"
+          },
+          "provider_name": {
+            "maxLength": 128,
+            "title": "Provider Name",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "completed",
+              "incomplete",
+              "failed",
+              "outcome_unknown"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "type": {
+            "const": "hosted_tool_call",
+            "default": "hosted_tool_call",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "call_id",
+          "status",
+          "provider_name",
+          "model",
+          "model_step_id",
+          "model_attempt_id"
+        ],
+        "title": "HostedToolCallPart",
         "type": "object"
       },
       "HostedToolManifest": {
@@ -10377,6 +10978,53 @@
           "maximum"
         ],
         "title": "MaxTotalTokensAssertionSpec",
+        "type": "object"
+      },
+      "Message": {
+        "additionalProperties": false,
+        "description": "Frozen transcript message.\n\nMessages and their parts are immutable once constructed: attribute\nassignment is rejected, `content` is a tuple, and every part entering the\nmessage is copied so the message exclusively owns its JSON payloads. The\nfreeze is shallow, though \u2014 nested payload dicts stay mutable \u2014 so sharing\na validated instance is safe only while every holder treats payloads as\nread-only. Hot-path `copy_message` \"copies\" are no-ops under that\ncontract; `detach_message` produces a genuinely isolated copy for\nstorage/trust boundaries, and `copy.deepcopy` isolates as well.",
+        "properties": {
+          "content": {
+            "default": [],
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/TextPart"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolCallPart"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolResultPart"
+                },
+                {
+                  "$ref": "#/components/schemas/ProviderStatePart"
+                },
+                {
+                  "$ref": "#/components/schemas/ThinkingPart"
+                },
+                {
+                  "$ref": "#/components/schemas/FilePart"
+                },
+                {
+                  "$ref": "#/components/schemas/HostedToolCallPart"
+                },
+                {
+                  "$ref": "#/components/schemas/CitationPart"
+                }
+              ]
+            },
+            "title": "Content",
+            "type": "array"
+          },
+          "role": {
+            "$ref": "#/components/schemas/MessageRole"
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "title": "Message",
         "type": "object"
       },
       "MessageRole": {
@@ -11586,6 +12234,31 @@
           "action"
         ],
         "title": "ProviderOperationResolutionBody",
+        "type": "object"
+      },
+      "ProviderStatePart": {
+        "additionalProperties": false,
+        "properties": {
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "state": {
+            "additionalProperties": true,
+            "title": "State",
+            "type": "object"
+          },
+          "type": {
+            "const": "provider_state",
+            "default": "provider_state",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider"
+        ],
+        "title": "ProviderStatePart",
         "type": "object"
       },
       "PublishedAssertionResult": {
@@ -13889,7 +14562,7 @@
       },
       "ScenarioResumedInputEventV2": {
         "additionalProperties": false,
-        "description": "Fresh caller input supplied when a scenario session is paused.",
+        "description": "Fresh caller input supplied when a scenario session is paused.\n\n``manual_recovery`` is the scenario-v2 wire name for an ordinary explicit\n``CayuApp.resume(...)`` interaction. It does not assert or synthesize the\noutcome of a runtime tool call whose external effect is unknown.",
         "properties": {
           "id": {
             "title": "Id",
@@ -14096,7 +14769,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "24",
+            "default": "25",
             "title": "Contract Version",
             "type": "string"
           },
@@ -15601,6 +16274,26 @@
         "title": "TaskStatusCounts",
         "type": "object"
       },
+      "TextPart": {
+        "additionalProperties": false,
+        "properties": {
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "type": {
+            "const": "text",
+            "default": "text",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "TextPart",
+        "type": "object"
+      },
       "ThinkingConfig": {
         "additionalProperties": false,
         "description": "Provider-neutral thinking/reasoning configuration.\n\nThe runtime carries this as a neutral ``options[\"thinking\"]`` payload and each\nprovider maps it to its own request shape (field-driven, no model lookup):\n\n- ``effort`` set -> adaptive thinking (Anthropic ``thinking={\"type\": \"adaptive\"}``\n  + ``output_config={\"effort\": ...}``; OpenAI ``reasoning={\"effort\": ...}``). This\n  is the path the current Claude and OpenAI reasoning models use.\n- ``max_tokens`` set (and no ``effort``) -> legacy budgeted thinking (Anthropic\n  ``thinking={\"type\": \"enabled\", \"budget_tokens\": ...}``). Only the older Claude\n  models accept a token budget; OpenAI has no budget knob and ignores it.\n- neither set, ``enabled=True`` -> adaptive thinking with provider defaults (on the\n  Chat Completions path this is a no-op: the model reasons by its own default).\n- ``enabled=False`` is best-effort and provider-dependent: Anthropic disables\n  (``thinking={\"type\": \"disabled\"}``); OpenAI reasoning models cannot be disabled, so\n  it is a no-op (the model still reasons); the generic Chat Completions adapter also\n  no-ops (disabling isn't portable \u2014 pass a raw ``reasoning_effort`` via\n  ``provider_options`` to target a backend like Gemini that accepts ``\"none\"``).\n\n``effort`` and ``max_tokens`` select mutually exclusive modes. Disabling thinking\ncannot be combined with either enabled-mode control. Provider-specific support is\nstill validated by the provider; contradictory neutral controls fail here before a\nprovider request can be built.",
@@ -15644,6 +16337,37 @@
           }
         },
         "title": "ThinkingConfig",
+        "type": "object"
+      },
+      "ThinkingPart": {
+        "additionalProperties": false,
+        "description": "Model reasoning/thinking content from a single reasoning block.\n\n`text` may be empty (the provider returned the reasoning in an omitted/redacted\nform). `provider_state` carries the opaque round-trip payload \u2014 the Anthropic\n`signature` or `redacted_thinking` data, or an OpenAI encrypted reasoning blob \u2014\nneeded to send the block back to the provider on a later turn. Built-in providers\ntag opaque reasoning state with its provider family, protocol, and protocol version;\nrequest adapters replay it only when all three match. Legacy untagged state remains\nreadable in the durable transcript but is not authoritative for opaque replay.",
+        "properties": {
+          "provider_state": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider State"
+          },
+          "text": {
+            "default": "",
+            "title": "Text",
+            "type": "string"
+          },
+          "type": {
+            "const": "thinking",
+            "default": "thinking",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "title": "ThinkingPart",
         "type": "object"
       },
       "TieredPricing": {
@@ -16032,6 +16756,69 @@
         "title": "ToolApprovalRecoveryOutcome",
         "type": "string"
       },
+      "ToolCallPart": {
+        "additionalProperties": false,
+        "properties": {
+          "arguments": {
+            "additionalProperties": true,
+            "title": "Arguments",
+            "type": "object"
+          },
+          "model_attempt_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Attempt Id"
+          },
+          "model_step_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Step Id"
+          },
+          "tool_call_id": {
+            "title": "Tool Call Id",
+            "type": "string"
+          },
+          "tool_name": {
+            "title": "Tool Name",
+            "type": "string"
+          },
+          "tool_round_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Round Id"
+          },
+          "type": {
+            "const": "tool_call",
+            "default": "tool_call",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool_call_id",
+          "tool_name"
+        ],
+        "title": "ToolCallPart",
+        "type": "object"
+      },
       "ToolCalledAssertionSpec": {
         "additionalProperties": false,
         "properties": {
@@ -16156,6 +16943,94 @@
           "implementation_provenance"
         ],
         "title": "ToolManifest",
+        "type": "object"
+      },
+      "ToolResultPart": {
+        "additionalProperties": false,
+        "properties": {
+          "artifacts": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Artifacts",
+            "type": "array"
+          },
+          "content": {
+            "default": "",
+            "title": "Content",
+            "type": "string"
+          },
+          "is_error": {
+            "default": false,
+            "title": "Is Error",
+            "type": "boolean"
+          },
+          "model_attempt_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Attempt Id"
+          },
+          "model_step_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Step Id"
+          },
+          "structured": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Structured"
+          },
+          "tool_call_id": {
+            "title": "Tool Call Id",
+            "type": "string"
+          },
+          "tool_name": {
+            "title": "Tool Name",
+            "type": "string"
+          },
+          "tool_round_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Round Id"
+          },
+          "type": {
+            "const": "tool_result",
+            "default": "tool_result",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool_call_id",
+          "tool_name"
+        ],
+        "title": "ToolResultPart",
         "type": "object"
       },
       "ToolResultProjectionPolicyManifest": {
@@ -17772,12 +18647,120 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "24",
+            "default": "25",
             "title": "Contract Version",
             "type": "string"
           }
         },
         "title": "VersioningContract",
+        "type": "object"
+      },
+      "WebSearchAction": {
+        "additionalProperties": false,
+        "description": "Bounded provider-neutral terminal web-search action evidence.",
+        "properties": {
+          "pattern": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pattern"
+          },
+          "queries": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 100,
+            "title": "Queries",
+            "type": "array"
+          },
+          "query": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Query"
+          },
+          "sources": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/WebSearchSource"
+            },
+            "maxItems": 100,
+            "title": "Sources",
+            "type": "array"
+          },
+          "type": {
+            "enum": [
+              "search",
+              "open_page",
+              "find_in_page"
+            ],
+            "title": "Type",
+            "type": "string"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "title": "WebSearchAction",
+        "type": "object"
+      },
+      "WebSearchSource": {
+        "additionalProperties": false,
+        "description": "Bounded external source returned by a provider-hosted web search.",
+        "properties": {
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "type": {
+            "const": "url",
+            "default": "url",
+            "title": "Type",
+            "type": "string"
+          },
+          "url": {
+            "maxLength": 4096,
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "title": "WebSearchSource",
         "type": "object"
       }
     }
@@ -20042,6 +21025,60 @@
         "summary": "Get Eval Result"
       }
     },
+    "/api/evals/runs/{run_id}/scenario-approval": {
+      "post": {
+        "operationId": "submit_eval_scenario_approval_api_evals_runs__run_id__scenario_approval_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalScenarioApprovalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalRunRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Submit Eval Scenario Approval"
+      }
+    },
     "/api/evals/scenarios": {
       "get": {
         "operationId": "list_eval_scenarios_api_evals_scenarios_get",
@@ -20369,6 +21406,71 @@
           }
         },
         "summary": "Download Eval Scenario"
+      }
+    },
+    "/api/evals/scenarios/{scenario_revision}/runs": {
+      "post": {
+        "operationId": "launch_eval_scenario_api_evals_scenarios__scenario_revision__runs_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scenario_revision",
+            "required": true,
+            "schema": {
+              "title": "Scenario Revision",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 512,
+              "minLength": 1,
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalScenarioRunCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalRunRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Launch Eval Scenario"
       }
     },
     "/api/evals/sessions/{session_id}/evaluation/export": {

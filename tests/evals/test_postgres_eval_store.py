@@ -10,6 +10,7 @@ from tests.evals.eval_store_conformance import (
     assert_captured_eval_store_conformance,
     assert_eval_store_conformance,
     assert_eval_store_reconstruction_releases_heartbeat_capacity,
+    assert_scenario_progress_conformance,
     captured_result_for_corpus,
 )
 from tests.evals.test_corpus_execution import _corpus, _provider, _target
@@ -105,13 +106,14 @@ def test_postgres_eval_store_shared_conformance(postgres_dsn) -> None:
                 corpus=corpus,
                 result=result,
             )
+            await assert_scenario_progress_conformance(store, corpus=corpus)
         finally:
             await store.close()
 
     asyncio.run(exercise())
 
 
-def test_postgres_eval_store_creates_revision_fifty_three_schema(postgres_dsn) -> None:
+def test_postgres_eval_store_creates_revision_fifty_six_schema(postgres_dsn) -> None:
     async def exercise() -> None:
         import psycopg
 
@@ -131,7 +133,8 @@ def test_postgres_eval_store_creates_revision_fifty_three_schema(postgres_dsn) -
         ):
             await cur.execute(
                 "SELECT revision, kind, compatible_from FROM cayu_schema_migrations "
-                "WHERE revision IN (47, 48, 49, 50, 51, 52, 53) ORDER BY revision"
+                "WHERE revision IN (47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57) "
+                "ORDER BY revision"
             )
             assert await cur.fetchall() == [
                 (47, "breaking", 47),
@@ -141,6 +144,10 @@ def test_postgres_eval_store_creates_revision_fifty_three_schema(postgres_dsn) -
                 (51, "additive", 50),
                 (52, "breaking", 52),
                 (53, "additive", 52),
+                (54, "breaking", 54),
+                (55, "breaking", 55),
+                (56, "additive", 55),
+                (57, "breaking", 57),
             ]
             await cur.execute(
                 "SELECT data_type, is_nullable, column_default "
@@ -148,6 +155,13 @@ def test_postgres_eval_store_creates_revision_fifty_three_schema(postgres_dsn) -
                 "AND table_name = 'cayu_eval_runs' AND column_name = 'invocation_json'"
             )
             assert await cur.fetchone() == ("text", "NO", None)
+            await cur.execute(
+                "SELECT data_type, is_nullable, column_default "
+                "FROM information_schema.columns WHERE table_schema = current_schema() "
+                "AND table_name = 'cayu_eval_runs' "
+                "AND column_name = 'scenario_progress_json'"
+            )
+            assert await cur.fetchone() == ("text", "YES", None)
             await cur.execute(
                 """
                 SELECT pg_get_constraintdef(constraint_record.oid)

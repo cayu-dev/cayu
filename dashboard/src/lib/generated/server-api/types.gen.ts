@@ -3010,6 +3010,67 @@ export type ChildStatusAssertionSpec = {
 };
 
 /**
+ * CitationPart
+ *
+ * Provider-neutral citation annotation over assistant text.
+ */
+export type CitationPart = {
+    /**
+     * Citation Type
+     */
+    citation_type?: 'url_citation';
+    /**
+     * End Index
+     */
+    end_index?: number | null;
+    /**
+     * Model Attempt Id
+     */
+    model_attempt_id: string;
+    /**
+     * Model Step Id
+     */
+    model_step_id: string;
+    provenance: CitationProvenance;
+    /**
+     * Start Index
+     */
+    start_index?: number | null;
+    /**
+     * Title
+     */
+    title?: string | null;
+    /**
+     * Type
+     */
+    type?: 'citation';
+    /**
+     * Url
+     */
+    url: string;
+};
+
+/**
+ * CitationProvenance
+ *
+ * Trust label for provider-hosted citation evidence.
+ */
+export type CitationProvenance = {
+    /**
+     * Hosted Tool
+     */
+    hosted_tool?: 'web_search';
+    /**
+     * Provider Name
+     */
+    provider_name: string;
+    /**
+     * Untrusted External Evidence
+     */
+    untrusted_external_evidence?: true;
+};
+
+/**
  * ClientGenerationContract
  */
 export type ClientGenerationContract = {
@@ -3466,6 +3527,7 @@ export type EnqueueSessionMessageBody = {
      * Idempotency Key
      */
     idempotency_key: string;
+    message?: Message | null;
     requested_by?: ResolutionActor | null;
 };
 
@@ -4037,6 +4099,7 @@ export type EvalRunInvocation = {
      */
     max_steps?: number | null;
     origin?: InvocationOrigin | null;
+    scenario?: EvalScenarioRunInvocation | null;
     /**
      * Schema Version
      */
@@ -4099,6 +4162,7 @@ export type EvalRunRecord = {
     finished_at?: string | null;
     ownership?: EvalRunOwnership | null;
     result?: EvalRunResultSummary | null;
+    scenario_progress?: EvalScenarioRunProgress | null;
     spec: EvalRunSpec;
     /**
      * Started At
@@ -4170,6 +4234,56 @@ export type EvalRunSpec = {
 export type EvalRunStatus = 'queued' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
 
 /**
+ * EvalScenarioApprovalDecisionRecord
+ */
+export type EvalScenarioApprovalDecisionRecord = {
+    /**
+     * Actor Id
+     */
+    actor_id: string;
+    /**
+     * Decision
+     */
+    decision: 'approve' | 'deny';
+    /**
+     * Reason
+     */
+    reason?: string | null;
+    /**
+     * Submitted At
+     */
+    submitted_at: string;
+};
+
+/**
+ * EvalScenarioApprovalRequest
+ *
+ * Fresh operator decision CAS-bound to one live scenario checkpoint.
+ */
+export type EvalScenarioApprovalRequest = {
+    /**
+     * Decision
+     */
+    decision: 'approve' | 'deny';
+    /**
+     * Event Id
+     */
+    event_id: string;
+    /**
+     * Expected Progress Revision
+     */
+    expected_progress_revision: string;
+    /**
+     * Reason
+     */
+    reason?: string | null;
+    /**
+     * Trial Number
+     */
+    trial_number: number;
+};
+
+/**
  * EvalScenarioArtifactMaterializationRequest
  *
  * Explicit immutable fixture preparation bound to one reviewed revision.
@@ -4189,6 +4303,22 @@ export type EvalScenarioArtifactMaterializationRequest = {
 export type EvalScenarioArtifactMaterializationResponse = {
     materialization: ScenarioArtifactMaterializationV2;
     preflight: ScenarioLaunchPreflightResultV2;
+};
+
+/**
+ * EvalScenarioArtifactReference
+ *
+ * One immutable scenario requirement-to-artifact launch selection.
+ */
+export type EvalScenarioArtifactReference = {
+    /**
+     * Artifact Id
+     */
+    artifact_id: string;
+    /**
+     * Requirement Id
+     */
+    requirement_id: string;
 };
 
 /**
@@ -4377,6 +4507,85 @@ export type EvalScenarioPreviewResponse = {
 };
 
 /**
+ * EvalScenarioRunCreateRequest
+ *
+ * Launch one stored scenario only from the exact reviewed current binding.
+ */
+export type EvalScenarioRunCreateRequest = {
+    /**
+     * Expected Binding Revision
+     */
+    expected_binding_revision: string;
+    settings?: ScenarioLaunchSettingsV2;
+};
+
+/**
+ * EvalScenarioRunInvocation
+ *
+ * Authority-free scenario launch facts frozen into one durable run.
+ */
+export type EvalScenarioRunInvocation = {
+    /**
+     * Artifact References
+     */
+    artifact_references?: Array<EvalScenarioArtifactReference>;
+    /**
+     * Binding Revision
+     */
+    binding_revision: string;
+    /**
+     * Environment Name
+     */
+    environment_name?: string | null;
+    /**
+     * Scenario Revision
+     */
+    scenario_revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Timeout Seconds
+     */
+    timeout_seconds: number;
+    /**
+     * Trials
+     */
+    trials: number;
+};
+
+/**
+ * EvalScenarioRunProgress
+ */
+export type EvalScenarioRunProgress = {
+    /**
+     * Attempt
+     */
+    attempt: number;
+    /**
+     * Binding Revision
+     */
+    binding_revision: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Scenario Revision
+     */
+    scenario_revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Trials
+     */
+    trials: Array<EvalScenarioTrialProgress>;
+};
+
+/**
  * EvalScenarioSaveRequest
  *
  * One reviewed immutable revision; settings affect only returned preflight.
@@ -4397,6 +4606,53 @@ export type EvalScenarioSaveResponse = {
     entry: EvalScenarioCatalogEntry;
     preflight: ScenarioLaunchPreflightResultV2;
     scenario: EvalScenarioDocumentV2;
+};
+
+/**
+ * EvalScenarioTrialFailureCode
+ */
+export type EvalScenarioTrialFailureCode = 'execution_failed' | 'unexpected_session_state' | 'expected_approval_unavailable' | 'expected_user_input_unavailable';
+
+/**
+ * EvalScenarioTrialPhase
+ */
+export type EvalScenarioTrialPhase = 'pending' | 'running' | 'awaiting_approval' | 'awaiting_resume' | 'completed' | 'error';
+
+/**
+ * EvalScenarioTrialProgress
+ */
+export type EvalScenarioTrialProgress = {
+    approval?: EvalScenarioApprovalDecisionRecord | null;
+    failure_code?: EvalScenarioTrialFailureCode | null;
+    /**
+     * Next Event Sequence
+     */
+    next_event_sequence: number;
+    /**
+     * Pending Event Id
+     */
+    pending_event_id?: string | null;
+    /**
+     * Pending Input Id
+     */
+    pending_input_id?: string | null;
+    /**
+     * Pending Resume Kind
+     */
+    pending_resume_kind?: 'user_input' | 'manual_recovery' | null;
+    /**
+     * Pending Tool Name
+     */
+    pending_tool_name?: string | null;
+    phase: EvalScenarioTrialPhase;
+    /**
+     * Session Id
+     */
+    session_id?: string | null;
+    /**
+     * Trial Number
+     */
+    trial_number: number;
 };
 
 /**
@@ -4928,6 +5184,29 @@ export type ExecutionRequirements = {
 };
 
 /**
+ * FilePart
+ *
+ * User-supplied file input (image or document) for a multimodal request.
+ *
+ * `attachment` carries a JSON-safe `cayu.file_attachment.v1` payload
+ * referencing a stored artifact — never file bytes. The runtime resolves the
+ * artifact from the active ArtifactStore immediately before each provider
+ * request, exactly like tool-result attachments.
+ */
+export type FilePart = {
+    /**
+     * Attachment
+     */
+    attachment: {
+        [key: string]: unknown;
+    };
+    /**
+     * Type
+     */
+    type?: 'file';
+};
+
+/**
  * FinalOutputContainsAssertionSpec
  */
 export type FinalOutputContainsAssertionSpec = {
@@ -4989,6 +5268,47 @@ export type HealthResponse = {
      * Ok
      */
     ok: boolean;
+};
+
+/**
+ * HostedToolCallPart
+ *
+ * Terminal provider-hosted execution evidence in an assistant transcript.
+ */
+export type HostedToolCallPart = {
+    action?: WebSearchAction | null;
+    /**
+     * Call Id
+     */
+    call_id: string;
+    /**
+     * Hosted Tool
+     */
+    hosted_tool?: 'web_search';
+    /**
+     * Model
+     */
+    model: string;
+    /**
+     * Model Attempt Id
+     */
+    model_attempt_id: string;
+    /**
+     * Model Step Id
+     */
+    model_step_id: string;
+    /**
+     * Provider Name
+     */
+    provider_name: string;
+    /**
+     * Status
+     */
+    status: 'completed' | 'incomplete' | 'failed' | 'outcome_unknown';
+    /**
+     * Type
+     */
+    type?: 'hosted_tool_call';
 };
 
 /**
@@ -5264,6 +5584,28 @@ export type MaxTotalTokensAssertionSpec = {
      * Maximum
      */
     maximum: number;
+};
+
+/**
+ * Message
+ *
+ * Frozen transcript message.
+ *
+ * Messages and their parts are immutable once constructed: attribute
+ * assignment is rejected, `content` is a tuple, and every part entering the
+ * message is copied so the message exclusively owns its JSON payloads. The
+ * freeze is shallow, though — nested payload dicts stay mutable — so sharing
+ * a validated instance is safe only while every holder treats payloads as
+ * read-only. Hot-path `copy_message` "copies" are no-ops under that
+ * contract; `detach_message` produces a genuinely isolated copy for
+ * storage/trust boundaries, and `copy.deepcopy` isolates as well.
+ */
+export type Message = {
+    /**
+     * Content
+     */
+    content?: Array<TextPart | ToolCallPart | ToolResultPart | ProviderStatePart | ThinkingPart | FilePart | HostedToolCallPart | CitationPart>;
+    role: MessageRole;
 };
 
 /**
@@ -5942,6 +6284,26 @@ export type ProviderOperationResolutionBody = {
      * Stage Id
      */
     stage_id: string;
+};
+
+/**
+ * ProviderStatePart
+ */
+export type ProviderStatePart = {
+    /**
+     * Provider
+     */
+    provider: string;
+    /**
+     * State
+     */
+    state?: {
+        [key: string]: unknown;
+    };
+    /**
+     * Type
+     */
+    type?: 'provider_state';
 };
 
 /**
@@ -7154,6 +7516,10 @@ export type ScenarioQueuedInputEventV2 = {
  * ScenarioResumedInputEventV2
  *
  * Fresh caller input supplied when a scenario session is paused.
+ *
+ * ``manual_recovery`` is the scenario-v2 wire name for an ordinary explicit
+ * ``CayuApp.resume(...)`` interaction. It does not assert or synthesize the
+ * outcome of a runtime tool call whose external effect is unknown.
  */
 export type ScenarioResumedInputEventV2 = {
     /**
@@ -8089,6 +8455,20 @@ export type TaskStatusCounts = {
 };
 
 /**
+ * TextPart
+ */
+export type TextPart = {
+    /**
+     * Text
+     */
+    text: string;
+    /**
+     * Type
+     */
+    type?: 'text';
+};
+
+/**
  * ThinkingConfig
  *
  * Provider-neutral thinking/reasoning configuration.
@@ -8132,6 +8512,36 @@ export type ThinkingConfig = {
      * Max Tokens
      */
     max_tokens?: number | null;
+};
+
+/**
+ * ThinkingPart
+ *
+ * Model reasoning/thinking content from a single reasoning block.
+ *
+ * `text` may be empty (the provider returned the reasoning in an omitted/redacted
+ * form). `provider_state` carries the opaque round-trip payload — the Anthropic
+ * `signature` or `redacted_thinking` data, or an OpenAI encrypted reasoning blob —
+ * needed to send the block back to the provider on a later turn. Built-in providers
+ * tag opaque reasoning state with its provider family, protocol, and protocol version;
+ * request adapters replay it only when all three match. Legacy untagged state remains
+ * readable in the durable transcript but is not authoritative for opaque replay.
+ */
+export type ThinkingPart = {
+    /**
+     * Provider State
+     */
+    provider_state?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * Text
+     */
+    text?: string;
+    /**
+     * Type
+     */
+    type?: 'thinking';
 };
 
 /**
@@ -8304,6 +8714,42 @@ export type ToolApprovalRecoveryBody = {
 export type ToolApprovalRecoveryOutcome = 'completed' | 'failed';
 
 /**
+ * ToolCallPart
+ */
+export type ToolCallPart = {
+    /**
+     * Arguments
+     */
+    arguments?: {
+        [key: string]: unknown;
+    };
+    /**
+     * Model Attempt Id
+     */
+    model_attempt_id?: string | null;
+    /**
+     * Model Step Id
+     */
+    model_step_id?: string | null;
+    /**
+     * Tool Call Id
+     */
+    tool_call_id: string;
+    /**
+     * Tool Name
+     */
+    tool_name: string;
+    /**
+     * Tool Round Id
+     */
+    tool_round_id?: string | null;
+    /**
+     * Type
+     */
+    type?: 'tool_call';
+};
+
+/**
  * ToolCalledAssertionSpec
  */
 export type ToolCalledAssertionSpec = {
@@ -8373,6 +8819,56 @@ export type ToolManifest = {
      * Workspace Mutation
      */
     workspace_mutation?: boolean;
+};
+
+/**
+ * ToolResultPart
+ */
+export type ToolResultPart = {
+    /**
+     * Artifacts
+     */
+    artifacts?: Array<{
+        [key: string]: unknown;
+    }>;
+    /**
+     * Content
+     */
+    content?: string;
+    /**
+     * Is Error
+     */
+    is_error?: boolean;
+    /**
+     * Model Attempt Id
+     */
+    model_attempt_id?: string | null;
+    /**
+     * Model Step Id
+     */
+    model_step_id?: string | null;
+    /**
+     * Structured
+     */
+    structured?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * Tool Call Id
+     */
+    tool_call_id: string;
+    /**
+     * Tool Name
+     */
+    tool_name: string;
+    /**
+     * Tool Round Id
+     */
+    tool_round_id?: string | null;
+    /**
+     * Type
+     */
+    type?: 'tool_result';
 };
 
 /**
@@ -9235,6 +9731,58 @@ export type VersioningContract = {
      * Contract Version
      */
     contract_version?: string;
+};
+
+/**
+ * WebSearchAction
+ *
+ * Bounded provider-neutral terminal web-search action evidence.
+ */
+export type WebSearchAction = {
+    /**
+     * Pattern
+     */
+    pattern?: string | null;
+    /**
+     * Queries
+     */
+    queries?: Array<string>;
+    /**
+     * Query
+     */
+    query?: string | null;
+    /**
+     * Sources
+     */
+    sources?: Array<WebSearchSource>;
+    /**
+     * Type
+     */
+    type: 'search' | 'open_page' | 'find_in_page';
+    /**
+     * Url
+     */
+    url?: string | null;
+};
+
+/**
+ * WebSearchSource
+ *
+ * Bounded external source returned by a provider-hosted web search.
+ */
+export type WebSearchSource = {
+    /**
+     * Title
+     */
+    title?: string | null;
+    /**
+     * Type
+     */
+    type?: 'url';
+    /**
+     * Url
+     */
+    url: string;
 };
 
 export type ListAgentsApiAgentsGetData = {
@@ -10743,6 +11291,50 @@ export type GetEvalResultApiEvalsRunsRunIdResultGetResponses = {
 
 export type GetEvalResultApiEvalsRunsRunIdResultGetResponse = GetEvalResultApiEvalsRunsRunIdResultGetResponses[keyof GetEvalResultApiEvalsRunsRunIdResultGetResponses];
 
+export type SubmitEvalScenarioApprovalApiEvalsRunsRunIdScenarioApprovalPostData = {
+    body: EvalScenarioApprovalRequest;
+    path: {
+        /**
+         * Run Id
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/api/evals/runs/{run_id}/scenario-approval';
+};
+
+export type SubmitEvalScenarioApprovalApiEvalsRunsRunIdScenarioApprovalPostErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type SubmitEvalScenarioApprovalApiEvalsRunsRunIdScenarioApprovalPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalRunRecord;
+};
+
+export type SubmitEvalScenarioApprovalApiEvalsRunsRunIdScenarioApprovalPostResponse = SubmitEvalScenarioApprovalApiEvalsRunsRunIdScenarioApprovalPostResponses[keyof SubmitEvalScenarioApprovalApiEvalsRunsRunIdScenarioApprovalPostResponses];
+
 export type ListEvalScenariosApiEvalsScenariosGetData = {
     body?: never;
     path?: never;
@@ -11010,6 +11602,56 @@ export type DownloadEvalScenarioApiEvalsScenariosScenarioRevisionDownloadGetResp
      */
     200: unknown;
 };
+
+export type LaunchEvalScenarioApiEvalsScenariosScenarioRevisionRunsPostData = {
+    body: EvalScenarioRunCreateRequest;
+    headers: {
+        /**
+         * Idempotency-Key
+         */
+        'Idempotency-Key': string;
+    };
+    path: {
+        /**
+         * Scenario Revision
+         */
+        scenario_revision: string;
+    };
+    query?: never;
+    url: '/api/evals/scenarios/{scenario_revision}/runs';
+};
+
+export type LaunchEvalScenarioApiEvalsScenariosScenarioRevisionRunsPostErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type LaunchEvalScenarioApiEvalsScenariosScenarioRevisionRunsPostResponses = {
+    /**
+     * Successful Response
+     */
+    202: EvalRunRecord;
+};
+
+export type LaunchEvalScenarioApiEvalsScenariosScenarioRevisionRunsPostResponse = LaunchEvalScenarioApiEvalsScenariosScenarioRevisionRunsPostResponses[keyof LaunchEvalScenarioApiEvalsScenariosScenarioRevisionRunsPostResponses];
 
 export type ExportCapturedEvaluationApiEvalsSessionsSessionIdEvaluationExportPostData = {
     body: CapturedEvaluationExportRequest;

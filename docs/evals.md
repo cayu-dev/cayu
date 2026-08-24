@@ -531,8 +531,9 @@ The same suite/assertion surface supports several modes:
 - **Production replay** — promote a completed or failed durable session tree with
   `trajectory_from_session(...)`, then score or export the resulting `Trajectory` without running
   the application again. The Control Plane can persist this captured result and, for a simple
-  safely reconstructable invocation, launch a bounded fresh trial; multi-stage scenario replay is
-  a separate versioned contract.
+  safely reconstructable invocation, launch a bounded fresh trial. Scenario-v2 extends that path
+  to ordered queued input, explicit session resumes, `ask_user` answers, files, portable JSON, and
+  fresh approval checkpoints when current launch authority passes readiness preflight.
 
 ## Results and repeated trials
 
@@ -953,13 +954,40 @@ The protected API exposes the same bounded workflow at:
 - `POST /api/evals/scenarios/preview` for canonical draft compilation and
   side-effect-free current-authority preflight;
 - `POST /api/evals/scenarios` plus target-scoped `GET` catalog/detail/download
-  routes for immutable persistence; and
+  routes for immutable persistence;
 - `POST /api/evals/scenarios/artifacts/{requirement_id}/materialize` for the
-  explicit idempotent fixture operation.
+  explicit idempotent fixture operation;
+- `POST /api/evals/scenarios/{scenario_revision}/runs` to admit the exact saved
+  revision and reviewed binding as durable work; and
+- `POST /api/evals/runs/{run_id}/scenario-approval` to submit a fresh,
+  actor-attributed approve or deny decision for one current trial checkpoint.
 
-Scenario execution and fresh approval/resume recovery remain the next layer.
-They consume the reviewed scenario and preflight binding rather than placing
-runtime authority into the portable document.
+**Run scenario** executes the reviewed document through the target's ordinary
+`CayuApp` runtime. Initial, queued, resumed, file, and structured inputs retain
+their typed message shape; scenario approval decisions are never copied from a
+source session. The worker records each trial's bounded cursor and phase on the
+fenced eval claim. An approval pause, `ask_user` answer, or explicit session
+resume survives coordinator and runtime-store restart and continues the same
+durable session. All other interrupted stages begin a new attempt after claim
+loss rather than being presented as exactly resumed.
+
+The `manual_recovery` scenario-v2 wire value means an ordinary explicit
+`CayuApp.resume(...)` interaction captured or authored by the operator. It does
+not assert the outcome of an externally effectful tool whose result is unknown;
+that runtime condition still requires the normal application-owned recovery
+contract and is not portable scenario input.
+
+Cancellation remains store-authoritative while a trial is running or awaiting
+approval. Claim epochs fence progress and result publication, so a stale worker
+cannot publish after ownership changes. This does not make provider billing or
+external tool effects exactly once: work dispatched immediately before lease
+loss may be repeated unless the provider or tool uses its own durable
+idempotency/reconciliation contract.
+
+Scenario runs publish the same `CorpusExecutionResult` shape as corpus-v1 runs.
+Their JSON and HTML downloads therefore work with `cayu eval report` and
+`cayu eval compare`, including the existing stable CI exit codes; no separate
+scenario-only result format or execution engine exists.
 
 ### Durable eval catalog and run state
 
@@ -970,7 +998,11 @@ claims; `InMemoryEvalStore` is intentionally process-local and is suitable for
 tests and transient SDK workflows only. SQLite and PostgreSQL require storage
 schema revision 50 for corpora and run state, and revision 53 for scenario
 persistence. Session-backed production capture additionally requires revision
-54. Corpus and scenario saves, run admission, and result publication require
+54. Controlled scenario progress and operator decisions require additive
+revision 56. Typed queued messages, including file references used by a running
+scenario, require breaking revision 57; stop older session workers before
+migration because they would deliver only the text projection. Corpus and
+scenario saves, run admission, and result publication require
 the active application's complete JSON redaction boundary. A configured
 workload secret or redaction failure rejects before any write; the store never
 retains the redaction function or secret registry.

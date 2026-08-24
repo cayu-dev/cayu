@@ -1013,6 +1013,7 @@ def _scenario_events(
                 ScenarioResumedInputEventV2(
                     sequence=sequence,
                     id=event_id,
+                    resume_kind="manual_recovery",
                     input=scenario_input,
                 )
             )

@@ -531,6 +531,7 @@ from cayu.runtime.sessions import (
     execution_profile_adoption_request_fingerprint,
     fork_session_invocation,
     model_completion_stage_settlement_request,
+    queued_session_message_input,
     run_request_authority_is_runtime_generated,
     run_request_with_task_invocation,
     runtime_prepared_session_authority,
@@ -8251,8 +8252,7 @@ class SessionEngine:
             if eligible_through is None:
                 eligible_through = batch.eligible_through
             messages.extend(
-                Message.text(MessageRole.USER, queued_message.content)
-                for queued_message in batch.messages
+                queued_session_message_input(queued_message) for queued_message in batch.messages
             )
             if batch.messages and not continue_active_interaction:
                 _activate_session_interaction(session_id, delivery_interaction_id)

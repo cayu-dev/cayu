@@ -1409,6 +1409,23 @@ class EvalScenarioArtifactMaterializationResponse(ApiBaseModel):
     preflight: ScenarioLaunchPreflightResultV2
 
 
+class EvalScenarioRunCreateRequest(ApiBaseModel):
+    """Launch one stored scenario only from the exact reviewed current binding."""
+
+    expected_binding_revision: EvalRevision
+    settings: ScenarioLaunchSettingsV2 = Field(default_factory=ScenarioLaunchSettingsV2)
+
+
+class EvalScenarioApprovalRequest(ApiBaseModel):
+    """Fresh operator decision CAS-bound to one live scenario checkpoint."""
+
+    expected_progress_revision: EvalRevision
+    trial_number: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
+    event_id: PromotionPortableId
+    decision: Literal["approve", "deny"]
+    reason: StrictStr | None = Field(default=None, min_length=1, max_length=2_048)
+
+
 class EvalBaselineSelectionRequest(ApiBaseModel):
     result_revision: EvalRevision
     expected_generation: StrictInt = Field(ge=0, le=9_223_372_036_854_775_807)

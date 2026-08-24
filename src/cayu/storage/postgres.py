@@ -53,7 +53,7 @@ from cayu.core.events import (
     EventType,
     event_with_runtime_payload_authority,
 )
-from cayu.core.messages import Message, MessageRole
+from cayu.core.messages import Message
 from cayu.core.runtime_authority import CheckpointValueAuthority
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.embeddings import (
@@ -406,8 +406,10 @@ from cayu.runtime.sessions import (
     encode_session_lineage_cursor,
     encode_transcript_search_cursor,
     enforce_pending_action_result_size,
+    enqueue_session_message_input,
     filter_transcript_records,
     fork_transcript_is_accepted,
+    queued_session_message_input,
     replace_session_user_metadata,
     resolve_interaction_attribution,
     restore_persisted_event_authority,
@@ -896,7 +898,7 @@ _SESSION_MESSAGE_QUEUE_COLUMNS = (
     "ordering_key, queue_id, session_id, idempotency_key, content, delivery_mode, status, "
     "requested_by, accepted_run_epoch, accepted_transcript_cursor, accepted_event_id, "
     "accepted_at, delivered_run_epoch, delivered_transcript_cursor, delivered_event_id, "
-    "delivered_at"
+    "delivered_at, message_json"
 )
 
 
@@ -908,6 +910,7 @@ def _queued_session_message_from_row(row: Any) -> SessionQueuedMessage:
         session_id=row[2],
         idempotency_key=row[3],
         content=row[4],
+        message=(None if row[16] is None else Message.model_validate(_json_obj(row[16]))),
         delivery_mode=row[5],
         status=row[6],
         requested_by=(
@@ -1223,6 +1226,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
             session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
             idempotency_key TEXT NOT NULL,
             content TEXT NOT NULL,
+            message_json JSONB,
             delivery_mode TEXT NOT NULL,
             status TEXT NOT NULL,
             requested_by JSONB,
@@ -2557,6 +2561,13 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         )
         """,
     ),
+    56: (
+        "ALTER TABLE cayu_eval_runs ADD COLUMN IF NOT EXISTS "
+        "scenario_progress_json TEXT CHECK (scenario_progress_json IS NULL OR "
+        "(octet_length(scenario_progress_json) BETWEEN 1 AND 262144 AND "
+        "scenario_progress_json::jsonb IS NOT NULL))",
+    ),
+    57: ("ALTER TABLE cayu_session_message_queue ADD COLUMN IF NOT EXISTS message_json JSONB",),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -3972,6 +3983,10 @@ class _PostgresStoreBase:
                             await self._validate_eval_scenario_schema(cur)
                         if self._min_required_revision >= 55:
                             await self._validate_task_retry_reconciliation_schema(cur)
+                        if self._min_required_revision >= 56:
+                            await self._validate_eval_run_scenario_progress_column(cur)
+                        if self._min_required_revision >= 57:
+                            await self._validate_session_message_queue_typed_message_column(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -4150,6 +4165,10 @@ class _PostgresStoreBase:
             await self._validate_eval_scenario_schema(cur)
         if self._min_required_revision >= 55:
             await self._validate_task_retry_reconciliation_schema(cur)
+        if self._min_required_revision >= 56:
+            await self._validate_eval_run_scenario_progress_column(cur)
+        if self._min_required_revision >= 57:
+            await self._validate_session_message_queue_typed_message_column(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -4246,6 +4265,10 @@ class _PostgresStoreBase:
             await self._validate_eval_scenario_schema(cur)
         if revision.revision == 55:
             await self._validate_task_retry_reconciliation_schema(cur)
+        if revision.revision == 56:
+            await self._validate_eval_run_scenario_progress_column(cur)
+        if revision.revision == 57:
+            await self._validate_session_message_queue_typed_message_column(cur)
 
     async def _validate_transcript_search_document_column(self, cur: Any) -> None:
         await cur.execute(
@@ -5485,6 +5508,41 @@ class _PostgresStoreBase:
                 "Postgres schema object 'cayu_eval_runs.invocation_json' conflicts "
                 "with Cayu's revision-50 durable eval invocation contract. Run "
                 "`cayu storage migrate` or restore the database from a known-good backup."
+            )
+
+    async def _validate_eval_run_scenario_progress_column(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT data_type, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_eval_runs'
+              AND column_name = 'scenario_progress_json'
+            """
+        )
+        if await cur.fetchone() != ("text", "YES", None):
+            raise RuntimeError(
+                "Postgres schema object 'cayu_eval_runs.scenario_progress_json' "
+                "conflicts with Cayu's revision-56 controlled-scenario execution "
+                "contract. Run `cayu storage migrate` or restore the database from "
+                "a known-good backup."
+            )
+
+    async def _validate_session_message_queue_typed_message_column(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT data_type, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_session_message_queue'
+              AND column_name = 'message_json'
+            """
+        )
+        if await cur.fetchone() != ("jsonb", "YES", None):
+            raise RuntimeError(
+                "Postgres schema object 'cayu_session_message_queue.message_json' "
+                "conflicts with Cayu's revision-57 typed queued-message contract. "
+                "Run `cayu storage migrate` or restore the database from a known-good backup."
             )
 
     async def _validate_memory_evidence_schema(self, cur: Any) -> None:
@@ -18292,12 +18350,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     await cur.execute(
                         """
                         INSERT INTO cayu_session_message_queue (
-                            queue_id, session_id, idempotency_key, content,
+                            queue_id, session_id, idempotency_key, content, message_json,
                             delivery_mode, status, requested_by,
                             accepted_run_epoch, accepted_transcript_cursor,
                             accepted_event_id, accepted_at
                         )
-                        VALUES (%s, %s, %s, %s, %s, 'queued', %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, 'queued', %s, %s, %s, %s, %s)
                         RETURNING ordering_key
                         """,
                         (
@@ -18305,6 +18363,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             request.session_id,
                             request.idempotency_key,
                             request.content,
+                            (
+                                None
+                                if request.message is None
+                                else _dumps(request.message.model_dump(mode="json"))
+                            ),
                             str(request.delivery_mode),
                             (
                                 None
@@ -18321,7 +18384,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     if ordering_row is None:
                         raise RuntimeError("Postgres queue insert did not return an ordering key.")
                     ordering_key = ordering_row[0]
-                    accepted_message = Message.text(MessageRole.USER, request.content)
+                    accepted_message = enqueue_session_message_input(request)
                     accepted_event = event_with_runtime_payload_authority(
                         Event(
                             id=accepted_event_id,
@@ -18594,10 +18657,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     for offset, row in enumerate(rows, start=1):
                         queued_message = _queued_session_message_from_row(row)
                         delivered_cursor = transcript_cursor + offset
-                        delivered_message = Message.text(
-                            MessageRole.USER,
-                            queued_message.content,
-                        )
+                        delivered_message = queued_session_message_input(queued_message)
                         delivery_event = event_with_runtime_payload_authority(
                             Event(
                                 type=EventType.SESSION_MESSAGE_DELIVERED,

@@ -19,6 +19,7 @@ import {
   MAX_EVAL_CORPUS_FILE_BYTES,
   preflightEvalCorpusFile,
   retryEvalQuery,
+  scenarioEvalLaunchRequestIdentity,
   shortEvalIdentity,
 } from "../src/lib/evals-dashboard.ts"
 
@@ -169,6 +170,15 @@ test("eval launch retries reuse their key across page reloads until reconciled",
 
   new EvalLaunchIdempotencyRegistry(storage, "/api").resolve(identity)
   assert.notEqual(new EvalLaunchIdempotencyRegistry(storage, "/api").keyFor(identity), originalKey)
+})
+
+test("scenario launch retry identity binds the immutable scenario and reviewed binding", () => {
+  const identity = scenarioEvalLaunchRequestIdentity("sha256:scenario", "sha256:binding")
+  assert.equal(identity, '["scenario-v2","sha256:scenario","sha256:binding"]')
+  assert.notEqual(
+    identity,
+    scenarioEvalLaunchRequestIdentity("sha256:scenario", "sha256:new-binding"),
+  )
 })
 
 test("captured eval retry identities include every execution contraction", () => {

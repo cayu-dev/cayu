@@ -242,6 +242,7 @@ def test_capture_reconstructs_initial_and_resumed_input_with_durable_proof(
     assert captured.diagnostics == ()
     assert captured.scenario is not None
     assert [event.kind for event in captured.scenario.events] == ["initial", "resumed"]
+    assert captured.scenario.events[1].resume_kind == "manual_recovery"  # type: ignore[union-attr]
     assert [
         event.input.messages[0].content[0].text  # type: ignore[union-attr]
         for event in captured.scenario.events

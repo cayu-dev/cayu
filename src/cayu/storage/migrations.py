@@ -317,6 +317,15 @@ REVISIONS: tuple[Revision, ...] = (
     # task workers do not maintain that registry, so mixed-version task writers
     # could accept changed evidence under a previously rejected key.
     Revision(revision=55, kind=RevisionKind.BREAKING, compatible_from=55),
+    # Controlled scenario runs persist their resumable execution cursor and any
+    # operator approval against the fenced eval-run claim. Revision-55 writers
+    # ignore the nullable column, so this is an additive compatibility step;
+    # scenario-aware EvalStore implementations require revision 56 explicitly.
+    Revision(revision=56, kind=RevisionKind.ADDITIVE, compatible_from=55),
+    # Typed queued user messages retain multimodal artifact references across
+    # durable delivery. Pre-57 workers would ignore that payload and deliver
+    # only its text projection, so mixed-version session workers are unsafe.
+    Revision(revision=57, kind=RevisionKind.BREAKING, compatible_from=57),
 )
 
 #: The revision an empty database is initialized to.

@@ -425,6 +425,7 @@ _BASELINE_DDL = """
         session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
         idempotency_key TEXT NOT NULL,
         content TEXT NOT NULL,
+        message_json TEXT CHECK (message_json IS NULL OR json_valid(message_json)),
         delivery_mode TEXT NOT NULL,
         status TEXT NOT NULL,
         requested_by_json TEXT,
@@ -1118,6 +1119,7 @@ _MIGRATION_STEPS: dict[int, str] = {
             session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
             idempotency_key TEXT NOT NULL,
             content TEXT NOT NULL,
+            message_json TEXT CHECK (message_json IS NULL OR json_valid(message_json)),
             delivery_mode TEXT NOT NULL,
             status TEXT NOT NULL,
             requested_by_json TEXT,
@@ -2626,6 +2628,8 @@ _MIGRATION_STEPS: dict[int, str] = {
             PRIMARY KEY (task_id, reconciliation_idempotency_key)
         );
     """,
+    56: "",
+    57: "",
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -2715,6 +2719,22 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
             "file_attachment_attestations_runtime_owned",
             "INTEGER NOT NULL DEFAULT 0 CHECK "
             "(file_attachment_attestations_runtime_owned IN (0, 1))",
+        ),
+    ),
+    56: (
+        (
+            "cayu_eval_runs",
+            "scenario_progress_json",
+            "TEXT CHECK (scenario_progress_json IS NULL OR "
+            "(json_valid(scenario_progress_json) AND "
+            "length(CAST(scenario_progress_json AS BLOB)) BETWEEN 1 AND 262144))",
+        ),
+    ),
+    57: (
+        (
+            "cayu_session_message_queue",
+            "message_json",
+            "TEXT CHECK (message_json IS NULL OR json_valid(message_json))",
         ),
     ),
 }
@@ -3800,6 +3820,10 @@ def reconcile_schema(
         _validate_eval_scenario_schema(connection)
     if app_min_supported >= 55:
         _validate_task_retry_reconciliation_schema(connection)
+    if app_min_supported >= 56:
+        _validate_eval_run_scenario_progress_column(connection)
+    if app_min_supported >= 57:
+        _validate_session_message_queue_typed_message_column(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -5399,6 +5423,34 @@ def _validate_eval_run_invocation_column(connection: sqlite3.Connection) -> None
         )
 
 
+def _validate_eval_run_scenario_progress_column(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]))
+        for row in connection.execute("PRAGMA table_info(cayu_eval_runs)")
+    }
+    if columns.get("scenario_progress_json") != ("TEXT", 0):
+        raise RuntimeError(
+            "SQLite schema object 'cayu_eval_runs.scenario_progress_json' conflicts "
+            "with Cayu's revision-56 controlled-scenario execution contract. Run "
+            "`cayu storage migrate` or restore the database from a known-good backup."
+        )
+
+
+def _validate_session_message_queue_typed_message_column(
+    connection: sqlite3.Connection,
+) -> None:
+    columns = {
+        str(row[1]): (str(row[2]).upper(), int(row[3]))
+        for row in connection.execute("PRAGMA table_info(cayu_session_message_queue)")
+    }
+    if columns.get("message_json") != ("TEXT", 0):
+        raise RuntimeError(
+            "SQLite schema object 'cayu_session_message_queue.message_json' conflicts "
+            "with Cayu's revision-57 typed queued-message contract. Run "
+            "`cayu storage migrate` or restore the database from a known-good backup."
+        )
+
+
 def _validate_memory_evidence_schema(connection: sqlite3.Connection) -> None:
     expected_columns = {
         "cayu_recall_receipts": (
@@ -5912,6 +5964,10 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_eval_scenario_schema(connection)
         if rev.revision == 55:
             _validate_task_retry_reconciliation_schema(connection)
+        if rev.revision == 56:
+            _validate_eval_run_scenario_progress_column(connection)
+        if rev.revision == 57:
+            _validate_session_message_queue_typed_message_column(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

@@ -72,6 +72,7 @@ import {
   fetchEvalTargets,
   importEvalCorpus,
   selectEvalBaseline,
+  submitEvalScenarioApproval,
 } from "@/lib/api"
 import { dashboardConfig } from "@/lib/config"
 import { dashboardCapabilityUnavailableText } from "@/lib/dashboard-capabilities"
@@ -99,7 +100,7 @@ import {
 } from "@/lib/evals-readiness"
 import { type EvalsSearch, evalResultRevisionIsValid, evalsSearchWithout } from "@/lib/evals-search"
 import { formatBytes, formatCount, formatDateTime } from "@/lib/format"
-import type { EvalsReadiness } from "@/lib/generated/server-api"
+import type { EvalScenarioTrialProgress, EvalsReadiness } from "@/lib/generated/server-api"
 
 const PAGE_LIMIT = 25
 type UpdateEvalsSearch = (next: (current: EvalsSearch) => EvalsSearch) => Promise<void>
@@ -726,7 +727,7 @@ function ScenarioCatalog({
               retry={() => void selected.refetch()}
             />
           ) : selected.data ? (
-            <ScenarioAuthoring captured={selected.data} disabled={!mutateEnabled} />
+            <ScenarioAuthoring captured={selected.data} disabled={!mutateEnabled} saved />
           ) : (
             <StateMessage>Select a scenario revision to inspect and edit it.</StateMessage>
           )}
@@ -1579,6 +1580,42 @@ function RunsView({
     })
   }
 
+  const decideScenarioApproval = (
+    trial: EvalScenarioTrialProgress,
+    decision: "approve" | "deny",
+  ) => {
+    const run = selectedRun.data
+    const progress = run?.scenario_progress
+    if (
+      !run ||
+      !progress ||
+      trial.phase !== "awaiting_approval" ||
+      !trial.pending_event_id ||
+      trial.approval ||
+      pendingAction !== null ||
+      !mutateEnabled
+    ) {
+      return
+    }
+    const actionName = `scenario-approval:${trial.trial_number}:${decision}`
+    void runAction(actionName, async (signal) => {
+      const updated = await submitEvalScenarioApproval(
+        run.spec.run_id,
+        {
+          expected_progress_revision: progress.revision,
+          trial_number: trial.trial_number,
+          event_id: trial.pending_event_id ?? "",
+          decision,
+        },
+        signal,
+      )
+      if (signal.aborted) return
+      queryClient.setQueryData(["evals", "run", run.spec.run_id], updated)
+      await queryClient.invalidateQueries({ queryKey: ["evals", "runs"] })
+      return `${decision === "approve" ? "Approved" : "Denied"} trial ${trial.trial_number}'s fresh tool request.`
+    })
+  }
+
   const downloadResult = (format: "json" | "html") => {
     const runId = selectedRun.data?.spec.run_id
     if (!runId || !result.data || pendingAction !== null) return
@@ -1742,8 +1779,10 @@ function RunsView({
           <RunLifecycleCard
             run={selectedRun.data}
             cancelling={pendingAction === "cancel-run"}
+            pendingAction={pendingAction}
             canMutate={mutateEnabled}
             cancel={cancelRun}
+            decideScenarioApproval={decideScenarioApproval}
           />
           {evalRunHasResult(selectedRun.data) &&
             (result.isLoading ? (
@@ -1790,14 +1829,19 @@ function RunsView({
 function RunLifecycleCard({
   run,
   cancelling,
+  pendingAction,
   canMutate,
   cancel,
+  decideScenarioApproval,
 }: {
   run: EvalRun
   cancelling: boolean
+  pendingAction: string | null
   canMutate: boolean
   cancel: () => void
+  decideScenarioApproval: (trial: EvalScenarioTrialProgress, decision: "approve" | "deny") => void
 }) {
+  const scenarioInvocation = run.spec.invocation?.scenario
   return (
     <DataCard
       title={
@@ -1828,7 +1872,79 @@ function RunLifecycleCard({
         <RunFact label="Created" value={formatDateTime(run.created_at)} />
         <RunFact label="Started" value={formatDateTime(run.started_at)} />
         <RunFact label="Finished" value={formatDateTime(run.finished_at)} />
+        {scenarioInvocation && (
+          <>
+            <RunFact
+              label="Scenario"
+              value={shortEvalIdentity(scenarioInvocation.scenario_revision)}
+            />
+            <RunFact label="Trials" value={formatCount(scenarioInvocation.trials)} />
+          </>
+        )}
       </div>
+      {run.scenario_progress && (
+        <div className="space-y-2 border-t border-border p-4" data-testid="scenario-run-progress">
+          <div className="text-sm font-medium">Scenario trial progress</div>
+          {run.scenario_progress.trials.map((trial) => {
+            const approvalPending =
+              pendingAction === `scenario-approval:${trial.trial_number}:approve` ||
+              pendingAction === `scenario-approval:${trial.trial_number}:deny`
+            return (
+              <div
+                key={trial.trial_number}
+                className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-border bg-muted/20 p-3 text-sm"
+              >
+                <div>
+                  <span className="font-medium">Trial {trial.trial_number}</span>
+                  <span className="ml-2 text-muted-foreground">
+                    {trial.phase.replaceAll("_", " ")} · event {trial.next_event_sequence}
+                  </span>
+                  {trial.pending_tool_name && (
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      Fresh approval required for {trial.pending_tool_name}.
+                    </div>
+                  )}
+                  {trial.failure_code && (
+                    <div className="mt-1 text-xs text-destructive">
+                      {trial.failure_code.replaceAll("_", " ")}
+                    </div>
+                  )}
+                </div>
+                {trial.phase === "awaiting_approval" && !trial.approval && (
+                  <div className="flex gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={!canMutate || pendingAction !== null}
+                      onClick={() => decideScenarioApproval(trial, "deny")}
+                    >
+                      {approvalPending ? <LoaderCircle className="animate-spin" /> : <Ban />}
+                      Deny
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      disabled={!canMutate || pendingAction !== null}
+                      onClick={() => decideScenarioApproval(trial, "approve")}
+                    >
+                      {approvalPending ? (
+                        <LoaderCircle className="animate-spin" />
+                      ) : (
+                        <CheckCircle2 />
+                      )}
+                      Approve
+                    </Button>
+                  </div>
+                )}
+                {trial.approval && (
+                  <Badge variant="secondary">{trial.approval.decision} submitted</Badge>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
       {run.cancel_requested_at && (
         <div className="border-t border-border px-4 py-3 text-sm text-amber-700 dark:text-amber-300">
           Cancellation requested {formatDateTime(run.cancel_requested_at)}.

@@ -10,11 +10,13 @@ from tests.core._execution_profile_fixtures import (
     versioned_test_provider_identity,
 )
 
+from cayu.artifacts import FileAttachment, FileAttachmentKind
 from cayu.core import (
     AgentSpec,
     Event,
     EventType,
     ExecutionProfileBehaviorIdentity,
+    FilePart,
     Message,
     MessageRole,
 )
@@ -1305,10 +1307,25 @@ def test_sqlite_queue_reconstructs_and_delivers_once_after_reopen(tmp_path) -> N
             ),
             identity=SessionIdentity(provider_name="fake", model="fake-model"),
         )
+        typed_message = Message(
+            role=MessageRole.USER,
+            content=(
+                FilePart(
+                    attachment=FileAttachment(
+                        artifact_id="artifact:queued-document",
+                        kind=FileAttachmentKind.DOCUMENT,
+                        filename="contract.pdf",
+                        content_type="application/pdf",
+                        size_bytes=128,
+                    ).model_dump(mode="json")
+                ),
+            ),
+        )
         request = EnqueueSessionMessageRequest(
             session_id="sess_queue_sqlite",
             idempotency_key="sqlite-queue-1",
-            content="survive restart",
+            content="Attached file: contract.pdf",
+            message=typed_message,
             delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
         )
         accepted = await store.enqueue_session_message(request)
@@ -1334,9 +1351,10 @@ def test_sqlite_queue_reconstructs_and_delivers_once_after_reopen(tmp_path) -> N
             )
 
             assert [message.queue_id for message in batch.messages] == [accepted.message.queue_id]
+            assert batch.messages[0].message == typed_message
             assert retry.messages == ()
             transcript = await reopened.load_transcript(request.session_id)
-            assert transcript[-1].content[0].text == "survive restart"  # type: ignore[union-attr]
+            assert transcript[-1] == typed_message
         finally:
             await reopened.close()
 

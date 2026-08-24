@@ -44,6 +44,7 @@ import type {
   EvalRunPage,
   EvalRunRecord,
   EvalRunStatus,
+  EvalScenarioApprovalRequest,
   EvalScenarioArtifactMaterializationRequest,
   EvalScenarioArtifactMaterializationResponse,
   EvalScenarioCatalogEntry,
@@ -52,6 +53,7 @@ import type {
   EvalScenarioDraftV2,
   EvalScenarioPreviewRequest,
   EvalScenarioPreviewResponse,
+  EvalScenarioRunCreateRequest,
   EvalScenarioSaveRequest,
   EvalScenarioSaveResponse,
   EvalSuiteCatalogPage,
@@ -235,6 +237,8 @@ export type EvalScenarioSave = EvalScenarioSaveRequest
 export type EvalScenarioSaved = EvalScenarioSaveResponse
 export type EvalScenarioArtifactPreparation = EvalScenarioArtifactMaterializationRequest
 export type EvalScenarioArtifactPrepared = EvalScenarioArtifactMaterializationResponse
+export type EvalScenarioRunLaunch = EvalScenarioRunCreateRequest
+export type EvalScenarioApproval = EvalScenarioApprovalRequest
 export type EvalScenarioEntry = EvalScenarioCatalogEntry
 export type EvalScenariosPage = EvalScenarioCatalogPage
 export type EvalCorporaQuery = NonNullable<ListEvalCorporaApiEvalsCorporaGetData["query"]>
@@ -665,6 +669,32 @@ export async function downloadEvalScenario(
     "cayu-eval-scenario.json",
     signal,
   )
+}
+
+export async function launchEvalScenario(
+  scenarioRevision: string,
+  body: EvalScenarioRunLaunch,
+  idempotencyKey: string,
+  signal?: AbortSignal,
+): Promise<EvalRun> {
+  return requestJson<EvalRun>(`/evals/scenarios/${encodeURIComponent(scenarioRevision)}/runs`, {
+    method: "POST",
+    headers: { "Idempotency-Key": idempotencyKey },
+    body: JSON.stringify(body),
+    signal,
+  })
+}
+
+export async function submitEvalScenarioApproval(
+  runId: string,
+  body: EvalScenarioApproval,
+  signal?: AbortSignal,
+): Promise<EvalRun> {
+  return requestJson<EvalRun>(`/evals/runs/${encodeURIComponent(runId)}/scenario-approval`, {
+    method: "POST",
+    body: JSON.stringify(body),
+    signal,
+  })
 }
 
 export async function fetchEvalSuites(
