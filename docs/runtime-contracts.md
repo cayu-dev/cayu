@@ -8621,3 +8621,93 @@ session/trajectory, workspace, and environment-fixture identities; applies
 separate body-policy and recall-policy mutations in private overlays; runs two
 identical hidden-case schedules; starts a fresh interpreter for recovery; and
 emits machine-readable lineage plus a review-only recommendation.
+
+## Portable memory intervention evidence
+
+`MemoryInterventionSpec` is Cayu's memory-specific bridge between an immutable
+`AgentSnapshot` and one fixed intervention. It is not an experiment manifest or
+runner. Generic corpus, case, evaluator, provider/model, pricing, budget,
+cohort, gate, selection, search, and recommendation contracts remain in Cayu
+Evals or in the caller. Cayu does not import Compound.
+
+Schema version 1 has exactly five intervention kinds: `as_declared`,
+`automatic_recall_off`, `omit_items`, `replace_items`, and
+`negative_control`. `as_declared` is an explicit baseline identity.
+`automatic_recall_off` binds both the frozen policy it replaces and the exact
+`AutomaticRecallPolicy` whose mode is `off`. The supplied starting policy must
+match the snapshot's exact recall-policy frontier; a foreign but otherwise valid
+policy fails before the spec is created or imported. The other three kinds bind
+sorted, bounded revision identities or scoped item aliases. Replacement and
+negative control content is carried only as immutable fixture id, content
+fingerprint, representation fingerprint, and byte count; portable records have no recalled
+text or mutable store location. Item declarations also bind proposer, source,
+reason, authority scope, and hard item/fixture/effect-receipt bounds. Unknown
+versions, kinds, mixed change kinds, duplicate identities, non-canonical
+ordering, oversized JSON, and fingerprint disagreement fail closed.
+
+Before an executor changes an evaluation overlay, it creates a
+`MemoryInterventionOperation` from the spec, exact
+`AgentSnapshotMaterialization`, and exact `AgentSnapshotTrialBinding`. The
+operation's `operation_id` is its canonical fingerprint and precommits the
+candidate, materialization, memory overlay, state scope, trial mode, case, and
+trial. The [downstream intervention-executor issue](https://github.com/cayu-tech/cayu/issues/1095)
+owns application of that operation through the canonical recall and
+AgentSnapshot memory-overlay seams.
+
+After the application-owned effect, `MemoryInterventionReceipt.create(...)`
+emits deterministic evidence for `verified_no_change`, `applied`,
+`matched_no_items`, `indeterminate`, or `conflicting`. Exact replay inputs
+therefore reproduce the same receipt. Indeterminate and conflicting receipts
+cannot carry successful effect identities. `matched_no_items` is a proven
+item-match outcome, not an empty successful omission inferred from missing
+evidence. Every `applied` effect fingerprint has application-owned receipt
+proof; zero or partial receipt coverage fails closed. Receipts contain only
+resulting state/policy/effect fingerprints and bounded application receipt
+references. They never activate, reward, demote, expire, consolidate, delete,
+or otherwise change production knowledge.
+
+`MemoryInterventionTrialBinding` reuses the complete existing
+`AgentSnapshotTrialBinding`, `AgentSnapshotResultBinding`, and
+`MemoryAttribution` records. Its canonical attribution fingerprint must equal
+`AgentSnapshotResultBinding.memory_evidence_fingerprint`. The
+`proves_no_memory_exposure` property is true only for complete attribution with
+zero observed receipts, exposures, and items. That observation remains
+distinct from a recall-off spec, a no-match receipt, and `truncated`,
+`unavailable`, `redacted`, or `contradictory` attribution.
+
+`MemoryInterventionComparability` compares only the memory-specific boundary.
+Its closed mismatch reasons cover starting memory state, intervention identity,
+recall policy, materialization/overlay isolation, changed-item revisions, trial
+mode, and required attribution availability. Changed-item comparison requires
+the exact declared revision set, so partial application is not comparable. The
+record always states that generic experiment comparability is still required;
+it does not normalize or judge corpus, case, evaluator, provider/model, price,
+budget, cohort, gate, or selection differences. Higher layers attach cost and
+quality evidence using the existing `PairedCostQualityComparisonRequest` and
+`PairedCostQualityComparisonReport`; the intervention records clone none of
+their attempt, usage, price, retry, quality, or aggregate fields.
+
+A provider-neutral caller maps its own declarations as follows:
+
+```text
+frozen memory/profile baseline       -> as_declared spec
+same baseline + exact OFF policy     -> automatic_recall_off spec
+revision-bound item aliases/digests  -> omit_items changes
+source revisions + fixture digests   -> replace_items changes
+bounded control fixture digests      -> negative_control changes
+private overlay effect               -> MemoryInterventionReceipt
+trial result + attribution projection-> MemoryInterventionTrialBinding
+```
+
+The Compound adapter owned outside Cayu maps the same records without adding a
+dependency in either direction:
+
+```text
+Compound baseline                          -> Cayu as_declared spec
+Compound PolicySurface / recall OFF        -> Cayu automatic_recall_off spec
+Compound KnowledgeOverlaySurface + OMIT    -> Cayu omit_items spec
+Compound KnowledgeOverlaySurface + REPLACE -> Cayu replace_items spec
+Compound CandidateMutationApplier          -> Cayu downstream intervention executor
+Cayu MemoryInterventionReceipt              -> Compound CandidateApplicationReceipt
+Cayu trial attribution/result               -> Compound CanonicalTrialEvaluator / TrialEvidence
+```

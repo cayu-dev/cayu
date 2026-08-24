@@ -89,6 +89,18 @@ guard.
 
 ## Unreleased
 
+### Memory interventions have portable, effect-bound evidence contracts
+
+Applications can now declare an explicit `as_declared`, recall-off, omission,
+replacement, or negative-control intervention against one exact
+`AgentSnapshot` memory frontier. Canonical precommitment, effect receipt, trial
+attribution, and memory-specific comparability records bind isolated overlays
+without carrying recalled text, mutable store locations, or production
+activation authority. Missing, truncated, redacted, contradictory,
+indeterminate, conflicting, no-match, and proven-no-exposure outcomes remain
+distinct. This schema layer does not add an executor, experiment envelope,
+optimizer, paired report, or Compound dependency.
+
 ## v0.4.0
 
 `v0.4.0` turns Cayu's evaluation, memory, durable task, provider, and workspace
