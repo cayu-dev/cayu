@@ -330,6 +330,11 @@ REVISIONS: tuple[Revision, ...] = (
     # immutable verifier profile prepared before dispatch. Older task workers
     # cannot maintain that authority chain, so mixed-version operation is unsafe.
     Revision(revision=58, kind=RevisionKind.BREAKING, compatible_from=58),
+    # Every verified-work contract now binds the exact application-owned result
+    # resolver needed to reconstruct accepted result content. Existing contract
+    # rows cannot acquire that authority by inference, so populated pre-59
+    # verified-work registries are a clean prerelease break.
+    Revision(revision=59, kind=RevisionKind.BREAKING, compatible_from=59),
 )
 
 #: The revision an empty database is initialized to.

@@ -835,7 +835,8 @@ class PostgresVerifiedWorkMixin:
         await cur.execute(
             """
             UPDATE cayu_tasks
-            SET status = %s, session_id = %s, worker_id = %s, lease_expires_at = %s,
+            SET status = %s, session_id = %s, session_instance_id = %s,
+                worker_id = %s, lease_expires_at = %s,
                 status_reason = %s, status_payload = %s, result = %s, error = %s,
                 updated_at = %s, started_at = %s, completed_at = %s, retry_series = %s,
                 work_contract = %s
@@ -844,6 +845,7 @@ class PostgresVerifiedWorkMixin:
             (
                 str(task.status),
                 task.session_id,
+                task.session_instance_id,
                 task.worker_id,
                 pg_support.to_utc_optional(task.lease_expires_at),
                 task.status_reason,

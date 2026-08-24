@@ -27,6 +27,7 @@ def unattributed_task_invocation() -> TaskInvocation:
 def unattributed_session_invocation_binding(session_id: str) -> SessionInvocationBinding:
     return SessionInvocationBinding(
         id=session_id,
+        session_instance_id=str(uuid4()),
         invocation=SessionInvocation(
             origin=InvocationOrigin(trust=InvocationOriginTrust.UNATTRIBUTED),
             root_invocation_id=str(uuid4()),
@@ -43,7 +44,11 @@ async def stored_session_invocation(
     snapshot = await store.load_invocation_snapshot(session_id)
     if snapshot is None:
         raise AssertionError(f"Session fixture not found: {session_id}")
-    return SessionInvocationBinding(id=snapshot.id, invocation=snapshot.invocation)
+    return SessionInvocationBinding(
+        id=snapshot.id,
+        session_instance_id=snapshot.session_instance_id,
+        invocation=snapshot.invocation,
+    )
 
 
 async def task_backed_session_invocation(
@@ -56,6 +61,7 @@ async def task_backed_session_invocation(
         raise AssertionError(f"Task fixture not found: {task_id}")
     return SessionInvocationBinding(
         id=session_id,
+        session_instance_id=task.session_instance_id or str(uuid4()),
         invocation=session_invocation_from_task(
             task.invocation,
             session_id=session_id,

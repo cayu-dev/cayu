@@ -4923,6 +4923,44 @@ def test_checkpoint_schema_keys_remain_valid_inside_typed_collections() -> None:
         redactor=SecretRedactor("model"),
     )
 
+    publication_digest = "a" * 64
+    publication_id = f"completion-result-publication:v1:{publication_digest}"
+    publication_owner_id = f"completion-result-owner:v1:{'b' * 64}"
+    result_publication_authority = {
+        "completion_result_event_publications": {
+            "schema_version": 2,
+            "reservations": {
+                publication_id: {
+                    "schema_version": 2,
+                    "publication_id": publication_id,
+                    "authority_sha256": publication_digest,
+                    "owners": {
+                        publication_owner_id: {
+                            "schema_version": 2,
+                            "owner_id": publication_owner_id,
+                            "expires_at": "2099-01-01T00:00:00+00:00",
+                        }
+                    },
+                }
+            },
+        }
+    }
+    for runtime_control in (
+        "completion",
+        "publication",
+        "reservations",
+        "publication_id",
+        "authority_sha256",
+        "owners",
+        "owner_id",
+        "expires_at",
+        "a" * 8,
+    ):
+        assert not durable_value_contains_secret(
+            result_publication_authority,
+            redactor=SecretRedactor(runtime_control),
+        )
+
     catalogue_revision = f"sha256:{'c' * 64}"
     exposure_authority = {
         "pending_tool_round": {

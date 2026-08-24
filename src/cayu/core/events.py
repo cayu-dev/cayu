@@ -106,6 +106,7 @@ class EventType(StrEnum):
     TASK_COMPLETED = "task.completed"
     TASK_FAILED = "task.failed"
     TASK_CANCELLED = "task.cancelled"
+    TASK_COMPLETION_RESULT_RESOLVED = "task.completion_result.resolved"
 
     FORK_GROUP_CREATED = "fork_group.created"
     FORK_GROUP_BRANCHES_RUNNING = "fork_group.branches_running"

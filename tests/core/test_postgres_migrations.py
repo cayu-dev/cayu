@@ -281,6 +281,80 @@ def test_revision_fifty_five_rejects_missing_reconciliation_rejection_registry(
     asyncio.run(runner())
 
 
+def test_revision_fifty_nine_rejects_a_populated_verified_work_registry(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "INSERT INTO cayu_work_contracts "
+                    "(contract_id, version, fingerprint, contract_json) "
+                    "VALUES (%s, %s, %s, %s::jsonb)",
+                    ("pre-59-contract", 1, "0" * 64, "{}"),
+                )
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 59")
+            await conn.commit()
+
+        migrated = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(
+                schema.SchemaTooOld,
+                match="requires an exact result-resolver identity",
+            ):
+                await migrated.ensure_schema()
+        finally:
+            await migrated.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cur.fetchone() == (58,)
+            await cur.execute("SELECT contract_id FROM cayu_work_contracts")
+            assert await cur.fetchone() == ("pre-59-contract",)
+
+    asyncio.run(runner())
+
+
+def test_postgres_task_store_validation_requires_revision_fifty_nine(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 59")
+            await conn.commit()
+
+        validator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 59"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
+
+    asyncio.run(runner())
+
+
 def test_revision_forty_nine_rejects_weakened_authority_index(postgres_dsn: str) -> None:
     async def runner() -> None:
         import psycopg

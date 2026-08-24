@@ -18,6 +18,9 @@ import pytest
 from pydantic import SecretStr, ValidationError
 from tests.core._execution_profile_fixtures import profiled_session_identity
 from tests.core._workload_secret_support import FakeProvider
+from tests.core.completion_result_resolver_conformance import (
+    assert_completion_result_resolver_session_publication_conformance,
+)
 from tests.core.transcript_search_conformance import (
     assert_transcript_search_conformance,
 )
@@ -17440,6 +17443,22 @@ def test_session_store_conformance_blocks_delete_during_incomplete_recovery_clai
             )
             await store.delete_session(created.id)
             assert await store.load(created.id) is None
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_fences_completion_result_event_publication(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            await assert_completion_result_resolver_session_publication_conformance(
+                store,
+                store_kind=session_store_case[0],
+            )
         finally:
             await _close_store(store)
 

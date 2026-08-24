@@ -143,6 +143,7 @@ async def handle_daily_check(
                 session_id=session_id,
                 session_invocation=SessionInvocationBinding(
                     id=existing_session.id,
+                    session_instance_id=existing_session.instance_id,
                     invocation=existing_session.invocation,
                 ),
                 worker_id=worker_id,

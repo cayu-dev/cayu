@@ -174,6 +174,25 @@ profile cannot be reconstructed safely. Stop revision-57 and older verifier/task
 workers, back up and recreate affected stores, migrate, and confirm revision 58
 before starting the new verifier workers.
 
+### Accepted verified-work results resolve through frozen application authority
+
+Work contracts now require an immutable application-owned result-resolver ID,
+version, and configuration fingerprint. Applications register the exact
+side-effect-free resolver during worker startup and can use
+`CayuApp.resolve_completion_result(...)` to reconstruct an accepted result from
+durable application state, validate its content-bound reference, and apply it
+through the existing immutable decision-application receipt. Exact retries after
+commit or process replacement are receipt-first and do not require the resolver.
+Runtime events expose resolver and result-reference identities, never result
+content.
+
+Breaking storage revision 59 makes that resolver identity part of every verified-
+work contract. Stop older task producers and workers, take an application-
+consistent backup, and recreate any prerelease SQLite or PostgreSQL task database
+whose verified-work contract registry is populated. Empty registries migrate
+normally. Mixed revision-58/revision-59 task processes and application-only
+rollback are unsupported.
+
 ## v0.4.0
 
 `v0.4.0` turns Cayu's evaluation, memory, durable task, provider, and workspace

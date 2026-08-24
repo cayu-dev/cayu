@@ -274,7 +274,10 @@ from cayu.runtime.sessions import (
     _authenticated_public_authority_alias_private_value,
     _build_runtime_publication_receipt,
     _checkpoint_after_initial_transcript_publication,
+    _checkpoint_transform_result_preserving_completion_result_event_publications,
     _classify_terminal_session_evidence_records,
+    _completion_result_event_publication_delete_block_reason,
+    _copy_checkpoint_for_transform,
     _copy_mcp_manifest_publication,
     _copy_optional_execution_profile,
     _copy_optional_execution_profile_decision,
@@ -336,6 +339,7 @@ from cayu.runtime.sessions import (
     _reconstruct_runtime_publication_receipt,
     _reject_reserved_runtime_publication_key,
     _reject_settled_model_completion_stage,
+    _replace_checkpoint_preserving_completion_result_event_publications,
     _replay_model_completion_stage_abandonment,
     _replay_promoted_model_completion_stage,
     _run_session_commit_guard_owned,
@@ -413,6 +417,7 @@ from cayu.runtime.sessions import (
     replace_session_user_metadata,
     resolve_interaction_attribution,
     restore_persisted_event_authority,
+    session_instance_id_for_run_request,
     session_invocation_for_run_request,
     session_messages_input_contract_evidence,
     session_metadata_for_creation,
@@ -487,6 +492,7 @@ from cayu.runtime.tasks import (
     _task_retry_events,
     _task_retry_reconciliation_identity_is_bounded,
     _task_session_id_for_start,
+    _task_session_instance_for_attachment,
     _TaskRetryCancellationReconciliationRejectionRecord,
     _validate_task_topology_ancestry,
     _validated_task_retry_cancellation,
@@ -671,7 +677,7 @@ _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
 _POSTGRES_SESSION_MIN_REQUIRED_REVISION = 54
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 58
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 59
 
 
 async def _postgres_lock_memory_evidence_id(cur: Any, lock_id: str) -> None:
@@ -889,10 +895,11 @@ logger = logging.getLogger(__name__)
 _PGVECTOR_SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7665_6374 & 0x7FFF_FFFF_FFFF_FFFF
 _TASK_RETURNING_COLUMNS = (
     "task.id, task.type, task.title, task.description, task.status, task.session_id, "
-    "task.parent_task_id, task.assigned_agent_name, task.available_at, task.worker_id, "
-    "task.lease_expires_at, task.status_reason, task.status_payload, task.input, task.result, "
-    "task.error, task.metadata, task.created_at, task.updated_at, task.started_at, "
-    "task.completed_at, task.invocation, task.retry_series, task.work_contract"
+    "task.session_instance_id, task.parent_task_id, task.assigned_agent_name, "
+    "task.available_at, task.worker_id, task.lease_expires_at, task.status_reason, "
+    "task.status_payload, task.input, task.result, task.error, task.metadata, task.created_at, "
+    "task.updated_at, task.started_at, task.completed_at, task.invocation, task.retry_series, "
+    "task.work_contract"
 )
 _SESSION_MESSAGE_QUEUE_COLUMNS = (
     "ordering_key, queue_id, session_id, idempotency_key, content, delivery_mode, status, "
@@ -2598,6 +2605,34 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "CREATE INDEX IF NOT EXISTS idx_cayu_completion_verifier_profiles_task "
         "ON cayu_completion_verifier_profiles(task_id, attempt_id)",
     ),
+    59: (
+        "ALTER TABLE cayu_sessions ADD COLUMN IF NOT EXISTS instance_id TEXT",
+        "ALTER TABLE cayu_tasks ADD COLUMN IF NOT EXISTS session_instance_id TEXT",
+        """
+        WITH generated AS (
+            SELECT id,
+                   md5(
+                       id || ':' || clock_timestamp()::text || ':' || random()::text
+                   ) AS digest
+            FROM cayu_sessions
+            WHERE instance_id IS NULL
+        )
+        UPDATE cayu_sessions AS session
+        SET instance_id = lower(
+            substr(generated.digest, 1, 8) || '-' ||
+            substr(generated.digest, 9, 4) || '-4' ||
+            substr(generated.digest, 14, 3) || '-a' ||
+            substr(generated.digest, 18, 3) || '-' ||
+            substr(generated.digest, 21, 12)
+        )
+        FROM generated
+        WHERE session.id = generated.id
+          AND session.instance_id IS NULL
+        """,
+        "ALTER TABLE cayu_sessions ALTER COLUMN instance_id SET NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_sessions_instance_id "
+        "ON cayu_sessions(instance_id)",
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -3723,6 +3758,22 @@ async def _reject_populated_pre_verifier_profile_database(cur: Any) -> None:
             )
 
 
+async def _reject_populated_pre_result_resolver_database(cur: Any) -> None:
+    await cur.execute("SELECT to_regclass('cayu_work_contracts')")
+    registered = await cur.fetchone()
+    if registered is None or registered[0] is None:
+        return
+    await cur.execute("LOCK TABLE cayu_work_contracts IN SHARE ROW EXCLUSIVE MODE")
+    await cur.execute("SELECT EXISTS(SELECT 1 FROM cayu_work_contracts)")
+    row = await cur.fetchone()
+    if row is not None and row[0] is True:
+        raise schema.SchemaTooOld(
+            "Storage revision 59 requires an exact result-resolver identity for every "
+            "verified-work contract and cannot infer one for existing contracts. "
+            "Recreate the Cayu task database before starting this build."
+        )
+
+
 async def _reject_revision_43_knowledge_identity_overflow(cur: Any) -> None:
     await cur.execute(
         """
@@ -3994,6 +4045,10 @@ class _PostgresStoreBase:
                         # Reject before applying any earlier pending revision so the
                         # clean break cannot leave a database half-migrated.
                         await _reject_populated_pre_verifier_profile_database(cur)
+                    if current < 59 and any(
+                        revision.revision == 59 for revision in schema.pending(current)
+                    ):
+                        await _reject_populated_pre_result_resolver_database(cur)
                     if current == schema.UNINITIALIZED:
                         await self._apply_baseline(cur)
                         current = schema.BASELINE_REVISION
@@ -4049,6 +4104,8 @@ class _PostgresStoreBase:
                             await self._validate_eval_run_scenario_progress_column(cur)
                         if self._min_required_revision >= 57:
                             await self._validate_session_message_queue_typed_message_column(cur)
+                        if self._min_required_revision >= 59:
+                            await self._validate_session_instance_schema(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -4337,6 +4394,32 @@ class _PostgresStoreBase:
                 cur,
                 require_verifier_profiles=True,
             )
+        if revision.revision == 59:
+            await _reject_populated_pre_result_resolver_database(cur)
+            await self._validate_session_instance_schema(cur)
+
+    async def _validate_session_instance_schema(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT table_name, column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND (
+                (table_name = 'cayu_sessions' AND column_name = 'instance_id')
+                OR (table_name = 'cayu_tasks' AND column_name = 'session_instance_id')
+              )
+            ORDER BY table_name, column_name
+            """
+        )
+        if tuple(await cur.fetchall()) != (
+            ("cayu_sessions", "instance_id", "text", "NO"),
+            ("cayu_tasks", "session_instance_id", "text", "YES"),
+        ):
+            raise RuntimeError("Postgres session-instance authority columns are malformed.")
+        await cur.execute("SELECT EXISTS(SELECT 1 FROM cayu_sessions WHERE instance_id IS NULL)")
+        row = await cur.fetchone()
+        if row is None or row[0] is True:
+            raise RuntimeError("Postgres session-instance authority is incomplete.")
 
     async def _validate_transcript_search_document_column(self, cur: Any) -> None:
         await cur.execute(
@@ -6913,6 +6996,8 @@ class _PostgresStoreBase:
             await _reject_populated_pre_targeted_tool_grant_database(cur)
         if current < 58 and any(revision.revision == 58 for revision in schema.pending(current)):
             await _reject_populated_pre_verifier_profile_database(cur)
+        if current < 59 and any(revision.revision == 59 for revision in schema.pending(current)):
+            await _reject_populated_pre_result_resolver_database(cur)
         if current == schema.UNINITIALIZED:
             await self._apply_baseline(cur)
             current = schema.BASELINE_REVISION
@@ -13467,6 +13552,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
+    supports_completion_result_event_publication_reservations: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
     supports_recall_evidence: ClassVar[bool] = True
     supports_owned_off_thread_session_commit_guards: ClassVar[bool] = True
@@ -15127,6 +15213,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise ValueError(f"Parent session not found: {request.parent_session_id}")
                     session = Session(
                         id=session_id,
+                        instance_id=session_instance_id_for_run_request(
+                            request,
+                            session_id=session_id,
+                        ),
                         agent_name=request.agent_name,
                         provider_name=identity.provider_name,
                         model=identity.model,
@@ -15164,7 +15254,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     await cur.execute(
                         f"""
                         INSERT INTO cayu_sessions ({pg_support.SESSION_COLUMNS})
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         pg_support.session_insert_values(session),
                     )
@@ -15254,10 +15344,16 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     elif checkpoint_transform is not None:
                         transformed = checkpoint_transform(session.model_copy(deep=True), None)
                         if transformed is not None:
+                            transformed = (
+                                _replace_checkpoint_preserving_completion_result_event_publications(
+                                    None,
+                                    copy_durable_json_object(transformed, "checkpoint"),
+                                )
+                            )
                             await self._upsert_checkpoint(
                                 cur,
                                 session.id,
-                                copy_durable_json_object(transformed, "checkpoint"),
+                                transformed,
                                 session.updated_at,
                             )
                 await conn.commit()
@@ -15378,6 +15474,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 transcript_cursor=transcript_cursor,
             )
         )
+        fork = fork.model_copy(update={"instance_id": str(uuid4())})
 
         await self._ensure_ready()
         async with self._connection() as conn:
@@ -15506,7 +15603,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     await cur.execute(
                         f"""
                         INSERT INTO cayu_sessions ({pg_support.SESSION_COLUMNS})
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         pg_support.session_insert_values(fork),
                     )
@@ -15660,18 +15757,19 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
             await cur.execute(
-                "SELECT id, status, invocation FROM cayu_sessions WHERE id = %s",
+                "SELECT id, instance_id, status, invocation FROM cayu_sessions WHERE id = %s",
                 (session_id,),
             )
             row = await cur.fetchone()
             if row is None:
                 return None
-            invocation_value = row[2]
+            invocation_value = row[3]
             if isinstance(invocation_value, str):
                 invocation_value = json.loads(invocation_value)
             return SessionInvocationSnapshot(
                 id=row[0],
-                status=SessionStatus(row[1]),
+                session_instance_id=row[1],
+                status=SessionStatus(row[2]),
                 invocation=SessionInvocation.model_validate(invocation_value),
             )
 
@@ -16362,6 +16460,14 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             "Cannot delete a session while durable operation "
                             f"{active_operation_id} is active: {session_id}"
                         )
+                    completion_result_publication_block = (
+                        _completion_result_event_publication_delete_block_reason(checkpoint)
+                    )
+                    if completion_result_publication_block is not None:
+                        raise ValueError(
+                            "Cannot delete a session while "
+                            f"{completion_result_publication_block}: {session_id}"
+                        )
                     await cur.execute(
                         "SELECT 1 FROM cayu_session_operations "
                         "WHERE session_id = %s AND idempotency_key = %s",
@@ -16636,13 +16742,15 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         require_existing_ceiling=prepared_execution_profile is not None,
                     )
 
+                    current_checkpoint = await self._load_checkpoint(cur, session_id)
                     transformed_checkpoint = checkpoint_transform(
                         loaded,
-                        await self._load_checkpoint(cur, session_id),
+                        _copy_checkpoint_for_transform(current_checkpoint),
                     )
                     if transformed_checkpoint is not None:
-                        transformed_checkpoint = copy_durable_json_object(
-                            transformed_checkpoint, "checkpoint"
+                        transformed_checkpoint = _checkpoint_transform_result_preserving_completion_result_event_publications(
+                            current_checkpoint,
+                            transformed_checkpoint,
                         )
 
                     admission_events = []
@@ -17447,11 +17555,14 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         )
                     transformed = checkpoint_transform(
                         loaded,
-                        current_checkpoint,
+                        _copy_checkpoint_for_transform(current_checkpoint),
                     )
                     if transformed is None:
                         raise ValueError("Fenced checkpoint transform must return a checkpoint.")
-                    transformed = copy_durable_json_object(transformed, "checkpoint")
+                    transformed = _checkpoint_transform_result_preserving_completion_result_event_publications(
+                        current_checkpoint,
+                        transformed,
+                    )
                     await cur.execute(
                         "UPDATE cayu_sessions SET run_epoch = run_epoch + 1, "
                         "last_activity_at = %s WHERE id = %s",
@@ -19021,6 +19132,27 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             expected_statuses=expected_statuses,
             expected_run_epoch=expected_run_epoch,
             expected_transcript_cursor=expected_transcript_cursor,
+            preserve_completion_result_publications=True,
+        )
+
+    async def _publish_completion_result_event_publication(
+        self,
+        session_id: str,
+        *,
+        checkpoint_transform: CheckpointTransform,
+        events: list[Event],
+    ) -> Session:
+        return await self._publish_checkpoint_and_events(
+            session_id,
+            checkpoint_transform=checkpoint_transform,
+            operation_idempotency_key=None,
+            operation_transform=None,
+            operation_commit_guard=None,
+            events=events,
+            expected_statuses=None,
+            expected_run_epoch=None,
+            expected_transcript_cursor=None,
+            preserve_completion_result_publications=False,
         )
 
     async def load_session_operation(
@@ -20518,6 +20650,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             expected_statuses=expected_statuses,
             expected_run_epoch=expected_run_epoch,
             expected_transcript_cursor=expected_transcript_cursor,
+            preserve_completion_result_publications=True,
         )
 
     async def publish_session_operation_guarded(
@@ -20545,6 +20678,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             expected_statuses=expected_statuses,
             expected_run_epoch=expected_run_epoch,
             expected_transcript_cursor=expected_transcript_cursor,
+            preserve_completion_result_publications=True,
         )
 
     async def _publish_checkpoint_and_events(
@@ -20559,6 +20693,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         expected_statuses: set[SessionStatus] | None,
         expected_run_epoch: int | None,
         expected_transcript_cursor: int | None,
+        preserve_completion_result_publications: bool,
     ) -> Session:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -20602,6 +20737,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             f"{expected_transcript_cursor}, current {current_cursor}."
                         )
                     current_checkpoint = await self._load_checkpoint(cur, session_id)
+                    callback_checkpoint = _copy_checkpoint_for_transform(current_checkpoint)
                     operation_records: dict[str, dict[str, Any]] = {}
                     model_completion_stage_release = None
                     if operation_transform is not None:
@@ -20616,7 +20752,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         )
                         publication = operation_transform(
                             loaded,
-                            current_checkpoint,
+                            callback_checkpoint,
                             current_operation,
                         )
                         if type(publication) is not SessionOperationPublication:
@@ -20628,6 +20764,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             publication.checkpoint,
                             "checkpoint",
                         )
+                        transformed = _checkpoint_transform_result_preserving_completion_result_event_publications(
+                            current_checkpoint,
+                            transformed,
+                        )
                         operation_records = copy_durable_json_object(
                             publication.operation_records,
                             "operation_records",
@@ -20636,10 +20776,15 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         _validate_session_operation_record_keys(operation_records)
                     else:
                         assert checkpoint_transform is not None
-                        transformed = checkpoint_transform(loaded, current_checkpoint)
+                        transformed = checkpoint_transform(loaded, callback_checkpoint)
                         if transformed is None:
                             raise ValueError("Checkpoint transform must return a checkpoint.")
                         transformed = copy_durable_json_object(transformed, "checkpoint")
+                        if preserve_completion_result_publications:
+                            transformed = _checkpoint_transform_result_preserving_completion_result_event_publications(
+                                current_checkpoint,
+                                transformed,
+                            )
 
                     await self._register_event_public_authorities(
                         cur,
@@ -23176,12 +23321,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     if checkpoint_transform is not None:
                         transformed = checkpoint_transform(
                             session,
-                            current_checkpoint,
+                            _copy_checkpoint_for_transform(current_checkpoint),
                         )
                         if transformed is not None:
-                            current_checkpoint = copy_durable_json_object(
+                            current_checkpoint = _checkpoint_transform_result_preserving_completion_result_event_publications(
+                                current_checkpoint,
                                 transformed,
-                                "checkpoint",
                             )
                     checkpoint = _checkpoint_after_initial_transcript_publication(
                         current_checkpoint,
@@ -23329,13 +23474,17 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     if session is None:
                         raise KeyError(f"Session not found: {session_id}")
                     _assert_session_run_epoch(session_id, session)
+                    current_checkpoint = await self._load_checkpoint(cur, session_id)
                     transformed = checkpoint_transform(
                         session,
-                        await self._load_checkpoint(cur, session_id),
+                        _copy_checkpoint_for_transform(current_checkpoint),
                     )
                     if transformed is None:
                         raise ValueError("Checkpoint transform must return a checkpoint.")
-                    transformed = copy_durable_json_object(transformed, "checkpoint")
+                    transformed = _checkpoint_transform_result_preserving_completion_result_event_publications(
+                        current_checkpoint,
+                        transformed,
+                    )
                     await _touch_session_activity(cur, session_id, updated_at)
                     if copied_messages:
                         await self._register_public_authorities(
@@ -23692,8 +23841,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             async with conn.cursor() as cur:
                 if await self._load_for_update(cur, session_id) is None:
                     raise KeyError(f"Session not found: {session_id}")
+                replacement = _replace_checkpoint_preserving_completion_result_event_publications(
+                    await self._load_checkpoint(cur, session_id),
+                    copied,
+                )
                 await _touch_session_activity(cur, session_id, updated_at)
-                await self._upsert_checkpoint(cur, session_id, copied, updated_at)
+                await self._upsert_checkpoint(cur, session_id, replacement, updated_at)
             await conn.commit()
 
     async def transform_checkpoint(
@@ -23713,12 +23866,18 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     if session is None:
                         raise KeyError(f"Session not found: {session_id}")
                     _assert_session_run_epoch(session_id, session)
+                    current = await self._load_checkpoint(cur, session_id)
                     transformed = checkpoint_transform(
                         session,
-                        await self._load_checkpoint(cur, session_id),
+                        _copy_checkpoint_for_transform(current),
                     )
                     if transformed is not None:
-                        transformed = copy_durable_json_object(transformed, "checkpoint")
+                        transformed = (
+                            _replace_checkpoint_preserving_completion_result_event_publications(
+                                current,
+                                copy_durable_json_object(transformed, "checkpoint"),
+                            )
+                        )
                         await _touch_session_activity(cur, session_id, updated_at)
                         await self._upsert_checkpoint(cur, session_id, transformed, updated_at)
                 await conn.commit()
@@ -24045,7 +24204,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     raise ValueError("Task cannot be its own parent.")
                 await cur.execute(
                     """
-                    SELECT id, session_id, invocation
+                    SELECT id, session_id, session_instance_id, invocation
                     FROM cayu_tasks
                     WHERE id = %s
                     FOR KEY SHARE
@@ -24055,12 +24214,13 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 row = await cur.fetchone()
                 if row is None:
                     raise ValueError(f"Parent task not found: {request.parent_task_id}")
-                invocation_value = row[2]
+                invocation_value = row[3]
                 if isinstance(invocation_value, str):
                     invocation_value = json.loads(invocation_value)
                 parent = TaskInvocationSnapshot(
                     id=row[0],
                     session_id=row[1],
+                    session_instance_id=row[2],
                     invocation=TaskInvocation.model_validate(invocation_value),
                 )
             if request.work_contract is not None:
@@ -24106,7 +24266,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s
                 )
                 """,
                 pg_support.task_insert_values(task),
@@ -24132,18 +24293,20 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
             await cur.execute(
-                "SELECT id, session_id, invocation FROM cayu_tasks WHERE id = %s",
+                "SELECT id, session_id, session_instance_id, invocation "
+                "FROM cayu_tasks WHERE id = %s",
                 (task_id,),
             )
             row = await cur.fetchone()
             if row is None:
                 return None
-            invocation_value = row[2]
+            invocation_value = row[3]
             if isinstance(invocation_value, str):
                 invocation_value = json.loads(invocation_value)
             return TaskInvocationSnapshot(
                 id=row[0],
                 session_id=row[1],
+                session_instance_id=row[2],
                 invocation=TaskInvocation.model_validate(invocation_value),
             )
 
@@ -24540,11 +24703,17 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 session_id=effective_session_id,
                 session_binding=session_binding,
             )
+            session_instance_id = _task_session_instance_for_attachment(
+                stored_session_instance_id=task.session_instance_id,
+                session_id=effective_session_id,
+                session_binding=session_binding,
+            )
             now = await self._database_now(cur)
             updated = task.model_copy(
                 update={
                     "status": TaskStatus.RUNNING,
                     "session_id": effective_session_id,
+                    "session_instance_id": session_instance_id,
                     "started_at": task.started_at or now,
                     "updated_at": now,
                 }
@@ -24596,10 +24765,16 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 session_id=session_id,
                 session_binding=session_binding,
             )
+            session_instance_id = _task_session_instance_for_attachment(
+                stored_session_instance_id=task.session_instance_id,
+                session_id=session_id,
+                session_binding=session_binding,
+            )
             updated = task.model_copy(
                 update={
                     "status": TaskStatus.RUNNING,
                     "session_id": session_id,
+                    "session_instance_id": session_instance_id,
                     "started_at": task.started_at or now,
                     "updated_at": now,
                 }
@@ -24856,7 +25031,8 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                             VALUES (
                                 %s, %s, %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s, %s, %s, %s
+                                %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s
                             )
                             """,
                             pg_support.task_insert_values(successor),

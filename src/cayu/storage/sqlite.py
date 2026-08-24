@@ -212,7 +212,10 @@ from cayu.runtime.sessions import (
     _authenticated_public_authority_alias_private_value,
     _build_runtime_publication_receipt,
     _checkpoint_after_initial_transcript_publication,
+    _checkpoint_transform_result_preserving_completion_result_event_publications,
     _classify_terminal_session_evidence_records,
+    _completion_result_event_publication_delete_block_reason,
+    _copy_checkpoint_for_transform,
     _copy_mcp_manifest_publication,
     _copy_optional_execution_profile,
     _copy_optional_execution_profile_decision,
@@ -274,6 +277,7 @@ from cayu.runtime.sessions import (
     _reconstruct_runtime_publication_receipt,
     _reject_reserved_runtime_publication_key,
     _reject_settled_model_completion_stage,
+    _replace_checkpoint_preserving_completion_result_event_publications,
     _replay_model_completion_stage_abandonment,
     _replay_promoted_model_completion_stage,
     _runtime_publication_json_equal,
@@ -424,6 +428,7 @@ from cayu.runtime.tasks import (
     _task_retry_events,
     _task_retry_reconciliation_identity_is_bounded,
     _task_session_id_for_start,
+    _task_session_instance_for_attachment,
     _TaskRetryCancellationReconciliationRejectionRecord,
     _validate_task_topology_ancestry,
     _validated_task_retry_cancellation,
@@ -516,7 +521,7 @@ from cayu.storage import migrations as schema
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
 _SQLITE_SESSION_MIN_REQUIRED_REVISION = 54
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 58
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 59
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -864,7 +869,7 @@ def _load_labels(connection: sqlite3.Connection, session_id: str) -> dict[str, s
 def _load_session(connection: sqlite3.Connection, session_id: str) -> Session | None:
     row = connection.execute(
         """
-        SELECT id, agent_name, provider_name, model, parent_session_id,
+        SELECT id, instance_id, agent_name, provider_name, model, parent_session_id,
                causal_budget_id, runtime_name, runtime_version, environment_name,
                status, created_at, updated_at, last_activity_at, run_epoch,
                invocation_json, metadata_json
@@ -1492,6 +1497,7 @@ class SQLiteSessionStore(SessionStore):
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
+    supports_completion_result_event_publication_reservations: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
     supports_recall_evidence: ClassVar[bool] = True
     supports_owned_off_thread_session_commit_guards: ClassVar[bool] = True
@@ -3116,6 +3122,7 @@ class SQLiteSessionStore(SessionStore):
                         """
                         INSERT INTO cayu_sessions (
                             id,
+                            instance_id,
                             agent_name,
                             provider_name,
                             model,
@@ -3132,10 +3139,11 @@ class SQLiteSessionStore(SessionStore):
                             invocation_json,
                             metadata_json
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             session.id,
+                            session.instance_id,
                             session.agent_name,
                             session.provider_name,
                             session.model,
@@ -3235,6 +3243,12 @@ class SQLiteSessionStore(SessionStore):
                     elif checkpoint_transform is not None:
                         transformed = checkpoint_transform(session.model_copy(deep=True), None)
                         if transformed is not None:
+                            transformed = (
+                                _replace_checkpoint_preserving_completion_result_event_publications(
+                                    None,
+                                    copy_durable_json_object(transformed, "checkpoint"),
+                                )
+                            )
                             self._connection.execute(
                                 """
                                 INSERT INTO cayu_checkpoints (
@@ -3247,7 +3261,7 @@ class SQLiteSessionStore(SessionStore):
                                 """,
                                 sqlite_support.checkpoint_row_values(
                                     session.id,
-                                    copy_durable_json_object(transformed, "checkpoint"),
+                                    transformed,
                                     session.updated_at,
                                 ),
                             )
@@ -3368,6 +3382,7 @@ class SQLiteSessionStore(SessionStore):
                 transcript_cursor=transcript_cursor,
             )
         )
+        fork = fork.model_copy(update={"instance_id": str(uuid4())})
 
         async with self._lock:
             self._require_current_public_authority_configuration(self._connection)
@@ -3491,6 +3506,7 @@ class SQLiteSessionStore(SessionStore):
                     """
                     INSERT INTO cayu_sessions (
                         id,
+                        instance_id,
                         agent_name,
                         provider_name,
                         model,
@@ -3507,7 +3523,7 @@ class SQLiteSessionStore(SessionStore):
                         invocation_json,
                         metadata_json
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     sqlite_support.session_to_row_values(fork),
                 )
@@ -3650,13 +3666,14 @@ class SQLiteSessionStore(SessionStore):
 
         def query(connection: sqlite3.Connection) -> SessionInvocationSnapshot | None:
             row = connection.execute(
-                "SELECT id, status, invocation_json FROM cayu_sessions WHERE id = ?",
+                "SELECT id, instance_id, status, invocation_json FROM cayu_sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
             if row is None:
                 return None
             return SessionInvocationSnapshot(
                 id=row["id"],
+                session_instance_id=row["instance_id"],
                 status=SessionStatus(row["status"]),
                 invocation=SessionInvocation.model_validate(json.loads(row["invocation_json"])),
             )
@@ -4307,6 +4324,14 @@ class SQLiteSessionStore(SessionStore):
                         "Cannot delete a session while durable operation "
                         f"{active_operation_id} is active: {session_id}"
                     )
+                completion_result_publication_block = (
+                    _completion_result_event_publication_delete_block_reason(checkpoint)
+                )
+                if completion_result_publication_block is not None:
+                    raise ValueError(
+                        "Cannot delete a session while "
+                        f"{completion_result_publication_block}: {session_id}"
+                    )
                 active_stage = self._connection.execute(
                     "SELECT 1 FROM cayu_session_operations "
                     "WHERE session_id = ? AND idempotency_key = ?",
@@ -4590,14 +4615,15 @@ class SQLiteSessionStore(SessionStore):
                     require_existing_ceiling=prepared_execution_profile is not None,
                 )
 
+                current_checkpoint = self._load_checkpoint_unlocked(session_id)
                 transformed_checkpoint = checkpoint_transform(
                     loaded,
-                    self._load_checkpoint_unlocked(session_id),
+                    _copy_checkpoint_for_transform(current_checkpoint),
                 )
                 if transformed_checkpoint is not None:
-                    transformed_checkpoint = copy_durable_json_object(
+                    transformed_checkpoint = _checkpoint_transform_result_preserving_completion_result_event_publications(
+                        current_checkpoint,
                         transformed_checkpoint,
-                        "checkpoint",
                     )
 
                 placeholders = ", ".join("?" for _ in allowed_statuses)
@@ -5008,11 +5034,16 @@ class SQLiteSessionStore(SessionStore):
                     )
                 transformed = checkpoint_transform(
                     loaded,
-                    current_checkpoint,
+                    _copy_checkpoint_for_transform(current_checkpoint),
                 )
                 if transformed is None:
                     raise ValueError("Fenced checkpoint transform must return a checkpoint.")
-                transformed = copy_durable_json_object(transformed, "checkpoint")
+                transformed = (
+                    _checkpoint_transform_result_preserving_completion_result_event_publications(
+                        current_checkpoint,
+                        transformed,
+                    )
+                )
                 self._connection.execute(
                     "UPDATE cayu_sessions SET run_epoch = run_epoch + 1, "
                     "last_activity_at = ? WHERE id = ?",
@@ -6589,6 +6620,27 @@ class SQLiteSessionStore(SessionStore):
             expected_statuses=expected_statuses,
             expected_run_epoch=expected_run_epoch,
             expected_transcript_cursor=expected_transcript_cursor,
+            preserve_completion_result_publications=True,
+        )
+
+    async def _publish_completion_result_event_publication(
+        self,
+        session_id: str,
+        *,
+        checkpoint_transform: CheckpointTransform,
+        events: list[Event],
+    ) -> Session:
+        return await self._publish_checkpoint_and_events(
+            session_id,
+            checkpoint_transform=checkpoint_transform,
+            operation_idempotency_key=None,
+            operation_transform=None,
+            operation_commit_guard=None,
+            events=events,
+            expected_statuses=None,
+            expected_run_epoch=None,
+            expected_transcript_cursor=None,
+            preserve_completion_result_publications=False,
         )
 
     async def load_session_operation(
@@ -8050,6 +8102,7 @@ class SQLiteSessionStore(SessionStore):
             expected_statuses=expected_statuses,
             expected_run_epoch=expected_run_epoch,
             expected_transcript_cursor=expected_transcript_cursor,
+            preserve_completion_result_publications=True,
         )
 
     async def publish_session_operation_guarded(
@@ -8077,6 +8130,7 @@ class SQLiteSessionStore(SessionStore):
             expected_statuses=expected_statuses,
             expected_run_epoch=expected_run_epoch,
             expected_transcript_cursor=expected_transcript_cursor,
+            preserve_completion_result_publications=True,
         )
 
     async def _publish_checkpoint_and_events(
@@ -8091,6 +8145,7 @@ class SQLiteSessionStore(SessionStore):
         expected_statuses: set[SessionStatus] | None,
         expected_run_epoch: int | None,
         expected_transcript_cursor: int | None,
+        preserve_completion_result_publications: bool,
     ) -> Session:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -8133,6 +8188,7 @@ class SQLiteSessionStore(SessionStore):
                         f"{expected_transcript_cursor}, current {current_cursor}."
                     )
                 current_checkpoint = self._load_checkpoint_unlocked(session_id)
+                callback_checkpoint = _copy_checkpoint_for_transform(current_checkpoint)
                 operation_records: dict[str, dict[str, Any]] = {}
                 model_completion_stage_release = None
                 if operation_transform is not None:
@@ -8146,7 +8202,7 @@ class SQLiteSessionStore(SessionStore):
                     )
                     publication = operation_transform(
                         loaded,
-                        current_checkpoint,
+                        callback_checkpoint,
                         current_operation,
                     )
                     if type(publication) is not SessionOperationPublication:
@@ -8157,6 +8213,10 @@ class SQLiteSessionStore(SessionStore):
                         publication.checkpoint,
                         "checkpoint",
                     )
+                    transformed = _checkpoint_transform_result_preserving_completion_result_event_publications(
+                        current_checkpoint,
+                        transformed,
+                    )
                     operation_records = copy_durable_json_object(
                         publication.operation_records,
                         "operation_records",
@@ -8165,10 +8225,15 @@ class SQLiteSessionStore(SessionStore):
                     _validate_session_operation_record_keys(operation_records)
                 else:
                     assert checkpoint_transform is not None
-                    transformed = checkpoint_transform(loaded, current_checkpoint)
+                    transformed = checkpoint_transform(loaded, callback_checkpoint)
                     if transformed is None:
                         raise ValueError("Checkpoint transform must return a checkpoint.")
                     transformed = copy_durable_json_object(transformed, "checkpoint")
+                    if preserve_completion_result_publications:
+                        transformed = _checkpoint_transform_result_preserving_completion_result_event_publications(
+                            current_checkpoint,
+                            transformed,
+                        )
                 event_rows = []
                 for event in copied_events:
                     lookup_key, projection, projection_bytes = pending_action_event_storage_values(
@@ -10932,7 +10997,7 @@ class SQLiteSessionStore(SessionStore):
                 ).fetchone()[0]
             rows = connection.execute(
                 f"""
-                SELECT id, agent_name, provider_name, model, parent_session_id,
+                SELECT id, instance_id, agent_name, provider_name, model, parent_session_id,
                        causal_budget_id, runtime_name, runtime_version, environment_name,
                        status, created_at, updated_at, last_activity_at, run_epoch,
                        invocation_json, metadata_json
@@ -11059,12 +11124,12 @@ class SQLiteSessionStore(SessionStore):
                 if checkpoint_transform is not None:
                     transformed = checkpoint_transform(
                         session,
-                        current_checkpoint,
+                        _copy_checkpoint_for_transform(current_checkpoint),
                     )
                     if transformed is not None:
-                        current_checkpoint = copy_durable_json_object(
+                        current_checkpoint = _checkpoint_transform_result_preserving_completion_result_event_publications(
+                            current_checkpoint,
                             transformed,
-                            "checkpoint",
                         )
                 checkpoint = _checkpoint_after_initial_transcript_publication(
                     current_checkpoint,
@@ -11237,13 +11302,19 @@ class SQLiteSessionStore(SessionStore):
                 if session is None:
                     raise KeyError(f"Session not found: {session_id}")
                 _assert_session_run_epoch(session_id, session)
+                current_checkpoint = self._load_checkpoint_unlocked(session_id)
                 transformed = checkpoint_transform(
                     session,
-                    self._load_checkpoint_unlocked(session_id),
+                    _copy_checkpoint_for_transform(current_checkpoint),
                 )
                 if transformed is None:
                     raise ValueError("Checkpoint transform must return a checkpoint.")
-                transformed = copy_durable_json_object(transformed, "checkpoint")
+                transformed = (
+                    _checkpoint_transform_result_preserving_completion_result_event_publications(
+                        current_checkpoint,
+                        transformed,
+                    )
+                )
                 _touch_session_activity(connection, session_id, updated_at)
                 if copied_messages:
                     connection.executemany(
@@ -11614,9 +11685,14 @@ class SQLiteSessionStore(SessionStore):
         updated_at = datetime.now(UTC)
 
         def statement(connection: sqlite3.Connection) -> None:
-            if not _session_exists(connection, session_id):
-                raise KeyError(f"Session not found: {session_id}")
-            with connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if not _session_exists(connection, session_id):
+                    raise KeyError(f"Session not found: {session_id}")
+                replacement = _replace_checkpoint_preserving_completion_result_event_publications(
+                    self._load_checkpoint_unlocked(session_id),
+                    checkpoint,
+                )
                 _touch_session_activity(connection, session_id, updated_at)
                 connection.execute(
                     """
@@ -11636,8 +11712,12 @@ class SQLiteSessionStore(SessionStore):
                         pending_action_flags = excluded.pending_action_flags,
                         pending_action_metrics_ready = excluded.pending_action_metrics_ready
                     """,
-                    sqlite_support.checkpoint_row_values(session_id, checkpoint, updated_at),
+                    sqlite_support.checkpoint_row_values(session_id, replacement, updated_at),
                 )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
 
         await self._run_write(statement)
 
@@ -11658,12 +11738,18 @@ class SQLiteSessionStore(SessionStore):
                 if session is None:
                     raise KeyError(f"Session not found: {session_id}")
                 _assert_session_run_epoch(session_id, session)
+                current = self._load_checkpoint_unlocked(session_id)
                 transformed = checkpoint_transform(
                     session,
-                    self._load_checkpoint_unlocked(session_id),
+                    _copy_checkpoint_for_transform(current),
                 )
                 if transformed is not None:
-                    transformed = copy_durable_json_object(transformed, "checkpoint")
+                    transformed = (
+                        _replace_checkpoint_preserving_completion_result_event_publications(
+                            current,
+                            copy_durable_json_object(transformed, "checkpoint"),
+                        )
+                    )
                     _touch_session_activity(connection, session_id, updated_at)
                     connection.execute(
                         """
@@ -12114,7 +12200,8 @@ class SQLiteTaskStore(TaskStore):
         cursor = self._connection.execute(
             """
             UPDATE cayu_tasks
-            SET status = ?, session_id = ?, worker_id = ?, lease_expires_at = ?,
+            SET status = ?, session_id = ?, session_instance_id = ?,
+                worker_id = ?, lease_expires_at = ?,
                 status_reason = ?, status_payload_json = ?, result_json = ?, error_json = ?,
                 updated_at = ?, started_at = ?, completed_at = ?, retry_series_json = ?,
                 work_contract_json = ?
@@ -12123,6 +12210,7 @@ class SQLiteTaskStore(TaskStore):
             (
                 str(task.status),
                 task.session_id,
+                task.session_instance_id,
                 task.worker_id,
                 sqlite_support.format_optional_datetime(task.lease_expires_at),
                 task.status_reason,
@@ -12992,6 +13080,7 @@ class SQLiteTaskStore(TaskStore):
                     description,
                     status,
                     session_id,
+                    session_instance_id,
                     parent_task_id,
                     assigned_agent_name,
                     available_at,
@@ -13011,7 +13100,7 @@ class SQLiteTaskStore(TaskStore):
                     retry_series_json,
                     work_contract_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 sqlite_support.task_to_row_values(task),
             )
@@ -13032,7 +13121,8 @@ class SQLiteTaskStore(TaskStore):
         task_id = require_clean_nonblank(task_id, "task_id")
         async with self._lock:
             row = self._connection.execute(
-                "SELECT id, session_id, invocation_json FROM cayu_tasks WHERE id = ?",
+                "SELECT id, session_id, session_instance_id, invocation_json "
+                "FROM cayu_tasks WHERE id = ?",
                 (task_id,),
             ).fetchone()
             if row is None:
@@ -13040,6 +13130,7 @@ class SQLiteTaskStore(TaskStore):
             return TaskInvocationSnapshot(
                 id=row["id"],
                 session_id=row["session_id"],
+                session_instance_id=row["session_instance_id"],
                 invocation=TaskInvocation.model_validate(json.loads(row["invocation_json"])),
             )
 
@@ -13387,11 +13478,17 @@ class SQLiteTaskStore(TaskStore):
                     session_id=effective_session_id,
                     session_binding=session_binding,
                 )
+                session_instance_id = _task_session_instance_for_attachment(
+                    stored_session_instance_id=task.session_instance_id,
+                    session_id=effective_session_id,
+                    session_binding=session_binding,
+                )
                 now = datetime.now(UTC)
                 updated = task.model_copy(
                     update={
                         "status": TaskStatus.RUNNING,
                         "session_id": effective_session_id,
+                        "session_instance_id": session_instance_id,
                         "started_at": task.started_at or now,
                         "updated_at": now,
                     }
@@ -13439,10 +13536,16 @@ class SQLiteTaskStore(TaskStore):
                     session_id=session_id,
                     session_binding=session_binding,
                 )
+                session_instance_id = _task_session_instance_for_attachment(
+                    stored_session_instance_id=task.session_instance_id,
+                    session_id=session_id,
+                    session_binding=session_binding,
+                )
                 updated = task.model_copy(
                     update={
                         "status": TaskStatus.RUNNING,
                         "session_id": session_id,
+                        "session_instance_id": session_instance_id,
                         "started_at": task.started_at or now,
                         "updated_at": now,
                     }
@@ -13695,12 +13798,12 @@ class SQLiteTaskStore(TaskStore):
                         """
                         INSERT INTO cayu_tasks (
                             id, type, title, description, status, session_id,
-                            parent_task_id, assigned_agent_name, available_at, worker_id,
+                            session_instance_id, parent_task_id, assigned_agent_name, available_at, worker_id,
                             lease_expires_at, status_reason, status_payload_json, input_json,
                             result_json, error_json, metadata_json, created_at, updated_at,
                             started_at, completed_at, invocation_json, retry_series_json,
                             work_contract_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         sqlite_support.task_to_row_values(successor),
                     )
@@ -14445,7 +14548,8 @@ class SQLiteTaskStore(TaskStore):
         if parent_task_id == task_id:
             raise ValueError("Task cannot be its own parent.")
         row = self._connection.execute(
-            "SELECT id, session_id, invocation_json FROM cayu_tasks WHERE id = ?",
+            "SELECT id, session_id, session_instance_id, invocation_json "
+            "FROM cayu_tasks WHERE id = ?",
             (parent_task_id,),
         ).fetchone()
         if row is None:
@@ -14453,6 +14557,7 @@ class SQLiteTaskStore(TaskStore):
         return TaskInvocationSnapshot(
             id=row["id"],
             session_id=row["session_id"],
+            session_instance_id=row["session_instance_id"],
             invocation=TaskInvocation.model_validate(json.loads(row["invocation_json"])),
         )
 

@@ -359,6 +359,24 @@ class CompletionVerifierRef(FrozenWorkContractModel):
         return _sha256_digest(value, "configuration_fingerprint")
 
 
+class CompletionResultResolverRef(FrozenWorkContractModel):
+    """Exact application-owned authority for reconstructing an accepted result."""
+
+    resolver_id: str
+    version: str
+    configuration_fingerprint: str
+
+    @field_validator("resolver_id", "version")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_identifier(value, info.field_name)
+
+    @field_validator("configuration_fingerprint")
+    @classmethod
+    def validate_configuration_fingerprint(cls, value: str) -> str:
+        return _sha256_digest(value, "configuration_fingerprint")
+
+
 class CompletionContinuationPolicy(FrozenWorkContractModel):
     rejection_action: CompletionRejectionAction = CompletionRejectionAction.INTERRUPT
     max_attempts: StrictInt = Field(default=3, ge=1, le=100)
@@ -461,6 +479,7 @@ class WorkContractDraft(FrozenWorkContractModel):
         max_length=WORK_CONTRACT_MAX_EVIDENCE_REQUIREMENTS,
     )
     verifier: CompletionVerifierRef
+    result_resolver: CompletionResultResolverRef
     continuation_policy: CompletionContinuationPolicy = Field(
         default_factory=CompletionContinuationPolicy
     )
@@ -475,13 +494,20 @@ class WorkContractDraft(FrozenWorkContractModel):
     def validate_objective(cls, value: str) -> str:
         return _bounded_text(value, "objective")
 
-    @field_validator("supersedes", "verifier", "continuation_policy", mode="before")
+    @field_validator(
+        "supersedes",
+        "verifier",
+        "result_resolver",
+        "continuation_policy",
+        mode="before",
+    )
     @classmethod
     def copy_nested_model(cls, value: object) -> object:
         return revalidate_model_input(
             value,
             WorkContractRef,
             CompletionVerifierRef,
+            CompletionResultResolverRef,
             CompletionContinuationPolicy,
         )
 
@@ -601,7 +627,7 @@ class WorkContract(WorkContractDraft):
 
 def _work_contract_definition_document(contract: WorkContractDraft) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "contract_id": contract.contract_id,
         "version": contract.version,
         "supersedes": (
@@ -618,6 +644,7 @@ def _work_contract_definition_document(contract: WorkContractDraft) -> dict[str,
             item.model_dump(mode="json", warnings=False) for item in contract.evidence_requirements
         ],
         "verifier": contract.verifier.model_dump(mode="json", warnings=False),
+        "result_resolver": contract.result_resolver.model_dump(mode="json", warnings=False),
         "continuation_policy": contract.continuation_policy.model_dump(mode="json", warnings=False),
     }
 
@@ -689,6 +716,11 @@ def _copy_work_contract_definition(value: WorkContractDraft) -> dict[str, object
             field_name="evidence_requirements",
         ),
         "verifier": _copy_bounded_model_input(value.verifier, CompletionVerifierRef, 4),
+        "result_resolver": _copy_bounded_model_input(
+            value.result_resolver,
+            CompletionResultResolverRef,
+            3,
+        ),
         "continuation_policy": _copy_bounded_model_input(
             value.continuation_policy,
             CompletionContinuationPolicy,
@@ -2154,6 +2186,7 @@ __all__ = [
     "CompletionProposalCreate",
     "CompletionRejectionAction",
     "CompletionResultReference",
+    "CompletionResultResolverRef",
     "CompletionSatisfactionBasis",
     "CompletionVerdict",
     "CompletionVerificationClaim",

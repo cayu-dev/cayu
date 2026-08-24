@@ -1144,13 +1144,14 @@ def test_postgres_session_topology_child_query_uses_composite_index(
             await cur.execute(
                 """
                 INSERT INTO cayu_sessions (
-                    id, agent_name, provider_name, model, parent_session_id,
+                    id, instance_id, agent_name, provider_name, model, parent_session_id,
                     causal_budget_id, runtime_name, runtime_version,
                     environment_name, status, created_at, updated_at,
                     last_activity_at, run_epoch, event_seq, invocation, metadata
                 )
                 SELECT
                     'topology-plan-child-' || lpad(value::text, 6, '0'),
+                    '00000000-0000-4000-a000-' || lpad(value::text, 12, '0'),
                     'child', 'fake', 'fake-model', 'topology-plan-parent',
                     'topology-plan-budget', 'cayu', NULL, NULL, 'pending',
                     TIMESTAMPTZ '2026-01-01T00:00:00Z',

@@ -278,6 +278,7 @@ from cayu.runtime.budgets import (
 from cayu.runtime.checkpoints import (
     AUTOMATIC_RECALL_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
+    COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
 from cayu.runtime.context import (
@@ -575,6 +576,7 @@ from cayu.runtime.tasks import (
     TaskTerminalizationRequest,
     TaskTerminalKind,
     _task_invocation_for_attachment,
+    _task_session_instance_for_attachment,
     _terminalize_claimed_task,
     copy_task,
 )
@@ -3574,6 +3576,10 @@ def _replace_checkpoint_preserving_runtime_state(
             (
                 _PROVIDER_OPERATION_PENDING_DISPOSITION_CHECKPOINT_KEY,
                 "provider_operation_pending_resolution_disposition",
+            ),
+            (
+                COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
+                "completion_result_event_publications",
             ),
         ):
             updated.pop(key, None)
@@ -14313,6 +14319,13 @@ class SessionEngine:
                     _QUEUED_DISPATCH_TERMINAL_RECEIPTS_CHECKPOINT_KEY,
                     None,
                 )
+                # Result-publication ownership belongs to the source session.
+                # A fork inherits resumable content, never the source's
+                # outstanding event-publication reservation.
+                fork_checkpoint.pop(
+                    COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
+                    None,
+                )
                 # Active invocation authority is bound to the source session's
                 # interaction and run epoch, never to the derived child.
                 fork_checkpoint.pop(
@@ -17844,6 +17857,7 @@ class SessionEngine:
             raise RuntimeError("task_store is required when RunRequest.task_id is set.")
         session_invocation = SessionInvocationBinding(
             id=session.id,
+            session_instance_id=session.instance_id,
             invocation=session.invocation,
         )
         existing = await self.task_store.load_task(task_id)
@@ -17856,6 +17870,11 @@ class SessionEngine:
         ):
             _task_invocation_for_attachment(
                 existing.invocation,
+                session_id=session.id,
+                session_binding=session_invocation,
+            )
+            _task_session_instance_for_attachment(
+                stored_session_instance_id=existing.session_instance_id,
                 session_id=session.id,
                 session_binding=session_invocation,
             )

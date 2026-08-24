@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -73,6 +73,7 @@ def test_task_root_and_child_provenance_is_immutable(store_factory, tmp_path) ->
             session_id="task-session",
             session_invocation=SessionInvocationBinding(
                 id="task-session",
+                session_instance_id=str(uuid4()),
                 invocation=session_invocation_from_task(
                     claimed.invocation,
                     session_id="task-session",
@@ -144,7 +145,12 @@ def test_task_stores_load_bounded_invocation_snapshots(store_factory, tmp_path) 
         assert snapshot.id == task.id
         assert snapshot.session_id == task.session_id
         assert snapshot.invocation == task.invocation
-        assert set(snapshot.model_dump()) == {"id", "session_id", "invocation"}
+        assert set(snapshot.model_dump()) == {
+            "id",
+            "session_id",
+            "session_instance_id",
+            "invocation",
+        }
         assert await store.load_invocation_snapshot("missing") is None
 
         if hasattr(store, "close"):
@@ -225,6 +231,7 @@ def test_session_engine_revalidates_an_already_running_task_attachment() -> None
             task.id,
             session_invocation=SessionInvocationBinding(
                 id=session.id,
+                session_instance_id=session.instance_id,
                 invocation=session_invocation_from_task(
                     task.invocation,
                     session_id=session.id,
@@ -290,6 +297,7 @@ def test_task_attachment_rejects_a_different_invocation_tree() -> None:
                 session_id=unrelated.id,
                 session_invocation=SessionInvocationBinding(
                     id=unrelated.id,
+                    session_instance_id=unrelated.instance_id,
                     invocation=unrelated.invocation,
                 ),
             )
@@ -326,6 +334,7 @@ def test_task_attachment_requires_explicit_session_provenance() -> None:
             session_id="planned-session",
             session_invocation=SessionInvocationBinding(
                 id="planned-session",
+                session_instance_id=str(uuid4()),
                 invocation=session_invocation_from_task(
                     task.invocation,
                     session_id="planned-session",

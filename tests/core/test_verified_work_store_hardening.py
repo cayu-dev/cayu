@@ -23,6 +23,7 @@ from cayu import (
     CompletionProposal,
     CompletionProposalCreate,
     CompletionResultReference,
+    CompletionResultResolverRef,
     CompletionSatisfactionBasis,
     CompletionVerdict,
     CompletionVerificationClaim,
@@ -69,6 +70,14 @@ def _digest(value: str) -> str:
     return sha256(value.encode()).hexdigest()
 
 
+def _resolver() -> CompletionResultResolverRef:
+    return CompletionResultResolverRef(
+        resolver_id="deterministic-result-content",
+        version="v1",
+        configuration_fingerprint=_digest("deterministic-result-content-v1"),
+    )
+
+
 def _contract(*, contract_id: str) -> WorkContract:
     return work_contract_from_draft(
         WorkContractDraft(
@@ -87,6 +96,7 @@ def _contract(*, contract_id: str) -> WorkContract:
                 version="v1",
                 configuration_fingerprint=_digest("deterministic-result-v1"),
             ),
+            result_resolver=_resolver(),
         )
     )
 
@@ -1057,6 +1067,7 @@ def test_public_boundary_preserves_redacted_postgres_cancellation_settlement_fai
                 version="v1",
                 configuration_fingerprint=_digest("deterministic-settlement-v1"),
             ),
+            result_resolver=_resolver(),
         )
         caller = asyncio.create_task(app.create_work_contract(draft))
         await operation_started.wait()

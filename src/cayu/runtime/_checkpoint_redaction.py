@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 from cayu._validation import copy_json_value
@@ -8,6 +9,7 @@ from cayu.runtime.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     AUTOMATIC_RECALL_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
+    COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
 )
 from cayu.runtime.structured_output import json_schema_contains_secret
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
@@ -450,6 +452,7 @@ _DURABLE_ROOT_STRUCTURE_KEYS = frozenset(
         ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
         CHECKPOINT_SCHEMA_VERSION_KEY,
         AUTOMATIC_RECALL_CHECKPOINT_KEY,
+        COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
         "context_compaction",
         "durable_subagent_submission_seeds",
         "durable_subagent_submissions",
@@ -514,6 +517,8 @@ _PENDING_TOOL_ROUND_EXECUTION_IDENTITY_FIELDS = frozenset(
         "tool_round_id",
     }
 )
+_COMPLETION_RESULT_EVENT_PUBLICATION_ID_PREFIX = "completion-result-publication:v1:"
+_COMPLETION_RESULT_EVENT_PUBLICATION_OWNER_ID_PREFIX = "completion-result-owner:v1:"
 
 
 def require_secret_free_durable_object(
@@ -567,16 +572,18 @@ def durable_value_contains_secret(
         if (
             _is_active_invocation_profile_identity_path(path)
             or _is_automatic_recall_evidence_identity_path(path)
+            or _is_completion_result_event_publication_identity(path, value)
             or _is_workspace_observation_identity_path(path)
             or _is_pending_tool_round_execution_identity_path(path)
             or _is_tool_exposure_authority_identity_path(path)
         ):
-            # Both checkpoint roots are runtime-owned typed authority. Active
+            # These checkpoint roots are runtime-owned typed authority. Active
             # profiles cross their dedicated admission boundary; workspace
-            # observation roots can be created only with a matching private
-            # intent admission. Configured dynamic identities are already
-            # field-scoped keyed aliases; static identities were checked, and
-            # exact runtime observer identities retain structural provenance.
+            # observations and result-publication reservations are admitted
+            # only through their runtime-owned state machines. Configured
+            # dynamic identities are already field-scoped keyed aliases;
+            # static identities were checked, and exact runtime identities
+            # retain structural provenance.
             return False
         if path and path[-1] in _DURABLE_ENUM_STRING_FIELDS and _path_has_typed_schema(path[:-1]):
             # Typed model validation owns these finite protocol values. A
@@ -634,6 +641,7 @@ def durable_value_contains_secret(
                 (
                     key in (_DURABLE_ROOT_STRUCTURE_KEYS if not path else _DURABLE_STRUCTURE_KEYS)
                     or _is_durable_subagent_structural_key(path, key)
+                    or _is_completion_result_event_publication_structural_key(path, key)
                     or _is_quarantined_assistant_message_structural_key(path, key)
                     or _is_staged_terminal_event_payload(path)
                 )
@@ -796,6 +804,8 @@ def _is_tool_exposure_authority_identity_path(path: tuple[str, ...]) -> bool:
 def _path_has_typed_schema(path: tuple[str, ...]) -> bool:
     """Return whether `path` remains inside a known runtime-owned checkpoint shape."""
 
+    if _is_completion_result_event_publication_schema_path(path):
+        return True
     if path and path[0] not in _DURABLE_ROOT_STRUCTURE_KEYS:
         return False
     for index, part in enumerate(path):
@@ -819,6 +829,143 @@ def _path_has_typed_schema(path: tuple[str, ...]) -> bool:
             continue
         return False
     return True
+
+
+def _is_completion_result_event_publication_id(value: str) -> bool:
+    return (
+        len(value) == len(_COMPLETION_RESULT_EVENT_PUBLICATION_ID_PREFIX) + 64
+        and value.startswith(_COMPLETION_RESULT_EVENT_PUBLICATION_ID_PREFIX)
+        and all(
+            character in "0123456789abcdef"
+            for character in value.removeprefix(_COMPLETION_RESULT_EVENT_PUBLICATION_ID_PREFIX)
+        )
+    )
+
+
+def _is_completion_result_event_publication_schema_path(path: tuple[str, ...]) -> bool:
+    if path in {
+        (COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,),
+        (COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, "reservations"),
+    }:
+        return True
+    if (
+        len(path) == 3
+        and path[:2] == (COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, "reservations")
+        and _is_completion_result_event_publication_id(path[2])
+    ):
+        return True
+    if (
+        len(path) == 4
+        and path[:2] == (COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, "reservations")
+        and _is_completion_result_event_publication_id(path[2])
+        and path[3] == "owners"
+    ):
+        return True
+    return (
+        len(path) == 5
+        and path[:2] == (COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, "reservations")
+        and _is_completion_result_event_publication_id(path[2])
+        and path[3] == "owners"
+        and _is_completion_result_event_publication_owner_id(path[4])
+    )
+
+
+def _is_completion_result_event_publication_owner_id(value: str) -> bool:
+    return (
+        len(value) == len(_COMPLETION_RESULT_EVENT_PUBLICATION_OWNER_ID_PREFIX) + 64
+        and value.startswith(_COMPLETION_RESULT_EVENT_PUBLICATION_OWNER_ID_PREFIX)
+        and all(
+            character in "0123456789abcdef"
+            for character in value.removeprefix(
+                _COMPLETION_RESULT_EVENT_PUBLICATION_OWNER_ID_PREFIX
+            )
+        )
+    )
+
+
+def _is_completion_result_event_publication_structural_key(
+    path: tuple[str, ...],
+    key: str,
+) -> bool:
+    if path == (COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,):
+        return key in {"schema_version", "reservations"}
+    if path == (
+        COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
+        "reservations",
+    ):
+        return _is_completion_result_event_publication_id(key)
+    return (
+        (
+            len(path) == 3
+            and path[:2] == (COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, "reservations")
+            and _is_completion_result_event_publication_id(path[2])
+            and key in {"schema_version", "publication_id", "authority_sha256", "owners"}
+        )
+        or (
+            len(path) == 4
+            and path[:2] == (COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, "reservations")
+            and _is_completion_result_event_publication_id(path[2])
+            and path[3] == "owners"
+            and _is_completion_result_event_publication_owner_id(key)
+        )
+        or (
+            len(path) == 5
+            and path[:2] == (COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, "reservations")
+            and _is_completion_result_event_publication_id(path[2])
+            and path[3] == "owners"
+            and _is_completion_result_event_publication_owner_id(path[4])
+            and key in {"schema_version", "owner_id", "expires_at"}
+        )
+    )
+
+
+def _is_completion_result_event_publication_identity(
+    path: tuple[str, ...],
+    value: str,
+) -> bool:
+    if (
+        len(path) == 4
+        and path[:2] == (COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, "reservations")
+        and _is_completion_result_event_publication_id(path[2])
+        and path[3] == "publication_id"
+    ):
+        return value == path[2]
+    if (
+        len(path) == 4
+        and path[:2] == (COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, "reservations")
+        and _is_completion_result_event_publication_id(path[2])
+        and path[3] == "authority_sha256"
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+        and path[2] == f"{_COMPLETION_RESULT_EVENT_PUBLICATION_ID_PREFIX}{value}"
+    ):
+        return True
+    if (
+        len(path) == 6
+        and path[:2] == (COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, "reservations")
+        and _is_completion_result_event_publication_id(path[2])
+        and path[3] == "owners"
+        and _is_completion_result_event_publication_owner_id(path[4])
+        and path[5] == "expires_at"
+    ):
+        try:
+            expiry = datetime.fromisoformat(value)
+        except ValueError:
+            return False
+        return (
+            expiry.tzinfo is not None
+            and expiry.utcoffset() is not None
+            and expiry.astimezone(UTC).isoformat() == value
+        )
+    return (
+        len(path) == 6
+        and path[:2] == (COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, "reservations")
+        and _is_completion_result_event_publication_id(path[2])
+        and path[3] == "owners"
+        and _is_completion_result_event_publication_owner_id(path[4])
+        and path[5] == "owner_id"
+        and value == path[4]
+    )
 
 
 def _is_automatic_recall_evidence_identity_path(path: tuple[str, ...]) -> bool:

@@ -174,6 +174,7 @@ from cayu.runtime.budgets import (
 )
 from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
+    COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     decode_runtime_checkpoint,
 )
@@ -505,6 +506,7 @@ UNASSOCIATED_RUNTIME_EVENT_TYPES: frozenset[EventType] = frozenset(
         EventType.SESSION_COMPLETED,
         EventType.SESSION_FAILED,
         EventType.SESSION_INTERRUPTED,
+        EventType.TASK_COMPLETION_RESULT_RESOLVED,
         EventType.RUNTIME_INTERACTION_TRANSITION_ACKNOWLEDGEMENT_FAILED,
     }
 )
@@ -2872,6 +2874,10 @@ class Session(BaseModel):
     # SessionStore implementations set this from RunRequest.session_id or mint it
     # before constructing the record so invocation.root_session_id is exact.
     id: str = Field(default_factory=lambda: str(uuid4()))
+    # One store-owned incarnation of ``id``. Deleting and recreating the same
+    # public session ID must mint a different value so durable work cannot
+    # publish into the replacement session.
+    instance_id: str = Field(default_factory=lambda: str(uuid4()), frozen=True)
     agent_name: str
     provider_name: str
     model: str
@@ -2930,6 +2936,11 @@ class Session(BaseModel):
         # predate it or come from an external store, and must remain loadable so
         # operators can inspect and migrate them.
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("instance_id")
+    @classmethod
+    def validate_instance_id(cls, value: str) -> str:
+        return SessionInvocationBinding.validate_session_instance_id(value)
 
     @field_validator("parent_session_id", "environment_name", "runtime_version")
     @classmethod
@@ -3180,6 +3191,369 @@ CheckpointTransform = Callable[
     dict[str, Any] | None,
 ]
 CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS = 32
+
+_COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION = 2
+_MAX_COMPLETION_RESULT_EVENT_PUBLICATIONS = 64
+_COMPLETION_RESULT_EVENT_PUBLICATION_ID_PREFIX = "completion-result-publication:v1:"
+_COMPLETION_RESULT_EVENT_PUBLICATION_OWNER_ID_PREFIX = "completion-result-owner:v1:"
+
+
+def _completion_result_event_publication_owner_expiry(value: object) -> datetime:
+    if type(value) is not str:
+        raise ValueError("Completion-result event publication owner is malformed.")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError("Completion-result event publication owner is malformed.") from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("Completion-result event publication owner is malformed.")
+    normalized = parsed.astimezone(UTC)
+    if normalized.isoformat() != value:
+        raise ValueError("Completion-result event publication owner is malformed.")
+    return normalized
+
+
+def _is_completion_result_event_publication_owner_id(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == len(_COMPLETION_RESULT_EVENT_PUBLICATION_OWNER_ID_PREFIX) + 64
+        and value.startswith(_COMPLETION_RESULT_EVENT_PUBLICATION_OWNER_ID_PREFIX)
+        and all(
+            character in "0123456789abcdef"
+            for character in value.removeprefix(
+                _COMPLETION_RESULT_EVENT_PUBLICATION_OWNER_ID_PREFIX
+            )
+        )
+    )
+
+
+def _completion_result_event_publication_reservations(
+    checkpoint: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    if checkpoint is None:
+        return {}
+    if COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY not in checkpoint:
+        return {}
+    raw = checkpoint[COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY]
+    if type(raw) is not dict or set(raw) != {"schema_version", "reservations"}:
+        raise ValueError("Completion-result event publication authority is malformed.")
+    if (
+        type(raw.get("schema_version")) is not int
+        or raw.get("schema_version") != _COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            "Completion-result event publication authority has an unsupported version."
+        )
+    reservations = raw.get("reservations")
+    if type(reservations) is not dict or len(reservations) > (
+        _MAX_COMPLETION_RESULT_EVENT_PUBLICATIONS
+    ):
+        raise ValueError("Completion-result event publication reservations are malformed.")
+    copied: dict[str, dict[str, Any]] = {}
+    for publication_id, record in reservations.items():
+        if (
+            type(publication_id) is not str
+            or len(publication_id) != len(_COMPLETION_RESULT_EVENT_PUBLICATION_ID_PREFIX) + 64
+            or not publication_id.startswith(_COMPLETION_RESULT_EVENT_PUBLICATION_ID_PREFIX)
+            or type(record) is not dict
+            or set(record) != {"schema_version", "publication_id", "authority_sha256", "owners"}
+            or type(record.get("schema_version")) is not int
+            or record.get("schema_version") != _COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION
+            or record.get("publication_id") != publication_id
+        ):
+            raise ValueError("Completion-result event publication reservation is malformed.")
+        authority_sha256 = record.get("authority_sha256")
+        if (
+            type(authority_sha256) is not str
+            or len(authority_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in authority_sha256)
+            or publication_id.removeprefix(_COMPLETION_RESULT_EVENT_PUBLICATION_ID_PREFIX)
+            != authority_sha256
+        ):
+            raise ValueError("Completion-result event publication reservation is malformed.")
+        owners = record.get("owners")
+        if (
+            type(owners) is not dict
+            or not owners
+            or len(owners) > (_MAX_COMPLETION_RESULT_EVENT_PUBLICATIONS)
+        ):
+            raise ValueError("Completion-result event publication reservation is malformed.")
+        copied_owners: dict[str, dict[str, Any]] = {}
+        for owner_id, owner in owners.items():
+            if (
+                not _is_completion_result_event_publication_owner_id(owner_id)
+                or type(owner) is not dict
+                or set(owner) != {"schema_version", "owner_id", "expires_at"}
+                or type(owner.get("schema_version")) is not int
+                or owner.get("schema_version")
+                != _COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION
+                or owner.get("owner_id") != owner_id
+            ):
+                raise ValueError("Completion-result event publication owner is malformed.")
+            expires_at = _completion_result_event_publication_owner_expiry(owner.get("expires_at"))
+            copied_owners[owner_id] = {
+                "schema_version": _COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
+                "owner_id": owner_id,
+                "expires_at": expires_at.isoformat(),
+            }
+        copied[publication_id] = {
+            "schema_version": _COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
+            "publication_id": publication_id,
+            "authority_sha256": authority_sha256,
+            "owners": copied_owners,
+        }
+    return copied
+
+
+def _prune_expired_completion_result_event_publication_owners(
+    reservations: dict[str, dict[str, Any]],
+    *,
+    now: datetime,
+) -> None:
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("Completion-result event publication time must be timezone-aware.")
+    normalized_now = now.astimezone(UTC)
+    for publication_id in tuple(reservations):
+        owners = reservations[publication_id]["owners"]
+        for owner_id in tuple(owners):
+            expires_at = _completion_result_event_publication_owner_expiry(
+                owners[owner_id]["expires_at"]
+            )
+            if expires_at <= normalized_now:
+                del owners[owner_id]
+        if not owners:
+            del reservations[publication_id]
+
+
+def _reserve_completion_result_event_publication(
+    checkpoint: dict[str, Any] | None,
+    *,
+    publication_id: str,
+    authority_sha256: str,
+    owner_id: str,
+    owner_expires_at: datetime,
+    now: datetime,
+) -> dict[str, Any]:
+    publication_id = require_clean_nonblank(publication_id, "publication_id")
+    if len(publication_id) > 256:
+        raise ValueError("publication_id cannot exceed 256 characters.")
+    if (
+        type(authority_sha256) is not str
+        or len(authority_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in authority_sha256)
+    ):
+        raise ValueError("authority_sha256 must be a lowercase SHA-256 digest.")
+    if publication_id != f"{_COMPLETION_RESULT_EVENT_PUBLICATION_ID_PREFIX}{authority_sha256}":
+        raise ValueError("publication_id does not match its authority digest.")
+    if not _is_completion_result_event_publication_owner_id(owner_id):
+        raise ValueError("owner_id is not a completion-result publication owner identity.")
+    if owner_expires_at.tzinfo is None or owner_expires_at.utcoffset() is None:
+        raise ValueError("owner_expires_at must be timezone-aware.")
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware.")
+    normalized_expiry = owner_expires_at.astimezone(UTC)
+    normalized_now = now.astimezone(UTC)
+    if normalized_expiry <= normalized_now:
+        raise ValueError("owner_expires_at must be later than now.")
+    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
+    reservations = _completion_result_event_publication_reservations(updated)
+    _prune_expired_completion_result_event_publication_owners(
+        reservations,
+        now=normalized_now,
+    )
+    requested: dict[str, Any] = {
+        "schema_version": _COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
+        "publication_id": publication_id,
+        "authority_sha256": authority_sha256,
+        "owners": {},
+    }
+    existing = reservations.get(publication_id)
+    if existing is not None and any(
+        existing.get(key) != requested[key]
+        for key in ("schema_version", "publication_id", "authority_sha256")
+    ):
+        raise ValueError("Completion-result event publication identity conflicts.")
+    if existing is None:
+        if len(reservations) >= _MAX_COMPLETION_RESULT_EVENT_PUBLICATIONS:
+            raise ValueError("Completion-result event publication capacity is exhausted.")
+        reservations[publication_id] = requested
+        existing = requested
+    owners = existing.get("owners")
+    if type(owners) is not dict:
+        raise ValueError("Completion-result event publication reservation is malformed.")
+    if owner_id not in owners and len(owners) >= _MAX_COMPLETION_RESULT_EVENT_PUBLICATIONS:
+        raise ValueError("Completion-result event publication capacity is exhausted.")
+    owners[owner_id] = {
+        "schema_version": _COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
+        "owner_id": owner_id,
+        "expires_at": normalized_expiry.isoformat(),
+    }
+    updated[COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY] = {
+        "schema_version": _COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
+        "reservations": reservations,
+    }
+    return updated
+
+
+def _release_completion_result_event_publication(
+    checkpoint: dict[str, Any] | None,
+    *,
+    publication_id: str,
+    authority_sha256: str,
+    owner_id: str,
+    require_present: bool,
+    now: datetime,
+) -> dict[str, Any]:
+    if type(require_present) is not bool:
+        raise TypeError("require_present must be a boolean.")
+    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
+    reservations = _completion_result_event_publication_reservations(updated)
+    _prune_expired_completion_result_event_publication_owners(reservations, now=now)
+    existing = reservations.get(publication_id)
+    if existing is None:
+        if require_present:
+            raise ValueError("Completion-result event publication reservation is missing.")
+        return updated
+    if existing.get("authority_sha256") != authority_sha256:
+        raise ValueError("Completion-result event publication identity conflicts.")
+    owners = existing["owners"]
+    if owner_id not in owners:
+        if require_present:
+            raise ValueError("Completion-result event publication owner is missing.")
+        return updated
+    del owners[owner_id]
+    if not owners:
+        del reservations[publication_id]
+    if reservations:
+        updated[COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY] = {
+            "schema_version": _COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
+            "reservations": reservations,
+        }
+    else:
+        updated.pop(COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, None)
+    return updated
+
+
+def _renew_completion_result_event_publication(
+    checkpoint: dict[str, Any] | None,
+    *,
+    publication_id: str,
+    authority_sha256: str,
+    owner_id: str,
+    owner_expires_at: datetime,
+    now: datetime,
+) -> dict[str, Any]:
+    if owner_expires_at.tzinfo is None or owner_expires_at.utcoffset() is None:
+        raise ValueError("owner_expires_at must be timezone-aware.")
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware.")
+    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
+    reservations = _completion_result_event_publication_reservations(updated)
+    _prune_expired_completion_result_event_publication_owners(reservations, now=now)
+    existing = reservations.get(publication_id)
+    if existing is None or existing.get("authority_sha256") != authority_sha256:
+        raise ValueError("Completion-result event publication reservation is missing.")
+    owners = existing["owners"]
+    if owner_id not in owners:
+        raise ValueError("Completion-result event publication owner is missing.")
+    normalized_expiry = owner_expires_at.astimezone(UTC)
+    if normalized_expiry <= now.astimezone(UTC):
+        raise ValueError("owner_expires_at must be later than now.")
+    owners[owner_id]["expires_at"] = normalized_expiry.isoformat()
+    updated[COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY] = {
+        "schema_version": _COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
+        "reservations": reservations,
+    }
+    return updated
+
+
+def _complete_completion_result_event_publication(
+    checkpoint: dict[str, Any] | None,
+    *,
+    publication_id: str,
+    authority_sha256: str,
+    owner_id: str,
+    require_present: bool,
+) -> dict[str, Any]:
+    if type(require_present) is not bool:
+        raise TypeError("require_present must be a boolean.")
+    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
+    reservations = _completion_result_event_publication_reservations(updated)
+    existing = reservations.get(publication_id)
+    if existing is None:
+        if require_present:
+            raise ValueError("Completion-result event publication reservation is missing.")
+        return updated
+    if existing.get("authority_sha256") != authority_sha256:
+        raise ValueError("Completion-result event publication identity conflicts.")
+    owners = existing["owners"]
+    if owner_id not in owners:
+        if require_present:
+            raise ValueError("Completion-result event publication owner is missing.")
+        return updated
+    del owners[owner_id]
+    if not owners:
+        del reservations[publication_id]
+    if reservations:
+        updated[COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY] = {
+            "schema_version": _COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION,
+            "reservations": reservations,
+        }
+    else:
+        updated.pop(COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, None)
+    return updated
+
+
+def _completion_result_event_publication_delete_block_reason(
+    checkpoint: dict[str, Any] | None,
+    *,
+    now: datetime | None = None,
+) -> str | None:
+    reservations = _completion_result_event_publication_reservations(checkpoint)
+    _prune_expired_completion_result_event_publication_owners(
+        reservations,
+        now=datetime.now(UTC) if now is None else now,
+    )
+    if not reservations:
+        return None
+    return "completion-result event publication is incomplete"
+
+
+def _replace_checkpoint_preserving_completion_result_event_publications(
+    current: dict[str, Any] | None,
+    replacement: dict[str, Any],
+) -> dict[str, Any]:
+    """Replace caller checkpoint state without changing runtime publication ownership."""
+
+    updated = copy_durable_json_object(replacement, "checkpoint")
+    updated.pop(COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY, None)
+    if current is not None and COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY in current:
+        _completion_result_event_publication_reservations(current)
+        updated[COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY] = copy_durable_json_object(
+            current[COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY],
+            "completion_result_event_publications",
+        )
+    return updated
+
+
+def _copy_checkpoint_for_transform(
+    checkpoint: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Detach callback-visible checkpoint state from store-owned authority."""
+
+    return None if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
+
+
+def _checkpoint_transform_result_preserving_completion_result_event_publications(
+    current: dict[str, Any] | None,
+    transformed: dict[str, Any],
+) -> dict[str, Any]:
+    """Own callback output while retaining the store's private publication root."""
+
+    return _replace_checkpoint_preserving_completion_result_event_publications(
+        current,
+        copy_durable_json_object(transformed, "checkpoint"),
+    )
 
 
 @dataclass(frozen=True)
@@ -3544,7 +3918,17 @@ def transform_fork_checkpoint(
     """Apply a fork transform without retaining its raw input on failure."""
 
     try:
-        return transform(source_session, source_checkpoint)
+        transformed = transform(source_session, source_checkpoint)
+        if transformed is None:
+            return None
+        # Forked checkpoints never inherit the source session's private
+        # completion-result publication ownership. Apply the same rule when a
+        # raw store caller returns the source checkpoint unchanged or attempts
+        # to manufacture the reserved root.
+        return _replace_checkpoint_preserving_completion_result_event_publications(
+            None,
+            transformed,
+        )
     except BaseException:
         if source_checkpoint is not None:
             source_checkpoint.clear()
@@ -3664,7 +4048,12 @@ class RuntimePublicationCheckpointOperation(BaseModel):
     @field_validator("key")
     @classmethod
     def validate_key(cls, value: str) -> str:
-        return require_clean_nonblank(value, "checkpoint operation key")
+        value = require_clean_nonblank(value, "checkpoint operation key")
+        if value == COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY:
+            raise ValueError(
+                "Runtime publications cannot mutate completion-result event publication authority."
+            )
+        return value
 
     @field_validator("expected_value_digest")
     @classmethod
@@ -7476,6 +7865,7 @@ class SessionStore(ABC):
     supports_pending_session_initial_checkpoint: ClassVar[bool] = False
     supports_profiled_forks: ClassVar[bool] = False
     supports_atomic_model_completion_stage_release: ClassVar[bool] = False
+    supports_completion_result_event_publication_reservations: ClassVar[bool] = False
     supports_transcript_search: ClassVar[bool] = False
     supports_recall_evidence: ClassVar[bool] = False
     supports_owned_off_thread_session_commit_guards: ClassVar[bool] = False
@@ -8201,6 +8591,19 @@ class SessionStore(ABC):
     ) -> Session:
         """Atomically transform a checkpoint and append its causal event batch."""
 
+    async def _publish_completion_result_event_publication(
+        self,
+        session_id: str,
+        *,
+        checkpoint_transform: CheckpointTransform,
+        events: list[Event],
+    ) -> Session:
+        """Mutate the private completion-result publication root atomically."""
+
+        raise NotImplementedError(
+            "This SessionStore does not own completion-result event publication."
+        )
+
     @abstractmethod
     async def load_session_operation(
         self,
@@ -8263,6 +8666,41 @@ class SessionStore(ABC):
         return (
             self.supports_atomic_model_completion_stage_release is True
             and capability_owner_index <= publication_owner_index
+        )
+
+    def _supports_completion_result_event_publication_reservation_protocol(self) -> bool:
+        """Return whether this exact store owns the complete reservation contract."""
+
+        mro = type(self).__mro__
+        capability_owner_index = next(
+            index
+            for index, owner in enumerate(mro)
+            if "supports_completion_result_event_publication_reservations" in owner.__dict__
+        )
+        required_owner_indexes = tuple(
+            next(index for index, owner in enumerate(mro) if method_name in owner.__dict__)
+            for method_name in (
+                "create",
+                "create_fork",
+                "create_fork_with_transcript_validation",
+                "create_profiled_fork",
+                "transition_status_and_checkpoint",
+                "admit_execution_profile_resume",
+                "admit_session_invocation",
+                "fence_run_and_transform_checkpoint",
+                "checkpoint",
+                "transform_checkpoint",
+                "delete_session",
+                "publish_checkpoint_and_events",
+                "publish_session_operation",
+                "publish_session_operation_guarded",
+                "replace_initial_transcript_messages",
+                "append_transcript_messages_and_transform_checkpoint",
+                "_publish_completion_result_event_publication",
+            )
+        )
+        return self.supports_completion_result_event_publication_reservations is True and all(
+            capability_owner_index <= index for index in required_owner_indexes
         )
 
     async def publish_session_operation_guarded(
@@ -9440,6 +9878,7 @@ class InMemorySessionStore(SessionStore):
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     supports_profiled_forks: ClassVar[bool] = True
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
+    supports_completion_result_event_publication_reservations: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
     supports_recall_evidence: ClassVar[bool] = True
     supports_owned_off_thread_session_commit_guards: ClassVar[bool] = True
@@ -10889,6 +11328,10 @@ class InMemorySessionStore(SessionStore):
             now = datetime.now(UTC)
             session = Session(
                 id=session_id,
+                instance_id=session_instance_id_for_run_request(
+                    request,
+                    session_id=session_id,
+                ),
                 agent_name=request.agent_name,
                 provider_name=identity.provider_name,
                 model=identity.model,
@@ -10918,9 +11361,11 @@ class InMemorySessionStore(SessionStore):
             if admission is None and checkpoint_transform is not None:
                 transformed = checkpoint_transform(session.model_copy(deep=True), None)
                 if transformed is not None:
-                    copied_checkpoint = copy_durable_json_object(
-                        transformed,
-                        "checkpoint",
+                    copied_checkpoint = (
+                        _replace_checkpoint_preserving_completion_result_event_publications(
+                            None,
+                            copy_durable_json_object(transformed, "checkpoint"),
+                        )
                     )
                     pending_checkpoint = self._prepare_checkpoint_store_unlocked(
                         session.id,
@@ -11073,6 +11518,7 @@ class InMemorySessionStore(SessionStore):
                 transcript_cursor=transcript_cursor,
             )
         )
+        fork = fork.model_copy(update={"instance_id": str(uuid4())})
         async with self._lock:
             source_session = _validate_session_fork_source(
                 source_session=self._sessions.get(source_session_id),
@@ -11243,6 +11689,7 @@ class InMemorySessionStore(SessionStore):
                 return None
             return SessionInvocationSnapshot(
                 id=session.id,
+                session_instance_id=session.instance_id,
                 status=session.status,
                 invocation=session.invocation,
             )
@@ -11355,6 +11802,14 @@ class InMemorySessionStore(SessionStore):
                 raise ValueError(
                     "Cannot delete a session while durable operation "
                     f"{active_operation_id} is active: {session_id}"
+                )
+            completion_result_publication_block = (
+                _completion_result_event_publication_delete_block_reason(checkpoint)
+            )
+            if completion_result_publication_block is not None:
+                raise ValueError(
+                    "Cannot delete a session while "
+                    f"{completion_result_publication_block}: {session_id}"
                 )
             if MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY in self._session_operation_records.get(
                 session_id, {}
@@ -11779,9 +12234,11 @@ class InMemorySessionStore(SessionStore):
                 None if current_checkpoint is None else deepcopy(current_checkpoint),
             )
             if transformed_checkpoint is not None:
-                transformed_checkpoint = copy_durable_json_object(
-                    transformed_checkpoint,
-                    "checkpoint",
+                transformed_checkpoint = (
+                    _checkpoint_transform_result_preserving_completion_result_event_publications(
+                        current_checkpoint,
+                        transformed_checkpoint,
+                    )
                 )
 
             if admission is not None:
@@ -12126,7 +12583,12 @@ class InMemorySessionStore(SessionStore):
             )
             if transformed is None:
                 raise ValueError("Fenced checkpoint transform must return a checkpoint.")
-            transformed = copy_durable_json_object(transformed, "checkpoint")
+            transformed = (
+                _checkpoint_transform_result_preserving_completion_result_event_publications(
+                    current,
+                    transformed,
+                )
+            )
             fenced = session.model_copy(
                 update={
                     "run_epoch": session.run_epoch + 1,
@@ -13124,6 +13586,44 @@ class InMemorySessionStore(SessionStore):
         expected_run_epoch: int | None = None,
         expected_transcript_cursor: int | None = None,
     ) -> Session:
+        return await self._publish_checkpoint_and_events(
+            session_id,
+            checkpoint_transform=checkpoint_transform,
+            events=events,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_transcript_cursor=expected_transcript_cursor,
+            preserve_completion_result_publications=True,
+        )
+
+    async def _publish_completion_result_event_publication(
+        self,
+        session_id: str,
+        *,
+        checkpoint_transform: CheckpointTransform,
+        events: list[Event],
+    ) -> Session:
+        return await self._publish_checkpoint_and_events(
+            session_id,
+            checkpoint_transform=checkpoint_transform,
+            events=events,
+            expected_statuses=None,
+            expected_run_epoch=None,
+            expected_transcript_cursor=None,
+            preserve_completion_result_publications=False,
+        )
+
+    async def _publish_checkpoint_and_events(
+        self,
+        session_id: str,
+        *,
+        checkpoint_transform: CheckpointTransform,
+        events: list[Event],
+        expected_statuses: set[SessionStatus] | None,
+        expected_run_epoch: int | None,
+        expected_transcript_cursor: int | None,
+        preserve_completion_result_publications: bool,
+    ) -> Session:
         session_id, copied_events = _copy_session_event_batch(session_id, events)
         if checkpoint_transform is None:
             raise TypeError("checkpoint_transform is required.")
@@ -13163,6 +13663,13 @@ class InMemorySessionStore(SessionStore):
             if transformed is None:
                 raise ValueError("Checkpoint transform must return a checkpoint.")
             copied_checkpoint = copy_durable_json_object(transformed, "checkpoint")
+            if preserve_completion_result_publications:
+                copied_checkpoint = (
+                    _checkpoint_transform_result_preserving_completion_result_event_publications(
+                        current,
+                        copied_checkpoint,
+                    )
+                )
             updated = self._append_events_unlocked(session, copied_events)
             self._store_checkpoint_unlocked(session_id, copied_checkpoint)
             self._sessions[session_id] = updated
@@ -13361,6 +13868,12 @@ class InMemorySessionStore(SessionStore):
             copied_checkpoint = copy_durable_json_object(
                 publication.checkpoint,
                 "checkpoint",
+            )
+            copied_checkpoint = (
+                _checkpoint_transform_result_preserving_completion_result_event_publications(
+                    current_checkpoint,
+                    copied_checkpoint,
+                )
             )
             copied_records = copy_durable_json_object(
                 publication.operation_records,
@@ -15110,9 +15623,9 @@ class InMemorySessionStore(SessionStore):
                     None if current_checkpoint is None else deepcopy(current_checkpoint),
                 )
                 if transformed is not None:
-                    current_checkpoint = copy_durable_json_object(
+                    current_checkpoint = _checkpoint_transform_result_preserving_completion_result_event_publications(
+                        current_checkpoint,
                         transformed,
-                        "checkpoint",
                     )
             checkpoint = _checkpoint_after_initial_transcript_publication(
                 current_checkpoint,
@@ -15207,7 +15720,12 @@ class InMemorySessionStore(SessionStore):
             )
             if transformed is None:
                 raise ValueError("Checkpoint transform must return a checkpoint.")
-            copied_checkpoint = copy_durable_json_object(transformed, "checkpoint")
+            copied_checkpoint = (
+                _checkpoint_transform_result_preserving_completion_result_event_publications(
+                    current,
+                    transformed,
+                )
+            )
             if copied_messages:
                 if interaction_id is not None:
                     self._register_private_authority_alias_unlocked(
@@ -15832,7 +16350,10 @@ class InMemorySessionStore(SessionStore):
             _assert_session_run_epoch(session_id, session)
             self._store_checkpoint_unlocked(
                 session_id,
-                copy_durable_json_object(state, "checkpoint"),
+                _replace_checkpoint_preserving_completion_result_event_publications(
+                    self._checkpoints.get(session_id),
+                    state,
+                ),
             )
             self._sessions[session_id] = session.model_copy(
                 update={"last_activity_at": datetime.now(UTC)}
@@ -15860,7 +16381,10 @@ class InMemorySessionStore(SessionStore):
                 return
             self._store_checkpoint_unlocked(
                 session_id,
-                copy_durable_json_object(transformed, "checkpoint"),
+                _replace_checkpoint_preserving_completion_result_event_publications(
+                    current,
+                    copy_durable_json_object(transformed, "checkpoint"),
+                ),
             )
             self._sessions[session_id] = session.model_copy(
                 update={"last_activity_at": datetime.now(UTC)}
@@ -16171,6 +16695,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         else TaskInvocationSnapshot(
             id=request._runtime_task_invocation.id,
             session_id=request._runtime_task_invocation.session_id,
+            session_instance_id=request._runtime_task_invocation.session_instance_id,
             invocation=copy_task_invocation(request._runtime_task_invocation.invocation),
         )
     )
@@ -16283,6 +16808,7 @@ def run_request_with_task_invocation(
     copied._runtime_task_invocation = TaskInvocationSnapshot(
         id=task_invocation.id,
         session_id=task_invocation.session_id,
+        session_instance_id=task_invocation.session_instance_id,
         invocation=copy_task_invocation(task_invocation.invocation),
     )
     if copied._runtime_invocation_source is None:
@@ -16686,6 +17212,24 @@ def session_invocation_for_run_request(
     )
 
 
+def session_instance_id_for_run_request(
+    request: RunRequest,
+    *,
+    session_id: str,
+) -> str:
+    """Mint one store-owned incarnation for a newly created session."""
+
+    if type(request) is not RunRequest:
+        raise TypeError("Session instance derivation requires a RunRequest.")
+    session_id = _require_bounded_session_id(session_id, "session_id")
+    task_invocation = request._runtime_task_invocation
+    if task_invocation is not None and task_invocation.session_instance_id is not None:
+        raise ValueError(
+            "A task already bound to a session instance cannot create that session again."
+        )
+    return str(uuid4())
+
+
 def session_invocation_matches_run_request(
     session: Session,
     *,
@@ -16712,6 +17256,10 @@ def session_invocation_matches_run_request(
             return False
         if task_invocation is not None and (
             task_invocation.id != request.task_id
+            or (
+                task_invocation.session_instance_id is not None
+                and task_invocation.session_instance_id != session.instance_id
+            )
             or task_invocation.invocation.origin != expected.origin
             or task_invocation.invocation.root_invocation_id != expected.root_invocation_id
             or (
@@ -16733,6 +17281,10 @@ def session_invocation_matches_run_request(
             request.task_id is None
             or task_invocation.id != request.task_id
             or task_invocation.session_id not in {None, session.id}
+            or (
+                task_invocation.session_instance_id is not None
+                and task_invocation.session_instance_id != session.instance_id
+            )
             or request.invocation_origin is not None
             or verified_origin is not None
             or source is not SessionExecutionSource.TASK
@@ -17193,6 +17745,7 @@ def copy_session(session: Session) -> Session:
         raise TypeError("Session copy requires a Session.")
     return Session(
         id=session.id,
+        instance_id=session.instance_id,
         agent_name=session.agent_name,
         provider_name=session.provider_name,
         model=session.model,
@@ -22109,6 +22662,20 @@ def _persisted_event_authority_fields(event_type: EventType | str) -> tuple[str,
             "stage_id",
             "stream_protocol",
         )
+    if event_type == EventType.TASK_COMPLETION_RESULT_RESOLVED:
+        return (
+            "application_request_sha256",
+            "contract_fingerprint",
+            "contract_id",
+            "decision_id",
+            "resolver_configuration_fingerprint",
+            "resolver_id",
+            "resolver_version",
+            "result_digest",
+            "result_kind",
+            "result_reference_id",
+            "task_id",
+        )
     if event_type == EventType.REQUEST_FOOTPRINT_RECORDED:
         return ("execution_profile_fingerprint",)
     if event_type == EventType.TOOL_EXPOSURE_RECORDED:
@@ -24090,7 +24657,10 @@ def _initial_transcript_pending_checkpoint(
     transformed = checkpoint_transform(session, checkpoint)
     if type(transformed) is not dict:
         raise TypeError("Initial transcript checkpoint transform must return an object.")
-    return copy_durable_json_object(transformed, "checkpoint")
+    return _replace_checkpoint_preserving_completion_result_event_publications(
+        checkpoint,
+        copy_durable_json_object(transformed, "checkpoint"),
+    )
 
 
 def _initial_transcript_pending_interaction_id(

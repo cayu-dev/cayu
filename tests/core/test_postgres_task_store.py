@@ -15,6 +15,10 @@ from uuid import uuid4
 import pytest
 from psycopg import errors as psycopg_errors
 from pydantic import ValidationError
+from tests.core.completion_result_resolver_conformance import (
+    assert_completion_result_resolver_cross_instance_concurrency,
+    assert_completion_result_resolver_store_conformance,
+)
 from tests.core.completion_verifier_profile_fixtures import (
     prepare_test_completion_verifier_profile,
 )
@@ -51,6 +55,9 @@ from cayu import (
     CompletionDecisionApplicationRequest,
     CompletionProposalCreate,
     CompletionRejectionAction,
+    CompletionResultResolutionRequest,
+    CompletionResultResolver,
+    CompletionResultResolverRequest,
     CompletionVerificationClaimLost,
     CompletionVerificationClaimRequest,
     CompletionVerifierDecision,
@@ -66,8 +73,11 @@ from cayu import (
     InvocationOrigin,
     InvocationOriginClaim,
     InvocationOriginTrust,
+    Message,
     ResolutionActor,
     ResolutionActorSource,
+    RunRequest,
+    SessionIdentity,
     Task,
     TaskClaimLost,
     TaskCompletionDecisionRequired,
@@ -766,7 +776,9 @@ def test_postgres_verifier_profile_restart_requires_exact_registration_for_repla
     asyncio.run(run())
 
 
-def test_postgres_revision_58_rejects_unprofiled_verification_records(postgres_dsn):
+def test_postgres_downgraded_verified_work_records_fail_closed_before_migration(
+    postgres_dsn,
+):
     async def run() -> None:
         import psycopg
 
@@ -834,12 +846,18 @@ def test_postgres_revision_58_rejects_unprofiled_verification_records(postgres_d
                 await cur.execute(
                     "ALTER TABLE cayu_completion_decisions DROP COLUMN verifier_profile_fingerprint"
                 )
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 58")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 58")
             await conn.commit()
 
         migrator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
         try:
-            with pytest.raises(RuntimeError, match="cannot attribute existing completion"):
+            with pytest.raises(
+                RuntimeError,
+                match=(
+                    "cannot attribute existing completion|"
+                    "requires an exact result-resolver identity"
+                ),
+            ):
                 await migrator.ensure_schema()
         finally:
             await migrator.close()
@@ -857,6 +875,158 @@ def test_postgres_revision_58_rejects_unprofiled_verification_records(postgres_d
                 "AND column_name = 'verifier_profile_fingerprint'"
             )
             assert await cur.fetchone() is None
+
+    asyncio.run(run())
+
+
+def test_postgres_completion_result_resolution_replays_without_adapter_after_restart(
+    postgres_dsn,
+) -> None:
+    class Resolver(CompletionResultResolver):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def resolve(
+            self,
+            request: CompletionResultResolverRequest,
+        ) -> dict[str, object]:
+            self.calls += 1
+            assert request.result_reference == request.proposal.result
+            return _task_result("postgres-result-resolver")
+
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        contract = _contract(contract_id="postgres-result-resolver-contract")
+        first = _new_store(postgres_dsn)
+        session_store = InMemorySessionStore()
+        await session_store.create(
+            RunRequest(
+                agent_name="postgres-result-resolver-agent",
+                session_id="session:postgres:result-resolver",
+                messages=[Message.text("user", "Resolve accepted work.")],
+            ),
+            identity=SessionIdentity(
+                provider_name="postgres-result-resolver-provider",
+                model="postgres-result-resolver-model",
+            ),
+        )
+        session_invocation = await session_store.load_invocation_snapshot(
+            "session:postgres:result-resolver"
+        )
+        assert session_invocation is not None
+        resolver = Resolver()
+        request: CompletionResultResolutionRequest | None = None
+        completed: Task | None = None
+        try:
+            await first.publish_work_contract(contract)
+            task = await first.create_running_task(
+                TaskCreate(
+                    task_id="postgres-result-resolver-task",
+                    type="verified-work",
+                    session_id="session:postgres:result-resolver",
+                    work_contract=contract.reference(),
+                ),
+                session_invocation=session_invocation,
+            )
+            attempt = await first.begin_work_attempt(
+                WorkAttemptCreate(
+                    attempt_id="postgres-result-resolver-attempt",
+                    task_id=task.id,
+                    session_id="session:postgres:result-resolver",
+                    contract=contract.reference(),
+                    execution_profile_fingerprint=_digest("postgres-result-resolver-profile"),
+                )
+            )
+            proposal = await first.submit_completion_proposal(
+                CompletionProposalCreate(
+                    proposal_id="postgres-result-resolver-proposal",
+                    attempt_id=attempt.attempt_id,
+                    result=_result_reference("postgres-result-resolver"),
+                    evidence_references=(_artifact_evidence(), _approval_evidence()),
+                )
+            )
+            claim = await _claim_completion_verification(
+                first,
+                CompletionVerificationClaimRequest(
+                    claim_id="postgres-result-resolver-claim",
+                    proposal_id=proposal.proposal_id,
+                    worker_id="postgres-result-resolver-verifier",
+                    verifier=contract.verifier,
+                    verifier_profile_fingerprint=_verifier_profile_fingerprint(contract.verifier),
+                ),
+            )
+            decision = await first.record_completion_decision(
+                _accepted_decision(
+                    proposal_id=proposal.proposal_id,
+                    claim_id=claim.claim_id,
+                    worker_id=claim.worker_id,
+                )
+            )
+            request = CompletionResultResolutionRequest(
+                task_id=task.id,
+                decision_id=decision.decision_id,
+                idempotency_key="postgres-result-resolver-application",
+            )
+            app = CayuApp(
+                session_store=session_store,
+                task_store=first,
+                enable_logging=False,
+            )
+            app.register_completion_result_resolver(contract.result_resolver, resolver)
+            completed = await app.resolve_completion_result(request)
+            assert completed.status is TaskStatus.COMPLETED
+            assert resolver.calls == 1
+        finally:
+            await first.close()
+
+        assert request is not None
+        assert completed is not None
+        reopened = _new_store(postgres_dsn)
+        try:
+            restarted = CayuApp(
+                session_store=session_store,
+                task_store=reopened,
+                enable_logging=False,
+            )
+            assert await restarted.resolve_completion_result(request) == completed
+            assert resolver.calls == 1
+        finally:
+            await reopened.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_completion_result_resolver_store_conformance(postgres_dsn) -> None:
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        try:
+            await assert_completion_result_resolver_store_conformance(
+                store,
+                store_kind="postgres",
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_completion_result_resolution_is_atomic_across_store_instances(
+    postgres_dsn,
+) -> None:
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        first = _new_store(postgres_dsn)
+        second = _new_store(postgres_dsn)
+        try:
+            await assert_completion_result_resolver_cross_instance_concurrency(
+                first,
+                second,
+                store_kind="postgres",
+            )
+        finally:
+            await first.close()
+            await second.close()
 
     asyncio.run(run())
 

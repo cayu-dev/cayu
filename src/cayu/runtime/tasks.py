@@ -985,6 +985,7 @@ class Task(BaseModel):
     description: str | None = None
     status: TaskStatus = TaskStatus.PENDING
     session_id: str | None = None
+    session_instance_id: str | None = None
     parent_task_id: str | None = None
     assigned_agent_name: str | None = None
     available_at: datetime | None = None
@@ -1057,6 +1058,13 @@ class Task(BaseModel):
             return require_nonblank(value, info.field_name)
         return require_clean_nonblank(value, info.field_name)
 
+    @field_validator("session_instance_id")
+    @classmethod
+    def validate_session_instance_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return SessionInvocationBinding.validate_session_instance_id(value)
+
     @field_validator("available_at")
     @classmethod
     def normalize_available_at(cls, value: datetime | None) -> datetime | None:
@@ -1071,6 +1079,8 @@ class Task(BaseModel):
 
     @model_validator(mode="after")
     def validate_retry_and_work_contract_authority(self) -> Task:
+        if self.session_instance_id is not None and self.session_id is None:
+            raise ValueError("Task session-instance authority requires a session_id.")
         if self.retry_series is not None:
             _validate_task_retry_reconciliation_identity(self.id, "id")
             if self.worker_id is not None:
@@ -1123,6 +1133,7 @@ class TaskInvocationSnapshot(BaseModel):
 
     id: str
     session_id: str | None
+    session_instance_id: str | None = None
     invocation: TaskInvocation
 
     @field_validator("id")
@@ -1136,6 +1147,19 @@ class TaskInvocationSnapshot(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, "session_id")
+
+    @field_validator("session_instance_id")
+    @classmethod
+    def validate_session_instance_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return SessionInvocationBinding.validate_session_instance_id(value)
+
+    @model_validator(mode="after")
+    def validate_session_instance_binding(self) -> TaskInvocationSnapshot:
+        if self.session_instance_id is not None and self.session_id is None:
+            raise ValueError("Task invocation session instance requires a session_id.")
+        return self
 
     @field_validator("invocation")
     @classmethod
@@ -3552,6 +3576,7 @@ class InMemoryTaskStore(TaskStore):
             return TaskInvocationSnapshot(
                 id=task.id,
                 session_id=task.session_id,
+                session_instance_id=task.session_instance_id,
                 invocation=task.invocation,
             )
 
@@ -3710,10 +3735,16 @@ class InMemoryTaskStore(TaskStore):
                 session_id=effective_session_id,
                 session_binding=session_binding,
             )
+            session_instance_id = _task_session_instance_for_attachment(
+                stored_session_instance_id=task.session_instance_id,
+                session_id=effective_session_id,
+                session_binding=session_binding,
+            )
             updated = task.model_copy(
                 update={
                     "status": TaskStatus.RUNNING,
                     "session_id": effective_session_id,
+                    "session_instance_id": session_instance_id,
                     "started_at": task.started_at or now,
                     "updated_at": now,
                 }
@@ -3748,10 +3779,16 @@ class InMemoryTaskStore(TaskStore):
                 session_id=session_id,
                 session_binding=session_binding,
             )
+            session_instance_id = _task_session_instance_for_attachment(
+                stored_session_instance_id=task.session_instance_id,
+                session_id=session_id,
+                session_binding=session_binding,
+            )
             updated = task.model_copy(
                 update={
                     "status": TaskStatus.RUNNING,
                     "session_id": session_id,
+                    "session_instance_id": session_instance_id,
                     "started_at": task.started_at or now,
                     "updated_at": now,
                 }
@@ -4380,6 +4417,7 @@ class InMemoryTaskStore(TaskStore):
         return TaskInvocationSnapshot(
             id=parent.id,
             session_id=parent.session_id,
+            session_instance_id=parent.session_instance_id,
             invocation=parent.invocation,
         )
 
@@ -5088,6 +5126,7 @@ def copy_task(task: Task) -> Task:
         description=task.description,
         status=task.status,
         session_id=task.session_id,
+        session_instance_id=task.session_instance_id,
         parent_task_id=task.parent_task_id,
         assigned_agent_name=task.assigned_agent_name,
         available_at=task.available_at,
@@ -7140,6 +7179,30 @@ def _task_invocation_for_attachment(
     return task_invocation
 
 
+def _task_session_instance_for_attachment(
+    *,
+    stored_session_instance_id: str | None,
+    session_id: str | None,
+    session_binding: SessionInvocationBinding | None,
+) -> str | None:
+    """Bind one task attachment to the exact durable session incarnation."""
+
+    if session_id is None:
+        if session_binding is not None or stored_session_instance_id is not None:
+            raise ValueError("Session-instance authority requires a session attachment.")
+        return None
+    if session_binding is None:
+        raise ValueError("Session-instance authority is required to attach this task.")
+    if session_binding.id != session_id:
+        raise ValueError("Task session identity conflicts with its instance authority.")
+    if (
+        stored_session_instance_id is not None
+        and stored_session_instance_id != session_binding.session_instance_id
+    ):
+        raise ValueError("Task is already bound to another session instance.")
+    return session_binding.session_instance_id
+
+
 def _task_session_id_for_start(
     *,
     task_id: str,
@@ -7245,6 +7308,9 @@ def _task_from_create(
         parent_task=parent_task,
         session_invocation=session_invocation,
     )
+    effective_session_binding = (
+        session_invocation if session_invocation is not None else request._runtime_session_binding
+    )
     retry_policy = request.retry_policy
     if retry_policy is None:
         retry_series = None
@@ -7286,6 +7352,11 @@ def _task_from_create(
         description=request.description,
         status=TaskStatus.PENDING,
         session_id=request.session_id,
+        session_instance_id=(
+            None
+            if request.session_id is None or effective_session_binding is None
+            else effective_session_binding.session_instance_id
+        ),
         parent_task_id=request.parent_task_id,
         assigned_agent_name=request.assigned_agent_name,
         available_at=request.available_at,

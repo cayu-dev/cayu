@@ -279,6 +279,20 @@ def test_revision_fifty_eight_breaks_for_completion_verifier_profiles() -> None:
         )
 
 
+def test_revision_fifty_nine_breaks_for_result_resolver_authority() -> None:
+    state = m.SchemaState(revision=59, compatible_from=59)
+
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 59"):
+        m.validate(state, app_latest=58, app_min_supported=58)
+    m.validate(state, app_latest=59, app_min_supported=59)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 59"):
+        m.validate(
+            m.SchemaState(revision=58, compatible_from=58),
+            app_latest=59,
+            app_min_supported=59,
+        )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

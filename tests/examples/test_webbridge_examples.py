@@ -489,6 +489,7 @@ def test_daily_recipe_does_not_recover_expired_attached_task_from_stale_evidence
             session_id=admitted.session.id,
             session_invocation=SessionInvocationBinding(
                 id=admitted.session.id,
+                session_instance_id=admitted.session.instance_id,
                 invocation=admitted.session.invocation,
             ),
             worker_id="daily-worker-a",
@@ -625,6 +626,7 @@ def test_daily_recipe_settles_ownerless_terminal_session_after_restart(
             session_id=admitted.session.id,
             session_invocation=SessionInvocationBinding(
                 id=admitted.session.id,
+                session_instance_id=admitted.session.instance_id,
                 invocation=admitted.session.invocation,
             ),
             worker_id="daily-worker-a",
@@ -784,6 +786,7 @@ def test_daily_recipe_concurrently_settles_the_same_ownerless_terminal_task(
             session_id=session_id,
             session_invocation=SessionInvocationBinding(
                 id=session_id,
+                session_instance_id=session.instance_id,
                 invocation=session.invocation,
             ),
             worker_id="daily-worker-a",

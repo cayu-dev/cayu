@@ -38,6 +38,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS cayu_sessions (
         id TEXT PRIMARY KEY,
+        instance_id TEXT NOT NULL UNIQUE,
         agent_name TEXT NOT NULL,
         provider_name TEXT NOT NULL,
         model TEXT NOT NULL,
@@ -295,6 +296,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         description TEXT,
         status TEXT NOT NULL,
         session_id TEXT,
+        session_instance_id TEXT,
         parent_task_id TEXT,
         assigned_agent_name TEXT,
         input JSONB NOT NULL,
@@ -633,6 +635,7 @@ def to_utc_optional(value: datetime | None) -> datetime | None:
 def session_insert_values(session: Session) -> tuple[object, ...]:
     return (
         session.id,
+        session.instance_id,
         session.agent_name,
         session.provider_name,
         session.model,
@@ -658,27 +661,28 @@ def session_label_insert_values(session: Session) -> list[tuple[str, str, str]]:
 def session_from_row(row: tuple[Any, ...], labels: dict[str, str] | None = None) -> Session:
     return Session(
         id=row[0],
-        agent_name=row[1],
-        provider_name=row[2],
-        model=row[3],
-        parent_session_id=row[4],
-        causal_budget_id=row[5],
-        runtime_name=row[6],
-        runtime_version=row[7],
-        environment_name=row[8],
-        status=SessionStatus(row[9]),
-        created_at=to_utc(row[10]),
-        updated_at=to_utc(row[11]),
-        last_activity_at=to_utc(row[12]),
-        run_epoch=row[13],
-        invocation=SessionInvocation.model_validate(_loads(row[14])),
-        metadata=_loads(row[15]),
+        instance_id=row[1],
+        agent_name=row[2],
+        provider_name=row[3],
+        model=row[4],
+        parent_session_id=row[5],
+        causal_budget_id=row[6],
+        runtime_name=row[7],
+        runtime_version=row[8],
+        environment_name=row[9],
+        status=SessionStatus(row[10]),
+        created_at=to_utc(row[11]),
+        updated_at=to_utc(row[12]),
+        last_activity_at=to_utc(row[13]),
+        run_epoch=row[14],
+        invocation=SessionInvocation.model_validate(_loads(row[15])),
+        metadata=_loads(row[16]),
         labels=copy_label_map(labels, "labels"),
     )
 
 
 SESSION_COLUMNS = (
-    "id, agent_name, provider_name, model, parent_session_id, causal_budget_id, "
+    "id, instance_id, agent_name, provider_name, model, parent_session_id, causal_budget_id, "
     "runtime_name, runtime_version, environment_name, status, created_at, updated_at, "
     "last_activity_at, run_epoch, invocation, metadata"
 )
@@ -743,6 +747,7 @@ def task_insert_values(task: Task) -> tuple[object, ...]:
         task.description,
         str(task.status),
         task.session_id,
+        task.session_instance_id,
         task.parent_task_id,
         task.assigned_agent_name,
         to_utc_optional(task.available_at),
@@ -769,7 +774,7 @@ def task_insert_values(task: Task) -> tuple[object, ...]:
 
 
 TASK_COLUMNS = (
-    "id, type, title, description, status, session_id, parent_task_id, "
+    "id, type, title, description, status, session_id, session_instance_id, parent_task_id, "
     "assigned_agent_name, available_at, worker_id, lease_expires_at, status_reason, "
     "status_payload, input, result, error, metadata, created_at, updated_at, started_at, "
     "completed_at, invocation, retry_series, work_contract"
@@ -784,27 +789,28 @@ def task_from_row(row: tuple[Any, ...]) -> Task:
         description=row[3],
         status=TaskStatus(row[4]),
         session_id=row[5],
-        parent_task_id=row[6],
-        assigned_agent_name=row[7],
-        available_at=to_utc_optional(row[8]),
-        worker_id=row[9],
-        lease_expires_at=to_utc_optional(row[10]),
-        status_reason=row[11],
-        status_payload=None if row[12] is None else _loads(row[12]),
-        input=_loads(row[13]),
-        result=None if row[14] is None else _loads(row[14]),
-        error=None if row[15] is None else _loads(row[15]),
-        metadata=_loads(row[16]),
-        created_at=to_utc(row[17]),
-        updated_at=to_utc(row[18]),
-        started_at=to_utc_optional(row[19]),
-        completed_at=to_utc_optional(row[20]),
-        invocation=TaskInvocation.model_validate(_loads(row[21])),
+        session_instance_id=row[6],
+        parent_task_id=row[7],
+        assigned_agent_name=row[8],
+        available_at=to_utc_optional(row[9]),
+        worker_id=row[10],
+        lease_expires_at=to_utc_optional(row[11]),
+        status_reason=row[12],
+        status_payload=None if row[13] is None else _loads(row[13]),
+        input=_loads(row[14]),
+        result=None if row[15] is None else _loads(row[15]),
+        error=None if row[16] is None else _loads(row[16]),
+        metadata=_loads(row[17]),
+        created_at=to_utc(row[18]),
+        updated_at=to_utc(row[19]),
+        started_at=to_utc_optional(row[20]),
+        completed_at=to_utc_optional(row[21]),
+        invocation=TaskInvocation.model_validate(_loads(row[22])),
         retry_series=(
-            None if row[22] is None else TaskRetrySeriesSnapshot.model_validate(_loads(row[22]))
+            None if row[23] is None else TaskRetrySeriesSnapshot.model_validate(_loads(row[23]))
         ),
         work_contract=(
-            None if row[23] is None else WorkContractRef.model_validate(_loads(row[23]))
+            None if row[24] is None else WorkContractRef.model_validate(_loads(row[24]))
         ),
     )
 

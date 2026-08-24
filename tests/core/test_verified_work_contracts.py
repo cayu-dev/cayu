@@ -38,6 +38,7 @@ from cayu import (
     CompletionProposalCreate,
     CompletionRejectionAction,
     CompletionResultReference,
+    CompletionResultResolverRef,
     CompletionSatisfactionBasis,
     CompletionVerdict,
     CompletionVerificationClaimLost,
@@ -289,6 +290,14 @@ async def _claim_completion_verification(
     return await store.claim_completion_verification(request)
 
 
+def _resolver() -> CompletionResultResolverRef:
+    return CompletionResultResolverRef(
+        resolver_id="accepted-result",
+        version="v1",
+        configuration_fingerprint=_digest("accepted-result-v1"),
+    )
+
+
 def _contract(
     *,
     contract_id: str = "bid-package",
@@ -338,6 +347,7 @@ def _contract(
                 ),
             ),
             verifier=_verifier(),
+            result_resolver=_resolver(),
             continuation_policy=(
                 continuation_policy
                 or CompletionContinuationPolicy(
@@ -403,6 +413,7 @@ def _shared_evidence_contract() -> WorkContract:
                 ),
             ),
             verifier=_verifier(),
+            result_resolver=_resolver(),
         )
     )
 
@@ -662,6 +673,7 @@ def test_work_contract_rejects_noncanonical_or_ambiguous_inputs() -> None:
                 ),
             ),
             verifier=_verifier(),
+            result_resolver=_resolver(),
         )
 
     oversized_references = tuple(
@@ -704,6 +716,7 @@ def test_work_contract_rejects_noncanonical_or_ambiguous_inputs() -> None:
                 ),
             ),
             verifier=_verifier(),
+            result_resolver=_resolver(),
         )
 
     with pytest.raises(ValidationError, match="must be assigned"):
@@ -726,6 +739,7 @@ def test_work_contract_rejects_noncanonical_or_ambiguous_inputs() -> None:
                 ),
             ),
             verifier=_verifier(),
+            result_resolver=_resolver(),
         )
 
 
@@ -758,6 +772,7 @@ def test_work_contract_collection_preflight_stops_at_the_declared_bound() -> Non
             "objective": "Accept the exact declared number of criteria.",
             "criteria": exact,
             "verifier": _verifier(),
+            "result_resolver": _resolver(),
         }
     )
     assert len(contract.criteria) == WORK_CONTRACT_MAX_CRITERIA
@@ -772,6 +787,7 @@ def test_work_contract_collection_preflight_stops_at_the_declared_bound() -> Non
                 "objective": "Reject before exhausting an untrusted criteria iterable.",
                 "criteria": excessive,
                 "verifier": _verifier(),
+                "result_resolver": _resolver(),
             }
         )
     assert excessive.consumed == WORK_CONTRACT_MAX_CRITERIA + 1
@@ -808,6 +824,7 @@ def test_work_contract_evidence_assignments_fit_completion_decision_bounds() -> 
         criteria=(criterion(1, thirty_two_ids),),
         evidence_requirements=thirty_two_requirements,
         verifier=_verifier(),
+        result_resolver=_resolver(),
     )
     assert work_contract_from_draft(exact_subject_limit).criteria[0].evidence_requirement_ids == (
         thirty_two_ids
@@ -827,6 +844,7 @@ def test_work_contract_evidence_assignments_fit_completion_decision_bounds() -> 
             ),
             evidence_requirements=thirty_three_requirements,
             verifier=_verifier(),
+            result_resolver=_resolver(),
         )
 
     exact_aggregate_limit = WorkContractDraft(
@@ -836,6 +854,7 @@ def test_work_contract_evidence_assignments_fit_completion_decision_bounds() -> 
         criteria=tuple(criterion(ordinal, thirty_two_ids) for ordinal in range(1, 9)),
         evidence_requirements=thirty_two_requirements,
         verifier=_verifier(),
+        result_resolver=_resolver(),
     )
     assert len(work_contract_from_draft(exact_aggregate_limit).criteria) == 8
 
@@ -854,6 +873,7 @@ def test_work_contract_evidence_assignments_fit_completion_decision_bounds() -> 
             ),
             evidence_requirements=thirty_two_requirements,
             verifier=_verifier(),
+            result_resolver=_resolver(),
         )
 
 
@@ -2822,6 +2842,7 @@ def test_explicit_verifier_assertions_cover_outcomes_without_evidence_requiremen
                     ),
                 ),
                 verifier=_verifier(),
+                result_resolver=_resolver(),
             )
         )
         await store.publish_work_contract(contract)
@@ -6579,7 +6600,9 @@ def test_sqlite_revision_49_validation_rejects_missing_authority_table(tmp_path)
         SQLiteTaskStore(path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
 
-def test_sqlite_revision_58_rejects_unprofiled_verification_records(tmp_path) -> None:
+def test_sqlite_downgraded_verified_work_records_fail_closed_before_migration(
+    tmp_path,
+) -> None:
     path = tmp_path / "populated-revision-57.sqlite"
 
     async def seed() -> None:
@@ -6641,13 +6664,16 @@ def test_sqlite_revision_58_rejects_unprofiled_verification_records(tmp_path) ->
         connection.execute(
             "ALTER TABLE cayu_completion_decisions DROP COLUMN verifier_profile_fingerprint"
         )
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 58")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 58")
         connection.execute("PRAGMA user_version = 57")
         connection.commit()
     finally:
         connection.close()
 
-    with pytest.raises(RuntimeError, match="cannot attribute existing completion"):
+    with pytest.raises(
+        RuntimeError,
+        match=("cannot attribute existing completion|requires an exact result-resolver identity"),
+    ):
         SQLiteTaskStore(path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
     connection = sqlite3.connect(path)
     try:

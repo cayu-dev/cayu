@@ -90,6 +90,9 @@ from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._completion_decision_application_coordinator import (
     CompletionDecisionApplicationCoordinator,
 )
+from cayu.runtime._completion_result_resolver_coordinator import (
+    CompletionResultResolverCoordinator,
+)
 from cayu.runtime._completion_verifier_coordinator import CompletionVerifierCoordinator
 from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
 from cayu.runtime._durable_subagent_coordinator import (
@@ -198,6 +201,10 @@ from cayu.runtime.budgets import (
     InMemoryBudgetLedger,
     SessionBudgetStore,
     copy_budget_policy,
+)
+from cayu.runtime.completion_result_resolvers import (
+    CompletionResultResolutionRequest,
+    CompletionResultResolver,
 )
 from cayu.runtime.completion_verifier_profiles import CompletionVerifierProfilePolicy
 from cayu.runtime.completion_verifiers import (
@@ -422,6 +429,7 @@ from cayu.runtime.user_input import (
 from cayu.runtime.work_contracts import (
     CompletionDecision,
     CompletionDecisionApplicationRequest,
+    CompletionResultResolverRef,
     CompletionVerifierRef,
     TaskCompletionDecisionRequired,
     WorkCompletionConflict,
@@ -1046,6 +1054,12 @@ class CayuApp:
             event_sinks=self._event_sinks,
             secret_redactor=self._secret_redactor,
             public_authority_alias_codec=self._public_authority_alias_codec,
+        )
+        self._completion_result_resolver_coordinator = CompletionResultResolverCoordinator(
+            application_coordinator=self._completion_decision_application_coordinator,
+            session_store=self._runtime_session_store,
+            event_writer=self._event_writer,
+            secret_redactor=self._secret_redactor,
         )
         self._environment_lifecycle = EnvironmentLifecycle(
             session_store=self._runtime_session_store,
@@ -2031,6 +2045,24 @@ class CayuApp:
             del reference, verifier
             raise
         del reference, verifier
+        return registered
+
+    def register_completion_result_resolver(
+        self,
+        reference: CompletionResultResolverRef,
+        resolver: CompletionResultResolver,
+    ) -> CompletionResultResolverRef:
+        """Register one result resolver under its complete durable identity."""
+
+        try:
+            registered = self._completion_result_resolver_coordinator.register(
+                reference,
+                resolver,
+            )
+        except BaseException:
+            del reference, resolver
+            raise
+        del reference, resolver
         return registered
 
     def register_fork_group_gate(
@@ -3927,6 +3959,16 @@ class CayuApp:
         """Apply or exactly replay one durable verifier decision."""
 
         operation = self._completion_decision_application_coordinator.apply(request)
+        del request
+        return await operation
+
+    async def resolve_completion_result(
+        self,
+        request: CompletionResultResolutionRequest,
+    ) -> Task:
+        """Resolve and exactly apply the accepted result for one durable decision."""
+
+        operation = self._completion_result_resolver_coordinator.resolve(request)
         del request
         return await operation
 
@@ -6183,6 +6225,10 @@ def _work_contract_contains_secret_public_identity(
         contract.contract_id,
         contract.verifier.verifier_id,
         contract.verifier.version,
+        contract.verifier.configuration_fingerprint,
+        contract.result_resolver.resolver_id,
+        contract.result_resolver.version,
+        contract.result_resolver.configuration_fingerprint,
         *(criterion.criterion_id for criterion in contract.criteria),
         *(constraint.constraint_id for constraint in contract.constraints),
         *(requirement.requirement_id for requirement in contract.evidence_requirements),
@@ -6365,6 +6411,7 @@ def _copied_public_task_invocation_snapshot(
         lambda: TaskInvocationSnapshot(
             id=value.id,
             session_id=value.session_id,
+            session_instance_id=value.session_instance_id,
             invocation=value.invocation,
         ),
         operation_name="Task invocation result validation",
@@ -6386,6 +6433,7 @@ def _contracted_task_invocation_matches_request(
     if (
         invocation_snapshot.id != task.id
         or invocation_snapshot.session_id != task.session_id
+        or invocation_snapshot.session_instance_id != task.session_instance_id
         or invocation_snapshot.invocation != invocation
         or invocation.source
         is not (request._runtime_invocation_source or TaskExecutionSource.SDK_TASK)
@@ -6399,7 +6447,9 @@ def _contracted_task_invocation_matches_request(
     session_binding = request._runtime_session_binding
     if session_binding is not None:
         matches_session = (
-            invocation.origin == session_binding.invocation.origin
+            task.session_instance_id == session_binding.session_instance_id
+            and invocation_snapshot.session_instance_id == session_binding.session_instance_id
+            and invocation.origin == session_binding.invocation.origin
             and invocation.root_invocation_id == session_binding.invocation.root_invocation_id
             and invocation.root_session_id == session_binding.invocation.root_session_id
         )

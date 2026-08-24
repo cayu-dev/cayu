@@ -10,6 +10,7 @@ from cayu._validation import copy_durable_json_object
 from cayu.runtime.checkpoints import (
     ACTIVE_INVOCATION_EXECUTION_PROFILE_CHECKPOINT_KEY,
     CHECKPOINT_SCHEMA_VERSION_KEY,
+    COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     decode_runtime_checkpoint,
     runtime_checkpoint_writer_view,
@@ -28,6 +29,7 @@ from cayu.runtime.sessions import (
     SessionOperationPublication,
     SessionStore,
     _apply_runtime_publication_checkpoint_mutation,
+    _replace_checkpoint_preserving_completion_result_event_publications,
     _runtime_publication_checkpoint_codec_scope,
     runtime_publication_checkpoint_value_digest,
 )
@@ -51,6 +53,7 @@ def _versioned_checkpoint_transform(
     *,
     stamp_noop: bool = False,
     stamp_empty: bool = False,
+    preserve_completion_result_publications: bool = False,
 ) -> CheckpointTransform:
     if checkpoint_transform is None:
         raise TypeError("checkpoint_transform is required.")
@@ -69,7 +72,13 @@ def _versioned_checkpoint_transform(
                 if stamp_empty:
                     return {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
                 return decoded if stamp_noop and checkpoint is not None else None
-            return decode_runtime_checkpoint(transformed, session_id=session_id)
+            result = decode_runtime_checkpoint(transformed, session_id=session_id)
+            if preserve_completion_result_publications:
+                return _replace_checkpoint_preserving_completion_result_event_publications(
+                    checkpoint,
+                    {} if result is None else result,
+                )
+            return result
         except BaseException:
             checkpoint = None
             if decoded is not None:
@@ -119,6 +128,10 @@ def _versioned_operation_transform(
             )
             if versioned is None:
                 raise TypeError("Session operation checkpoint must be an object.")
+            versioned = _replace_checkpoint_preserving_completion_result_event_publications(
+                checkpoint,
+                versioned,
+            )
             return SessionOperationPublication(
                 checkpoint=versioned,
                 operation_records=publication.operation_records,
@@ -156,6 +169,14 @@ class _RuntimeCheckpointSessionStore:
         checker = getattr(
             self._store,
             "_supports_owned_off_thread_session_commit_guard_protocol",
+            None,
+        )
+        return callable(checker) and checker() is True
+
+    def _supports_completion_result_event_publication_reservation_protocol(self) -> bool:
+        checker = getattr(
+            self._store,
+            "_supports_completion_result_event_publication_reservation_protocol",
             None,
         )
         return callable(checker) and checker() is True
@@ -215,7 +236,10 @@ class _RuntimeCheckpointSessionStore:
                 current: dict[str, Any] | None,
             ) -> dict[str, Any]:
                 decode_runtime_checkpoint(current, session_id=session_id)
-                return encoded_checkpoint
+                return _replace_checkpoint_preserving_completion_result_event_publications(
+                    current,
+                    encoded_checkpoint,
+                )
 
             await self._store.transform_checkpoint(session_id, replace_checkpoint)
         except BaseException:
@@ -235,6 +259,7 @@ class _RuntimeCheckpointSessionStore:
                 session_id,
                 checkpoint_transform,
                 stamp_noop=True,
+                preserve_completion_result_publications=True,
             ),
         )
 
@@ -250,6 +275,7 @@ class _RuntimeCheckpointSessionStore:
             checkpoint_transform=_versioned_checkpoint_transform(
                 session_id,
                 checkpoint_transform,
+                preserve_completion_result_publications=True,
             ),
             **kwargs,
         )
@@ -267,6 +293,7 @@ class _RuntimeCheckpointSessionStore:
             checkpoint_transform=_versioned_checkpoint_transform(
                 session_id,
                 checkpoint_transform,
+                preserve_completion_result_publications=True,
             ),
             execution_profile=execution_profile,
             **kwargs,
@@ -286,6 +313,7 @@ class _RuntimeCheckpointSessionStore:
                     session_id,
                     admission.checkpoint_transform,
                     stamp_empty=True,
+                    preserve_completion_result_publications=True,
                 ),
             ),
         )
@@ -303,6 +331,7 @@ class _RuntimeCheckpointSessionStore:
             _versioned_checkpoint_transform(
                 session_id,
                 checkpoint_transform,
+                preserve_completion_result_publications=True,
             ),
             **kwargs,
         )
@@ -376,6 +405,7 @@ class _RuntimeCheckpointSessionStore:
             checkpoint_transform=_versioned_checkpoint_transform(
                 session_id,
                 checkpoint_transform,
+                preserve_completion_result_publications=True,
             ),
             **kwargs,
         )
@@ -392,8 +422,25 @@ class _RuntimeCheckpointSessionStore:
             checkpoint_transform=_versioned_checkpoint_transform(
                 session_id,
                 checkpoint_transform,
+                preserve_completion_result_publications=True,
             ),
             **kwargs,
+        )
+
+    async def _publish_completion_result_event_publication(
+        self,
+        session_id: str,
+        *,
+        checkpoint_transform: CheckpointTransform,
+        events: list[Any],
+    ) -> Session:
+        return await self._store._publish_completion_result_event_publication(
+            session_id,
+            checkpoint_transform=_versioned_checkpoint_transform(
+                session_id,
+                checkpoint_transform,
+            ),
+            events=events,
         )
 
     async def publish_session_operation(
@@ -456,6 +503,7 @@ class _RuntimeCheckpointSessionStore:
             checkpoint_transform=_versioned_checkpoint_transform(
                 session_id,
                 checkpoint_transform,
+                preserve_completion_result_publications=True,
             ),
             **kwargs,
         )
@@ -478,6 +526,14 @@ class _RuntimeCheckpointSessionStore:
             raise ValueError(
                 "Runtime publication callers cannot mutate active invocation "
                 "execution-profile authority."
+            )
+        if any(
+            operation.key == COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY
+            for operation in request.mutation.operations
+        ):
+            raise ValueError(
+                "Runtime publication callers cannot mutate completion-result event "
+                "publication authority."
             )
         schema_operation = RuntimePublicationCheckpointOperation(
             key=CHECKPOINT_SCHEMA_VERSION_KEY,

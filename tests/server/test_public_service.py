@@ -6,6 +6,7 @@ import json
 import threading
 from contextlib import asynccontextmanager
 from typing import Literal
+from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException, Request
@@ -1494,19 +1495,8 @@ def test_replacement_worker_continues_abandoned_session_without_starting_over() 
         product_task = await task_store.create_task(
             _product_task_create(reservation.operation, agent_name=service.agent_name)
         )
-        await task_store.start_task(
-            reservation.operation.task_id,
-            session_id=reservation.operation.session_id,
-            session_invocation=SessionInvocationBinding(
-                id=reservation.operation.session_id,
-                invocation=session_invocation_from_task(
-                    product_task.invocation,
-                    session_id=reservation.operation.session_id,
-                ),
-            ),
-        )
         original_message = Message.text("user", reservation.operation.request_text)
-        await session_store.create(
+        created_session = await session_store.create(
             run_request_with_task_invocation(
                 RunRequest(
                     agent_name=service.agent_name,
@@ -1531,6 +1521,15 @@ def test_replacement_worker_continues_abandoned_session_without_starting_over() 
                         claim_id="claim_abandoned_session_fixture",
                     ),
                 ),
+            ),
+        )
+        await task_store.start_task(
+            reservation.operation.task_id,
+            session_id=created_session.id,
+            session_invocation=SessionInvocationBinding(
+                id=created_session.id,
+                session_instance_id=created_session.instance_id,
+                invocation=created_session.invocation,
             ),
         )
         interaction_id = "interaction_abandoned_session"
@@ -1607,6 +1606,7 @@ def test_progressed_product_work_release_reconciles_lost_acknowledgement() -> No
             session_id=reservation.operation.session_id,
             session_invocation=SessionInvocationBinding(
                 id=reservation.operation.session_id,
+                session_instance_id=str(uuid4()),
                 invocation=session_invocation_from_task(
                     product_task.invocation,
                     session_id=reservation.operation.session_id,
@@ -1666,6 +1666,7 @@ def test_recovery_status_reconciles_lost_acknowledgement() -> None:
             session_id=reservation.operation.session_id,
             session_invocation=SessionInvocationBinding(
                 id=reservation.operation.session_id,
+                session_instance_id=str(uuid4()),
                 invocation=session_invocation_from_task(
                     product_task.invocation,
                     session_id=reservation.operation.session_id,
@@ -1720,6 +1721,7 @@ def test_progressed_product_work_release_resists_caller_cancellation() -> None:
             session_id=reservation.operation.session_id,
             session_invocation=SessionInvocationBinding(
                 id=reservation.operation.session_id,
+                session_instance_id=str(uuid4()),
                 invocation=session_invocation_from_task(
                     product_task.invocation,
                     session_id=reservation.operation.session_id,
@@ -1809,19 +1811,8 @@ def test_progressed_recovery_failure_releases_execution_claim(monkeypatch) -> No
         product_task = await task_store.create_task(
             _product_task_create(reservation.operation, agent_name=service.agent_name)
         )
-        await task_store.start_task(
-            reservation.operation.task_id,
-            session_id=reservation.operation.session_id,
-            session_invocation=SessionInvocationBinding(
-                id=reservation.operation.session_id,
-                invocation=session_invocation_from_task(
-                    product_task.invocation,
-                    session_id=reservation.operation.session_id,
-                ),
-            ),
-        )
         original_message = Message.text("user", reservation.operation.request_text)
-        await service.cayu_app.session_store.create(
+        created_session = await service.cayu_app.session_store.create(
             run_request_with_task_invocation(
                 RunRequest(
                     agent_name=service.agent_name,
@@ -1838,6 +1829,15 @@ def test_progressed_recovery_failure_releases_execution_claim(monkeypatch) -> No
             identity=SessionIdentity(
                 provider_name=provider.name,
                 model="scripted-model",
+            ),
+        )
+        await task_store.start_task(
+            reservation.operation.task_id,
+            session_id=created_session.id,
+            session_invocation=SessionInvocationBinding(
+                id=created_session.id,
+                session_instance_id=created_session.instance_id,
+                invocation=created_session.invocation,
             ),
         )
         await service.cayu_app.session_store.update_status(

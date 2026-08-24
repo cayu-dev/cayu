@@ -131,12 +131,30 @@ class SessionInvocationBinding(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     id: str
+    session_instance_id: str = Field(
+        min_length=36,
+        max_length=36,
+        pattern=_CANONICAL_UUID4_PATTERN,
+        json_schema_extra={"format": "uuid4"},
+    )
     invocation: SessionInvocation
 
     @field_validator("id")
     @classmethod
     def validate_id(cls, value: str) -> str:
         return require_durable_clean_nonblank(value, "id")
+
+    @field_validator("session_instance_id")
+    @classmethod
+    def validate_session_instance_id(cls, value: str) -> str:
+        value = require_durable_clean_nonblank(value, "session_instance_id")
+        try:
+            parsed = UUID(value)
+        except ValueError as exc:
+            raise ValueError("session_instance_id must be a canonical UUIDv4 string.") from exc
+        if parsed.version != 4 or str(parsed) != value:
+            raise ValueError("session_instance_id must be a canonical UUIDv4 string.")
+        return value
 
     @field_validator("invocation")
     @classmethod
@@ -213,6 +231,7 @@ def copy_session_invocation_binding(
         raise TypeError("Session invocation binding must be a SessionInvocationBinding instance.")
     return SessionInvocationBinding(
         id=value.id,
+        session_instance_id=value.session_instance_id,
         invocation=copy_session_invocation(value.invocation),
     )
 

@@ -268,6 +268,7 @@ from cayu.runtime._session_engine import _require_native_structured_output_suppo
 from cayu.runtime.budgets import budget_settlement_id
 from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
+    COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
 )
 from cayu.runtime.context import (
@@ -278,6 +279,7 @@ from cayu.runtime.context import (
 )
 from cayu.runtime.sessions import (
     _checkpoint_with_session_run_operation,
+    _reserve_completion_result_event_publication,
     fork_session_invocation,
 )
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
@@ -20225,6 +20227,8 @@ def test_interruption_cascade_completion_clear_failure_is_durably_reported(monke
 
 
 def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrection():
+    owner_expiry = datetime.now(UTC) + timedelta(hours=1)
+
     async def run():
         store = InMemorySessionStore()
         app = CayuApp(session_store=store, enable_logging=False)
@@ -20263,6 +20267,29 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
             "version": 1,
             "records": {"stale-transition": {"status": "prepared"}},
         }
+        current_publication_digest = "a" * 64
+        stale_publication_digest = "b" * 64
+        current_owner_id = f"completion-result-owner:v1:{'c' * 64}"
+        stale_owner_id = f"completion-result-owner:v1:{'d' * 64}"
+        stale_publications = {
+            "schema_version": 2,
+            "reservations": {
+                f"completion-result-publication:v1:{stale_publication_digest}": {
+                    "schema_version": 2,
+                    "publication_id": (
+                        f"completion-result-publication:v1:{stale_publication_digest}"
+                    ),
+                    "authority_sha256": stale_publication_digest,
+                    "owners": {
+                        stale_owner_id: {
+                            "schema_version": 2,
+                            "owner_id": stale_owner_id,
+                            "expires_at": owner_expiry.isoformat(),
+                        }
+                    },
+                }
+            },
+        }
         await store.checkpoint(
             session_id,
             {
@@ -20276,6 +20303,22 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
                 "current": True,
             },
         )
+        await store._publish_completion_result_event_publication(
+            session_id,
+            checkpoint_transform=lambda _session, checkpoint: (
+                _reserve_completion_result_event_publication(
+                    checkpoint,
+                    publication_id=(
+                        f"completion-result-publication:v1:{current_publication_digest}"
+                    ),
+                    authority_sha256=current_publication_digest,
+                    owner_id=current_owner_id,
+                    owner_expires_at=owner_expiry,
+                    now=datetime.now(UTC),
+                )
+            ),
+            events=[],
+        )
         stale_replacement = {
             "pending_session_interrupt": {
                 "reason": "stale reason",
@@ -20284,6 +20327,7 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
             "pending_interruption_cascade": stale_marker,
             "session_operations": stale_operations,
             "prompt_anatomy_transition_intents": stale_prompt_intents,
+            COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY: stale_publications,
             "replacement": True,
         }
         await store.transform_checkpoint(
@@ -20293,13 +20337,18 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
         preserved = await store.load_checkpoint(session_id)
         await app._session_engine._clear_pending_session_interrupt(session_id)
         await app._session_engine._clear_pending_interruption_cascade(session_id)
-        await store.transform_checkpoint(
+        await store._publish_completion_result_event_publication(
             session_id,
-            lambda _session, checkpoint: {
+            checkpoint_transform=lambda _session, checkpoint: {
                 key: value
                 for key, value in (checkpoint or {}).items()
-                if key != "session_operations"
+                if key
+                not in {
+                    "session_operations",
+                    COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY,
+                }
             },
+            events=[],
         )
         await store.transform_checkpoint(
             session_id,
@@ -20328,6 +20377,23 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
             "version": 1,
             "records": {"current-transition": {"status": "prepared"}},
         },
+        COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY: {
+            "schema_version": 2,
+            "reservations": {
+                f"completion-result-publication:v1:{'a' * 64}": {
+                    "schema_version": 2,
+                    "publication_id": f"completion-result-publication:v1:{'a' * 64}",
+                    "authority_sha256": "a" * 64,
+                    "owners": {
+                        f"completion-result-owner:v1:{'c' * 64}": {
+                            "schema_version": 2,
+                            "owner_id": f"completion-result-owner:v1:{'c' * 64}",
+                            "expires_at": owner_expiry.isoformat(),
+                        }
+                    },
+                }
+            },
+        },
         "replacement": True,
     }
     assert after_clear == {
@@ -20338,6 +20404,105 @@ def test_checkpoint_replacement_preserves_current_runtime_state_without_resurrec
         },
         "replacement": True,
     }
+
+
+def test_fork_does_not_inherit_source_result_event_publication_reservation() -> None:
+    from cayu.runtime._fork_source_snapshot import fork_source_checkpoint_sha256
+
+    authority_sha256 = "c" * 64
+    publication_id = f"completion-result-publication:v1:{authority_sha256}"
+    owner_id = f"completion-result-owner:v1:{'d' * 64}"
+    owner_expiry = datetime.now(UTC) + timedelta(hours=1)
+    checkpoint_without_reservation = {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        "resumable": {"value": True},
+    }
+    checkpoint_with_reservation = {
+        **checkpoint_without_reservation,
+        COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY: {
+            "schema_version": 2,
+            "reservations": {
+                publication_id: {
+                    "schema_version": 2,
+                    "publication_id": publication_id,
+                    "authority_sha256": authority_sha256,
+                    "owners": {
+                        owner_id: {
+                            "schema_version": 2,
+                            "owner_id": owner_id,
+                            "expires_at": owner_expiry.isoformat(),
+                        }
+                    },
+                }
+            },
+        },
+    }
+    assert fork_source_checkpoint_sha256(
+        checkpoint_with_reservation
+    ) == fork_source_checkpoint_sha256(checkpoint_without_reservation)
+
+    async def run():
+        store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            secret_redactor=SecretRedactor("completion"),
+        )
+        app.register_provider(
+            FakeProvider(
+                [
+                    ModelStreamEvent.text_delta("source complete"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        source_session_id = "sess_result_publication_fork_source"
+        child_session_id = "sess_result_publication_fork_child"
+        await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=source_session_id,
+                messages=[Message.text("user", "finish the source")],
+            ),
+        )
+        await store._publish_completion_result_event_publication(
+            source_session_id,
+            checkpoint_transform=lambda _session, checkpoint: (
+                _reserve_completion_result_event_publication(
+                    checkpoint,
+                    publication_id=publication_id,
+                    authority_sha256=authority_sha256,
+                    owner_id=owner_id,
+                    owner_expires_at=owner_expiry,
+                    now=datetime.now(UTC),
+                )
+            ),
+            events=[],
+        )
+
+        events = await collect_fork_events(
+            app,
+            ForkSessionRequest(
+                source_session_id=source_session_id,
+                session_id=child_session_id,
+            ),
+        )
+        return (
+            events,
+            await store.load_checkpoint(source_session_id),
+            await store.load_checkpoint(child_session_id),
+        )
+
+    events, source_checkpoint, child_checkpoint = asyncio.run(run())
+
+    assert any(event.type is EventType.SESSION_FORKED for event in events)
+    assert source_checkpoint is not None
+    assert COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY in source_checkpoint
+    assert child_checkpoint is not None
+    assert COMPLETION_RESULT_EVENT_PUBLICATIONS_CHECKPOINT_KEY not in child_checkpoint
 
 
 def test_pending_interruption_cascade_blocks_resume_and_fork():

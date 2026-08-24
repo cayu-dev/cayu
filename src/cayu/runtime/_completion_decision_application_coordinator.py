@@ -75,6 +75,10 @@ from cayu.vaults import SecretRedactor
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
 
+class _CompletionDecisionApplicationNotCommitted(WorkCompletionConflict):
+    """An exact application conflict with positive no-receipt evidence."""
+
+
 def _durable_json_equal(left: object, right: object, *, field_name: str) -> bool:
     left_encoded: bytes | None = None
     right_encoded: bytes | None = None
@@ -428,7 +432,7 @@ class CompletionDecisionApplicationCoordinator:
                     contract,
                     verifier_profile,
                     authority_task,
-                ) = await self._load_authority(store, request)
+                ) = await self._load_authority(store, decision_id=request.decision_id)
                 self._require_application_binding(
                     request=request,
                     decision=decision,
@@ -451,7 +455,7 @@ class CompletionDecisionApplicationCoordinator:
                 contract,
                 verifier_profile,
                 authority_task,
-            ) = await self._load_authority(store, request)
+            ) = await self._load_authority(store, decision_id=request.decision_id)
             self._require_application_binding(
                 request=request,
                 decision=decision,
@@ -561,6 +565,53 @@ class CompletionDecisionApplicationCoordinator:
             ) from None
         return store
 
+    async def load_result_resolution_receipt(
+        self,
+        *,
+        task_id: str,
+        idempotency_key: str,
+    ) -> CompletionDecisionApplicationReceipt | None:
+        """Load one validated application receipt for receipt-first result replay."""
+
+        return await self._load_receipt(
+            self._require_store(),
+            task_id=task_id,
+            idempotency_key=idempotency_key,
+        )
+
+    async def load_result_resolution_authority(
+        self,
+        *,
+        task_id: str,
+        decision_id: str,
+    ) -> tuple[
+        CompletionDecision,
+        CompletionVerificationClaim,
+        CompletionProposal,
+        WorkAttempt,
+        WorkContract,
+        CompletionVerifierProfileRecord,
+        Task,
+    ]:
+        """Load and validate the complete authority chain needed by a resolver."""
+
+        authority = await self._load_authority(
+            self._require_store(),
+            decision_id=decision_id,
+        )
+        decision = authority[0]
+        if decision.task_id != task_id or decision.decision_id != decision_id:
+            del authority, decision
+            raise WorkCompletionConflict(
+                "Result resolution conflicts with its durable task or decision."
+            ) from None
+        if decision.verdict is not CompletionVerdict.ACCEPTED:
+            del authority, decision
+            raise ValueError(
+                "Only an accepted completion decision can resolve a task result."
+            ) from None
+        return authority
+
     def _require_safe_public_identity(
         self,
         request: CompletionDecisionApplicationRequest,
@@ -626,7 +677,8 @@ class CompletionDecisionApplicationCoordinator:
     async def _load_authority(
         self,
         store: TaskStore,
-        request: CompletionDecisionApplicationRequest,
+        *,
+        decision_id: str,
     ) -> tuple[
         CompletionDecision,
         CompletionVerificationClaim,
@@ -649,7 +701,7 @@ class CompletionDecisionApplicationCoordinator:
         authority_task: Task | None = None
         try:
             decision = await self._load_required(
-                lambda: store.load_completion_decision(request.decision_id),
+                lambda: store.load_completion_decision(decision_id),
                 CompletionDecision,
                 operation_name="Completion decision lookup",
             )
@@ -750,7 +802,7 @@ class CompletionDecisionApplicationCoordinator:
                 authority_task,
             )
         except BaseException:
-            del store, request, decision, indexed, claim, proposal, attempt, contract
+            del store, decision_id, decision, indexed, claim, proposal, attempt, contract
             del verifier_profile
             del prior_verifier_profile, prior_proposal, prior_attempt
             del authority_task
@@ -863,6 +915,7 @@ class CompletionDecisionApplicationCoordinator:
         if (
             authority_task.id != decision.task_id
             or authority_task.work_contract != decision.contract
+            or authority_task.session_id != attempt.session_id
         ):
             del decision, claim, proposal, attempt, contract, authority_task, validated
             raise WorkCompletionConflict(
@@ -1028,6 +1081,7 @@ class CompletionDecisionApplicationCoordinator:
             *(() if contract.supersedes is None else (contract.supersedes,)),
         )
         verifier_references = (decision.verifier, claim.verifier, contract.verifier)
+        result_resolver = contract.result_resolver
         evidence_references = (
             *proposal.evidence_references,
             *decision.evidence_references,
@@ -1088,6 +1142,9 @@ class CompletionDecisionApplicationCoordinator:
             *(reference.verifier_id for reference in verifier_references),
             *(reference.version for reference in verifier_references),
             *(reference.configuration_fingerprint for reference in verifier_references),
+            result_resolver.resolver_id,
+            result_resolver.version,
+            result_resolver.configuration_fingerprint,
             *(criterion.criterion_id for criterion in contract.criteria),
             *(
                 requirement_id
@@ -1151,7 +1208,8 @@ class CompletionDecisionApplicationCoordinator:
             self._secret_redactor,
         ):
             del decision, claim, proposal, attempt, contract, verifier_profile, authority_task
-            del contract_references, verifier_references, evidence_references, identities
+            del contract_references, verifier_references, result_resolver
+            del evidence_references, identities
             raise ValueError(
                 "Durable completion-decision authority contains a workload secret in public "
                 "identity."
@@ -1288,6 +1346,7 @@ class CompletionDecisionApplicationCoordinator:
             or task.created_at != authority_task.created_at
             or task.started_at != authority_task.started_at
             or task.invocation != authority_task.invocation
+            or task.session_instance_id != authority_task.session_instance_id
             or task.work_contract != authority_task.work_contract
         ):
             del task, authority_task, request, decision, attempt, contract
@@ -1439,6 +1498,8 @@ class CompletionDecisionApplicationCoordinator:
                     redactor=self._secret_redactor,
                 ) from None
             if receipt is None:
+                if isinstance(failure, WorkCompletionConflict):
+                    raise _CompletionDecisionApplicationNotCommitted(str(failure)) from failure
                 raise_task_store_operation_failure(failure)
             try:
                 self._require_exact_receipt_identity(

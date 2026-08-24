@@ -3109,6 +3109,67 @@ process-local reference, while `SQLiteTaskStore` and `PostgresTaskStore`
 persist the same contract, attempt, proposal, current claim, decision, task
 transition, and immutable application-receipt authority.
 
+Every work contract freezes a required `CompletionResultResolverRef` beside its
+verifier reference. Resolver ID, version, and bounded non-secret configuration
+fingerprint participate in the contract fingerprint and supersession identity;
+current mutable application registration can never replace the resolver named by
+an accepted proposal. Applications reconstruct exact process-local adapters with
+`CayuApp.register_completion_result_resolver(...)` during worker startup. An exact
+duplicate registration is rejected rather than replacing live application logic.
+Resolver implementations are side-effect-free readers of application-owned
+durable state. External mutation belongs behind Cayu's ordinary effect,
+idempotency, approval, and recovery contracts.
+
+`CayuApp.resolve_completion_result(CompletionResultResolutionRequest(...))` is
+the runtime-owned reconstruction boundary for an accepted durable decision. It
+loads and validates the complete decision, verification claim, proposal, attempt,
+task, and frozen contract chain before resolving the exact registered adapter.
+The adapter receives detached immutable copies of that authority plus the accepted
+`CompletionResultReference`; it receives no IDs, references, verifier outcomes, or
+task authority that it can replace. It returns only one bounded durable JSON object.
+Cayu then requires its digest and exact reference kind and ID to match the accepted
+proposal and invokes the existing decision-application boundary. Missing
+registration, unavailable or changed application state, malformed content, and
+identity or digest mismatch fail closed through bounded workload-secret-safe
+diagnostics.
+
+Result resolution is decision-scoped single-flight in one application instance,
+bounded to 64 active or draining adapters, and has an explicit timeout of at most
+300 seconds. Caller cancellation and process-control signals remain authoritative.
+An adapter-owned cancellation is an ordinary resolver failure, and an adapter that
+does not settle after caller cancellation or timeout remains draining so the same
+application cannot overlap another exact read. Before adapter dispatch, Cayu
+atomically compares the task's attached, store-minted immutable session-instance ID
+and reserves that exact session incarnation for the deterministic result event. A
+missing or same-ID replacement session therefore fails before adapter work even when
+all public session and invocation fields are identical. Session stores mint a fresh
+instance ID for every creation and fork; task stores persist that exact ID when
+attaching work and never infer it from timestamps or caller-selected lineage.
+Concurrent attempts receive distinct runtime-minted,
+expiring owner identities. Each owner renews its exact claim while resolver or cleanup
+work may still be in flight; ordinary pre-application exit releases only that owner,
+while durable publication of the exact event atomically retires the publishing owner.
+Other concurrent owners remain live until they observe the same receipt and event,
+release after failure, or expire after process loss. Process loss leaves no permanent
+deletion fence because an unrenewed owner eventually expires, while
+cancellation-opaque work remains fenced and capacity-counted until its owned settlement
+completes. Session deletion remains fenced while any live owner exists. Ordinary
+creation, fork, whole-checkpoint replacement, or transformation cannot copy, remove,
+replace, or manufacture this runtime-owned reservation root. Custom `SessionStore`
+implementations must explicitly own immutable session-incarnation generation,
+reservation publication, checkpoint-replacement preservation, and deletion fencing as
+one capability; compatible `TaskStore` implementations must retain the exact
+incarnation in task invocation snapshots and attachments. Result resolution fails
+before resolver dispatch when that authority is missing. The durable application receipt
+is checked before adapter lookup: after application commit, acknowledgement loss,
+process replacement, or event-publication failure, an exact retry reconstructs the
+committed task snapshot from that receipt without requiring or invoking the
+process-local resolver. The deterministic
+`task.completion_result.resolved` event publishes only the contract ID and fingerprint,
+resolver,
+result-reference, decision, task, and application receipt identities; application
+result content is never included.
+
 `CayuApp.apply_completion_decision(CompletionDecisionApplicationRequest(...))`
 is the runtime-owned application boundary for a decision that is already
 durable. The complete exact-operation tuple is the task ID, decision ID,
@@ -3134,11 +3195,11 @@ original failure, and conflicting authority fails closed. Cancellation and
 process-control signals remain authoritative even when the store committed, so
 a later caller must retry the exact request to observe its receipt. Supporting
 custom stores must make `apply_completion_decision(...)` cancellation-quiescent
-and publish the task transition and receipt atomically. Accepted decisions
-require the application to reconstruct the bounded task result from an
-application-owned durable source and provide the exact proposal result
-reference and digest. This boundary does not register process-local result
-resolvers, start another attempt, resume a session, or schedule continuation.
+and publish the task transition and receipt atomically. Direct callers may still
+reconstruct the bounded task result themselves and provide the exact proposal
+result reference and digest. The registered resolver is only the narrow automatic
+reconstruction layer above this unchanged application boundary; neither entrance
+starts another attempt, resumes a session, or schedules continuation.
 
 `InMemoryTaskStore(clock=...)` uses its injectable clock for availability,
 retry-series timing, and verified-work attempt, proposal, claim, and decision

@@ -439,13 +439,15 @@ def test_sqlite_topology_child_page_work_is_independent_of_branch_size(tmp_path)
                         SELECT value + 1 FROM numbers WHERE value < 99999
                     )
                     INSERT INTO cayu_sessions (
-                        id, agent_name, provider_name, model, parent_session_id,
+                        id, instance_id, agent_name, provider_name, model, parent_session_id,
                         causal_budget_id, runtime_name, runtime_version,
                         environment_name, status, created_at, updated_at,
                         last_activity_at, run_epoch, invocation_json, metadata_json
                     )
                     SELECT
-                        printf('child-%06d', value), 'agent', 'fake', 'fake-model',
+                        printf('child-%06d', value),
+                        printf('00000000-0000-4000-a000-%012d', value),
+                        'agent', 'fake', 'fake-model',
                         'parent', 'budget', 'cayu', NULL, NULL, 'pending', ?, ?, ?,
                         0,
                         json_object(

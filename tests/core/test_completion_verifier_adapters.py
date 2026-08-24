@@ -27,6 +27,7 @@ from cayu import (
     CompletionProposalCreate,
     CompletionRejectionAction,
     CompletionResultReference,
+    CompletionResultResolverRef,
     CompletionSatisfactionBasis,
     CompletionVerdict,
     CompletionVerificationClaimLost,
@@ -111,6 +112,14 @@ def _verifier_reference(
     )
 
 
+def _resolver_reference() -> CompletionResultResolverRef:
+    return CompletionResultResolverRef(
+        resolver_id="bid-result",
+        version="v1",
+        configuration_fingerprint=_digest("bid-result-v1"),
+    )
+
+
 def _contract(
     *,
     verifier: CompletionVerifierRef | None = None,
@@ -130,6 +139,7 @@ def _contract(
                 ),
             ),
             verifier=verifier or _verifier_reference(),
+            result_resolver=_resolver_reference(),
             continuation_policy=continuation_policy or CompletionContinuationPolicy(),
         )
     )

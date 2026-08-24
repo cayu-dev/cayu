@@ -3180,8 +3180,104 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (56, 55),
         (57, 57),
         (58, 58),
+        (59, 59),
     ]
     assert version == schema_migrations.LATEST_REVISION
+
+
+def test_sqlite_revision_fifty_nine_migrates_an_empty_verified_work_registry(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "empty-result-resolver-migration.sqlite"
+    store = SQLiteTaskStore(db_path)
+    asyncio.run(store.close())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 59")
+        connection.execute("PRAGMA user_version = 58")
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrated = SQLiteTaskStore(
+        db_path,
+        schema_mode=schema_migrations.SchemaMode.MIGRATE,
+    )
+    asyncio.run(migrated.close())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        revision = connection.execute(
+            "SELECT revision, compatible_from FROM cayu_schema_migrations "
+            "ORDER BY revision DESC LIMIT 1"
+        ).fetchone()
+        version = connection.execute("PRAGMA user_version").fetchone()
+    finally:
+        connection.close()
+    assert revision == (59, 59)
+    assert version == (59,)
+
+
+def test_sqlite_revision_fifty_nine_rejects_a_populated_verified_work_registry(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "populated-result-resolver-migration.sqlite"
+    store = SQLiteTaskStore(db_path)
+    asyncio.run(store.close())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            "INSERT INTO cayu_work_contracts "
+            "(contract_id, version, fingerprint, contract_json) VALUES (?, ?, ?, ?)",
+            ("pre-59-contract", 1, "0" * 64, "{}"),
+        )
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 59")
+        connection.execute("PRAGMA user_version = 58")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(
+        schema_migrations.SchemaTooOld,
+        match="requires an exact result-resolver identity",
+    ):
+        SQLiteTaskStore(
+            db_path,
+            schema_mode=schema_migrations.SchemaMode.MIGRATE,
+        )
+
+    connection = sqlite3.connect(db_path)
+    try:
+        revision = connection.execute("SELECT MAX(revision) FROM cayu_schema_migrations").fetchone()
+        contract = connection.execute("SELECT contract_id FROM cayu_work_contracts").fetchone()
+        version = connection.execute("PRAGMA user_version").fetchone()
+    finally:
+        connection.close()
+    assert revision == (58,)
+    assert contract == ("pre-59-contract",)
+    assert version == (58,)
+
+
+def test_sqlite_task_store_validation_requires_revision_fifty_nine(tmp_path) -> None:
+    db_path = tmp_path / "pre-result-resolver-task-store.sqlite"
+    store = SQLiteTaskStore(db_path)
+    asyncio.run(store.close())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 59")
+        connection.execute("PRAGMA user_version = 58")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 59"):
+        SQLiteTaskStore(
+            db_path,
+            schema_mode=schema_migrations.SchemaMode.VALIDATE,
+        )
 
 
 def test_sqlite_revision_forty_one_rejects_populated_knowledge_receipt_database(

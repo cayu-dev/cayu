@@ -1430,7 +1430,6 @@ from cayu import (
     TaskInvocationSnapshot,
     TaskStatus,
     ToolCapabilityCeiling,
-    session_invocation_from_task,
 )
 from cayu.runtime import _execution_profile_admission as execution_profile_admission
 from cayu.runtime.sessions import run_request_with_task_invocation
@@ -2239,17 +2238,6 @@ def test_replacement_worker_continues_same_durable_session(tmp_path) -> None:
                 agent_name=first_service.agent_name,
             )
         )
-        await first_service.cayu_app.task_store.start_task(
-            reservation.operation.task_id,
-            session_id=reservation.operation.session_id,
-            session_invocation=SessionInvocationBinding(
-                id=reservation.operation.session_id,
-                invocation=session_invocation_from_task(
-                    product_task.invocation,
-                    session_id=reservation.operation.session_id,
-                ),
-            ),
-        )
         invocation_loop_policies = await first_service._continuation_loop_policies(
             reservation.operation.session_id
         )
@@ -2265,7 +2253,7 @@ def test_replacement_worker_continues_same_durable_session(tmp_path) -> None:
                 first_service.cayu_app._agents[first_service.agent_name].tools
             )
         )
-        await first_service.cayu_app.session_store.create(
+        created_session = await first_service.cayu_app.session_store.create(
             run_request_with_task_invocation(
                 RunRequest(
                     agent_name=first_service.agent_name,
@@ -2281,6 +2269,15 @@ def test_replacement_worker_continues_same_durable_session(tmp_path) -> None:
                 ),
             ),
             identity=session_identity,
+        )
+        await first_service.cayu_app.task_store.start_task(
+            reservation.operation.task_id,
+            session_id=created_session.id,
+            session_invocation=SessionInvocationBinding(
+                id=created_session.id,
+                session_instance_id=created_session.instance_id,
+                invocation=created_session.invocation,
+            ),
         )
         execution_profile = session_identity.execution_profile
         assert execution_profile is not None

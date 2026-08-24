@@ -4,6 +4,7 @@ import asyncio
 import warnings
 from datetime import timedelta
 from hashlib import sha256
+from uuid import uuid4
 
 import pytest
 from tests.core.completion_verifier_profile_fixtures import (
@@ -13,7 +14,7 @@ from tests.core.completion_verifier_profile_fixtures import (
 from tests.core.task_invocation_fixtures import unattributed_session_invocation_binding
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-from cayu import CayuApp
+from cayu import CayuApp, SessionInvocationBinding
 from cayu.runtime.invocation import InvocationOrigin, InvocationOriginTrust
 from cayu.runtime.sessions import InMemorySessionStore
 from cayu.runtime.tasks import (
@@ -34,6 +35,7 @@ from cayu.runtime.work_contracts import (
     CompletionProposalCreate,
     CompletionRejectionAction,
     CompletionResultReference,
+    CompletionResultResolverRef,
     CompletionSatisfactionBasis,
     CompletionVerdict,
     CompletionVerificationClaim,
@@ -68,6 +70,14 @@ def _verifier() -> CompletionVerifierRef:
     )
 
 
+def _resolver() -> CompletionResultResolverRef:
+    return CompletionResultResolverRef(
+        resolver_id="application-result",
+        version="v1",
+        configuration_fingerprint=_digest("application-result-v1"),
+    )
+
+
 def _contract(
     *,
     contract_id: str = "application-contract",
@@ -88,6 +98,7 @@ def _contract(
                 ),
             ),
             verifier=_verifier(),
+            result_resolver=_resolver(),
             continuation_policy=CompletionContinuationPolicy(
                 rejection_action=rejection_action,
                 max_attempts=max_attempts,
@@ -211,6 +222,7 @@ async def _running_task(
     contract: WorkContract | None = None,
     task_input: dict[str, object] | None = None,
     metadata: dict[str, object] | None = None,
+    session_invocation: SessionInvocationBinding | None = None,
 ) -> Task:
     contract = contract or _contract()
     await store.publish_work_contract(contract)
@@ -223,7 +235,11 @@ async def _running_task(
             metadata={} if metadata is None else metadata,
             work_contract=contract.reference(),
         ),
-        session_invocation=unattributed_session_invocation_binding("session:application"),
+        session_invocation=(
+            unattributed_session_invocation_binding("session:application")
+            if session_invocation is None
+            else session_invocation
+        ),
     )
 
 
@@ -1779,6 +1795,7 @@ def test_app_rejects_exact_receipt_with_forged_verifier_profile_fingerprint() ->
         "parent_task_id",
         "available_at",
         "started_at",
+        "session_instance_id",
         "input",
         "metadata",
     ],
@@ -1838,6 +1855,8 @@ def test_app_rejects_receipt_with_forged_immutable_task_authority(
             elif field_name == "started_at":
                 assert receipt.task.started_at is not None
                 update = {"started_at": receipt.task.started_at + timedelta(seconds=1)}
+            elif field_name == "session_instance_id":
+                update = {"session_instance_id": str(uuid4())}
             elif field_name == "input":
                 update = {"input": {"nested": {"value": True}}}
             else:

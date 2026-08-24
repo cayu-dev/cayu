@@ -29,6 +29,7 @@ from cayu.runtime.sessions import (
     SessionIdentity,
     SessionOrder,
     SessionStatus,
+    session_instance_id_for_run_request,
     session_invocation_for_run_request,
     session_metadata_for_creation,
     transcript_search_document,
@@ -199,6 +200,7 @@ class _ExactUsageSum:
 _BASELINE_DDL = """
     CREATE TABLE IF NOT EXISTS cayu_sessions (
         id TEXT PRIMARY KEY,
+        instance_id TEXT NOT NULL UNIQUE,
         agent_name TEXT NOT NULL,
         provider_name TEXT NOT NULL,
         model TEXT NOT NULL,
@@ -465,6 +467,7 @@ _BASELINE_DDL = """
         description TEXT,
         status TEXT NOT NULL,
         session_id TEXT,
+        session_instance_id TEXT,
         parent_task_id TEXT,
         assigned_agent_name TEXT,
         input_json TEXT NOT NULL,
@@ -2651,6 +2654,10 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_completion_verifier_profiles_task
             ON cayu_completion_verifier_profiles(task_id, attempt_id);
     """,
+    59: """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_sessions_instance_id
+            ON cayu_sessions(instance_id);
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -2692,6 +2699,10 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
             "(length(verifier_profile_fingerprint) = 64 AND "
             "verifier_profile_fingerprint NOT GLOB '*[^0-9a-f]*'))",
         ),
+    ),
+    59: (
+        ("cayu_sessions", "instance_id", "TEXT"),
+        ("cayu_tasks", "session_instance_id", "TEXT"),
     ),
     14: (
         (
@@ -2926,6 +2937,45 @@ def _reject_populated_pre_transcript_search_database(
             "on every transcript row and deliberately does not backfill earlier "
             "data. Recreate the Cayu database before starting this build."
         )
+
+
+def _reject_populated_pre_result_resolver_database(
+    connection: sqlite3.Connection,
+) -> None:
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cayu_work_contracts'"
+    ).fetchone()
+    if table is None:
+        return
+    if connection.execute("SELECT EXISTS(SELECT 1 FROM cayu_work_contracts)").fetchone()[0]:
+        raise schema.SchemaTooOld(
+            "Storage revision 59 requires an exact result-resolver identity for every "
+            "verified-work contract and cannot infer one for existing contracts. "
+            "Recreate the Cayu task database before starting this build."
+        )
+
+
+def _backfill_session_instance_ids(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        "SELECT id FROM cayu_sessions WHERE instance_id IS NULL ORDER BY id"
+    ).fetchall()
+    for row in rows:
+        connection.execute(
+            "UPDATE cayu_sessions SET instance_id = ? WHERE id = ? AND instance_id IS NULL",
+            (str(uuid4()), row[0]),
+        )
+
+
+def _validate_session_instance_schema(connection: sqlite3.Connection) -> None:
+    session_columns = {row[1] for row in connection.execute("PRAGMA table_info(cayu_sessions)")}
+    task_columns = {row[1] for row in connection.execute("PRAGMA table_info(cayu_tasks)")}
+    if "instance_id" not in session_columns or "session_instance_id" not in task_columns:
+        raise RuntimeError("SQLite session-instance authority columns are missing.")
+    invalid = connection.execute(
+        "SELECT EXISTS(SELECT 1 FROM cayu_sessions WHERE instance_id IS NULL)"
+    ).fetchone()
+    if invalid is None or invalid[0]:
+        raise RuntimeError("SQLite session-instance authority is incomplete.")
 
 
 def _backfill_session_activity(connection: sqlite3.Connection) -> None:
@@ -3406,6 +3456,7 @@ _MIGRATION_HOOKS: dict[int, Callable[[sqlite3.Connection], None]] = {
     23: _prepare_revision_twenty_three,
     25: _prepare_revision_twenty_five,
     37: _migrate_revision_thirty_seven_knowledge_fts,
+    59: _backfill_session_instance_ids,
 }
 
 _REVISION_17_INDEX_NAMES = frozenset(
@@ -3783,6 +3834,12 @@ def reconcile_schema(
         # Refuse before even creating migration bookkeeping in an unversioned
         # database. The old transcript remains untouched for an explicit reset.
         _reject_populated_pre_transcript_search_database(connection)
+    if (
+        schema_mode is not schema.SchemaMode.VALIDATE
+        and state.revision < 59
+        and any(revision.revision == 59 for revision in schema.pending(state.revision))
+    ):
+        _reject_populated_pre_result_resolver_database(connection)
     if schema_mode is not schema.SchemaMode.VALIDATE:
         connection.execute(_MIGRATIONS_TABLE_DDL)
         connection.commit()
@@ -3864,6 +3921,8 @@ def reconcile_schema(
         _validate_eval_run_scenario_progress_column(connection)
     if app_min_supported >= 57:
         _validate_session_message_queue_typed_message_column(connection)
+    if app_min_supported >= 59:
+        _validate_session_instance_schema(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -5973,6 +6032,8 @@ def _apply_pending(connection: sqlite3.Connection, state: schema.SchemaState) ->
         _reject_populated_pre_targeted_tool_grant_database(connection)
     if current < 58 and any(revision.revision == 58 for revision in schema.pending(current)):
         _reject_unprofiled_verified_work_records(connection)
+    if current < 59 and any(revision.revision == 59 for revision in schema.pending(current)):
+        _reject_populated_pre_result_resolver_database(connection)
     if current == schema.UNINITIALIZED:
         _apply_baseline(connection)
         current = schema.BASELINE_REVISION
@@ -6035,6 +6096,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             # BEGIN IMMEDIATE fences session writers between the clean-break
             # check and installation of targeted-grant durability.
             _reject_populated_pre_targeted_tool_grant_database(connection)
+        if rev.revision == 59:
+            _reject_populated_pre_result_resolver_database(connection)
         for table, column, decl in _MIGRATION_ADD_COLUMNS.get(rev.revision, ()):
             _add_column_if_missing(connection, table, column, decl)
         for table, column in _MIGRATION_DROP_COLUMNS.get(rev.revision, ()):
@@ -6081,6 +6144,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
                 connection,
                 require_verifier_profiles=True,
             )
+        if rev.revision == 59:
+            _validate_session_instance_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 
@@ -6174,6 +6239,10 @@ def session_from_request(
     session_id = request.session_id if request.session_id is not None else str(uuid4())
     return Session(
         id=session_id,
+        instance_id=session_instance_id_for_run_request(
+            request,
+            session_id=session_id,
+        ),
         agent_name=request.agent_name,
         provider_name=identity.provider_name,
         model=identity.model,
@@ -6203,6 +6272,7 @@ def session_from_request(
 def session_to_row_values(session: Session) -> tuple[object, ...]:
     return (
         session.id,
+        session.instance_id,
         session.agent_name,
         session.provider_name,
         session.model,
@@ -6233,6 +6303,7 @@ def task_to_row_values(task: Task) -> tuple[object, ...]:
         task.description,
         str(task.status),
         task.session_id,
+        task.session_instance_id,
         task.parent_task_id,
         task.assigned_agent_name,
         format_optional_datetime(task.available_at),
@@ -6273,6 +6344,7 @@ def task_from_row(row: sqlite3.Row) -> Task:
         description=row["description"],
         status=TaskStatus(row["status"]),
         session_id=row["session_id"],
+        session_instance_id=row["session_instance_id"],
         parent_task_id=row["parent_task_id"],
         assigned_agent_name=row["assigned_agent_name"],
         available_at=parse_optional_datetime(row["available_at"]),
@@ -6416,6 +6488,7 @@ def task_topology_node_from_row(row: sqlite3.Row) -> TaskTopologyNode:
 def session_from_row(row: sqlite3.Row, labels: dict[str, str] | None = None) -> Session:
     return Session(
         id=row["id"],
+        instance_id=row["instance_id"],
         agent_name=row["agent_name"],
         provider_name=row["provider_name"],
         model=row["model"],

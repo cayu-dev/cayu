@@ -3965,6 +3965,7 @@ def test_unassociated_runtime_event_allowlist_is_exhaustive() -> None:
                 EventType.SESSION_COMPLETED,
                 EventType.SESSION_FAILED,
                 EventType.SESSION_INTERRUPTED,
+                EventType.TASK_COMPLETION_RESULT_RESOLVED,
                 EventType.RUNTIME_INTERACTION_TRANSITION_ACKNOWLEDGEMENT_FAILED,
             }
         )

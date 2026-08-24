@@ -109,6 +109,7 @@ from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 _DISPATCH_TASK_TYPE = "cayu.dispatch"
 _TEST_DISPATCH_ROOTS: dict[str, str] = {}
+_TEST_DISPATCH_SESSION_INSTANCES: dict[str, str] = {}
 
 
 class FakeProvider(ModelProvider):
@@ -214,6 +215,10 @@ class _SecretFreeDispatchRuntime:
     async def session_invocation_for_dispatch(session_id: str) -> SessionInvocationBinding:
         return SessionInvocationBinding(
             id=session_id,
+            session_instance_id=_TEST_DISPATCH_SESSION_INSTANCES.setdefault(
+                session_id,
+                str(uuid4()),
+            ),
             invocation=SessionInvocation(
                 origin=InvocationOrigin(trust=InvocationOriginTrust.UNATTRIBUTED),
                 root_invocation_id=_TEST_DISPATCH_ROOTS.setdefault(

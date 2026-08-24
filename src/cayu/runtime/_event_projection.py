@@ -3097,6 +3097,24 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         EventType.TASK_CANCELLED,
     ):
         policies[event_type] = task_policy
+    policies[EventType.TASK_COMPLETION_RESULT_RESOLVED] = _observed_policy(
+        "application_request_sha256 contract_fingerprint contract_id "
+        "decision_id resolver_configuration_fingerprint resolver_id resolver_version "
+        "result_digest result_kind result_reference_id task_id",
+        authority_keys={
+            "application_request_sha256",
+            "contract_fingerprint",
+            "contract_id",
+            "decision_id",
+            "resolver_configuration_fingerprint",
+            "resolver_id",
+            "resolver_version",
+            "result_digest",
+            "result_kind",
+            "result_reference_id",
+            "task_id",
+        },
+    )
 
     structured_policy = _observed_policy(
         "attempt errors execution_profile_fingerprint max_retries model_attempt_id model_step_id "

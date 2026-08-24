@@ -34,6 +34,7 @@ from cayu import (
     ArtifactScope,
     BillingIdentity,
     CayuApp,
+    CompletionResultResolverRef,
     CompletionVerifierRef,
     Environment,
     EnvironmentFactory,
@@ -2149,6 +2150,11 @@ def test_server_task_status_omits_private_work_contract_fingerprint() -> None:
                 verifier_id="private-status-verifier",
                 version="v1",
                 configuration_fingerprint="0" * 64,
+            ),
+            result_resolver=CompletionResultResolverRef(
+                resolver_id="private-status-result",
+                version="v1",
+                configuration_fingerprint="1" * 64,
             ),
         )
     )
