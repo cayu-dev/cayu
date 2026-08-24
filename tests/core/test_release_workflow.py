@@ -65,6 +65,7 @@ def test_every_ref_uses_balanced_shards_behind_the_stable_test_gate() -> None:
     test_gate = _job_block(workflow, "test")
 
     assert "github.event_name == 'pull_request'" not in shards
+    assert "timeout-minutes: 30" in shards
     assert "shard: [1, 2, 3, 4, 5, 6]" in shards
     assert "--splits 6" in shards
     assert '--group "${{ matrix.shard }}"' in shards
@@ -79,6 +80,7 @@ def test_every_ref_uses_balanced_shards_behind_the_stable_test_gate() -> None:
     assert "uses: actions/upload-artifact@" in shards
 
     assert "github.event_name == 'pull_request'" not in specialists
+    assert "timeout-minutes: 30" in specialists
     assert "lane: stress-process" in specialists
     assert 'marker: "stress or process"' in specialists
     assert specialists.count('marker: "postgres and not (stress or process)"') == 2
@@ -164,7 +166,11 @@ def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     publish = _job_block(workflow, "publish")
     github_release = _job_block(workflow, "github-release")
 
+    assert "timeout-minutes: 40" in package
+
     assert 'tags: ["v*"]' in workflow
+    assert "!cancelled()" in publish
+    assert "!failure()" in publish
     assert "startsWith(github.ref, 'refs/tags/v')" in publish
     assert "vars.PYPI_PUBLISH_ENABLED == 'true'" in publish
     assert (

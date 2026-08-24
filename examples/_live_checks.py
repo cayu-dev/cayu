@@ -20,6 +20,32 @@ SESSION_TERMINAL_EVENTS = frozenset(
     }
 )
 
+_READ_ONLY_POST_PATHS = frozenset(
+    {
+        "/api/sessions/summary",
+        "/api/usage/rollup",
+    }
+)
+
+
+def is_superseded_browser_read_abort(
+    *,
+    method: str,
+    path: str,
+    failure: str | None,
+    mutation_id: str | None,
+) -> bool:
+    """Return whether Chromium cancelled a read while the page moved on."""
+    if failure != "net::ERR_ABORTED" or mutation_id is not None:
+        return False
+    if method == "GET":
+        return path.startswith("/api/")
+    if method != "POST":
+        return False
+    return path in _READ_ONLY_POST_PATHS or (
+        path.startswith("/api/sessions/") and path.endswith("/topology")
+    )
+
 
 def require(condition: bool, message: str) -> None:
     if not condition:

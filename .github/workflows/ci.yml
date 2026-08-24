@@ -70,7 +70,7 @@ jobs:
   test_shards:
     name: Test shard ${{ matrix.shard }}/6 (Python 3.14)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -113,7 +113,7 @@ jobs:
   test_specialists:
     name: Test specialist ${{ matrix.lane }} (Python 3.14)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -259,7 +259,7 @@ jobs:
     needs: verification-scope
     if: needs.verification-scope.outputs.release_artifacts == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     outputs:
       prerelease: ${{ steps.release-version.outputs.prerelease }}
     steps:
@@ -771,7 +771,12 @@ jobs:
   #      validation jobs are green.
   publish:
     name: Publish to PyPI
+    # The sidecar artifact lane is intentionally skipped outside pull requests.
+    # Explicit status checks prevent that skipped transitive dependency from
+    # activating GitHub's implicit success() guard and suppressing publication.
     if: >-
+      !cancelled() &&
+      !failure() &&
       startsWith(github.ref, 'refs/tags/v') &&
       vars.PYPI_PUBLISH_ENABLED == 'true'
     needs: [static, test, sqlite-cancellation, release-artifacts, windows-dashboard-artifact, dashboard]

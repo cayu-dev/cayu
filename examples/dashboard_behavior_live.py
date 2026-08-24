@@ -26,7 +26,7 @@ from playwright.async_api import (
     expect,
 )
 
-from _live_checks import require, require_equal
+from _live_checks import is_superseded_browser_read_abort, require, require_equal
 from cayu import (
     AgentSpec,
     AlwaysRequireApprovalToolPolicy,
@@ -1020,6 +1020,7 @@ async def _run_browser_contract(
     }
     expected_observer_aborts: list[ObserverAbort] = []
     expected_query_aborts: list[str] = []
+    superseded_read_aborts: list[str] = []
     expected_edit_rejections: list[str] = []
     expected_edit_console_errors: list[str] = []
     expected_usage_rejections: list[str] = []
@@ -1054,6 +1055,7 @@ async def _run_browser_contract(
             expected_observer_aborts,
             expected_observer_abort_paths,
             expected_query_aborts,
+            superseded_read_aborts,
             expected_edit_rejections,
             expected_edit_console_errors,
             expected_usage_rejections,
@@ -1195,6 +1197,7 @@ async def _run_browser_contract(
         "page_errors": 0,
         "mutation_observer_aborts": len(expected_observer_aborts),
         "query_aborts": len(expected_query_aborts),
+        "superseded_read_aborts": len(superseded_read_aborts),
         "session_edit_rejections": len(expected_edit_rejections),
         "usage_refresh_rejections": len(expected_usage_rejections),
         "request_failures": 0,
@@ -3652,6 +3655,7 @@ def _record_browser_failures(
     expected_observer_aborts: list[ObserverAbort],
     expected_observer_abort_paths: set[str],
     expected_query_aborts: list[str],
+    superseded_read_aborts: list[str],
     expected_edit_rejections: list[str],
     expected_edit_console_errors: list[str],
     expected_usage_rejections: list[str],
@@ -3718,6 +3722,14 @@ def _record_browser_failures(
             ):
                 expected_query_aborts.append(detail)
                 return
+        if is_superseded_browser_read_abort(
+            method=request.method,
+            path=path,
+            failure=request.failure,
+            mutation_id=headers.get("cayu-mutation-id"),
+        ):
+            superseded_read_aborts.append(detail)
+            return
         failures["request_failures"].append(detail)
 
     def record_response(response) -> None:
