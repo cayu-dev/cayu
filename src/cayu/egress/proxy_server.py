@@ -268,16 +268,16 @@ class TransparentEgressProxyServer:
         with self._connections_lock:
             connections = tuple(self._connections)
         for connection in connections:
-            with contextlib.suppress(OSError):
-                connection.shutdown(socket.SHUT_RDWR)
-            with contextlib.suppress(OSError):
-                connection.close()
+            _interrupt(connection)
         if self._accept_threads:
             await asyncio.gather(
                 *(asyncio.to_thread(thread.join, 5.0) for thread in self._accept_threads)
             )
             self._accept_threads = []
         await asyncio.to_thread(self._executor.shutdown, wait=True, cancel_futures=True)
+        for connection in connections:
+            with contextlib.suppress(OSError):
+                connection.close()
         if self._owns_authority:
             self._authority.close()
             self._owns_authority = False
@@ -623,3 +623,22 @@ def _shutdown(sock: socket.socket) -> None:
         sock.shutdown(socket.SHUT_RDWR)
     with contextlib.suppress(OSError):
         sock.close()
+
+
+def _interrupt(sock: socket.socket) -> None:
+    """Wake a blocking handler without mutating its SSL wrapper concurrently."""
+
+    try:
+        duplicate = socket.socket(
+            sock.family,
+            sock.type,
+            sock.proto,
+            fileno=socket.dup(sock.fileno()),
+        )
+    except OSError:
+        return
+    try:
+        with contextlib.suppress(OSError):
+            duplicate.shutdown(socket.SHUT_RDWR)
+    finally:
+        duplicate.close()
