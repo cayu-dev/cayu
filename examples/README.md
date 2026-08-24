@@ -56,6 +56,9 @@ corresponding credentials or service.
   [`subagent_parallel_live.py`](subagent_parallel_live.py) — bounded delegated model work.
 - [`session_labels_summary.py`](session_labels_summary.py) — session metadata and summaries.
 - [`knowledge_remember_local.py`](knowledge_remember_local.py) — local reviewed knowledge.
+- [`reviewed_knowledge_curator.py`](reviewed_knowledge_curator.py) — credential-free,
+  explicitly invoked curation from completed-run evidence through pending review and
+  later recall.
 - [`knowledge_recall_live.py`](knowledge_recall_live.py) and
   [`knowledge_embedding_live.py`](knowledge_embedding_live.py) — provider-backed retrieval.
 - [`cross_source_recall.py`](cross_source_recall.py) — credential-free bounded

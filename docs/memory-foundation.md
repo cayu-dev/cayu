@@ -399,6 +399,88 @@ claim. SQLite/PostgreSQL cursor and acknowledgement state survives restart.
 This change stream is canonical mutation publication, not derived-index
 readiness.
 
+## Explicit reviewed knowledge curation
+
+`KnowledgeCurator` is the provider-neutral, explicitly invoked path from application
+evidence to human-reviewable knowledge. It does not inspect sessions by itself, start a
+worker, choose a model, or write active knowledge. The application decides when a run or
+domain operation is complete, extracts bounded `LearningSignal` values, and calls
+`curate(...)` with a `LearningBatch`.
+
+The lifecycle keeps five concepts separate:
+
+- raw evidence is the application-owned transcript, artifact, repository revision, or
+  domain record;
+- a learning signal is a bounded observation that points to exact evidence but is not
+  itself knowledge;
+- a candidate is a proposed reusable fact, procedure, or pattern from a caller-supplied
+  `KnowledgeCandidateGenerator`;
+- pending knowledge is an accepted candidate committed for review with immutable,
+  revision-bound `KnowledgeEvidence`; and
+- active knowledge is a reviewed revision that normal list, search, recall, and context
+  injection may use.
+
+A separately supplied `LearningEvaluator` must explicitly accept each candidate. An
+optional application policy can reject or transform content before evaluation; when it
+is present, the configuration requires its stable identity. Generator and evaluator
+identities are always explicit. Core supplies no prompts, model IDs, taxonomy, ambient
+scheduler, semantic-merging heuristic, or universal secret detector. Applications must
+validate source authorization and enforce their own domain-specific rejection or
+redaction rules.
+
+Accepted candidates always enter `KnowledgeStatus.PENDING`. The curator uses the same
+atomic revision, chunks, evidence, publication-receipt, change-outbox, and derived-index
+readiness contracts as other knowledge writes. Deterministic scoped proposal identities
+make exact retries and concurrent calls converge across processes. A retry of an already
+pending, active, archived, or deleted proposal reports that durable state; it does not
+create a replacement revision or rerun an evaluator after the exact proposal is known to
+be durable.
+
+`LearningBatchResult` reports batch, signal, and candidate outcomes with stable codes.
+Generator failure invalidates the whole batch before any write. Evaluator, policy, and
+store failures are isolated per candidate where the durable outcome can be established
+safely, and raw component exception text is not copied into the public result.
+
+The default configuration accepts at most 50 signals (16 KiB each and 256 KiB for the
+batch), 20 candidates (64 KiB each and 512 KiB together), 32 KiB of candidate text, and
+4 KiB of title text. A signal may carry 20 source references; one candidate's complete
+provenance, including all referenced signals, may carry 100. References, JSON metadata,
+and evaluator notes are each capped at 16 KiB by default. Configuration can lower these
+bounds or raise them only to the contract ceilings. Candidate evaluation is limited to
+four concurrent calls by default, and unfinished publication tasks retained across caller
+cancellation are bounded separately. Timeouts, chunk sizes, and chunk counts are also
+explicit configuration rather than unbounded component behavior.
+
+```python
+curator = KnowledgeCurator(
+    knowledge_store,
+    candidate_generator=my_generator,
+    evaluator=my_evaluator,
+    config=KnowledgeCuratorConfig(
+        candidate_generator_identity="acme.generator.v1",
+        evaluator_identity="acme.evaluator.v1",
+        namespace="acme",
+        labels={"tenant": "acme"},
+    ),
+)
+result = await curator.curate(LearningBatch(id="build-42", signals=(signal,)))
+
+reviewer = KnowledgeReviewWorkflow(
+    knowledge_store,
+    namespace="acme",
+    labels={"tenant": "acme"},
+)
+pending = await reviewer.list_pending()
+approved = await reviewer.approve(pending.entries[0].entry.id)
+```
+
+The existing `remember_knowledge` tool remains the explicit foreground write primitive
+for an agent or application. The curator is a higher-level evidence-to-proposal workflow;
+it does not replace that tool, retrieval fusion, `ContextExposure`, or the runtime's
+separate decision about what active memory enters model context. See the credential-free
+[`reviewed_knowledge_curator.py`](../examples/reviewed_knowledge_curator.py) example for a
+completed-session-to-pending-to-approved-to-later-recall path.
+
 ## Derived-index identity and readiness
 
 Every comparable durable embedding uses one immutable

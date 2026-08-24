@@ -101,6 +101,14 @@ indeterminate, conflicting, no-match, and proven-no-exposure outcomes remain
 distinct. This schema layer does not add an executor, experiment envelope,
 optimizer, paired report, or Compound dependency.
 
+- Added an explicitly invoked, provider-neutral `KnowledgeCurator` for reviewed learning.
+  Applications can submit bounded source-attributed signals, inject separate candidate
+  generators and evaluators plus an optional content policy, and atomically persist only
+  accepted proposals as pending revision-bound knowledge. Typed per-signal and
+  per-candidate outcomes, deterministic cross-process retries, exact evidence,
+  cancellation-safe owned publication, and the existing review workflow keep proposals
+  auditable and unavailable to normal recall until approval.
+
 ## v0.4.0
 
 `v0.4.0` turns Cayu's evaluation, memory, durable task, provider, and workspace
