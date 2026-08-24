@@ -19,6 +19,7 @@ from cayu import (
     CayuApp,
     Event,
     EventType,
+    ExecutionProfileBehaviorIdentity,
     FileAttachmentKind,
     InMemorySessionStore,
     Message,
@@ -28,6 +29,7 @@ from cayu import (
     ResumeRequest,
     RetryPolicy,
     RunRequest,
+    SQLiteSessionStore,
     file_attachment,
 )
 from cayu.core.messages import FilePart, MessageRole, ProviderStatePart, TextPart, ToolCallPart
@@ -118,6 +120,16 @@ class RecordingTransport:
             raise AssertionError("No fake OpenAI stream queued.")
         for event in self.stream_event_batches.pop(0):
             yield event
+
+
+class RestartableRecordingOpenAIProvider(OpenAIProvider):
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:openai:restartable-recording-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
 
 
 class BlankFailingTransport:
@@ -434,7 +446,9 @@ async def test_hosted_web_search_configuration_changes_execution_profile_identit
 
 
 @pytest.mark.anyio
-async def test_runtime_persists_web_search_lifecycle_citation_sources_and_replay() -> None:
+async def test_runtime_accepts_empty_terminal_output_and_replays_hosted_search_evidence(
+    tmp_path,
+) -> None:
     from cayu import CitationPart, HostedToolCallPart, OpenAIWebSearch
 
     transport = RecordingTransport(
@@ -444,6 +458,27 @@ async def test_runtime_persists_web_search_lifecycle_citation_sources_and_replay
                     "type": "response.output_item.added",
                     "output_index": 0,
                     "item": {
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "status": "in_progress",
+                        "summary": [],
+                    },
+                },
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "status": "completed",
+                        "summary": [],
+                        "encrypted_content": "opaque-test-reasoning",
+                    },
+                },
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 1,
+                    "item": {
                         "type": "web_search_call",
                         "id": "ws_1",
                         "status": "in_progress",
@@ -451,12 +486,12 @@ async def test_runtime_persists_web_search_lifecycle_citation_sources_and_replay
                 },
                 {
                     "type": "response.web_search_call.searching",
-                    "output_index": 0,
+                    "output_index": 1,
                     "item_id": "ws_1",
                 },
                 {
                     "type": "response.output_item.done",
-                    "output_index": 0,
+                    "output_index": 1,
                     "item": {
                         "type": "web_search_call",
                         "id": "ws_1",
@@ -475,21 +510,26 @@ async def test_runtime_persists_web_search_lifecycle_citation_sources_and_replay
                     },
                 },
                 {
-                    "type": "response.output_text.delta",
-                    "output_index": 1,
-                    "content_index": 0,
-                    "delta": "Prefix ",
+                    "type": "response.output_item.added",
+                    "output_index": 2,
+                    "item": {
+                        "type": "message",
+                        "id": "msg_1",
+                        "status": "in_progress",
+                        "role": "assistant",
+                        "content": [],
+                    },
                 },
                 {
                     "type": "response.output_text.delta",
-                    "output_index": 1,
-                    "content_index": 1,
+                    "output_index": 2,
+                    "content_index": 0,
                     "delta": "Cayu is a runtime.",
                 },
                 {
                     "type": "response.output_text.annotation.added",
-                    "output_index": 1,
-                    "content_index": 1,
+                    "output_index": 2,
+                    "content_index": 0,
                     "annotation": {
                         "type": "url_citation",
                         "url": "https://github.com/example/cayu",
@@ -499,11 +539,37 @@ async def test_runtime_persists_web_search_lifecycle_citation_sources_and_replay
                     },
                 },
                 {
+                    "type": "response.output_item.done",
+                    "output_index": 2,
+                    "item": {
+                        "type": "message",
+                        "id": "msg_1",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "Cayu is a runtime.",
+                                "annotations": [
+                                    {
+                                        "type": "url_citation",
+                                        "url": "https://github.com/example/cayu",
+                                        "title": "Cayu",
+                                        "start_index": 0,
+                                        "end_index": 4,
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                },
+                {
                     "type": "response.completed",
                     "response": {
                         "id": "resp_1",
                         "model": "gpt-test",
                         "status": "completed",
+                        "output": [],
                         "usage": {
                             "input_tokens": 3,
                             "output_tokens": 4,
@@ -543,9 +609,11 @@ async def test_runtime_persists_web_search_lifecycle_citation_sources_and_replay
             ],
         ]
     )
-    store = InMemorySessionStore()
+    database = tmp_path / "empty-terminal-output.sqlite3"
+    store = SQLiteSessionStore(database)
+    provider = RestartableRecordingOpenAIProvider(api_key="test-key", transport=transport)
     app = CayuApp(session_store=store)
-    app.register_provider(OpenAIProvider(api_key="test-key", transport=transport), default=True)
+    app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="gpt-5.6"),
         hosted_tools=[OpenAIWebSearch()],
@@ -560,16 +628,6 @@ async def test_runtime_persists_web_search_lifecycle_citation_sources_and_replay
             max_steps=1,
         ),
     )
-    resume_events = [
-        event
-        async for event in app.resume(
-            ResumeRequest(
-                session_id="sess_web_search",
-                messages=[Message.text("user", "Continue.")],
-                max_steps=1,
-            )
-        )
-    ]
 
     hosted_events = [
         event for event in run_events if event.type == EventType.MODEL_HOSTED_TOOL_CALL
@@ -593,6 +651,8 @@ async def test_runtime_persists_web_search_lifecycle_citation_sources_and_replay
         "hosted_tool": "web_search",
         "untrusted_external_evidence": True,
     }
+    assert EventType.MODEL_ERROR not in {event.type for event in run_events}
+    assert EventType.MODEL_ATTEMPT_DISCARDED not in {event.type for event in run_events}
     completed = next(event for event in run_events if event.type == EventType.MODEL_COMPLETED)
     assert "hosted_tools" not in completed.payload["usage_metrics"]
     assert completed.payload["hosted_tool_usage"] == {
@@ -618,15 +678,48 @@ async def test_runtime_persists_web_search_lifecycle_citation_sources_and_replay
         if event.type == EventType.MODEL_HOSTED_TOOL_CALL
     ]
     assert hosted_part.model_attempt_id == stored_hosted_events[-1].payload["model_attempt_id"]
-    assert citation_part.start_index == 7
-    assert citation_part.end_index == 11
-    assert resume_events[-1].type == EventType.SESSION_COMPLETED
+    assert citation_part.start_index == 0
+    assert citation_part.end_index == 4
     usage = await app.get_session_usage("sess_web_search")
     assert usage.usage.hosted_tools.web_search_calls == 1
     assert usage.usage.hosted_tools.web_search_outcome_unknown == 0
-    assert any(
-        item.get("type") == "web_search_call" for item in transport.calls[1]["payload"]["input"]
+    await store.close()
+
+    reopened_store = SQLiteSessionStore(database)
+    assert await reopened_store.load_transcript("sess_web_search") == transcript
+    reopened_app = CayuApp(session_store=reopened_store)
+    reopened_app.register_provider(
+        RestartableRecordingOpenAIProvider(api_key="test-key", transport=transport),
+        default=True,
     )
+    reopened_app.register_agent(
+        AgentSpec(name="assistant", model="gpt-5.6"),
+        hosted_tools=[OpenAIWebSearch()],
+    )
+    resume_events = [
+        event
+        async for event in reopened_app.resume(
+            ResumeRequest(
+                session_id="sess_web_search",
+                messages=[Message.text("user", "Continue.")],
+                max_steps=1,
+            )
+        )
+    ]
+
+    assert resume_events[-1].type == EventType.SESSION_COMPLETED
+    replayed_output = [
+        item
+        for item in transport.calls[1]["payload"]["input"]
+        if item.get("type") in {"reasoning", "web_search_call", "message"}
+    ]
+    assert [item["type"] for item in replayed_output] == [
+        "reasoning",
+        "web_search_call",
+        "message",
+    ]
+    assert replayed_output[1]["id"] == "ws_1"
+    await reopened_store.close()
 
 
 @pytest.mark.anyio
@@ -2766,7 +2859,6 @@ async def test_openai_stream_events_reconciles_matching_terminal_search_evidence
 @pytest.mark.parametrize(
     "terminal_output",
     [
-        pytest.param([], id="omitted"),
         pytest.param(
             [
                 {
@@ -2792,7 +2884,7 @@ async def test_openai_stream_events_reconciles_matching_terminal_search_evidence
         ),
     ],
 )
-async def test_openai_stream_events_rejects_terminal_output_that_omits_or_rebinds_search(
+async def test_openai_stream_events_rejects_nonempty_terminal_output_that_rebinds_search(
     terminal_output: list[dict[str, object]],
 ) -> None:
     lifecycle_call = {
@@ -2828,6 +2920,260 @@ async def test_openai_stream_events_rejects_terminal_output_that_omits_or_rebind
     assert (await anext(stream)).payload["status"] == "completed"
     with pytest.raises(OpenAIProtocolError, match="omitted|conflicts"):
         await anext(stream)
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_rejects_empty_terminal_output_with_pending_search() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "web_search_call", "id": "ws_1", "status": "in_progress"},
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [],
+            },
+        }
+
+    stream = openai_stream_events(raw_events())
+    assert (await anext(stream)).payload["status"] == "in_progress"
+    assert (await anext(stream)).payload["status"] == "outcome_unknown"
+    with pytest.raises(OpenAIProtocolError, match="unfinished web search calls"):
+        await anext(stream)
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_rejects_malformed_empty_output_fallback_message() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "message",
+                "id": "msg_1",
+                "status": "in_progress",
+                "role": "assistant",
+                "content": [],
+            },
+        }
+        yield {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "message",
+                "id": "msg_1",
+                "status": "completed",
+                "role": "user",
+                "content": "not-a-list",
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [],
+            },
+        }
+
+    with pytest.raises(OpenAIProtocolError, match="must have assistant role"):
+        _ = [event async for event in openai_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_rejects_unsupported_empty_output_fallback_item() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "image_generation_call",
+                "id": "image_1",
+                "status": "completed",
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [],
+            },
+        }
+
+    with pytest.raises(OpenAIProtocolError, match="Unsupported .* output_item.done"):
+        _ = [event async for event in openai_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_rejects_empty_output_message_text_conflict() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "message",
+                "id": "msg_1",
+                "status": "in_progress",
+                "role": "assistant",
+                "content": [],
+            },
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "visible",
+        }
+        yield {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "message",
+                "id": "msg_1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "different",
+                        "annotations": [],
+                    }
+                ],
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [],
+            },
+        }
+
+    with pytest.raises(OpenAIProtocolError, match="conflicts with streamed text"):
+        _ = [event async for event in openai_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_rejects_unindexed_empty_output_text_conflict() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "message",
+                "id": "msg_1",
+                "status": "in_progress",
+                "role": "assistant",
+                "content": [],
+            },
+        }
+        yield {"type": "response.output_text.delta", "delta": "visible"}
+        yield {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "message",
+                "id": "msg_1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "different",
+                        "annotations": [],
+                    }
+                ],
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [],
+            },
+        }
+
+    with pytest.raises(OpenAIProtocolError, match="streamed visible text"):
+        _ = [event async for event in openai_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_rejects_empty_output_rebound_reasoning_identity() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "reasoning",
+                "id": "rs_added",
+                "status": "in_progress",
+                "summary": [],
+            },
+        }
+        yield {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "reasoning",
+                "id": "rs_done",
+                "status": "completed",
+                "summary": [],
+                "encrypted_content": "opaque-reasoning",
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [],
+            },
+        }
+
+    with pytest.raises(OpenAIProtocolError, match="identity conflicts"):
+        _ = [event async for event in openai_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_rejects_orphan_empty_output_function_call_done() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "echo",
+                "arguments": '{"text":"hello"}',
+                "status": "completed",
+            },
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [],
+            },
+        }
+
+    with pytest.raises(OpenAIProtocolError, match="before arguments completion"):
+        _ = [event async for event in openai_stream_events(raw_events())]
 
 
 @pytest.mark.anyio

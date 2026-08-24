@@ -1826,8 +1826,10 @@ async def _openai_stream_events(
     pending_web_search_calls: dict[int, tuple[str, str]] = {}
     streamed_text: dict[tuple[int, int], str] = {}
     streamed_text_offsets: dict[tuple[int, int], int] = {}
+    streamed_visible_text: list[str] = []
     assembled_text_length = 0
     fallback_output_items: dict[int, dict[str, Any]] = {}
+    pending_replay_items: dict[int, tuple[str, str]] = {}
     completed = False
     async for event in _stream_events_with_cancellation_marker(events):
         if not isinstance(event, Mapping):
@@ -1843,6 +1845,7 @@ async def _openai_stream_events(
             if not isinstance(delta, str):
                 raise OpenAIProtocolError("OpenAI output_text delta must be a string.")
             if delta:
+                streamed_visible_text.append(delta)
                 output_index = event.get("output_index")
                 content_index = event.get("content_index")
                 if type(output_index) is int and type(content_index) is int:
@@ -1875,6 +1878,7 @@ async def _openai_stream_events(
             if not isinstance(delta, str):
                 raise OpenAIProtocolError("OpenAI refusal delta must be a string.")
             if delta:
+                streamed_visible_text.append(delta)
                 assembled_text_length += len(delta)
                 yield ModelStreamEvent.text_delta(delta)
             continue
@@ -1894,6 +1898,7 @@ async def _openai_stream_events(
             item = event.get("item")
             if isinstance(item, Mapping) and item.get("type") == "reasoning":
                 pending_reasoning_items.add(_stream_output_index(event))
+            _record_stream_replay_item_added(event, pending_replay_items)
             if isinstance(item, Mapping) and item.get("type") == "web_search_call":
                 output_index = _stream_output_index(event)
                 if output_index in pending_web_search_calls:
@@ -1941,8 +1946,6 @@ async def _openai_stream_events(
             continue
         if event_type == "response.output_item.done":
             item = event.get("item")
-            if isinstance(item, Mapping) and item.get("type") == "reasoning":
-                pending_reasoning_items.discard(_stream_output_index(event))
             if isinstance(item, Mapping) and item.get("type") == "web_search_call":
                 output_index = _stream_output_index(event)
                 pending = pending_web_search_calls.pop(output_index, None)
@@ -1955,7 +1958,14 @@ async def _openai_stream_events(
                     raise OpenAIProtocolError("OpenAI web_search_call output identity mismatch.")
                 fallback_output_items[output_index] = normalized
                 yield _web_search_call_event(normalized)
-            _record_stream_output_item_done(event, fallback_output_items)
+            _record_stream_output_item_done(
+                event,
+                fallback_output_items,
+                pending_replay_items=pending_replay_items,
+                streamed_text=streamed_text,
+            )
+            if isinstance(item, Mapping) and item.get("type") == "reasoning":
+                pending_reasoning_items.discard(_stream_output_index(event))
             continue
         if event_type == "response.function_call_arguments.delta":
             _record_stream_function_call_delta(event, pending_function_calls)
@@ -1973,6 +1983,7 @@ async def _openai_stream_events(
                 *pending_function_calls,
                 *pending_reasoning_items,
                 *pending_web_search_calls,
+                *pending_replay_items,
             }
             # A completed response promises complete output items. An incomplete
             # response may end mid-item, so retain the terminal classification but
@@ -1984,6 +1995,10 @@ async def _openai_stream_events(
             if event_type == "response.completed" and pending_reasoning_items:
                 raise OpenAIProtocolError(
                     "OpenAI streaming response completed with unfinished reasoning items."
+                )
+            if event_type == "response.completed" and pending_replay_items:
+                raise OpenAIProtocolError(
+                    "OpenAI streaming response completed with unfinished output items."
                 )
             if event_type == "response.completed" and pending_web_search_calls:
                 for call_id, _status in pending_web_search_calls.values():
@@ -2000,6 +2015,9 @@ async def _openai_stream_events(
                 fallback_output_items,
                 excluded_output_indexes=unfinished_output_indexes,
                 reasoning_state=reasoning_state,
+                streamed_visible_text=(
+                    "".join(streamed_visible_text) if streamed_visible_text else None
+                ),
             ):
                 yield terminal_event
             if event_type == "response.completed":
@@ -2472,15 +2490,23 @@ def _stream_terminal_events(
     *,
     excluded_output_indexes: set[int] | None = None,
     reasoning_state: str = "inline",
+    streamed_visible_text: str | None = None,
 ) -> list[ModelStreamEvent]:
     response = _stream_response_object(event)
     excluded_output_indexes = excluded_output_indexes or set()
-    if response.get("output") is None:
+    output = response.get("output")
+    # Some completed Responses streams deliver every authoritative item through
+    # output_item.done and leave the terminal envelope's repeated output empty.
+    if output is None or (
+        event.get("type") == "response.completed" and isinstance(output, list) and not output
+    ):
         completed_output_items = {
             index: item
             for index, item in fallback_output_items.items()
             if index not in excluded_output_indexes
         }
+        if streamed_visible_text is not None:
+            _reconcile_fallback_visible_text(completed_output_items, streamed_visible_text)
         provider_state_items = _provider_state_items_from_output_items(completed_output_items)
         completion_output_items = list(_sorted_output_items(completed_output_items))
         return [
@@ -2491,7 +2517,6 @@ def _stream_terminal_events(
                 reasoning_state=reasoning_state,
             )
         ]
-    output = response.get("output")
     if not isinstance(output, list):
         raise OpenAIProtocolError("OpenAI response output must be a list.")
 
@@ -2624,9 +2649,24 @@ def _provider_state_items_from_output_items(
     output_items: Mapping[int, Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     provider_state_items: list[dict[str, Any]] = []
-    for item in _sorted_output_items(output_items):
-        if item.get("type") == "web_search_call" and item.get("status") != "completed":
-            continue
+    for output_index in sorted(output_items):
+        item = output_items[output_index]
+        item_type = item.get("type")
+        if item_type == "message":
+            _validate_completed_stream_message(item, output_index)
+        elif item_type == "function_call":
+            _validate_completed_stream_item_status(item, output_index)
+            _function_call_event(item, output_index)
+        elif item_type == "reasoning":
+            _validate_completed_stream_reasoning(item, output_index)
+        elif item_type == "web_search_call":
+            normalized = _normalized_web_search_call(item, item_index=output_index)
+            if normalized["status"] != "completed":
+                continue
+        else:
+            raise OpenAIProtocolError(
+                f"Unsupported OpenAI fallback output item type: {item_type!r}."
+            )
         provider_state_items.append(
             {"provider": "openai", "state": copy_json_value(item, "output_item")}
         )
@@ -2658,17 +2698,157 @@ def _record_stream_output_item_added(
     )
 
 
+def _record_stream_replay_item_added(
+    event: Mapping[str, Any],
+    pending_replay_items: dict[int, tuple[str, str]],
+) -> None:
+    output_index = _stream_output_index(event)
+    item = event.get("item")
+    if not isinstance(item, Mapping):
+        raise OpenAIProtocolError("OpenAI output_item.added requires item object.")
+    item_type = item.get("type")
+    if item_type not in {"message", "reasoning"}:
+        return
+    if output_index in pending_replay_items:
+        raise OpenAIProtocolError("OpenAI replayable output_item.added was repeated.")
+    item_id = _mapping_optional_string(item, "id")
+    if item_id is None:
+        raise OpenAIProtocolError(f"OpenAI {item_type} output_item.added requires nonblank id.")
+    if item.get("status") not in {None, "in_progress", "incomplete"}:
+        raise OpenAIProtocolError(
+            f"OpenAI {item_type} output_item.added has invalid lifecycle status."
+        )
+    if item_type == "message":
+        _message_output_events(item, output_index, text_offset=0)
+    else:
+        _validate_stream_reasoning_shape(item, output_index)
+    pending_replay_items[output_index] = (item_type, item_id)
+
+
 def _record_stream_output_item_done(
     event: Mapping[str, Any],
     output_items: dict[int, dict[str, Any]],
+    *,
+    pending_replay_items: dict[int, tuple[str, str]],
+    streamed_text: Mapping[tuple[int, int], str],
 ) -> None:
     output_index = _stream_output_index(event)
     item = event.get("item")
     if not isinstance(item, Mapping):
         raise OpenAIProtocolError("OpenAI output_item.done requires item object.")
     item_type = item.get("type")
-    if item_type in {"reasoning", "message", "function_call"}:
+    if item_type in {"reasoning", "message"}:
+        if output_index in output_items:
+            raise OpenAIProtocolError(f"OpenAI {item_type} output_item.done was repeated.")
+        pending = pending_replay_items.pop(output_index, None)
+        item_id = _mapping_optional_string(item, "id")
+        if pending is not None and (item_type != pending[0] or item_id != pending[1]):
+            raise OpenAIProtocolError(
+                f"OpenAI {item_type} output_item.done identity conflicts with added item."
+            )
+        if item_type == "message":
+            _validate_completed_stream_message(item, output_index)
+            _reconcile_streamed_message_text(item, output_index, streamed_text)
+        else:
+            _validate_completed_stream_reasoning(item, output_index)
         output_items[output_index] = copy_json_value(item, "output_item")
+        return
+    if item_type == "function_call":
+        _validate_completed_stream_item_status(item, output_index)
+        _function_call_event(item, output_index)
+        existing = output_items.get(output_index)
+        if existing is None:
+            raise OpenAIProtocolError(
+                "OpenAI function_call output_item.done arrived before arguments completion."
+            )
+        if existing is not None and any(
+            existing.get(key) != item.get(key)
+            for key in ("type", "id", "call_id", "name", "arguments", "status")
+        ):
+            raise OpenAIProtocolError(
+                "OpenAI function_call output_item.done conflicts with streamed arguments."
+            )
+        output_items[output_index] = copy_json_value(item, "output_item")
+        return
+    if item_type != "web_search_call":
+        raise OpenAIProtocolError(f"Unsupported OpenAI output_item.done item type: {item_type!r}.")
+
+
+def _validate_completed_stream_item_status(
+    item: Mapping[str, Any],
+    output_index: int,
+) -> None:
+    if item.get("status") not in {None, "completed"}:
+        raise OpenAIProtocolError(f"OpenAI output_item.done item {output_index} must be completed.")
+
+
+def _validate_completed_stream_message(item: Mapping[str, Any], output_index: int) -> None:
+    _validate_completed_stream_item_status(item, output_index)
+    _message_output_events(item, output_index, text_offset=0)
+
+
+def _validate_stream_reasoning_shape(item: Mapping[str, Any], output_index: int) -> None:
+    summary = item.get("summary", [])
+    if not isinstance(summary, list):
+        raise OpenAIProtocolError(
+            f"OpenAI reasoning output item {output_index} summary must be a list."
+        )
+    encrypted_content = item.get("encrypted_content")
+    if encrypted_content is not None and not isinstance(encrypted_content, str):
+        raise OpenAIProtocolError(
+            f"OpenAI reasoning output item {output_index} encrypted_content must be a string."
+        )
+
+
+def _validate_completed_stream_reasoning(item: Mapping[str, Any], output_index: int) -> None:
+    _validate_completed_stream_item_status(item, output_index)
+    if _mapping_optional_string(item, "id") is None:
+        raise OpenAIProtocolError(
+            f"OpenAI reasoning output_item.done {output_index} requires nonblank id."
+        )
+    _validate_stream_reasoning_shape(item, output_index)
+
+
+def _reconcile_streamed_message_text(
+    item: Mapping[str, Any],
+    output_index: int,
+    streamed_text: Mapping[tuple[int, int], str],
+) -> None:
+    content = cast("list[Mapping[str, Any]]", item["content"])
+    for (streamed_output_index, content_index), text in streamed_text.items():
+        if streamed_output_index != output_index:
+            continue
+        if content_index >= len(content):
+            raise OpenAIProtocolError(
+                "OpenAI message output_item.done omitted streamed text content."
+            )
+        part = content[content_index]
+        if part.get("type") != "output_text" or part.get("text") != text:
+            raise OpenAIProtocolError(
+                "OpenAI message output_item.done conflicts with streamed text."
+            )
+
+
+def _reconcile_fallback_visible_text(
+    output_items: Mapping[int, Mapping[str, Any]],
+    streamed_visible_text: str,
+) -> None:
+    fallback_visible_text: list[str] = []
+    has_message = False
+    for output_index in sorted(output_items):
+        item = output_items[output_index]
+        if item.get("type") != "message":
+            continue
+        has_message = True
+        _validate_completed_stream_message(item, output_index)
+        content = cast("list[Mapping[str, Any]]", item["content"])
+        for part in content:
+            text_key = "text" if part.get("type") == "output_text" else "refusal"
+            fallback_visible_text.append(cast("str", part[text_key]))
+    if has_message and "".join(fallback_visible_text) != streamed_visible_text:
+        raise OpenAIProtocolError(
+            "OpenAI fallback message content conflicts with streamed visible text."
+        )
 
 
 def _record_stream_function_call_delta(
