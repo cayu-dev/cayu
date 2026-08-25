@@ -7,8 +7,10 @@ import asyncio
 import filecmp
 import importlib.metadata
 import json
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -26,6 +28,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Fail if the committed API baseline or generated types are stale.",
     )
     args = parser.parse_args(argv)
+    if args.check:
+        _assert_expected_cayu_import()
 
     with tempfile.TemporaryDirectory(prefix="cayu-dashboard-openapi-") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
@@ -96,6 +100,23 @@ def _release_metadata() -> bytes:
         f'export const DASHBOARD_SOURCE_CAYU_VERSION = "{cayu_version}"\n'
         f'export const SUPPORTED_SERVER_CONTRACT_VERSION = "{SERVER_CONTRACT_VERSION}"\n'
     ).encode()
+
+
+def _assert_expected_cayu_import() -> None:
+    import cayu
+
+    committed = RELEASE_METADATA.read_text(encoding="utf-8")
+    match = re.search(r'DASHBOARD_SOURCE_CAYU_VERSION = "([^"]+)"', committed)
+    if match is None:
+        raise SystemExit(f"Dashboard release metadata has no Cayu version: {RELEASE_METADATA}")
+    expected = match.group(1)
+    observed = importlib.metadata.version("cayu")
+    if observed != expected:
+        raise SystemExit(
+            "Dashboard Cayu import version mismatch: "
+            f"expected={expected!r}, observed={observed!r}, "
+            f"python={sys.executable!r}, cayu={cayu.__file__!r}."
+        )
 
 
 def _run_generator(*, schema_path: Path, output_dir: Path) -> None:

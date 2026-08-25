@@ -1,3 +1,9 @@
+import {
+  invalidDurableText,
+  MAX_LABEL_KEY_LENGTH,
+  MAX_LABEL_VALUE_LENGTH,
+  unicodeScalarLength,
+} from "./durable-text.ts"
 import type {
   LabelSelectorRequirement,
   PriceBook,
@@ -21,8 +27,6 @@ const MAX_WINDOW_SECONDS = 366n * 24n * 60n * 60n
 const MAX_LABEL_FILTERS = 50
 const MAX_LABEL_SELECTORS = 25
 const MAX_LABEL_SELECTOR_VALUES = 100
-const MAX_LABEL_KEY_LENGTH = 128
-const MAX_LABEL_VALUE_LENGTH = 512
 
 const RANGE_DURATION_MS: Record<Exclude<UsageRange, "custom">, number> = {
   "24h": DAY_MS,
@@ -450,7 +454,9 @@ function cleanBoundedText(value: string, label: string, maxLength: number): stri
   const trimmed = value.trim()
   if (!trimmed) throw new Error(`${label} cannot be blank.`)
   if (trimmed !== value) throw new Error(`${label} cannot start or end with whitespace.`)
-  if (trimmed.length > maxLength) {
+  const invalid = invalidDurableText(trimmed)
+  if (invalid !== null) throw new Error(`${label} ${invalid}.`)
+  if (unicodeScalarLength(trimmed) > maxLength) {
     throw new Error(`${label} cannot exceed ${maxLength} characters.`)
   }
   return trimmed

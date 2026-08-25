@@ -28,17 +28,18 @@ Create production assets with:
 npm run lint
 npm run test
 npm run typecheck
-npm run check:api
+npm run check:api:repo
 npm run build
 ```
 
 Normal development builds support Node.js 22.18.0 or newer. Byte-for-byte release asset
 reproduction is verified with exactly Node.js 22.18.0 and the committed `package-lock.json`.
 
-`npm run check:api` compares the generated client and `server-openapi.json` with an installed
-Cayu Python package that includes the `server` extra (`cayu[server]`). Set `CAYU_PYTHON` when
-that package is installed in a Python environment whose interpreter is not available as
-`python`.
+`npm run check:api:repo` compares the generated client and `server-openapi.json` with the
+repository-root `.venv` and fails if that environment is absent. `CAYU_PYTHON` remains the
+explicit highest-priority override. Ejected dashboard source can use `npm run check:api`, which
+selects an ambient `python` unless `CAYU_PYTHON` is set; that environment must contain the exact
+Cayu version recorded in `src/lib/release-metadata.ts` with the `server` extra.
 
 Serve `dist/` with `DashboardConfig(directory=...)`, `mount_cayu(..., dashboard_dir=...)`, or
 `mount_dashboard(..., dashboard_dir=...)`. Cayu injects the configured base path and API URL,
@@ -50,8 +51,8 @@ The normal build retains `LICENSE`, `NOTICE`, `REDISTRIBUTION.md`, and
 ## Compatibility and ownership
 
 The dashboard refuses to load control-plane data when the server reports a different contract
-version. After upgrading Cayu, run `npm run check:api` to detect contract or generated-client
-drift. Run `npm run generate:api` only when you intentionally want to update this
+version. After upgrading Cayu, run `npm run check:api:repo` to detect contract or generated-client
+drift. Run `npm run generate:api:repo` only when you intentionally want to update this
 application-owned copy for the newly installed server.
 
 You may also replace this project completely with any UI that consumes Cayu's versioned,

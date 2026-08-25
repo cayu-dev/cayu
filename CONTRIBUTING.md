@@ -160,7 +160,7 @@ npm ci
 npm run lint
 npm run test
 npm run typecheck
-npm run check:api
+npm run check:api:repo
 npm run build:package
 cd ..
 uv run python scripts/build_dashboard_source_bundle.py

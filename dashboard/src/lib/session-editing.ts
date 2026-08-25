@@ -1,8 +1,12 @@
 import type { QueryClient } from "@tanstack/react-query"
 import type { SessionDetail, SessionUpdate } from "./api.ts"
+import {
+  invalidDurableText,
+  MAX_LABEL_KEY_LENGTH,
+  MAX_LABEL_VALUE_LENGTH,
+  unicodeScalarLength,
+} from "./durable-text.ts"
 
-const MAX_LABEL_KEY_LENGTH = 128
-const MAX_LABEL_VALUE_LENGTH = 512
 const RESERVED_LABEL_PREFIX = "cayu:"
 const RUNTIME_METADATA_KEYS = new Set(["subagent"])
 const RUNTIME_METADATA_PREFIX = "cayu:"
@@ -16,21 +20,6 @@ export type SessionMetadataOwnership = {
 function jsonObject(value: unknown): Record<string, unknown> | null {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return null
   return value as Record<string, unknown>
-}
-
-function invalidDurableText(value: string): string | null {
-  if (value.includes("\0")) return "must not contain NUL characters"
-  for (const character of value) {
-    const codePoint = character.codePointAt(0)
-    if (codePoint !== undefined && codePoint >= 0xd800 && codePoint <= 0xdfff) {
-      return "must not contain Unicode surrogate code points"
-    }
-  }
-  return null
-}
-
-function unicodeLength(value: string): number {
-  return Array.from(value).length
 }
 
 function isRuntimeMetadataKey(key: string): boolean {
@@ -120,7 +109,7 @@ export function parseSessionLabelsDraft(
         message: `Label key ${JSON.stringify(key)} cannot start or end with whitespace.`,
       }
     }
-    if (unicodeLength(key) > MAX_LABEL_KEY_LENGTH) {
+    if (unicodeScalarLength(key) > MAX_LABEL_KEY_LENGTH) {
       return {
         ok: false,
         message: `Label key ${JSON.stringify(key)} exceeds ${MAX_LABEL_KEY_LENGTH} characters.`,
@@ -144,7 +133,7 @@ export function parseSessionLabelsDraft(
         message: `Label ${JSON.stringify(key)} cannot start or end with whitespace.`,
       }
     }
-    if (unicodeLength(value) > MAX_LABEL_VALUE_LENGTH) {
+    if (unicodeScalarLength(value) > MAX_LABEL_VALUE_LENGTH) {
       return {
         ok: false,
         message: `Label ${JSON.stringify(key)} exceeds ${MAX_LABEL_VALUE_LENGTH} characters.`,

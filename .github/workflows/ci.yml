@@ -745,7 +745,7 @@ jobs:
         working-directory: .
       - run: uv sync --frozen --extra dev --extra server --python 3.11
         working-directory: .
-      - run: CAYU_PYTHON=../.venv/bin/python npm run check:api
+      - run: npm run check:api:repo
       - run: npm run build:package
       - name: Check packaged dashboard assets
         run: |

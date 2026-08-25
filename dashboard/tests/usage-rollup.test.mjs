@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import { parseDashboardSearch, stringifyDashboardSearch } from "../src/lib/search-params.ts"
+import { parseSessionLabelsDraft } from "../src/lib/session-editing.ts"
 import {
   buildUsageRollupRequest,
   multilineUsageFilters,
@@ -263,6 +264,92 @@ test("invalid filters fail locally instead of silently broadening the aggregate"
       .error,
     /must use \(a,b\)/,
   )
+})
+
+test("label filters use Unicode scalar lengths across exact and selector forms", () => {
+  const key128 = "😀".repeat(128)
+  const key129 = "😀".repeat(129)
+  const value512 = "😀".repeat(512)
+  const value513 = "😀".repeat(513)
+
+  assert.equal(
+    usageRollupRequestState(validateUsageRollupSearch({ label: [`${key128}=${value512}`] })).ok,
+    true,
+  )
+  assert.equal(
+    usageRollupRequestState(validateUsageRollupSearch({ label: [`${key129}=value`] })).ok,
+    false,
+  )
+  assert.equal(
+    usageRollupRequestState(validateUsageRollupSearch({ label: [`key=${value513}`] })).ok,
+    false,
+  )
+
+  for (const selector of [
+    key128,
+    `!${key128}`,
+    `${key128}=${value512}`,
+    `${key128}==${value512}`,
+    `${key128}!=${value512}`,
+    `${key128} in (${value512})`,
+    `${key128} notin (${value512})`,
+  ]) {
+    assert.equal(
+      usageRollupRequestState(validateUsageRollupSearch({ label_selector: [selector] })).ok,
+      true,
+      selector,
+    )
+  }
+  assert.equal(
+    usageRollupRequestState(validateUsageRollupSearch({ label_selector: [key129] })).ok,
+    false,
+  )
+  assert.equal(
+    usageRollupRequestState(validateUsageRollupSearch({ label_selector: [`key=${value513}`] })).ok,
+    false,
+  )
+})
+
+test("label filters share durable-text validation with session editing", () => {
+  const validKey = "😀".repeat(128)
+  const validValue = "😀".repeat(512)
+  assert.equal(parseSessionLabelsDraft(JSON.stringify({ [validKey]: validValue })).ok, true)
+  assert.equal(
+    usageRollupRequestState(validateUsageRollupSearch({ label: [`${validKey}=${validValue}`] })).ok,
+    true,
+  )
+
+  for (const invalid of ["nul\0text", "surrogate\ud800text"]) {
+    assert.equal(parseSessionLabelsDraft(JSON.stringify({ [invalid]: "value" })).ok, false)
+    assert.equal(parseSessionLabelsDraft(JSON.stringify({ key: invalid })).ok, false)
+
+    for (const label of [`${invalid}=value`, `key=${invalid}`]) {
+      const state = usageRollupRequestState(validateUsageRollupSearch({ label: [label] }))
+      assert.equal(state.ok, false, label)
+      assert.match(state.error, /NUL|surrogate/)
+    }
+
+    for (const selector of [
+      invalid,
+      `!${invalid}`,
+      `${invalid}=value`,
+      `${invalid}==value`,
+      `${invalid}!=value`,
+      `${invalid} in (value)`,
+      `${invalid} notin (value)`,
+      `key=${invalid}`,
+      `key==${invalid}`,
+      `key!=${invalid}`,
+      `key in (${invalid})`,
+      `key notin (${invalid})`,
+    ]) {
+      const state = usageRollupRequestState(
+        validateUsageRollupSearch({ label_selector: [selector] }),
+      )
+      assert.equal(state.ok, false, selector)
+      assert.match(state.error, /NUL|surrogate/)
+    }
+  }
 })
 
 test("range and filter updates preserve only their independent URL state", () => {

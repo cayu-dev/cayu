@@ -1,13 +1,28 @@
 import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const args = process.argv.slice(2);
+const rawArgs = process.argv.slice(2);
+const repositoryMode = rawArgs[0] === "--repository";
+const args = repositoryMode ? rawArgs.slice(1) : rawArgs;
 
 if (args.length === 0) {
   console.error("usage: node scripts/run-python.mjs <script> [args...]");
   process.exit(2);
 }
 
-const python = process.env.CAYU_PYTHON || "python";
+const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
+const repositoryPython = path.join(
+  repositoryRoot,
+  ".venv",
+  process.platform === "win32" ? "Scripts/python.exe" : "bin/python",
+);
+const python = process.env.CAYU_PYTHON || (repositoryMode ? repositoryPython : "python");
+if (repositoryMode && !process.env.CAYU_PYTHON && !existsSync(python)) {
+  console.error(`repository Python environment is missing: ${JSON.stringify(python)}`);
+  process.exit(1);
+}
 const result = spawnSync(python, args, {
   shell: false,
   stdio: "inherit",
