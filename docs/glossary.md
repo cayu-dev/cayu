@@ -62,13 +62,17 @@ disambiguates them so a name never sends you down the wrong path.
   `supersedes`, `derived_from`, or symmetric `contradicts` statement between
   exact revisions of two different entries. None of these proves provider
   exposure or automatically changes recall ranking, lifecycle, or truth.
-- **Maintenance proposal vs maintenance decision.** A
-  `KnowledgeMaintenanceProposal` is a bounded plan over exact current source
-  revisions and one exact pending replacement; it has no write authority. A
-  `KnowledgeMaintenanceDecision` is an explicit non-model review of that exact
-  proposal fingerprint. The store atomically applies approval or durably records
-  rejection. Candidate discovery, recall ranking, and context placement remain
-  separate concerns.
+- **Maintenance routing vs plan draft vs proposal vs decision.** A
+  `KnowledgeMaintenanceRouter` turns explicit hints into a bounded exact-revision
+  snapshot without making semantic claims. A `KnowledgeMaintenancePlanDraft` is
+  strict, read-only planner output submitted to independent evaluation. An
+  accepted `KnowledgeMaintenancePlanningResult` proves that exact draft passed;
+  neither object creates storage. A durable `KnowledgeMaintenanceProposal` binds
+  one exact pending replacement to its current source revisions for review; it has
+  no activation authority. A `KnowledgeMaintenanceDecision` is an explicit
+  non-model review of that exact proposal fingerprint. The store atomically applies
+  approval or durably records rejection. Candidate discovery, recall ranking,
+  context placement, and provider exposure remain separate concerns.
 - **Curator.** `KnowledgeCurator` is an explicitly invoked application workflow
   that turns bounded source-attributed learning signals into pending proposals
   for review. It is not a background agent, retrieval manager, context manager,

@@ -705,6 +705,122 @@ PYTHONPATH=src python scripts/run_knowledge_maintenance_routing_performance.py -
 Results are recorded in
 [`benchmarks/memory/knowledge-maintenance-routing-performance-v1.json`](../benchmarks/memory/knowledge-maintenance-routing-performance-v1.json).
 
+## Bounded maintenance planning and independent evaluation
+
+`KnowledgeMaintenancePlanningWorkflow` is the read-only semantic boundary after
+candidate routing. An application injects a `KnowledgeMaintenancePlanner` and a
+separate `KnowledgeMaintenancePlanEvaluator`; Cayu rejects using the same object or
+logical component identity for both roles. The workflow does not choose a provider,
+supply a universal prompt, persist a proposal, create a pending replacement, publish a
+relation, or change lifecycle state. Even an accepted planning result is an evaluated
+draft without write or review authority.
+
+The planner receives a defensively copied `KnowledgeMaintenancePlannerInput` containing
+a minimized `KnowledgeMaintenancePlanningSnapshot`, the planning-configuration
+fingerprint, allowed replacement kinds, and a stage budget. The snapshot carries only
+authorized routed candidates and signals, requested namespace/labels and policy, exact
+binding fingerprints, and candidate payload accounting. It deliberately excludes the
+broader access-scope configuration, omitted signals, router limits, and unrelated source
+identities. A strict `KnowledgeMaintenancePlanDraft` binds:
+
+- every exact routed source revision;
+- the routing-request, routing-result, planning-configuration, and policy fingerprints;
+- replacement text, title, kind, aspects, and impact targets, but no model-controlled
+  namespace, visibility, status, labels, source authority, or write identity;
+- one typed relation disposition per source using an unpersisted replacement endpoint;
+- bounded replacement claims mapped to exact source revisions and referenced by relation
+  dispositions; and
+- bounded rationale and evidence-summary text.
+
+Planner output is untrusted even after schema validation. Cayu deterministically rejects
+foreign or omitted sources, incomplete or repeated relation coverage, invalid directed
+relation orientation, missing relation evidence, evidence outside the routed snapshot,
+disallowed replacement kinds, and mismatched policy or configuration bindings. Only a
+structurally valid plan reaches the separately injected evaluator. That evaluator owns
+the application-specific semantic checks that deterministic code cannot infer from prose:
+unsupported synthesis, information loss, contradiction handling, retention constraints,
+policy compatibility, and prompt-injected source content. Its result is another strict,
+revision-bound structure containing framework-closed, kind-bound codes and exact
+references rather than evaluator-selected strings or copied source/replacement prose.
+Before disclosing any candidate to either component, the workflow also proves that routed
+signals and omissions exactly partition the supplied request and that each routed signal
+still equals its original request value. A self-asserted request fingerprint therefore
+cannot substitute unrelated authorized knowledge into a planning attempt.
+
+Source entries are storage-reauthorized and compared with the routed immutable snapshot
+before planner invocation, after planning, and after evaluation. A revision advance,
+disappearance, or scope loss therefore prevents acceptance; a change during planning
+also avoids spending the evaluator budget on stale work. The later persistence slice
+must still compare-and-swap the same exact revisions because a read-only accepted result
+cannot reserve the corpus. A source that actually advances produces a deterministic stale
+rejection. By contrast, a timeout or storage failure while checking currentness remains a
+distinct revalidation-failure outcome, including whether it happened after planning or
+evaluation, so retry policy never has to infer infrastructure failure from a semantic
+rejection.
+
+```python
+from cayu import (
+    KnowledgeMaintenancePlanningConfig,
+    KnowledgeMaintenancePlanningOutcome,
+    KnowledgeMaintenancePlanningWorkflow,
+)
+
+workflow = KnowledgeMaintenancePlanningWorkflow(
+    store,
+    planner=application_planner,
+    evaluator=independent_evaluator,
+    config=KnowledgeMaintenancePlanningConfig(
+        planner_id="billing-consolidator",
+        planner_version="2026-08",
+        evaluator_id="billing-consolidation-reviewer",
+        evaluator_version="2026-08",
+        planner_model_ids=("provider/planning-model",),
+        evaluator_model_ids=("provider/review-model",),
+        allowed_replacement_kinds=("fact", "procedure"),
+    ),
+)
+planning = await workflow.plan(request, result)
+if planning.outcome is KnowledgeMaintenancePlanningOutcome.ACCEPTED:
+    # The draft is eligible for a later pending-persistence operation, not activation.
+    queue_for_pending_persistence(planning)
+```
+
+Configuration separately bounds planner input, plan output, evaluator input and output,
+source revalidation bytes and concurrency, claim count and size, replacement text, stage
+timeouts, model calls, and provider cost. The planner receives its claim-count,
+claim-size, and replacement-size ceilings in a planner-specific budget before invocation,
+so an integration never has to infer hidden structured-output limits from a failed call.
+Cost uses integer micro-US dollars to avoid floating-point accounting ambiguity. Each
+stage also receives an application-owned allowlist of provider model identities and
+reports measured `KnowledgeMaintenanceInferenceUsage`. Unknown component-reported model
+identities make the component output invalid and are not reflected into the result;
+authorized over-budget usage is preserved while the plan fails closed. Caller cancellation
+propagates, even if an injected component catches its own cancellation: planner and
+evaluator calls run in separately owned tasks, late output is never accepted, and unsettled
+cancelled work remains observed until it finishes. Component exception text is never copied into
+diagnostics, truncated routing never calls either component, and zero-candidate routing
+performs no store read or component call. Every result records the application-configured
+planner and evaluator identities and versions; a completed evaluation is cross-bound to
+that evaluator attribution. Final accepted/rejected codes are stamped by the workflow,
+not selected by the evaluator.
+
+The planning workflow revalidates the public routing result into its own snapshot contract
+and rejects more than the hard 50-source bound before any storage read or component
+disclosure. It does not trust caller-supplied router limit fields to establish that bound.
+
+The hermetic performance gate uses the full 50-source bound across in-memory and SQLite
+stores. Its deterministic planner and evaluator make no provider or model calls, report
+zero cost, perform the required three currentness reads per source, and verify that no
+knowledge revision changes. The separate zero-candidate control performs no store read or
+component call:
+
+```bash
+PYTHONPATH=src python scripts/run_knowledge_maintenance_planning_performance.py --check
+```
+
+Results are recorded in
+[`benchmarks/memory/knowledge-maintenance-planning-performance-v1.json`](../benchmarks/memory/knowledge-maintenance-planning-performance-v1.json).
+
 ## Explicit reviewed knowledge curation
 
 `KnowledgeCurator` is the provider-neutral, explicitly invoked path from application

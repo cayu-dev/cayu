@@ -660,6 +660,26 @@ class KnowledgeMaintenanceRoutingResult(_RoutingModel):
 
     @model_validator(mode="after")
     def validate_result(self) -> KnowledgeMaintenanceRoutingResult:
+        if self.signal_count > MAX_KNOWLEDGE_MAINTENANCE_ROUTING_SIGNALS:
+            raise ValueError(
+                f"`signal_count` cannot exceed {MAX_KNOWLEDGE_MAINTENANCE_ROUTING_SIGNALS}."
+            )
+        if self.loaded_reference_count > MAX_KNOWLEDGE_MAINTENANCE_ROUTING_CANDIDATE_READS:
+            raise ValueError(
+                "`loaded_reference_count` cannot exceed "
+                f"{MAX_KNOWLEDGE_MAINTENANCE_ROUTING_CANDIDATE_READS}."
+            )
+        if self.max_candidates > MAX_KNOWLEDGE_MAINTENANCE_SOURCES:
+            raise ValueError(f"`max_candidates` cannot exceed {MAX_KNOWLEDGE_MAINTENANCE_SOURCES}.")
+        if self.max_candidate_bytes > MAX_KNOWLEDGE_MAINTENANCE_ROUTING_BYTES:
+            raise ValueError(
+                f"`max_candidate_bytes` cannot exceed {MAX_KNOWLEDGE_MAINTENANCE_ROUTING_BYTES}."
+            )
+        if self.max_relation_load_bytes > MAX_KNOWLEDGE_MAINTENANCE_ROUTING_BYTES:
+            raise ValueError(
+                "`max_relation_load_bytes` cannot exceed "
+                f"{MAX_KNOWLEDGE_MAINTENANCE_ROUTING_BYTES}."
+            )
         if len(self.candidates) > self.max_candidates:
             raise ValueError("`candidates` cannot exceed `max_candidates`.")
         if self.candidate_payload_bytes > self.max_candidate_bytes:

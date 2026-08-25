@@ -281,6 +281,40 @@ backfill, inferred proposal, legacy interpretation, dual write, or compatibility
 wrapper is included. A provider-free performance gate covers the zero-decision
 path and bounded multi-source applications.
 
+### Maintenance plans are bounded and independently evaluated
+
+Applications can now pass an exact deterministic maintenance-routing snapshot to
+`KnowledgeMaintenancePlanningWorkflow`, inject a strict provider-neutral planner, and
+evaluate its draft through a separately identified component. Cayu checks exact source,
+policy, routing, and configuration bindings; complete source, relation, and evidence
+coverage; directed relation orientation; and replacement-kind policy before semantic
+evaluation. The independent evaluator can record unsupported synthesis, information
+loss, mishandled contradictions, retention or policy violations, and prompt injection as
+bounded content-free findings whose codes come from a closed, kind-bound framework
+vocabulary. Routed and omitted signals must also exactly partition and match the supplied
+request; a result cannot authorize unrelated candidates by copying request fingerprint
+fields.
+
+Sources are storage-reauthorized before planning, after planning, and after evaluation.
+Source advances remain deterministic stale rejections, while unavailable currentness
+checks after planning or evaluation have distinct retryable outcomes instead of being
+misreported as semantic rejection.
+
+Count, byte, concurrency, timeout, model-call, and integer micro-US-dollar cost ceilings
+are explicit, measured over-budget usage remains visible, and results retain separately
+configured planner/evaluator identities and versions. Component calls run in separately
+owned tasks so caller cancellation cannot be consumed, and output observed after a stage
+deadline is discarded. Truncated or empty routing does not call either component.
+Accepted output remains a read-only evaluated draft: this slice cannot persist a pending
+replacement, publish relations, activate knowledge, or archive predecessors.
+
+The workflow independently enforces the hard 50-source ceiling before a storage read,
+even when a caller constructs its own structurally valid routing-result object. Planner
+budgets disclose the configured evidence-count, claim-size, and replacement-size ceilings
+before invocation. Provider model identities are application-authorized per stage; an
+unknown component-reported identity invalidates the output without copying that identity
+into failure diagnostics.
+
 ### Memory interventions have portable, effect-bound evidence contracts
 
 Applications can now declare an explicit `as_declared`, recall-off, omission,

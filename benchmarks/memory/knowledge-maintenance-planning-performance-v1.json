@@ -1,0 +1,101 @@
+{
+  "ceiling_findings": [],
+  "ceilings": {
+    "evaluator_input_bytes_per_candidate": 16384,
+    "memory_bounded_planning_p95_ms": 400.0,
+    "memory_planning_p95_ms_per_candidate": 10.0,
+    "memory_zero_candidate_planning_p95_ms": 5.0,
+    "plan_bytes_per_candidate": 4096,
+    "planner_input_bytes_per_candidate": 8192,
+    "sqlite_bounded_planning_p95_ms": 500.0,
+    "sqlite_planning_p95_ms_per_candidate": 12.0,
+    "sqlite_zero_candidate_planning_p95_ms": 5.0
+  },
+  "control": {
+    "candidate_count": 0,
+    "evaluator_calls": 0,
+    "historical_pre_feature": false,
+    "kind": "current_runtime_zero_candidates",
+    "planner_calls": 0,
+    "store_reads": 0
+  },
+  "environment": {
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "results": [
+    {
+      "backend": "memory",
+      "candidate_count": 50,
+      "cost_micro_usd": 0,
+      "evaluator_calls_per_attempt": 1,
+      "evaluator_input_bytes": 86252,
+      "evaluator_input_bytes_per_candidate": 1725.04,
+      "iteration_count": 30,
+      "knowledge_revision_mutations": 0,
+      "model_calls": 0,
+      "plan_bytes": 23818,
+      "plan_bytes_per_candidate": 476.36,
+      "planner_calls_per_attempt": 1,
+      "planner_input_bytes": 62259,
+      "planner_input_bytes_per_candidate": 1245.18,
+      "planning_latency": {
+        "p50_ms": 139.16377,
+        "p95_ms": 172.592625
+      },
+      "planning_latency_per_candidate": {
+        "p50_ms": 2.783275,
+        "p95_ms": 3.451852
+      },
+      "provider_calls": 0,
+      "source_revalidation_reads_per_attempt": 150,
+      "zero_candidate_planning_latency": {
+        "p50_ms": 0.513146,
+        "p95_ms": 0.575166
+      }
+    },
+    {
+      "backend": "sqlite",
+      "candidate_count": 50,
+      "cost_micro_usd": 0,
+      "evaluator_calls_per_attempt": 1,
+      "evaluator_input_bytes": 86252,
+      "evaluator_input_bytes_per_candidate": 1725.04,
+      "iteration_count": 30,
+      "knowledge_revision_mutations": 0,
+      "model_calls": 0,
+      "plan_bytes": 23818,
+      "plan_bytes_per_candidate": 476.36,
+      "planner_calls_per_attempt": 1,
+      "planner_input_bytes": 62259,
+      "planner_input_bytes_per_candidate": 1245.18,
+      "planning_latency": {
+        "p50_ms": 160.15475,
+        "p95_ms": 192.138834
+      },
+      "planning_latency_per_candidate": {
+        "p50_ms": 3.203095,
+        "p95_ms": 3.842777
+      },
+      "provider_calls": 0,
+      "source_revalidation_reads_per_attempt": 150,
+      "zero_candidate_planning_latency": {
+        "p50_ms": 0.510667,
+        "p95_ms": 0.553667
+      }
+    }
+  ],
+  "schema_version": "cayu.knowledge_maintenance_planning_performance.v1",
+  "within_ceilings": true,
+  "workload": {
+    "candidate_count": 50,
+    "cost_micro_usd": 0,
+    "evaluator_calls_per_attempt": 1,
+    "iterations": 30,
+    "model_calls": 0,
+    "planner_calls_per_attempt": 1,
+    "provider_calls": 0,
+    "source_revalidations_per_attempt": 3,
+    "store_writes_during_planning": 0
+  }
+}
