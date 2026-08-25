@@ -284,9 +284,11 @@ from cayu.runtime.request_footprints import (
     RequestFootprintConfig,
     RequestVariant,
     TargetedToolGrantFootprint,
+    ToolDiscoveryViewFootprint,
     analyze_request_context_pressure,
     analyze_request_footprint,
     copy_request_footprint_config,
+    tool_discovery_view_footprint,
 )
 from cayu.runtime.retry_policy import (
     RetryDecision,
@@ -331,7 +333,13 @@ from cayu.runtime.targeted_tool_projection import (
     resolve_targeted_tool_projection,
 )
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
-from cayu.runtime.tool_discovery import ToolDiscoveryMode, search_tools_spec
+from cayu.runtime.tool_discovery import (
+    TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+    ToolDiscoveryMode,
+    current_tool_discovery_view,
+    search_tools_spec,
+    tool_discovery_generation_id,
+)
 from cayu.runtime.tool_exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
     TOOL_EXPOSURE_PROFILE_ID_MAX_CHARS,
@@ -4639,6 +4647,27 @@ class ModelStepExecutor:
                 raise ValueError(
                     "Tool exposure evidence does not match the frozen model request authority."
                 )
+        discovery_view_footprint: ToolDiscoveryViewFootprint | None = None
+        if (
+            self._request_footprint.enabled
+            and registered_agent.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS
+        ):
+            capability_ceiling = tool_capability_ceiling_from_session_metadata(session.metadata)
+            discovery_view = current_tool_discovery_view(
+                await self._session_store.load_session_operation(
+                    session.id,
+                    TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+                ),
+                session_id=session.id,
+                generation_id=tool_discovery_generation_id(
+                    session_id=session.id,
+                    root_invocation_id=session.invocation.root_invocation_id,
+                ),
+                agent_name=registered_agent.spec.name,
+                catalogue=registered_agent.tool_catalogue,
+                ceiling=capability_ceiling,
+            )
+            discovery_view_footprint = tool_discovery_view_footprint(discovery_view)
         provider.preflight_model_target(model=model_request.model)
         provider.preflight_hosted_tools(
             model=model_request.model,
@@ -4729,6 +4758,7 @@ class ModelStepExecutor:
                 execution_profile=execution_profile,
                 tool_exposure=tool_exposure_evidence,
                 targeted_tool_grants=targeted_tool_grants,
+                tool_discovery_view=discovery_view_footprint,
             )
             if request_footprint_event is not None:
                 yield request_footprint_event, None
@@ -5031,6 +5061,7 @@ class ModelStepExecutor:
         execution_profile: ExecutionProfileIdentity | None,
         tool_exposure: ToolExposure | None,
         targeted_tool_grants: TargetedToolGrantFootprint | None,
+        tool_discovery_view: ToolDiscoveryViewFootprint | None,
     ) -> tuple[RequestFootprint | None, Event | None]:
         if not self._request_footprint.enabled:
             return None, None
@@ -5060,6 +5091,7 @@ class ModelStepExecutor:
             ),
             tool_exposure=tool_exposure,
             targeted_tool_grants=targeted_tool_grants,
+            tool_discovery_view=tool_discovery_view,
         )
         footprint_event = Event(
             type=EventType.REQUEST_FOOTPRINT_RECORDED,

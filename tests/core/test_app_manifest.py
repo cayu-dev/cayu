@@ -313,7 +313,7 @@ def test_request_footprint_config_is_safely_manifested_and_fingerprinted() -> No
         "enabled": True,
         "fingerprint_key_id": "manifest-key",
         "fingerprinting_enabled": True,
-        "footprint_schema_version": 5,
+        "footprint_schema_version": 6,
         "canonicalization_version": 1,
     }
     assert disabled.runtime.request_footprint.enabled is False
@@ -769,7 +769,7 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
                         "enabled": True,
                         "fingerprint_key_id": None,
                         "fingerprinting_enabled": False,
-                        "footprint_schema_version": 5,
+                        "footprint_schema_version": 6,
                         "canonicalization_version": 1,
                     },
                     "max_file_attachment_bytes": 1,

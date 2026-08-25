@@ -340,6 +340,77 @@ def test_request_footprint_tool_exposure_requires_and_retains_runtime_provenance
     )
 
 
+@pytest.mark.parametrize(
+    ("schema_version", "targeted_tool_grants"),
+    [
+        (
+            3,
+            {
+                "schema_version": 2,
+                "projection": "call_tool",
+                "generation_id": f"sha256:{'d' * 64}",
+                "catalogue_revision": f"sha256:{'c' * 64}",
+                "grant_count": 1,
+                "grant_ids": [f"sha256:{'e' * 64}"],
+                "tool_ids": ["cayu:remember"],
+                "max_calls": 2,
+                "used_calls": 1,
+                "remaining_calls": 1,
+                "direct_tool_prefix_changed": False,
+            },
+        ),
+        (4, None),
+        (5, None),
+    ],
+)
+def test_malformed_request_footprint_downgrade_removes_all_tool_evidence(
+    schema_version: int,
+    targeted_tool_grants: dict[str, object] | None,
+) -> None:
+    forged = Event(
+        type=EventType.REQUEST_FOOTPRINT_RECORDED,
+        session_id="malformed-request-footprint-tools",
+        payload={
+            "schema_version": schema_version,
+            "execution_profile_fingerprint": "a" * 64,
+            "tool_exposure": {
+                "profile_id": "public-phase",
+                "exposure_fingerprint": "b" * 64,
+                "registered_count": 2,
+                "ceiling_count": 1,
+                "exposed_count": 1,
+                "profile_changed": False,
+            },
+            "targeted_tool_grants": targeted_tool_grants,
+            "tool_discovery_view": {
+                "generation_id": f"sha256:{'1' * 64}",
+                "revision": 1,
+                "catalogue_revision": f"sha256:{'2' * 64}",
+                "ceiling_fingerprint": f"sha256:{'3' * 64}",
+                "grant_count": 1,
+            },
+        },
+    )
+
+    projected = project_runtime_event(
+        forged,
+        sequence=1,
+        redactor=SecretRedactor(),
+    )
+
+    assert projected.payload["execution_profile_fingerprint"] == PRIVATE_EVENT_AUTHORITY
+    assert (
+        not {
+            "tool_exposure",
+            "targeted_tool_grants",
+            "targeted_native_item_active",
+            "targeted_native_item_message_index",
+            "tool_discovery_view",
+        }
+        & projected.payload.keys()
+    )
+
+
 def test_runtime_exposure_digest_survives_an_exact_workload_secret_collision() -> None:
     exposure_fingerprint = "b" * 64
     catalogue_revision = f"sha256:{'c' * 64}"

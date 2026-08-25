@@ -27,6 +27,7 @@ from cayu import (
     RequestVariant,
     StructuredOutputSpec,
     TargetedToolGrantFootprint,
+    ToolDiscoveryViewFootprint,
     ToolExposure,
     build_prompt_contribution_manifest,
     build_request_footprint,
@@ -158,7 +159,7 @@ def _build(
     )
 
 
-@pytest.mark.parametrize("invalid_version", [True, 1.0, "1", 6])
+@pytest.mark.parametrize("invalid_version", [True, 1.0, "1", 7])
 def test_request_footprint_versions_require_supported_exact_integers(
     invalid_version: object,
 ) -> None:
@@ -166,7 +167,7 @@ def test_request_footprint_versions_require_supported_exact_integers(
     footprint_payload["schema_version"] = invalid_version
     with pytest.raises(
         ValidationError,
-        match="schema_version must be integer 1, 2, 3, 4, or 5",
+        match="schema_version must be integer 1, 2, 3, 4, 5, or 6",
     ):
         RequestFootprint.model_validate(footprint_payload)
 
@@ -552,6 +553,99 @@ def test_targeted_grant_footprint_rejects_unbounded_iterators_before_consuming()
             max_calls=1,
             used_calls=0,
             remaining_calls=1,
+        )
+
+
+def test_discovery_view_footprint_tracks_authority_without_changing_provider_prefix() -> None:
+    execution_profile_fingerprint = "a" * 64
+    exposure = ToolExposure(
+        execution_profile_fingerprint=execution_profile_fingerprint,
+        profile_id=TOOL_DISCOVERY_ONLY_PROFILE_ID,
+        catalogue_revision=_CATALOGUE_REVISION,
+        exposure_fingerprint="b" * 64,
+        registered_count=100,
+        ceiling_count=100,
+        exposed_count=0,
+        profile_changed=False,
+        step=1,
+        provider_name="provider-a",
+        model="model-a",
+        model_step_id="mstep_00000000000000000000000000000001",
+    )
+    request = _request().model_copy(
+        update={"tools": [search_tools_spec(), call_tool_spec()]},
+        deep=True,
+    )
+    config = RequestFootprintConfig(
+        fingerprint_key_id="discovery-view-key",
+        fingerprint_key=SecretStr("d" * 32),
+    )
+    common = {
+        "provider_name": "provider-a",
+        "step": 1,
+        "attempt": 1,
+        "max_attempts": 1,
+        "request_variant": RequestVariant.INITIAL,
+        "model_step_id": exposure.model_step_id,
+        "model_attempt_id": "matt_00000000000000000000000000000001",
+        "config": config,
+        "execution_profile_fingerprint": execution_profile_fingerprint,
+        "tool_exposure": exposure,
+    }
+    baseline = build_request_footprint(
+        request,
+        observation_id="discovery-baseline",
+        **common,
+    )
+    discovered = build_request_footprint(
+        request,
+        observation_id="discovery-current",
+        tool_discovery_view=ToolDiscoveryViewFootprint(
+            generation_id=f"sha256:{'d' * 64}",
+            revision=1,
+            catalogue_revision=_CATALOGUE_REVISION,
+            ceiling_fingerprint=f"sha256:{'e' * 64}",
+            grant_count=1,
+        ),
+        **common,
+    )
+
+    assert baseline.schema_version == 3
+    assert discovered.schema_version == 6
+    assert discovered.tool_discovery_view is not None
+    assert discovered.tool_discovery_view.grant_count == 1
+    assert discovered.tools == baseline.tools
+    assert discovered.fingerprints.tool_manifest == baseline.fingerprints.tool_manifest
+    assert discovered.cache_breakpoints == baseline.cache_breakpoints
+    serialized = discovered.model_dump_json()
+    assert "tool_ref" not in serialized
+    assert "input_schema" not in serialized
+    assert "origin_query" not in serialized
+
+    missing_view = discovered.model_dump(mode="python")
+    missing_view["tool_discovery_view"] = None
+    with pytest.raises(ValidationError, match="schema v6 requires tool exposure and discovery"):
+        RequestFootprint.model_validate(missing_view)
+    with pytest.raises(ValidationError, match="zero exactly when grant_count is zero"):
+        ToolDiscoveryViewFootprint(
+            generation_id=f"sha256:{'d' * 64}",
+            revision=0,
+            catalogue_revision=_CATALOGUE_REVISION,
+            ceiling_fingerprint=f"sha256:{'e' * 64}",
+            grant_count=1,
+        )
+    with pytest.raises(ValueError, match="must match tool_exposure authority"):
+        build_request_footprint(
+            request,
+            observation_id="discovery-mismatched-catalogue",
+            tool_discovery_view=ToolDiscoveryViewFootprint(
+                generation_id=f"sha256:{'d' * 64}",
+                revision=1,
+                catalogue_revision=f"sha256:{'f' * 64}",
+                ceiling_fingerprint=f"sha256:{'e' * 64}",
+                grant_count=1,
+            ),
+            **common,
         )
 
 

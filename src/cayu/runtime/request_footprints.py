@@ -62,8 +62,13 @@ from cayu.runtime.tool_catalogue import (
     CALL_TOOL_NAME,
     SEARCH_TOOLS_NAME,
     validate_canonical_tool_id,
+    validate_tool_catalogue_revision,
 )
-from cayu.runtime.tool_discovery import search_tools_spec
+from cayu.runtime.tool_discovery import (
+    TOOL_DISCOVERY_MAX_GRANTS,
+    ToolDiscoveryViewState,
+    search_tools_spec,
+)
 from cayu.runtime.tool_exposure import (
     TOOL_EXPOSURE_MAX_REGISTERED_TOOLS,
     TOOL_EXPOSURE_PROFILE_ID_MAX_CHARS,
@@ -77,7 +82,7 @@ from cayu.runtime.tool_grants import (
     copy_targeted_tool_grant_record,
 )
 
-REQUEST_FOOTPRINT_SCHEMA_VERSION = 5
+REQUEST_FOOTPRINT_SCHEMA_VERSION = 6
 PROMPT_CONTRIBUTION_MANIFEST_SCHEMA_VERSION = 1
 REQUEST_FOOTPRINT_CANONICALIZATION_VERSION = 1
 _HMAC_CONTEXT = b"cayu.request-footprint"
@@ -302,6 +307,46 @@ class ToolExposureFootprint(BaseModel):
         if self.exposed_count > self.ceiling_count:
             raise ValueError("exposed_count cannot exceed ceiling_count.")
         return self
+
+
+class ToolDiscoveryViewFootprint(BaseModel):
+    """Content-free authority summary for one current discovery view."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    generation_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    revision: StrictInt = Field(ge=0, le=TOOL_DISCOVERY_MAX_GRANTS)
+    catalogue_revision: str
+    ceiling_fingerprint: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    grant_count: StrictInt = Field(ge=0, le=TOOL_DISCOVERY_MAX_GRANTS)
+
+    @field_validator("catalogue_revision")
+    @classmethod
+    def validate_catalogue_revision(cls, value: str) -> str:
+        return validate_tool_catalogue_revision(value)
+
+    @model_validator(mode="after")
+    def validate_revision(self) -> ToolDiscoveryViewFootprint:
+        if (self.revision == 0) != (self.grant_count == 0):
+            raise ValueError("Discovery revision must be zero exactly when grant_count is zero.")
+        return self
+
+
+def tool_discovery_view_footprint(
+    state: ToolDiscoveryViewState,
+) -> ToolDiscoveryViewFootprint:
+    """Project durable discovery state without refs, schemas, or query evidence."""
+
+    if type(state) is not ToolDiscoveryViewState:
+        raise TypeError("state must be a ToolDiscoveryViewState.")
+    state = ToolDiscoveryViewState.model_validate(state.model_dump(mode="python"))
+    return ToolDiscoveryViewFootprint(
+        generation_id=state.generation_id,
+        revision=state.revision,
+        catalogue_revision=state.catalogue_revision,
+        ceiling_fingerprint=state.ceiling_fingerprint,
+        grant_count=len(state.grants),
+    )
 
 
 class RequestComponentTokenEstimates(BaseModel):
@@ -628,12 +673,13 @@ class RequestFootprint(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    schema_version: Literal[1, 2, 3, 4, 5]
+    schema_version: Literal[1, 2, 3, 4, 5, 6]
     execution_profile_fingerprint: str | None = None
     tool_exposure: ToolExposureFootprint | None = None
     targeted_tool_grants: TargetedToolGrantFootprint | None = None
     targeted_native_item_active: StrictBool | None = None
     targeted_native_item_message_index: StrictInt | None = Field(default=None, ge=0)
+    tool_discovery_view: ToolDiscoveryViewFootprint | None = None
     observation_id: str
     provider_name: str
     model: str
@@ -665,9 +711,12 @@ class RequestFootprint(BaseModel):
             2,
             3,
             4,
+            5,
             REQUEST_FOOTPRINT_SCHEMA_VERSION,
         ):
-            raise ValueError("Request footprint schema_version must be integer 1, 2, 3, 4, or 5.")
+            raise ValueError(
+                "Request footprint schema_version must be integer 1, 2, 3, 4, 5, or 6."
+            )
         return value
 
     @field_validator("execution_profile_fingerprint")
@@ -722,6 +771,7 @@ class RequestFootprint(BaseModel):
             self.execution_profile_fingerprint is not None
             or self.tool_exposure is not None
             or self.targeted_tool_grants is not None
+            or self.tool_discovery_view is not None
         ):
             raise ValueError(
                 "Request footprint schema v1 cannot carry an execution profile or tool exposure."
@@ -745,13 +795,19 @@ class RequestFootprint(BaseModel):
             or self.targeted_native_item_message_index is not None
         ):
             raise ValueError("Request footprint schema v1-v4 cannot carry native item evidence.")
-        if self.schema_version == 5:
+        if self.schema_version < 6 and self.tool_discovery_view is not None:
+            raise ValueError("Request footprint schema v1-v5 cannot carry a discovery view.")
+        if self.schema_version == 6 and (
+            self.tool_exposure is None or self.tool_discovery_view is None
+        ):
+            raise ValueError("Request footprint schema v6 requires tool exposure and discovery.")
+        if self.schema_version in (5, 6) and self.targeted_tool_grants is not None:
             if self.tool_exposure is None or self.targeted_tool_grants is None:
                 raise ValueError(
-                    "Request footprint schema v5 requires tool exposure and targeted grants."
+                    "A targeted request footprint requires tool exposure and targeted grants."
                 )
             if self.targeted_native_item_active is None:
-                raise ValueError("Request footprint schema v5 requires native item state.")
+                raise ValueError("A targeted request footprint requires native item state.")
             is_native = (
                 self.targeted_tool_grants.projection
                 is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS
@@ -764,6 +820,17 @@ class RequestFootprint(BaseModel):
                 self.targeted_native_item_active
             ):
                 raise ValueError("An active native item requires exactly one insertion position.")
+        if self.schema_version == 5 and self.targeted_tool_grants is None:
+            raise ValueError("Request footprint schema v5 requires targeted grants.")
+        if (
+            self.schema_version == 6
+            and self.targeted_tool_grants is None
+            and (
+                self.targeted_native_item_active is not None
+                or self.targeted_native_item_message_index is not None
+            )
+        ):
+            raise ValueError("A discovery-only footprint cannot carry native item evidence.")
         if self.attempt > self.max_attempts:
             raise ValueError("attempt cannot exceed max_attempts.")
         if (self.operation_id is None) != (self.attempt_id is None):
@@ -814,6 +881,7 @@ def analyze_request_footprint(
     execution_profile_fingerprint: str | None = None,
     tool_exposure: ToolExposure | None = None,
     targeted_tool_grants: TargetedToolGrantFootprint | None = None,
+    tool_discovery_view: ToolDiscoveryViewFootprint | None = None,
 ) -> RequestFootprint:
     """Analyze one detached request with the provider's effective cache policy."""
 
@@ -858,6 +926,7 @@ def analyze_request_footprint(
         execution_profile_fingerprint=execution_profile_fingerprint,
         tool_exposure=tool_exposure,
         targeted_tool_grants=targeted_tool_grants,
+        tool_discovery_view=tool_discovery_view,
     )
 
 
@@ -922,6 +991,7 @@ def build_request_footprint(
     execution_profile_fingerprint: str | None = None,
     tool_exposure: ToolExposure | None = None,
     targeted_tool_grants: TargetedToolGrantFootprint | None = None,
+    tool_discovery_view: ToolDiscoveryViewFootprint | None = None,
 ) -> RequestFootprint:
     """Analyze one final provider-neutral request without retaining its content."""
 
@@ -1001,6 +1071,18 @@ def build_request_footprint(
         )
         if tool_exposure is None:
             raise ValueError("targeted_tool_grants requires tool_exposure evidence.")
+    if tool_discovery_view is not None:
+        if type(tool_discovery_view) is not ToolDiscoveryViewFootprint:
+            raise TypeError("tool_discovery_view must be a ToolDiscoveryViewFootprint or None.")
+        tool_discovery_view = ToolDiscoveryViewFootprint.model_validate(
+            tool_discovery_view.model_dump(mode="python")
+        )
+        if tool_exposure is None:
+            raise ValueError("tool_discovery_view requires tool_exposure evidence.")
+        if tool_discovery_view.catalogue_revision != tool_exposure.catalogue_revision:
+            raise ValueError(
+                "tool_discovery_view catalogue_revision must match tool_exposure authority."
+            )
 
     targeted_native_item_active: bool | None = None
     targeted_native_item_message_index: int | None = None
@@ -1283,11 +1365,15 @@ def build_request_footprint(
     return RequestFootprint(
         schema_version=(
             REQUEST_FOOTPRINT_SCHEMA_VERSION
-            if targeted_tool_grants is not None
+            if tool_discovery_view is not None
             else (
-                3
-                if tool_exposure is not None
-                else (2 if execution_profile_fingerprint is not None else 1)
+                5
+                if targeted_tool_grants is not None
+                else (
+                    3
+                    if tool_exposure is not None
+                    else (2 if execution_profile_fingerprint is not None else 1)
+                )
             )
         ),
         execution_profile_fingerprint=execution_profile_fingerprint,
@@ -1306,6 +1392,7 @@ def build_request_footprint(
         targeted_tool_grants=targeted_tool_grants,
         targeted_native_item_active=targeted_native_item_active,
         targeted_native_item_message_index=targeted_native_item_message_index,
+        tool_discovery_view=tool_discovery_view,
         observation_id=observation_id,
         provider_name=provider_name,
         model=model_request.model,
