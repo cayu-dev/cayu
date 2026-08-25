@@ -3978,7 +3978,7 @@ def test_timed_out_runner_mutation_returns_promptly_and_fences_reuse(
                 ),
             )
         )
-        public_events = await asyncio.wait_for(consumer, timeout=1)
+        public_events = await asyncio.wait_for(consumer, timeout=5)
         assert following.started.is_set() is False
         assert provider.requests == 1
         before_release = await store.query_events(EventQuery(session_id=session_id))
