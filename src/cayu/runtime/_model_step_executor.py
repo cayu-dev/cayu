@@ -130,6 +130,7 @@ from cayu.providers import (
 )
 from cayu.providers._credential_boundary import aclosing_provider_stream
 from cayu.providers.base import (
+    CALL_TOOL_CORE_CALLABLE_OPTION,
     TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
     TargetedToolProjectionRequest,
     copy_model_completion,
@@ -330,6 +331,7 @@ from cayu.runtime.targeted_tool_projection import (
     resolve_targeted_tool_projection,
 )
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
+from cayu.runtime.tool_discovery import ToolDiscoveryMode, search_tools_spec
 from cayu.runtime.tool_exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
     TOOL_EXPOSURE_PROFILE_ID_MAX_CHARS,
@@ -4322,6 +4324,7 @@ class ModelStepExecutor:
             tool_exposure=resolved_tool_exposure,
             structured_output=structured_output,
             targeted_tool_projection=targeted_tool_projection_kind,
+            tool_discovery_mode=registered_agent.tool_discovery_mode,
         )
         if targeted_tool_gateway is not None and (
             targeted_tool_projection_kind is not TargetedToolProjectionKind.CALL_TOOL
@@ -4390,6 +4393,8 @@ class ModelStepExecutor:
             request_options["thinking"] = thinking_payload
         if targeted_tool_projection_kind is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS:
             request_options[TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION] = CALL_TOOL_NAME
+            if registered_agent.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS:
+                request_options[CALL_TOOL_CORE_CALLABLE_OPTION] = True
         redacted_messages = [
             redact_runtime_message_for_boundary(
                 message,
@@ -10427,6 +10432,7 @@ def _model_request_tools(
     tool_exposure: ResolvedToolExposure,
     structured_output: StructuredOutputSpec | None,
     targeted_tool_projection: TargetedToolProjectionKind | None = None,
+    tool_discovery_mode: ToolDiscoveryMode | None = None,
 ) -> list[dict[str, Any]]:
     """Build detached tool declarations shared by preflight and model dispatch."""
 
@@ -10435,14 +10441,22 @@ def _model_request_tools(
     ):
         raise TypeError("targeted_tool_projection must be a TargetedToolProjectionKind or None.")
 
-    tools = [
-        {
-            "name": tool.name,
-            "description": tool.description,
-            "input_schema": tool.input_schema_copy(),
-        }
-        for tool in tool_exposure.tools
-    ]
+    if tool_discovery_mode is not None and type(tool_discovery_mode) is not ToolDiscoveryMode:
+        raise TypeError("tool_discovery_mode must be a ToolDiscoveryMode or None.")
+
+    tools: list[dict[str, Any]] = []
+    if tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS:
+        tools.extend((search_tools_spec(), call_tool_spec()))
+    tools.extend(
+        [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema_copy(),
+            }
+            for tool in tool_exposure.tools
+        ]
+    )
     if (
         structured_output is not None
         and structured_output.strategy == StructuredOutputStrategy.TOOL
@@ -10451,7 +10465,7 @@ def _model_request_tools(
     if targeted_tool_projection in {
         TargetedToolProjectionKind.CALL_TOOL,
         TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS,
-    }:
+    } and not any(tool.get("name") == CALL_TOOL_NAME for tool in tools):
         tools.append(call_tool_spec())
     return tools
 
@@ -10560,6 +10574,7 @@ def _context_pressure_overhead(
         tool_exposure=tool_exposure,
         structured_output=structured_output,
         targeted_tool_projection=targeted_tool_projection_kind,
+        tool_discovery_mode=registered_agent.tool_discovery_mode,
     )
     if targeted_tool_native is not None:
         tools.extend(copy_json_value(list(targeted_tool_native.tools), "targeted tools"))

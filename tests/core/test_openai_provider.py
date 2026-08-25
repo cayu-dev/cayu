@@ -61,6 +61,7 @@ from cayu.providers import (
 from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS
 from cayu.providers._sse import aiter_sse_json_events
 from cayu.providers.base import (
+    CALL_TOOL_CORE_CALLABLE_OPTION,
     OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
     TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
     TARGETED_TOOL_PROJECTION_MARKER_TYPE,
@@ -69,6 +70,7 @@ from cayu.providers.base import (
 from cayu.providers.openai import openai_stream_events
 from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
+from cayu.runtime.tool_discovery import search_tools_spec
 from cayu.runtime.tool_gateway import call_tool_spec
 
 
@@ -5314,6 +5316,32 @@ def test_openai_native_callability_excludes_only_the_cache_anchor() -> None:
         "tools": [
             {"type": "function", "name": "inspect"},
             {"type": "web_search"},
+            {"type": "function", "name": "remember"},
+        ],
+    }
+
+
+def test_openai_native_targeting_keeps_discovery_gateway_callable() -> None:
+    marker, projection = _targeted_projection_fixture()
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "find or remember"), marker],
+        tools=[search_tools_spec(), call_tool_spec()],
+        targeted_tool_projection=projection,
+        options={
+            TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION: CALL_TOOL_NAME,
+            CALL_TOOL_CORE_CALLABLE_OPTION: True,
+        },
+    )
+
+    payload = build_openai_payload(request)
+
+    assert payload["tool_choice"] == {
+        "type": "allowed_tools",
+        "mode": "auto",
+        "tools": [
+            {"type": "function", "name": "search_tools"},
+            {"type": "function", "name": CALL_TOOL_NAME},
             {"type": "function", "name": "remember"},
         ],
     }

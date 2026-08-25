@@ -754,6 +754,13 @@ from cayu.runtime.tool_catalogue import (
     tool_catalogue_descriptors_within_ceiling,
     validate_application_tool_name,
 )
+from cayu.runtime.tool_discovery import (
+    ToolDiscoveryGrantRecord,
+    ToolDiscoveryMode,
+    ToolDiscoverySearchMatch,
+    ToolDiscoverySearchResult,
+    ToolDiscoveryViewState,
+)
 from cayu.runtime.tool_exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
     TOOL_CAPABILITY_CEILING_SCHEMA_VERSION,
@@ -1567,6 +1574,11 @@ __all__ = [
     "ToolCatalogSnapshot",
     "ToolDescriptor",
     "ToolDescriptorProvenance",
+    "ToolDiscoveryGrantRecord",
+    "ToolDiscoveryMode",
+    "ToolDiscoverySearchMatch",
+    "ToolDiscoverySearchResult",
+    "ToolDiscoveryViewState",
     "ToolExposure",
     "ToolExposureDecision",
     "ToolExposureFootprint",

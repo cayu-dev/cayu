@@ -4931,7 +4931,8 @@ class RecoveryCoordinator:
             ) or any(
                 registered is not None and registered.workspace_mutation
                 for registered in (
-                    registered_agent.tools.get(tool_call.name) for tool_call in round_tool_calls
+                    registered_agent.executable_tool(tool_call.name)
+                    for tool_call in round_tool_calls
                 )
             )
             publication_coordinator = (
@@ -5080,7 +5081,7 @@ class RecoveryCoordinator:
                     continue
 
                 pending_call = pending_by_id[tool_call.id]
-                registered_tool = registered_agent.tools.get(tool_call.name)
+                registered_tool = registered_agent.executable_tool(tool_call.name)
                 policy_evidence = approval_support.effective_tool_policy_evidence(pending_call)
                 policy_result = approval_support.policy_result_from_pending_tool_call(pending_call)
                 if tool_call.id == pending.tool_call_id:
@@ -6250,7 +6251,8 @@ class RecoveryCoordinator:
             ) or any(
                 registered is not None and registered.workspace_mutation
                 for registered in (
-                    registered_agent.tools.get(tool_call.name) for tool_call in round_tool_calls
+                    registered_agent.executable_tool(tool_call.name)
+                    for tool_call in round_tool_calls
                 )
             )
             publication_coordinator = (
@@ -6372,7 +6374,7 @@ class RecoveryCoordinator:
                 round_tool_calls,
                 strict=True,
             ):
-                registered_tool = registered_agent.tools.get(tool_call.name)
+                registered_tool = registered_agent.executable_tool(tool_call.name)
                 policy_result = approval_support.policy_result_from_pending_tool_call(
                     pending_tool_call
                 )
@@ -10024,7 +10026,7 @@ class RecoveryCoordinator:
             yield targeted_resolution_event
         if targeted_resolution_events:
             checkpoint = await self._session_store.load_checkpoint(session.id)
-        registered_tool_names = frozenset(registered_agent.tools)
+        registered_tool_names = registered_agent.executable_tool_names
         durable_policy_decisions = frozenset(decision.value for decision in ToolPolicyDecision)
         ambiguous_interrupt_close_intent = (
             session.status == SessionStatus.INTERRUPTING
@@ -10256,7 +10258,7 @@ class RecoveryCoordinator:
                         "Unexposed recovered tool call lost its frozen exposure snapshot."
                     )
                 if (
-                    tool_call.name not in registered_agent.tools
+                    tool_call.name not in registered_agent.executable_tool_names
                     or tool_call.name in exposure.tool_names
                 ):
                     raise RuntimeError(
@@ -10286,7 +10288,7 @@ class RecoveryCoordinator:
                 idempotency_key=expected_idempotency_key,
                 fallback=tool_call.arguments,
             )
-            registered_tool = registered_agent.tools.get(pending_tool_call.tool_name)
+            registered_tool = registered_agent.executable_tool(pending_tool_call.tool_name)
             result: ToolResult | None = None
             if registered_tool is not None and registered_tool.durable_tool_recovery is not None:
 

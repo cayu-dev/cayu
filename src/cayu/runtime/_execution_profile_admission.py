@@ -35,6 +35,7 @@ from cayu.runtime.targeted_tool_projection import (
     TargetedToolProjectionKind,
     resolve_targeted_tool_projection,
 )
+from cayu.runtime.tool_discovery import tool_discovery_execution_profile_material
 from cayu.runtime.tool_gateway import call_tool_gateway_execution_profile_material
 from cayu.runtime.user_input import pending_user_input_from_checkpoint
 from cayu.vaults import SecretRedactor
@@ -528,12 +529,25 @@ def resolve_execution_profile_identity(
                         **call_tool_gateway_execution_profile_material(),
                         "callable": (
                             targeted_tool_projection is TargetedToolProjectionKind.CALL_TOOL
+                            or registered_agent.tool_discovery_mode is not None
                         ),
                     }
                 }
                 if targeted_tool_projection is not None
                 else {}
             ),
+        }
+    )
+    tool_discovery_material = (
+        None
+        if registered_agent.tool_discovery_mode is None
+        else {
+            **tool_discovery_execution_profile_material(),
+            "configured_mode": registered_agent.tool_discovery_mode.value,
+            "call_tool_core": {
+                **call_tool_gateway_execution_profile_material(),
+                "callable": True,
+            },
         }
     )
     return build_execution_profile_identity(
@@ -560,6 +574,11 @@ def resolve_execution_profile_identity(
                 {}
                 if targeted_tool_delivery_material is None
                 else {"targeted_tool_delivery": targeted_tool_delivery_material}
+            ),
+            **(
+                {}
+                if tool_discovery_material is None
+                else {"tool_discovery": tool_discovery_material}
             ),
             **(
                 {}

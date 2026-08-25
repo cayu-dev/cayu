@@ -89,6 +89,33 @@ guard.
 
 ## Unreleased
 
+### Agents can discover large registered tool catalogues through a stable core
+
+Agents may opt into provider-neutral discovery with
+`tool_discovery_mode="search_tools"`. Cayu then sends one stable two-definition
+prefix—`search_tools` and `call_tool`—while keeping the application catalogue
+out of the provider's top-level tool array by default. Existing agents retain
+their current expose-all request shape. Applications may combine discovery with
+an explicit exposure policy for a small directly callable core.
+
+Search is local, model-free, deterministic, and bounded. It considers only
+canonical descriptors inside the session's durable capability ceiling, omits
+the current direct exposure, and matches normalized name, canonical-id,
+description, and input-property terms. Results carry bounded descriptions,
+exact admitted schemas, descriptor/schema fingerprints, readiness, and opaque
+references. The typed view reuses a reference for an unchanged descriptor,
+survives ordinary resume, and is not copied to a fork.
+
+`call_tool` resolves a discovery reference to the effective registered tool and
+validates its inner arguments before the ordinary policy, approval, hooks,
+effects, secrets, environment, idempotency, execution, result, and recovery
+path. Search schemas and references remain in the private model transcript;
+public completion events retain only count, view revision, and truncation
+evidence. The same two-schema prefix is used by context-pressure accounting and
+all provider adapters. In OpenAI native-targeting mode, runtime-owned
+`allowed_tools` keeps both discovery functions callable without changing the
+cache anchor.
+
 ### Fixed memory interventions have an exact durable execution boundary
 
 Applications can now submit one frozen `MemoryInterventionTrialRequest` to

@@ -50,7 +50,7 @@ from cayu.runtime.structured_output import (
     StructuredOutputValidation,
     copy_structured_output_spec,
 )
-from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
+from cayu.runtime.tool_catalogue import CALL_TOOL_NAME, SEARCH_TOOLS_NAME
 from cayu.runtime.tool_exposure import (
     ResolvedToolExposureAuthority,
     copy_resolved_tool_exposure_authority,
@@ -342,7 +342,7 @@ class PendingToolRound(BaseModel):
         if unexposed_calls and self.tool_exposure is None:
             raise ValueError("Unexposed tool calls require a frozen exposure snapshot.")
         if self.tool_exposure is not None:
-            exposed_names = frozenset(self.tool_exposure.tool_names)
+            exposed_names = frozenset((*self.tool_exposure.tool_names, SEARCH_TOOLS_NAME))
             if any(call.tool_name in exposed_names for call in unexposed_calls):
                 raise ValueError("Unexposed tool-call evidence conflicts with the snapshot.")
             if self.policy_state == "planned" and any(

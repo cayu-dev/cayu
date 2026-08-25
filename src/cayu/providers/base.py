@@ -81,6 +81,7 @@ _DEFAULT_FINGERPRINT_RUNTIME_OPTION_KEYS = frozenset(
         "step",
         "structured_output",
         "targeted_tool_native_cache_anchor",
+        "call_tool_core_callable",
         "thinking",
     }
 )
@@ -88,6 +89,16 @@ _DEFAULT_FINGERPRINT_RUNTIME_OPTION_KEYS = frozenset(
 OPENAI_ADDITIONAL_TOOLS_PROTOCOL = "openai.additional_tools.v1"
 TARGETED_TOOL_PROJECTION_MARKER_TYPE = "cayu.targeted-tool-projection-marker"
 TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION = "targeted_tool_native_cache_anchor"
+CALL_TOOL_CORE_CALLABLE_OPTION = "call_tool_core_callable"
+
+
+def call_tool_core_callable(options: Mapping[str, Any]) -> bool:
+    """Return whether the stable call_tool definition is executable in this request."""
+
+    value = options.get(CALL_TOOL_CORE_CALLABLE_OPTION, False)
+    if type(value) is not bool:
+        raise ValueError("The call_tool core callability marker must be a bool.")
+    return value
 
 
 def targeted_tool_native_cache_anchor_name(options: Mapping[str, Any]) -> str | None:

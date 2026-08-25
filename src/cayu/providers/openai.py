@@ -89,6 +89,7 @@ from cayu.providers.base import (
     TargetedToolProjectionRequest,
     UsageDialect,
     _preflight_provider_portable_messages,
+    call_tool_core_callable,
     privacy_safe_provider_option_projection,
     targeted_tool_native_cache_anchor_name,
 )
@@ -763,6 +764,8 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             raise TypeError("request must be a ModelRequest.")
         projection = request.targeted_tool_projection
         cache_anchor = targeted_tool_native_cache_anchor_name(request.options)
+        if call_tool_core_callable(request.options) and cache_anchor is None:
+            raise ValueError("Callable call_tool core requires a stable cache anchor.")
         if cache_anchor is not None:
             self.preflight_targeted_tool_projection(
                 model=request.model,
@@ -3351,9 +3354,10 @@ def _openai_native_allowed_tool_selectors(
     cache_anchor_name: str,
 ) -> tuple[dict[str, str], ...]:
     selectors: list[dict[str, str]] = []
+    callable_anchor = call_tool_core_callable(request.options)
     for tool in request.tools:
         selector = _openai_function_tool_selector(tool)
-        if selector["name"] != cache_anchor_name:
+        if selector["name"] != cache_anchor_name or callable_anchor:
             selectors.append(selector)
     for hosted_tool in request.hosted_tools:
         if type(hosted_tool) is not OpenAIWebSearch:

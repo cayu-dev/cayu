@@ -173,7 +173,19 @@ from cayu.runtime.structured_output import (
     StructuredOutputSpec,
     copy_structured_output_spec,
 )
-from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
+from cayu.runtime.tool_catalogue import CALL_TOOL_NAME, SEARCH_TOOLS_NAME
+from cayu.runtime.tool_discovery import (
+    TOOL_DISCOVERY_REFERENCE_PREFIX,
+    TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+    ToolDiscoveryMode,
+    _bind_runtime_tool_discovery_authority,
+    current_tool_discovery_view,
+    discovered_tool_rejection_event,
+    resolved_discovered_tool_invocation,
+    tool_discovery_generation_id,
+    tool_discovery_record_matches_descriptor,
+    tool_discovery_reference_rejection_reason,
+)
 from cayu.runtime.tool_exposure import (
     NOT_EXPOSED_IN_REQUEST_REASON,
     ResolvedToolExposureAuthority,
@@ -1011,9 +1023,13 @@ class ToolRoundExecutor:
         ):
             raise RuntimeError("An unresolved targeted-tool call cannot carry a policy plan.")
 
-        records = await self._session_store.list_targeted_tool_grants(
-            session.id,
-            interaction_id=interaction_id,
+        records = (
+            ()
+            if registered_agent.targeted_tool_mode is None
+            else await self._session_store.list_targeted_tool_grants(
+                session.id,
+                interaction_id=interaction_id,
+            )
         )
         records_by_ref = {record.tool_ref: record for record in records}
         records_by_id = {record.grant_id: record for record in records}
@@ -1023,8 +1039,29 @@ class ToolRoundExecutor:
         resolution_events: list[Event] = []
         identity = tool_round_recovery.pending_tool_round_identity(pending_round)
         observed_at = self._clock()
-        ceiling_names = frozenset(
-            tool_capability_ceiling_from_session_metadata(session.metadata).tool_names
+        capability_ceiling = tool_capability_ceiling_from_session_metadata(session.metadata)
+        ceiling_names = frozenset(capability_ceiling.tool_names)
+        discovery_view = None
+        if registered_agent.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS:
+            raw_discovery_view = await self._session_store.load_session_operation(
+                session.id,
+                TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+            )
+            discovery_view = current_tool_discovery_view(
+                raw_discovery_view,
+                session_id=session.id,
+                generation_id=tool_discovery_generation_id(
+                    session_id=session.id,
+                    root_invocation_id=session.invocation.root_invocation_id,
+                ),
+                agent_name=registered_agent.spec.name,
+                catalogue=registered_agent.tool_catalogue,
+                ceiling=capability_ceiling,
+            )
+        discovery_records_by_ref = (
+            {}
+            if discovery_view is None
+            else {grant.tool_ref: grant for grant in discovery_view.grants}
         )
 
         async def publish_persisted(event: Event) -> None:
@@ -1038,6 +1075,8 @@ class ToolRoundExecutor:
             record = records_by_ref.get(tool_ref)
             if record is not None:
                 return record
+            if registered_agent.targeted_tool_mode is None:
+                return None
             try:
                 parsed = parse_public_authority_alias(tool_ref)
             except (TypeError, ValueError):
@@ -1091,6 +1130,43 @@ class ToolRoundExecutor:
                     if invocation.dispatch_kind == "gateway" and invocation.tool_ref is not None
                     else records_by_id.get(invocation.grant_id)
                 )
+                discovered_record = (
+                    None
+                    if invocation.dispatch_kind != "gateway" or invocation.tool_ref is None
+                    else discovery_records_by_ref.get(invocation.tool_ref)
+                )
+                if record is None and discovered_record is not None:
+                    try:
+                        descriptor = registered_agent.tool_catalogue.descriptor_for_id(
+                            discovered_record.tool_id
+                        )
+                    except KeyError:
+                        descriptor = None
+                    if (
+                        discovered_record.grant_id != invocation.grant_id
+                        or discovered_record.tool_id != invocation.tool_id
+                        or discovered_record.tool_name != invocation.effective_tool_name
+                        or discovered_record.catalogue_revision != invocation.catalogue_revision
+                        or discovered_record.descriptor_version != invocation.descriptor_version
+                        or discovered_record.schema_fingerprint != invocation.schema_fingerprint
+                        or descriptor is None
+                        or not tool_discovery_record_matches_descriptor(
+                            discovered_record,
+                            descriptor,
+                        )
+                        or descriptor.name not in ceiling_names
+                        or invocation.session_id != session.id
+                        or invocation.interaction_id != interaction_id
+                        or invocation.model_step_id != identity.model_step_id
+                        or invocation.outer_tool_call_id != call.id
+                        or invocation.model_tool_name != call.model_tool_name
+                        or targeted_arguments_sha256(call.arguments) != invocation.arguments_sha256
+                    ):
+                        raise RuntimeError(
+                            "Resolved discovered-tool checkpoint conflicts with view state."
+                        )
+                    resolved_calls.append(runtime_records.copy_tool_call_request(call))
+                    continue
                 if (
                     record is None
                     or record.grant_id != invocation.grant_id
@@ -1165,6 +1241,7 @@ class ToolRoundExecutor:
             model_tool_name = call.name
             tool_ref: str | None
             effective_arguments: dict[str, Any]
+            discovered_record = None
             if call.name == CALL_TOOL_NAME:
                 dispatch_kind = "gateway"
                 raw_digest = targeted_arguments_sha256(call.arguments)
@@ -1196,6 +1273,8 @@ class ToolRoundExecutor:
                 selected_grant_id = call.targeted_tool_grant_id
                 if selected_grant_id is None:
                     record = await record_for_reference(envelope.tool_ref)
+                    if record is None:
+                        discovered_record = discovery_records_by_ref.get(envelope.tool_ref)
                 else:
                     record = records_by_id.get(selected_grant_id)
                     resolved_grant_id = await self._session_store.resolve_public_authority_alias(
@@ -1220,9 +1299,99 @@ class ToolRoundExecutor:
                     )
                 tool_ref = None
                 effective_arguments = copy_durable_json_value(call.arguments, "arguments")
+            if discovered_record is not None:
+                try:
+                    descriptor = registered_agent.tool_catalogue.descriptor_for_id(
+                        discovered_record.tool_id
+                    )
+                except KeyError:
+                    descriptor = None
+                rejection_reason = None
+                if (
+                    descriptor is None
+                    or discovered_record.catalogue_revision
+                    != registered_agent.tool_catalogue.revision
+                    or not tool_discovery_record_matches_descriptor(
+                        discovered_record,
+                        descriptor,
+                    )
+                    or discovered_record.tool_name not in ceiling_names
+                ):
+                    rejection_reason = TargetedToolUseRejectionReason.CATALOGUE_DRIFT
+                elif not validate_effective_tool_arguments(
+                    effective_arguments,
+                    descriptor.input_schema_copy(),
+                ):
+                    rejection_reason = TargetedToolUseRejectionReason.INVALID_ARGUMENTS
+                arguments_digest = targeted_arguments_sha256(effective_arguments)
+                if rejection_reason is not None:
+                    event = discovered_tool_rejection_event(
+                        session_id=session.id,
+                        interaction_id=interaction_id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=_environment_name(registered_environment),
+                        model_step_id=identity.model_step_id,
+                        outer_tool_call_id=call.id,
+                        arguments_sha256=arguments_digest,
+                        reason=rejection_reason,
+                        timestamp=observed_at,
+                    )
+                    await publish_new(event)
+                    resolved_calls.append(
+                        rejected_call(
+                            call,
+                            reason=rejection_reason,
+                            event=event,
+                        )
+                    )
+                    continue
+                resolved_calls.append(
+                    runtime_records.ToolCallRequest(
+                        id=call.id,
+                        name=discovered_record.tool_name,
+                        arguments=copy_durable_json_value(effective_arguments, "arguments"),
+                        model_tool_name=model_tool_name,
+                        targeted_tool_invocation=resolved_discovered_tool_invocation(
+                            record=discovered_record,
+                            session_id=session.id,
+                            interaction_id=interaction_id,
+                            model_step_id=identity.model_step_id,
+                            outer_tool_call_id=call.id,
+                            arguments_sha256=arguments_digest,
+                            invocation_id=invocation_id,
+                        ),
+                    )
+                )
+                continue
             if record is None:
                 if dispatch_kind != "gateway" or tool_ref is None:
                     raise RuntimeError("Native targeted projection lost its durable grant.")
+                if registered_agent.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS and (
+                    registered_agent.targeted_tool_mode is None
+                    or tool_ref.startswith(TOOL_DISCOVERY_REFERENCE_PREFIX)
+                ):
+                    arguments_digest = targeted_arguments_sha256(effective_arguments)
+                    rejection_reason = tool_discovery_reference_rejection_reason(tool_ref)
+                    event = discovered_tool_rejection_event(
+                        session_id=session.id,
+                        interaction_id=interaction_id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=_environment_name(registered_environment),
+                        model_step_id=identity.model_step_id,
+                        outer_tool_call_id=call.id,
+                        arguments_sha256=arguments_digest,
+                        reason=rejection_reason,
+                        timestamp=observed_at,
+                    )
+                    await publish_new(event)
+                    resolved_calls.append(
+                        rejected_call(
+                            call,
+                            reason=rejection_reason,
+                            event=event,
+                        )
+                    )
+                    continue
                 request = self._targeted_tool_use_request(
                     session=session,
                     registered_agent=registered_agent,
@@ -1461,6 +1630,56 @@ class ToolRoundExecutor:
         ):
             raise RuntimeError("Paused targeted invocation conflicts with its binding.")
         tool_ref = invocation.tool_ref
+        if (
+            tool_ref is not None
+            and registered_agent.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS
+        ):
+            ceiling = tool_capability_ceiling_from_session_metadata(session.metadata)
+            discovery_view = current_tool_discovery_view(
+                await self._session_store.load_session_operation(
+                    session.id,
+                    TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+                ),
+                session_id=session.id,
+                generation_id=tool_discovery_generation_id(
+                    session_id=session.id,
+                    root_invocation_id=session.invocation.root_invocation_id,
+                ),
+                agent_name=registered_agent.spec.name,
+                catalogue=registered_agent.tool_catalogue,
+                ceiling=ceiling,
+            )
+            discovery_record = discovery_view.record_for_reference(tool_ref)
+            if discovery_record is not None:
+                try:
+                    descriptor = registered_agent.tool_catalogue.descriptor_for_id(
+                        discovery_record.tool_id
+                    )
+                except KeyError:
+                    descriptor = None
+                if (
+                    discovery_record.grant_id != invocation.grant_id
+                    or discovery_record.tool_id != invocation.tool_id
+                    or discovery_record.tool_name != invocation.effective_tool_name
+                    or discovery_record.catalogue_revision != invocation.catalogue_revision
+                    or discovery_record.descriptor_version != invocation.descriptor_version
+                    or discovery_record.schema_fingerprint != invocation.schema_fingerprint
+                    or descriptor is None
+                    or not tool_discovery_record_matches_descriptor(
+                        discovery_record,
+                        descriptor,
+                    )
+                    or descriptor.name not in ceiling.tool_names
+                ):
+                    raise RuntimeError(
+                        "Paused discovered-tool invocation conflicts with its durable view."
+                    )
+                return ()
+            if (
+                tool_ref.startswith(TOOL_DISCOVERY_REFERENCE_PREFIX)
+                or registered_agent.targeted_tool_mode is None
+            ):
+                raise RuntimeError("Paused discovered-tool invocation lost its durable view grant.")
         if tool_ref is None:
             records = await self._session_store.list_targeted_tool_grants(
                 session.id,
@@ -1513,13 +1732,14 @@ class ToolRoundExecutor:
         policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] = []
         approval_policy_result: ToolPolicyResult | None = None
         approval_tool_call: runtime_records.ToolCallRequest | None = None
+        executable_names = registered_agent.executable_tool_names
         exposed_names = (
-            frozenset(registered_agent.tools)
+            executable_names
             if tool_exposure is None
-            else frozenset(tool_exposure.tool_names)
+            else frozenset((*tool_exposure.tool_names, *registered_agent.runtime_tools))
         )
         has_authorizable_call = any(
-            call.name in registered_agent.tools
+            call.name in executable_names
             and (call.name in exposed_names or call.targeted_tool_invocation is not None)
             for call in tool_calls
         )
@@ -1535,7 +1755,7 @@ class ToolRoundExecutor:
         active_taint_labels: dict[str, frozenset[str]] = {}
         for tool_call in tool_calls:
             active_taint_labels[tool_call.id] = frozenset(taint_labels)
-            if tool_call.name not in registered_agent.tools:
+            if tool_call.name not in executable_names:
                 policy_outcomes.append(
                     runtime_records.ToolCallPolicyOutcome(
                         call=tool_call,
@@ -1636,13 +1856,14 @@ class ToolRoundExecutor:
         policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] = []
         authoritative_approval_tool_call: runtime_records.ToolCallRequest | None = None
         ambiguous_tool_call: runtime_records.ToolCallRequest | None = None
+        executable_names = registered_agent.executable_tool_names
         exposed_names = (
-            frozenset(registered_agent.tools)
+            executable_names
             if tool_exposure is None
-            else frozenset(tool_exposure.tool_names)
+            else frozenset((*tool_exposure.tool_names, *registered_agent.runtime_tools))
         )
         has_authorizable_call = any(
-            call.name in registered_agent.tools
+            call.name in executable_names
             and (call.name in exposed_names or call.targeted_tool_invocation is not None)
             for call in tool_calls
         )
@@ -1658,7 +1879,7 @@ class ToolRoundExecutor:
         active_taint_labels: dict[str, frozenset[str]] = {}
         for tool_call in tool_calls:
             active_taint_labels[tool_call.id] = frozenset(taint_labels)
-            if tool_call.name not in registered_agent.tools:
+            if tool_call.name not in executable_names:
                 policy_outcomes.append(
                     runtime_records.ToolCallPolicyOutcome(
                         call=tool_call,
@@ -2569,7 +2790,7 @@ class ToolRoundExecutor:
                 registered_agent.tool_capabilities,
                 catalogue_revision=registered_agent.tool_catalogue.revision,
             )
-            if tool_call.name not in registered_agent.tools:
+            if tool_call.name not in registered_agent.executable_tool_names:
                 raise RuntimeError("Unexposed tool call is not registered.")
             if tool_call.name in tool_exposure.tool_names:
                 raise RuntimeError("Unexposed tool call is present in its exposure snapshot.")
@@ -2734,7 +2955,7 @@ class ToolRoundExecutor:
             return True
 
         started_event: Event | None = None
-        registered_tool = registered_agent.tools.get(tool_call.name)
+        registered_tool = registered_agent.executable_tool(tool_call.name)
         if registered_tool is not None and not registered_tool.publish_arguments:
             publish_arguments_as_unavailable = True
         if taint_labels is None:
@@ -3316,6 +3537,23 @@ class ToolRoundExecutor:
             workspace=raw_workspace,
             artifact_store=raw_artifact_store,
         )
+        if effective_tool_call.name == SEARCH_TOOLS_NAME:
+            if registered_agent.tool_discovery_mode is not ToolDiscoveryMode.SEARCH_TOOLS:
+                raise RuntimeError("search_tools execution requires enabled tool discovery.")
+            _bind_runtime_tool_discovery_authority(
+                tool_context,
+                generation_id=tool_discovery_generation_id(
+                    session_id=session.id,
+                    root_invocation_id=session.invocation.root_invocation_id,
+                ),
+                catalogue=registered_agent.tool_catalogue,
+                ceiling=tool_capability_ceiling_from_session_metadata(session.metadata),
+                directly_exposed_names=(
+                    registered_agent.tools if tool_exposure is None else tool_exposure.tool_names
+                ),
+                model_step_id=tool_round_identity.model_step_id,
+                created_at=self._clock(),
+            )
         if execution_profile is not None:
 
             async def load_durable_operation(storage_key: str) -> dict[str, Any] | None:
@@ -5111,7 +5349,7 @@ class ToolRoundExecutor:
             raise ValueError("Deferred terminal staging requires a publication snapshot.")
         if deferred_terminal_projection_recorder is not None and not publish_before_hooks:
             raise ValueError("Deferred terminal projection recording requires observational hooks.")
-        registered_tool = registered_agent.tools.get(tool_call.name)
+        registered_tool = registered_agent.executable_tool(tool_call.name)
         quarantine_hook_output = (
             registered_tool is not None and not registered_tool.publish_arguments
         )
@@ -5899,7 +6137,7 @@ class ToolRoundRun:
         ) or any(
             registered is not None and registered.workspace_mutation
             for registered in (
-                self._registered_agent.tools.get(tool_call.name) for tool_call in tool_calls
+                self._registered_agent.executable_tool(tool_call.name) for tool_call in tool_calls
             )
         )
         publication_coordinator = (
@@ -6890,7 +7128,7 @@ def _first_user_input_tool_call(
     policy_evidence_by_id: Mapping[str, ToolPolicyEvidence],
 ) -> tuple[runtime_records.ToolCallRequest, str, list[str]] | None:
     for tool_call in tool_calls:
-        registered_tool = registered_agent.tools.get(tool_call.name)
+        registered_tool = registered_agent.executable_tool(tool_call.name)
         if registered_tool is None or not getattr(registered_tool.tool, "pauses_session", False):
             continue
         if policy_evidence_by_id.get(tool_call.id) is not ToolPolicyEvidence.AUTHORITATIVE:
@@ -6922,7 +7160,7 @@ def _tool_call_is_parallel_safe(
     registered_agent: runtime_records.RegisteredAgentState,
     tool_call: runtime_records.ToolCallRequest,
 ) -> bool:
-    registered_tool = registered_agent.tools.get(tool_call.name)
+    registered_tool = registered_agent.executable_tool(tool_call.name)
     return True if registered_tool is None else registered_tool.parallel_safe
 
 
@@ -9232,7 +9470,7 @@ def _tool_effect(
     registered_agent: runtime_records.RegisteredAgentState,
     tool_call: runtime_records.ToolCallRequest,
 ) -> ToolEffect:
-    registered_tool = registered_agent.tools.get(tool_call.name)
+    registered_tool = registered_agent.executable_tool(tool_call.name)
     if registered_tool is None:
         return ToolEffect.EXTERNAL
     return registered_tool.effect
@@ -9245,7 +9483,7 @@ def _tool_round_publishes_arguments(
     """Require every paused call to permit one shared argument projection."""
 
     for tool_call in tool_calls:
-        registered_tool = registered_agent.tools.get(tool_call.name)
+        registered_tool = registered_agent.executable_tool(tool_call.name)
         if registered_tool is None or not registered_tool.publish_arguments:
             return False
     return True
@@ -9757,7 +9995,7 @@ def _redactor_for_tool_calls(
 ) -> SecretRedactor:
     redactor = base
     for tool_call in tool_calls:
-        registered_tool = registered_agent.tools.get(tool_call.name)
+        registered_tool = registered_agent.executable_tool(tool_call.name)
         if registered_tool is None:
             continue
         tool = registered_tool.tool

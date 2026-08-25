@@ -1529,8 +1529,11 @@ targeted-grant delivery policy with `targeted_tool_mode`; the portable
 `"call_tool"` mode projects the canonical gateway definition on every request in
 that agent's execution profile. Registration requires targeted-grant-capable
 storage and configured public-alias authority, so every selected projection can
-reject fabricated or replayed authority durably. Generalized `search_tools`
-remains reserved and is not yet exposed.
+reject fabricated or replayed authority durably. An agent may independently opt
+into provider-neutral catalogue discovery with
+`tool_discovery_mode="search_tools"`; that mode does not require public-alias
+keys because its non-authorizing references live in Cayu's branch-local durable
+tool view.
 
 The catalogue revision and descriptor versions join the existing direct-tools
 execution-profile component. Tool implementation behavior remains solely in
@@ -1614,8 +1617,11 @@ app.register_agent(
 )
 ```
 
-Omitting `tool_exposure_policy` uses `AllRegisteredToolsExposurePolicy` and
-preserves the historical expose-all request shape. For a configured policy,
+Omitting `tool_exposure_policy` uses `AllRegisteredToolsExposurePolicy` unless
+tool discovery is enabled. Discovery defaults to the stable
+`cayu:tool-discovery-only:v1` empty application-tool profile so opting in cannot
+accidentally send the entire catalogue; applications may still supply an
+explicit policy for a small directly exposed core. For a configured policy,
 Cayu resolves one snapshot before context construction and official provider
 counting. Context-pressure estimates and the final OpenAI, Anthropic, Chat
 Completions, Bedrock, or Vertex request see exactly that registration-ordered
@@ -1680,6 +1686,65 @@ error `tool_result` and performs no approval, policy authorization, hook, or
 tool execution for that call. The compact frozen authority follows the pending
 tool round through ordinary recovery, approval, and user-input interruption so
 continuation cannot reinterpret the call against a wider request.
+
+### Provider-neutral tool discovery
+
+`tool_discovery_mode="search_tools"` installs two Cayu-owned definitions as a
+stable prefix on every model request: `search_tools(query, limit)` and
+`call_tool(tool_ref, arguments)`. Application tools remain in the canonical
+catalogue and durable capability ceiling, but the default discovery exposure
+profile sends none of their schemas. Registering 10, 100, or 1,000 application
+tools therefore does not enlarge this two-schema core. An explicit
+`ToolExposurePolicy` may add a small direct subset after the core; discovery
+omits those already visible names from its results.
+
+Search is local, deterministic, and model-free. It case-folds and ranks name
+and description word matches plus input-property names in canonical tie order.
+One search scans at most 10,000 catalogue descriptors, returns at most eight,
+limits each schema to 64 KiB, bounds description summaries to 4,096 characters,
+and limits the complete result to 256 KiB. `query="*"` lists from the hidden
+eligible catalogue. Each returned descriptor includes its current registered
+name, bounded description, exact admitted input schema, canonical tool id,
+descriptor and schema fingerprints, readiness, and one opaque `tool_ref`. A
+session branch retains at most 256 discovered tools. Repeating a search returns
+the same reference for an existing descriptor. V1 readiness is
+`"registered"`: the implementation exists in the admitted catalogue, but the
+reference still conveys no policy, approval, credential, or environment
+authorization.
+
+The view is typed `ToolDiscoveryViewState` authority stored atomically with the
+session. It binds the private session id, branch generation, agent, catalogue
+revision, capability-ceiling fingerprint, monotonic view revision, descriptor
+versions, schema fingerprints, and bounded creation provenance. It survives
+later model steps and ordinary resume interactions. Forks do not copy
+session-operation records, and the
+session/generation binding also rejects a copied parent view, so a child starts
+with an empty discovery view and must search for its own references. Malformed
+durable state fails validation; changed catalogue or ceiling authority resets
+addressability instead of translating stale grants.
+
+`call_tool` validates the exact current view record and the inner arguments
+against the registered Draft 2020-12 schema before policy planning. The
+effective application tool then enters the ordinary policy, approval, hook,
+effect, environment, secret, idempotency, execution, result, and recovery path.
+The reference grants addressability only and is not a bearer credential. Exact
+references and schemas stay in the private model transcript. Generic public
+tool-completion events retain only the discovery result count, view revision,
+and truncation flag; request footprints continue to count only directly
+exposed application tools.
+
+```python
+app.register_agent(
+    AgentSpec(name="assistant", model="provider-model"),
+    tools=(search_docs, remember_knowledge, publish_report),
+    tool_discovery_mode="search_tools",
+)
+```
+
+The model first calls `search_tools` for the capability it needs, then calls
+the stable `call_tool` gateway with a returned reference. Applications define
+and register ordinary `Tool` implementations; there is no separate dynamic-tool
+implementation type and no second executor.
 
 ### Targeted tool grants and scoped references
 
@@ -1858,6 +1923,13 @@ provider-level `tool_choice` can narrow this set or require one of its members,
 but cannot re-enable the anchor or name an unavailable function. This fixed
 one-schema core is the cache-stable prefix; registering many targeted tools
 does not add their schemas to it.
+
+When provider-neutral tool discovery is also enabled, the stable core contains
+`search_tools` followed by `call_tool`, and both functions are callable.
+OpenAI's runtime-owned `allowed_tools` projection then contains those two core
+functions plus any directly exposed or active native targeted function. The
+gateway still resolves every reference against Cayu's durable targeted or
+branch-local discovery authority before target policy or execution.
 
 The fallback mode resolves once, before the logical model request exists. A
 capability error after dispatch never retries with a different projection,

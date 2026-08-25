@@ -406,6 +406,7 @@ from cayu.runtime.tasks import (
     task_create_with_runtime_invocation,
 )
 from cayu.runtime.tool_catalogue import (
+    SEARCH_TOOLS_NAME,
     ToolCatalogSnapshot,
     ToolDescriptor,
     ToolDescriptorProvenance,
@@ -414,11 +415,18 @@ from cayu.runtime.tool_catalogue import (
     mcp_source_tool_fingerprint,
     validate_application_tool_name,
 )
+from cayu.runtime.tool_discovery import (
+    TOOL_DISCOVERY_ONLY_PROFILE_ID,
+    SearchToolsTool,
+    ToolDiscoveryMode,
+    copy_tool_discovery_mode,
+)
 from cayu.runtime.tool_exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
     AllRegisteredToolsExposurePolicy,
     RegisteredToolCapability,
     ResolvedToolExposure,
+    StaticToolExposurePolicy,
     ToolExposurePolicy,
     resolved_tool_exposure_from_authority,
     tool_capability_ceiling_from_session_metadata,
@@ -1912,6 +1920,7 @@ class CayuApp:
         context_overflow_policy: ContextPolicy | None = None,
         tool_exposure_policy: ToolExposurePolicy | None = None,
         targeted_tool_mode: TargetedToolMode | str | None = None,
+        tool_discovery_mode: ToolDiscoveryMode | str | None = None,
         tool_policy: ToolPolicy | None = None,
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         loop_policies: Iterable[LoopPolicy] | None = None,
@@ -1934,8 +1943,18 @@ class CayuApp:
             stored_context_overflow_policy = context_overflow_policy
         else:
             raise TypeError("context_overflow_policy must be a ContextPolicy.")
+        stored_tool_discovery_mode = (
+            None if tool_discovery_mode is None else copy_tool_discovery_mode(tool_discovery_mode)
+        )
         if tool_exposure_policy is None:
-            stored_tool_exposure_policy = AllRegisteredToolsExposurePolicy()
+            stored_tool_exposure_policy = (
+                AllRegisteredToolsExposurePolicy()
+                if stored_tool_discovery_mode is None
+                else StaticToolExposurePolicy(
+                    profile_id=TOOL_DISCOVERY_ONLY_PROFILE_ID,
+                    tools=(),
+                )
+            )
         elif isinstance(tool_exposure_policy, ToolExposurePolicy):
             stored_tool_exposure_policy = tool_exposure_policy
         else:
@@ -1998,6 +2017,15 @@ class CayuApp:
                 raise ValueError(f"Duplicate tool registered for agent: {registered_tool.name}")
             tools_by_name[registered_tool.name] = registered_tool
 
+        runtime_tools_by_name: dict[str, runtime_records.RegisteredTool] = {}
+        if stored_tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS:
+            search_tool = _validate_registered_tool(
+                SearchToolsTool(),
+                redactor=self._secret_redactor,
+                framework_owned=True,
+            )
+            runtime_tools_by_name[search_tool.name] = search_tool
+
         if hosted_tools is None:
             stored_hosted_tools: tuple[OpenAIWebSearch, ...] = ()
         else:
@@ -2037,6 +2065,7 @@ class CayuApp:
         registered_agent = runtime_records.RegisteredAgentState(
             spec=stored_spec,
             tools=MappingProxyType(tools_by_name),
+            runtime_tools=MappingProxyType(runtime_tools_by_name),
             tool_catalogue=tool_catalogue,
             tool_capabilities=tool_capabilities,
             all_registered_tool_exposure=all_registered_tool_exposure,
@@ -2049,6 +2078,7 @@ class CayuApp:
                 )
             ),
             targeted_tool_mode=stored_targeted_tool_mode,
+            tool_discovery_mode=stored_tool_discovery_mode,
             hosted_tools=stored_hosted_tools,
             context_policy=stored_context_policy,
             context_policy_execution_profile_identity=(
@@ -2206,6 +2236,7 @@ class CayuApp:
                     deep=True,
                 ),
                 tools=MappingProxyType({}),
+                runtime_tools=MappingProxyType({}),
                 tool_catalogue=empty_tool_catalogue,
                 tool_capabilities=(),
                 all_registered_tool_exposure=ResolvedToolExposure(
@@ -2218,6 +2249,7 @@ class CayuApp:
                 tool_exposure_policy=AllRegisteredToolsExposurePolicy(),
                 tool_exposure_policy_execution_profile_identity=None,
                 targeted_tool_mode=None,
+                tool_discovery_mode=None,
                 context_policy=evaluator_context_policy,
                 context_policy_execution_profile_identity=(
                     copy_secret_free_execution_profile_behavior_identity(
@@ -7321,11 +7353,18 @@ def _validate_registered_tool(
     tool: Tool,
     *,
     redactor: SecretRedactor,
+    framework_owned: bool = False,
 ) -> runtime_records.RegisteredTool:
     spec = getattr(tool, "spec", None)
     if type(spec) is not ToolSpec:
         raise TypeError("Agent tools must define ToolSpec instances.")
-    name = validate_application_tool_name(require_clean_nonblank(spec.name, "name"))
+    raw_name = require_clean_nonblank(spec.name, "name")
+    if framework_owned:
+        if raw_name != SEARCH_TOOLS_NAME:
+            raise ValueError(f"Unsupported Cayu runtime tool: {raw_name}")
+        name = raw_name
+    else:
+        name = validate_application_tool_name(raw_name)
     if not inspect.iscoroutinefunction(tool.run):
         raise TypeError(
             f"{type(tool).__name__}.run must be declared with `async def` and return a ToolResult."

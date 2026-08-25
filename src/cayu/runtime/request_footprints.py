@@ -38,6 +38,7 @@ from cayu.artifacts.attachments import (
 )
 from cayu.core.messages import FilePart, Message, MessageRole, ToolCallPart, ToolResultPart
 from cayu.providers.base import (
+    CALL_TOOL_CORE_CALLABLE_OPTION,
     TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
     ModelContextPressureProfile,
     ModelProvider,
@@ -57,7 +58,12 @@ from cayu.runtime.targeted_tool_projection import (
     persisted_targeted_tool_projection_marker_id,
     targeted_tool_projection_marker_id,
 )
-from cayu.runtime.tool_catalogue import CALL_TOOL_NAME, validate_canonical_tool_id
+from cayu.runtime.tool_catalogue import (
+    CALL_TOOL_NAME,
+    SEARCH_TOOLS_NAME,
+    validate_canonical_tool_id,
+)
+from cayu.runtime.tool_discovery import search_tools_spec
 from cayu.runtime.tool_exposure import (
     TOOL_EXPOSURE_MAX_REGISTERED_TOOLS,
     TOOL_EXPOSURE_PROFILE_ID_MAX_CHARS,
@@ -83,6 +89,7 @@ _RUNTIME_ONLY_OPTION_KEYS = frozenset(
         "environment_metadata",
         "step",
         "structured_output",
+        CALL_TOOL_CORE_CALLABLE_OPTION,
         TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
         "thinking",
         RESOLVED_FILE_ATTACHMENTS_OPTION,
@@ -1111,10 +1118,19 @@ def build_request_footprint(
     tool_gateway_tools = [
         tool for tool in model_request.tools if tool.get("name") == CALL_TOOL_NAME
     ]
+    tool_discovery_tools = [
+        tool for tool in model_request.tools if tool.get("name") == SEARCH_TOOLS_NAME
+    ]
     if len(tool_gateway_tools) > 1:
         raise ValueError("ModelRequest.tools cannot contain duplicate call_tool definitions.")
     if tool_gateway_tools and tool_gateway_tools[0] != call_tool_spec():
         raise ValueError("ModelRequest.tools contains a non-canonical call_tool definition.")
+    if len(tool_discovery_tools) > 1:
+        raise ValueError("ModelRequest.tools cannot contain duplicate search_tools definitions.")
+    if tool_discovery_tools and tool_discovery_tools[0] != search_tools_spec():
+        raise ValueError("ModelRequest.tools contains a non-canonical search_tools definition.")
+    if tool_discovery_tools and not tool_gateway_tools:
+        raise ValueError("The search_tools definition requires the stable call_tool gateway.")
     native_cache_anchor = targeted_tool_native_cache_anchor_name(model_request.options)
     if native_cache_anchor is not None:
         if native_cache_anchor != CALL_TOOL_NAME:
@@ -1138,7 +1154,10 @@ def build_request_footprint(
         ):
             raise ValueError("The call_tool projection cannot use a native cache anchor.")
     if tool_exposure is not None and (
-        len(model_request.tools) - len(structured_output_tools) - len(tool_gateway_tools)
+        len(model_request.tools)
+        - len(structured_output_tools)
+        - len(tool_gateway_tools)
+        - len(tool_discovery_tools)
         != tool_exposure.exposed_count
     ):
         raise ValueError(

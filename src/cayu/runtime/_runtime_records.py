@@ -25,6 +25,7 @@ from cayu.runtime._policy_evidence import ToolPolicyEvidence
 from cayu.runtime.context import ContextPolicy
 from cayu.runtime.hooks import RuntimeHook
 from cayu.runtime.targeted_tool_projection import TargetedToolMode
+from cayu.runtime.tool_discovery import ToolDiscoveryMode
 from cayu.runtime.tool_grants import (
     TARGETED_TOOL_TRANSCRIPT_REFERENCE,
     RejectedTargetedToolInvocation,
@@ -54,12 +55,14 @@ class RegisteredAgent:
 class RegisteredAgentState:
     spec: AgentSpec
     tools: Mapping[str, RegisteredTool]
+    runtime_tools: Mapping[str, RegisteredTool]
     tool_catalogue: ToolCatalogSnapshot
     tool_capabilities: tuple[RegisteredToolCapability, ...]
     all_registered_tool_exposure: ResolvedToolExposure
     tool_exposure_policy: ToolExposurePolicy
     tool_exposure_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None
     targeted_tool_mode: TargetedToolMode | None
+    tool_discovery_mode: ToolDiscoveryMode | None
     hosted_tools: tuple[OpenAIWebSearch, ...]
     context_policy: ContextPolicy
     context_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None
@@ -76,6 +79,18 @@ class RegisteredAgentState:
     ] = field(default_factory=dict)
     registration_source: str | None = None
     registration_symbol: str | None = None
+
+    def executable_tool(self, name: str) -> RegisteredTool | None:
+        """Resolve an application or runtime-owned executable without merging catalogues."""
+
+        registered = self.tools.get(name)
+        return registered if registered is not None else self.runtime_tools.get(name)
+
+    @property
+    def executable_tool_names(self) -> frozenset[str]:
+        """Return every name executable through the ordinary tool lifecycle."""
+
+        return frozenset((*self.tools, *self.runtime_tools))
 
 
 @dataclass(frozen=True)

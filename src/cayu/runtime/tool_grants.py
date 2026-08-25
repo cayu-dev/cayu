@@ -1081,6 +1081,43 @@ class TargetedToolUseRequest(BaseModel):
         )
 
 
+def tool_reference_use_id(
+    *,
+    grant_id: str,
+    session_id: str,
+    interaction_id: str,
+    model_step_id: str,
+    outer_tool_call_id: str,
+    arguments_sha256: str,
+    invocation_id: str,
+) -> str:
+    """Build the stable use identity shared by opaque-reference transports."""
+
+    return _sha256_identity(
+        {
+            "record_type": "cayu.targeted-tool-use",
+            "schema_version": TARGETED_TOOL_GRANT_SCHEMA_VERSION,
+            "grant_id": require_durable_clean_nonblank(grant_id, "grant_id"),
+            "session_id": require_durable_clean_nonblank(session_id, "session_id"),
+            "interaction_id": require_durable_clean_nonblank(
+                interaction_id,
+                "interaction_id",
+            ),
+            "model_step_id": require_durable_clean_nonblank(model_step_id, "model_step_id"),
+            "outer_tool_call_id": require_durable_clean_nonblank(
+                outer_tool_call_id,
+                "outer_tool_call_id",
+            ),
+            "arguments_sha256": require_durable_clean_nonblank(
+                arguments_sha256,
+                "arguments_sha256",
+            ),
+            "invocation_id": require_durable_clean_nonblank(invocation_id, "invocation_id"),
+        },
+        "targeted_tool_use",
+    )
+
+
 class TargetedToolUseBinding(BaseModel):
     """Permanent digest-only evidence for one accepted grant use."""
 
@@ -1139,19 +1176,14 @@ class TargetedToolUseBinding(BaseModel):
 
     @model_validator(mode="after")
     def validate_use_id(self) -> TargetedToolUseBinding:
-        expected_use_id = _sha256_identity(
-            {
-                "record_type": "cayu.targeted-tool-use",
-                "schema_version": TARGETED_TOOL_GRANT_SCHEMA_VERSION,
-                "grant_id": self.grant_id,
-                "session_id": self.session_id,
-                "interaction_id": self.interaction_id,
-                "model_step_id": self.model_step_id,
-                "outer_tool_call_id": self.outer_tool_call_id,
-                "arguments_sha256": self.arguments_sha256,
-                "invocation_id": self.invocation_id,
-            },
-            "targeted_tool_use",
+        expected_use_id = tool_reference_use_id(
+            grant_id=self.grant_id,
+            session_id=self.session_id,
+            interaction_id=self.interaction_id,
+            model_step_id=self.model_step_id,
+            outer_tool_call_id=self.outer_tool_call_id,
+            arguments_sha256=self.arguments_sha256,
+            invocation_id=self.invocation_id,
         )
         if self.use_id != expected_use_id:
             raise ValueError("use_id conflicts with immutable targeted tool use evidence.")
@@ -1275,19 +1307,14 @@ class ResolvedTargetedToolInvocation(BaseModel):
             raise ValueError(
                 "Native invocations require the effective model tool name and no reference."
             )
-        expected_use_id = _sha256_identity(
-            {
-                "record_type": "cayu.targeted-tool-use",
-                "schema_version": TARGETED_TOOL_GRANT_SCHEMA_VERSION,
-                "grant_id": self.grant_id,
-                "session_id": self.session_id,
-                "interaction_id": self.interaction_id,
-                "model_step_id": self.model_step_id,
-                "outer_tool_call_id": self.outer_tool_call_id,
-                "arguments_sha256": self.arguments_sha256,
-                "invocation_id": self.invocation_id,
-            },
-            "targeted_tool_use",
+        expected_use_id = tool_reference_use_id(
+            grant_id=self.grant_id,
+            session_id=self.session_id,
+            interaction_id=self.interaction_id,
+            model_step_id=self.model_step_id,
+            outer_tool_call_id=self.outer_tool_call_id,
+            arguments_sha256=self.arguments_sha256,
+            invocation_id=self.invocation_id,
         )
         if self.use_id != expected_use_id:
             raise ValueError("use_id conflicts with resolved targeted tool authority.")
@@ -1355,19 +1382,14 @@ def targeted_tool_use_binding(
     if type(request) is not TargetedToolUseRequest:
         raise TypeError("request must be a TargetedToolUseRequest.")
     grant_id = require_durable_clean_nonblank(grant_id, "grant_id")
-    use_id = _sha256_identity(
-        {
-            "record_type": "cayu.targeted-tool-use",
-            "schema_version": TARGETED_TOOL_GRANT_SCHEMA_VERSION,
-            "grant_id": grant_id,
-            "session_id": request.session_id,
-            "interaction_id": request.interaction_id,
-            "model_step_id": request.model_step_id,
-            "outer_tool_call_id": request.outer_tool_call_id,
-            "arguments_sha256": request.arguments_sha256,
-            "invocation_id": request.invocation_id,
-        },
-        "targeted_tool_use",
+    use_id = tool_reference_use_id(
+        grant_id=grant_id,
+        session_id=request.session_id,
+        interaction_id=request.interaction_id,
+        model_step_id=request.model_step_id,
+        outer_tool_call_id=request.outer_tool_call_id,
+        arguments_sha256=request.arguments_sha256,
+        invocation_id=request.invocation_id,
     )
     return TargetedToolUseBinding(
         grant_id=grant_id,
@@ -2177,6 +2199,7 @@ __all__ = [
     "targeted_tool_use_rejection_reason",
     "targeted_tool_use_scope_rejection_reason",
     "targeted_tool_view_generation_id",
+    "tool_reference_use_id",
     "validate_targeted_tool_grant_batch_evidence",
     "validate_targeted_tool_grant_issuance_evidence",
     "validate_targeted_tool_grant_lifecycle_event",

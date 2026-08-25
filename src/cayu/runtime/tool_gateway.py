@@ -58,7 +58,7 @@ def call_tool_spec() -> dict[str, Any]:
     return {
         "name": CALL_TOOL_NAME,
         "description": (
-            "Call one tool from the current Cayu targeted-tool context using its exact "
+            "Call one tool from the current Cayu tool context using its exact "
             "opaque reference. The reference grants addressability only; Cayu still "
             "applies the target's validation, policy, approval, and execution controls."
         ),

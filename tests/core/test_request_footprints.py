@@ -51,6 +51,7 @@ from cayu.runtime.structured_output import (
     structured_output_tool_spec,
 )
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
+from cayu.runtime.tool_discovery import TOOL_DISCOVERY_ONLY_PROFILE_ID, search_tools_spec
 from cayu.runtime.tool_gateway import call_tool_spec
 
 _CATALOGUE_REVISION = f"sha256:{'c' * 64}"
@@ -273,6 +274,48 @@ def test_request_footprint_v3_binds_the_prepared_tool_exposure() -> None:
             execution_profile_fingerprint=execution_profile_fingerprint,
             tool_exposure=mismatched,
         )
+
+
+def test_discovery_core_does_not_count_as_direct_application_exposure() -> None:
+    execution_profile_fingerprint = "a" * 64
+    exposure = ToolExposure(
+        execution_profile_fingerprint=execution_profile_fingerprint,
+        profile_id=TOOL_DISCOVERY_ONLY_PROFILE_ID,
+        catalogue_revision=_CATALOGUE_REVISION,
+        exposure_fingerprint="b" * 64,
+        registered_count=100,
+        ceiling_count=100,
+        exposed_count=0,
+        profile_changed=False,
+        step=1,
+        provider_name="provider-a",
+        model="model-a",
+        model_step_id="mstep_00000000000000000000000000000001",
+    )
+    request = ModelRequest(
+        model="model-a",
+        messages=[Message.text("user", "Find the right capability")],
+        tools=[search_tools_spec(), call_tool_spec()],
+    )
+
+    footprint = build_request_footprint(
+        request,
+        provider_name="provider-a",
+        step=1,
+        attempt=1,
+        max_attempts=1,
+        request_variant=RequestVariant.INITIAL,
+        observation_id="discovery-core-footprint",
+        model_step_id=exposure.model_step_id,
+        model_attempt_id="matt_00000000000000000000000000000001",
+        execution_profile_fingerprint=execution_profile_fingerprint,
+        tool_exposure=exposure,
+    )
+
+    assert footprint.tool_exposure is not None
+    assert footprint.tool_exposure.registered_count == 100
+    assert footprint.tool_exposure.exposed_count == 0
+    assert footprint.tools.count == 2
 
 
 def test_request_footprint_v5_adds_bounded_targeted_grants_without_tool_prefix_drift() -> None:

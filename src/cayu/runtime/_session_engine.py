@@ -14679,6 +14679,7 @@ class SessionEngine:
                             provider=registered_provider.provider,
                             model=requested_target.model,
                         ),
+                        tool_discovery_mode=registered_agent.tool_discovery_mode,
                     )
                     registered_provider.provider.preflight_portable_messages(
                         model=requested_target.model,
@@ -15849,6 +15850,7 @@ class SessionEngine:
                                     provider=registered_provider.provider,
                                     model=model,
                                 ),
+                                tool_discovery_mode=registered_agent.tool_discovery_mode,
                             )
                             registered_provider.provider.preflight_portable_messages(
                                 model=model,

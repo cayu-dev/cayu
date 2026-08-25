@@ -25,6 +25,7 @@ from cayu.core.tools import (
     _POLICY_DENIAL_TRUNCATION_MARKER,
     _TOOL_POLICY_DENIAL_SOURCE,
     ToolEffect,
+    ToolResult,
 )
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.egress.authority import (
@@ -53,6 +54,8 @@ from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     parse_public_authority_alias,
 )
+from cayu.runtime.tool_catalogue import SEARCH_TOOLS_NAME
+from cayu.runtime.tool_discovery import minimized_tool_discovery_result
 from cayu.runtime.tool_result_projection import (
     _TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
     reestimate_tool_result_projection_tokens,
@@ -3648,6 +3651,37 @@ def _fail_closed_public_terminal_tool_argument_projection(
     payload[tool_argument_publication.ARGUMENTS_STATE_FIELD] = "unavailable"
 
 
+def _minimize_public_tool_discovery_result(
+    event: Event,
+    *,
+    payload: dict[str, Any],
+) -> None:
+    """Keep schemas and opaque references inside the private model transcript."""
+
+    if (
+        event.type not in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        or event.tool_name != SEARCH_TOOLS_NAME
+    ):
+        return
+    original_result = event.payload.get("result")
+    projected_result = payload.get("result")
+    if type(original_result) is not dict or type(projected_result) is not dict:
+        payload.pop("result", None)
+        return
+    try:
+        minimized = minimized_tool_discovery_result(ToolResult.model_validate(original_result))
+    except (TypeError, ValueError):
+        projected_result.update(
+            {
+                "content": "Tool discovery result withheld from the public event stream.",
+                "structured": None,
+                "artifacts": [],
+            }
+        )
+        return
+    projected_result.update(minimized.model_dump(mode="json"))
+
+
 def project_runtime_event(
     event: Event,
     *,
@@ -3824,6 +3858,10 @@ def _project_runtime_event(
         controls=controls,
     )
     _fail_closed_public_terminal_tool_argument_projection(
+        event,
+        payload=redacted_payload,
+    )
+    _minimize_public_tool_discovery_result(
         event,
         payload=redacted_payload,
     )
