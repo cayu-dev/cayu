@@ -3630,6 +3630,21 @@ export type EnvironmentsResponse = {
 };
 
 /**
+ * EvalAuthoredSuiteAdmittedRun
+ */
+export type EvalAuthoredSuiteAdmittedRun = {
+    /**
+     * Case Ids
+     */
+    case_ids: Array<string>;
+    /**
+     * Kind
+     */
+    kind: 'simple_input' | 'scenario';
+    run: EvalRunRecord;
+};
+
+/**
  * EvalAuthoredSuiteCatalogEntry
  */
 export type EvalAuthoredSuiteCatalogEntry = {
@@ -3707,6 +3722,84 @@ export type EvalAuthoredSuiteCatalogPage = {
      * Next Cursor
      */
     next_cursor?: string | null;
+};
+
+/**
+ * EvalAuthoredSuiteLaunchDiagnostic
+ */
+export type EvalAuthoredSuiteLaunchDiagnostic = {
+    /**
+     * Case Id
+     */
+    case_id?: string | null;
+    /**
+     * Code
+     */
+    code: 'one_trial_required' | 'simple_launch_not_ready' | 'scenario_execution_unavailable' | 'scenario_launch_not_ready';
+    /**
+     * Message
+     */
+    message: string;
+};
+
+/**
+ * EvalAuthoredSuiteLaunchPlanItem
+ */
+export type EvalAuthoredSuiteLaunchPlanItem = {
+    /**
+     * Case Ids
+     */
+    case_ids: Array<string>;
+    /**
+     * Kind
+     */
+    kind: 'simple_input' | 'scenario';
+    /**
+     * Scenario Revision
+     */
+    scenario_revision?: string | null;
+};
+
+/**
+ * EvalAuthoredSuiteRunLaunchResponse
+ */
+export type EvalAuthoredSuiteRunLaunchResponse = {
+    /**
+     * Runs
+     */
+    runs: Array<EvalAuthoredSuiteAdmittedRun>;
+    selection: EvalSuiteSelectionV1;
+};
+
+/**
+ * EvalAuthoredSuiteRunPreviewResponse
+ */
+export type EvalAuthoredSuiteRunPreviewResponse = {
+    /**
+     * Diagnostics
+     */
+    diagnostics?: Array<EvalAuthoredSuiteLaunchDiagnostic>;
+    /**
+     * Launches
+     */
+    launches: Array<EvalAuthoredSuiteLaunchPlanItem>;
+    /**
+     * Ready
+     */
+    ready: boolean;
+    selection: EvalSuiteSelectionV1;
+};
+
+/**
+ * EvalAuthoredSuiteRunSelectionRequest
+ *
+ * Select all or an explicit non-empty subset of one stored suite revision.
+ */
+export type EvalAuthoredSuiteRunSelectionRequest = {
+    /**
+     * Case Ids
+     */
+    case_ids?: Array<string> | null;
 };
 
 /**
@@ -4436,6 +4529,14 @@ export type EvalRunFailureCode = 'target_unavailable' | 'corpus_unavailable' | '
  * ``None`` bounds inherit the server-owned target request base.
  */
 export type EvalRunInvocation = {
+    /**
+     * Authored Suite Revision
+     */
+    authored_suite_revision?: string | null;
+    /**
+     * Authored Suite Selection Revision
+     */
+    authored_suite_selection_revision?: string | null;
     cost_budget?: EvalRunCostBudgetOutput | null;
     limits?: RunLimits | null;
     /**
@@ -4873,6 +4974,14 @@ export type EvalScenarioRunInvocation = {
      * Artifact References
      */
     artifact_references?: Array<EvalScenarioArtifactReference>;
+    /**
+     * Authored Case Revision
+     */
+    authored_case_revision?: string | null;
+    /**
+     * Authored Suite Revision
+     */
+    authored_suite_revision?: string | null;
     /**
      * Binding Revision
      */
@@ -5599,7 +5708,7 @@ export type EvaluationPromotionSuiteDraft = {
 /**
  * EvaluationSourceIdentityV1
  *
- * Diagnostic capture provenance without runtime or session authority.
+ * Diagnostic capture or authored-definition provenance without runtime authority.
  */
 export type EvaluationSourceIdentityV1 = {
     /**
@@ -12947,6 +13056,100 @@ export type DownloadEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionDownloadGetRespo
      */
     200: unknown;
 };
+
+export type LaunchEvalAuthoredSuiteRunApiEvalsSuitesSuiteRevisionRunsPostData = {
+    body: EvalAuthoredSuiteRunSelectionRequest;
+    headers: {
+        /**
+         * Idempotency-Key
+         */
+        'Idempotency-Key': string;
+    };
+    path: {
+        /**
+         * Suite Revision
+         */
+        suite_revision: string;
+    };
+    query?: never;
+    url: '/api/evals/suites/{suite_revision}/runs';
+};
+
+export type LaunchEvalAuthoredSuiteRunApiEvalsSuitesSuiteRevisionRunsPostErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type LaunchEvalAuthoredSuiteRunApiEvalsSuitesSuiteRevisionRunsPostResponses = {
+    /**
+     * Successful Response
+     */
+    202: EvalAuthoredSuiteRunLaunchResponse;
+};
+
+export type LaunchEvalAuthoredSuiteRunApiEvalsSuitesSuiteRevisionRunsPostResponse = LaunchEvalAuthoredSuiteRunApiEvalsSuitesSuiteRevisionRunsPostResponses[keyof LaunchEvalAuthoredSuiteRunApiEvalsSuitesSuiteRevisionRunsPostResponses];
+
+export type PreviewEvalAuthoredSuiteRunApiEvalsSuitesSuiteRevisionRunsPreviewPostData = {
+    body: EvalAuthoredSuiteRunSelectionRequest;
+    path: {
+        /**
+         * Suite Revision
+         */
+        suite_revision: string;
+    };
+    query?: never;
+    url: '/api/evals/suites/{suite_revision}/runs/preview';
+};
+
+export type PreviewEvalAuthoredSuiteRunApiEvalsSuitesSuiteRevisionRunsPreviewPostErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type PreviewEvalAuthoredSuiteRunApiEvalsSuitesSuiteRevisionRunsPreviewPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalAuthoredSuiteRunPreviewResponse;
+};
+
+export type PreviewEvalAuthoredSuiteRunApiEvalsSuitesSuiteRevisionRunsPreviewPostResponse = PreviewEvalAuthoredSuiteRunApiEvalsSuitesSuiteRevisionRunsPreviewPostResponses[keyof PreviewEvalAuthoredSuiteRunApiEvalsSuitesSuiteRevisionRunsPreviewPostResponses];
 
 export type ListEvalTargetsApiEvalsTargetsGetData = {
     body?: never;

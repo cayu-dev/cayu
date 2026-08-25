@@ -157,7 +157,13 @@ stimulus:
 `compile_eval_suite_draft(...)` sorts cases by stable ID and computes immutable
 case, suite-spec, and complete suite-document revisions. Captured source
 identity is optional for authored cases; Cayu does not fabricate production
-provenance for a fresh input. `add_eval_case(...)`, `duplicate_eval_case(...)`,
+provenance for a fresh input. When a source-less authored case is adapted to the
+existing corpus runner, Cayu uses an explicitly domain-tagged authored-definition
+identity derived only from the immutable case revision. It never claims that
+identity is an application release or production capture, and it remains stable
+across real application releases so the same saved suite can serve as a
+regression contract. The fresh result separately records the actual execution
+release and AppManifest. `add_eval_case(...)`, `duplicate_eval_case(...)`,
 and `revise_eval_case(...)` return new immutable suite revisions. Case revision
 checks reject stale edits without changing prior results.
 
@@ -174,6 +180,75 @@ boundary, and atomically verifies every scenario reference. SQLite and
 PostgreSQL persistence requires storage revision 64. These authoring contracts
 do not create provider, tool, environment, fixture, secret, or runtime
 authority, and they do not change the existing one-trial execution default.
+
+### Control Plane: create and run an evaluation
+
+For an ordinary project started with `cayu serve`, users do not need to write an
+Evals-specific Python suite. Select a server-published target on the **Evals**
+page and choose **New evaluation**. The authoring sheet supports the complete
+deterministic workflow:
+
+1. name a reusable suite and set its per-case timeout;
+2. add, duplicate, remove, and select cases;
+3. enter one or more ordered user messages for a simple fresh session, or build
+   and save a controlled multi-stage scenario;
+4. define expected behavior with status, output, tool, model-step, usage, token,
+   and cost assertions;
+5. check current target and scenario readiness, save the reviewed immutable
+   suite revision, and check either the full suite or an explicit subset;
+6. launch the selected cases and follow the resulting durable run in the normal
+   Runs and Results views.
+
+Saved revisions remain in the authoring catalog and can be loaded, revised into
+a new immutable revision, or run again. A launch freezes an
+`EvalSuiteSelectionV1`, so a subset always records the exact suite and case
+revisions that were reviewed. A completed result can use the existing baseline,
+comparison, JSON-report, and HTML-report workflow.
+
+Editing a saved scenario immediately makes prior suite and launch readiness
+stale. Save the new scenario revision, check and save the resulting suite
+revision, and check launch readiness again before execution. Dirty scenario
+work also locks case and suite transitions until the operator explicitly saves
+or discards it, so changing views cannot silently lose a child-editor draft.
+While a scenario operation is pending, the complete parent form remains locked
+so a late response cannot be attached to a different case identity, draft, or
+selection. Editable portable case IDs are not browser row identity: temporary
+invalid or duplicate IDs do not move the active editor, change case selection,
+or cross-wire in-progress scenario state while the operator corrects them.
+Within suite authoring, an artifact override remains transient until **Prepare
+fixture** embeds its reusable retained reference in the scenario. The scenario
+cannot be saved into the suite, and parent transitions remain locked, until
+every nonblank override has been materialized this way.
+
+Simple-input cases in one selection execute together as one ordinary corpus
+run. Each selected multi-stage scenario executes as its own restart-safe
+scenario run because it has independent progress, approval, resume, and fixture
+state. One launch response maps every selected case to its resulting run; mixed
+selections therefore remain one user action without pretending that separately
+recoverable scenarios share one runtime state machine.
+
+Control Plane-authored suite launches currently use exactly one trial per case,
+and every admitted run has maximum concurrency one. Simple cases share one run;
+each independently recoverable scenario has its own run, so deployments with
+multiple coordinators may process those durable runs independently. The browser
+exposes only deterministic assertions in this workflow; portable model-judge
+assertions still require a trusted server-resolved evaluator and are not
+silently fabricated by the client.
+
+The protected HTTP contract mirrors the same review boundary:
+
+- `POST /api/evals/suites/preview` canonicalizes an unsaved draft;
+- `POST /api/evals/suites` saves the exact reviewed revision;
+- `GET /api/evals/suites` and `GET /api/evals/suites/{revision}` list and load
+  reusable immutable suites;
+- `POST /api/evals/suites/{revision}/runs/preview` freezes and preflights a full
+  or subset selection;
+- `POST /api/evals/suites/{revision}/runs` admits that selection with an
+  `Idempotency-Key`.
+
+These routes select existing server-owned application authority. They never
+accept providers, secrets, tool implementations, environment objects, database
+connections, or callbacks from the browser.
 
 ## Portable corpus documents
 
@@ -1435,6 +1510,13 @@ file bytes unchanged so
 the server's strict duplicate-key, UTF-8, portable-JSON, and corpus validation
 remains authoritative. Mutation controls remain disabled when
 `surfaces.evals.mutate` is unavailable even when catalog reads are allowed.
+
+The same page also provides **New evaluation** for an author-first path that
+does not depend on an imported corpus or captured production session. Its
+bounded editor previews and saves immutable suite and scenario definitions,
+preflights a full or explicit subset selection against current target
+authority, and admits the selection through the existing durable workers. It
+does not maintain a browser-only definition format or execution engine.
 
 Launches use a cryptographically random `Idempotency-Key`. If a response is
 ambiguous, retrying the unchanged launch reuses that key rather than duplicating

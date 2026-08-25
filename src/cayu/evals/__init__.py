@@ -467,6 +467,11 @@ from cayu.evals.suite_authoring import (
     validate_eval_suite_selection,
     validate_expected_eval_suite_revision,
 )
+from cayu.evals.suite_execution import (
+    authored_suite_launch_settings,
+    corpus_for_authored_scenario_case,
+    corpus_for_authored_simple_selection,
+)
 from cayu.evals.testing import ScriptedModelProvider, scripted_structured_output
 from cayu.evals.trajectory import (
     SessionTrajectoryBounds,
@@ -806,6 +811,7 @@ __all__ = [
     "WorkspaceFileProbe",
     "add_eval_case",
     "assertion_spec_revision",
+    "authored_suite_launch_settings",
     "build_captured_evaluation_candidate",
     "build_promotion_candidate",
     "capture_eval_scenario_from_session",
@@ -824,6 +830,8 @@ __all__ = [
     "corpus_execution_compatibility",
     "corpus_execution_result_from_json",
     "corpus_execution_result_to_json",
+    "corpus_for_authored_scenario_case",
+    "corpus_for_authored_simple_selection",
     "corpus_for_eval_scenario",
     "corpus_from_captured_evaluation_candidate",
     "corpus_from_promotion_candidate",

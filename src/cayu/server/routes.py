@@ -112,6 +112,7 @@ from cayu.evals.scenario_capture import capture_eval_scenario_from_session
 from cayu.evals.scenario_execution import corpus_for_eval_scenario
 from cayu.evals.scenario_preflight import (
     ScenarioArtifactMaterializationError,
+    ScenarioLaunchBindingV2,
     ScenarioLaunchSettingsV2,
     materialize_eval_scenario_artifact_fixture,
     preflight_eval_scenario,
@@ -162,11 +163,18 @@ from cayu.evals.store import (
     authored_suite_scenario_cases,
 )
 from cayu.evals.suite_authoring import (
+    EvalScenarioStimulusV1,
+    EvalSimpleInputStimulusV1,
     EvalSuiteDocumentV1,
     compile_eval_suite_draft,
     eval_suite_document_to_json,
     eval_suite_selection,
     validate_expected_eval_suite_revision,
+)
+from cayu.evals.suite_execution import (
+    authored_suite_launch_settings,
+    corpus_for_authored_scenario_case,
+    corpus_for_authored_simple_selection,
 )
 from cayu.evals.trajectory import (
     SessionTrajectoryError,
@@ -356,6 +364,12 @@ from cayu.server.contracts import (
     CausalBudgetSummaryResponse,
     ClientGenerationContract,
     EnvironmentsResponse,
+    EvalAuthoredSuiteAdmittedRun,
+    EvalAuthoredSuiteLaunchDiagnostic,
+    EvalAuthoredSuiteLaunchPlanItem,
+    EvalAuthoredSuiteRunLaunchResponse,
+    EvalAuthoredSuiteRunPreviewResponse,
+    EvalAuthoredSuiteRunSelectionRequest,
     EvalBaselineSelectionRequest,
     EvalBaselineSelectionResponse,
     EvalComparisonRequest,
@@ -5225,6 +5239,8 @@ def create_router(
             limits: RunLimits | None,
             cost_budget: EvalRunCostBudget | None,
             scenario: EvalScenarioRunInvocation | None = None,
+            authored_suite_revision: str | None = None,
+            authored_suite_selection_revision: str | None = None,
         ) -> EvalRunInvocation:
             try:
                 origin = (
@@ -5242,6 +5258,8 @@ def create_router(
                     max_steps=max_steps,
                     limits=limits,
                     cost_budget=cost_budget,
+                    authored_suite_revision=authored_suite_revision,
+                    authored_suite_selection_revision=(authored_suite_selection_revision),
                     scenario=scenario,
                 )
             except (TypeError, ValueError) as exc:
@@ -5250,19 +5268,33 @@ def create_router(
                     detail="Eval execution bounds or authenticated provenance are invalid.",
                 ) from exc
 
-        def _eval_idempotency_digest(target_key: str, idempotency_key: str) -> str:
+        def _eval_idempotency_digest(
+            target_key: str,
+            idempotency_key: str,
+            *,
+            namespace: str | None = None,
+        ) -> str:
             try:
                 clean_key = require_clean_nonblank(idempotency_key, "Idempotency-Key")
                 require_unicode_scalar_text(clean_key, "Idempotency-Key")
             except (TypeError, ValueError) as exc:
                 raise HTTPException(status_code=400, detail="Invalid Idempotency-Key.") from exc
+            if namespace is None:
+                domain = b"cayu-server-eval-idempotency-v1\0"
+            else:
+                try:
+                    clean_namespace = require_clean_nonblank(
+                        namespace,
+                        "internal eval idempotency namespace",
+                    )
+                    namespace_bytes = clean_namespace.encode("ascii")
+                except (TypeError, UnicodeEncodeError, ValueError) as exc:
+                    raise RuntimeError("Invalid internal eval idempotency namespace.") from exc
+                domain = b"cayu-server-eval-idempotency-v1\0internal\0" + namespace_bytes + b"\0"
             return (
                 "sha256:"
                 + hashlib.sha256(
-                    b"cayu-server-eval-idempotency-v1\0"
-                    + target_key.encode("ascii")
-                    + b"\0"
-                    + clean_key.encode("utf-8")
+                    domain + target_key.encode("ascii") + b"\0" + clean_key.encode("utf-8")
                 ).hexdigest()
             )
 
@@ -5272,6 +5304,7 @@ def create_router(
             max_concurrency: int,
             invocation: EvalRunInvocation,
             idempotency_key: str,
+            idempotency_namespace: str | None = None,
             eval_target: CorpusTarget,
             compiled: CompiledCorpusSuite,
         ) -> EvalRunRecord:
@@ -5288,6 +5321,7 @@ def create_router(
                 idempotency_key=_eval_idempotency_digest(
                     eval_target.key,
                     idempotency_key,
+                    namespace=idempotency_namespace,
                 ),
             )
             try:
@@ -5671,6 +5705,172 @@ def create_router(
                 raise HTTPException(status_code=404, detail="Authored eval suite not found.")
             return suite
 
+        async def _preview_authored_suite_launch(
+            suite: EvalSuiteDocumentV1,
+            case_ids: tuple[str, ...] | None,
+        ) -> tuple[
+            EvalAuthoredSuiteRunPreviewResponse,
+            dict[str, tuple[EvalScenarioDocumentV2, ScenarioLaunchBindingV2]],
+        ]:
+            try:
+                selection = eval_suite_selection(suite, case_ids)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Authored eval suite selection is invalid.",
+                ) from exc
+            selected_ids = {item.id for item in selection.cases}
+            selected_cases = tuple(case for case in suite.cases if case.id in selected_ids)
+            simple_cases = tuple(
+                case for case in selected_cases if type(case.stimulus) is EvalSimpleInputStimulusV1
+            )
+            scenario_cases = tuple(
+                case for case in selected_cases if type(case.stimulus) is EvalScenarioStimulusV1
+            )
+            launches: list[EvalAuthoredSuiteLaunchPlanItem] = []
+            if simple_cases:
+                launches.append(
+                    EvalAuthoredSuiteLaunchPlanItem(
+                        kind="simple_input",
+                        case_ids=tuple(case.id for case in simple_cases),
+                    )
+                )
+            launches.extend(
+                EvalAuthoredSuiteLaunchPlanItem(
+                    kind="scenario",
+                    case_ids=(case.id,),
+                    scenario_revision=case.stimulus.scenario_revision,
+                )
+                for case in scenario_cases
+                if type(case.stimulus) is EvalScenarioStimulusV1
+            )
+            diagnostics: list[EvalAuthoredSuiteLaunchDiagnostic] = []
+            if suite.suite.trial_request.trials != 1:
+                diagnostics.append(
+                    EvalAuthoredSuiteLaunchDiagnostic(
+                        code="one_trial_required",
+                        message=(
+                            "Control Plane authored-suite launch currently requires exactly "
+                            "one trial. Revise this suite to one trial before launching."
+                        ),
+                    )
+                )
+            registration = active_eval_registry.registration(suite.target_key)
+            if registration is None:
+                raise HTTPException(status_code=404, detail="Authored eval suite not found.")
+            if simple_cases and not diagnostics:
+                try:
+                    simple_selection = eval_suite_selection(
+                        suite,
+                        tuple(case.id for case in simple_cases),
+                    )
+                    corpus = await asyncio.to_thread(
+                        corpus_for_authored_simple_selection,
+                        suite,
+                        simple_selection,
+                        registration.target,
+                        project_root=registration.manifest_project_root,
+                    )
+                    await asyncio.to_thread(
+                        compile_corpus_suite,
+                        corpus,
+                        registration.target,
+                        suite.suite.id,
+                    )
+                except (TypeError, ValueError):
+                    diagnostics.append(
+                        EvalAuthoredSuiteLaunchDiagnostic(
+                            code="simple_launch_not_ready",
+                            message=(
+                                "The selected simple cases are incompatible with the current "
+                                "target, evidence policy, pricing, or execution limits."
+                            ),
+                        )
+                    )
+            prepared_scenarios: dict[
+                str,
+                tuple[EvalScenarioDocumentV2, ScenarioLaunchBindingV2],
+            ] = {}
+            if scenario_cases and not eval_store.scenario_execution:
+                diagnostics.append(
+                    EvalAuthoredSuiteLaunchDiagnostic(
+                        code="scenario_execution_unavailable",
+                        message="Durable scenario execution is not available in this deployment.",
+                    )
+                )
+            elif scenario_cases and not diagnostics:
+                settings = authored_suite_launch_settings(suite)
+                preflight_limit = asyncio.Semaphore(16)
+
+                async def prepare_scenario(case):
+                    stimulus = case.stimulus
+                    assert type(stimulus) is EvalScenarioStimulusV1
+                    async with preflight_limit:
+                        try:
+                            scenario = await eval_store.load_scenario(stimulus.scenario_revision)
+                            if scenario is None:
+                                raise ValueError("scenario unavailable")
+                            preflight = await preflight_eval_scenario(
+                                scenario,
+                                registration.target,
+                                settings,
+                                actor_authorized=True,
+                                project_root=registration.manifest_project_root,
+                            )
+                            if not preflight.ready or preflight.binding is None:
+                                detail = (
+                                    preflight.diagnostics[0].message
+                                    if preflight.diagnostics
+                                    else "Current scenario launch requirements are not ready."
+                                )
+                                return case.id, None, detail
+                            corpus = await asyncio.to_thread(
+                                corpus_for_authored_scenario_case,
+                                suite,
+                                case.id,
+                                scenario,
+                                preflight.binding,
+                                registration.target,
+                                project_root=registration.manifest_project_root,
+                            )
+                            await asyncio.to_thread(
+                                compile_corpus_suite,
+                                corpus,
+                                registration.target,
+                                suite.suite.id,
+                            )
+                            return case.id, (scenario, preflight.binding), None
+                        except Exception:
+                            return (
+                                case.id,
+                                None,
+                                "The exact scenario is unavailable or incompatible with current authority.",
+                            )
+
+                prepared = await asyncio.gather(
+                    *(prepare_scenario(case) for case in scenario_cases)
+                )
+                for case_id, material, message in prepared:
+                    if material is None:
+                        diagnostics.append(
+                            EvalAuthoredSuiteLaunchDiagnostic(
+                                code="scenario_launch_not_ready",
+                                case_id=case_id,
+                                message=message,
+                            )
+                        )
+                    else:
+                        prepared_scenarios[case_id] = material
+            return (
+                EvalAuthoredSuiteRunPreviewResponse(
+                    selection=selection,
+                    ready=not diagnostics,
+                    launches=tuple(launches),
+                    diagnostics=tuple(diagnostics),
+                ),
+                prepared_scenarios,
+            )
+
         @bounded_evals_router.post(
             "/evals/suites/preview",
             response_model=EvalSuitePreviewResponse,
@@ -5839,6 +6039,170 @@ def create_router(
                         f'{suite.revision[7:19]}.eval-suite.json"'
                     )
                 },
+            )
+
+        @bounded_evals_router.post(
+            "/evals/suites/{suite_revision}/runs/preview",
+            response_model=EvalAuthoredSuiteRunPreviewResponse,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def preview_eval_authored_suite_run(
+            suite_revision: str,
+            body: EvalAuthoredSuiteRunSelectionRequest,
+        ) -> EvalAuthoredSuiteRunPreviewResponse:
+            suite = await _load_authored_suite(suite_revision)
+            preview, _ = await _preview_authored_suite_launch(suite, body.case_ids)
+            return preview
+
+        @bounded_evals_router.post(
+            "/evals/suites/{suite_revision}/runs",
+            response_model=EvalAuthoredSuiteRunLaunchResponse,
+            status_code=202,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def launch_eval_authored_suite_run(
+            suite_revision: str,
+            body: EvalAuthoredSuiteRunSelectionRequest,
+            idempotency_key: Annotated[
+                str,
+                Header(alias="Idempotency-Key", min_length=1, max_length=512),
+            ],
+            auth_context: AuthContext | None = optional_auth_context,
+        ) -> EvalAuthoredSuiteRunLaunchResponse:
+            suite = await _load_authored_suite(suite_revision)
+            preview, prepared_scenarios = await _preview_authored_suite_launch(
+                suite,
+                body.case_ids,
+            )
+            if not preview.ready:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Authored eval suite launch requirements are not currently ready.",
+                )
+            registration = active_eval_registry.registration(suite.target_key)
+            if registration is None:
+                raise HTTPException(status_code=404, detail="Authored eval suite not found.")
+            cases_by_id = {case.id: case for case in suite.cases}
+            prepared_runs = []
+            for plan in preview.launches:
+                if plan.kind == "simple_input":
+                    selection = eval_suite_selection(suite, plan.case_ids)
+                    invocation = _eval_run_invocation(
+                        auth_context,
+                        max_steps=None,
+                        limits=None,
+                        cost_budget=None,
+                        authored_suite_revision=suite.revision,
+                        authored_suite_selection_revision=preview.selection.revision,
+                    )
+                    effective_target = target_for_eval_invocation(
+                        registration.target,
+                        invocation,
+                    )
+                    corpus = await asyncio.to_thread(
+                        corpus_for_authored_simple_selection,
+                        suite,
+                        selection,
+                        effective_target,
+                        project_root=registration.manifest_project_root,
+                    )
+                else:
+                    case_id = plan.case_ids[0]
+                    case = cases_by_id[case_id]
+                    scenario, binding = prepared_scenarios[case_id]
+                    scenario_invocation = EvalScenarioRunInvocation(
+                        scenario_revision=scenario.revision,
+                        binding_revision=binding.revision,
+                        authored_suite_revision=suite.revision,
+                        authored_case_revision=case.revision,
+                        environment_name=binding.environment_name,
+                        trials=1,
+                        timeout_seconds=binding.timeout_seconds,
+                        artifact_references=tuple(
+                            EvalScenarioArtifactReference(
+                                requirement_id=item.requirement_id,
+                                artifact_id=item.artifact_id,
+                            )
+                            for item in binding.artifacts
+                        ),
+                    )
+                    invocation = _eval_run_invocation(
+                        auth_context,
+                        max_steps=binding.max_steps,
+                        limits=binding.operator_run_limits,
+                        cost_budget=binding.cost_budget,
+                        scenario=scenario_invocation,
+                        authored_suite_revision=suite.revision,
+                        authored_suite_selection_revision=preview.selection.revision,
+                    )
+                    effective_target = target_for_eval_invocation(
+                        registration.target,
+                        invocation,
+                    )
+                    corpus = await asyncio.to_thread(
+                        corpus_for_authored_scenario_case,
+                        suite,
+                        case_id,
+                        scenario,
+                        binding,
+                        effective_target,
+                        project_root=registration.manifest_project_root,
+                    )
+                eval_target, compiled = await _prepare_eval_run(
+                    corpus=corpus,
+                    suite_id=suite.suite.id,
+                    max_concurrency=1,
+                    invocation=invocation,
+                )
+                prepared_runs.append((plan, corpus, invocation, eval_target, compiled))
+
+            for _, corpus, _, eval_target, _ in prepared_runs:
+                try:
+                    await eval_store.save_corpus(
+                        corpus,
+                        redact_json=eval_target.app.redact_json,
+                    )
+                except EvalCorpusConflict as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Derived authored-suite corpus conflicts with stored content.",
+                    ) from exc
+                except EvalStorePublicationRejected as exc:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Derived authored-suite corpus contains unsafe public data.",
+                    ) from exc
+                except EvalStoreResultTooLarge as exc:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Derived authored-suite corpus exceeds the server byte limit.",
+                    ) from exc
+
+            admitted: list[EvalAuthoredSuiteAdmittedRun] = []
+            for index, (plan, corpus, invocation, eval_target, compiled) in enumerate(
+                prepared_runs
+            ):
+                run = await _admit_eval_run(
+                    corpus=corpus,
+                    max_concurrency=1,
+                    invocation=invocation,
+                    idempotency_key=idempotency_key,
+                    idempotency_namespace=f"authored-suite-part-{index + 1}",
+                    eval_target=eval_target,
+                    compiled=compiled,
+                )
+                admitted.append(
+                    EvalAuthoredSuiteAdmittedRun(
+                        kind=plan.kind,
+                        case_ids=plan.case_ids,
+                        run=run,
+                    )
+                )
+            return EvalAuthoredSuiteRunLaunchResponse(
+                selection=preview.selection,
+                runs=tuple(admitted),
             )
 
         @bounded_evals_router.post(

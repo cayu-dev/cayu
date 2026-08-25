@@ -31,6 +31,8 @@ from cayu.evals.store import (
     EvalRunStateConflict,
     EvalRunStatus,
 )
+from cayu.evals.suite_authoring import EvalSuiteDocumentV1
+from cayu.evals.suite_execution import corpus_for_authored_scenario_case
 from cayu.server.config import EvalsConfig
 from cayu.server.evals_registry import (
     EvalTargetRegistration,
@@ -249,6 +251,18 @@ class EvalRunCoordinator:
                 return EvalRunFailureCode.CORPUS_UNAVAILABLE
             if scenario is None:
                 return EvalRunFailureCode.CORPUS_UNAVAILABLE
+            authored_suite: EvalSuiteDocumentV1 | None = None
+            if scenario_invocation.authored_suite_revision is not None:
+                try:
+                    authored_suite = await self._config.store.load_authored_suite(
+                        scenario_invocation.authored_suite_revision
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return EvalRunFailureCode.CORPUS_UNAVAILABLE
+                if authored_suite is None:
+                    return EvalRunFailureCode.CORPUS_UNAVAILABLE
             try:
                 settings = scenario_launch_settings_from_invocation(
                     scenario_invocation,
@@ -280,6 +294,7 @@ class EvalRunCoordinator:
                 corpus,
                 scenario,
                 binding,
+                authored_suite,
                 lease,
                 registration,
             )
@@ -335,6 +350,7 @@ class EvalRunCoordinator:
         corpus: EvalCorpusDocument,
         scenario: EvalScenarioDocumentV2,
         binding: ScenarioLaunchBindingV2,
+        authored_suite: EvalSuiteDocumentV1 | None,
         lease: EvalRunLease,
         registration: EvalTargetRegistration,
     ) -> _PreparedEvalRun | EvalRunFailureCode:
@@ -343,12 +359,39 @@ class EvalRunCoordinator:
                 registration.target,
                 lease.run.spec.invocation,
             )
-            expected_corpus = corpus_for_eval_scenario(
-                scenario,
-                binding,
-                target,
-                project_root=registration.manifest_project_root,
-            )
+            scenario_invocation = lease.run.spec.invocation.scenario
+            if scenario_invocation is None:
+                return EvalRunFailureCode.CORPUS_UNAVAILABLE
+            if authored_suite is None:
+                expected_corpus = corpus_for_eval_scenario(
+                    scenario,
+                    binding,
+                    target,
+                    project_root=registration.manifest_project_root,
+                )
+            else:
+                authored_case = (
+                    next(
+                        (item for item in authored_suite.cases if item.id == corpus.cases[0].id),
+                        None,
+                    )
+                    if len(corpus.cases) == 1
+                    else None
+                )
+                if (
+                    authored_suite.revision != scenario_invocation.authored_suite_revision
+                    or authored_case is None
+                    or authored_case.revision != scenario_invocation.authored_case_revision
+                ):
+                    return EvalRunFailureCode.CORPUS_UNAVAILABLE
+                expected_corpus = corpus_for_authored_scenario_case(
+                    authored_suite,
+                    corpus.cases[0].id,
+                    scenario,
+                    binding,
+                    target,
+                    project_root=registration.manifest_project_root,
+                )
             if expected_corpus != corpus:
                 return EvalRunFailureCode.CORPUS_UNAVAILABLE
             compiled = compile_corpus_suite(corpus, target, lease.run.spec.suite_id)

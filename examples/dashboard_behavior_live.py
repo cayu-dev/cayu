@@ -197,6 +197,10 @@ class DashboardContractProvider(ModelProvider):
             yield ModelStreamEvent.text_delta("dashboard eval promotion output")
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
             return
+        if "exercise one fresh control plane-authored evaluation" in request_text.lower():
+            yield ModelStreamEvent.text_delta("dashboard authored evaluation output")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+            return
         if "recover after" not in request_text:
             if "seed the dashboard approval" in request_text.lower() and not self._approval_seeded:
                 self._approval_seeded = True
@@ -1190,6 +1194,8 @@ async def _run_browser_contract(
             "session_detail",
             "captured_evaluation_preview_and_assertion_authoring",
             "scenario_authoring_and_controlled_execution",
+            "authored_eval_suite_creation_and_subset_launch",
+            "authored_eval_suite_reuse",
             "captured_result_save_and_baseline",
             "eval_result_catalog_navigation",
             "eval_catalog_import_and_download",
@@ -1559,6 +1565,247 @@ async def _exercise_captured_evaluation(
         scenario_html_download.suggested_filename,
         f"{scenario_run_id}.eval-report.html",
         "the scenario run must publish the ordinary HTML report",
+    )
+
+    await page.get_by_test_id("new-evaluation").click()
+    authoring = page.get_by_test_id("eval-suite-authoring-sheet")
+    await expect(authoring).to_be_visible()
+    await authoring.get_by_test_id("authored-suite-id").fill("authored-dashboard-regressions")
+    await authoring.get_by_test_id("authored-suite-name").fill("Authored dashboard regressions")
+    await authoring.get_by_test_id("authored-case-id").fill("authored-primary")
+    await authoring.get_by_test_id("authored-case-name").fill("Authored primary behavior")
+    await authoring.get_by_role(
+        "textbox",
+        name="Case input message 1",
+        exact=True,
+    ).fill("Exercise one fresh Control Plane-authored evaluation.")
+    await authoring.get_by_role("button", name="Add case", exact=True).click()
+    case_list = authoring.get_by_test_id("authored-suite-cases")
+    case_id_input = authoring.get_by_test_id("authored-case-id")
+    case_name_input = authoring.get_by_test_id("authored-case-name")
+    await case_id_input.fill("authored-primary")
+    await expect(case_name_input).to_have_value("Case 2")
+    await expect(case_list.locator('input[type="checkbox"]:checked')).to_have_count(2)
+    await case_id_input.fill("authored-scenario")
+    await case_list.get_by_role("button").filter(has_text="Authored primary behavior").click()
+    await expect(case_id_input).to_have_value("authored-primary")
+    await case_list.get_by_role("button").filter(has_text="Case 2").click()
+    await expect(case_id_input).to_have_value("authored-scenario")
+    await authoring.get_by_role("button", name="Multi-stage scenario", exact=True).click()
+    await expect(authoring.get_by_test_id("authored-suite-scenario-lock")).to_be_visible()
+    await expect(authoring.get_by_role("button", name="New", exact=True)).to_be_disabled()
+    await expect(authoring.get_by_role("button", name="Add case", exact=True)).to_be_disabled()
+    await expect(authoring.get_by_test_id("authored-case-id")).to_be_disabled()
+    await authoring.get_by_role("button", name="Discard scenario edits", exact=True).click()
+    await expect(authoring.get_by_test_id("authored-simple-input")).to_be_visible()
+    await expect(authoring.get_by_test_id("authored-suite-scenario-lock")).not_to_be_visible()
+    await expect(authoring.get_by_role("button", name="Add case", exact=True)).to_be_enabled()
+    await authoring.get_by_role("button", name="Multi-stage scenario", exact=True).click()
+    authored_scenario = authoring.get_by_test_id("scenario-authoring")
+    authored_initial_event = authored_scenario.get_by_test_id("scenario-event-0")
+    await authored_initial_event.locator("textarea").fill(
+        "Exercise one Control Plane-authored multi-stage scenario."
+    )
+    await authored_scenario.get_by_role("button", name="Check readiness", exact=True).click()
+    await expect(
+        authored_scenario.get_by_text("Current launch requirements are ready", exact=True)
+    ).to_be_visible()
+    await authored_scenario.get_by_role("button", name="Save scenario", exact=True).click()
+    await expect(
+        authoring.get_by_text(re.compile(r"Saved scenario .+ for authored-scenario\."))
+    ).to_be_visible()
+    await authoring.get_by_label("Select Case 2 for launch", exact=True).uncheck()
+    await authoring.get_by_test_id("authored-suite-preview").click()
+    await expect(authoring.get_by_text("Suite is ready to save", exact=True)).to_be_visible()
+    suite_save_started = asyncio.Event()
+    release_suite_save = asyncio.Event()
+
+    async def delay_authored_suite_save(route, request) -> None:
+        if request.method != "POST":
+            await route.continue_()
+            return
+        suite_save_started.set()
+        await release_suite_save.wait()
+        await route.continue_()
+
+    authored_suite_path = "**/api/evals/suites"
+    await page.route(authored_suite_path, delay_authored_suite_save)
+    try:
+        await authoring.get_by_test_id("authored-suite-save").click()
+        await asyncio.wait_for(suite_save_started.wait(), timeout=5)
+        try:
+            await expect(authoring.get_by_role("button", name="New", exact=True)).to_be_disabled()
+            await expect(
+                authoring.get_by_role("button", name="Add case", exact=True)
+            ).to_be_disabled()
+            await expect(
+                authoring.get_by_label(
+                    "Select Authored primary behavior for launch",
+                    exact=True,
+                )
+            ).to_be_disabled()
+        finally:
+            release_suite_save.set()
+        await expect(
+            authoring.get_by_text(re.compile(r"Saved immutable suite .+\."))
+        ).to_be_visible()
+    finally:
+        release_suite_save.set()
+        await page.unroute(authored_suite_path, delay_authored_suite_save)
+    await authoring.get_by_test_id("authored-suite-run-preview").click()
+    await expect(authoring.get_by_text("1 durable run ready", exact=True)).to_be_visible()
+    await authoring.get_by_test_id("authored-suite-launch").click()
+    await expect(
+        authoring.get_by_text(
+            "Started 1 durable eval run for 1 selected case.",
+            exact=True,
+        )
+    ).to_be_visible()
+    authored_run_ids = parse_qs(urlsplit(page.url).query).get("run", [])
+    require_equal(
+        len(authored_run_ids),
+        1,
+        "the authored subset launch must open its exact durable run",
+    )
+    authored_run_id = authored_run_ids[0]
+    await page.keyboard.press("Escape")
+    await expect(page.get_by_test_id("eval-run-status-announcement")).to_have_text(
+        "Eval run status: completed.",
+        timeout=20_000,
+    )
+    await expect(
+        page.locator('[data-slot="card-title"]').filter(has_text="Published result")
+    ).to_be_visible()
+    await expect(page.get_by_text("root_status", exact=True)).to_be_visible()
+
+    await page.get_by_test_id("new-evaluation").click()
+    authoring = page.get_by_test_id("eval-suite-authoring-sheet")
+    await authoring.get_by_role(
+        "button",
+        name=re.compile(r"^Authored dashboard regressions\b"),
+    ).click()
+    await expect(authoring.get_by_text(re.compile(r"Loaded immutable suite .+\."))).to_be_visible()
+    await authoring.get_by_test_id("authored-suite-preview").click()
+    await expect(authoring.get_by_text("Suite is ready to save", exact=True)).to_be_visible()
+    await authoring.get_by_test_id("authored-suite-run-preview").click()
+    await expect(authoring.get_by_text("2 durable runs ready", exact=True)).to_be_visible()
+    scenario_case_button = (
+        authoring.get_by_test_id("authored-suite-cases")
+        .get_by_role("button")
+        .filter(has_text="Case 2")
+    )
+    await scenario_case_button.click()
+    revised_scenario = authoring.get_by_test_id("scenario-authoring")
+    scenario_preview_started = asyncio.Event()
+    release_scenario_preview = asyncio.Event()
+
+    async def delay_clean_scenario_preview(route, request) -> None:
+        if request.method != "POST":
+            await route.continue_()
+            return
+        scenario_preview_started.set()
+        await release_scenario_preview.wait()
+        await route.continue_()
+
+    authored_scenario_preview_path = "**/api/evals/scenarios/preview"
+    await page.route(authored_scenario_preview_path, delay_clean_scenario_preview)
+    try:
+        await revised_scenario.get_by_role("button", name="Check readiness", exact=True).click()
+        await asyncio.wait_for(scenario_preview_started.wait(), timeout=5)
+        try:
+            await expect(authoring.get_by_test_id("authored-suite-preview")).to_be_disabled()
+            await expect(authoring.get_by_test_id("authored-suite-save")).to_be_disabled()
+            await expect(authoring.get_by_test_id("authored-suite-run-preview")).to_be_disabled()
+            await expect(authoring.get_by_test_id("authored-suite-launch")).to_be_disabled()
+        finally:
+            release_scenario_preview.set()
+        await expect(
+            revised_scenario.get_by_text("Current launch requirements are ready", exact=True)
+        ).to_be_visible()
+    finally:
+        release_scenario_preview.set()
+        await page.unroute(authored_scenario_preview_path, delay_clean_scenario_preview)
+
+    revised_scenario_input = revised_scenario.get_by_test_id("scenario-event-0").locator("textarea")
+    await revised_scenario_input.fill(
+        "Exercise revised Control Plane-authored multi-stage behavior."
+    )
+    await expect(authoring.get_by_test_id("authored-suite-scenario-lock")).to_be_visible()
+    await expect(authoring.get_by_role("button", name="New", exact=True)).to_be_disabled()
+    await expect(authoring.get_by_role("button", name="Add case", exact=True)).to_be_disabled()
+    await expect(scenario_case_button).to_be_disabled()
+    await expect(authoring.get_by_test_id("authored-case-id")).to_be_disabled()
+    await expect(authoring.get_by_test_id("authored-suite-preview")).to_be_disabled()
+    await expect(authoring.get_by_test_id("authored-suite-save")).to_be_disabled()
+    await expect(authoring.get_by_test_id("authored-suite-run-preview")).to_be_disabled()
+    await expect(authoring.get_by_test_id("authored-suite-launch")).to_be_disabled()
+    await authoring.get_by_role("button", name="Discard scenario edits", exact=True).click()
+    await expect(revised_scenario_input).to_have_value(
+        "Exercise one Control Plane-authored multi-stage scenario."
+    )
+    await expect(authoring.get_by_test_id("authored-suite-scenario-lock")).not_to_be_visible()
+    await expect(scenario_case_button).to_be_enabled()
+    await expect(authoring.get_by_test_id("authored-case-id")).to_be_enabled()
+    await revised_scenario_input.fill(
+        "Exercise revised Control Plane-authored multi-stage behavior."
+    )
+    await expect(authoring.get_by_test_id("authored-suite-scenario-lock")).to_be_visible()
+
+    await revised_scenario.get_by_role("button", name="Check readiness", exact=True).click()
+    await expect(
+        revised_scenario.get_by_text("Current launch requirements are ready", exact=True)
+    ).to_be_visible()
+    scenario_save_started = asyncio.Event()
+    release_scenario_save = asyncio.Event()
+
+    async def delay_revised_scenario_save(route, request) -> None:
+        scenario_save_started.set()
+        await release_scenario_save.wait()
+        await route.continue_()
+
+    authored_scenario_path = "**/api/evals/scenarios"
+    await page.route(authored_scenario_path, delay_revised_scenario_save)
+    try:
+        await revised_scenario.get_by_role("button", name="Save scenario", exact=True).click()
+        await asyncio.wait_for(scenario_save_started.wait(), timeout=5)
+        try:
+            await expect(authoring.get_by_role("button", name="New", exact=True)).to_be_disabled()
+            await expect(
+                authoring.get_by_role("button", name="Add case", exact=True)
+            ).to_be_disabled()
+            await expect(scenario_case_button).to_be_disabled()
+            await expect(authoring.get_by_test_id("authored-suite-name")).to_be_disabled()
+            await expect(authoring.get_by_test_id("authored-case-id")).to_be_disabled()
+        finally:
+            release_scenario_save.set()
+        await expect(
+            authoring.get_by_text(re.compile(r"Saved scenario .+ for authored-scenario\."))
+        ).to_be_visible()
+    finally:
+        release_scenario_save.set()
+        await page.unroute(authored_scenario_path, delay_revised_scenario_save)
+
+    await expect(authoring.get_by_test_id("authored-suite-scenario-lock")).not_to_be_visible()
+    await expect(authoring.get_by_test_id("authored-suite-preview")).to_be_enabled()
+    await expect(authoring.get_by_test_id("authored-suite-run-preview")).to_be_disabled()
+    await expect(authoring.get_by_test_id("authored-suite-launch")).to_be_disabled()
+    await authoring.get_by_test_id("authored-suite-preview").click()
+    await expect(authoring.get_by_text("Suite is ready to save", exact=True)).to_be_visible()
+    await authoring.get_by_test_id("authored-suite-save").click()
+    await expect(authoring.get_by_text(re.compile(r"Saved immutable suite .+\."))).to_be_visible()
+    await authoring.get_by_test_id("authored-suite-run-preview").click()
+    await expect(authoring.get_by_text("2 durable runs ready", exact=True)).to_be_visible()
+    await authoring.get_by_test_id("authored-suite-name").fill(
+        "Authored dashboard regressions revised"
+    )
+    await authoring.get_by_test_id("authored-suite-preview").click()
+    await expect(authoring.get_by_text("Suite is ready to save", exact=True)).to_be_visible()
+    await expect(authoring.get_by_test_id("authored-suite-run-preview")).to_be_disabled()
+    await expect(authoring.get_by_test_id("authored-suite-launch")).to_be_disabled()
+    await page.keyboard.press("Escape")
+    require(
+        authored_run_id in page.url,
+        "reviewing a reusable authored suite must not replace the selected run",
     )
     provider.block_next_promotion_run = True
 

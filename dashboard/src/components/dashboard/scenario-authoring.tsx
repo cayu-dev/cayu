@@ -32,6 +32,7 @@ import {
   saveEvalScenario,
 } from "@/lib/api"
 import { dashboardConfig } from "@/lib/config"
+import { scenarioArtifactBindingsRequireMaterialization } from "@/lib/eval-suite-authoring"
 import {
   EvalLaunchIdempotencyRegistry,
   evalErrorMessage,
@@ -56,6 +57,11 @@ type ScenarioInputEvent = Exclude<ScenarioEvent, { tool_name: string }>
 type ScenarioMessage = ScenarioInputV2["messages"][number]
 type ScenarioPart = ScenarioMessage["content"][number]
 type InputEventKind = "initial" | "queued" | "resumed"
+
+export type ScenarioAuthoringState = Readonly<{
+  dirty: boolean
+  pending: boolean
+}>
 
 type ScenarioSettingsDraft = {
   environmentName: string
@@ -91,9 +97,12 @@ function clone<T>(value: T): T {
   return structuredClone(value)
 }
 
-function draftFromScenario(scenario: EvalScenario): EvalScenarioDraft {
-  const { revision: _revision, schema_version: _schemaVersion, ...draft } = scenario
-  return clone(draft)
+function draftFromScenario(scenario: EvalScenario | EvalScenarioDraft): EvalScenarioDraft {
+  if ("revision" in scenario) {
+    const { revision: _revision, schema_version: _schemaVersion, ...draft } = scenario
+    return clone(draft)
+  }
+  return clone(scenario)
 }
 
 function eventKind(event: ScenarioEvent): ScenarioEvent["kind"] {
@@ -244,10 +253,18 @@ export function ScenarioAuthoring({
   captured,
   disabled = false,
   saved = false,
+  showLaunch = true,
+  showLaunchSettings = true,
+  onSaved,
+  onAuthoringStateChange,
 }: {
-  captured: EvalScenario
+  captured: EvalScenario | EvalScenarioDraft
   disabled?: boolean
   saved?: boolean
+  showLaunch?: boolean
+  showLaunchSettings?: boolean
+  onSaved?: (scenario: EvalScenario) => void
+  onAuthoringStateChange?: (state: ScenarioAuthoringState) => void
 }) {
   const queryClient = useQueryClient()
   const formId = useId()
@@ -261,8 +278,10 @@ export function ScenarioAuthoring({
   const [pending, setPending] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
-  const [savedRevision, setSavedRevision] = useState<string | null>(
-    saved ? captured.revision : null,
+  const capturedRevision = "revision" in captured ? captured.revision : null
+  const [savedRevision, setSavedRevision] = useState<string | null>(saved ? capturedRevision : null)
+  const [savedDraftIdentity, setSavedDraftIdentity] = useState<string | null>(() =>
+    saved ? JSON.stringify(draftFromScenario(captured)) : null,
   )
   const [invalidJsonEditors, setInvalidJsonEditors] = useState(0)
   const controllerRef = useRef<AbortController | null>(null)
@@ -271,6 +290,7 @@ export function ScenarioAuthoring({
     queryKey: ["environments"],
     queryFn: fetchEnvironments,
     staleTime: 15_000,
+    enabled: showLaunchSettings,
   })
   const targets = useQuery({
     queryKey: ["evals", "targets"],
@@ -281,6 +301,16 @@ export function ScenarioAuthoring({
     (target) => target.target_key === draft.target_key,
   )
   const currentIdentity = useMemo(() => JSON.stringify([draft, settings]), [draft, settings])
+  const draftIdentity = useMemo(() => JSON.stringify(draft), [draft])
+  const hasUnmaterializedArtifactBindings = scenarioArtifactBindingsRequireMaterialization(
+    settings.artifactReferences,
+    !showLaunchSettings,
+  )
+  const dirty =
+    savedDraftIdentity === null ||
+    draftIdentity !== savedDraftIdentity ||
+    invalidJsonEditors > 0 ||
+    hasUnmaterializedArtifactBindings
   const previewCurrent =
     preview !== null && previewIdentity === currentIdentity && invalidJsonEditors === 0
   const settingsValue = settingsContract(settings, selectedTarget)
@@ -294,8 +324,9 @@ export function ScenarioAuthoring({
     setPreviewIdentity(null)
     setError(null)
     setNotice(null)
-    setSavedRevision(saved ? captured.revision : null)
-  }, [captured, saved])
+    setSavedRevision(saved ? capturedRevision : null)
+    setSavedDraftIdentity(saved ? JSON.stringify(nextDraft) : null)
+  }, [captured, capturedRevision, saved])
   useEffect(() => {
     if (!selectedTarget) return
     setSettings((current) => {
@@ -309,6 +340,9 @@ export function ScenarioAuthoring({
       return currency === current.currency ? current : { ...current, currency }
     })
   }, [selectedTarget])
+  useEffect(() => {
+    onAuthoringStateChange?.({ dirty, pending: pending !== null })
+  }, [dirty, onAuthoringStateChange, pending])
   useEffect(() => () => controllerRef.current?.abort(), [])
 
   const run = async (name: string, action: (signal: AbortSignal) => Promise<void>) => {
@@ -359,7 +393,14 @@ export function ScenarioAuthoring({
   }, [])
 
   const save = () => {
-    if (!previewCurrent || preview === null || settingsValue === null) return
+    if (
+      !previewCurrent ||
+      preview === null ||
+      settingsValue === null ||
+      hasUnmaterializedArtifactBindings
+    ) {
+      return
+    }
     void run("save", async (signal) => {
       const saved = await saveEvalScenario(
         {
@@ -370,10 +411,15 @@ export function ScenarioAuthoring({
         signal,
       )
       if (signal.aborted) return
+      const normalizedDraft = draftFromScenario(saved.scenario)
+      const normalizedIdentity = JSON.stringify([normalizedDraft, settings])
+      setDraft(normalizedDraft)
       setPreview({ scenario: saved.scenario, preflight: saved.preflight })
-      setPreviewIdentity(currentIdentity)
+      setPreviewIdentity(normalizedIdentity)
       setSavedRevision(saved.scenario.revision)
+      setSavedDraftIdentity(JSON.stringify(normalizedDraft))
       setNotice(`Saved scenario ${shortEvalIdentity(saved.entry.revision)}.`)
+      onSaved?.(saved.scenario)
       await queryClient.invalidateQueries({ queryKey: ["evals", "scenarios"] })
     })
   }
@@ -599,7 +645,7 @@ export function ScenarioAuthoring({
             </div>
             {draft.events.map((event, index) => (
               <ScenarioEventEditor
-                key={`${captured.revision}:${event.id}`}
+                key={`${capturedRevision ?? "draft"}:${event.id}`}
                 event={event}
                 index={index}
                 eventCount={draft.events.length}
@@ -614,7 +660,7 @@ export function ScenarioAuthoring({
 
           <ScenarioRequirementsEditor draft={draft} setDraft={setDraft} />
 
-          <div className="rounded-lg border border-border p-3">
+          <div className={showLaunchSettings ? "rounded-lg border border-border p-3" : "hidden"}>
             <div className="mb-3">
               <div className="text-sm font-medium">Current launch selections</div>
               <div className="text-xs text-muted-foreground">
@@ -759,6 +805,15 @@ export function ScenarioAuthoring({
           {(draft.artifact_requirements ?? []).length > 0 && (
             <div className="space-y-2 rounded-lg border border-border p-3">
               <div className="text-sm font-medium">Artifact bindings</div>
+              {!showLaunchSettings && (
+                <p
+                  className="text-xs text-muted-foreground"
+                  data-testid="scenario-artifact-materialization-guidance"
+                >
+                  Prepare each artifact override as a reusable fixture before saving this scenario
+                  into the suite.
+                </p>
+              )}
               {(draft.artifact_requirements ?? []).map((requirement) => {
                 const diagnostic = preview?.preflight.diagnostics?.find(
                   (item) => item.requirement_id === requirement.id,
@@ -845,27 +900,31 @@ export function ScenarioAuthoring({
           </Button>
           <Button
             type="button"
-            disabled={disabled || pending !== null || !previewCurrent}
+            disabled={
+              disabled || pending !== null || !previewCurrent || hasUnmaterializedArtifactBindings
+            }
             onClick={save}
           >
             {pending === "save" ? <LoaderCircle className="animate-spin" /> : <Save />}
             {pending === "save" ? "Saving..." : "Save scenario"}
           </Button>
-          <Button
-            type="button"
-            disabled={
-              disabled ||
-              pending !== null ||
-              !previewCurrent ||
-              !preview?.preflight.ready ||
-              preview.preflight.binding == null ||
-              savedRevision !== preview.scenario.revision
-            }
-            onClick={launch}
-          >
-            {pending === "launch" ? <LoaderCircle className="animate-spin" /> : <Play />}
-            {pending === "launch" ? "Starting..." : "Run scenario"}
-          </Button>
+          {showLaunch && (
+            <Button
+              type="button"
+              disabled={
+                disabled ||
+                pending !== null ||
+                !previewCurrent ||
+                !preview?.preflight.ready ||
+                preview.preflight.binding == null ||
+                savedRevision !== preview.scenario.revision
+              }
+              onClick={launch}
+            >
+              {pending === "launch" ? <LoaderCircle className="animate-spin" /> : <Play />}
+              {pending === "launch" ? "Starting..." : "Run scenario"}
+            </Button>
+          )}
         </div>
       </CardContent>
     </Card>

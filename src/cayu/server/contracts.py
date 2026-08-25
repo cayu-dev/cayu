@@ -28,6 +28,7 @@ from cayu.core.events import EVENT_ID_MAX_CHARS
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_BYTES,
+    EVAL_CORPUS_MAX_CASES,
     EVAL_CORPUS_MAX_TIMEOUT_SECONDS,
     EVAL_CORPUS_MAX_TRIALS,
     AssertionSpec,
@@ -1434,6 +1435,114 @@ class EvalSuiteSaveResponse(ApiBaseModel):
     entry: EvalAuthoredSuiteCatalogEntry
     suite: EvalSuiteDocumentV1
     full_selection: EvalSuiteSelectionV1
+
+
+class EvalAuthoredSuiteRunSelectionRequest(ApiBaseModel):
+    """Select all or an explicit non-empty subset of one stored suite revision."""
+
+    case_ids: tuple[PromotionPortableId, ...] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=EVAL_CORPUS_MAX_CASES,
+    )
+
+    @field_validator("case_ids")
+    @classmethod
+    def validate_case_ids(
+        cls,
+        value: tuple[str, ...] | None,
+    ) -> tuple[str, ...] | None:
+        if value is None:
+            return None
+        if len(value) != len(set(value)):
+            raise ValueError("Authored suite launch case IDs must be unique.")
+        return value
+
+
+class EvalAuthoredSuiteLaunchDiagnostic(ApiBaseModel):
+    code: Literal[
+        "one_trial_required",
+        "simple_launch_not_ready",
+        "scenario_execution_unavailable",
+        "scenario_launch_not_ready",
+    ]
+    case_id: PromotionPortableId | None = None
+    message: StrictStr = Field(min_length=1, max_length=2_048)
+
+
+class EvalAuthoredSuiteLaunchPlanItem(ApiBaseModel):
+    kind: Literal["simple_input", "scenario"]
+    case_ids: tuple[PromotionPortableId, ...] = Field(
+        min_length=1,
+        max_length=EVAL_CORPUS_MAX_CASES,
+    )
+    scenario_revision: EvalRevision | None = None
+
+    @model_validator(mode="after")
+    def validate_plan_item(self) -> EvalAuthoredSuiteLaunchPlanItem:
+        if self.case_ids != tuple(sorted(set(self.case_ids))):
+            raise ValueError("Authored suite launch plan case IDs must be unique and sorted.")
+        if (self.kind == "scenario") != (self.scenario_revision is not None):
+            raise ValueError("Only authored scenario launch items require a scenario revision.")
+        if self.kind == "scenario" and len(self.case_ids) != 1:
+            raise ValueError("Each authored scenario launch item must identify exactly one case.")
+        return self
+
+
+class EvalAuthoredSuiteRunPreviewResponse(ApiBaseModel):
+    selection: EvalSuiteSelectionV1
+    ready: StrictBool
+    launches: tuple[EvalAuthoredSuiteLaunchPlanItem, ...] = Field(
+        min_length=1,
+        max_length=EVAL_CORPUS_MAX_CASES,
+    )
+    diagnostics: tuple[EvalAuthoredSuiteLaunchDiagnostic, ...] = Field(
+        default_factory=tuple,
+        max_length=EVAL_CORPUS_MAX_CASES + 1,
+    )
+
+    @model_validator(mode="after")
+    def validate_readiness(self) -> EvalAuthoredSuiteRunPreviewResponse:
+        if self.ready == bool(self.diagnostics):
+            raise ValueError("Authored suite launch readiness contradicts its diagnostics.")
+        planned = tuple(case_id for item in self.launches for case_id in item.case_ids)
+        selected = tuple(item.id for item in self.selection.cases)
+        if tuple(sorted(planned)) != selected or len(planned) != len(set(planned)):
+            raise ValueError("Authored suite launch plan does not match its immutable selection.")
+        return self
+
+
+class EvalAuthoredSuiteAdmittedRun(ApiBaseModel):
+    kind: Literal["simple_input", "scenario"]
+    case_ids: tuple[PromotionPortableId, ...] = Field(
+        min_length=1,
+        max_length=EVAL_CORPUS_MAX_CASES,
+    )
+    run: EvalRunRecord
+
+    @model_validator(mode="after")
+    def validate_case_ids(self) -> EvalAuthoredSuiteAdmittedRun:
+        if self.case_ids != tuple(sorted(set(self.case_ids))):
+            raise ValueError("Admitted authored suite case IDs must be unique and sorted.")
+        if self.kind == "scenario" and len(self.case_ids) != 1:
+            raise ValueError("Each admitted authored scenario run must identify exactly one case.")
+        return self
+
+
+class EvalAuthoredSuiteRunLaunchResponse(ApiBaseModel):
+    selection: EvalSuiteSelectionV1
+    runs: tuple[EvalAuthoredSuiteAdmittedRun, ...] = Field(
+        min_length=1,
+        max_length=EVAL_CORPUS_MAX_CASES,
+    )
+
+    @model_validator(mode="after")
+    def validate_runs(self) -> EvalAuthoredSuiteRunLaunchResponse:
+        admitted = tuple(case_id for item in self.runs for case_id in item.case_ids)
+        selected = tuple(item.id for item in self.selection.cases)
+        if tuple(sorted(admitted)) != selected or len(admitted) != len(set(admitted)):
+            raise ValueError("Admitted authored suite runs do not match their immutable selection.")
+        return self
 
 
 class EvalScenarioArtifactMaterializationRequest(ApiBaseModel):

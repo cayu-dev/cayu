@@ -139,7 +139,7 @@ function validateCapturedDraft(draft: CapturedEvaluationDraft): void {
   }
   requireBoundedCleanText(draft.case.name, "Case name", 256)
   requireOptionalCleanText(draft.case.description, "Case description", 2_048)
-  validateAssertions(draft.case.assertions)
+  validateDeterministicAssertions(draft.case.assertions)
 }
 
 export function previewMatchesDraft(
@@ -203,10 +203,10 @@ function validateDraft(draft: EvaluationPromotionDraft): void {
     throw new Error("Eval input cannot exceed 262,144 total characters.")
   }
 
-  validateAssertions(draft.case.assertions)
+  validateDeterministicAssertions(draft.case.assertions)
 }
 
-function validateAssertions(assertions: readonly PromotionAssertion[]): void {
+export function validateDeterministicAssertions(assertions: readonly PromotionAssertion[]): void {
   if (assertions.length < 1 || assertions.length > 64) {
     throw new Error("An eval case must contain between 1 and 64 assertions.")
   }
@@ -426,7 +426,7 @@ function requireTerminalStatus(value: string): void {
   }
 }
 
-function requirePortableId(value: string, label: string): void {
+export function requirePortableId(value: string, label: string): void {
   if (!PORTABLE_ID_PATTERN.test(value)) {
     throw new Error(
       `${label} must start with a lowercase letter and use lowercase letters, digits, '.', '_', or '-'.`,
@@ -434,14 +434,14 @@ function requirePortableId(value: string, label: string): void {
   }
 }
 
-function requireBoundedCleanText(value: string, label: string, maximum: number): void {
+export function requireBoundedCleanText(value: string, label: string, maximum: number): void {
   const length = durableTextLength(value, label)
   if (length === 0 || hasPythonOuterWhitespace(value) || length > maximum) {
     throw new Error(`${label} must contain 1 to ${maximum} characters without outer whitespace.`)
   }
 }
 
-function requireOptionalCleanText(
+export function requireOptionalCleanText(
   value: string | null | undefined,
   label: string,
   maximum: number,
@@ -450,7 +450,7 @@ function requireOptionalCleanText(
   requireBoundedCleanText(value, label, maximum)
 }
 
-function durableTextLength(value: string, label: string): number {
+export function durableTextLength(value: string, label: string): number {
   let length = 0
   for (let index = 0; index < value.length; index += 1) {
     const codeUnit = value.charCodeAt(index)
@@ -469,7 +469,7 @@ function durableTextLength(value: string, label: string): number {
   return length
 }
 
-function isPythonBlank(value: string): boolean {
+export function isPythonBlank(value: string): boolean {
   for (const character of value) {
     if (!isPythonWhitespace(character.codePointAt(0) as number)) return false
   }

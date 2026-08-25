@@ -218,6 +218,13 @@ export function scenarioEvalLaunchRequestIdentity(
   return JSON.stringify(["scenario-v2", scenarioRevision, bindingRevision])
 }
 
+export function authoredSuiteEvalLaunchRequestIdentity(
+  suiteRevision: string,
+  selectionRevision: string,
+): string {
+  return JSON.stringify(["authored-suite-v1", suiteRevision, selectionRevision])
+}
+
 export function capturedEvalLaunchRequestIdentity(
   sessionId: string,
   candidateRevision: string,

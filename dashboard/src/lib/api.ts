@@ -29,6 +29,10 @@ import type {
   CompareCatalogEvalResultsApiEvalsResultComparisonsPostData,
   CreateEvalRunApiEvalsRunsPostData,
   EnvironmentsResponse,
+  EvalAuthoredSuiteCatalogPage,
+  EvalAuthoredSuiteRunLaunchResponse,
+  EvalAuthoredSuiteRunPreviewResponse,
+  EvalAuthoredSuiteRunSelectionRequest,
   EvalBaselineSelectionRequest,
   EvalBaselineSelectionResponse,
   EvalCaseCatalogPage,
@@ -57,6 +61,12 @@ import type {
   EvalScenarioSaveRequest,
   EvalScenarioSaveResponse,
   EvalSuiteCatalogPage,
+  EvalSuiteDocumentV1,
+  EvalSuiteDraftV1,
+  EvalSuitePreviewRequest,
+  EvalSuitePreviewResponse,
+  EvalSuiteSaveRequest,
+  EvalSuiteSaveResponse,
   EvalTargetCatalogEntry,
   EvalTargetCatalogResponse,
   EvaluationPromotionDraft,
@@ -80,6 +90,7 @@ import type {
   GetUsageRollupApiUsageRollupPostResponse,
   InterruptSessionBody,
   ListArtifactsApiArtifactsGetData,
+  ListEvalAuthoredSuitesApiEvalsSuitesGetData,
   ListEvalCasesApiEvalsCorporaCorpusRevisionSuitesSuiteIdCasesGetData,
   ListEvalCorporaApiEvalsCorporaGetData,
   ListEvalResultsApiEvalsResultsGetData,
@@ -241,6 +252,16 @@ export type EvalScenarioRunLaunch = EvalScenarioRunCreateRequest
 export type EvalScenarioApproval = EvalScenarioApprovalRequest
 export type EvalScenarioEntry = EvalScenarioCatalogEntry
 export type EvalScenariosPage = EvalScenarioCatalogPage
+export type EvalAuthoredSuite = EvalSuiteDocumentV1
+export type EvalAuthoredSuiteDraft = EvalSuiteDraftV1
+export type EvalAuthoredSuitePreviewRequestBody = EvalSuitePreviewRequest
+export type EvalAuthoredSuitePreview = EvalSuitePreviewResponse
+export type EvalAuthoredSuiteSave = EvalSuiteSaveRequest
+export type EvalAuthoredSuiteSaved = EvalSuiteSaveResponse
+export type EvalAuthoredSuitesPage = EvalAuthoredSuiteCatalogPage
+export type EvalAuthoredSuiteRunSelection = EvalAuthoredSuiteRunSelectionRequest
+export type EvalAuthoredSuiteRunPreview = EvalAuthoredSuiteRunPreviewResponse
+export type EvalAuthoredSuiteRunLaunched = EvalAuthoredSuiteRunLaunchResponse
 export type EvalCorporaQuery = NonNullable<ListEvalCorporaApiEvalsCorporaGetData["query"]>
 export type EvalSuitesQuery = NonNullable<
   ListEvalSuitesApiEvalsCorporaCorpusRevisionSuitesGetData["query"]
@@ -251,6 +272,9 @@ export type EvalCasesQuery = NonNullable<
 export type EvalRunsQuery = NonNullable<ListEvalRunsApiEvalsRunsGetData["query"]>
 export type EvalResultsQuery = NonNullable<ListEvalResultsApiEvalsResultsGetData["query"]>
 export type EvalScenariosQuery = NonNullable<ListEvalScenariosApiEvalsScenariosGetData["query"]>
+export type EvalAuthoredSuitesQuery = NonNullable<
+  ListEvalAuthoredSuitesApiEvalsSuitesGetData["query"]
+>
 
 export type DownloadedFile = {
   blob: Blob
@@ -608,6 +632,83 @@ export async function downloadEvalCorpus(
     `/evals/corpora/${encodeURIComponent(corpusRevision)}/download`,
     "cayu-eval-corpus.json",
     signal,
+  )
+}
+
+export async function previewEvalAuthoredSuite(
+  body: EvalAuthoredSuitePreviewRequestBody,
+  signal?: AbortSignal,
+): Promise<EvalAuthoredSuitePreview> {
+  return requestJson<EvalAuthoredSuitePreview>("/evals/suites/preview", {
+    method: "POST",
+    body: JSON.stringify(body),
+    signal,
+  })
+}
+
+export async function saveEvalAuthoredSuite(
+  body: EvalAuthoredSuiteSave,
+  signal?: AbortSignal,
+): Promise<EvalAuthoredSuiteSaved> {
+  return requestJson<EvalAuthoredSuiteSaved>("/evals/suites", {
+    method: "POST",
+    body: JSON.stringify(body),
+    signal,
+  })
+}
+
+export async function fetchEvalAuthoredSuites(
+  query: EvalAuthoredSuitesQuery = {},
+  signal?: AbortSignal,
+): Promise<EvalAuthoredSuitesPage> {
+  return requestJson<EvalAuthoredSuitesPage>(`/evals/suites${queryString(query)}`, { signal })
+}
+
+export async function fetchEvalAuthoredSuite(
+  suiteRevision: string,
+  signal?: AbortSignal,
+): Promise<EvalAuthoredSuite> {
+  return requestJson<EvalAuthoredSuite>(`/evals/suites/${encodeURIComponent(suiteRevision)}`, {
+    signal,
+  })
+}
+
+export async function downloadEvalAuthoredSuite(
+  suiteRevision: string,
+  signal?: AbortSignal,
+): Promise<DownloadedFile> {
+  return downloadFile(
+    `/evals/suites/${encodeURIComponent(suiteRevision)}/download`,
+    "cayu-eval-suite.json",
+    signal,
+  )
+}
+
+export async function previewEvalAuthoredSuiteRun(
+  suiteRevision: string,
+  body: EvalAuthoredSuiteRunSelection,
+  signal?: AbortSignal,
+): Promise<EvalAuthoredSuiteRunPreview> {
+  return requestJson<EvalAuthoredSuiteRunPreview>(
+    `/evals/suites/${encodeURIComponent(suiteRevision)}/runs/preview`,
+    { method: "POST", body: JSON.stringify(body), signal },
+  )
+}
+
+export async function launchEvalAuthoredSuiteRun(
+  suiteRevision: string,
+  body: EvalAuthoredSuiteRunSelection,
+  idempotencyKey: string,
+  signal?: AbortSignal,
+): Promise<EvalAuthoredSuiteRunLaunched> {
+  return requestJson<EvalAuthoredSuiteRunLaunched>(
+    `/evals/suites/${encodeURIComponent(suiteRevision)}/runs`,
+    {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify(body),
+      signal,
+    },
   )
 }
 

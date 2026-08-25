@@ -20,6 +20,7 @@ import {
   useRef,
   useState,
 } from "react"
+import { EvalSuiteAuthoringAction } from "@/components/dashboard/eval-suite-authoring"
 import {
   DataCard,
   Page,
@@ -327,6 +328,33 @@ export function EvalsPage() {
               loading={targets.isLoading}
               selectTarget={selectTarget}
             />
+            {selectedTargetKey && (
+              <EvalSuiteAuthoringAction
+                key={selectedTargetKey}
+                targetKey={selectedTargetKey}
+                disabled={!mutateCapability.enabled}
+                onLaunched={async (runIds) => {
+                  const firstRunId = runIds[0]
+                  if (!firstRunId) return
+                  await updateSearch((current) => ({
+                    ...evalsSearchWithout(
+                      current,
+                      "suite",
+                      "result",
+                      "baseline",
+                      "suites_cursor",
+                      "cases_cursor",
+                      "corpora_cursor",
+                      "results_cursor",
+                      "runs_cursor",
+                      "status",
+                    ),
+                    tab: "runs",
+                    run: firstRunId,
+                  }))
+                }}
+              />
+            )}
             <input
               ref={fileInputRef}
               type="file"

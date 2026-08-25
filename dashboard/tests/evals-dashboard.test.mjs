@@ -3,6 +3,7 @@ import test from "node:test"
 import { QueryClient, QueryObserver } from "@tanstack/react-query"
 
 import {
+  authoredSuiteEvalLaunchRequestIdentity,
   capturedEvalLaunchRequestIdentity,
   createEvalIdempotencyKey,
   EVAL_RESULT_QUERY_RETENTION,
@@ -178,6 +179,15 @@ test("scenario launch retry identity binds the immutable scenario and reviewed b
   assert.notEqual(
     identity,
     scenarioEvalLaunchRequestIdentity("sha256:scenario", "sha256:new-binding"),
+  )
+})
+
+test("authored suite retry identity binds the immutable suite and exact selection", () => {
+  const identity = authoredSuiteEvalLaunchRequestIdentity("sha256:suite", "sha256:selection")
+  assert.equal(identity, '["authored-suite-v1","sha256:suite","sha256:selection"]')
+  assert.notEqual(
+    identity,
+    authoredSuiteEvalLaunchRequestIdentity("sha256:suite", "sha256:other-selection"),
   )
 })
 

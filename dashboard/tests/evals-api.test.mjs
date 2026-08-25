@@ -11,6 +11,9 @@ const {
   downloadCatalogEvalResultJson,
   downloadEvalResultJson,
   downloadEvalScenario,
+  downloadEvalAuthoredSuite,
+  fetchEvalAuthoredSuite,
+  fetchEvalAuthoredSuites,
   fetchEvalCases,
   fetchEvalCorpora,
   fetchEvalRuns,
@@ -21,11 +24,15 @@ const {
   fetchEvalTargets,
   importEvalCorpus,
   launchEvalScenario,
+  launchEvalAuthoredSuiteRun,
   materializeEvalScenarioArtifact,
   previewCapturedEvaluation,
   previewEvalScenario,
+  previewEvalAuthoredSuite,
+  previewEvalAuthoredSuiteRun,
   saveCapturedEvaluation,
   saveEvalScenario,
+  saveEvalAuthoredSuite,
   selectEvalBaseline,
   submitEvalScenarioApproval,
 } = await import("../src/lib/api.ts")
@@ -390,5 +397,69 @@ test("scenario adapters preserve reviewed revisions, bindings, target scope, and
     event_id: "approval-1",
     decision: "approve",
   })
+  assert.ok(calls.every((call) => call.init.signal === controller.signal))
+})
+
+test("authored suite adapters preserve immutable selection and launch idempotency", async () => {
+  const originalFetch = globalThis.fetch
+  const calls = []
+  const controller = new AbortController()
+  const revision = `sha256:${"d".repeat(64)}`
+  const draft = { id: "suite", target_key: "eval.target", name: "Suite", cases: [] }
+  const suite = { revision }
+  globalThis.fetch = async (input, init) => {
+    calls.push({ input: String(input), init })
+    if (String(input).endsWith("/download")) {
+      return new Response("{}", {
+        headers: { "content-disposition": 'attachment; filename="suite.eval-suite.json"' },
+      })
+    }
+    return new Response(JSON.stringify({ items: [], suite, selection: {}, runs: [] }), {
+      status: String(input).endsWith("/runs") ? 202 : 200,
+      headers: { "content-type": "application/json" },
+    })
+  }
+
+  try {
+    await previewEvalAuthoredSuite({ draft }, controller.signal)
+    await saveEvalAuthoredSuite({ expected_suite_revision: revision, suite }, controller.signal)
+    await fetchEvalAuthoredSuites(
+      { target_key: "eval.target", suite_id: "suite/one", limit: 10 },
+      controller.signal,
+    )
+    await fetchEvalAuthoredSuite(revision, controller.signal)
+    const download = await downloadEvalAuthoredSuite(revision, controller.signal)
+    assert.equal(download.filename, "suite.eval-suite.json")
+    await previewEvalAuthoredSuiteRun(revision, { case_ids: ["case-one"] }, controller.signal)
+    await launchEvalAuthoredSuiteRun(
+      revision,
+      { case_ids: ["case-one"] },
+      "authored-suite-idempotency-key",
+      controller.signal,
+    )
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  assert.equal(calls[0].input, "/api/evals/suites/preview")
+  assert.deepEqual(JSON.parse(calls[0].init.body), { draft })
+  assert.equal(calls[1].input, "/api/evals/suites")
+  assert.deepEqual(JSON.parse(calls[1].init.body), {
+    expected_suite_revision: revision,
+    suite,
+  })
+  assert.equal(
+    calls[2].input,
+    "/api/evals/suites?target_key=eval.target&suite_id=suite%2Fone&limit=10",
+  )
+  assert.equal(calls[3].input, `/api/evals/suites/${encodeURIComponent(revision)}`)
+  assert.equal(calls[4].input, `/api/evals/suites/${encodeURIComponent(revision)}/download`)
+  assert.equal(calls[5].input, `/api/evals/suites/${encodeURIComponent(revision)}/runs/preview`)
+  assert.deepEqual(JSON.parse(calls[5].init.body), { case_ids: ["case-one"] })
+  assert.equal(calls[6].input, `/api/evals/suites/${encodeURIComponent(revision)}/runs`)
+  assert.equal(
+    new Headers(calls[6].init.headers).get("Idempotency-Key"),
+    "authored-suite-idempotency-key",
+  )
   assert.ok(calls.every((call) => call.init.signal === controller.signal))
 })

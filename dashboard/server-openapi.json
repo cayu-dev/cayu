@@ -7285,6 +7285,41 @@
         "title": "EnvironmentsResponse",
         "type": "object"
       },
+      "EvalAuthoredSuiteAdmittedRun": {
+        "additionalProperties": false,
+        "properties": {
+          "case_ids": {
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Case Ids",
+            "type": "array"
+          },
+          "kind": {
+            "enum": [
+              "simple_input",
+              "scenario"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "run": {
+            "$ref": "#/components/schemas/EvalRunRecord"
+          }
+        },
+        "required": [
+          "kind",
+          "case_ids",
+          "run"
+        ],
+        "title": "EvalAuthoredSuiteAdmittedRun",
+        "type": "object"
+      },
       "EvalAuthoredSuiteCatalogEntry": {
         "additionalProperties": false,
         "properties": {
@@ -7417,6 +7452,178 @@
           "items"
         ],
         "title": "EvalAuthoredSuiteCatalogPage",
+        "type": "object"
+      },
+      "EvalAuthoredSuiteLaunchDiagnostic": {
+        "additionalProperties": false,
+        "properties": {
+          "case_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Case Id"
+          },
+          "code": {
+            "enum": [
+              "one_trial_required",
+              "simple_launch_not_ready",
+              "scenario_execution_unavailable",
+              "scenario_launch_not_ready"
+            ],
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "EvalAuthoredSuiteLaunchDiagnostic",
+        "type": "object"
+      },
+      "EvalAuthoredSuiteLaunchPlanItem": {
+        "additionalProperties": false,
+        "properties": {
+          "case_ids": {
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Case Ids",
+            "type": "array"
+          },
+          "kind": {
+            "enum": [
+              "simple_input",
+              "scenario"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "scenario_revision": {
+            "anyOf": [
+              {
+                "maxLength": 71,
+                "minLength": 71,
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scenario Revision"
+          }
+        },
+        "required": [
+          "kind",
+          "case_ids"
+        ],
+        "title": "EvalAuthoredSuiteLaunchPlanItem",
+        "type": "object"
+      },
+      "EvalAuthoredSuiteRunLaunchResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/EvalAuthoredSuiteAdmittedRun"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Runs",
+            "type": "array"
+          },
+          "selection": {
+            "$ref": "#/components/schemas/EvalSuiteSelectionV1"
+          }
+        },
+        "required": [
+          "selection",
+          "runs"
+        ],
+        "title": "EvalAuthoredSuiteRunLaunchResponse",
+        "type": "object"
+      },
+      "EvalAuthoredSuiteRunPreviewResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/EvalAuthoredSuiteLaunchDiagnostic"
+            },
+            "maxItems": 1001,
+            "title": "Diagnostics",
+            "type": "array"
+          },
+          "launches": {
+            "items": {
+              "$ref": "#/components/schemas/EvalAuthoredSuiteLaunchPlanItem"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Launches",
+            "type": "array"
+          },
+          "ready": {
+            "title": "Ready",
+            "type": "boolean"
+          },
+          "selection": {
+            "$ref": "#/components/schemas/EvalSuiteSelectionV1"
+          }
+        },
+        "required": [
+          "selection",
+          "ready",
+          "launches"
+        ],
+        "title": "EvalAuthoredSuiteRunPreviewResponse",
+        "type": "object"
+      },
+      "EvalAuthoredSuiteRunSelectionRequest": {
+        "additionalProperties": false,
+        "description": "Select all or an explicit non-empty subset of one stored suite revision.",
+        "properties": {
+          "case_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+                  "type": "string"
+                },
+                "maxItems": 1000,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Case Ids"
+          }
+        },
+        "title": "EvalAuthoredSuiteRunSelectionRequest",
         "type": "object"
       },
       "EvalBaselineKey": {
@@ -8890,6 +9097,28 @@
         "additionalProperties": false,
         "description": "Durable, authority-free execution contractions and trusted caller provenance.\n\nThe HTTP API constructs this value after authentication. It retains only the\nbounded subject/tenant projection needed to mint ordinary runtime invocation\nprovenance after a worker restart; authentication claims never enter EvalStore.\n``None`` bounds inherit the server-owned target request base.",
         "properties": {
+          "authored_suite_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Authored Suite Revision"
+          },
+          "authored_suite_selection_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Authored Suite Selection Revision"
+          },
           "cost_budget": {
             "anyOf": [
               {
@@ -9786,6 +10015,28 @@
             "maxItems": 128,
             "title": "Artifact References",
             "type": "array"
+          },
+          "authored_case_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Authored Case Revision"
+          },
+          "authored_suite_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Authored Suite Revision"
           },
           "binding_revision": {
             "title": "Binding Revision",
@@ -11169,7 +11420,7 @@
       },
       "EvaluationSourceIdentityV1": {
         "additionalProperties": false,
-        "description": "Diagnostic capture provenance without runtime or session authority.",
+        "description": "Diagnostic capture or authored-definition provenance without runtime authority.",
         "properties": {
           "app_manifest_fingerprint": {
             "title": "App Manifest Fingerprint",
@@ -16459,7 +16710,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "27",
+            "default": "28",
             "title": "Contract Version",
             "type": "string"
           },
@@ -20398,7 +20649,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "27",
+            "default": "28",
             "title": "Contract Version",
             "type": "string"
           }
@@ -23717,6 +23968,125 @@
           }
         },
         "summary": "Download Eval Authored Suite"
+      }
+    },
+    "/api/evals/suites/{suite_revision}/runs": {
+      "post": {
+        "operationId": "launch_eval_authored_suite_run_api_evals_suites__suite_revision__runs_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "suite_revision",
+            "required": true,
+            "schema": {
+              "title": "Suite Revision",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 512,
+              "minLength": 1,
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalAuthoredSuiteRunSelectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalAuthoredSuiteRunLaunchResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Launch Eval Authored Suite Run"
+      }
+    },
+    "/api/evals/suites/{suite_revision}/runs/preview": {
+      "post": {
+        "operationId": "preview_eval_authored_suite_run_api_evals_suites__suite_revision__runs_preview_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "suite_revision",
+            "required": true,
+            "schema": {
+              "title": "Suite Revision",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalAuthoredSuiteRunSelectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalAuthoredSuiteRunPreviewResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Preview Eval Authored Suite Run"
       }
     },
     "/api/evals/targets": {

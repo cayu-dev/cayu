@@ -575,7 +575,7 @@ def assertion_spec_revision(spec: AssertionSpec) -> str:
 
 
 class EvaluationSourceIdentityV1(_SchemaV1PortableModel):
-    """Diagnostic capture provenance without runtime or session authority."""
+    """Diagnostic capture or authored-definition provenance without runtime authority."""
 
     schema_version: Literal[1] = EVALUATION_SOURCE_IDENTITY_SCHEMA_VERSION
     application_release_id: StrictStr

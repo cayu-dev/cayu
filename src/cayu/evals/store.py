@@ -1079,6 +1079,14 @@ class EvalScenarioRunInvocation(_EvalStoreModel):
     schema_version: Literal[1] = 1
     scenario_revision: StrictStr
     binding_revision: StrictStr
+    authored_suite_revision: StrictStr | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    authored_case_revision: StrictStr | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     environment_name: StrictStr | None = None
     trials: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
     timeout_seconds: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TIMEOUT_SECONDS)
@@ -1094,9 +1102,16 @@ class EvalScenarioRunInvocation(_EvalStoreModel):
             raise ValueError("schema_version must be the integer 1.")
         return value
 
-    @field_validator("scenario_revision", "binding_revision")
+    @field_validator(
+        "scenario_revision",
+        "binding_revision",
+        "authored_suite_revision",
+        "authored_case_revision",
+    )
     @classmethod
-    def validate_revisions(cls, value: str, info) -> str:
+    def validate_revisions(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
         return _sha256_revision(value, info.field_name)
 
     @field_validator("environment_name")
@@ -1117,6 +1132,10 @@ class EvalScenarioRunInvocation(_EvalStoreModel):
         requirement_ids = tuple(item.requirement_id for item in self.artifact_references)
         if requirement_ids != tuple(sorted(set(requirement_ids))):
             raise ValueError("Scenario artifact references must be unique and sorted.")
+        if (self.authored_suite_revision is None) != (self.authored_case_revision is None):
+            raise ValueError(
+                "Authored scenario runs require both suite and case revision identities."
+            )
         return self
 
 
@@ -1430,6 +1449,14 @@ class EvalRunInvocation(_EvalStoreModel):
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
     limits: RunLimits | None = None
     cost_budget: EvalRunCostBudget | None = None
+    authored_suite_revision: StrictStr | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    authored_suite_selection_revision: StrictStr | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     scenario: EvalScenarioRunInvocation | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
@@ -1478,6 +1505,16 @@ class EvalRunInvocation(_EvalStoreModel):
             return EvalScenarioRunInvocation.model_validate(value.model_dump(mode="python"))
         return value
 
+    @field_validator(
+        "authored_suite_revision",
+        "authored_suite_selection_revision",
+    )
+    @classmethod
+    def validate_authored_revisions(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _sha256_revision(value, info.field_name)
+
     @model_validator(mode="after")
     def validate_provenance(self) -> EvalRunInvocation:
         if self.source not in {
@@ -1492,6 +1529,19 @@ class EvalRunInvocation(_EvalStoreModel):
             raise ValueError("Eval run origins require server-verified HTTP provenance.")
         if self.limits is not None and self.limits.scope != "run":
             raise ValueError("Eval run invocation limits must use run scope.")
+        if (self.authored_suite_revision is None) != (
+            self.authored_suite_selection_revision is None
+        ):
+            raise ValueError(
+                "Authored suite runs require both suite and selection revision identities."
+            )
+        if (
+            self.scenario is not None
+            and self.scenario.authored_suite_revision != self.authored_suite_revision
+        ):
+            raise ValueError(
+                "Authored scenario suite identity must match its parent run invocation."
+            )
         if not json_utf8_size_within_limit(self, EVAL_RUN_INVOCATION_MAX_BYTES):
             raise ValueError(
                 f"Eval run invocation exceeds {EVAL_RUN_INVOCATION_MAX_BYTES} JSON bytes."

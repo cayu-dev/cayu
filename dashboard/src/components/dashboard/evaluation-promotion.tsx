@@ -509,10 +509,14 @@ export function EvaluationPromotionAction({
                   disabled={previewing || exporting || saving || launching || baselining}
                 >
                   <PromotionIdentityEditor draft={draft} editDraft={editDraft} />
-                  <PromotionAssertionsEditor
-                    draft={draft}
+                  <ExpectedBehaviorEditor
+                    assertions={draft.case.assertions}
                     evidence={preview?.candidate.evidence}
-                    editDraft={editDraft}
+                    onChange={(assertions) =>
+                      editDraft((next) => {
+                        next.case.assertions = assertions
+                      })
+                    }
                   />
                   {preview?.runnable_conversion.available && (
                     <FreshExecutionEditor
@@ -1070,20 +1074,27 @@ function PromotionIdentityEditor({ draft, editDraft }: PromotionEditorProps) {
   )
 }
 
-function PromotionAssertionsEditor({
-  draft,
+export function ExpectedBehaviorEditor({
+  assertions,
   evidence,
-  editDraft,
-}: PromotionEditorProps & {
+  onChange,
+}: {
+  assertions: PromotionAssertion[]
   evidence: EvaluationPromotionPreview["candidate"]["evidence"] | undefined
+  onChange: (assertions: PromotionAssertion[]) => void
 }) {
   const [quickKind, setQuickKind] = useState<PromotionAssertionKind>("root_status")
+  const editAssertions = (edit: (next: PromotionAssertion[]) => void) => {
+    const next = structuredClone(assertions)
+    edit(next)
+    onChange(next)
+  }
   const addAssertion = () =>
-    editDraft((next) => {
-      next.case.assertions.push(
+    editAssertions((next) => {
+      next.push(
         evidence
-          ? createCapturedEvaluationAssertion(quickKind, next.case.assertions, evidence)
-          : createPromotionAssertion(quickKind, next.case.assertions),
+          ? createCapturedEvaluationAssertion(quickKind, next, evidence)
+          : createPromotionAssertion(quickKind, next),
       )
     })
   return (
@@ -1092,7 +1103,9 @@ function PromotionAssertionsEditor({
         <div>
           <CardTitle>Assertions</CardTitle>
           <p className="mt-1 text-xs text-muted-foreground">
-            Assertions are rescored against the captured run before export.
+            {evidence
+              ? "Assertions are rescored against the captured run before export."
+              : "Define deterministic behavior that every fresh trial must satisfy."}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -1111,28 +1124,28 @@ function PromotionAssertionsEditor({
           <Button
             size="xs"
             variant="outline"
-            disabled={draft.case.assertions.length >= 64}
+            disabled={assertions.length >= 64}
             onClick={addAssertion}
           >
-            <Plus /> Add observed
+            <Plus /> {evidence ? "Add observed" : "Add expectation"}
           </Button>
         </div>
       </CardHeader>
       <CardContent className="space-y-3">
-        {draft.case.assertions.map((assertion, index) => (
+        {assertions.map((assertion, index) => (
           <AssertionEditor
             // biome-ignore lint/suspicious/noArrayIndexKey: rows never reorder and own no local state.
             key={index}
             assertion={assertion}
             index={index}
-            assertions={draft.case.assertions}
+            assertions={assertions}
             evidence={evidence}
             update={(updated) =>
-              editDraft((next) => {
-                next.case.assertions[index] = updated
+              editAssertions((next) => {
+                next[index] = updated
               })
             }
-            remove={() => editDraft((next) => next.case.assertions.splice(index, 1))}
+            remove={() => editAssertions((next) => next.splice(index, 1))}
           />
         ))}
       </CardContent>
