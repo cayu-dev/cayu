@@ -5991,6 +5991,22 @@ Compatible keyless argument continuations still attach to the most recently
 accumulated call. The legacy `function_call` finish reason normalizes to
 provider-neutral `tool_calls` while remaining available as the raw reason.
 
+Stream identity is frozen on first observation: later non-null response IDs and
+models must match exactly. A finish reason seals semantic output. Usage-only and
+metadata-only tails, omitted identities, and identical empty terminal repeats
+remain valid, while later text, reasoning, choices, or tool fragments fail the
+model attempt before deferred tool calls are released. Gemini's single chunk
+that carries both a `stop` finish reason and tool-call fragments remains one
+atomic terminal chunk and normalizes to `tool_calls`.
+
+Anthropic and Vertex Messages streams likewise require exactly one
+`message_start`; content and message deltas require that start, and
+`message_stop` seals the stream. Bedrock `messageStop` seals semantic output but
+continues to admit its documented trailing `metadata` event. Provider timeout
+and stream-idle/close timeout options accept only finite positive real seconds;
+booleans, strings, zero, negatives, infinities, NaN, and integers too large to
+represent as a float fail during construction.
+
 `VertexProvider` adapts Anthropic Messages through Google Cloud Vertex AI's
 regional raw-predict endpoint. Install `cayu[vertex]`, pass the GCP project and
 region, and provide explicit Google credentials or use Application Default

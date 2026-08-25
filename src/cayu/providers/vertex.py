@@ -5,8 +5,9 @@ import importlib
 from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol
 
-from cayu._validation import require_clean_nonblank, require_finite
+from cayu._validation import require_clean_nonblank
 from cayu.core.messages import Message
+from cayu.providers._config import positive_finite_seconds
 from cayu.providers._credential_boundary import (
     aclosing_provider_stream,
     detach_provider_call_traceback,
@@ -355,20 +356,11 @@ class VertexProvider(ModelProvider):
             raise TypeError("max_tokens must be an integer.")
         if max_tokens <= 0:
             raise ValueError("max_tokens must be greater than zero.")
-        if type(timeout_s) not in {int, float}:
-            raise TypeError("timeout_s must be a number.")
-        if timeout_s <= 0:
-            raise ValueError("timeout_s must be greater than zero.")
         self.max_tokens = max_tokens
-        self.timeout_s = float(timeout_s)
-        if type(stream_idle_timeout_s) not in {int, float}:
-            raise TypeError("stream_idle_timeout_s must be a number.")
-        stream_idle_timeout_s = require_finite(
-            float(stream_idle_timeout_s), "stream_idle_timeout_s"
+        self.timeout_s = positive_finite_seconds(timeout_s, "timeout_s")
+        self.stream_idle_timeout_s = positive_finite_seconds(
+            stream_idle_timeout_s, "stream_idle_timeout_s"
         )
-        if stream_idle_timeout_s <= 0:
-            raise ValueError("stream_idle_timeout_s must be greater than zero.")
-        self.stream_idle_timeout_s = stream_idle_timeout_s
         self.credentials = _resolve_credentials(
             credentials=credentials,
             service_account_info=service_account_info,
@@ -437,11 +429,12 @@ class VertexProvider(ModelProvider):
                     reasoning_provenance=self._reasoning_state_provenance,
                 )
                 async with aclosing_provider_stream(raw_events), aclosing_provider_stream(events):
+                    # Completion is synthesized only after the raw Messages
+                    # stream tail is validated. Exhaust the translator so a
+                    # deferred transport failure remains observable after it.
                     async for event in events:
                         completion_emitted = event.type == ModelStreamEventType.COMPLETED
                         yield event
-                        if completion_emitted:
-                            break
         except asyncio.CancelledError as exc:
             cancellation = sanitize_provider_cancellation(
                 exc,

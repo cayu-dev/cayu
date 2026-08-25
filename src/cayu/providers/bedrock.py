@@ -13,7 +13,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from typing import Any, Literal, get_args
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_finite
+from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.artifacts import (
     FileAttachmentKind,
     file_attachment_from_payload,
@@ -30,6 +30,7 @@ from cayu.core.messages import (
     ToolCallPart,
     ToolResultPart,
 )
+from cayu.providers._config import positive_finite_seconds
 from cayu.providers._credential_boundary import (
     detach_provider_call_traceback,
     detach_provider_stream_traceback,
@@ -718,6 +719,15 @@ async def bedrock_converse_stream_events(
     async for raw in raw_events:
         if not isinstance(raw, Mapping):
             raise BedrockProtocolError("Bedrock stream events must be objects.")
+        if saw_message_stop:
+            if "metadata" in raw and len(raw) == 1:
+                metadata = dict(_mapping(raw["metadata"], "metadata"))
+                continue
+            if "messageStop" in raw and len(raw) == 1:
+                repeated = _mapping(raw["messageStop"], "messageStop")
+                if _required_string(repeated, "stopReason") == stop_reason:
+                    continue
+            raise BedrockProtocolError("Bedrock stream emitted an event after messageStop.")
         _raise_stream_error(raw)
         if "contentBlockStart" in raw:
             start_event = _mapping(raw["contentBlockStart"], "contentBlockStart")
@@ -1332,9 +1342,4 @@ def _optional_clean_string(value: str | None, field_name: str) -> str | None:
 
 
 def _positive_float(value: float, field_name: str) -> float:
-    if type(value) not in {int, float}:
-        raise TypeError(f"{field_name} must be a number.")
-    value = require_finite(float(value), field_name)
-    if value <= 0:
-        raise ValueError(f"{field_name} must be greater than zero.")
-    return value
+    return positive_finite_seconds(value, field_name)

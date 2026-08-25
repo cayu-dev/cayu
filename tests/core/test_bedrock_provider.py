@@ -1253,10 +1253,10 @@ def test_bedrock_provider_reports_unfinished_tool_blocks() -> None:
 
 @pytest.mark.parametrize(
     "stream_idle_timeout_s",
-    [float("nan"), float("inf"), float("-inf")],
+    [float("nan"), float("inf"), float("-inf"), 10**1000],
 )
 def test_bedrock_provider_rejects_nonfinite_stream_idle_timeout(
-    stream_idle_timeout_s: float,
+    stream_idle_timeout_s: int | float,
 ) -> None:
     with pytest.raises(ValueError, match="stream_idle_timeout_s"):
         BedrockProvider(
@@ -1267,13 +1267,33 @@ def test_bedrock_provider_rejects_nonfinite_stream_idle_timeout(
 
 @pytest.mark.parametrize(
     "stream_close_timeout_s",
-    [float("nan"), float("inf"), float("-inf")],
+    [float("nan"), float("inf"), float("-inf"), 10**1000],
 )
 def test_bedrock_provider_rejects_nonfinite_stream_close_timeout(
-    stream_close_timeout_s: float,
+    stream_close_timeout_s: int | float,
 ) -> None:
     with pytest.raises(ValueError, match="stream_close_timeout_s"):
         BedrockProvider(
             client=FakeBedrockClient([]),
             stream_close_timeout_s=stream_close_timeout_s,
         )
+
+
+@pytest.mark.anyio
+async def test_bedrock_stream_rejects_semantic_output_after_message_stop() -> None:
+    async def raw_events():
+        yield {"messageStop": {"stopReason": "end_turn"}}
+        yield {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "late"}}}
+
+    with pytest.raises(bedrock_module.BedrockProtocolError, match="after messageStop"):
+        [event async for event in bedrock_module.bedrock_converse_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
+async def test_bedrock_stream_accepts_metadata_after_message_stop() -> None:
+    async def raw_events():
+        yield {"messageStop": {"stopReason": "end_turn"}}
+        yield {"metadata": {"usage": {"inputTokens": 1, "outputTokens": 2}}}
+
+    events = [event async for event in bedrock_module.bedrock_converse_stream_events(raw_events())]
+    assert events[-1].payload["usage"] == {"input_tokens": 1, "output_tokens": 2}

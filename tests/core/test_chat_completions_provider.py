@@ -3858,6 +3858,62 @@ def test_cayu_app_preserves_chat_http_completion_before_response_cleanup_failure
     assert [message.role for message in transcript] == ["user"]
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize("field", ["id", "model"])
+async def test_chat_completions_stream_rejects_contradictory_response_identity(
+    field: str,
+) -> None:
+    async def raw_events():
+        yield {"id": "response-1", "model": "model-1", "choices": []}
+        yield {
+            "id": "response-2" if field == "id" else "response-1",
+            "model": "model-2" if field == "model" else "model-1",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+
+    with pytest.raises(ChatCompletionsProtocolError, match="conflicting"):
+        [event async for event in chat_completions_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "late_delta",
+    [
+        {"content": "late"},
+        {"reasoning_content": "late"},
+        {"tool_calls": [{"index": 0, "id": "late", "function": {"name": "exec"}}]},
+    ],
+)
+async def test_chat_completions_stream_rejects_post_terminal_semantic_output(
+    late_delta: dict[str, object],
+) -> None:
+    async def raw_events():
+        yield {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+        yield {"choices": [{"index": 0, "delta": late_delta, "finish_reason": None}]}
+
+    with pytest.raises(ChatCompletionsProtocolError, match="after finish_reason"):
+        [event async for event in chat_completions_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
+async def test_chat_completions_stream_allows_identity_bound_usage_tail() -> None:
+    async def raw_events():
+        yield {
+            "id": "response-1",
+            "model": "model-1",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+        yield {
+            "id": "response-1",
+            "model": "model-1",
+            "choices": [],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+        }
+
+    events = [event async for event in chat_completions_stream_events(raw_events())]
+    assert events[-1].payload["usage"]["total_tokens"] == 3
+
+
 def test_cayu_app_preserves_chat_http_completion_before_real_tail_cancellation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

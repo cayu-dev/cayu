@@ -6,7 +6,7 @@ import re
 from collections.abc import AsyncIterator, Callable, Mapping
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_finite
+from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.artifacts import (
     FileAttachmentKind,
     file_attachment_from_payload,
@@ -25,6 +25,7 @@ from cayu.core.messages import (
     ToolResultPart,
 )
 from cayu.providers._api_keys import resolve_api_key
+from cayu.providers._config import positive_finite_seconds
 from cayu.providers._credential_boundary import (
     aclosing_provider_stream,
     detach_provider_call_traceback,
@@ -491,21 +492,11 @@ class AnthropicProvider(ModelProvider):
             raise TypeError("max_tokens must be an integer.")
         if max_tokens <= 0:
             raise ValueError("max_tokens must be greater than zero.")
-        if type(timeout_s) not in {int, float}:
-            raise TypeError("timeout_s must be a number.")
-        timeout_s = require_finite(float(timeout_s), "timeout_s")
-        if timeout_s <= 0:
-            raise ValueError("timeout_s must be greater than zero.")
         self.max_tokens = max_tokens
-        self.timeout_s = timeout_s
-        if type(stream_idle_timeout_s) not in {int, float}:
-            raise TypeError("stream_idle_timeout_s must be a number.")
-        stream_idle_timeout_s = require_finite(
-            float(stream_idle_timeout_s), "stream_idle_timeout_s"
+        self.timeout_s = positive_finite_seconds(timeout_s, "timeout_s")
+        self.stream_idle_timeout_s = positive_finite_seconds(
+            stream_idle_timeout_s, "stream_idle_timeout_s"
         )
-        if stream_idle_timeout_s <= 0:
-            raise ValueError("stream_idle_timeout_s must be greater than zero.")
-        self.stream_idle_timeout_s = stream_idle_timeout_s
         self.transport = transport if transport is not None else HttpxAnthropicTransport()
         self.extra_headers = _copy_headers(extra_headers)
         if cache_policy is not None and type(cache_policy) is not CachePolicy:
@@ -574,11 +565,12 @@ class AnthropicProvider(ModelProvider):
                     reasoning_provenance=self._reasoning_state_provenance,
                 )
                 async with aclosing_provider_stream(raw_events), aclosing_provider_stream(events):
+                    # Completion is synthesized only after the raw Messages
+                    # stream tail is validated. Exhaust the translator so a
+                    # deferred transport failure remains observable after it.
                     async for event in events:
                         completion_emitted = event.type == ModelStreamEventType.COMPLETED
                         yield event
-                        if completion_emitted:
-                            break
         except asyncio.CancelledError as exc:
             cancellation = sanitize_provider_cancellation(
                 exc,
@@ -1104,7 +1096,10 @@ async def anthropic_stream_events(
     stop_reason: str | None = None
     stop_sequence: str | None = None
     usage: dict[str, Any] | None = None
+    started = False
     completed = False
+    completed_payload: dict[str, Any] | None = None
+    post_terminal_failure: BaseException | None = None
 
     def optional_string(mapping: Mapping[str, Any], key: str) -> str | None:
         value = mapping.get(key)
@@ -1126,13 +1121,42 @@ async def anthropic_stream_events(
             raise protocol_error(f"{provider_label} {label} requires nonblank {key}.")
         return value
 
-    async for event in events:
+    iterator = events.__aiter__()
+    while True:
+        try:
+            event = await iterator.__anext__()
+        except StopAsyncIteration:
+            break
+        except asyncio.CancelledError as exc:
+            if not completed:
+                raise
+            post_terminal_failure = exc
+            break
+        except Exception as exc:
+            if not completed:
+                raise
+            post_terminal_failure = exc
+            break
         if not isinstance(event, Mapping):
             raise protocol_error(f"{provider_label} stream event must be a JSON object.")
         event_type = event.get("type")
         if event_type == "ping":
             continue
+        if completed and event_type in {
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+            "error",
+        }:
+            raise protocol_error(f"{provider_label} stream emitted an event after message_stop.")
+        if completed:
+            continue
         if event_type == "message_start":
+            if started:
+                raise protocol_error(f"{provider_label} stream emitted duplicate message_start.")
             message = event.get("message")
             if not isinstance(message, Mapping):
                 raise protocol_error(f"{provider_label} message_start requires message object.")
@@ -1143,7 +1167,25 @@ async def anthropic_stream_events(
                 raise protocol_error(f"{provider_label} message_start usage must be an object.")
             if isinstance(start_usage, Mapping):
                 usage = {**(usage or {}), **start_usage}
+            started = True
             continue
+        if (
+            event_type
+            in {
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            }
+            and not started
+        ):
+            if event_type in {"content_block_delta", "content_block_stop"}:
+                raise protocol_error(
+                    f"{provider_label} {event_type} arrived before content_block_start "
+                    "or message_start."
+                )
+            raise protocol_error(f"{provider_label} {event_type} arrived before message_start.")
         if event_type == "content_block_start":
             index = block_index(event)
             content_block = event.get("content_block")
@@ -1295,15 +1337,13 @@ async def anthropic_stream_events(
                     f"{provider_label} message_stop arrived with unfinished content blocks."
                 )
             completed = True
-            yield ModelStreamEvent.completed(
-                {
-                    "id": message_id,
-                    "model": model,
-                    "stop_reason": stop_reason,
-                    "stop_sequence": stop_sequence,
-                    "usage": copy_json_value(usage, "usage"),
-                }
-            )
+            completed_payload = {
+                "id": message_id,
+                "model": model,
+                "stop_reason": stop_reason,
+                "stop_sequence": stop_sequence,
+                "usage": copy_json_value(usage, "usage"),
+            }
             continue
         if event_type == "error":
             raw_error = event.get("error")
@@ -1350,8 +1390,15 @@ async def anthropic_stream_events(
         # Unknown event types are ignored for forward compatibility, as the
         # Anthropic streaming docs require.
 
-    if not completed:
+    if completed_payload is None:
         raise protocol_error(f"{provider_label} streaming response ended before message_stop.")
+    yield ModelStreamEvent.completed(completed_payload)
+    if post_terminal_failure is not None:
+        failure = post_terminal_failure
+        post_terminal_failure = None
+        event = {}
+        del iterator, events
+        raise failure from None
 
 
 def _is_anthropic_stream_error_context_overflow(

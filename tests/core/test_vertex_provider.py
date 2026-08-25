@@ -805,6 +805,23 @@ async def test_vertex_provider_streams_sse_events_incrementally() -> None:
 
 
 @pytest.mark.anyio
+async def test_vertex_provider_rejects_post_stop_output_before_completion() -> None:
+    start = {
+        "type": "message_start",
+        "message": {"id": "msg_v1", "model": "claude-sonnet-4-6"},
+    }
+    transport = StreamingRecordingTransport(
+        event_batches=[[start, {"type": "message_stop"}, {"type": "message_delta", "delta": {}}]]
+    )
+    provider = _provider(transport)
+
+    events = [event async for event in provider.stream(_request())]
+
+    assert [event.type for event in events] == [ModelStreamEventType.ERROR]
+    assert events[0].payload["error_type"] == "VertexProtocolError"
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("error_type", "expected_status", "expected_retryable"),
     [
@@ -1289,3 +1306,9 @@ def test_vertex_provider_rejects_invalid_stream_idle_timeout() -> None:
         _provider(FailingTransport(), stream_idle_timeout_s=0)
     with pytest.raises(TypeError, match="stream_idle_timeout_s"):
         _provider(FailingTransport(), stream_idle_timeout_s="60")
+
+
+@pytest.mark.parametrize("timeout_s", [float("nan"), float("inf"), float("-inf"), 10**1000])
+def test_vertex_provider_rejects_nonfinite_timeout(timeout_s: int | float) -> None:
+    with pytest.raises(ValueError, match="timeout_s"):
+        _provider(FailingTransport(), timeout_s=timeout_s)

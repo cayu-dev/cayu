@@ -2351,8 +2351,8 @@ def test_anthropic_provider_rejects_invalid_stream_idle_timeout() -> None:
         AnthropicProvider(api_key="test-key", stream_idle_timeout_s="60")  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("timeout_s", [float("nan"), float("inf"), float("-inf")])
-def test_anthropic_provider_rejects_nonfinite_timeout(timeout_s: float) -> None:
+@pytest.mark.parametrize("timeout_s", [float("nan"), float("inf"), float("-inf"), 10**1000])
+def test_anthropic_provider_rejects_nonfinite_timeout(timeout_s: int | float) -> None:
     with pytest.raises(ValueError, match="timeout_s"):
         AnthropicProvider(api_key="test-key", timeout_s=timeout_s)
 
@@ -2443,3 +2443,71 @@ def test_anthropic_provider_validates_credential_source_configuration() -> None:
 
     with pytest.raises(TypeError, match="SecretRef"):
         AnthropicProvider(api_key_ref="anthropic_api_key", credential_proxy=proxy)  # type: ignore[arg-type]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "events",
+    [
+        [{"type": "message_stop"}],
+        [{"type": "message_delta", "delta": {}}],
+        [{"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}],
+    ],
+)
+async def test_anthropic_stream_requires_message_start(
+    events: list[Mapping[str, Any]],
+) -> None:
+    with pytest.raises(AnthropicProtocolError, match="before message_start"):
+        [event async for event in anthropic_stream_events(_aiter_events(events))]
+
+
+@pytest.mark.anyio
+async def test_anthropic_stream_rejects_duplicate_start_and_post_stop_output() -> None:
+    start = {"type": "message_start", "message": {"id": "m-1", "model": "claude"}}
+    with pytest.raises(AnthropicProtocolError, match="duplicate message_start"):
+        [event async for event in anthropic_stream_events(_aiter_events([start, start]))]
+
+    events = [start, {"type": "message_stop"}, {"type": "message_delta", "delta": {}}]
+    emitted = []
+    with pytest.raises(AnthropicProtocolError, match="after message_stop"):
+        async for event in anthropic_stream_events(_aiter_events(events)):
+            emitted.append(event)
+    assert ModelStreamEventType.COMPLETED not in {event.type for event in emitted}
+
+
+@pytest.mark.anyio
+async def test_anthropic_provider_rejects_post_stop_output_before_completion() -> None:
+    start = {"type": "message_start", "message": {"id": "m-1", "model": "claude"}}
+    transport = StreamingRecordingTransport(
+        [[start, {"type": "message_stop"}, {"type": "message_delta", "delta": {}}]]
+    )
+    provider = AnthropicProvider(api_key="test-key", transport=transport)
+    request = ModelRequest(model="claude-test", messages=[Message.text("user", "hello")])
+
+    emitted = [event async for event in provider.stream(request)]
+
+    assert [event.type for event in emitted] == [ModelStreamEventType.ERROR]
+    assert emitted[0].payload["error_type"] == "AnthropicProtocolError"
+
+
+@pytest.mark.anyio
+async def test_anthropic_stream_validates_tail_before_synthesizing_completion() -> None:
+    start = {"type": "message_start", "message": {"id": "m-1", "model": "claude"}}
+    translated = [
+        event
+        async for event in anthropic_stream_events(
+            _aiter_events([start, {"type": "message_stop"}, {"type": "ping"}, {"type": "future"}])
+        )
+    ]
+    assert [event.type for event in translated] == [ModelStreamEventType.COMPLETED]
+
+    async def failing_tail():
+        yield start
+        yield {"type": "message_stop"}
+        raise RuntimeError("response cleanup failed")
+
+    emitted = []
+    with pytest.raises(RuntimeError, match="response cleanup failed"):
+        async for event in anthropic_stream_events(failing_tail()):
+            emitted.append(event)
+    assert [event.type for event in emitted] == [ModelStreamEventType.COMPLETED]

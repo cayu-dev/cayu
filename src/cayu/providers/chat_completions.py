@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import math
 import re
 from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol
@@ -13,7 +12,6 @@ from cayu._validation import (
     copy_durable_json_value,
     copy_json_value,
     require_clean_nonblank,
-    require_finite,
 )
 from cayu.artifacts import (
     FileAttachmentKind,
@@ -33,6 +31,7 @@ from cayu.core.messages import (
     ToolResultPart,
 )
 from cayu.providers._api_keys import resolve_api_key
+from cayu.providers._config import positive_finite_seconds
 from cayu.providers._credential_boundary import (
     aclosing_provider_stream,
     detach_provider_stream_traceback,
@@ -476,14 +475,9 @@ class ChatCompletionsProvider(ModelProvider):
                     f"{type(self).__name__}.usage_dialect",
                 )
         self.timeout_s = _validate_timeout_s(timeout_s)
-        if type(stream_idle_timeout_s) not in {int, float}:
-            raise TypeError("stream_idle_timeout_s must be a number.")
-        stream_idle_timeout_s = require_finite(
-            float(stream_idle_timeout_s), "stream_idle_timeout_s"
+        self.stream_idle_timeout_s = positive_finite_seconds(
+            stream_idle_timeout_s, "stream_idle_timeout_s"
         )
-        if stream_idle_timeout_s <= 0:
-            raise ValueError("stream_idle_timeout_s must be greater than zero.")
-        self.stream_idle_timeout_s = stream_idle_timeout_s
         # A caller-supplied transport manages its own scheme policy; the default
         # transport inherits allow_http so a local http endpoint actually connects.
         self.transport = (
@@ -1003,8 +997,18 @@ async def chat_completions_stream_events(
             raise ChatCompletionsProtocolError(
                 "Chat Completions stream event must be a JSON object."
             )
-        response_id = response_id or _optional_string(event, "id")
-        model = model or _optional_string(event, "model")
+        chunk_response_id = _optional_string(event, "id")
+        if response_id is not None and chunk_response_id not in {None, response_id}:
+            raise ChatCompletionsProtocolError(
+                "Chat Completions stream emitted conflicting response ids."
+            )
+        response_id = response_id or chunk_response_id
+        chunk_model = _optional_string(event, "model")
+        if model is not None and chunk_model not in {None, model}:
+            raise ChatCompletionsProtocolError(
+                "Chat Completions stream emitted conflicting models."
+            )
+        model = model or chunk_model
         chunk_upstream_provider_evidence = _openrouter_provider_evidence(event.get("provider"))
         if chunk_upstream_provider_evidence is not None:
             if (
@@ -1076,6 +1080,26 @@ async def chat_completions_stream_events(
                     "Chat Completions stream emitted conflicting choice indexes."
                 )
             choice_index = chunk_choice_index
+        if finish_reason is not None:
+            repeated_finish = choice.get("finish_reason")
+            repeated_delta = choice.get("delta")
+            if isinstance(repeated_finish, str) and _canonical_chat_finish_reason(
+                repeated_finish
+            ) != _canonical_chat_finish_reason(finish_reason):
+                raise ChatCompletionsProtocolError(
+                    "Chat Completions stream emitted conflicting finish_reason values."
+                )
+            if (
+                isinstance(repeated_finish, str)
+                and _canonical_chat_finish_reason(repeated_finish)
+                == _canonical_chat_finish_reason(finish_reason)
+                and (repeated_delta is None or repeated_delta == {})
+                and set(choice).issubset({"index", "delta", "finish_reason", "logprobs"})
+            ):
+                continue
+            raise ChatCompletionsProtocolError(
+                "Chat Completions stream emitted semantic output after finish_reason."
+            )
         delta = choice.get("delta")
         if delta is not None:
             if not isinstance(delta, Mapping):
@@ -2010,15 +2034,7 @@ def _validate_document_encoding(value: object) -> str:
 
 
 def _validate_timeout_s(value: float) -> float:
-    if type(value) not in {int, float}:
-        raise TypeError("timeout_s must be a number.")
-    try:
-        normalized = float(value)
-    except OverflowError:
-        raise ValueError("timeout_s must be finite and greater than zero.") from None
-    if not math.isfinite(normalized) or normalized <= 0:
-        raise ValueError("timeout_s must be finite and greater than zero.")
-    return normalized
+    return positive_finite_seconds(value, "timeout_s")
 
 
 def _declared_subclass_usage_dialect(

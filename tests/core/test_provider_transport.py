@@ -160,18 +160,18 @@ class _BlockingAfterEventByteStream(httpx.AsyncByteStream):
 
 
 class _ClosableEventStream:
-    def __init__(self, event: Mapping[str, Any]) -> None:
-        self._event = event
-        self._yielded = False
+    def __init__(self, event: Mapping[str, Any] | list[Mapping[str, Any]]) -> None:
+        self._events = iter(event if isinstance(event, list) else [event])
         self.closed = False
 
     def __aiter__(self) -> _ClosableEventStream:
         return self
 
     async def __anext__(self) -> Mapping[str, Any]:
-        if not self._yielded:
-            self._yielded = True
-            return self._event
+        try:
+            return next(self._events)
+        except StopIteration:
+            pass
         await asyncio.Event().wait()
         raise StopAsyncIteration  # pragma: no cover
 
@@ -392,11 +392,17 @@ async def test_provider_closes_translator_and_raw_stream_on_abandonment(
             "choices": [{"index": 0, "delta": {"content": "hello"}, "finish_reason": None}],
         }
     elif provider_name in {"anthropic", "vertex"}:
-        raw_event = {
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "text", "text": "hello"},
-        }
+        raw_event = [
+            {
+                "type": "message_start",
+                "message": {"id": "message-1", "model": "test-model"},
+            },
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": "hello"},
+            },
+        ]
     else:  # pragma: no cover - guarded by the parameter list
         raise AssertionError(f"Unhandled provider: {provider_name}")
     source = _ClosableEventStream(raw_event)

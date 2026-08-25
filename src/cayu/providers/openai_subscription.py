@@ -27,9 +27,10 @@ from urllib.parse import urlencode
 
 import httpx
 
-from cayu._validation import require_clean_nonblank, require_finite
+from cayu._validation import require_clean_nonblank
 from cayu._version import package_version
 from cayu.core.messages import Message
+from cayu.providers._config import positive_finite_seconds
 from cayu.providers._credential_boundary import (
     ProviderStreamCleanupError,
     aclosing_provider_stream,
@@ -703,19 +704,10 @@ class OpenAISubscriptionProvider(ModelProvider):
             if hosted_web_search_supported is None
             else hosted_web_search_supported
         )
-        if type(timeout_s) not in {int, float}:
-            raise TypeError("timeout_s must be a number.")
-        if timeout_s <= 0:
-            raise ValueError("timeout_s must be greater than zero.")
-        self.timeout_s = float(timeout_s)
-        if type(stream_idle_timeout_s) not in {int, float}:
-            raise TypeError("stream_idle_timeout_s must be a number.")
-        stream_idle_timeout_s = require_finite(
-            float(stream_idle_timeout_s), "stream_idle_timeout_s"
+        self.timeout_s = positive_finite_seconds(timeout_s, "timeout_s")
+        self.stream_idle_timeout_s = positive_finite_seconds(
+            stream_idle_timeout_s, "stream_idle_timeout_s"
         )
-        if stream_idle_timeout_s <= 0:
-            raise ValueError("stream_idle_timeout_s must be greater than zero.")
-        self.stream_idle_timeout_s = stream_idle_timeout_s
         self.transport = transport if transport is not None else HttpxOpenAITransport()
         self.extra_headers = copy_headers(
             extra_headers,
@@ -868,11 +860,7 @@ class HttpxOpenAISubscriptionOAuthTransport:
         timeout_s: float = 30.0,
     ) -> None:
         self.issuer = validate_base_url(issuer, provider_label="OpenAI OAuth")
-        if isinstance(timeout_s, bool) or not isinstance(timeout_s, int | float):
-            raise TypeError("timeout_s must be a number.")
-        if timeout_s <= 0:
-            raise ValueError("timeout_s must be greater than zero.")
-        self.timeout_s = float(timeout_s)
+        self.timeout_s = positive_finite_seconds(timeout_s, "timeout_s")
 
     def refresh(self, refresh_token: str) -> Mapping[str, Any]:
         refresh_token = require_clean_nonblank(refresh_token, "refresh_token")

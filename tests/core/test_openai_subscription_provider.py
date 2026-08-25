@@ -89,6 +89,12 @@ class RecordingTransport:
         self.closed = True
 
 
+@pytest.mark.parametrize("timeout_s", [float("nan"), float("inf"), float("-inf"), 10**1000])
+def test_subscription_provider_rejects_nonfinite_timeout(timeout_s: int | float) -> None:
+    with pytest.raises(ValueError, match="timeout_s"):
+        OpenAISubscriptionProvider(auth=StaticSubscriptionAuth(), timeout_s=timeout_s)
+
+
 def test_subscription_provider_projects_privacy_safe_openai_options() -> None:
     provider = OpenAISubscriptionProvider(
         auth=StaticSubscriptionAuth(),

@@ -12,7 +12,6 @@ from cayu._validation import (
     copy_json_value,
     escape_json_pointer_segment,
     require_clean_nonblank,
-    require_finite,
     unescape_json_pointer_segment,
 )
 from cayu.artifacts import (
@@ -43,6 +42,7 @@ from cayu.embeddings import (
     copy_text_embedding_request,
 )
 from cayu.providers._api_keys import resolve_api_key
+from cayu.providers._config import positive_finite_seconds
 from cayu.providers._credential_boundary import (
     aclosing_provider_stream,
     detach_provider_call_traceback,
@@ -786,20 +786,10 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                 "OpenAI background operations require the official OpenAI API base URL."
             )
         self.background = background
-        if type(timeout_s) not in {int, float}:
-            raise TypeError("timeout_s must be a number.")
-        timeout_s = require_finite(float(timeout_s), "timeout_s")
-        if timeout_s <= 0:
-            raise ValueError("timeout_s must be greater than zero.")
-        self.timeout_s = timeout_s
-        if type(stream_idle_timeout_s) not in {int, float}:
-            raise TypeError("stream_idle_timeout_s must be a number.")
-        stream_idle_timeout_s = require_finite(
-            float(stream_idle_timeout_s), "stream_idle_timeout_s"
+        self.timeout_s = positive_finite_seconds(timeout_s, "timeout_s")
+        self.stream_idle_timeout_s = positive_finite_seconds(
+            stream_idle_timeout_s, "stream_idle_timeout_s"
         )
-        if stream_idle_timeout_s <= 0:
-            raise ValueError("stream_idle_timeout_s must be greater than zero.")
-        self.stream_idle_timeout_s = stream_idle_timeout_s
         self.transport = transport if transport is not None else HttpxOpenAITransport()
         if self.background:
             missing_operations = [
