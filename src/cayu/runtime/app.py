@@ -2878,11 +2878,23 @@ class CayuApp:
             async for event in owned_stream:
                 yield await self._project_emitted_event_for_public_api(event)
 
-    async def _run_private(self, request: RunRequest) -> AsyncGenerator[Event, None]:
+    async def _run_private(
+        self,
+        request: RunRequest,
+        *,
+        expected_execution_profile: ExecutionProfileIdentity | None = None,
+        expected_registered_environment: runtime_records.RegisteredEnvironment | None = None,
+        expected_context_policy: object | None = None,
+    ) -> AsyncGenerator[Event, None]:
         if type(request) is not RunRequest:
             raise TypeError("Runtime run requires a RunRequest.")
         request = _validate_run_request(request)
-        stream = self._session_engine.run(request=request)
+        stream = self._session_engine.run(
+            request=request,
+            expected_execution_profile=expected_execution_profile,
+            expected_registered_environment=expected_registered_environment,
+            expected_context_policy=expected_context_policy,
+        )
         del request
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:

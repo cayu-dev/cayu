@@ -8846,9 +8846,104 @@ Before an executor changes an evaluation overlay, it creates a
 `AgentSnapshotMaterialization`, and exact `AgentSnapshotTrialBinding`. The
 operation's `operation_id` is its canonical fingerprint and precommits the
 candidate, materialization, memory overlay, state scope, trial mode, case, and
-trial. The [downstream intervention-executor issue](https://github.com/cayu-tech/cayu/issues/1095)
-owns application of that operation through the canonical recall and
-AgentSnapshot memory-overlay seams.
+trial. `MemoryInterventionExecutor.execute_trial()` is the one bounded SDK
+entrance that applies this operation. It rejects caller-owned session, parent,
+task, causal-budget, invocation-origin, and loop-policy authority, derives the
+trial's runtime identities, and binds a secret-safe HMAC of the complete request
+to the exact snapshot, application-owned overlay provider, runtime runner, and
+evaluator fingerprints before any candidate effect. Public requests must also
+arrive without private runtime-preparation, redaction, invocation, task, or
+session-claim authority; those in-process capabilities are minted only after
+the executor has authenticated and copied the public request.
+
+Execution progresses through a compare-and-set phase journal: prepared, trial
+bound, effect resolved, session bound, runtime terminal, evaluated, and
+finalized. `InMemoryMemoryInterventionExecutionStore` and
+`SQLiteMemoryInterventionExecutionStore` preserve the complete immutable
+authority tuple, every previously published evidence fingerprint, and the
+bounded typed runtime result needed to distinguish timeout, cancellation,
+failure, and unknown outcomes after restart. They reject phase skips, evidence
+rewrites, stale revisions, and a SQLite indexed revision that disagrees with
+its validated record. A lost acknowledgement is therefore resolved by loading
+the exact phase rather than repeating or reinterpreting the logical trial.
+The session-bound revision also persists the runtime-owned session-create
+claim, absolute deadline, dispatch owner, and renewable lease. A competing
+worker waits while that lease is live and may enter recovery only after durable
+lease expiry; losing the phase CAS is not abandonment evidence.
+
+`MemoryInterventionOverlayProvider.recover()` must use the precommitted
+operation id as its idempotency authority. Recovery can begin after the claim
+but before the first effect call, so it must either complete the undispatched
+exact operation or return its prior exact receipt without duplicating an
+effect. `MemoryInterventionRuntimeRunner.recover()` and
+`MemoryInterventionEvaluator.recover()` have the same obligation for the
+runtime-owned session and evaluation. Evaluation uses the complete execution
+identity, including the immutable case revision, as its idempotency authority;
+the overlay operation id is not reused across revised cases. The runner is not
+an alternative recall or provider stack: it must enter Cayu's ordinary recall,
+admission, context, dispatch, acknowledgement, completion, and attribution
+paths using only the isolated `MemoryInterventionRuntimeView`. It must not
+return from timeout,
+cancellation, or interruption while a dispatched mutation is unowned; the work
+must be settled or durably recoverable. Completed, failed, cancelled, timed-out,
+outcome-unknown, conflicting, and indeterminate results remain distinct in the
+typed execution record. Both runner entrances receive the verified snapshot's
+complete execution-profile reference; custom runners must use it as immutable
+starting authority rather than reconstructing authority from a fingerprint.
+When caller cancellation reaches the runtime entrance, the executor first
+records that positive cancellation authority at the session-bound journal
+revision while preserving the original task cancellation count. Recovery may
+classify an interrupted session as cancelled only from that marker. Operator,
+approval, abandonment, or otherwise unattributed interruption remains
+`outcome_unknown` rather than being inferred as cancellation from a generic
+interrupted status. The canonical runner enforces the absolute runtime deadline
+recorded at the session-bound revision. Expiry before session creation records
+timeout evidence without dispatch, and a failed, cancelled, or restarted
+evidence read recovers the same timed-out classification instead of granting a
+fresh timeout. The runtime-owned create claim binds the exact prepared request,
+causal budget, trial metadata, and execution profile; recovery rejects a
+foreign session even when it occupies the deterministic session id. Concurrent
+deliveries of one exact execution identity share the durable lease through
+runtime dispatch rather than racing recovery or fencing a live owner;
+evaluation recovery uses the full execution identity.
+
+Every executable view carries an exact
+`MemoryInterventionIsolationAuthority` for its materialization, memory overlay,
+and state scope. The application-owned overlay provider must not issue that
+authority for a production store. A view without matching authority, a store
+bound to another scope, or authority for another overlay fails before runtime
+construction. The view also carries the exact
+`AutomaticRecallPolicy`; the executor verifies it against the frozen spec before
+dispatch. `accumulate_within_candidate` state is partitioned by the intervention
+spec fingerprint, so trials of one fixed variant may accumulate while another
+variant for the same candidate receives a distinct overlay scope.
+
+`CayuMemoryInterventionRuntimeRunner` is the canonical concrete adapter. Its
+application-owned `MemoryInterventionRuntimeApplicationFactory` installs the
+isolated store and exact recall policy in a concrete `CayuApp`. Before provider
+dispatch the runner verifies the selected environment, canonical
+`AutomaticRecallContextPolicy`, and the application-declared exact trial
+execution profile. Unchanged recall must retain the verified snapshot profile;
+policy-changing variants require a factory-owned profile mapping bound by the
+factory fingerprint, and the complete component comparison permits only the
+`automatic_recall` component to differ. A variant that also changes provider,
+model, tools, environment, budgets, routing, context, or any other profile
+component fails before provider dispatch. The expected profile is rechecked by
+the actual session-admission operation, so a registration change after dry
+preflight cannot create or dispatch a session under another profile. The exact
+registered environment and context-policy objects are likewise pinned through
+actual admission, and an `Environment` knowledge-store binding is read-only
+after registration, so a store swap cannot redirect an admitted trial into
+production knowledge. The runner
+drains the ordinary runtime stream, loads exact terminal or fresh interrupted
+evidence, projects the
+ordinary memory attribution and usage evidence, and recovers an undispatched or
+incomplete runtime-owned session without creating another session identity.
+Concrete attribution capture is capped at 512 KiB. The execution journal keeps
+its independent 1 MiB record bound and, if a custom runner still returns a
+larger valid attribution, persists a truthful `truncated` projection with the
+observed and omitted-at-least counts instead of stranding the session-bound
+record after provider completion.
 
 After the application-owned effect, `MemoryInterventionReceipt.create(...)`
 emits deterministic evidence for `verified_no_change`, `applied`,

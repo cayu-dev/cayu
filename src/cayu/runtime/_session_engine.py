@@ -7017,8 +7017,20 @@ class SessionEngine:
         registered_agent_override: runtime_records.RegisteredAgentState | None = None,
         admit_session: bool = True,
         store_resolved_existing_session_id: str | None = None,
+        expected_execution_profile: ExecutionProfileIdentity | None = None,
+        expected_registered_environment: runtime_records.RegisteredEnvironment | None = None,
+        expected_context_policy: object | None = None,
     ) -> _PreparedInitialRun | None:
         """Resolve one new-session request, optionally without ordinary admission."""
+
+        if expected_execution_profile is not None:
+            if type(expected_execution_profile) is not ExecutionProfileIdentity:
+                raise TypeError(
+                    "expected_execution_profile must be an exact ExecutionProfileIdentity."
+                )
+            expected_execution_profile = ExecutionProfileIdentity.model_validate(
+                expected_execution_profile.model_dump(mode="json")
+            )
 
         request = session_request_boundary.prepare_run_request(
             request,
@@ -7072,6 +7084,11 @@ class SessionEngine:
         )
         if registered_agent.spec.name != request.agent_name:
             raise ValueError("Initial-run agent override conflicts with the request agent.")
+        if (
+            expected_context_policy is not None
+            and registered_agent.context_policy is not expected_context_policy
+        ):
+            raise ValueError("Initial-run context policy changed after private admission.")
         if request.tool_capability_ceiling is None:
             effective_tool_capability_ceiling = ToolCapabilityCeiling(
                 tool_names=registered_agent.all_registered_tool_exposure.tool_names
@@ -7107,6 +7124,11 @@ class SessionEngine:
             )
         registered_provider.provider.preflight_model_target(model=model)
         registered_environment = self._get_registered_environment(request.environment_name)
+        if (
+            expected_registered_environment is not None
+            and registered_environment is not expected_registered_environment
+        ):
+            raise ValueError("Initial-run environment changed after private admission.")
         if registered_environment is not None:
             session_request_boundary.require_secret_free_session_authority(
                 registered_environment.spec.name,
@@ -7158,6 +7180,21 @@ class SessionEngine:
             names = ", ".join(component.value for component in unavailable_profile_components)
             raise RuntimeError(
                 "Invocation execution profile has unavailable required components: " + names
+            )
+        if expected_execution_profile is not None and (
+            execution_profile != expected_execution_profile
+        ):
+            session_id = request.session_id
+            if session_id is None:
+                raise AssertionError("Run request session identity was not retained.")
+            raise ExecutionProfileMismatchError(
+                session_id=session_id,
+                expected_profile_fingerprint=expected_execution_profile.fingerprint,
+                candidate_profile_fingerprint=execution_profile.fingerprint,
+                changed_component_classes=changed_execution_profile_components(
+                    expected_execution_profile,
+                    execution_profile,
+                ),
             )
         # Native schema validation is provider-owned code, but it is not an
         # execution attempt. Freeze the invocation profile first while retaining
@@ -7405,8 +7442,20 @@ class SessionEngine:
             "retry with current session state."
         ) from None
 
-    async def run(self, request: RunRequest) -> AsyncGenerator[Event, None]:
-        preparation = self._prepare_initial_run(request)
+    async def run(
+        self,
+        request: RunRequest,
+        *,
+        expected_execution_profile: ExecutionProfileIdentity | None = None,
+        expected_registered_environment: runtime_records.RegisteredEnvironment | None = None,
+        expected_context_policy: object | None = None,
+    ) -> AsyncGenerator[Event, None]:
+        preparation = self._prepare_initial_run(
+            request,
+            expected_execution_profile=expected_execution_profile,
+            expected_registered_environment=expected_registered_environment,
+            expected_context_policy=expected_context_policy,
+        )
         del request
         prepared = await preparation
         del preparation

@@ -1097,10 +1097,16 @@ class AgentSnapshotMaterializationRequest(_SnapshotModel):
     candidate_id: StrictStr = Field(max_length=256)
     trial_id: StrictStr = Field(max_length=256)
     state_mode: AgentSnapshotTrialStateMode
+    state_partition_fingerprint: StrictStr | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
-    @field_validator("snapshot_fingerprint")
+    @field_validator("snapshot_fingerprint", "state_partition_fingerprint")
     @classmethod
-    def validate_snapshot_fingerprint(cls, value: str, info) -> str:
+    def validate_snapshot_fingerprint(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
         return _sha256_hex(value, info.field_name)
 
     @field_validator("candidate_id", "trial_id")
@@ -1120,6 +1126,8 @@ class AgentSnapshotMaterializationRequest(_SnapshotModel):
             ),
             "state_mode": self.state_mode.value,
         }
+        if self.state_partition_fingerprint is not None:
+            material["state_partition_fingerprint"] = self.state_partition_fingerprint
         return _content_sha256(material, "snapshot_state_scope")
 
 
@@ -1135,14 +1143,25 @@ class AgentSnapshotMaterializationOperation(_SnapshotModel):
     candidate_id: StrictStr = Field(max_length=256)
     state_scope_id: StrictStr = Field(max_length=256)
     state_mode: AgentSnapshotTrialStateMode
+    state_partition_fingerprint: StrictStr | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     component_kind: AgentSnapshotComponentKind
     provider_id: StrictStr = Field(max_length=256)
     baseline_fingerprint: StrictStr
     capability: AgentSnapshotMaterializationCapability
 
-    @field_validator("operation_id", "snapshot_fingerprint", "baseline_fingerprint")
+    @field_validator(
+        "operation_id",
+        "snapshot_fingerprint",
+        "state_partition_fingerprint",
+        "baseline_fingerprint",
+    )
     @classmethod
-    def validate_fingerprints(cls, value: str, info) -> str:
+    def validate_fingerprints(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
         return _sha256_hex(value, info.field_name)
 
     @field_validator("candidate_id", "state_scope_id", "provider_id")
@@ -1159,7 +1178,7 @@ class AgentSnapshotMaterializationOperation(_SnapshotModel):
         return self
 
     def identity_material(self) -> dict[str, object]:
-        return {
+        material: dict[str, object] = {
             "record_type": self.record_type,
             "schema_version": self.schema_version,
             "snapshot_fingerprint": self.snapshot_fingerprint,
@@ -1171,6 +1190,9 @@ class AgentSnapshotMaterializationOperation(_SnapshotModel):
             "baseline_fingerprint": self.baseline_fingerprint,
             "capability": self.capability.value,
         }
+        if self.state_partition_fingerprint is not None:
+            material["state_partition_fingerprint"] = self.state_partition_fingerprint
+        return material
 
     @classmethod
     def create(
@@ -1185,6 +1207,7 @@ class AgentSnapshotMaterializationOperation(_SnapshotModel):
             candidate_id=request.candidate_id,
             state_scope_id=request.state_scope_id,
             state_mode=request.state_mode,
+            state_partition_fingerprint=request.state_partition_fingerprint,
             component_kind=component.kind,
             provider_id=component.provider_id,
             baseline_fingerprint=component.logical.fingerprint,
@@ -1198,6 +1221,7 @@ class AgentSnapshotMaterializationOperation(_SnapshotModel):
             candidate_id=request.candidate_id,
             state_scope_id=request.state_scope_id,
             state_mode=request.state_mode,
+            state_partition_fingerprint=request.state_partition_fingerprint,
             component_kind=component.kind,
             provider_id=component.provider_id,
             baseline_fingerprint=component.logical.fingerprint,
@@ -1216,12 +1240,23 @@ class AgentSnapshotMaterialization(_SnapshotModel):
     candidate_id: StrictStr = Field(max_length=256)
     state_scope_id: StrictStr = Field(max_length=256)
     state_mode: AgentSnapshotTrialStateMode
+    state_partition_fingerprint: StrictStr | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     created_at: datetime
     components: tuple[AgentSnapshotMaterializedComponent, ...]
 
-    @field_validator("fingerprint", "progress_id", "snapshot_fingerprint")
+    @field_validator(
+        "fingerprint",
+        "progress_id",
+        "snapshot_fingerprint",
+        "state_partition_fingerprint",
+    )
     @classmethod
-    def validate_fingerprint(cls, value: str, info) -> str:
+    def validate_fingerprint(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
         return _sha256_hex(value, info.field_name)
 
     @field_validator("candidate_id", "state_scope_id")
@@ -1252,7 +1287,7 @@ class AgentSnapshotMaterialization(_SnapshotModel):
         return self
 
     def identity_material(self) -> dict[str, object]:
-        return {
+        material: dict[str, object] = {
             "record_type": self.record_type,
             "schema_version": self.schema_version,
             "progress_id": self.progress_id,
@@ -1262,6 +1297,9 @@ class AgentSnapshotMaterialization(_SnapshotModel):
             "state_mode": self.state_mode.value,
             "components": [component.identity_material() for component in self.components],
         }
+        if self.state_partition_fingerprint is not None:
+            material["state_partition_fingerprint"] = self.state_partition_fingerprint
+        return material
 
     @classmethod
     def create(
@@ -1280,6 +1318,7 @@ class AgentSnapshotMaterialization(_SnapshotModel):
             candidate_id=request.candidate_id,
             state_scope_id=request.state_scope_id,
             state_mode=request.state_mode,
+            state_partition_fingerprint=request.state_partition_fingerprint,
             created_at=created_at,
             components=ordered,
         )
@@ -1292,6 +1331,7 @@ class AgentSnapshotMaterialization(_SnapshotModel):
             candidate_id=request.candidate_id,
             state_scope_id=request.state_scope_id,
             state_mode=request.state_mode,
+            state_partition_fingerprint=request.state_partition_fingerprint,
             created_at=created_at,
             components=ordered,
         )
@@ -1309,6 +1349,10 @@ class AgentSnapshotMaterializationProgress(_SnapshotModel):
     candidate_id: StrictStr = Field(max_length=256)
     state_scope_id: StrictStr = Field(max_length=256)
     state_mode: AgentSnapshotTrialStateMode
+    state_partition_fingerprint: StrictStr | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     created_at: datetime
     operations: tuple[AgentSnapshotMaterializationOperation, ...]
     revision: StrictInt = Field(ge=0)
@@ -1319,6 +1363,7 @@ class AgentSnapshotMaterializationProgress(_SnapshotModel):
     @field_validator(
         "progress_id",
         "snapshot_fingerprint",
+        "state_partition_fingerprint",
         "active_operation_id",
         "materialization_fingerprint",
     )
@@ -1349,6 +1394,7 @@ class AgentSnapshotMaterializationProgress(_SnapshotModel):
                 or operation.candidate_id != self.candidate_id
                 or operation.state_scope_id != self.state_scope_id
                 or operation.state_mode is not self.state_mode
+                or operation.state_partition_fingerprint != self.state_partition_fingerprint
             ):
                 raise ValueError("Materialization operation escaped its durable scope.")
         completed_kinds = tuple(component.kind for component in self.components)
@@ -1392,7 +1438,7 @@ class AgentSnapshotMaterializationProgress(_SnapshotModel):
         return self
 
     def identity_material(self) -> dict[str, object]:
-        return {
+        material: dict[str, object] = {
             "record_type": self.record_type,
             "schema_version": self.schema_version,
             "snapshot_fingerprint": self.snapshot_fingerprint,
@@ -1401,6 +1447,9 @@ class AgentSnapshotMaterializationProgress(_SnapshotModel):
             "state_mode": self.state_mode.value,
             "operations": [operation.identity_material() for operation in self.operations],
         }
+        if self.state_partition_fingerprint is not None:
+            material["state_partition_fingerprint"] = self.state_partition_fingerprint
+        return material
 
     @classmethod
     def create(
@@ -1428,6 +1477,7 @@ class AgentSnapshotMaterializationProgress(_SnapshotModel):
             candidate_id=request.candidate_id,
             state_scope_id=request.state_scope_id,
             state_mode=request.state_mode,
+            state_partition_fingerprint=request.state_partition_fingerprint,
             created_at=created_at,
             operations=operations,
             revision=0,
@@ -1443,6 +1493,7 @@ class AgentSnapshotMaterializationProgress(_SnapshotModel):
             candidate_id=request.candidate_id,
             state_scope_id=request.state_scope_id,
             state_mode=request.state_mode,
+            state_partition_fingerprint=request.state_partition_fingerprint,
             created_at=created_at,
             operations=operations,
             revision=0,
@@ -1954,6 +2005,7 @@ def _final_progress(
         or materialization.candidate_id != progress.candidate_id
         or materialization.state_scope_id != progress.state_scope_id
         or materialization.state_mode is not progress.state_mode
+        or materialization.state_partition_fingerprint != progress.state_partition_fingerprint
         or tuple(component.identity_material() for component in materialization.components)
         != tuple(component.identity_material() for component in progress.components)
     ):
@@ -3408,6 +3460,7 @@ class AgentSnapshotCoordinator:
                     candidate_id=materialization.candidate_id,
                     trial_id="recovery",
                     state_mode=materialization.state_mode,
+                    state_partition_fingerprint=(materialization.state_partition_fingerprint),
                 ),
                 created_at=materialization.created_at,
                 components=recovered,
@@ -3466,6 +3519,7 @@ class AgentSnapshotCoordinator:
             candidate_id=stored.candidate_id,
             trial_id=trial_id,
             state_mode=stored.state_mode,
+            state_partition_fingerprint=stored.state_partition_fingerprint,
         )
         if trial_request.state_scope_id != stored.state_scope_id:
             raise AgentSnapshotMaterializationError(

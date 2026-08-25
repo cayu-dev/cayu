@@ -678,8 +678,12 @@ class MemoryInterventionOperation(_FingerprintRecord):
             candidate_id=materialization.candidate_id,
             trial_id=trial.trial_id,
             state_mode=spec.trial_state_mode,
+            state_partition_fingerprint=spec.fingerprint,
         ).state_scope_id
-        if materialization.state_scope_id != expected_scope_id:
+        if (
+            materialization.state_scope_id != expected_scope_id
+            or materialization.state_partition_fingerprint != spec.fingerprint
+        ):
             raise ValueError("Intervention materialization uses another trial state scope.")
         memory_component = next(
             (

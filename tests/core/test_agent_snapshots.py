@@ -1086,6 +1086,39 @@ async def test_trial_state_accumulation_is_explicit() -> None:
     assert sum(provider.materialize_calls for provider in providers) == 2 * len(snapshot.components)
 
 
+def test_default_materialization_identity_preserves_base_record_shape() -> None:
+    snapshot = _snapshot()
+    component = snapshot.component(AgentSnapshotComponentKind.MEMORY)
+    legacy_request = AgentSnapshotMaterializationRequest(
+        snapshot_fingerprint=snapshot.fingerprint,
+        candidate_id="candidate-a",
+        trial_id="trial-1",
+        state_mode=AgentSnapshotTrialStateMode.RESET_EACH_TRIAL,
+    )
+    legacy_operation = AgentSnapshotMaterializationOperation.create(
+        request=legacy_request,
+        component=component,
+    )
+    legacy_payload = legacy_operation.model_dump(mode="json")
+
+    assert "state_partition_fingerprint" not in legacy_request.model_dump(mode="json")
+    assert "state_partition_fingerprint" not in legacy_payload
+    assert AgentSnapshotMaterializationOperation.model_validate(legacy_payload) == legacy_operation
+
+    partitioned_request = legacy_request.model_copy(
+        update={"state_partition_fingerprint": _digest("partition-a")}
+    )
+    partitioned_operation = AgentSnapshotMaterializationOperation.create(
+        request=partitioned_request,
+        component=component,
+    )
+    assert partitioned_request.state_scope_id != legacy_request.state_scope_id
+    assert partitioned_operation.operation_id != legacy_operation.operation_id
+    assert partitioned_operation.model_dump(mode="json")["state_partition_fingerprint"] == _digest(
+        "partition-a"
+    )
+
+
 @_async_test
 async def test_fresh_process_recovery_and_result_lineage_are_idempotent(tmp_path) -> None:
     now = [datetime(2026, 8, 23, tzinfo=UTC)]

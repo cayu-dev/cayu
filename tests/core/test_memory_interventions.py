@@ -237,6 +237,7 @@ def _materialization_and_trial(
         candidate_id=candidate_id,
         trial_id=materialization_trial_id,
         state_mode=spec.trial_state_mode,
+        state_partition_fingerprint=spec.fingerprint,
     )
     overlay = AgentSnapshotOverlayRef.create(
         kind=AgentSnapshotOverlayKind.MEMORY,
@@ -686,7 +687,7 @@ def test_memory_comparability_is_closed_and_requires_isolated_overlays() -> None
         intervention=contaminated,
     )
     assert comparison.status is MemoryInterventionComparabilityStatus.INCOMPARABLE
-    assert MemoryInterventionMismatchReason.MATERIALIZATION_OVERLAY in comparison.mismatch_reasons
+    assert comparison.mismatch_reasons == (MemoryInterventionMismatchReason.INTERVENTION_IDENTITY,)
 
 
 def test_memory_comparability_rejects_partial_item_application() -> None:

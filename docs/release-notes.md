@@ -89,6 +89,47 @@ guard.
 
 ## Unreleased
 
+### Fixed memory interventions have an exact durable execution boundary
+
+Applications can now submit one frozen `MemoryInterventionTrialRequest` to
+`MemoryInterventionExecutor.execute_trial()`. The bounded SDK derives isolated
+session and causal-budget identities, authenticates the complete request with a
+restart-stable HMAC key, verifies its `AgentSnapshot`, and binds the overlay
+provider, runtime runner, evaluator, materialization, effect receipt, runtime
+evidence, evaluation, and final trial result through an exact compare-and-set
+phase journal. In-memory and SQLite journals reconcile lost acknowledgements
+without duplicating the logical effect, runtime session, or evaluation, and
+retain the bounded typed runtime result needed to preserve failed, cancelled,
+timed-out, outcome-unknown, conflicting, and indeterminate outcomes as distinct
+evidence after restart.
+
+Session binding now includes an absolute runtime deadline, an authenticated
+runtime-owned create claim, and a renewable cross-process dispatch lease.
+Retries cannot adopt a foreign session under the deterministic id, restart a
+missing session after timeout, or fence a live worker merely because they lost
+the phase CAS. The canonical adapter pins the isolated store through actual
+session admission, and evaluator idempotency uses the full execution identity
+so a new immutable case revision cannot recover another revision's result.
+
+The execution adapters are application-owned authority boundaries, not alternate
+recall or provider stacks. Their recovery methods must complete or reconcile the
+precommitted operation idempotently, and a runtime adapter must enter Cayu's
+ordinary recall, admission, context, provider-dispatch, acknowledgement,
+completion, and attribution paths using only the candidate-local overlay.
+Executable views now require positive isolated-store authority and the exact
+trial recall policy. Cayu also provides
+`CayuMemoryInterventionRuntimeRunner`, which validates a concrete application
+factory, isolated environment, canonical automatic-recall policy, and exact
+trial execution profile before using the normal runtime and durable evidence
+paths. Recall-policy variants may change only the profile's automatic-recall
+component. Caller cancellation is recorded as separate positive journal
+authority so other interrupted sessions remain outcome-unknown, and oversized
+runtime attribution is reduced to a truthful bounded truncation record after
+successful provider work. Accumulating materializations are partitioned by
+fixed intervention identity so variants for the same candidate cannot share
+mutable state. Snapshot requests without an intervention partition preserve
+the existing materialization identities and serialized record shape.
+
 ### Memory interventions have portable, effect-bound evidence contracts
 
 Applications can now declare an explicit `as_declared`, recall-off, omission,
@@ -98,8 +139,8 @@ attribution, and memory-specific comparability records bind isolated overlays
 without carrying recalled text, mutable store locations, or production
 activation authority. Missing, truncated, redacted, contradictory,
 indeterminate, conflicting, no-match, and proven-no-exposure outcomes remain
-distinct. This schema layer does not add an executor, experiment envelope,
-optimizer, paired report, or Compound dependency.
+distinct. The portable schema remains separate from execution and adds no
+experiment envelope, optimizer, paired report, or Compound dependency.
 
 - Added an explicitly invoked, provider-neutral `KnowledgeCurator` for reviewed learning.
   Applications can submit bounded source-attributed signals, inject separate candidate

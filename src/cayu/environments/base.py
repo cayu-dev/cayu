@@ -228,8 +228,8 @@ class Environment:
         self.runner = runner
         self.vault = vault
         self.proxy = proxy
-        self.knowledge_store = knowledge_store
-        self.knowledge_access_scope = (
+        self._knowledge_store = knowledge_store
+        self._knowledge_access_scope = (
             None
             if knowledge_access_scope is None
             else _copy_knowledge_access_scope(knowledge_access_scope)
@@ -238,6 +238,28 @@ class Environment:
         self.mcp_servers = tuple(copy_mcp_server_spec(server) for server in servers)
         self.workspace_instructions = copy_workspace_instructions_input(
             workspace_instructions,
+        )
+
+    @property
+    def knowledge_store(self) -> KnowledgeStore | None:
+        """Return the registration-time knowledge store binding.
+
+        The binding is intentionally read-only. Runtime execution profiles and
+        isolated intervention admission both authenticate this exact object;
+        replacing it after admission would turn those checks into a check/use
+        race.
+        """
+
+        return self._knowledge_store
+
+    @property
+    def knowledge_access_scope(self) -> KnowledgeAccessScope | None:
+        """Return a defensive copy of the registration-time access scope."""
+
+        return (
+            None
+            if self._knowledge_access_scope is None
+            else _copy_knowledge_access_scope(self._knowledge_access_scope)
         )
 
     async def resolve_secret(

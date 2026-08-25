@@ -3762,9 +3762,9 @@ def test_sqlite_submission_crash_boundaries_reconcile_one_child_and_task(
             original_prepare = app._session_engine._prepare_initial_run
             preparation_calls = 0
 
-            async def lose_worker_during_child_preparation(request):
+            async def lose_worker_during_child_preparation(*args, **kwargs):
                 nonlocal preparation_calls
-                result = await original_prepare(request)
+                result = await original_prepare(*args, **kwargs)
                 preparation_calls += 1
                 if preparation_calls == 2:
                     raise _SimulatedWorkerLoss(
