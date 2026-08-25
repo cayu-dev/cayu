@@ -62,6 +62,10 @@ from cayu.runtime._durable_subagents import (
     require_durable_subagent_intent_matches_seed,
 )
 from cayu.runtime.dispatch import _queued_dispatch_request_sha256
+from cayu.runtime.tool_discovery import (
+    TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+    ToolDiscoveryViewState,
+)
 from cayu.storage import (
     PostgresSessionStore,
     PostgresTaskStore,
@@ -1043,6 +1047,79 @@ def test_durable_subagent_creates_child_before_claimable_task_and_worker_complet
         assert result_without_task_store.content == "durable child complete"
         assert result_without_task_store.structured["task_authority_status"] == "unavailable"
         assert len(provider.requests) == 3
+
+    asyncio.run(run())
+
+
+def test_durable_subagent_initializes_discovery_view_before_queue_publication() -> None:
+    async def run() -> None:
+        sessions = InMemorySessionStore()
+        tasks = InMemoryTaskStore()
+        dispatcher = TaskStoreDispatcher(tasks)
+        provider = _DurableSubagentProvider()
+        app = CayuApp(
+            session_store=sessions,
+            task_store=tasks,
+            dispatcher=dispatcher,
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="parent", model="model"),
+            tools=[
+                SubagentTool(
+                    app,
+                    execution_profile_identity=_DURABLE_SUBAGENT_TOOL_PROFILE_IDENTITY,
+                    agents={
+                        "reviewer": SubagentSpec(
+                            agent_name="reviewer",
+                            mode=SubagentExecutionMode.DURABLE,
+                        )
+                    },
+                )
+            ],
+        )
+        app.register_agent(
+            AgentSpec(name="reviewer", model="model"),
+            tool_discovery_mode="search_tools",
+        )
+
+        parent_events = await _collect(
+            app.run(
+                RunRequest(
+                    agent_name="parent",
+                    session_id="durable-discovery-parent",
+                    messages=[Message.text("user", "parent task")],
+                )
+            )
+        )
+        assert parent_events[-1].type is EventType.SESSION_COMPLETED
+        [child] = (
+            await sessions.list_sessions(SessionQuery(parent_session_id="durable-discovery-parent"))
+        ).sessions
+        child_view = ToolDiscoveryViewState.model_validate(
+            await sessions.load_session_operation(
+                child.id,
+                TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+            )
+        )
+        assert child.status is SessionStatus.PENDING
+        assert child_view.session_id == child.id
+        assert child_view.revision == 0
+        assert child_view.grants == ()
+
+        handle = await dispatcher.process_next(app, worker_id="durable-discovery-worker")
+        assert handle is not None
+        assert handle.status.value == "completed"
+        assert (
+            ToolDiscoveryViewState.model_validate(
+                await sessions.load_session_operation(
+                    child.id,
+                    TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+                )
+            )
+            == child_view
+        )
 
     asyncio.run(run())
 

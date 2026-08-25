@@ -34,6 +34,7 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.tools import (
+    DurableToolOperationConflict,
     Tool,
     ToolContext,
     ToolEffect,
@@ -73,6 +74,7 @@ TOOL_DISCOVERY_MAX_RESULT_BYTES = 256 * 1024
 TOOL_DISCOVERY_SCOPE_ID_MAX_BYTES = 2_048
 TOOL_DISCOVERY_MAX_SCHEMA_SEARCH_NODES = 4_096
 TOOL_DISCOVERY_MAX_SCHEMA_SEARCH_TERMS = 4_096
+TOOL_DISCOVERY_MAX_WRITE_ATTEMPTS = 8
 TOOL_DISCOVERY_REFERENCE_PREFIX = "cayu_tool_v1_"
 TOOL_DISCOVERY_REFERENCE_PATTERN = rf"^{TOOL_DISCOVERY_REFERENCE_PREFIX}[0-9a-f]{{64}}$"
 _WORD_PATTERN = re.compile(r"[^\W_]+", re.UNICODE)
@@ -459,6 +461,29 @@ def empty_tool_discovery_view(
     )
 
 
+def initial_tool_discovery_operation_records(
+    *,
+    session_id: str,
+    root_invocation_id: str,
+    agent_name: str,
+    catalogue: ToolCatalogSnapshot,
+    ceiling: ToolCapabilityCeiling,
+) -> dict[str, dict[str, Any]]:
+    """Return the typed empty view committed with one new session branch."""
+
+    view = empty_tool_discovery_view(
+        session_id=session_id,
+        generation_id=tool_discovery_generation_id(
+            session_id=session_id,
+            root_invocation_id=root_invocation_id,
+        ),
+        agent_name=agent_name,
+        catalogue=catalogue,
+        ceiling=ceiling,
+    )
+    return {TOOL_DISCOVERY_VIEW_OPERATION_KEY: view.model_dump(mode="json")}
+
+
 def current_tool_discovery_view(
     raw: dict[str, Any] | None,
     *,
@@ -468,7 +493,7 @@ def current_tool_discovery_view(
     catalogue: ToolCatalogSnapshot,
     ceiling: ToolCapabilityCeiling,
 ) -> ToolDiscoveryViewState:
-    """Load exact current authority, resetting stale or foreign state fail-closed."""
+    """Load exact current authority and reject missing, stale, or foreign state."""
 
     empty = empty_tool_discovery_view(
         session_id=session_id,
@@ -478,7 +503,7 @@ def current_tool_discovery_view(
         ceiling=ceiling,
     )
     if raw is None:
-        return empty
+        raise ValueError("Tool discovery view is not initialized.")
     state = ToolDiscoveryViewState.model_validate(raw)
     if (
         state.session_id != empty.session_id
@@ -487,7 +512,7 @@ def current_tool_discovery_view(
         or state.catalogue_revision != empty.catalogue_revision
         or state.ceiling_fingerprint != empty.ceiling_fingerprint
     ):
-        return empty
+        raise ValueError("Tool discovery view conflicts with current session authority.")
     return state
 
 
@@ -988,6 +1013,112 @@ def _runtime_tool_discovery_authority(
     return registered[1]
 
 
+def _tool_discovery_search_transition(
+    state: ToolDiscoveryViewState,
+    *,
+    ranked: tuple[ToolDescriptor, ...],
+    query: str,
+    limit: int,
+    model_step_id: str,
+    created_at: datetime,
+) -> tuple[ToolDiscoveryViewState, ToolDiscoverySearchResult]:
+    """Build one deterministic view transition and its exact private result."""
+
+    existing_by_tool_id = {grant.tool_id: grant for grant in state.grants}
+    next_revision = state.revision + 1
+    new_grants: list[ToolDiscoveryGrantRecord] = []
+    matches: list[ToolDiscoverySearchMatch] = []
+    truncated = len(ranked) > limit
+    for descriptor in ranked:
+        if len(matches) >= limit:
+            break
+        descriptor_schema = descriptor.input_schema_copy()
+        if (
+            len(canonical_durable_json_bytes(descriptor_schema, "search_tools.input_schema"))
+            > TOOL_DISCOVERY_MAX_SCHEMA_BYTES
+        ):
+            truncated = True
+            continue
+        grant = existing_by_tool_id.get(descriptor.tool_id)
+        if grant is None:
+            if len(state.grants) + len(new_grants) >= TOOL_DISCOVERY_MAX_GRANTS:
+                truncated = True
+                continue
+            grant_id = tool_discovery_grant_id(
+                session_id=state.session_id,
+                generation_id=state.generation_id,
+                agent_name=state.agent_name,
+                catalogue_revision=state.catalogue_revision,
+                ceiling_fingerprint=state.ceiling_fingerprint,
+                descriptor=descriptor,
+            )
+            grant = ToolDiscoveryGrantRecord(
+                grant_id=grant_id,
+                tool_ref=tool_discovery_reference(grant_id),
+                tool_id=descriptor.tool_id,
+                tool_name=descriptor.name,
+                catalogue_revision=state.catalogue_revision,
+                descriptor_version=descriptor.version,
+                schema_fingerprint=descriptor.schema_fingerprint,
+                origin_query_sha256=_sha256_identity(
+                    {"query": query},
+                    "tool_discovery_query",
+                ),
+                origin_model_step_id=model_step_id,
+                created_at=created_at,
+                discovered_revision=next_revision,
+            )
+            new_grants.append(grant)
+        candidate = ToolDiscoverySearchMatch(
+            tool_ref=grant.tool_ref,
+            tool_id=descriptor.tool_id,
+            name=descriptor.name,
+            description=_bounded_description(descriptor.description),
+            input_schema=descriptor_schema,
+            descriptor_version=descriptor.version,
+            schema_fingerprint=descriptor.schema_fingerprint,
+        )
+        candidate_matches = (*matches, candidate)
+        candidate_payload = {
+            "schema_version": TOOL_DISCOVERY_SCHEMA_VERSION,
+            "query": query,
+            "matches": [match.model_dump(mode="json") for match in candidate_matches],
+            # Reserve the largest possible V1 revision representation so adding a
+            # later match cannot make an earlier size decision optimistic.
+            "view_revision": TOOL_DISCOVERY_MAX_GRANTS,
+            "truncated": truncated,
+        }
+        if (
+            len(canonical_durable_json_bytes(candidate_payload, "search_tools.result"))
+            > TOOL_DISCOVERY_MAX_RESULT_BYTES
+        ):
+            if grant in new_grants:
+                new_grants.remove(grant)
+            truncated = True
+            continue
+        matches.append(candidate)
+
+    desired_state = (
+        ToolDiscoveryViewState.model_validate(
+            {
+                **state.model_dump(mode="python"),
+                "revision": next_revision,
+                "grants": tuple(
+                    sorted((*state.grants, *new_grants), key=lambda item: item.tool_id)
+                ),
+            }
+        )
+        if new_grants
+        else state
+    )
+    return desired_state, ToolDiscoverySearchResult(
+        query=query,
+        matches=tuple(matches),
+        view_revision=desired_state.revision,
+        truncated=truncated,
+    )
+
+
 class SearchToolsTool(Tool):
     """Cayu-owned stable discovery tool executed through the ordinary tool path."""
 
@@ -1026,122 +1157,51 @@ class SearchToolsTool(Tool):
         except (TypeError, ValueError) as exc:
             return ToolResult(content=str(exc), is_error=True)
 
-        raw = await durable.load_durable_operation(TOOL_DISCOVERY_VIEW_OPERATION_KEY)
-        state = current_tool_discovery_view(
-            raw,
-            session_id=discovery.session_id,
-            generation_id=discovery.generation_id,
-            agent_name=discovery.agent_name,
-            catalogue=discovery.catalogue,
-            ceiling=discovery.ceiling,
-        )
         ranked = search_tool_descriptors(
             query,
             catalogue=discovery.catalogue,
             ceiling=discovery.ceiling,
             excluded_names=discovery.directly_exposed_names,
         )
-        existing_by_tool_id = {grant.tool_id: grant for grant in state.grants}
-        next_revision = state.revision + 1
-        new_grants: list[ToolDiscoveryGrantRecord] = []
-        matches: list[ToolDiscoverySearchMatch] = []
-        truncated = len(ranked) > raw_limit
-        for descriptor in ranked:
-            if len(matches) >= raw_limit:
-                break
-            descriptor_schema = descriptor.input_schema_copy()
-            if (
-                len(canonical_durable_json_bytes(descriptor_schema, "search_tools.input_schema"))
-                > TOOL_DISCOVERY_MAX_SCHEMA_BYTES
-            ):
-                truncated = True
-                continue
-            grant = existing_by_tool_id.get(descriptor.tool_id)
-            if grant is None:
-                if len(state.grants) + len(new_grants) >= TOOL_DISCOVERY_MAX_GRANTS:
-                    truncated = True
-                    continue
-                grant_id = tool_discovery_grant_id(
-                    session_id=state.session_id,
-                    generation_id=state.generation_id,
-                    agent_name=state.agent_name,
-                    catalogue_revision=state.catalogue_revision,
-                    ceiling_fingerprint=state.ceiling_fingerprint,
-                    descriptor=descriptor,
-                )
-                grant = ToolDiscoveryGrantRecord(
-                    grant_id=grant_id,
-                    tool_ref=tool_discovery_reference(grant_id),
-                    tool_id=descriptor.tool_id,
-                    tool_name=descriptor.name,
-                    catalogue_revision=state.catalogue_revision,
-                    descriptor_version=descriptor.version,
-                    schema_fingerprint=descriptor.schema_fingerprint,
-                    origin_query_sha256=_sha256_identity(
-                        {"query": query},
-                        "tool_discovery_query",
-                    ),
-                    origin_model_step_id=discovery.model_step_id,
-                    created_at=discovery.created_at,
-                    discovered_revision=next_revision,
-                )
-                new_grants.append(grant)
-            candidate = ToolDiscoverySearchMatch(
-                tool_ref=grant.tool_ref,
-                tool_id=descriptor.tool_id,
-                name=descriptor.name,
-                description=_bounded_description(descriptor.description),
-                input_schema=descriptor_schema,
-                descriptor_version=descriptor.version,
-                schema_fingerprint=descriptor.schema_fingerprint,
-            )
-            candidate_matches = (*matches, candidate)
-            candidate_payload = {
-                "schema_version": TOOL_DISCOVERY_SCHEMA_VERSION,
-                "query": query,
-                "matches": [match.model_dump(mode="json") for match in candidate_matches],
-                # Reserve the largest possible V1 revision representation so adding a
-                # later match cannot make an earlier size decision optimistic.
-                "view_revision": TOOL_DISCOVERY_MAX_GRANTS,
-                "truncated": truncated,
-            }
-            if (
-                len(canonical_durable_json_bytes(candidate_payload, "search_tools.result"))
-                > TOOL_DISCOVERY_MAX_RESULT_BYTES
-            ):
-                if grant in new_grants:
-                    new_grants.remove(grant)
-                truncated = True
-                continue
-            matches.append(candidate)
-
-        if new_grants:
-            desired_state = ToolDiscoveryViewState.model_validate(
-                {
-                    **state.model_dump(mode="python"),
-                    "revision": next_revision,
-                    "grants": tuple(
-                        sorted((*state.grants, *new_grants), key=lambda item: item.tool_id)
-                    ),
-                }
-            )
-        else:
-            desired_state = state
-        desired_raw = desired_state.model_dump(mode="json")
-        result = ToolDiscoverySearchResult(
-            query=query,
-            matches=tuple(matches),
-            view_revision=desired_state.revision,
-            truncated=truncated,
-        )
-        payload = result.model_dump(mode="json")
-        if raw != desired_raw:
-            await durable.compare_and_set_durable_operation(
-                TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+        result: ToolDiscoverySearchResult | None = None
+        for attempt in range(TOOL_DISCOVERY_MAX_WRITE_ATTEMPTS):
+            raw = await durable.load_durable_operation(TOOL_DISCOVERY_VIEW_OPERATION_KEY)
+            state = current_tool_discovery_view(
                 raw,
-                desired_raw,
-                {},
+                session_id=discovery.session_id,
+                generation_id=discovery.generation_id,
+                agent_name=discovery.agent_name,
+                catalogue=discovery.catalogue,
+                ceiling=discovery.ceiling,
             )
+            desired_state, candidate_result = _tool_discovery_search_transition(
+                state,
+                ranked=ranked,
+                query=query,
+                limit=raw_limit,
+                model_step_id=discovery.model_step_id,
+                created_at=discovery.created_at,
+            )
+            desired_raw = desired_state.model_dump(mode="json")
+            if raw == desired_raw:
+                result = candidate_result
+                break
+            try:
+                await durable.compare_and_set_durable_operation(
+                    TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+                    raw,
+                    desired_raw,
+                    {},
+                )
+            except DurableToolOperationConflict:
+                if attempt + 1 == TOOL_DISCOVERY_MAX_WRITE_ATTEMPTS:
+                    raise
+                continue
+            result = candidate_result
+            break
+        if result is None:  # pragma: no cover - loop always returns or raises
+            raise RuntimeError("Tool discovery search did not reach a durable outcome.")
+        payload = result.model_dump(mode="json")
         return ToolResult(
             content=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             structured=payload,
@@ -1157,6 +1217,7 @@ __all__ = [
     "TOOL_DISCOVERY_MAX_RESULT_BYTES",
     "TOOL_DISCOVERY_MAX_SCAN_COUNT",
     "TOOL_DISCOVERY_MAX_SCHEMA_BYTES",
+    "TOOL_DISCOVERY_MAX_WRITE_ATTEMPTS",
     "TOOL_DISCOVERY_ONLY_PROFILE_ID",
     "TOOL_DISCOVERY_REFERENCE_PATTERN",
     "TOOL_DISCOVERY_REFERENCE_PREFIX",
@@ -1172,6 +1233,7 @@ __all__ = [
     "current_tool_discovery_view",
     "discovered_tool_rejection_event",
     "empty_tool_discovery_view",
+    "initial_tool_discovery_operation_records",
     "minimized_tool_discovery_result",
     "resolved_discovered_tool_invocation",
     "search_tool_descriptors",

@@ -80,6 +80,13 @@ from cayu.runtime.sessions import (
     run_request_with_runtime_invocation,
 )
 from cayu.runtime.tasks import TaskStatus, TaskStore
+from cayu.runtime.tool_discovery import (
+    TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+    ToolDiscoveryMode,
+    current_tool_discovery_view,
+    initial_tool_discovery_operation_records,
+    tool_discovery_generation_id,
+)
 from cayu.runtime.tool_exposure import (
     resolve_tool_capability_ceiling,
     tool_capability_ceiling_from_session_metadata,
@@ -875,6 +882,30 @@ class DurableSubagentCoordinator:
         if queue_task is not None and child is None:
             raise RuntimeError("Durable subagent task exists without its referenced child session.")
 
+        registered_child = self._get_registered_agent(intent.agent_name)
+        discovery_initializer = None
+        if registered_child.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS:
+            if not self.session_store.supports_atomic_session_operation_initialization:
+                raise RuntimeError(
+                    "Tool discovery requires atomic session operation initialization."
+                )
+            discovery_ceiling = intent.request.tool_capability_ceiling
+            if discovery_ceiling is None:
+                raise RuntimeError("Durable subagent discovery has no capability ceiling.")
+
+            def initialize_discovery_view(
+                session: Session,
+            ) -> dict[str, dict[str, Any]]:
+                return initial_tool_discovery_operation_records(
+                    session_id=session.id,
+                    root_invocation_id=session.invocation.root_invocation_id,
+                    agent_name=registered_child.spec.name,
+                    catalogue=registered_child.tool_catalogue,
+                    ceiling=discovery_ceiling,
+                )
+
+            discovery_initializer = initialize_discovery_view
+
         if child is None:
             request = copy_run_request(intent.request)
             request = run_request_with_runtime_generated_authority(
@@ -908,6 +939,7 @@ class DurableSubagentCoordinator:
                         execution_profile=intent.child_execution_profile,
                     ),
                     checkpoint_transform=persist_child_submission,
+                    operation_initializer=discovery_initializer,
                 )
             except Exception as publication_failure:
                 try:
@@ -933,6 +965,21 @@ class DurableSubagentCoordinator:
             raise RuntimeError(
                 "Existing durable subagent child has no tool capability ceiling."
             ) from exc
+        if registered_child.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS:
+            current_tool_discovery_view(
+                await self.session_store.load_session_operation(
+                    child.id,
+                    TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+                ),
+                session_id=child.id,
+                generation_id=tool_discovery_generation_id(
+                    session_id=child.id,
+                    root_invocation_id=child.invocation.root_invocation_id,
+                ),
+                agent_name=registered_child.spec.name,
+                catalogue=registered_child.tool_catalogue,
+                ceiling=child_tool_capability_ceiling,
+            )
         if (
             child_intent != intent
             or intent.request.tool_capability_ceiling is None

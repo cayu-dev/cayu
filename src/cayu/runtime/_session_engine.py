@@ -497,6 +497,7 @@ from cayu.runtime.sessions import (
     SessionMessageDeliveryBatch,
     SessionModelCompletionStageConflict,
     SessionModelTransition,
+    SessionOperationInitializer,
     SessionOperationPublication,
     SessionOrder,
     SessionQuery,
@@ -603,6 +604,13 @@ from cayu.runtime.tasks import (
     copy_task,
 )
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
+from cayu.runtime.tool_discovery import (
+    TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+    ToolDiscoveryMode,
+    current_tool_discovery_view,
+    initial_tool_discovery_operation_records,
+    tool_discovery_generation_id,
+)
 from cayu.runtime.tool_exposure import (
     ResolvedToolExposure,
     ToolCapabilityCeiling,
@@ -2910,6 +2918,61 @@ class _PreparedInitialRun:
     targeted_tool_grants: tuple[PreparedTargetedToolGrant, ...]
     budget_policy: BudgetPolicy | None
     session_identity: SessionIdentity
+
+
+def _tool_discovery_operation_initializer(
+    registered_agent: runtime_records.RegisteredAgentState,
+    ceiling: ToolCapabilityCeiling,
+) -> SessionOperationInitializer | None:
+    """Freeze one pure initializer for a discovery-enabled session branch."""
+
+    if registered_agent.tool_discovery_mode is not ToolDiscoveryMode.SEARCH_TOOLS:
+        return None
+    catalogue = registered_agent.tool_catalogue
+    agent_name = registered_agent.spec.name
+
+    def initialize(session: Session) -> dict[str, dict[str, Any]]:
+        if session.agent_name != agent_name:
+            raise ValueError("Tool discovery initializer received a different agent.")
+        return initial_tool_discovery_operation_records(
+            session_id=session.id,
+            root_invocation_id=session.invocation.root_invocation_id,
+            agent_name=agent_name,
+            catalogue=catalogue,
+            ceiling=ceiling,
+        )
+
+    return initialize
+
+
+async def _require_tool_discovery_view(
+    store: SessionStore,
+    session: Session,
+    registered_agent: runtime_records.RegisteredAgentState,
+    ceiling: ToolCapabilityCeiling,
+    *,
+    require_empty: bool,
+) -> None:
+    """Validate exact persisted discovery authority after a lifecycle boundary."""
+
+    if registered_agent.tool_discovery_mode is not ToolDiscoveryMode.SEARCH_TOOLS:
+        return
+    state = current_tool_discovery_view(
+        await store.load_session_operation(
+            session.id,
+            TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+        ),
+        session_id=session.id,
+        generation_id=tool_discovery_generation_id(
+            session_id=session.id,
+            root_invocation_id=session.invocation.root_invocation_id,
+        ),
+        agent_name=registered_agent.spec.name,
+        catalogue=registered_agent.tool_catalogue,
+        ceiling=ceiling,
+    )
+    if require_empty and (state.revision != 0 or state.grants):
+        raise RuntimeError("New session branch did not start with an empty discovery view.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -7300,6 +7363,11 @@ class SessionEngine:
         if registered_agent.spec.name != request.agent_name:
             raise ValueError("Initial-run agent override conflicts with the request agent.")
         if (
+            registered_agent.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS
+            and not self.session_store.supports_atomic_session_operation_initialization
+        ):
+            raise RuntimeError("Tool discovery requires atomic session operation initialization.")
+        if (
             expected_context_policy is not None
             and registered_agent.context_policy is not expected_context_policy
         ):
@@ -8361,6 +8429,12 @@ class SessionEngine:
                 "Rejected/continue work requires the continuation admission entrance."
             )
         execution_profile = prepared.execution_profile
+        discovery_agent = prepared.registered_agent
+        discovery_ceiling = prepared.tool_capability_ceiling
+        tool_discovery_initializer = _tool_discovery_operation_initializer(
+            discovery_agent,
+            discovery_ceiling,
+        )
 
         def freeze_initial_invocation_profile(
             current_session: Session,
@@ -8384,6 +8458,7 @@ class SessionEngine:
             started_event: Event = interaction_started_event,
             source_messages: list[Message] = prepared_request.messages,
             checkpoint_transform: CheckpointTransform = freeze_initial_invocation_profile,
+            operation_initializer: SessionOperationInitializer | None = tool_discovery_initializer,
         ) -> Awaitable[Session]:
             return self.session_store.create(
                 request_to_create,
@@ -8391,6 +8466,7 @@ class SessionEngine:
                 interaction_started_event=started_event,
                 interaction_source_messages=source_messages,
                 checkpoint_transform=checkpoint_transform,
+                operation_initializer=operation_initializer,
             )
 
         mutation = settle_work_attempt_session_mutation(
@@ -8414,12 +8490,13 @@ class SessionEngine:
             interaction_started_event,
             session_binding,
             freeze_initial_invocation_profile,
+            tool_discovery_initializer,
             create_session,
         )
         try:
             raw_session = await mutation
         except BaseException:
-            del admission, execution_profile, mutation
+            del admission, discovery_agent, discovery_ceiling, execution_profile, mutation
             raise
         del mutation
         session_validation = capture_work_attempt_session_result(
@@ -8429,13 +8506,21 @@ class SessionEngine:
         )
         del raw_session
         if session_validation.failure is not None:
-            del admission, execution_profile
+            del admission, discovery_agent, discovery_ceiling, execution_profile
             raise_task_store_operation_failure(session_validation.failure)
         session = session_validation.result
         del session_validation
         if session is None:
-            del admission, execution_profile
+            del admission, discovery_agent, discovery_ceiling, execution_profile
             raise RuntimeError("Work-attempt session creation returned no session.")
+        await _require_tool_discovery_view(
+            self.session_store,
+            session,
+            discovery_agent,
+            discovery_ceiling,
+            require_empty=True,
+        )
+        del discovery_agent, discovery_ceiling
         return await self._activate_runtime_work_attempt(
             admission=admission,
             session=session,
@@ -8965,6 +9050,10 @@ class SessionEngine:
         prompt_contributions = list(prepared.prompt_contributions)
         execution_profile = prepared.execution_profile
         tool_capability_ceiling = prepared.tool_capability_ceiling
+        tool_discovery_initializer = _tool_discovery_operation_initializer(
+            registered_agent,
+            tool_capability_ceiling,
+        )
         targeted_tool_grants = prepared.targeted_tool_grants
         budget_policy = prepared.budget_policy
         session_identity = prepared.session_identity
@@ -9019,6 +9108,7 @@ class SessionEngine:
                 interaction_started_event=interaction_started_event,
                 interaction_source_messages=request.messages,
                 checkpoint_transform=freeze_initial_invocation_profile,
+                operation_initializer=tool_discovery_initializer,
             )
         else:
 
@@ -9092,6 +9182,13 @@ class SessionEngine:
         messages: list[Message] | None = None
         prompt_contribution_manifest: PromptContributionManifest | None = None
         try:
+            await _require_tool_discovery_view(
+                self.session_store,
+                session,
+                registered_agent,
+                tool_capability_ceiling,
+                require_empty=True,
+            )
             (
                 targeted_tool_grant_records,
                 targeted_tool_grant_events,
@@ -14001,6 +14098,23 @@ class SessionEngine:
         tool_capability_ceiling_narrowed = (
             effective_tool_capability_ceiling != stored_tool_capability_ceiling
         )
+        if registered_agent.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS:
+            if not self.session_store.supports_atomic_session_operation_initialization:
+                raise RuntimeError(
+                    "Tool discovery requires atomic session operation initialization."
+                )
+            if tool_capability_ceiling_narrowed:
+                raise ValueError(
+                    "A tool-discovery session cannot change its durable capability ceiling; "
+                    "start a new session or fork with the narrower ceiling."
+                )
+            await _require_tool_discovery_view(
+                self.session_store,
+                loaded_session,
+                registered_agent,
+                effective_tool_capability_ceiling,
+                require_empty=False,
+            )
         requested_target = request.target
         target_changed = requested_target is not None and (
             requested_target.provider_name != loaded_session.provider_name
@@ -15479,8 +15593,25 @@ class SessionEngine:
         source_tool_capability_ceiling = tool_capability_ceiling_from_session_metadata(
             source_session.metadata,
         )
+        if source_registered_agent.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS:
+            if not self.session_store.supports_atomic_session_operation_initialization:
+                raise RuntimeError(
+                    "Tool discovery requires atomic session operation initialization."
+                )
+            await _require_tool_discovery_view(
+                self.session_store,
+                source_session,
+                source_registered_agent,
+                source_tool_capability_ceiling,
+                require_empty=False,
+            )
         agent_name = request.agent_name or source_session.agent_name
         registered_agent = self._get_registered_agent(agent_name)
+        if (
+            registered_agent.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS
+            and not self.session_store.supports_atomic_session_operation_initialization
+        ):
+            raise RuntimeError("Tool discovery requires atomic session operation initialization.")
         effective_tool_capability_ceiling = resolve_tool_capability_ceiling(
             request.tool_capability_ceiling,
             registered_agent.tool_capabilities,
@@ -16306,6 +16437,22 @@ class SessionEngine:
         )
         prepared_events.append(fork_event)
         prepared_events.append(grant_reset_event)
+        tool_discovery_initializer = _tool_discovery_operation_initializer(
+            registered_agent,
+            effective_tool_capability_ceiling,
+        )
+
+        async def validate_tool_discovery_view(created: Session) -> None:
+            await _require_tool_discovery_view(
+                self.session_store,
+                created,
+                registered_agent,
+                effective_tool_capability_ceiling,
+                # The child is visible after the store transaction commits. A
+                # concurrent owner may legitimately discover a tool before this
+                # acknowledgement or lost-ack reconciliation reads the record.
+                require_empty=False,
+            )
 
         async def reconcile_profiled_fork(
             initial_error: BaseException | None,
@@ -16324,6 +16471,7 @@ class SessionEngine:
                 existing_relationship = session_fork_profile_relationship(existing)
                 if existing_relationship != relationship:
                     raise RuntimeError("Existing profiled fork conflicts with the exact request.")
+                await validate_tool_discovery_view(existing)
                 recovered_events: list[Event] = []
                 for prepared_event in prepared_events:
                     records = await self.session_store.query_events(
@@ -16388,6 +16536,7 @@ class SessionEngine:
                     ),
                     events=[copy_event(event) for event in prepared_events],
                     transcript_validator=transcript_validator,
+                    operation_initializer=tool_discovery_initializer,
                 )
                 try:
                     result = copy_profiled_session_fork_result(raw_result)
@@ -16398,6 +16547,7 @@ class SessionEngine:
                         raise RuntimeError(
                             "Profiled fork publication returned a different session snapshot."
                         )
+                    await validate_tool_discovery_view(result.session)
                     validate_profiled_fork_evidence(
                         fork=result.session,
                         relationship=relationship,

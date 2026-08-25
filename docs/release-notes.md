@@ -104,7 +104,11 @@ the current direct exposure, and matches normalized name, canonical-id,
 description, and input-property terms. Results carry bounded descriptions,
 exact admitted schemas, descriptor/schema fingerprints, readiness, and opaque
 references. The typed view reuses a reference for an unchanged descriptor,
-survives ordinary resume, and is not copied to a fork.
+survives ordinary resume, and is not copied to a fork. Each new session or fork
+commits its own typed empty view in the branch-creation transaction; missing,
+malformed, stale, or foreign view authority fails closed. Built-in in-memory,
+SQLite, and PostgreSQL stores implement the atomic initialization seam required
+by discovery-enabled agents.
 
 `call_tool` resolves a discovery reference to the effective registered tool and
 validates its inner arguments before the ordinary policy, approval, hooks,

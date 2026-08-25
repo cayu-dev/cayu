@@ -7,8 +7,14 @@ from collections.abc import AsyncIterator
 import pytest
 from pydantic import ValidationError
 
-from cayu.core import AgentSpec, EventType, Message
-from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
+from cayu.core import AgentSpec, EventType, ExecutionProfileBehaviorIdentity, Message
+from cayu.core.tools import (
+    DurableToolOperationConflict,
+    Tool,
+    ToolContext,
+    ToolResult,
+    ToolSpec,
+)
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     CayuApp,
@@ -23,6 +29,7 @@ from cayu.runtime.tool_discovery import (
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
     ToolDiscoveryViewState,
     current_tool_discovery_view,
+    initial_tool_discovery_operation_records,
     search_tool_descriptors,
     search_tools_spec,
 )
@@ -34,6 +41,7 @@ from cayu.runtime.tool_policy import (
     ToolPolicyRequest,
     ToolPolicyResult,
 )
+from cayu.storage.sqlite import SQLiteSessionStore
 
 
 class _RememberKnowledgeTool(Tool):
@@ -46,6 +54,11 @@ class _RememberKnowledgeTool(Tool):
             "properties": {"fact": {"type": "string"}},
             "required": ["fact"],
         },
+        execution_profile_identity=ExecutionProfileBehaviorIdentity(
+            name="tests:tool-discovery:remember-knowledge",
+            behavior_version="1",
+            implementation_version="1",
+        ),
     )
 
     def __init__(self) -> None:
@@ -75,6 +88,14 @@ class _NoiseTool(Tool):
 
 class _DiscoveryProvider(ModelProvider):
     name = "discovery-test"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:tool-discovery:provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
 
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
@@ -205,9 +226,28 @@ class _RecordingHook(RuntimeHook):
         self.after.append(context.tool_name)
 
 
+class _DiscoveryConflictOnceStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.discovery_conflicts = 0
+
+    async def publish_session_operation(self, *args, **kwargs):
+        if (
+            kwargs.get("idempotency_key") == TOOL_DISCOVERY_VIEW_OPERATION_KEY
+            and self.discovery_conflicts == 0
+        ):
+            self.discovery_conflicts += 1
+            raise DurableToolOperationConflict("simulated discovery contention")
+        return await super().publish_session_operation(*args, **kwargs)
+
+
+class _NoAtomicOperationInitializationStore(InMemorySessionStore):
+    supports_atomic_session_operation_initialization = False
+
+
 def test_search_tools_vertical_keeps_catalogue_hidden_and_routes_effective_tool() -> None:
     async def run() -> None:
-        store = InMemorySessionStore()
+        store = _DiscoveryConflictOnceStore()
         provider = _DiscoveryProvider()
         remembered = _RememberKnowledgeTool()
         policy = _RecordingPolicy()
@@ -234,6 +274,7 @@ def test_search_tools_vertical_keeps_catalogue_hidden_and_routes_effective_tool(
         ]
 
         assert events[-1].type is EventType.SESSION_COMPLETED
+        assert store.discovery_conflicts == 1
         assert remembered.calls == [{"fact": "Keep discovery branch-local."}]
         assert [request.tools for request in provider.requests] == [
             [search_tools_spec(), call_tool_spec()]
@@ -283,6 +324,28 @@ def test_search_tools_vertical_keeps_catalogue_hidden_and_routes_effective_tool(
             if event.type is EventType.TOOL_CALL_COMPLETED
         ] == ["search_tools", "search_tools", "remember_knowledge"]
 
+        with pytest.raises(ValueError, match="cannot change its durable capability ceiling"):
+            _ = [
+                event
+                async for event in app.resume(
+                    ResumeRequest(
+                        session_id="discovery-session",
+                        messages=[Message.text("user", "Drop every tool.")],
+                        tool_capability_ceiling=ToolCapabilityCeiling(tool_names=()),
+                    )
+                )
+            ]
+        assert len(provider.requests) == 4
+        assert (
+            ToolDiscoveryViewState.model_validate(
+                await store.load_session_operation(
+                    "discovery-session",
+                    TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+                )
+            )
+            == state
+        )
+
         forked = [
             event
             async for event in app.fork_session(
@@ -293,13 +356,16 @@ def test_search_tools_vertical_keeps_catalogue_hidden_and_routes_effective_tool(
             )
         ]
         assert forked[0].type is EventType.SESSION_FORKED
-        assert (
+        child_state = ToolDiscoveryViewState.model_validate(
             await store.load_session_operation(
                 "discovery-child",
                 TOOL_DISCOVERY_VIEW_OPERATION_KEY,
             )
-            is None
         )
+        assert child_state.session_id == "discovery-child"
+        assert child_state.generation_id != state.generation_id
+        assert child_state.revision == 0
+        assert child_state.grants == ()
         assert (
             ToolDiscoveryViewState.model_validate(
                 await store.load_session_operation(
@@ -368,6 +434,131 @@ def test_search_tools_vertical_keeps_catalogue_hidden_and_routes_effective_tool(
     asyncio.run(run())
 
 
+def test_discovery_rejects_a_store_without_atomic_view_initialization() -> None:
+    async def run() -> None:
+        store = _NoAtomicOperationInitializationStore()
+        provider = _DiscoveryProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(_RememberKnowledgeTool(),),
+            tool_discovery_mode="search_tools",
+        )
+
+        with pytest.raises(RuntimeError, match="atomic session operation initialization"):
+            _ = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="unsupported-discovery-store",
+                        messages=[Message.text("user", "Find a tool.")],
+                    )
+                )
+            ]
+
+        assert await store.load("unsupported-discovery-store") is None
+        assert provider.requests == []
+
+    asyncio.run(run())
+
+
+def test_sqlite_reconstruction_preserves_parent_view_and_empty_fork(tmp_path) -> None:
+    async def run() -> None:
+        database = tmp_path / "tool-discovery.sqlite"
+        provider = _DiscoveryProvider()
+        remembered = _RememberKnowledgeTool()
+
+        first_store = SQLiteSessionStore(database)
+        first_app = CayuApp(session_store=first_store, enable_logging=False)
+        first_app.register_provider(provider, default=True)
+        first_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(remembered,),
+            tool_discovery_mode="search_tools",
+        )
+        try:
+            initial = [
+                event
+                async for event in first_app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="sqlite-discovery-parent",
+                        messages=[Message.text("user", "Find and save the lesson.")],
+                    )
+                )
+            ]
+            assert initial[-1].type is EventType.SESSION_COMPLETED
+            forked = [
+                event
+                async for event in first_app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id="sqlite-discovery-parent",
+                        session_id="sqlite-discovery-child",
+                    )
+                )
+            ]
+            assert forked[0].type is EventType.SESSION_FORKED
+        finally:
+            await first_store.close()
+
+        reopened_store = SQLiteSessionStore(database)
+        reopened_app = CayuApp(session_store=reopened_store, enable_logging=False)
+        reopened_app.register_provider(provider, default=True)
+        reopened_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(remembered,),
+            tool_discovery_mode="search_tools",
+        )
+        try:
+            child = [
+                event
+                async for event in reopened_app.resume(
+                    ResumeRequest(
+                        session_id="sqlite-discovery-child",
+                        messages=[Message.text("user", "Try the copied parent reference.")],
+                    )
+                )
+            ]
+            assert child[-1].type is EventType.SESSION_COMPLETED
+            child_state = ToolDiscoveryViewState.model_validate(
+                await reopened_store.load_session_operation(
+                    "sqlite-discovery-child",
+                    TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+                )
+            )
+            assert child_state.revision == 0
+            assert child_state.grants == ()
+
+            parent = [
+                event
+                async for event in reopened_app.resume(
+                    ResumeRequest(
+                        session_id="sqlite-discovery-parent",
+                        messages=[Message.text("user", "Save one more lesson.")],
+                    )
+                )
+            ]
+            assert parent[-1].type is EventType.SESSION_COMPLETED
+            parent_state = ToolDiscoveryViewState.model_validate(
+                await reopened_store.load_session_operation(
+                    "sqlite-discovery-parent",
+                    TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+                )
+            )
+            assert parent_state.revision == 1
+            assert [grant.tool_name for grant in parent_state.grants] == ["remember_knowledge"]
+            assert remembered.calls == [
+                {"fact": "Keep discovery branch-local."},
+                {"fact": "Discovery survives ordinary resume."},
+            ]
+        finally:
+            await reopened_store.close()
+
+    asyncio.run(run())
+
+
 def test_search_ranking_is_deterministic_bounded_and_excludes_direct_tools() -> None:
     descriptors = (
         build_tool_descriptor(
@@ -432,7 +623,7 @@ def test_search_ranking_is_deterministic_bounded_and_excludes_direct_tools() -> 
     )
 
 
-def test_foreign_or_stale_view_resets_instead_of_leaking_discovery_authority() -> None:
+def test_missing_foreign_or_stale_view_fails_closed() -> None:
     descriptor = build_tool_descriptor(
         name="remember_knowledge",
         description="Save reusable knowledge.",
@@ -444,28 +635,68 @@ def test_foreign_or_stale_view_resets_instead_of_leaking_discovery_authority() -
     )
     catalogue = build_tool_catalog_snapshot((descriptor,))
     ceiling = ToolCapabilityCeiling(tool_names=(descriptor.name,))
-    state = current_tool_discovery_view(
-        None,
-        session_id="parent",
-        generation_id=f"sha256:{'1' * 64}",
-        agent_name="assistant",
-        catalogue=catalogue,
-        ceiling=ceiling,
+    state = ToolDiscoveryViewState.model_validate(
+        initial_tool_discovery_operation_records(
+            session_id="parent",
+            root_invocation_id="root",
+            agent_name="assistant",
+            catalogue=catalogue,
+            ceiling=ceiling,
+        )[TOOL_DISCOVERY_VIEW_OPERATION_KEY]
     )
 
-    child = current_tool_discovery_view(
-        state.model_dump(mode="json"),
-        session_id="child",
-        generation_id=f"sha256:{'2' * 64}",
-        agent_name="assistant",
-        catalogue=catalogue,
-        ceiling=ceiling,
-    )
+    with pytest.raises(ValueError, match="not initialized"):
+        current_tool_discovery_view(
+            None,
+            session_id="parent",
+            generation_id=state.generation_id,
+            agent_name="assistant",
+            catalogue=catalogue,
+            ceiling=ceiling,
+        )
 
-    assert child.session_id == "child"
-    assert child.generation_id == f"sha256:{'2' * 64}"
-    assert child.revision == 0
-    assert child.grants == ()
+    with pytest.raises(ValueError, match="conflicts with current session authority"):
+        current_tool_discovery_view(
+            state.model_dump(mode="json"),
+            session_id="child",
+            generation_id=f"sha256:{'2' * 64}",
+            agent_name="assistant",
+            catalogue=catalogue,
+            ceiling=ceiling,
+        )
+
+    changed_catalogue = build_tool_catalog_snapshot(
+        (
+            build_tool_descriptor(
+                name="remember_knowledge",
+                description="Save changed reusable knowledge.",
+                input_schema={},
+                parallel_safe=True,
+                effect="external",
+                publishes_arguments=True,
+                workspace_mutation=False,
+            ),
+        )
+    )
+    with pytest.raises(ValueError, match="conflicts with current session authority"):
+        current_tool_discovery_view(
+            state.model_dump(mode="json"),
+            session_id="parent",
+            generation_id=state.generation_id,
+            agent_name="assistant",
+            catalogue=changed_catalogue,
+            ceiling=ceiling,
+        )
+
+    with pytest.raises(ValueError, match="conflicts with current session authority"):
+        current_tool_discovery_view(
+            state.model_dump(mode="json"),
+            session_id="parent",
+            generation_id=state.generation_id,
+            agent_name="assistant",
+            catalogue=catalogue,
+            ceiling=ToolCapabilityCeiling(tool_names=()),
+        )
 
 
 def test_malformed_discovery_view_fails_closed() -> None:
