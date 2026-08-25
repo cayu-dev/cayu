@@ -1,0 +1,98 @@
+{
+  "ceiling_findings": [],
+  "ceilings": {
+    "memory_application_p95_ms_per_source": 10.0,
+    "memory_receipt_load_p95_ms": 25.0,
+    "memory_replay_p95_ms": 100.0,
+    "memory_zero_decision_entry_publish_p95_ms": 10.0,
+    "preparation_p95_ms_per_source": 2.0,
+    "sqlite_application_p95_ms_per_source": 30.0,
+    "sqlite_receipt_load_p95_ms": 50.0,
+    "sqlite_replay_p95_ms": 200.0,
+    "sqlite_storage_bytes_per_applied_source": 65536,
+    "sqlite_zero_decision_entry_publish_p95_ms": 100.0
+  },
+  "control": {
+    "decision_count": 0,
+    "entry_count": 420,
+    "historical_pre_feature": false,
+    "kind": "current_runtime_zero_maintenance_decisions"
+  },
+  "environment": {
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "results": [
+    {
+      "application_latency_per_source": {
+        "p50_ms": 1.080533,
+        "p95_ms": 1.128288
+      },
+      "applied_source_count": 400,
+      "backend": "memory",
+      "decision_count": 20,
+      "entry_count": 420,
+      "exact_replay_latency": {
+        "p50_ms": 21.60925,
+        "p95_ms": 22.075416
+      },
+      "populated_decision_storage_bytes": null,
+      "preparation_latency_per_source": {
+        "p50_ms": 0.459443,
+        "p95_ms": 0.47134
+      },
+      "receipt_load_latency": {
+        "p50_ms": 0.41425,
+        "p95_ms": 0.474083
+      },
+      "sources_per_decision": 20,
+      "storage_byte_overhead": null,
+      "storage_bytes_per_applied_source": null,
+      "zero_decision_entry_publish_latency": {
+        "p50_ms": 0.140271,
+        "p95_ms": 0.199833
+      },
+      "zero_decision_storage_bytes": null
+    },
+    {
+      "application_latency_per_source": {
+        "p50_ms": 1.084157,
+        "p95_ms": 1.147729
+      },
+      "applied_source_count": 400,
+      "backend": "sqlite",
+      "decision_count": 20,
+      "entry_count": 420,
+      "exact_replay_latency": {
+        "p50_ms": 43.39023,
+        "p95_ms": 46.582667
+      },
+      "populated_decision_storage_bytes": 3960832,
+      "preparation_latency_per_source": {
+        "p50_ms": 0.466892,
+        "p95_ms": 0.496648
+      },
+      "receipt_load_latency": {
+        "p50_ms": 22.1635,
+        "p95_ms": 24.205791
+      },
+      "sources_per_decision": 20,
+      "storage_byte_overhead": 1921024,
+      "storage_bytes_per_applied_source": 4802.56,
+      "zero_decision_entry_publish_latency": {
+        "p50_ms": 0.310688,
+        "p95_ms": 0.545791
+      },
+      "zero_decision_storage_bytes": 2039808
+    }
+  ],
+  "schema_version": "cayu.knowledge_maintenance_performance.v1",
+  "within_ceilings": true,
+  "workload": {
+    "applied_source_count": 400,
+    "decision_count": 20,
+    "entry_count": 420,
+    "provider_calls": 0,
+    "sources_per_decision": 20
+  }
+}

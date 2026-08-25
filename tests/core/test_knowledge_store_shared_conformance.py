@@ -14,6 +14,9 @@ from tests.core.knowledge_access_scope_conformance import (
 from tests.core.knowledge_index_readiness_conformance import (
     assert_index_readiness_conformance,
 )
+from tests.core.knowledge_maintenance_conformance import (
+    assert_knowledge_maintenance_conformance,
+)
 from tests.core.knowledge_relation_conformance import (
     assert_knowledge_relation_conformance,
     assert_knowledge_relation_scope_conformance,
@@ -212,6 +215,19 @@ def test_knowledge_store_shared_relation_contract(knowledge_store_case) -> None:
             await assert_knowledge_relation_scope_conformance(unbound)
         finally:
             await _close_store(unbound)
+            await _reset_case(knowledge_store_case)
+
+    asyncio.run(run())
+
+
+def test_knowledge_store_shared_maintenance_contract(knowledge_store_case) -> None:
+    async def run() -> None:
+        await _reset_case(knowledge_store_case)
+        store = await _open_store(knowledge_store_case)
+        try:
+            await assert_knowledge_maintenance_conformance(store)
+        finally:
+            await _close_store(store)
             await _reset_case(knowledge_store_case)
 
     asyncio.run(run())

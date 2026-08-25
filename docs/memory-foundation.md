@@ -490,6 +490,106 @@ result is recorded in
 The zero-relation lane is a current-runtime control with the same canonical
 entries, not a historical binary comparison.
 
+## Atomic reviewed knowledge maintenance
+
+Revision-bound relations describe lineage but do not change lifecycle by
+themselves. `KnowledgeMaintenanceProposal` and `KnowledgeMaintenanceDecision`
+provide the separate reviewed authority needed to activate one pending
+replacement, archive exact superseded predecessors, and publish the approved
+relations as one atomic operation.
+
+A proposal is an immutable, bounded plan. It binds:
+
+- one exact pending replacement revision;
+- up to 50 exact current source revisions, each with exactly one `supersedes`,
+  `derived_from`, or `contradicts` disposition;
+- the relations that bind the replacement's deterministic active successor
+  revision (as the subject for directed dispositions, or either endpoint for a
+  symmetric contradiction);
+- the complete access scope and policy identity used for review; and
+- bounded rationale, evidence summary, metadata, proposer identity, timestamp,
+  and a canonical fingerprint.
+
+The proposal is supplied by application policy or a future candidate-discovery
+component. The store does not search for duplicates, invoke a curator, infer
+supersession from similarity, or let model output authorize the mutation. A
+decision binds the exact proposal fingerprint and requires a non-model reviewer
+identity, safe reason, timestamp, and immutable operation ID.
+
+```python
+proposal = KnowledgeMaintenanceProposal(
+    id="refund-policy-maintenance-2026-08",
+    replacement=KnowledgeRevisionRef(entry_id="refund-policy-new", revision=1),
+    sources=[KnowledgeRevisionRef(entry_id="refund-policy-old", revision=3)],
+    relations=[
+        KnowledgeRelation(
+            id="refund-policy-supersession-2026-08",
+            subject=KnowledgeRevisionRef(entry_id="refund-policy-new", revision=2),
+            object=KnowledgeRevisionRef(entry_id="refund-policy-old", revision=3),
+            kind=KnowledgeRelationKind.SUPERSEDES,
+            policy_id="knowledge-maintenance-v1",
+        )
+    ],
+    access_scope=review_scope,
+    policy_id="knowledge-maintenance-v1",
+    rationale="The pending revision replaces the reviewed policy.",
+    evidence_summary="The application verified the signed policy artifact.",
+)
+decision = KnowledgeMaintenanceDecision(
+    operation_id="refund-policy-maintenance-operation-2026-08",
+    proposal_id=proposal.id,
+    proposal_fingerprint=proposal.fingerprint,
+    kind=KnowledgeMaintenanceDecisionKind.APPROVE,
+    reviewer_type=KnowledgeActorType.USER,
+    reviewer="policy-owner",
+    reason="The exact proposal and evidence were reviewed.",
+)
+receipt = await review_workflow.decide_maintenance(proposal, decision)
+```
+
+Inside one store transaction, approval reauthorizes every exact reference,
+checks that the replacement is still pending and every source is still active
+at the reviewed revision, appends the active replacement revision, appends
+archived revisions only for `supersedes` sources, publishes every relation,
+appends the metadata-only lifecycle and relation changes, and persists the
+proposal, decision, and receipt. Any stale revision, authorization denial,
+identity conflict, failure, or cancellation leaves all of those records
+unchanged. Exact replay returns the original receipt with `replayed=True`.
+Maintenance history and exact replay remain authorized by the immutable
+pre-transition entries that the reviewer inspected. Archiving a source outside
+the review scope's readable statuses therefore neither hides that history nor
+grants the reviewer read access to the archived revision.
+
+`derived_from` and `contradicts` sources remain active. In particular,
+contradiction records an unresolved reviewed conflict without silently choosing
+a winner. Rejection persists immutable review history but does not activate,
+archive, relate, or delete any entry. Rejected pending content therefore remains
+pending unless the caller performs a separate lifecycle decision.
+
+Normal active recall cannot see the pending replacement before approval. After
+approval it sees the replacement only after the predecessor lifecycle and
+lineage are committed with it. This storage operation does not rank relations,
+run graph traversal, or decide what retrieved memory enters model context;
+recall policy and `ContextExposure` remain separate later boundaries.
+
+Breaking storage revision 63 installs the final reviewed-maintenance record.
+Fresh databases and completely empty earlier knowledge schemas initialize
+directly. A populated pre-63 knowledge schema fails before any DDL or data
+change and must be explicitly replaced. There is no backfill, legacy proposal
+interpretation, compatibility wrapper, or dual-write path.
+
+The hermetic performance gate runs with no provider calls:
+
+```bash
+PYTHONPATH=src python scripts/run_knowledge_maintenance_performance.py --check
+```
+
+Its checked workload applies 20 decisions with 20 sources each and compares
+them with a current-runtime zero-decision control containing the same 420
+entries. It measures preparation, atomic application, exact replay, receipt
+loading, and incremental SQLite storage. Results are recorded in
+[`benchmarks/memory/knowledge-maintenance-performance-v1.json`](../benchmarks/memory/knowledge-maintenance-performance-v1.json).
+
 ## Explicit reviewed knowledge curation
 
 `KnowledgeCurator` is the provider-neutral, explicitly invoked path from application

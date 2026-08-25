@@ -101,3 +101,21 @@ relations; it is not a historical pre-feature comparison. The populated lane
 measures canonical preparation, atomic ten-relation batches, bounded 50-result
 queries, isolated-endpoint lookup across the unrelated background, and steady-state
 SQLite bytes after close. CI reruns the workload without coverage instrumentation.
+
+## Reviewed knowledge-maintenance overhead
+
+`knowledge-maintenance-performance-v1.json` is the provider-free baseline for 20
+approved decisions with 20 exact predecessor revisions each. Regenerate it, or
+check the same fixed regression ceilings, with:
+
+```bash
+PYTHONPATH=src python scripts/run_knowledge_maintenance_performance.py \
+  --output benchmarks/memory/knowledge-maintenance-performance-v1.json \
+  --check
+```
+
+The zero-decision control creates the same 420 current-runtime entries without
+applying maintenance; it is not a historical binary comparison. The applied lane
+measures canonical proposal/decision preparation, atomic activation plus archival
+and relation publication, exact replay, receipt loading, and steady-state SQLite
+bytes. It makes no provider calls.

@@ -98,6 +98,7 @@ def test_every_ref_uses_balanced_shards_behind_the_stable_test_gate() -> None:
 
     assert "scripts/run_memory_evidence_performance.py --check" in performance
     assert "scripts/run_knowledge_relation_performance.py --check" in performance
+    assert "scripts/run_knowledge_maintenance_performance.py --check" in performance
 
     assert "name: Test (Python 3.14)" in test_gate
     assert "needs: [test_shards, test_specialists, memory-evidence-performance]" in test_gate

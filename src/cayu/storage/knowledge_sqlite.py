@@ -53,6 +53,12 @@ from cayu.storage.memory import (
     KnowledgeListItem,
     KnowledgeListQuery,
     KnowledgeListResult,
+    KnowledgeMaintenanceConflict,
+    KnowledgeMaintenanceDecision,
+    KnowledgeMaintenanceDecisionKind,
+    KnowledgeMaintenanceDecisionReceipt,
+    KnowledgeMaintenanceOutcome,
+    KnowledgeMaintenanceProposal,
     KnowledgePublicationConflict,
     KnowledgePublicationReceipt,
     KnowledgeQuery,
@@ -90,25 +96,35 @@ from cayu.storage.memory import (
     _knowledge_embedding_identity_sha256,
     _knowledge_entry_id,
     _knowledge_index_readiness_update_sha256,
+    _knowledge_maintenance_access_snapshot,
+    _knowledge_maintenance_access_snapshot_json,
+    _knowledge_maintenance_identity,
+    _knowledge_maintenance_successors,
     _knowledge_publication_operation_id,
     _knowledge_relation_access_snapshot,
     _knowledge_relation_access_snapshot_json,
     _knowledge_relation_change_audiences,
     _knowledge_relation_identity,
     _knowledge_relation_query_fingerprint,
+    _knowledge_scope_allows_maintenance_access_snapshot,
     _knowledge_scope_allows_relation_access_snapshot,
     _knowledge_scope_allows_snapshot,
+    _KnowledgeMaintenanceAccessSnapshot,
     _KnowledgeRelationAccessSnapshot,
     _next_knowledge_revision,
     _parse_knowledge_access_snapshot_json,
+    _parse_knowledge_maintenance_access_snapshot_json,
     _parse_knowledge_relation_access_snapshot_json,
     _require_knowledge_entry_access,
+    _require_knowledge_maintenance_current_entries,
     _require_knowledge_successor_access,
     _validate_knowledge_change_limit,
     _validate_knowledge_change_sequence,
     _validate_knowledge_index_readiness_limit,
     _validate_knowledge_index_readiness_transition,
     _validate_knowledge_index_sequence,
+    _validate_knowledge_maintenance_record,
+    _validate_knowledge_maintenance_replay,
     _validate_knowledge_publication_replay,
     _validate_knowledge_relation_publication_replay,
     _validate_knowledge_revision,
@@ -122,10 +138,14 @@ from cayu.storage.memory import (
     copy_knowledge_entry,
     copy_knowledge_index_readiness_update,
     copy_knowledge_list_query,
+    copy_knowledge_maintenance_decision,
+    copy_knowledge_maintenance_decision_receipt,
+    copy_knowledge_maintenance_proposal,
     copy_knowledge_publication_receipt,
     copy_knowledge_query,
     copy_knowledge_relation_publication_receipt,
     copy_knowledge_relation_query,
+    prepare_knowledge_maintenance_decision,
     prepare_knowledge_publication,
     prepare_knowledge_relations,
 )
@@ -134,7 +154,7 @@ _SEARCH_TOKEN_RE = re.compile(r"\w+")
 _SEARCH_PAGE_SIZE = 500
 _CHUNK_ID_LOOKUP_BATCH_SIZE = 400
 _EVIDENCE_ID_LOOKUP_BATCH_SIZE = 400
-_SQLITE_MIN_REQUIRED_REVISION = 60
+_SQLITE_MIN_REQUIRED_REVISION = 63
 
 
 class SQLiteKnowledgeStore(KnowledgeStore):
@@ -701,25 +721,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     committed_at=committed_at,
                 )
                 try:
-                    self._connection.executemany(
-                        """
-                        INSERT INTO cayu_knowledge_relations (
-                            id,
-                            subject_entry_id,
-                            subject_revision,
-                            object_entry_id,
-                            object_revision,
-                            kind,
-                            created_by_type,
-                            created_by,
-                            policy_id,
-                            created_at,
-                            metadata_json
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        [_relation_row_values(relation) for relation in copied_relations],
-                    )
+                    self._insert_relations_unlocked(copied_relations)
                     for relation, access_snapshot in zip(
                         copied_relations,
                         endpoint_access,
@@ -808,6 +810,256 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             [_relation_from_row(row) for row in rows],
             fingerprint=fingerprint,
         )
+
+    async def apply_maintenance_decision(
+        self,
+        proposal: KnowledgeMaintenanceProposal,
+        decision: KnowledgeMaintenanceDecision,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceDecisionReceipt:
+        scope = self._operation_access_scope(access_scope)
+        proposal, decision, request_sha256 = prepare_knowledge_maintenance_decision(
+            proposal,
+            decision,
+        )
+        operation = "apply_maintenance_decision"
+        async with self._lock:
+            with sqlite_support._transaction(self._connection):
+                existing = self._load_maintenance_record_unlocked(
+                    decision.operation_id,
+                    access_scope=scope,
+                    deny_inaccessible=True,
+                )
+                if existing is not None:
+                    stored_proposal, stored_decision, receipt = existing
+                    _validate_knowledge_maintenance_replay(
+                        stored_proposal,
+                        stored_decision,
+                        receipt,
+                        proposal=proposal,
+                        decision=decision,
+                        request_sha256=request_sha256,
+                    )
+                    return copy_knowledge_maintenance_decision_receipt(
+                        receipt,
+                        replayed=True,
+                    )
+
+                prior = self._connection.execute(
+                    "SELECT operation_id FROM cayu_knowledge_maintenance_decisions "
+                    "WHERE proposal_id = ?",
+                    (proposal.id,),
+                ).fetchone()
+                if prior is not None:
+                    self._load_maintenance_record_unlocked(
+                        str(prior["operation_id"]),
+                        access_scope=scope,
+                        deny_inaccessible=True,
+                    )
+                    raise KnowledgeMaintenanceConflict("proposal_already_decided")
+                current_entries = self._load_entries_unlocked(
+                    [
+                        proposal.replacement.entry_id,
+                        *(source.entry_id for source in proposal.sources),
+                    ]
+                )
+                replacement, sources = _require_knowledge_maintenance_current_entries(
+                    proposal,
+                    current_entries,
+                    access_scope=scope,
+                    operation=operation,
+                )
+                committed_at = max(self._clock(), proposal.created_at, decision.decided_at)
+                if decision.kind is KnowledgeMaintenanceDecisionKind.REJECT:
+                    receipt = KnowledgeMaintenanceDecisionReceipt(
+                        operation_id=decision.operation_id,
+                        proposal_id=proposal.id,
+                        proposal_fingerprint=proposal.fingerprint,
+                        request_sha256=request_sha256,
+                        outcome=KnowledgeMaintenanceOutcome.REJECTED,
+                        committed_at=committed_at,
+                    )
+                    self._insert_maintenance_record_unlocked(
+                        proposal,
+                        decision,
+                        receipt,
+                        access_snapshot=_knowledge_maintenance_access_snapshot(
+                            [replacement, *sources]
+                        ),
+                    )
+                    return copy_knowledge_maintenance_decision_receipt(receipt)
+
+                active_replacement, archived_sources = _knowledge_maintenance_successors(
+                    proposal,
+                    replacement,
+                    sources,
+                    access_scope=scope,
+                    committed_at=committed_at,
+                    operation=operation,
+                )
+                for relation in proposal.relations:
+                    row = self._connection.execute(
+                        """
+                        SELECT *
+                        FROM cayu_knowledge_relations
+                        WHERE id = ? OR (
+                            kind = ?
+                            AND subject_entry_id = ?
+                            AND subject_revision = ?
+                            AND object_entry_id = ?
+                            AND object_revision = ?
+                        )
+                        LIMIT 1
+                        """,
+                        (relation.id, *_relation_semantic_row_values(relation)),
+                    ).fetchone()
+                    if row is not None:
+                        occupied = _relation_from_row(row)
+                        if not self._relation_endpoints_in_scope_unlocked(occupied, scope):
+                            raise KnowledgeAccessDenied(operation)
+                        raise KnowledgeMaintenanceConflict("relation_exists")
+                    historic = self._connection.execute(
+                        "SELECT sequence FROM cayu_knowledge_changes WHERE relation_id = ?",
+                        (relation.id,),
+                    ).fetchone()
+                    if historic is not None:
+                        if (
+                            self._load_change_in_scope_unlocked(
+                                int(historic["sequence"]),
+                                scope,
+                            )
+                            is None
+                        ):
+                            raise KnowledgeAccessDenied(operation)
+                        raise KnowledgeMaintenanceConflict("relation_exists")
+
+                for successor in [active_replacement, *archived_sources]:
+                    self._append_revision_unlocked(
+                        successor,
+                        expected_revision=current_entries[successor.id].revision,
+                        chunks=None,
+                        evidence=None,
+                        access_scope=scope,
+                        operation=operation,
+                        change_kind=KnowledgeChangeKind.STATUS_TRANSITIONED,
+                        inherit_evidence=True,
+                        change_operation_id=decision.operation_id,
+                        committed_at=committed_at,
+                    )
+
+                post_current = self._load_entries_unlocked(list(current_entries))
+                relation_access: list[_KnowledgeRelationAccessSnapshot] = []
+                for relation in proposal.relations:
+                    subject_exact = self._load_entry_unlocked(
+                        relation.subject.entry_id,
+                        revision=relation.subject.revision,
+                    )
+                    object_exact = self._load_entry_unlocked(
+                        relation.object.entry_id,
+                        revision=relation.object.revision,
+                    )
+                    if subject_exact is None or object_exact is None:
+                        raise KnowledgeMaintenanceConflict("relation_endpoint")
+                    relation_access.append(
+                        _knowledge_relation_access_snapshot(
+                            subject_exact=subject_exact,
+                            subject_current=post_current[relation.subject.entry_id],
+                            object_exact=object_exact,
+                            object_current=post_current[relation.object.entry_id],
+                        )
+                    )
+                self._insert_relations_unlocked(proposal.relations)
+                for relation, snapshot in zip(
+                    proposal.relations,
+                    relation_access,
+                    strict=True,
+                ):
+                    self._insert_relation_change_unlocked(
+                        relation,
+                        access_snapshot=snapshot,
+                        operation_id=decision.operation_id,
+                        committed_at=committed_at,
+                    )
+                receipt = KnowledgeMaintenanceDecisionReceipt(
+                    operation_id=decision.operation_id,
+                    proposal_id=proposal.id,
+                    proposal_fingerprint=proposal.fingerprint,
+                    request_sha256=request_sha256,
+                    outcome=KnowledgeMaintenanceOutcome.APPLIED,
+                    replacement=KnowledgeRevisionRef(
+                        entry_id=active_replacement.id,
+                        revision=active_replacement.revision,
+                    ),
+                    archived_revisions=[
+                        KnowledgeRevisionRef(entry_id=entry.id, revision=entry.revision)
+                        for entry in archived_sources
+                    ],
+                    relation_ids=[relation.id for relation in proposal.relations],
+                    committed_at=committed_at,
+                )
+                self._insert_maintenance_record_unlocked(
+                    proposal,
+                    decision,
+                    receipt,
+                    access_snapshot=_knowledge_maintenance_access_snapshot([replacement, *sources]),
+                )
+                return copy_knowledge_maintenance_decision_receipt(receipt)
+
+    async def load_maintenance_proposal(
+        self,
+        proposal_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceProposal | None:
+        scope = self._operation_access_scope(access_scope)
+        proposal_id = _knowledge_maintenance_identity(proposal_id, "proposal_id")
+        async with self._lock:
+            row = self._connection.execute(
+                "SELECT operation_id FROM cayu_knowledge_maintenance_decisions "
+                "WHERE proposal_id = ?",
+                (proposal_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            record = self._load_maintenance_record_unlocked(
+                str(row["operation_id"]),
+                access_scope=scope,
+                deny_inaccessible=False,
+            )
+        return None if record is None else copy_knowledge_maintenance_proposal(record[0])
+
+    async def load_maintenance_decision(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceDecision | None:
+        scope = self._operation_access_scope(access_scope)
+        operation_id = _knowledge_maintenance_identity(operation_id, "operation_id")
+        async with self._lock:
+            record = self._load_maintenance_record_unlocked(
+                operation_id,
+                access_scope=scope,
+                deny_inaccessible=False,
+            )
+        return None if record is None else copy_knowledge_maintenance_decision(record[1])
+
+    async def load_maintenance_decision_receipt(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceDecisionReceipt | None:
+        scope = self._operation_access_scope(access_scope)
+        operation_id = _knowledge_maintenance_identity(operation_id, "operation_id")
+        async with self._lock:
+            record = self._load_maintenance_record_unlocked(
+                operation_id,
+                access_scope=scope,
+                deny_inaccessible=False,
+            )
+        return None if record is None else copy_knowledge_maintenance_decision_receipt(record[2])
 
     async def read_evidence(
         self,
@@ -1859,6 +2111,8 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         operation: str,
         change_kind: KnowledgeChangeKind,
         inherit_evidence: bool,
+        change_operation_id: str | None = None,
+        committed_at: datetime | None = None,
     ) -> None:
         _validate_revision_append(entry, expected_revision=expected_revision)
         current = self._load_entry_unlocked(entry.id)
@@ -1924,6 +2178,8 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             before_entry=current,
             after_entry=entry,
             kind=change_kind,
+            operation_id=change_operation_id,
+            committed_at=committed_at,
         )
 
     def _insert_chunks_unlocked(
@@ -2187,6 +2443,27 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             )
         return change
 
+    def _insert_relations_unlocked(self, relations: list[KnowledgeRelation]) -> None:
+        self._connection.executemany(
+            """
+            INSERT INTO cayu_knowledge_relations (
+                id,
+                subject_entry_id,
+                subject_revision,
+                object_entry_id,
+                object_revision,
+                kind,
+                created_by_type,
+                created_by,
+                policy_id,
+                created_at,
+                metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [_relation_row_values(relation) for relation in relations],
+        )
+
     def _insert_relation_change_unlocked(
         self,
         relation: KnowledgeRelation,
@@ -2367,6 +2644,98 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 receipt.request_sha256,
                 sqlite_support.format_datetime(receipt.committed_at),
                 json.dumps(snapshots, ensure_ascii=False, separators=(",", ":")),
+            ),
+        )
+
+    def _load_maintenance_record_unlocked(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope,
+        deny_inaccessible: bool,
+    ) -> (
+        tuple[
+            KnowledgeMaintenanceProposal,
+            KnowledgeMaintenanceDecision,
+            KnowledgeMaintenanceDecisionReceipt,
+        ]
+        | None
+    ):
+        row = self._connection.execute(
+            """
+            SELECT proposal_id, proposal_fingerprint, request_sha256, committed_at,
+                   proposal_json, decision_json, receipt_json, access_snapshot_json
+            FROM cayu_knowledge_maintenance_decisions
+            WHERE operation_id = ?
+            """,
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            proposal = KnowledgeMaintenanceProposal.model_validate_json(row["proposal_json"])
+            decision = KnowledgeMaintenanceDecision.model_validate_json(row["decision_json"])
+            receipt = KnowledgeMaintenanceDecisionReceipt.model_validate_json(row["receipt_json"])
+            snapshot = _parse_knowledge_maintenance_access_snapshot_json(
+                row["access_snapshot_json"]
+            )
+            if (
+                decision.operation_id != operation_id
+                or receipt.operation_id != operation_id
+                or proposal.id != row["proposal_id"]
+                or proposal.id != decision.proposal_id
+                or proposal.id != receipt.proposal_id
+                or proposal.fingerprint != row["proposal_fingerprint"]
+                or proposal.fingerprint != decision.proposal_fingerprint
+                or proposal.fingerprint != receipt.proposal_fingerprint
+                or receipt.request_sha256 != row["request_sha256"]
+                or receipt.committed_at != sqlite_support.parse_datetime(row["committed_at"])
+            ):
+                raise ValueError("Maintenance record indexes conflict with content.")
+            _validate_knowledge_maintenance_record(proposal, decision, receipt)
+        except KnowledgeMaintenanceConflict:
+            raise
+        except Exception:
+            raise KnowledgeMaintenanceConflict("malformed_receipt") from None
+        if not _knowledge_scope_allows_maintenance_access_snapshot(access_scope, snapshot):
+            if deny_inaccessible:
+                raise KnowledgeAccessDenied("apply_maintenance_decision")
+            return None
+        return proposal, decision, receipt
+
+    def _insert_maintenance_record_unlocked(
+        self,
+        proposal: KnowledgeMaintenanceProposal,
+        decision: KnowledgeMaintenanceDecision,
+        receipt: KnowledgeMaintenanceDecisionReceipt,
+        *,
+        access_snapshot: _KnowledgeMaintenanceAccessSnapshot,
+    ) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO cayu_knowledge_maintenance_decisions (
+                operation_id,
+                proposal_id,
+                proposal_fingerprint,
+                request_sha256,
+                committed_at,
+                proposal_json,
+                decision_json,
+                receipt_json,
+                access_snapshot_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                receipt.operation_id,
+                receipt.proposal_id,
+                receipt.proposal_fingerprint,
+                receipt.request_sha256,
+                sqlite_support.format_datetime(receipt.committed_at),
+                proposal.model_dump_json(warnings=False),
+                decision.model_dump_json(warnings=False),
+                receipt.model_dump_json(warnings=False),
+                _knowledge_maintenance_access_snapshot_json(access_snapshot),
             ),
         )
 

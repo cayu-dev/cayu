@@ -4,6 +4,11 @@ import asyncio
 from typing import Any, cast
 
 import pytest
+from tests.core.knowledge_maintenance_conformance import (
+    _create_proposal_entries,
+    maintenance_decision,
+    maintenance_proposal,
+)
 
 from cayu._validation import DurableValueError
 from cayu.storage import (
@@ -11,6 +16,8 @@ from cayu.storage import (
     KnowledgeAccessScope,
     KnowledgeEntry,
     KnowledgeListQuery,
+    KnowledgeMaintenanceDecisionKind,
+    KnowledgeMaintenanceOutcome,
     KnowledgeQuery,
     KnowledgeReviewWorkflow,
     KnowledgeRevisionConflict,
@@ -266,3 +273,32 @@ def test_review_workflow_rejects_conflicting_query_scope() -> None:
 def test_review_workflow_validates_store_contract() -> None:
     with pytest.raises(TypeError, match="review store methods"):
         KnowledgeReviewWorkflow(cast("Any", object()))
+
+
+def test_review_workflow_delegates_exact_maintenance_decision_atomically() -> None:
+    async def run() -> None:
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
+        proposal = maintenance_proposal("review-workflow")
+        decision = maintenance_decision(
+            proposal,
+            operation_id="review-workflow-operation",
+            kind=KnowledgeMaintenanceDecisionKind.APPROVE,
+        )
+        await _create_proposal_entries(store, proposal)
+        workflow = KnowledgeReviewWorkflow(
+            store,
+            namespace="project:cayu",
+            labels={"project": "cayu"},
+        )
+
+        receipt = await workflow.decide_maintenance(proposal, decision)
+
+        assert receipt.outcome is KnowledgeMaintenanceOutcome.APPLIED
+        replacement = await store.get_entry(proposal.replacement.entry_id)
+        source = await store.get_entry(proposal.sources[0].entry_id)
+        assert replacement is not None
+        assert replacement.status is KnowledgeStatus.ACTIVE
+        assert source is not None
+        assert source.status is KnowledgeStatus.ARCHIVED
+
+    asyncio.run(run())

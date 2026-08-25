@@ -8811,6 +8811,34 @@ check with its writer transaction; PostgreSQL locks the inspected knowledge
 tables so an older writer cannot race the clean break. Revision 60 supersedes
 the historical revision-42-to-44 preservation behavior for current upgrades.
 
+Revision 63 adds the atomic reviewed-maintenance boundary. Immutable
+`KnowledgeMaintenanceProposal` values bind one exact pending replacement, exact
+active source revisions, one approved relation disposition per source, the
+review scope and policy, bounded rationale/evidence summaries, and a canonical
+fingerprint. `KnowledgeMaintenanceDecision` binds that fingerprint to one
+approve/reject operation and a non-model reviewer. Proposal generation,
+similarity search, and curator invocation are deliberately outside the store
+operation.
+
+`KnowledgeStore.apply_maintenance_decision(...)` reauthorizes and compare-and-
+swap checks every current revision inside one backend transaction. Approval
+commits replacement activation, archival revisions for only the superseded
+sources, all approved exact-revision relations, their lifecycle/relation outbox
+changes, and the immutable decision receipt together. Rejection commits only
+review history. Contradiction and derivation preserve active sources. Stale,
+denied, conflicting, failed, or cancelled calls publish none of those records;
+exact replay returns the original receipt without writing again. Receipts and
+errors carry identifiers and safe summaries, never entry text or evidence
+payloads. Durable review-record access is bound to the exact pre-transition
+entries the reviewer inspected. A reviewer may therefore replay or audit an
+approved retirement without gaining read access to an archived successor that
+its scope excludes.
+
+Fresh databases and empty revision-62 knowledge schemas install revision 63
+directly. A populated pre-63 schema fails before DDL and must be explicitly
+replaced. No content is interpreted into a proposal, relation, decision, or
+receipt, and there is no backfill, dual write, or compatibility adapter.
+
 The deterministic backend conformance registry lives in
 `tests/core/test_knowledge_store_shared_conformance.py`, with reusable scenarios
 and registration types in `tests/core/knowledge_store_conformance.py`. A

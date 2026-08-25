@@ -339,6 +339,22 @@ def test_revision_sixty_two_breaks_for_deferred_interaction_payloads() -> None:
         )
 
 
+def test_revision_sixty_three_breaks_for_reviewed_knowledge_maintenance() -> None:
+    state = m.SchemaState(revision=63, compatible_from=63)
+
+    # Pre-63 knowledge workers cannot preserve atomic multi-entry decisions or
+    # distinguish their immutable review receipts from partial lifecycle writes.
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 63"):
+        m.validate(state, app_latest=62, app_min_supported=62)
+    m.validate(state, app_latest=63, app_min_supported=63)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 63"):
+        m.validate(
+            m.SchemaState(revision=62, compatible_from=62),
+            app_latest=63,
+            app_min_supported=63,
+        )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

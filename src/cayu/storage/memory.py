@@ -55,6 +55,10 @@ MAX_KNOWLEDGE_RELATION_BATCH = 100
 MAX_KNOWLEDGE_RELATION_BYTES = 8_192
 MAX_KNOWLEDGE_RELATION_CURSOR_BYTES = 2_048
 MAX_KNOWLEDGE_RELATION_LIMIT = 1_000
+MAX_KNOWLEDGE_MAINTENANCE_SOURCES = 50
+MAX_KNOWLEDGE_MAINTENANCE_BYTES = 256_000
+MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES = 16_384
+MAX_KNOWLEDGE_MAINTENANCE_METADATA_BYTES = 16_384
 MAX_KNOWLEDGE_EMBEDDING_DIMENSIONS = 2**31 - 1
 MAX_KNOWLEDGE_INDEX_READINESS_LIMIT = 1_000
 MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT = 10_000
@@ -158,6 +162,20 @@ class KnowledgeRelationDirection(StrEnum):
     BOTH = "both"
 
 
+class KnowledgeMaintenanceDecisionKind(StrEnum):
+    """Reviewer disposition for one exact maintenance proposal."""
+
+    APPROVE = "approve"
+    REJECT = "reject"
+
+
+class KnowledgeMaintenanceOutcome(StrEnum):
+    """Durable outcome of an applied maintenance decision."""
+
+    APPLIED = "applied"
+    REJECTED = "rejected"
+
+
 class KnowledgeChangeKind(StrEnum):
     CREATED = "created"
     REVISION_APPENDED = "revision_appended"
@@ -216,6 +234,22 @@ class KnowledgeRelationConflict(RuntimeError):
     def __init__(self, reason: str) -> None:
         self.reason = require_clean_nonblank(reason, "reason")
         super().__init__("Knowledge relation publication conflicts with durable state.")
+
+
+class KnowledgeMaintenanceConflict(RuntimeError):
+    """A maintenance identity conflicts with immutable durable state."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = require_clean_nonblank(reason, "reason")
+        super().__init__("Knowledge maintenance conflicts with durable state.")
+
+
+class KnowledgeMaintenanceStale(RuntimeError):
+    """A reviewed maintenance proposal no longer matches current knowledge."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = require_clean_nonblank(reason, "reason")
+        super().__init__("Knowledge maintenance proposal is stale.")
 
 
 class KnowledgeRevisionConflict(RuntimeError):
@@ -553,6 +587,28 @@ class _KnowledgeRelationAccessSnapshot(BaseModel):
         if type(value) is dict:
             return _KnowledgeAccessSnapshot.model_validate(value)
         raise TypeError("Relation access authorities require access snapshots.")
+
+
+class _KnowledgeMaintenanceAccessSnapshot(BaseModel):
+    """Immutable authorization projection for the pre-transition reviewed entries."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    entries: list[_KnowledgeAccessSnapshot]
+
+    @field_validator("entries", mode="before")
+    @classmethod
+    def copy_entries(cls, value) -> list[_KnowledgeAccessSnapshot]:
+        if type(value) is not list or not value:
+            raise ValueError("Maintenance access snapshots require a non-empty list.")
+        if len(value) > MAX_KNOWLEDGE_MAINTENANCE_SOURCES + 1:
+            raise ValueError("Maintenance access snapshots exceed the reviewed entry bound.")
+        return [
+            item.model_copy(deep=True)
+            if type(item) is _KnowledgeAccessSnapshot
+            else _KnowledgeAccessSnapshot.model_validate(item)
+            for item in value
+        ]
 
 
 class _KnowledgeChangeAudience(BaseModel):
@@ -965,6 +1021,402 @@ class KnowledgeRelationPublicationReceipt(BaseModel):
         if type(value) is not bool:
             raise ValueError("`replayed` must be a boolean.")
         return value
+
+
+class KnowledgeMaintenanceProposal(BaseModel):
+    """Immutable reviewed plan over exact current knowledge revisions.
+
+    Relations bind the replacement's deterministic active successor revision.
+    A ``supersedes`` relation archives its object; ``derived_from`` and
+    ``contradicts`` preserve their source as active knowledge.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    schema_version: Literal[1] = 1
+    id: str
+    replacement: KnowledgeRevisionRef
+    sources: list[KnowledgeRevisionRef]
+    relations: list[KnowledgeRelation]
+    access_scope: KnowledgeAccessScope
+    policy_id: str
+    proposed_by_type: KnowledgeActorType = KnowledgeActorType.APP
+    proposed_by: str = "app"
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    rationale: str
+    evidence_summary: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version(cls, value: object) -> object:
+        if type(value) is not int or value != 1:
+            raise ValueError("`schema_version` must be the integer 1.")
+        return value
+
+    @field_validator("id", "policy_id", "proposed_by")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _knowledge_maintenance_identity(value, info.field_name)
+
+    @field_validator("replacement", mode="before")
+    @classmethod
+    def copy_replacement(cls, value):
+        if isinstance(value, KnowledgeRevisionRef):
+            return copy_knowledge_revision_ref(value)
+        return value
+
+    @field_validator("sources", mode="before")
+    @classmethod
+    def copy_sources(cls, value) -> list[KnowledgeRevisionRef]:
+        if type(value) is not list:
+            raise ValueError("`sources` must be a list.")
+        if not value or len(value) > MAX_KNOWLEDGE_MAINTENANCE_SOURCES:
+            raise ValueError(
+                "`sources` must contain between 1 and "
+                f"{MAX_KNOWLEDGE_MAINTENANCE_SOURCES} exact revisions."
+            )
+        copied = [
+            copy_knowledge_revision_ref(item)
+            if isinstance(item, KnowledgeRevisionRef)
+            else KnowledgeRevisionRef.model_validate(item)
+            for item in value
+        ]
+        copied.sort(key=lambda item: (item.entry_id, item.revision))
+        if len({(item.entry_id, item.revision) for item in copied}) != len(copied):
+            raise ValueError("`sources` cannot repeat an exact revision.")
+        if len({item.entry_id for item in copied}) != len(copied):
+            raise ValueError("`sources` cannot repeat a logical entry.")
+        return copied
+
+    @field_validator("relations", mode="before")
+    @classmethod
+    def copy_relations(cls, value) -> list[KnowledgeRelation]:
+        if type(value) is not list:
+            raise ValueError("`relations` must be a list.")
+        if not value or len(value) > MAX_KNOWLEDGE_RELATION_BATCH:
+            raise ValueError(
+                f"`relations` must contain between 1 and {MAX_KNOWLEDGE_RELATION_BATCH} records."
+            )
+        copied = [
+            copy_knowledge_relation(item)
+            if type(item) is KnowledgeRelation
+            else copy_knowledge_relation(KnowledgeRelation.model_validate(item))
+            for item in value
+        ]
+        copied.sort(key=lambda item: item.id)
+        if len({item.id for item in copied}) != len(copied):
+            raise ValueError("`relations` cannot repeat an identity.")
+        semantic_keys = [_knowledge_relation_semantic_key(item) for item in copied]
+        if len(set(semantic_keys)) != len(semantic_keys):
+            raise ValueError("`relations` cannot repeat one semantic relation.")
+        return copied
+
+    @field_validator("access_scope", mode="before")
+    @classmethod
+    def copy_access_scope(cls, value):
+        if isinstance(value, KnowledgeAccessScope):
+            return copy_knowledge_access_scope(value)
+        return value
+
+    @field_validator("created_at")
+    @classmethod
+    def validate_created_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("`created_at` must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @field_validator("rationale", "evidence_summary")
+    @classmethod
+    def validate_bounded_text(cls, value: str, info) -> str:
+        value = require_clean_nonblank(value, info.field_name)
+        if len(value.encode("utf-8")) > MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES:
+            raise ValueError(
+                f"`{info.field_name}` must be at most "
+                f"{MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES} UTF-8 bytes."
+            )
+        return value
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        copied = copy_durable_json_object(value, "metadata")
+        if len(canonical_durable_json_bytes(copied, "knowledge maintenance metadata")) > (
+            MAX_KNOWLEDGE_MAINTENANCE_METADATA_BYTES
+        ):
+            raise ValueError("`metadata` exceeds the knowledge maintenance metadata budget.")
+        return copied
+
+    @model_validator(mode="after")
+    def validate_plan(self) -> KnowledgeMaintenanceProposal:
+        if self.replacement.entry_id in {source.entry_id for source in self.sources}:
+            raise ValueError("The replacement cannot also be a maintenance source.")
+        if self.replacement.revision >= MAX_KNOWLEDGE_REVISION:
+            raise ValueError("The replacement revision cannot advance safely.")
+        active_replacement = KnowledgeRevisionRef(
+            entry_id=self.replacement.entry_id,
+            revision=self.replacement.revision + 1,
+        )
+        source_keys = {(source.entry_id, source.revision) for source in self.sources}
+        referenced_sources: set[tuple[str, int]] = set()
+        for relation in self.relations:
+            if relation.created_at > self.created_at:
+                raise ValueError("A proposed relation cannot postdate its proposal.")
+            if relation.policy_id != self.policy_id:
+                raise ValueError("Every proposed relation must use the proposal policy identity.")
+            if relation.kind is KnowledgeRelationKind.CONTRADICTS:
+                endpoints = {relation.subject, relation.object}
+                if active_replacement not in endpoints:
+                    raise ValueError(
+                        "A proposed contradiction must include the active replacement revision."
+                    )
+                source = (
+                    relation.object if relation.subject == active_replacement else relation.subject
+                )
+            else:
+                if relation.subject != active_replacement:
+                    raise ValueError(
+                        "A proposed directed relation must start at the active replacement revision."
+                    )
+                source = relation.object
+            source_key = (source.entry_id, source.revision)
+            if source_key not in source_keys:
+                raise ValueError("Every proposed relation must target a reviewed source revision.")
+            if (
+                relation.kind is KnowledgeRelationKind.SUPERSEDES
+                and source.revision >= MAX_KNOWLEDGE_REVISION
+            ):
+                raise ValueError("A superseded source revision must be able to advance safely.")
+            if source_key in referenced_sources:
+                raise ValueError(
+                    "Every reviewed source must have exactly one maintenance disposition."
+                )
+            referenced_sources.add(source_key)
+        if referenced_sources != source_keys:
+            raise ValueError("Every reviewed source must participate in a proposed relation.")
+        if (
+            len(
+                canonical_durable_json_bytes(
+                    self.model_dump(mode="json"),
+                    "knowledge maintenance proposal",
+                )
+            )
+            > MAX_KNOWLEDGE_MAINTENANCE_BYTES
+        ):
+            raise ValueError("Knowledge maintenance proposal exceeds its canonical byte budget.")
+        return self
+
+    @property
+    def fingerprint(self) -> str:
+        return sha256(
+            canonical_durable_json_bytes(
+                {
+                    "contract": "cayu-knowledge-maintenance-proposal-v1",
+                    "proposal": self.model_dump(mode="json"),
+                },
+                "knowledge maintenance proposal fingerprint",
+            )
+        ).hexdigest()
+
+
+class KnowledgeMaintenanceDecision(BaseModel):
+    """Immutable external review over one exact maintenance proposal."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    schema_version: Literal[1] = 1
+    operation_id: str
+    proposal_id: str
+    proposal_fingerprint: str
+    kind: KnowledgeMaintenanceDecisionKind
+    reviewer_type: KnowledgeActorType
+    reviewer: str
+    reason: str
+    decided_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version(cls, value: object) -> object:
+        if type(value) is not int or value != 1:
+            raise ValueError("`schema_version` must be the integer 1.")
+        return value
+
+    @field_validator("operation_id", "proposal_id", "reviewer")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _knowledge_maintenance_identity(value, info.field_name)
+
+    @field_validator("proposal_fingerprint")
+    @classmethod
+    def validate_proposal_fingerprint(cls, value: str) -> str:
+        if type(value) is not str or _SHA256_HEX_RE.fullmatch(value) is None:
+            raise ValueError("`proposal_fingerprint` must be lowercase SHA-256 hex.")
+        return value
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        value = require_clean_nonblank(value, "reason")
+        if len(value.encode("utf-8")) > MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES:
+            raise ValueError(
+                f"`reason` must be at most {MAX_KNOWLEDGE_MAINTENANCE_TEXT_BYTES} UTF-8 bytes."
+            )
+        return value
+
+    @field_validator("decided_at")
+    @classmethod
+    def validate_decided_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("`decided_at` must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        copied = copy_durable_json_object(value, "metadata")
+        if len(canonical_durable_json_bytes(copied, "knowledge decision metadata")) > (
+            MAX_KNOWLEDGE_MAINTENANCE_METADATA_BYTES
+        ):
+            raise ValueError("`metadata` exceeds the knowledge decision metadata budget.")
+        return copied
+
+    @model_validator(mode="after")
+    def validate_reviewer(self) -> KnowledgeMaintenanceDecision:
+        if self.reviewer_type is KnowledgeActorType.MODEL:
+            raise ValueError("Model output cannot authorize a knowledge maintenance decision.")
+        if (
+            len(
+                canonical_durable_json_bytes(
+                    self.model_dump(mode="json"),
+                    "knowledge maintenance decision",
+                )
+            )
+            > MAX_KNOWLEDGE_MAINTENANCE_BYTES
+        ):
+            raise ValueError("Knowledge maintenance decision exceeds its canonical byte budget.")
+        return self
+
+    @property
+    def fingerprint(self) -> str:
+        return sha256(
+            canonical_durable_json_bytes(
+                {
+                    "contract": "cayu-knowledge-maintenance-decision-v1",
+                    "decision": self.model_dump(mode="json"),
+                },
+                "knowledge maintenance decision fingerprint",
+            )
+        ).hexdigest()
+
+
+class KnowledgeMaintenanceDecisionReceipt(BaseModel):
+    """Immutable evidence for one atomic reviewed maintenance outcome."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    operation_id: str
+    proposal_id: str
+    proposal_fingerprint: str
+    request_sha256: str
+    outcome: KnowledgeMaintenanceOutcome
+    replacement: KnowledgeRevisionRef | None = None
+    archived_revisions: list[KnowledgeRevisionRef] = Field(default_factory=list)
+    relation_ids: list[str] = Field(default_factory=list)
+    committed_at: datetime
+    replayed: bool = False
+
+    @field_validator("operation_id", "proposal_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _knowledge_maintenance_identity(value, info.field_name)
+
+    @field_validator("proposal_fingerprint", "request_sha256")
+    @classmethod
+    def validate_sha256(cls, value: str, info) -> str:
+        if type(value) is not str or _SHA256_HEX_RE.fullmatch(value) is None:
+            raise ValueError(f"`{info.field_name}` must be lowercase SHA-256 hex.")
+        return value
+
+    @field_validator("replacement", mode="before")
+    @classmethod
+    def copy_replacement(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, KnowledgeRevisionRef):
+            return copy_knowledge_revision_ref(value)
+        return value
+
+    @field_validator("archived_revisions", mode="before")
+    @classmethod
+    def copy_archived_revisions(cls, value) -> list[KnowledgeRevisionRef]:
+        if type(value) is not list:
+            raise ValueError("`archived_revisions` must be a list.")
+        if len(value) > MAX_KNOWLEDGE_MAINTENANCE_SOURCES:
+            raise ValueError("`archived_revisions` cannot exceed the maintenance source bound.")
+        copied = [
+            copy_knowledge_revision_ref(item)
+            if isinstance(item, KnowledgeRevisionRef)
+            else KnowledgeRevisionRef.model_validate(item)
+            for item in value
+        ]
+        copied.sort(key=lambda item: (item.entry_id, item.revision))
+        if len({(item.entry_id, item.revision) for item in copied}) != len(copied):
+            raise ValueError("`archived_revisions` cannot repeat a revision.")
+        if len({item.entry_id for item in copied}) != len(copied):
+            raise ValueError("`archived_revisions` cannot repeat a logical entry.")
+        return copied
+
+    @field_validator("relation_ids", mode="before")
+    @classmethod
+    def copy_relation_ids(cls, value) -> list[str]:
+        if type(value) is not list:
+            raise ValueError("`relation_ids` must be a list.")
+        if len(value) > MAX_KNOWLEDGE_MAINTENANCE_SOURCES:
+            raise ValueError("`relation_ids` cannot exceed the maintenance source bound.")
+        copied = sorted(_knowledge_relation_identity(item, "relation_ids") for item in value)
+        if len(set(copied)) != len(copied):
+            raise ValueError("`relation_ids` cannot repeat an identity.")
+        return copied
+
+    @field_validator("committed_at")
+    @classmethod
+    def validate_committed_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("`committed_at` must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @field_validator("replayed", mode="before")
+    @classmethod
+    def validate_replayed(cls, value) -> bool:
+        if type(value) is not bool:
+            raise ValueError("`replayed` must be a boolean.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> KnowledgeMaintenanceDecisionReceipt:
+        if self.outcome is KnowledgeMaintenanceOutcome.REJECTED:
+            if self.replacement is not None or self.archived_revisions or self.relation_ids:
+                raise ValueError("A rejected maintenance receipt cannot claim lifecycle changes.")
+        elif self.replacement is None or not self.relation_ids:
+            raise ValueError("An applied maintenance receipt requires replacement and relations.")
+        elif self.replacement.entry_id in {
+            reference.entry_id for reference in self.archived_revisions
+        }:
+            raise ValueError("The active replacement cannot also be an archived revision.")
+        elif len(self.archived_revisions) > len(self.relation_ids):
+            raise ValueError("Archived revisions cannot outnumber approved relations.")
+        if (
+            len(
+                canonical_durable_json_bytes(
+                    self.model_dump(mode="json"),
+                    "knowledge maintenance receipt",
+                )
+            )
+            > MAX_KNOWLEDGE_MAINTENANCE_BYTES
+        ):
+            raise ValueError("Knowledge maintenance receipt exceeds its canonical byte budget.")
+        return self
 
 
 class KnowledgeRelationQuery(BaseModel):
@@ -2690,6 +3142,55 @@ class KnowledgeStore(ABC):
             "This KnowledgeStore does not support revision-bound knowledge relations."
         )
 
+    async def apply_maintenance_decision(
+        self,
+        proposal: KnowledgeMaintenanceProposal,
+        decision: KnowledgeMaintenanceDecision,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceDecisionReceipt:
+        """Apply one exact reviewed maintenance decision atomically."""
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support reviewed knowledge maintenance."
+        )
+
+    async def load_maintenance_proposal(
+        self,
+        proposal_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceProposal | None:
+        """Load one durably decided maintenance proposal in scope."""
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support reviewed knowledge maintenance."
+        )
+
+    async def load_maintenance_decision(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceDecision | None:
+        """Load one durable maintenance decision in scope."""
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support reviewed knowledge maintenance."
+        )
+
+    async def load_maintenance_decision_receipt(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceDecisionReceipt | None:
+        """Load immutable maintenance application evidence in scope."""
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support reviewed knowledge maintenance."
+        )
+
     @abstractmethod
     async def read_evidence(
         self,
@@ -2911,6 +3412,11 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             str, tuple[_KnowledgeRelationAccessSnapshot, ...]
         ] = {}
         self._relation_change_sequences: dict[str, int] = {}
+        self._maintenance_proposals: dict[str, KnowledgeMaintenanceProposal] = {}
+        self._maintenance_decisions: dict[str, KnowledgeMaintenanceDecision] = {}
+        self._maintenance_receipts: dict[str, KnowledgeMaintenanceDecisionReceipt] = {}
+        self._maintenance_operation_by_proposal: dict[str, str] = {}
+        self._maintenance_access: dict[str, _KnowledgeMaintenanceAccessSnapshot] = {}
         self._changes: list[KnowledgeChange] = []
         self._changes_by_sequence: dict[int, KnowledgeChange] = {}
         self._change_access: dict[int, tuple[_KnowledgeChangeAudience, ...]] = {}
@@ -3771,6 +4277,328 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             operation_id=operation_id,
             relation_id=relation.id,
         )
+
+    async def apply_maintenance_decision(
+        self,
+        proposal: KnowledgeMaintenanceProposal,
+        decision: KnowledgeMaintenanceDecision,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceDecisionReceipt:
+        scope = self._operation_access_scope(access_scope)
+        proposal, decision, request_sha256 = prepare_knowledge_maintenance_decision(
+            proposal,
+            decision,
+        )
+        operation = "apply_maintenance_decision"
+        existing_receipt = self._maintenance_receipts.get(decision.operation_id)
+        if existing_receipt is not None:
+            snapshot = self._maintenance_access.get(decision.operation_id)
+            if snapshot is None:
+                raise KnowledgeMaintenanceConflict("malformed_receipt")
+            if not _knowledge_scope_allows_maintenance_access_snapshot(scope, snapshot):
+                raise KnowledgeAccessDenied(operation)
+            stored_proposal = self._maintenance_proposals.get(existing_receipt.proposal_id)
+            stored_decision = self._maintenance_decisions.get(decision.operation_id)
+            if stored_proposal is None or stored_decision is None:
+                raise KnowledgeMaintenanceConflict("malformed_receipt")
+            _validate_knowledge_maintenance_replay(
+                stored_proposal,
+                stored_decision,
+                existing_receipt,
+                proposal=proposal,
+                decision=decision,
+                request_sha256=request_sha256,
+            )
+            return copy_knowledge_maintenance_decision_receipt(
+                existing_receipt,
+                replayed=True,
+            )
+
+        prior_operation = self._maintenance_operation_by_proposal.get(proposal.id)
+        if prior_operation is not None:
+            snapshot = self._maintenance_access.get(prior_operation)
+            if snapshot is None:
+                raise KnowledgeMaintenanceConflict("malformed_receipt")
+            if not _knowledge_scope_allows_maintenance_access_snapshot(scope, snapshot):
+                raise KnowledgeAccessDenied(operation)
+            raise KnowledgeMaintenanceConflict("proposal_already_decided")
+        current_entries = {
+            entry_id: entry
+            for entry_id in [
+                proposal.replacement.entry_id,
+                *(source.entry_id for source in proposal.sources),
+            ]
+            if (entry := self._current_entry(entry_id)) is not None
+        }
+        replacement, sources = _require_knowledge_maintenance_current_entries(
+            proposal,
+            current_entries,
+            access_scope=scope,
+            operation=operation,
+        )
+        committed_at = max(self._clock(), proposal.created_at, decision.decided_at)
+        if decision.kind is KnowledgeMaintenanceDecisionKind.REJECT:
+            receipt = KnowledgeMaintenanceDecisionReceipt(
+                operation_id=decision.operation_id,
+                proposal_id=proposal.id,
+                proposal_fingerprint=proposal.fingerprint,
+                request_sha256=request_sha256,
+                outcome=KnowledgeMaintenanceOutcome.REJECTED,
+                committed_at=committed_at,
+            )
+            snapshot = _knowledge_maintenance_access_snapshot([replacement, *sources])
+            self._maintenance_proposals[proposal.id] = proposal
+            self._maintenance_decisions[decision.operation_id] = decision
+            self._maintenance_receipts[decision.operation_id] = receipt
+            self._maintenance_operation_by_proposal[proposal.id] = decision.operation_id
+            self._maintenance_access[decision.operation_id] = snapshot
+            return copy_knowledge_maintenance_decision_receipt(receipt)
+
+        active_replacement, archived_sources = _knowledge_maintenance_successors(
+            proposal,
+            replacement,
+            sources,
+            access_scope=scope,
+            committed_at=committed_at,
+            operation=operation,
+        )
+        successor_by_id = {entry.id: entry for entry in [active_replacement, *archived_sources]}
+        lifecycle_material: list[
+            tuple[KnowledgeEntry, KnowledgeEntry, list[KnowledgeChunk], list[KnowledgeEvidence]]
+        ] = []
+        all_chunk_ids: list[str] = []
+        all_evidence_ids: list[str] = []
+        for successor in [active_replacement, *archived_sources]:
+            current = current_entries[successor.id]
+            previous_chunks = self._chunks.get((current.id, current.revision), [])
+            chunks = self._revision_chunks(successor, None, previous=current)
+            evidence = _copy_evidence_for_revision(
+                self._evidence.get((current.id, current.revision), []),
+                entry=successor,
+                previous_chunks=previous_chunks,
+                chunks=chunks,
+            )
+            self._require_chunk_ids_available(
+                chunks,
+                access_scope=scope,
+                operation=operation,
+            )
+            self._require_evidence_ids_available(
+                evidence,
+                access_scope=scope,
+                operation=operation,
+            )
+            all_chunk_ids.extend(chunk.id for chunk in chunks)
+            all_evidence_ids.extend(item.id for item in evidence)
+            lifecycle_material.append((current, successor, chunks, evidence))
+        if len(set(all_chunk_ids)) != len(all_chunk_ids):
+            raise KnowledgeChunkConflict(operation)
+        if len(set(all_evidence_ids)) != len(all_evidence_ids):
+            raise KnowledgeEvidenceConflict(operation)
+
+        for relation in proposal.relations:
+            occupied_id = self._relations.get(relation.id)
+            occupied_semantic_id = self._relation_semantics.get(
+                _knowledge_relation_semantic_key(relation)
+            )
+            for occupied_relation_id in (
+                relation.id if occupied_id else None,
+                occupied_semantic_id,
+            ):
+                if occupied_relation_id is None:
+                    continue
+                occupied = self._relations.get(occupied_relation_id)
+                if occupied is not None:
+                    self._require_relation_endpoints(occupied, scope, operation=operation)
+                raise KnowledgeMaintenanceConflict("relation_exists")
+            historic_sequence = self._relation_change_sequences.get(relation.id)
+            if historic_sequence is not None:
+                historic_change = self._changes_by_sequence[historic_sequence]
+                audiences = self._change_access.get(historic_sequence, ())
+                if not _knowledge_scope_allows_change(scope, historic_change, audiences):
+                    raise KnowledgeAccessDenied(operation)
+                raise KnowledgeMaintenanceConflict("relation_exists")
+
+        change_count = len(lifecycle_material) + len(proposal.relations)
+        if self._next_change_sequence + change_count - 1 > MAX_KNOWLEDGE_CHANGE_SEQUENCE:
+            raise RuntimeError("Knowledge change sequence is exhausted.")
+        prepared_lifecycle_changes: list[
+            tuple[KnowledgeChange, KnowledgeEntry, KnowledgeEntry]
+        ] = []
+        sequence = self._next_change_sequence
+        for current, successor, _, _ in lifecycle_material:
+            prepared_lifecycle_changes.append(
+                (
+                    KnowledgeChange(
+                        id=f"kchg_{uuid4().hex}",
+                        sequence=sequence,
+                        kind=KnowledgeChangeKind.STATUS_TRANSITIONED,
+                        entry_id=successor.id,
+                        entry_revision=successor.revision,
+                        committed_at=committed_at,
+                        operation_id=decision.operation_id,
+                    ),
+                    current,
+                    successor,
+                )
+            )
+            sequence += 1
+
+        post_current_entries = dict(current_entries)
+        post_current_entries.update(successor_by_id)
+        prepared_relation_changes: list[
+            tuple[KnowledgeRelation, KnowledgeChange, tuple[_KnowledgeChangeAudience, ...]]
+        ] = []
+        for relation in proposal.relations:
+            subject_exact = (
+                active_replacement
+                if relation.subject
+                == KnowledgeRevisionRef(
+                    entry_id=active_replacement.id,
+                    revision=active_replacement.revision,
+                )
+                else self._entry_revision(
+                    relation.subject.entry_id,
+                    relation.subject.revision,
+                )
+            )
+            object_exact = (
+                active_replacement
+                if relation.object
+                == KnowledgeRevisionRef(
+                    entry_id=active_replacement.id,
+                    revision=active_replacement.revision,
+                )
+                else self._entry_revision(
+                    relation.object.entry_id,
+                    relation.object.revision,
+                )
+            )
+            if subject_exact is None or object_exact is None:
+                raise KnowledgeMaintenanceStale("relation_endpoint")
+            snapshot = _knowledge_relation_access_snapshot(
+                subject_exact=subject_exact,
+                subject_current=post_current_entries[relation.subject.entry_id],
+                object_exact=object_exact,
+                object_current=post_current_entries[relation.object.entry_id],
+            )
+            change = self._prepare_relation_change(
+                relation,
+                sequence=sequence,
+                operation_id=decision.operation_id,
+                committed_at=committed_at,
+            )
+            prepared_relation_changes.append(
+                (
+                    relation,
+                    change,
+                    _knowledge_relation_change_audiences(
+                        change,
+                        access_snapshot=snapshot,
+                    ),
+                )
+            )
+            sequence += 1
+
+        receipt = KnowledgeMaintenanceDecisionReceipt(
+            operation_id=decision.operation_id,
+            proposal_id=proposal.id,
+            proposal_fingerprint=proposal.fingerprint,
+            request_sha256=request_sha256,
+            outcome=KnowledgeMaintenanceOutcome.APPLIED,
+            replacement=KnowledgeRevisionRef(
+                entry_id=active_replacement.id,
+                revision=active_replacement.revision,
+            ),
+            archived_revisions=[
+                KnowledgeRevisionRef(entry_id=entry.id, revision=entry.revision)
+                for entry in archived_sources
+            ],
+            relation_ids=[relation.id for relation in proposal.relations],
+            committed_at=committed_at,
+        )
+        maintenance_access = _knowledge_maintenance_access_snapshot([replacement, *sources])
+
+        for _, successor, chunks, evidence in lifecycle_material:
+            self._entries[successor.id][successor.revision] = successor
+            self._chunks[(successor.id, successor.revision)] = chunks
+            self._evidence[(successor.id, successor.revision)] = evidence
+            self._current_revisions[successor.id] = successor.revision
+        for change, current, successor in prepared_lifecycle_changes:
+            self._record_change(change, before_entry=current, after_entry=successor)
+        for relation, change, audiences in prepared_relation_changes:
+            self._relations[relation.id] = relation
+            self._index_relation(relation)
+            self._relation_semantics[_knowledge_relation_semantic_key(relation)] = relation.id
+            self._changes.append(change)
+            self._changes_by_sequence[change.sequence] = change
+            self._change_access[change.sequence] = audiences
+            self._relation_change_sequences[relation.id] = change.sequence
+        self._next_change_sequence = sequence
+        self._maintenance_proposals[proposal.id] = proposal
+        self._maintenance_decisions[decision.operation_id] = decision
+        self._maintenance_receipts[decision.operation_id] = receipt
+        self._maintenance_operation_by_proposal[proposal.id] = decision.operation_id
+        self._maintenance_access[decision.operation_id] = maintenance_access
+        return copy_knowledge_maintenance_decision_receipt(receipt)
+
+    async def load_maintenance_proposal(
+        self,
+        proposal_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceProposal | None:
+        scope = self._operation_access_scope(access_scope)
+        proposal_id = _knowledge_maintenance_identity(proposal_id, "proposal_id")
+        operation_id = self._maintenance_operation_by_proposal.get(proposal_id)
+        if operation_id is None:
+            return None
+        snapshot = self._maintenance_access.get(operation_id)
+        proposal = self._maintenance_proposals.get(proposal_id)
+        if (
+            snapshot is None
+            or proposal is None
+            or not _knowledge_scope_allows_maintenance_access_snapshot(scope, snapshot)
+        ):
+            return None
+        return copy_knowledge_maintenance_proposal(proposal)
+
+    async def load_maintenance_decision(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceDecision | None:
+        scope = self._operation_access_scope(access_scope)
+        operation_id = _knowledge_maintenance_identity(operation_id, "operation_id")
+        snapshot = self._maintenance_access.get(operation_id)
+        decision = self._maintenance_decisions.get(operation_id)
+        if (
+            snapshot is None
+            or decision is None
+            or not _knowledge_scope_allows_maintenance_access_snapshot(scope, snapshot)
+        ):
+            return None
+        return copy_knowledge_maintenance_decision(decision)
+
+    async def load_maintenance_decision_receipt(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceDecisionReceipt | None:
+        scope = self._operation_access_scope(access_scope)
+        operation_id = _knowledge_maintenance_identity(operation_id, "operation_id")
+        snapshot = self._maintenance_access.get(operation_id)
+        receipt = self._maintenance_receipts.get(operation_id)
+        if (
+            snapshot is None
+            or receipt is None
+            or not _knowledge_scope_allows_maintenance_access_snapshot(scope, snapshot)
+        ):
+            return None
+        return copy_knowledge_maintenance_decision_receipt(receipt)
 
     async def read_evidence(
         self,
@@ -5243,7 +6071,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
 
 def copy_knowledge_access_scope(scope: KnowledgeAccessScope) -> KnowledgeAccessScope:
     if type(scope) is not KnowledgeAccessScope:
-        raise TypeError("access_scope must be a KnowledgeAccessScope.")
+        raise TypeError("KnowledgeAccessScope instances must not be subclasses.")
     return KnowledgeAccessScope(
         allowed_namespaces=list(scope.allowed_namespaces),
         allow_all_namespaces=scope.allow_all_namespaces,
@@ -5293,6 +6121,16 @@ def _knowledge_relation_access_snapshot(
     )
 
 
+def _knowledge_maintenance_access_snapshot(
+    entries: list[KnowledgeEntry],
+) -> _KnowledgeMaintenanceAccessSnapshot:
+    if type(entries) is not list or not entries:
+        raise ValueError("Knowledge maintenance access requires reviewed entries.")
+    return _KnowledgeMaintenanceAccessSnapshot(
+        entries=[_knowledge_access_snapshot(entry) for entry in entries]
+    )
+
+
 def _knowledge_access_snapshot_json(snapshot: _KnowledgeAccessSnapshot) -> str:
     if type(snapshot) is not _KnowledgeAccessSnapshot:
         raise TypeError("snapshot must be a _KnowledgeAccessSnapshot.")
@@ -5310,6 +6148,17 @@ def _knowledge_relation_access_snapshot_json(
     return canonical_durable_json_bytes(
         snapshot.model_dump(mode="json"),
         "knowledge relation access snapshot",
+    ).decode("utf-8")
+
+
+def _knowledge_maintenance_access_snapshot_json(
+    snapshot: _KnowledgeMaintenanceAccessSnapshot,
+) -> str:
+    if type(snapshot) is not _KnowledgeMaintenanceAccessSnapshot:
+        raise TypeError("snapshot must be a _KnowledgeMaintenanceAccessSnapshot.")
+    return canonical_durable_json_bytes(
+        snapshot.model_dump(mode="json"),
+        "knowledge maintenance access snapshot",
     ).decode("utf-8")
 
 
@@ -5345,6 +6194,14 @@ def _parse_knowledge_relation_access_snapshot_json(
     if type(value) is not str:
         raise TypeError("Knowledge relation access snapshot must be JSON text.")
     return _KnowledgeRelationAccessSnapshot.model_validate_json(value)
+
+
+def _parse_knowledge_maintenance_access_snapshot_json(
+    value: str,
+) -> _KnowledgeMaintenanceAccessSnapshot:
+    if type(value) is not str:
+        raise TypeError("Knowledge maintenance access snapshot must be JSON text.")
+    return _KnowledgeMaintenanceAccessSnapshot.model_validate_json(value)
 
 
 def _knowledge_scope_allows_snapshot(
@@ -5393,6 +6250,17 @@ def _knowledge_scope_allows_relation_access_snapshot(
             snapshot.object_exact,
             snapshot.object_current,
         )
+    )
+
+
+def _knowledge_scope_allows_maintenance_access_snapshot(
+    scope: KnowledgeAccessScope,
+    snapshot: _KnowledgeMaintenanceAccessSnapshot,
+) -> bool:
+    now = datetime.now(UTC)
+    return all(
+        _knowledge_scope_allows_snapshot(scope, authority, now=now)
+        for authority in snapshot.entries
     )
 
 
@@ -5683,6 +6551,43 @@ def copy_knowledge_relation_publication_receipt(
     )
 
 
+def copy_knowledge_maintenance_proposal(
+    proposal: KnowledgeMaintenanceProposal,
+) -> KnowledgeMaintenanceProposal:
+    if type(proposal) is not KnowledgeMaintenanceProposal:
+        raise TypeError("KnowledgeMaintenanceProposal instances must not be subclasses.")
+    return KnowledgeMaintenanceProposal.model_validate(
+        proposal.model_dump(mode="python", warnings=False)
+    )
+
+
+def copy_knowledge_maintenance_decision(
+    decision: KnowledgeMaintenanceDecision,
+) -> KnowledgeMaintenanceDecision:
+    if type(decision) is not KnowledgeMaintenanceDecision:
+        raise TypeError("KnowledgeMaintenanceDecision instances must not be subclasses.")
+    return KnowledgeMaintenanceDecision.model_validate(
+        decision.model_dump(mode="python", warnings=False)
+    )
+
+
+def copy_knowledge_maintenance_decision_receipt(
+    receipt: KnowledgeMaintenanceDecisionReceipt,
+    *,
+    replayed: bool | None = None,
+) -> KnowledgeMaintenanceDecisionReceipt:
+    if type(receipt) is not KnowledgeMaintenanceDecisionReceipt:
+        raise TypeError("KnowledgeMaintenanceDecisionReceipt instances must not be subclasses.")
+    return KnowledgeMaintenanceDecisionReceipt(
+        **receipt.model_dump(
+            mode="python",
+            exclude={"replayed"},
+            warnings=False,
+        ),
+        replayed=receipt.replayed if replayed is None else replayed,
+    )
+
+
 def copy_knowledge_embedding_identity(
     identity: KnowledgeEmbeddingIdentity,
 ) -> KnowledgeEmbeddingIdentity:
@@ -5950,6 +6855,196 @@ def _validate_knowledge_relation_publication_replay(
         or receipt.request_sha256 != request_sha256
     ):
         raise KnowledgeRelationConflict("operation_reuse")
+
+
+def prepare_knowledge_maintenance_decision(
+    proposal: KnowledgeMaintenanceProposal,
+    decision: KnowledgeMaintenanceDecision,
+) -> tuple[KnowledgeMaintenanceProposal, KnowledgeMaintenanceDecision, str]:
+    """Copy and bind one exact proposal and external review decision."""
+
+    copied_proposal = copy_knowledge_maintenance_proposal(proposal)
+    copied_decision = copy_knowledge_maintenance_decision(decision)
+    if copied_decision.proposal_id != copied_proposal.id:
+        raise ValueError("The maintenance decision references another proposal identity.")
+    if copied_decision.proposal_fingerprint != copied_proposal.fingerprint:
+        raise ValueError("The maintenance decision references another proposal fingerprint.")
+    if copied_decision.decided_at < copied_proposal.created_at:
+        raise ValueError("The maintenance decision cannot predate its proposal.")
+    request_sha256 = sha256(
+        canonical_durable_json_bytes(
+            {
+                "contract": "cayu-knowledge-maintenance-application-v1",
+                "proposal": copied_proposal.model_dump(mode="json"),
+                "decision": copied_decision.model_dump(mode="json"),
+            },
+            "knowledge maintenance application",
+        )
+    ).hexdigest()
+    return copied_proposal, copied_decision, request_sha256
+
+
+def _validate_knowledge_maintenance_replay(
+    stored_proposal: KnowledgeMaintenanceProposal,
+    stored_decision: KnowledgeMaintenanceDecision,
+    receipt: KnowledgeMaintenanceDecisionReceipt,
+    *,
+    proposal: KnowledgeMaintenanceProposal,
+    decision: KnowledgeMaintenanceDecision,
+    request_sha256: str,
+) -> None:
+    _validate_knowledge_maintenance_record(stored_proposal, stored_decision, receipt)
+    if (
+        stored_proposal != proposal
+        or stored_decision != decision
+        or receipt.operation_id != decision.operation_id
+        or receipt.proposal_id != proposal.id
+        or receipt.proposal_fingerprint != proposal.fingerprint
+        or receipt.request_sha256 != request_sha256
+    ):
+        raise KnowledgeMaintenanceConflict("operation_reuse")
+
+
+def _validate_knowledge_maintenance_record(
+    proposal: KnowledgeMaintenanceProposal,
+    decision: KnowledgeMaintenanceDecision,
+    receipt: KnowledgeMaintenanceDecisionReceipt,
+) -> None:
+    try:
+        _, _, request_sha256 = prepare_knowledge_maintenance_decision(proposal, decision)
+        expected_outcome = (
+            KnowledgeMaintenanceOutcome.APPLIED
+            if decision.kind is KnowledgeMaintenanceDecisionKind.APPROVE
+            else KnowledgeMaintenanceOutcome.REJECTED
+        )
+        expected_replacement = (
+            KnowledgeRevisionRef(
+                entry_id=proposal.replacement.entry_id,
+                revision=proposal.replacement.revision + 1,
+            )
+            if expected_outcome is KnowledgeMaintenanceOutcome.APPLIED
+            else None
+        )
+        superseded = {
+            (relation.object.entry_id, relation.object.revision)
+            for relation in proposal.relations
+            if relation.kind is KnowledgeRelationKind.SUPERSEDES
+        }
+        expected_archived = (
+            sorted(
+                (
+                    KnowledgeRevisionRef(
+                        entry_id=source.entry_id,
+                        revision=source.revision + 1,
+                    )
+                    for source in proposal.sources
+                    if (source.entry_id, source.revision) in superseded
+                ),
+                key=lambda item: (item.entry_id, item.revision),
+            )
+            if expected_outcome is KnowledgeMaintenanceOutcome.APPLIED
+            else []
+        )
+        expected_relation_ids = (
+            [relation.id for relation in proposal.relations]
+            if expected_outcome is KnowledgeMaintenanceOutcome.APPLIED
+            else []
+        )
+        if (
+            receipt.operation_id != decision.operation_id
+            or receipt.proposal_id != proposal.id
+            or receipt.proposal_fingerprint != proposal.fingerprint
+            or receipt.request_sha256 != request_sha256
+            or receipt.outcome is not expected_outcome
+            or receipt.replacement != expected_replacement
+            or receipt.archived_revisions != expected_archived
+            or receipt.relation_ids != expected_relation_ids
+            or receipt.committed_at < proposal.created_at
+            or receipt.committed_at < decision.decided_at
+            or receipt.replayed
+        ):
+            raise ValueError("Maintenance record conflicts with its reviewed authority.")
+    except KnowledgeMaintenanceConflict:
+        raise
+    except Exception:
+        raise KnowledgeMaintenanceConflict("malformed_receipt") from None
+
+
+def _require_knowledge_maintenance_current_entries(
+    proposal: KnowledgeMaintenanceProposal,
+    current_entries: dict[str, KnowledgeEntry],
+    *,
+    access_scope: KnowledgeAccessScope,
+    operation: str,
+) -> tuple[KnowledgeEntry, list[KnowledgeEntry]]:
+    if copy_knowledge_access_scope(access_scope) != proposal.access_scope:
+        raise KnowledgeAccessDenied(operation)
+    replacement = current_entries.get(proposal.replacement.entry_id)
+    if replacement is None:
+        raise KnowledgeMaintenanceStale("replacement_missing")
+    _require_knowledge_entry_access(access_scope, replacement, operation=operation)
+    if replacement.revision != proposal.replacement.revision:
+        raise KnowledgeMaintenanceStale("replacement_revision")
+    if replacement.status is not KnowledgeStatus.PENDING:
+        raise KnowledgeMaintenanceStale("replacement_status")
+
+    sources: list[KnowledgeEntry] = []
+    for reference in proposal.sources:
+        source = current_entries.get(reference.entry_id)
+        if source is None:
+            raise KnowledgeMaintenanceStale("source_missing")
+        _require_knowledge_entry_access(access_scope, source, operation=operation)
+        if source.revision != reference.revision:
+            raise KnowledgeMaintenanceStale("source_revision")
+        if source.status is not KnowledgeStatus.ACTIVE:
+            raise KnowledgeMaintenanceStale("source_status")
+        sources.append(source)
+    return replacement, sources
+
+
+def _knowledge_maintenance_successors(
+    proposal: KnowledgeMaintenanceProposal,
+    replacement: KnowledgeEntry,
+    sources: list[KnowledgeEntry],
+    *,
+    access_scope: KnowledgeAccessScope,
+    committed_at: datetime,
+    operation: str,
+) -> tuple[KnowledgeEntry, list[KnowledgeEntry]]:
+    active_replacement = replacement.model_copy(
+        update={
+            "revision": _next_knowledge_revision(replacement.revision),
+            "status": KnowledgeStatus.ACTIVE,
+            "updated_at": max(committed_at, replacement.created_at, replacement.updated_at),
+        }
+    )
+    _validate_revision_successor(replacement, active_replacement)
+    _require_knowledge_successor_access(
+        access_scope,
+        active_replacement,
+        operation=operation,
+    )
+    superseded = {
+        (relation.object.entry_id, relation.object.revision)
+        for relation in proposal.relations
+        if relation.kind is KnowledgeRelationKind.SUPERSEDES
+    }
+    archived_sources: list[KnowledgeEntry] = []
+    for source in sources:
+        if (source.id, source.revision) not in superseded:
+            continue
+        archived = source.model_copy(
+            update={
+                "revision": _next_knowledge_revision(source.revision),
+                "status": KnowledgeStatus.ARCHIVED,
+                "updated_at": max(committed_at, source.created_at, source.updated_at),
+            }
+        )
+        _validate_revision_successor(source, archived)
+        _require_knowledge_successor_access(access_scope, archived, operation=operation)
+        archived_sources.append(archived)
+    archived_sources.sort(key=lambda entry: entry.id)
+    return active_replacement, archived_sources
 
 
 def _knowledge_relation_semantic_key(
@@ -6954,6 +8049,10 @@ def _knowledge_chunk_id(value: str, field_name: str = "chunk_id") -> str:
 
 
 def _knowledge_relation_identity(value: str, field_name: str) -> str:
+    return _bounded_knowledge_identity(value, field_name, max_bytes=256)
+
+
+def _knowledge_maintenance_identity(value: str, field_name: str) -> str:
     return _bounded_knowledge_identity(value, field_name, max_bytes=256)
 
 

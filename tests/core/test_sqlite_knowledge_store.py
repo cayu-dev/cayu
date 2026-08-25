@@ -12,6 +12,11 @@ from tests.core.knowledge_access_scope_conformance import (
 from tests.core.knowledge_index_readiness_conformance import (
     assert_index_readiness_conformance,
 )
+from tests.core.knowledge_maintenance_conformance import (
+    _create_proposal_entries,
+    maintenance_decision,
+    maintenance_proposal,
+)
 from tests.core.knowledge_none_terms_conformance import (
     assert_entry_wide_none_terms_conformance,
     assert_entry_wide_none_terms_precede_chunk_pagination,
@@ -37,9 +42,11 @@ from cayu.storage import (
     KnowledgeEntry,
     KnowledgeListGroup,
     KnowledgeListQuery,
+    KnowledgeMaintenanceDecisionKind,
     KnowledgeQuery,
     KnowledgeRelation,
     KnowledgeRelationKind,
+    KnowledgeRelationQuery,
     KnowledgeRevisionConflict,
     KnowledgeRevisionRef,
     KnowledgeRevisionResetRequired,
@@ -192,6 +199,36 @@ def _reconcile_sqlite_through_revision_59(connection: sqlite3.Connection) -> Non
             connection,
             schema_migrations.SchemaMode.MIGRATE,
             app_min_supported=59,
+        )
+    finally:
+        schema_migrations.REVISIONS = revisions
+
+
+def _reconcile_sqlite_through_revision_60(connection: sqlite3.Connection) -> None:
+    revisions = schema_migrations.REVISIONS
+    try:
+        schema_migrations.REVISIONS = tuple(
+            revision for revision in revisions if revision.revision <= 60
+        )
+        sqlite_support.reconcile_schema(
+            connection,
+            schema_migrations.SchemaMode.MIGRATE,
+            app_min_supported=60,
+        )
+    finally:
+        schema_migrations.REVISIONS = revisions
+
+
+def _reconcile_sqlite_through_revision_62(connection: sqlite3.Connection) -> None:
+    revisions = schema_migrations.REVISIONS
+    try:
+        schema_migrations.REVISIONS = tuple(
+            revision for revision in revisions if revision.revision <= 62
+        )
+        sqlite_support.reconcile_schema(
+            connection,
+            schema_migrations.SchemaMode.MIGRATE,
+            app_min_supported=62,
         )
     finally:
         schema_migrations.REVISIONS = revisions
@@ -511,6 +548,87 @@ def test_sqlite_knowledge_publication_rolls_back_each_material_write(
             assert receipt.replayed is False
         finally:
             await _close(reopened)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "failure_phase",
+    ["replacement", "predecessor", "relations", "relation_change", "decision"],
+)
+def test_sqlite_maintenance_rolls_back_every_material_boundary(
+    tmp_path,
+    failure_phase: str,
+) -> None:
+    class FailingMaintenanceStore(SQLiteKnowledgeStore):
+        lifecycle_writes = 0
+
+        def _append_revision_unlocked(self, *args, **kwargs) -> None:
+            super()._append_revision_unlocked(*args, **kwargs)
+            self.lifecycle_writes += 1
+            self._fail_after("replacement" if self.lifecycle_writes == 1 else "predecessor")
+
+        def _insert_relations_unlocked(self, relations) -> None:
+            super()._insert_relations_unlocked(relations)
+            self._fail_after("relations")
+
+        def _insert_relation_change_unlocked(self, *args, **kwargs):
+            change = super()._insert_relation_change_unlocked(*args, **kwargs)
+            self._fail_after("relation_change")
+            return change
+
+        def _insert_maintenance_record_unlocked(self, *args, **kwargs) -> None:
+            super()._insert_maintenance_record_unlocked(*args, **kwargs)
+            self._fail_after("decision")
+
+        def _fail_after(self, phase: str) -> None:
+            if phase == failure_phase:
+                raise RuntimeError(f"injected {phase}-boundary failure")
+
+    async def assert_unchanged(store, proposal, operation_id: str, baseline: int) -> None:
+        replacement = await store.get_entry(proposal.replacement.entry_id)
+        source = await store.get_entry(proposal.sources[0].entry_id)
+        assert replacement is not None
+        assert replacement.revision == 1
+        assert replacement.status is KnowledgeStatus.PENDING
+        assert source is not None
+        assert source.revision == 1
+        assert source.status is KnowledgeStatus.ACTIVE
+        relations = await store.read_relations(
+            KnowledgeRelationQuery(reference=proposal.sources[0])
+        )
+        assert relations is not None
+        assert relations.relations == []
+        assert await store.load_maintenance_decision_receipt(operation_id) is None
+        assert (await store.read_changes(after_sequence=0, limit=100)).high_water_sequence == (
+            baseline
+        )
+
+    async def run() -> None:
+        path = tmp_path / f"maintenance-rollback-{failure_phase}.sqlite"
+        proposal = maintenance_proposal(f"sqlite-rollback-{failure_phase}")
+        decision = maintenance_decision(
+            proposal,
+            operation_id=f"sqlite-rollback-{failure_phase}-operation",
+            kind=KnowledgeMaintenanceDecisionKind.APPROVE,
+        )
+        failing = FailingMaintenanceStore(path, access_scope=_ACCESS_SCOPE)
+        try:
+            await _create_proposal_entries(failing, proposal)
+            baseline = (await failing.read_changes(after_sequence=0, limit=100)).high_water_sequence
+            with pytest.raises(RuntimeError, match=rf"{failure_phase}-boundary"):
+                await failing.apply_maintenance_decision(proposal, decision)
+            await assert_unchanged(failing, proposal, decision.operation_id, baseline)
+        finally:
+            await failing.close()
+
+        reopened = SQLiteKnowledgeStore(path, access_scope=_ACCESS_SCOPE)
+        try:
+            await assert_unchanged(reopened, proposal, decision.operation_id, baseline)
+            receipt = await reopened.apply_maintenance_decision(proposal, decision)
+            assert receipt.replayed is False
+        finally:
+            await reopened.close()
 
     asyncio.run(run())
 
@@ -1570,8 +1688,141 @@ def test_sqlite_revision_60_initializes_empty_pre_relation_schema_directly(
             ).fetchone()
             is not None
         )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'cayu_knowledge_maintenance_decisions'"
+            ).fetchone()
+            is not None
+        )
     finally:
         connection.close()
+
+
+def test_sqlite_revision_63_refuses_populated_knowledge_without_interpretation(
+    tmp_path,
+) -> None:
+    database = tmp_path / "revision-62-to-63-populated.sqlite"
+    connection = sqlite_support.connect(database)
+    entry = KnowledgeEntry(id="revision-62-entry", text="Must remain untouched.")
+    try:
+        _reconcile_sqlite_through_revision_62(connection)
+        seed_store = SQLiteKnowledgeStore.__new__(SQLiteKnowledgeStore)
+        seed_store._connection = connection
+        with sqlite_support._transaction(connection):
+            seed_store._insert_entry_unlocked(entry)
+    finally:
+        connection.close()
+
+    with pytest.raises(
+        schema_migrations.SchemaTooOld,
+        match="clean prerelease reviewed-maintenance break",
+    ):
+        SQLiteKnowledgeStore(
+            database,
+            schema_mode=schema_migrations.SchemaMode.MIGRATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+
+    connection = sqlite_support.connect(database)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 62
+        assert (
+            connection.execute(
+                "SELECT text FROM cayu_knowledge_revisions WHERE entry_id = ? AND revision = 1",
+                (entry.id,),
+            ).fetchone()[0]
+            == entry.text
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'cayu_knowledge_maintenance_decisions'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+
+def test_sqlite_revision_63_initializes_empty_knowledge_schema_directly(tmp_path) -> None:
+    database = tmp_path / "revision-62-to-63-empty.sqlite"
+    connection = sqlite_support.connect(database)
+    try:
+        _reconcile_sqlite_through_revision_62(connection)
+    finally:
+        connection.close()
+
+    store = SQLiteKnowledgeStore(
+        database,
+        schema_mode=schema_migrations.SchemaMode.MIGRATE,
+        access_scope=_ACCESS_SCOPE,
+    )
+    store._connection.close()
+
+    connection = sqlite_support.connect(database)
+    try:
+        assert (
+            connection.execute("PRAGMA user_version").fetchone()[0]
+            == schema_migrations.LATEST_REVISION
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'cayu_knowledge_maintenance_decisions'"
+            ).fetchone()
+            is not None
+        )
+    finally:
+        connection.close()
+
+
+def test_sqlite_revision_63_rejects_a_malformed_maintenance_table(tmp_path) -> None:
+    database = tmp_path / "revision-63-malformed-maintenance.sqlite"
+    store = SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
+    store._connection.close()
+    connection = sqlite_support.connect(database)
+    try:
+        connection.execute("DROP TABLE cayu_knowledge_maintenance_decisions")
+        connection.execute(
+            "CREATE TABLE cayu_knowledge_maintenance_decisions (operation_id TEXT PRIMARY KEY)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="reviewed knowledge maintenance contract"):
+        SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
+
+
+def test_sqlite_revision_63_requires_lowercase_sha_constraints(tmp_path) -> None:
+    database = tmp_path / "revision-63-weak-maintenance-hashes.sqlite"
+    store = SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
+    store._connection.close()
+    connection = sqlite_support.connect(database)
+    try:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'cayu_knowledge_maintenance_decisions'"
+        ).fetchone()
+        assert row is not None
+        definition = str(row[0])
+        weakened = definition.replace(
+            "AND proposal_fingerprint NOT GLOB '*[^0-9a-f]*'",
+            "",
+        ).replace(
+            "AND request_sha256 NOT GLOB '*[^0-9a-f]*'",
+            "",
+        )
+        assert weakened != definition
+        connection.execute("DROP TABLE cayu_knowledge_maintenance_decisions")
+        connection.execute(weakened)
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="reviewed knowledge maintenance contract"):
+        SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
 
 
 def test_sqlite_revision_43_rejects_out_of_contract_revision_42_identities(

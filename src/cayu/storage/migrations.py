@@ -351,6 +351,10 @@ REVISIONS: tuple[Revision, ...] = (
     # workers do not preserve those payload/authority fields and cannot share
     # the migrated store safely.
     Revision(revision=62, kind=RevisionKind.BREAKING, compatible_from=62),
+    # Reviewed maintenance decisions bind exact proposals to atomic replacement,
+    # archival, lineage, outbox, and receipt commits. Populated pre-63 knowledge
+    # stores are deliberately not rewritten or backfilled.
+    Revision(revision=63, kind=RevisionKind.BREAKING, compatible_from=63),
 )
 
 #: The revision an empty database is initialized to.

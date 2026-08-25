@@ -10,6 +10,11 @@ from tests.core.knowledge_access_scope_conformance import (
 from tests.core.knowledge_index_readiness_conformance import (
     assert_index_readiness_conformance,
 )
+from tests.core.knowledge_maintenance_conformance import (
+    _create_proposal_entries,
+    maintenance_decision,
+    maintenance_proposal,
+)
 from tests.core.knowledge_none_terms_conformance import (
     assert_entry_wide_none_terms_conformance,
     assert_entry_wide_none_terms_precede_chunk_pagination,
@@ -49,6 +54,7 @@ from cayu.storage import (
     KnowledgeIndexState,
     KnowledgeListGroup,
     KnowledgeListQuery,
+    KnowledgeMaintenanceDecisionKind,
     KnowledgeQuery,
     KnowledgeRelation,
     KnowledgeRelationKind,
@@ -90,6 +96,7 @@ _TABLES = (
     "cayu_recall_item_exposures",
     "cayu_context_exposures",
     "cayu_recall_receipts",
+    "cayu_knowledge_maintenance_decisions",
     "cayu_knowledge_relation_publication_receipts",
     "cayu_knowledge_relations",
     "cayu_knowledge_change_acknowledgements",
@@ -329,6 +336,73 @@ def test_postgres_cancelled_relation_publication_rolls_back_atomically(
                 [relation],
                 operation_id="cancelled-relation-operation",
             )
+            assert committed.replayed is False
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_postgres_cancelled_maintenance_rolls_back_atomically(
+    postgres_dsn: str,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        store = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        proposal = maintenance_proposal("cancelled-postgres-maintenance")
+        decision = maintenance_decision(
+            proposal,
+            operation_id="cancelled-postgres-maintenance-operation",
+            kind=KnowledgeMaintenanceDecisionKind.APPROVE,
+        )
+        try:
+            await _create_proposal_entries(store, proposal)
+            baseline = (await store.read_changes(after_sequence=0, limit=100)).high_water_sequence
+            original_insert_relations = store._insert_relations
+            entered = asyncio.Event()
+
+            async def pause_after_relation_insert(cur, relations) -> None:
+                await original_insert_relations(cur, relations)
+                entered.set()
+                await asyncio.Future()
+
+            monkeypatch.setattr(store, "_insert_relations", pause_after_relation_insert)
+            application = asyncio.create_task(store.apply_maintenance_decision(proposal, decision))
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            application.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await application
+            monkeypatch.setattr(store, "_insert_relations", original_insert_relations)
+
+            replacement = await store.get_entry(proposal.replacement.entry_id)
+            source = await store.get_entry(proposal.sources[0].entry_id)
+            assert replacement is not None
+            assert replacement.revision == 1
+            assert replacement.status is KnowledgeStatus.PENDING
+            assert source is not None
+            assert source.revision == 1
+            assert source.status is KnowledgeStatus.ACTIVE
+            relations = await store.read_relations(
+                KnowledgeRelationQuery(reference=proposal.sources[0])
+            )
+            assert relations is not None
+            assert relations.relations == []
+            assert await store.load_maintenance_decision_receipt(decision.operation_id) is None
+            assert (await store.read_changes(after_sequence=0, limit=100)).high_water_sequence == (
+                baseline
+            )
+
+            committed = await store.apply_maintenance_decision(proposal, decision)
             assert committed.replayed is False
         finally:
             await store.close()
@@ -1376,6 +1450,86 @@ def test_postgres_knowledge_publication_rolls_back_each_material_write(
                     entry_id=entry.id,
                     operation_id=f"postgres-rollback-{failure_phase}",
                 )
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "failure_phase",
+    ["replacement", "predecessor", "relations", "relation_change", "decision"],
+)
+def test_postgres_maintenance_rolls_back_every_material_boundary(
+    postgres_dsn: str,
+    failure_phase: str,
+) -> None:
+    async def run() -> None:
+        from cayu import PostgresKnowledgeStore
+
+        class FailingMaintenanceStore(PostgresKnowledgeStore):
+            lifecycle_writes = 0
+
+            async def _append_revision(self, *args, **kwargs) -> None:
+                await super()._append_revision(*args, **kwargs)
+                self.lifecycle_writes += 1
+                self._fail_after("replacement" if self.lifecycle_writes == 1 else "predecessor")
+
+            async def _insert_relations(self, cur, relations) -> None:
+                await super()._insert_relations(cur, relations)
+                self._fail_after("relations")
+
+            async def _insert_relation_change(self, *args, **kwargs):
+                change = await super()._insert_relation_change(*args, **kwargs)
+                self._fail_after("relation_change")
+                return change
+
+            async def _insert_maintenance_record(self, *args, **kwargs) -> None:
+                await super()._insert_maintenance_record(*args, **kwargs)
+                self._fail_after("decision")
+
+            def _fail_after(self, phase: str) -> None:
+                if phase == failure_phase:
+                    raise RuntimeError(f"injected {phase}-boundary failure")
+
+        await _drop_all(postgres_dsn)
+        store = FailingMaintenanceStore(
+            postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
+            min_size=1,
+            max_size=4,
+            schema_mode=SchemaMode.CREATE,
+        )
+        proposal = maintenance_proposal(f"postgres-rollback-{failure_phase}")
+        decision = maintenance_decision(
+            proposal,
+            operation_id=f"postgres-rollback-{failure_phase}-operation",
+            kind=KnowledgeMaintenanceDecisionKind.APPROVE,
+        )
+        try:
+            await _create_proposal_entries(store, proposal)
+            baseline = (await store.read_changes(after_sequence=0, limit=100)).high_water_sequence
+            with pytest.raises(RuntimeError, match=rf"{failure_phase}-boundary"):
+                await store.apply_maintenance_decision(proposal, decision)
+
+            replacement = await store.get_entry(proposal.replacement.entry_id)
+            source = await store.get_entry(proposal.sources[0].entry_id)
+            assert replacement is not None
+            assert replacement.revision == 1
+            assert replacement.status is KnowledgeStatus.PENDING
+            assert source is not None
+            assert source.revision == 1
+            assert source.status is KnowledgeStatus.ACTIVE
+            relations = await store.read_relations(
+                KnowledgeRelationQuery(reference=proposal.sources[0])
+            )
+            assert relations is not None
+            assert relations.relations == []
+            assert await store.load_maintenance_decision_receipt(decision.operation_id) is None
+            assert (await store.read_changes(after_sequence=0, limit=100)).high_water_sequence == (
+                baseline
+            )
         finally:
             await store.close()
             await _drop_all(postgres_dsn)
@@ -4028,12 +4182,162 @@ def test_postgres_revision_60_initializes_empty_pre_relation_schema_directly(
             assert await cursor.fetchone() == (schema_migrations.LATEST_REVISION,)
             await cursor.execute(
                 "SELECT to_regclass('cayu_knowledge_relations'), "
-                "to_regclass('cayu_knowledge_relation_publication_receipts')"
+                "to_regclass('cayu_knowledge_relation_publication_receipts'), "
+                "to_regclass('cayu_knowledge_maintenance_decisions')"
             )
             assert await cursor.fetchone() == (
                 "cayu_knowledge_relations",
                 "cayu_knowledge_relation_publication_receipts",
+                "cayu_knowledge_maintenance_decisions",
             )
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_revision_63_refuses_populated_knowledge_without_interpretation(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        await _initialize_historical_schema(postgres_dsn, through_revision=62)
+        historical = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        historical._min_required_revision = 62
+        entry = KnowledgeEntry(
+            id="revision-62-entry",
+            text="Revision 63 must not interpret this populated store.",
+        )
+        try:
+            await historical.create_entry(entry)
+        finally:
+            await historical.close()
+
+        migrator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            with pytest.raises(
+                schema_migrations.SchemaTooOld,
+                match="clean prerelease reviewed-maintenance break",
+            ):
+                await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cursor.fetchone() == (62,)
+            await cursor.execute(
+                "SELECT text FROM cayu_knowledge_revisions WHERE entry_id = %s AND revision = 1",
+                (entry.id,),
+            )
+            assert await cursor.fetchone() == (entry.text,)
+            await cursor.execute("SELECT to_regclass('cayu_knowledge_maintenance_decisions')")
+            assert await cursor.fetchone() == (None,)
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_revision_63_initializes_empty_knowledge_schema_directly(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        await _initialize_historical_schema(postgres_dsn, through_revision=62)
+        migrator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cursor.fetchone() == (schema_migrations.LATEST_REVISION,)
+            await cursor.execute("SELECT to_regclass('cayu_knowledge_maintenance_decisions')")
+            assert await cursor.fetchone() == ("cayu_knowledge_maintenance_decisions",)
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_revision_63_rejects_a_malformed_maintenance_table(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute("DROP TABLE cayu_knowledge_maintenance_decisions")
+                await cursor.execute(
+                    "CREATE TABLE cayu_knowledge_maintenance_decisions "
+                    "(operation_id TEXT PRIMARY KEY)"
+                )
+            await connection.commit()
+
+        validator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="reviewed knowledge maintenance contract"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
 
     try:
         asyncio.run(run())

@@ -3306,6 +3306,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (60, 60),
         (61, 61),
         (62, 62),
+        (63, 63),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
@@ -3340,8 +3341,11 @@ def test_sqlite_revision_fifty_nine_migrates_an_empty_verified_work_registry(
         version = connection.execute("PRAGMA user_version").fetchone()
     finally:
         connection.close()
-    assert revision == (62, 62)
-    assert version == (62,)
+    assert revision == (
+        schema_migrations.LATEST_REVISION,
+        schema_migrations.MIN_SUPPORTED_REVISION,
+    )
+    assert version == (schema_migrations.LATEST_REVISION,)
 
 
 def test_sqlite_revision_fifty_nine_rejects_a_populated_verified_work_registry(

@@ -153,6 +153,25 @@ entry-publication control, canonical relation preparation, atomic batch
 publication, endpoint-indexed reads across unrelated background relations, and
 incremental SQLite storage on every CI run.
 
+### Reviewed supersession decisions commit atomically
+
+In-memory, SQLite, and PostgreSQL knowledge stores now accept immutable,
+revision-bound maintenance proposals plus explicit non-model approve/reject
+decisions. Approval compare-and-swap checks every reviewed current revision and
+commits replacement activation, superseded-source archival revisions, exact
+lineage relations, metadata-only outbox changes, and a durable receipt in one
+transaction. Rejection records review history without changing lifecycle;
+contradiction and derivation preserve active sources. Exact retries are
+idempotent, while stale, conflicting, denied, failed, and cancelled attempts
+leave no partial state.
+
+Breaking storage revision 63 installs the final decision record. Fresh and
+completely empty earlier knowledge schemas initialize directly; populated
+pre-63 knowledge schemas fail untouched and require explicit replacement. No
+backfill, inferred proposal, legacy interpretation, dual write, or compatibility
+wrapper is included. A provider-free performance gate covers the zero-decision
+path and bounded multi-source applications.
+
 ### Memory interventions have portable, effect-bound evidence contracts
 
 Applications can now declare an explicit `as_declared`, recall-off, omission,

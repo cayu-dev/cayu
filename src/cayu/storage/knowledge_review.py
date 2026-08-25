@@ -16,6 +16,9 @@ from cayu.storage.memory import (
     KnowledgeEntry,
     KnowledgeListQuery,
     KnowledgeListResult,
+    KnowledgeMaintenanceDecision,
+    KnowledgeMaintenanceDecisionReceipt,
+    KnowledgeMaintenanceProposal,
     KnowledgeStatus,
     KnowledgeVisibility,
     copy_knowledge_access_scope,
@@ -33,6 +36,7 @@ class _KnowledgeReviewStore(Protocol):
         self,
         entry_id: str,
         *,
+        revision: int | None = None,
         access_scope: KnowledgeAccessScope,
     ) -> KnowledgeEntry | None: ...
 
@@ -54,6 +58,14 @@ class _KnowledgeReviewStore(Protocol):
         *,
         access_scope: KnowledgeAccessScope,
     ) -> KnowledgeListResult: ...
+
+    async def apply_maintenance_decision(
+        self,
+        proposal: KnowledgeMaintenanceProposal,
+        decision: KnowledgeMaintenanceDecision,
+        *,
+        access_scope: KnowledgeAccessScope,
+    ) -> KnowledgeMaintenanceDecisionReceipt: ...
 
 
 class KnowledgeReviewWorkflow:
@@ -147,6 +159,35 @@ class KnowledgeReviewWorkflow:
             to_status=KnowledgeStatus.ARCHIVED,
             expected_namespace=self.namespace,
             expected_labels=self.labels,
+        )
+
+    async def decide_maintenance(
+        self,
+        proposal: KnowledgeMaintenanceProposal,
+        decision: KnowledgeMaintenanceDecision,
+    ) -> KnowledgeMaintenanceDecisionReceipt:
+        """Apply one exact multi-entry review through the store transaction."""
+
+        apply = getattr(self.store, "apply_maintenance_decision", None)
+        if not callable(apply):
+            raise TypeError("store must implement reviewed knowledge maintenance.")
+        if type(proposal) is not KnowledgeMaintenanceProposal:
+            raise TypeError("proposal must be a KnowledgeMaintenanceProposal.")
+        if type(decision) is not KnowledgeMaintenanceDecision:
+            raise TypeError("decision must be a KnowledgeMaintenanceDecision.")
+        for reference in [proposal.replacement, *proposal.sources]:
+            entry = await self.store.get_entry(
+                reference.entry_id,
+                revision=reference.revision,
+                access_scope=self.access_scope,
+            )
+            if entry is None:
+                raise KeyError("A reviewed maintenance entry revision is unavailable.")
+            self._require_entry_in_scope(entry)
+        return await apply(
+            proposal,
+            decision,
+            access_scope=self.access_scope,
         )
 
     async def _require_pending_entry(self, entry_id: str) -> KnowledgeEntry:

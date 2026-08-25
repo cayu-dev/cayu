@@ -2917,6 +2917,35 @@ _MIGRATION_STEPS: dict[int, str] = {
             ON cayu_work_attempt_execution_claims(admission_id)
             WHERE is_current = 1;
     """,
+    63: """
+        DROP TABLE IF EXISTS cayu_knowledge_maintenance_decisions;
+        CREATE TABLE cayu_knowledge_maintenance_decisions (
+            operation_id TEXT PRIMARY KEY,
+            proposal_id TEXT NOT NULL UNIQUE,
+            proposal_fingerprint TEXT NOT NULL CHECK (
+                length(proposal_fingerprint) = 64
+                AND proposal_fingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+            request_sha256 TEXT NOT NULL CHECK (
+                length(request_sha256) = 64
+                AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            committed_at TEXT NOT NULL,
+            proposal_json TEXT NOT NULL CHECK (
+                json_valid(proposal_json) AND json_type(proposal_json) = 'object'
+            ),
+            decision_json TEXT NOT NULL CHECK (
+                json_valid(decision_json) AND json_type(decision_json) = 'object'
+            ),
+            receipt_json TEXT NOT NULL CHECK (
+                json_valid(receipt_json) AND json_type(receipt_json) = 'object'
+            ),
+            access_snapshot_json TEXT NOT NULL CHECK (
+                json_valid(access_snapshot_json)
+                AND json_type(access_snapshot_json) = 'object'
+            )
+        );
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -3182,30 +3211,62 @@ def _reject_populated_pre_knowledge_revision_database(
     )
 
 
+_KNOWLEDGE_RELATION_CLEAN_BREAK_TABLES = (
+    "cayu_knowledge_entries",
+    "cayu_knowledge_revisions",
+    "cayu_knowledge_chunks",
+    "cayu_knowledge_chunks_fts",
+    "cayu_knowledge_labels",
+    "cayu_knowledge_aspects",
+    "cayu_knowledge_impact_targets",
+    "cayu_knowledge_evidence",
+    "cayu_knowledge_publication_receipts",
+    "cayu_knowledge_relations",
+    "cayu_knowledge_relation_publication_receipts",
+    "cayu_knowledge_changes",
+    "cayu_knowledge_change_audiences",
+    "cayu_knowledge_change_labels",
+    "cayu_knowledge_change_consumers",
+    "cayu_knowledge_change_acknowledgements",
+    "cayu_knowledge_index_readiness_events",
+    "cayu_knowledge_index_readiness_current",
+    "cayu_knowledge_embeddings",
+)
+_KNOWLEDGE_MAINTENANCE_CLEAN_BREAK_TABLES = (
+    *_KNOWLEDGE_RELATION_CLEAN_BREAK_TABLES,
+    "cayu_knowledge_maintenance_decisions",
+)
+
+
 def _reject_populated_pre_knowledge_relation_database(
     connection: sqlite3.Connection,
 ) -> None:
-    candidates = (
-        "cayu_knowledge_entries",
-        "cayu_knowledge_revisions",
-        "cayu_knowledge_chunks",
-        "cayu_knowledge_chunks_fts",
-        "cayu_knowledge_labels",
-        "cayu_knowledge_aspects",
-        "cayu_knowledge_impact_targets",
-        "cayu_knowledge_evidence",
-        "cayu_knowledge_publication_receipts",
-        "cayu_knowledge_relations",
-        "cayu_knowledge_relation_publication_receipts",
-        "cayu_knowledge_changes",
-        "cayu_knowledge_change_audiences",
-        "cayu_knowledge_change_labels",
-        "cayu_knowledge_change_consumers",
-        "cayu_knowledge_change_acknowledgements",
-        "cayu_knowledge_index_readiness_events",
-        "cayu_knowledge_index_readiness_current",
-        "cayu_knowledge_embeddings",
+    _reject_populated_pre_knowledge_contract_database(
+        connection,
+        candidates=_KNOWLEDGE_RELATION_CLEAN_BREAK_TABLES,
+        revision=60,
+        contract="knowledge-lineage",
     )
+
+
+def _reject_populated_pre_knowledge_maintenance_database(
+    connection: sqlite3.Connection,
+) -> None:
+    _reject_populated_pre_knowledge_contract_database(
+        connection,
+        candidates=_KNOWLEDGE_MAINTENANCE_CLEAN_BREAK_TABLES,
+        revision=63,
+        contract="reviewed-maintenance",
+    )
+
+
+def _reject_populated_pre_knowledge_contract_database(
+    connection: sqlite3.Connection,
+    *,
+    candidates: tuple[str, ...],
+    revision: int,
+    contract: str,
+) -> None:
     existing = {
         str(row[0])
         for row in connection.execute(
@@ -3217,7 +3278,7 @@ def _reject_populated_pre_knowledge_relation_database(
             continue
         if connection.execute(f"SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)").fetchone()[0]:
             raise schema.SchemaTooOld(
-                "Storage revision 60 is a clean prerelease knowledge-lineage break "
+                f"Storage revision {revision} is a clean prerelease {contract} break "
                 "and cannot migrate a populated Cayu knowledge database. Recreate "
                 "the Cayu knowledge database before starting this build."
             )
@@ -4247,6 +4308,12 @@ def reconcile_schema(
         _reject_populated_pre_knowledge_relation_database(connection)
     if (
         schema_mode is not schema.SchemaMode.VALIDATE
+        and state.revision < 63
+        and any(revision.revision == 63 for revision in schema.pending(state.revision))
+    ):
+        _reject_populated_pre_knowledge_maintenance_database(connection)
+    if (
+        schema_mode is not schema.SchemaMode.VALIDATE
         and state.revision == schema.UNINITIALIZED
         and any(revision.revision == 46 for revision in schema.pending(state.revision))
     ):
@@ -4312,6 +4379,8 @@ def reconcile_schema(
         _validate_revision_44_knowledge_schema(connection)
     if current.revision >= 60:
         _validate_revision_60_knowledge_schema(connection)
+    if current.revision >= 63:
+        _validate_revision_63_knowledge_schema(connection)
     if app_min_supported >= 38:
         _validate_task_terminalization_receipt_table(connection)
     if app_min_supported >= 39:
@@ -5276,6 +5345,61 @@ def _raise_revision_60_sqlite_schema_error(name: str) -> NoReturn:
     raise RuntimeError(
         "SQLite schema object "
         f"{name!r} conflicts with Cayu's revision-bound knowledge relation contract. "
+        "Recreate the prerelease knowledge database with schema_mode=CREATE or MIGRATE."
+    )
+
+
+def _validate_revision_63_knowledge_schema(connection: sqlite3.Connection) -> None:
+    table = "cayu_knowledge_maintenance_decisions"
+    expected_columns = (
+        ("operation_id", "TEXT", 0, 1),
+        ("proposal_id", "TEXT", 1, 0),
+        ("proposal_fingerprint", "TEXT", 1, 0),
+        ("request_sha256", "TEXT", 1, 0),
+        ("committed_at", "TEXT", 1, 0),
+        ("proposal_json", "TEXT", 1, 0),
+        ("decision_json", "TEXT", 1, 0),
+        ("receipt_json", "TEXT", 1, 0),
+        ("access_snapshot_json", "TEXT", 1, 0),
+    )
+    actual_columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute(f"PRAGMA table_info({table})")
+    )
+    if actual_columns != expected_columns:
+        _raise_revision_63_sqlite_schema_error(table)
+    if tuple(connection.execute(f"PRAGMA foreign_key_list({table})")):
+        _raise_revision_63_sqlite_schema_error(table)
+    for key in (("operation_id",), ("proposal_id",)):
+        if not _sqlite_has_unique_index(connection, table, key):
+            _raise_revision_63_sqlite_schema_error(table)
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    normalized = _normalize_sqlite_schema_sql(None if row is None else row[0])
+    required = (
+        "length(proposal_fingerprint) = 64",
+        "proposal_fingerprint not glob '*[^0-9a-f]*'",
+        "length(request_sha256) = 64",
+        "request_sha256 not glob '*[^0-9a-f]*'",
+        "json_valid(proposal_json)",
+        "json_type(proposal_json) = 'object'",
+        "json_valid(decision_json)",
+        "json_type(decision_json) = 'object'",
+        "json_valid(receipt_json)",
+        "json_type(receipt_json) = 'object'",
+        "json_valid(access_snapshot_json)",
+        "json_type(access_snapshot_json) = 'object'",
+    )
+    if any(fragment not in normalized for fragment in required):
+        _raise_revision_63_sqlite_schema_error(table)
+
+
+def _raise_revision_63_sqlite_schema_error(name: str) -> NoReturn:
+    raise RuntimeError(
+        "SQLite schema object "
+        f"{name!r} conflicts with Cayu's reviewed knowledge maintenance contract. "
         "Recreate the prerelease knowledge database with schema_mode=CREATE or MIGRATE."
     )
 
@@ -6849,6 +6973,10 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             # this fence closes the race between that check and replacement of
             # the empty prerelease knowledge outbox/relation tables.
             _reject_populated_pre_knowledge_relation_database(connection)
+        if rev.revision == 63:
+            # Recheck while BEGIN IMMEDIATE excludes pre-63 writers. Populated
+            # prerelease knowledge is never inferred into reviewed decisions.
+            _reject_populated_pre_knowledge_maintenance_database(connection)
         for table, column, decl in _MIGRATION_ADD_COLUMNS.get(rev.revision, ()):
             _add_column_if_missing(connection, table, column, decl)
         for table, column in _MIGRATION_DROP_COLUMNS.get(rev.revision, ()):
@@ -6901,6 +7029,10 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_work_attempt_admission_schema(connection)
         if rev.revision == 62:
             _validate_revision_sixty_two_payload_schema(connection)
+        if rev.revision == 60:
+            _validate_revision_60_knowledge_schema(connection)
+        if rev.revision == 63:
+            _validate_revision_63_knowledge_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 
