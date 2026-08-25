@@ -37,6 +37,7 @@ from cayu.storage.memory import (
     KnowledgeChunkConflict,
     KnowledgeEmbeddingIdentity,
     KnowledgeEntry,
+    KnowledgeEntryReadLimitExceeded,
     KnowledgeEvidence,
     KnowledgeEvidenceConflict,
     KnowledgeEvidenceDisposition,
@@ -145,6 +146,7 @@ from cayu.storage.memory import (
     copy_knowledge_query,
     copy_knowledge_relation_publication_receipt,
     copy_knowledge_relation_query,
+    knowledge_entry_payload_bytes,
     prepare_knowledge_maintenance_decision,
     prepare_knowledge_publication,
     prepare_knowledge_relations,
@@ -154,7 +156,7 @@ _SEARCH_TOKEN_RE = re.compile(r"\w+")
 _SEARCH_PAGE_SIZE = 500
 _CHUNK_ID_LOOKUP_BATCH_SIZE = 400
 _EVIDENCE_ID_LOOKUP_BATCH_SIZE = 400
-_SQLITE_MIN_REQUIRED_REVISION = 63
+_SQLITE_MIN_REQUIRED_REVISION = 65
 
 
 class SQLiteKnowledgeStore(KnowledgeStore):
@@ -282,23 +284,61 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         entry_id: str,
         *,
         revision: int | None = None,
+        max_bytes: int | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry | None:
         scope = self._operation_access_scope(access_scope)
         clean_id = _knowledge_entry_id(entry_id)
         if revision is not None:
             _validate_knowledge_revision(revision, "revision")
+        if max_bytes is not None:
+            _validate_positive_int(max_bytes, "max_bytes")
         async with self._lock:
             with sqlite_support._transaction(
                 self._connection,
                 begin_immediate=False,
             ):
+                access_now = datetime.now(UTC)
+                if max_bytes is None:
+                    entry = self._load_entry_in_scope_unlocked(
+                        clean_id,
+                        scope,
+                        revision=revision,
+                        access_now=access_now,
+                    )
+                    return None if entry is None else copy_knowledge_entry(entry)
+                payload_descriptor = self._load_entry_payload_bytes_in_scope_unlocked(
+                    clean_id,
+                    scope,
+                    revision=revision,
+                    access_now=access_now,
+                )
+                if payload_descriptor is None:
+                    return None
+                selected_revision, stored_payload_bytes = payload_descriptor
+                if stored_payload_bytes > max_bytes:
+                    raise KnowledgeEntryReadLimitExceeded(
+                        clean_id,
+                        revision=selected_revision,
+                        payload_bytes=stored_payload_bytes,
+                        max_bytes=max_bytes,
+                    )
                 entry = self._load_entry_in_scope_unlocked(
                     clean_id,
                     scope,
                     revision=revision,
+                    access_now=access_now,
                 )
-                return None if entry is None else copy_knowledge_entry(entry)
+                if entry is None:
+                    raise RuntimeError(
+                        "Knowledge entry disappeared inside a stable SQLite read snapshot."
+                    )
+                actual_bytes = knowledge_entry_payload_bytes(entry)
+                if actual_bytes != stored_payload_bytes:
+                    raise RuntimeError(
+                        "Stored knowledge entry payload size does not match canonical content."
+                    )
+                return copy_knowledge_entry(entry)
 
     async def transition_entry_status(
         self,
@@ -2037,9 +2077,10 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 last_used_at,
                 expires_at,
                 title,
-                metadata_json
+                metadata_json,
+                payload_bytes
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             _entry_row_values(entry),
         )
@@ -3244,8 +3285,10 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         access_scope: KnowledgeAccessScope,
         *,
         revision: int | None = None,
+        access_now: datetime | None = None,
     ) -> KnowledgeEntry | None:
-        access_now = datetime.now(UTC)
+        if access_now is None:
+            access_now = datetime.now(UTC)
         access_sql, access_params = _knowledge_access_scope_filter_sql(
             access_scope,
             now=access_now,
@@ -3320,6 +3363,70 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             aspects=self._load_aspects_unlocked(entry_id, selected_revision),
             impact_targets=self._load_impact_targets_unlocked(entry_id, selected_revision),
         )
+
+    def _load_entry_payload_bytes_in_scope_unlocked(
+        self,
+        entry_id: str,
+        access_scope: KnowledgeAccessScope,
+        *,
+        revision: int | None = None,
+        access_now: datetime,
+    ) -> tuple[int, int] | None:
+        access_sql, access_params = _knowledge_access_scope_filter_sql(
+            access_scope,
+            now=access_now,
+        )
+        if revision is None:
+            row = self._connection.execute(
+                f"""
+                SELECT e.revision, e.payload_bytes
+                FROM cayu_knowledge_current_entries AS e
+                WHERE e.id = ?
+                {access_sql}
+                """,
+                [entry_id, *access_params],
+            ).fetchone()
+        else:
+            current_access_sql, current_access_params = _knowledge_access_scope_filter_sql(
+                access_scope,
+                entry_alias="current_entry",
+                now=access_now,
+            )
+            row = self._connection.execute(
+                f"""
+                SELECT e.revision, e.payload_bytes
+                FROM (
+                    SELECT
+                        logical.id AS id,
+                        stored.revision AS revision,
+                        logical.namespace AS namespace,
+                        stored.visibility AS visibility,
+                        stored.status AS status,
+                        stored.source_type AS source_type,
+                        stored.source_id AS source_id,
+                        stored.expires_at AS expires_at,
+                        stored.payload_bytes AS payload_bytes
+                    FROM cayu_knowledge_entries AS logical
+                    JOIN cayu_knowledge_revisions AS stored
+                      ON stored.entry_id = logical.id
+                    WHERE logical.id = ? AND stored.revision = ?
+                ) AS e
+                JOIN cayu_knowledge_current_entries AS current_entry
+                  ON current_entry.id = e.id
+                WHERE TRUE
+                {access_sql}
+                {current_access_sql}
+                """,
+                [
+                    entry_id,
+                    revision,
+                    *access_params,
+                    *current_access_params,
+                ],
+            ).fetchone()
+        if row is None:
+            return None
+        return int(row["revision"]), int(row["payload_bytes"])
 
     def _load_chunks_unlocked(
         self,
@@ -3902,6 +4009,7 @@ def _entry_row_values(entry: KnowledgeEntry) -> tuple[object, ...]:
         sqlite_support.format_optional_datetime(entry.expires_at),
         entry.title,
         sqlite_support.json_dumps(entry.metadata),
+        knowledge_entry_payload_bytes(entry),
     )
 
 

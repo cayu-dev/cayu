@@ -590,6 +590,121 @@ entries. It measures preparation, atomic application, exact replay, receipt
 loading, and incremental SQLite storage. Results are recorded in
 [`benchmarks/memory/knowledge-maintenance-performance-v1.json`](../benchmarks/memory/knowledge-maintenance-performance-v1.json).
 
+## Deterministic maintenance candidate routing
+
+`KnowledgeMaintenanceRouter` is the read-only boundary between explicit
+application-produced hints and the later consolidation planner. It does not scan the
+whole corpus, discover its own authority, call a model, create a pending replacement,
+or change knowledge. The application or a separately owned scheduler submits a bounded
+`KnowledgeMaintenanceRoutingRequest` containing exact revision signals and an explicit
+`KnowledgeAccessScope`, namespace, label subset, and policy identity.
+
+Signals have a closed meaning:
+
+- `exact_reference` nominates one exact revision directly;
+- `duplicate_hint` nominates two revisions for comparison while preserving any raw
+  similarity score as diagnostics only;
+- `expiry` verifies an entry's exact expiration time against the supplied cutoff;
+- `low_usage` verifies that creation, latest revision, and last-use time are all older
+  than the supplied cutoff; and
+- `contradiction` binds and verifies one exact accessible revision-bound `contradicts`
+  relation identity between the two exact revisions.
+
+None of these signals proves equivalence, truth, authority, or supersession. They only
+justify spending a later bounded evaluation budget on the candidate set.
+
+```python
+from datetime import UTC, datetime
+
+from cayu import (
+    KnowledgeMaintenanceCandidateSignal,
+    KnowledgeMaintenanceRouter,
+    KnowledgeMaintenanceRoutingRequest,
+    KnowledgeMaintenanceSignalKind,
+    KnowledgeRevisionRef,
+)
+
+now = datetime.now(UTC)
+request = KnowledgeMaintenanceRoutingRequest(
+    id="refund-maintenance-routing-2026-08",
+    policy_id="knowledge-maintenance-v1",
+    namespace="acme-support",
+    labels={"project": "billing"},
+    access_scope=review_scope,
+    signals=(
+        KnowledgeMaintenanceCandidateSignal(
+            id="refund-policy-duplicate-hint",
+            kind=KnowledgeMaintenanceSignalKind.DUPLICATE_HINT,
+            references=(
+                KnowledgeRevisionRef(entry_id="refund-policy-a", revision=3),
+                KnowledgeRevisionRef(entry_id="refund-policy-b", revision=2),
+            ),
+            producer_id="billing-policy-index",
+            producer_version="2026-08",
+            reason_code="bounded_lexical_duplicate_hint",
+            observed_at=now,
+            raw_score=8.25,
+            score_kind="bm25-diagnostic-v1",
+        ),
+    ),
+    created_at=now,
+)
+result = await KnowledgeMaintenanceRouter(store).route(request)
+```
+
+Before any store read, the router rejects requests that exceed its signal or unique
+candidate-read ceilings. It loads only current revisions through storage-enforced
+authorization and passes a per-read byte ceiling to `KnowledgeStore.get_entry(...)`.
+Stores persist the canonical payload size with every revision, so they can refuse an
+oversized authorized entry before fetching or copying its content. The router also
+reserves concurrent reads against `max_candidate_load_bytes`; this bounds aggregate
+materialized input independently from the smaller final-payload budget. Entries refused
+by either byte boundary receive a content-free `candidate_bytes` omission. Inaccessible
+entries remain indistinguishable from missing entries and never disclose their size.
+
+Contradiction verification reserves every relation page from the request-wide
+`max_relation_load_bytes` budget before launching the read. Page reservations share the
+same deterministic signal order as routing, are capped by `max_concurrency`, and reclaim
+only the unused portion of a validated page. This prevents individually valid page and
+concurrency settings from multiplying into unbounded simultaneous materialization. When
+the remaining budget cannot admit one valid relation page, every pending scan receives a
+content-free `relation_coverage_incomplete` omission instead of a guessed decision.
+
+The router rejects stale, cross-scope, and non-active candidates and applies configured
+signal priority plus stable timestamp/identity tie-breaking. Pair signals are admitted
+or omitted as a unit. Final admission uses incremental exact canonical-byte accounting,
+adding only the current signal/reference deltas instead of rebuilding and reserializing
+the entire trial payload for every signal. The planner-facing payload is bounded by exact
+candidate count and canonical serialized bytes; timeout and caller cancellation cancel
+in-flight reads rather than returning a guessed partial result.
+
+`KnowledgeMaintenanceRoutingResult` exhaustively partitions every submitted signal
+into routed signals or content-free omission diagnostics. `truncated=True` means a
+candidate budget or bounded relation scan prevented complete routing; unavailable,
+stale, or condition-not-met signals are fully evaluated rejections instead. The result
+binds canonical request and configuration fingerprints and defensively copied current
+entries. It also reports exact relation payload bytes consumed against the configured
+request-wide ceiling. Routing performs no publication, relation write, lifecycle
+transition, or proposal persistence.
+
+Breaking storage revision 65 installs persisted canonical entry sizes and the bounded
+entry-read contract. Fresh databases and completely empty earlier knowledge schemas
+initialize directly. A populated pre-65 knowledge schema fails before DDL or data change
+and must be explicitly replaced. There is no size backfill, legacy read fallback,
+compatibility wrapper, or dual-write path.
+
+The hermetic performance gate uses the full supported 50 exact candidates across
+in-memory and SQLite stores, plus a zero-candidate control that performs no store reads.
+It makes no model or provider calls and verifies that routing leaves every canonical
+revision unchanged:
+
+```bash
+PYTHONPATH=src python scripts/run_knowledge_maintenance_routing_performance.py --check
+```
+
+Results are recorded in
+[`benchmarks/memory/knowledge-maintenance-routing-performance-v1.json`](../benchmarks/memory/knowledge-maintenance-routing-performance-v1.json).
+
 ## Explicit reviewed knowledge curation
 
 `KnowledgeCurator` is the provider-neutral, explicitly invoked path from application

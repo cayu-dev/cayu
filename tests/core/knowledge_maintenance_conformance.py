@@ -139,8 +139,14 @@ async def assert_knowledge_maintenance_conformance(store: Any) -> None:
     ]
     assert receipt.relation_ids == [proposal.relations[0].id]
 
-    replacement = await store.get_entry(proposal.replacement.entry_id)
-    source = await store.get_entry(proposal.sources[0].entry_id)
+    replacement = await store.get_entry(
+        proposal.replacement.entry_id,
+        max_bytes=4 * 1024 * 1024,
+    )
+    source = await store.get_entry(
+        proposal.sources[0].entry_id,
+        max_bytes=4 * 1024 * 1024,
+    )
     assert replacement is not None
     assert replacement.revision == 2
     assert replacement.status is KnowledgeStatus.ACTIVE

@@ -1,0 +1,80 @@
+{
+  "ceiling_findings": [],
+  "ceilings": {
+    "candidate_payload_bytes_per_candidate": 4096,
+    "memory_bounded_routing_p95_ms": 100.0,
+    "memory_routing_p95_ms_per_candidate": 5.0,
+    "memory_zero_candidate_routing_p95_ms": 5.0,
+    "sqlite_bounded_routing_p95_ms": 150.0,
+    "sqlite_routing_p95_ms_per_candidate": 10.0,
+    "sqlite_zero_candidate_routing_p95_ms": 5.0
+  },
+  "control": {
+    "candidate_count": 0,
+    "historical_pre_feature": false,
+    "kind": "current_runtime_zero_candidates",
+    "store_reads": 0
+  },
+  "environment": {
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "results": [
+    {
+      "backend": "memory",
+      "candidate_count": 50,
+      "candidate_payload_bytes": 59536,
+      "candidate_payload_bytes_per_candidate": 1190.72,
+      "iteration_count": 30,
+      "knowledge_revision_mutations": 0,
+      "loaded_reference_count": 50,
+      "relation_payload_bytes": 0,
+      "routed_signal_count": 50,
+      "routing_latency": {
+        "p50_ms": 36.810833,
+        "p95_ms": 38.711417
+      },
+      "routing_latency_per_candidate": {
+        "p50_ms": 0.736217,
+        "p95_ms": 0.774228
+      },
+      "zero_candidate_routing_latency": {
+        "p50_ms": 0.283104,
+        "p95_ms": 0.33625
+      }
+    },
+    {
+      "backend": "sqlite",
+      "candidate_count": 50,
+      "candidate_payload_bytes": 59536,
+      "candidate_payload_bytes_per_candidate": 1190.72,
+      "iteration_count": 30,
+      "knowledge_revision_mutations": 0,
+      "loaded_reference_count": 50,
+      "relation_payload_bytes": 0,
+      "routed_signal_count": 50,
+      "routing_latency": {
+        "p50_ms": 44.285312,
+        "p95_ms": 49.493625
+      },
+      "routing_latency_per_candidate": {
+        "p50_ms": 0.885706,
+        "p95_ms": 0.989873
+      },
+      "zero_candidate_routing_latency": {
+        "p50_ms": 0.285416,
+        "p95_ms": 0.336625
+      }
+    }
+  ],
+  "schema_version": "cayu.knowledge_maintenance_routing_performance.v1",
+  "within_ceilings": true,
+  "workload": {
+    "candidate_count": 50,
+    "iterations": 30,
+    "model_calls": 0,
+    "provider_calls": 0,
+    "signal_kind": "exact_reference",
+    "store_writes_during_routing": 0
+  }
+}

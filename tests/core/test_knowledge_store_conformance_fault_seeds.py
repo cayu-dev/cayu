@@ -8,6 +8,7 @@ from tests.core.knowledge_store_conformance import (
     KnowledgeStoreConformanceFailure,
     verify_access_scope,
     verify_atomic_invalid_write,
+    verify_bounded_entry_read,
     verify_change_outbox,
     verify_change_page,
     verify_embedding_space_isolation,
@@ -120,6 +121,7 @@ class _SeededBrokenKnowledgeStore(InMemoryKnowledgeStore):
         entry_id: str,
         *,
         revision: int | None = None,
+        max_bytes: int | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry | None:
         if self.defect == "mutation-leakage":
@@ -128,11 +130,13 @@ class _SeededBrokenKnowledgeStore(InMemoryKnowledgeStore):
             return await super().get_entry(
                 entry_id,
                 revision=revision,
+                max_bytes=max_bytes,
                 access_scope=KnowledgeAccessScope.privileged(),
             )
         return await super().get_entry(
             entry_id,
             revision=revision,
+            max_bytes=max_bytes,
             access_scope=access_scope,
         )
 
@@ -251,6 +255,7 @@ class _SeededBrokenEmbeddingKnowledgeStore(InMemoryEmbeddingKnowledgeStore):
     (
         ("lost-update", verify_revision_cas),
         ("mutation-leakage", verify_result_isolation),
+        ("mutation-leakage", verify_bounded_entry_read),
         ("access-widening", verify_access_scope),
         ("partial-write", verify_atomic_invalid_write),
         ("missing-outbox", verify_change_outbox),

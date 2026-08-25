@@ -48,6 +48,7 @@ MAX_KNOWLEDGE_CHANGE_SEQUENCE = 2**63 - 1
 MAX_KNOWLEDGE_CHUNK_ID_BYTES = 512
 MAX_KNOWLEDGE_CHUNK_INDEX = 2**31 - 1
 MAX_KNOWLEDGE_ENTRY_ID_BYTES = 256
+MAX_KNOWLEDGE_ENTRY_PAYLOAD_BYTES = 2**31 - 1
 MAX_KNOWLEDGE_REVISION = 2**31 - 1
 MAX_KNOWLEDGE_EVIDENCE_BYTES = DEFAULT_KNOWLEDGE_MAX_BYTES
 MAX_KNOWLEDGE_EVIDENCE_JSON_BYTES = 16_384
@@ -210,6 +211,29 @@ class KnowledgeAccessDenied(PermissionError):
     def __init__(self, operation: str) -> None:
         self.operation = require_clean_nonblank(operation, "operation")
         super().__init__(f"Knowledge access denied for {self.operation}.")
+
+
+class KnowledgeEntryReadLimitExceeded(ValueError):
+    """An authorized entry exceeds a caller-owned read byte ceiling."""
+
+    def __init__(
+        self,
+        entry_id: str,
+        *,
+        revision: int,
+        payload_bytes: int,
+        max_bytes: int,
+    ) -> None:
+        self.entry_id = _knowledge_entry_id(entry_id)
+        _validate_knowledge_revision(revision, "revision")
+        _validate_positive_int(payload_bytes, "payload_bytes")
+        _validate_positive_int(max_bytes, "max_bytes")
+        if payload_bytes <= max_bytes:
+            raise ValueError("payload_bytes must exceed max_bytes.")
+        self.revision = revision
+        self.payload_bytes = payload_bytes
+        self.max_bytes = max_bytes
+        super().__init__("Knowledge entry exceeds the configured read byte limit.")
 
 
 class KnowledgeChunkConflict(RuntimeError):
@@ -3041,9 +3065,10 @@ class KnowledgeStore(ABC):
         entry_id: str,
         *,
         revision: int | None = None,
+        max_bytes: int | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry | None:
-        """Load the current revision, or one exact historical revision."""
+        """Load one revision, optionally refusing its content before copying it."""
 
     @abstractmethod
     async def transition_entry_status(
@@ -3399,6 +3424,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         )
         self._clock = utc_clock(clock)
         self._entries: dict[str, dict[int, KnowledgeEntry]] = {}
+        self._entry_payload_bytes: dict[tuple[str, int], int] = {}
         self._current_revisions: dict[str, int] = {}
         self._chunks: dict[tuple[str, int], list[KnowledgeChunk]] = {}
         self._evidence: dict[tuple[str, int], list[KnowledgeEvidence]] = {}
@@ -3438,7 +3464,9 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                     raise ValueError("Initial knowledge entries must be revision 1.")
                 if copied.id in self._entries:
                     raise ValueError(f"Duplicate knowledge entry id {copied.id!r}.")
+                payload_bytes = knowledge_entry_payload_bytes(copied)
                 self._entries[copied.id] = {1: copied}
+                self._entry_payload_bytes[(copied.id, 1)] = payload_bytes
                 self._current_revisions[copied.id] = 1
                 self._chunks[(copied.id, 1)] = [_default_chunk_for_entry(copied)]
                 self._evidence[(copied.id, 1)] = []
@@ -3482,8 +3510,10 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             access_scope=scope,
             operation="create_entry",
         )
+        payload_bytes = knowledge_entry_payload_bytes(entry)
         change = self._prepare_change(entry, kind=KnowledgeChangeKind.CREATED)
         self._entries[entry.id] = {1: entry}
+        self._entry_payload_bytes[(entry.id, 1)] = payload_bytes
         self._current_revisions[entry.id] = 1
         self._chunks[(entry.id, 1)] = copied_chunks
         self._evidence[(entry.id, 1)] = copied_evidence
@@ -3517,12 +3547,15 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         entry_id: str,
         *,
         revision: int | None = None,
+        max_bytes: int | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry | None:
         scope = self._operation_access_scope(access_scope)
         clean_id = _knowledge_entry_id(entry_id)
         if revision is not None:
             _validate_knowledge_revision(revision, "revision")
+        if max_bytes is not None:
+            _validate_positive_int(max_bytes, "max_bytes")
         if revision is not None:
             current = self._current_entry(clean_id)
             if current is None or not _knowledge_scope_allows_entry(scope, current):
@@ -3530,6 +3563,18 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         entry = self._entry_revision(clean_id, revision)
         if entry is None or not _knowledge_scope_allows_entry(scope, entry):
             return None
+        if max_bytes is not None:
+            try:
+                payload_bytes = self._entry_payload_bytes[(clean_id, entry.revision)]
+            except KeyError as exc:
+                raise RuntimeError("Knowledge entry payload size metadata is missing.") from exc
+            if payload_bytes > max_bytes:
+                raise KnowledgeEntryReadLimitExceeded(
+                    clean_id,
+                    revision=entry.revision,
+                    payload_bytes=payload_bytes,
+                    max_bytes=max_bytes,
+                )
         return copy_knowledge_entry(entry)
 
     async def transition_entry_status(
@@ -3626,6 +3671,8 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             self._drop_relations_for_entry(clean_id)
             self._entries.pop(clean_id, None)
             self._current_revisions.pop(clean_id, None)
+            for key in [key for key in self._entry_payload_bytes if key[0] == clean_id]:
+                self._entry_payload_bytes.pop(key, None)
             for key in [key for key in self._chunks if key[0] == clean_id]:
                 self._chunks.pop(key, None)
             for key in [key for key in self._evidence if key[0] == clean_id]:
@@ -3668,6 +3715,8 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             self._drop_relations_for_entry(entry_id)
             self._entries.pop(entry_id, None)
             self._current_revisions.pop(entry_id, None)
+            for key in [key for key in self._entry_payload_bytes if key[0] == entry_id]:
+                self._entry_payload_bytes.pop(key, None)
             for key in [key for key in self._chunks if key[0] == entry_id]:
                 self._chunks.pop(key, None)
             for key in [key for key in self._evidence if key[0] == entry_id]:
@@ -3740,6 +3789,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             access_scope=scope,
             operation="publish_entry_revision",
         )
+        payload_bytes = knowledge_entry_payload_bytes(copied_entry)
         receipt = KnowledgePublicationReceipt(
             operation_id=operation_id,
             entry_id=copied_entry.id,
@@ -3761,6 +3811,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             committed_at=receipt.committed_at,
         )
         self._entries.setdefault(copied_entry.id, {})[copied_entry.revision] = copied_entry
+        self._entry_payload_bytes[(copied_entry.id, copied_entry.revision)] = payload_bytes
         self._chunks[(copied_entry.id, copied_entry.revision)] = copied_chunks
         self._evidence[(copied_entry.id, copied_entry.revision)] = copied_evidence
         self._current_revisions[copied_entry.id] = copied_entry.revision
@@ -3830,8 +3881,10 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             access_scope=access_scope,
             operation=operation,
         )
+        payload_bytes = knowledge_entry_payload_bytes(entry)
         change = self._prepare_change(entry, kind=change_kind)
         self._entries[entry.id][entry.revision] = entry
+        self._entry_payload_bytes[(entry.id, entry.revision)] = payload_bytes
         self._chunks[(entry.id, entry.revision)] = copied_chunks
         self._evidence[(entry.id, entry.revision)] = copied_evidence
         self._current_revisions[entry.id] = entry.revision
@@ -4367,6 +4420,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         lifecycle_material: list[
             tuple[KnowledgeEntry, KnowledgeEntry, list[KnowledgeChunk], list[KnowledgeEvidence]]
         ] = []
+        successor_payload_bytes: dict[tuple[str, int], int] = {}
         all_chunk_ids: list[str] = []
         all_evidence_ids: list[str] = []
         for successor in [active_replacement, *archived_sources]:
@@ -4391,6 +4445,9 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             )
             all_chunk_ids.extend(chunk.id for chunk in chunks)
             all_evidence_ids.extend(item.id for item in evidence)
+            successor_payload_bytes[(successor.id, successor.revision)] = (
+                knowledge_entry_payload_bytes(successor)
+            )
             lifecycle_material.append((current, successor, chunks, evidence))
         if len(set(all_chunk_ids)) != len(all_chunk_ids):
             raise KnowledgeChunkConflict(operation)
@@ -4522,6 +4579,9 @@ class InMemoryKnowledgeStore(KnowledgeStore):
 
         for _, successor, chunks, evidence in lifecycle_material:
             self._entries[successor.id][successor.revision] = successor
+            self._entry_payload_bytes[(successor.id, successor.revision)] = successor_payload_bytes[
+                (successor.id, successor.revision)
+            ]
             self._chunks[(successor.id, successor.revision)] = chunks
             self._evidence[(successor.id, successor.revision)] = evidence
             self._current_revisions[successor.id] = successor.revision
@@ -6455,6 +6515,25 @@ def copy_knowledge_entry(entry: KnowledgeEntry) -> KnowledgeEntry:
         title=entry.title,
         metadata=copy_durable_json_object(entry.metadata, "metadata"),
     )
+
+
+def knowledge_entry_payload_bytes(entry: KnowledgeEntry) -> int:
+    """Return the backend-stable canonical byte size of one entry payload."""
+
+    if type(entry) is not KnowledgeEntry:
+        raise TypeError("KnowledgeEntry instances must not be subclasses.")
+    payload_bytes = len(
+        canonical_durable_json_bytes(
+            entry.model_dump(mode="json"),
+            "knowledge entry payload",
+        )
+    )
+    if payload_bytes > MAX_KNOWLEDGE_ENTRY_PAYLOAD_BYTES:
+        raise ValueError(
+            "Knowledge entry payload must be at most "
+            f"{MAX_KNOWLEDGE_ENTRY_PAYLOAD_BYTES} canonical UTF-8 bytes."
+        )
+    return payload_bytes
 
 
 def copy_knowledge_chunk(chunk: KnowledgeChunk) -> KnowledgeChunk:

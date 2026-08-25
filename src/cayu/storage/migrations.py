@@ -359,6 +359,10 @@ REVISIONS: tuple[Revision, ...] = (
     # not touch this independent catalog, so mixed-version processes remain
     # safe while suite-authoring EvalStore implementations require revision 64.
     Revision(revision=64, kind=RevisionKind.ADDITIVE, compatible_from=63),
+    # Canonical knowledge-entry payload sizes make bounded reads enforceable
+    # before entry content crosses the storage boundary. Existing populated
+    # prerelease knowledge rows are deliberately not measured or backfilled.
+    Revision(revision=65, kind=RevisionKind.BREAKING, compatible_from=65),
 )
 
 #: The revision an empty database is initialized to.

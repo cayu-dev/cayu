@@ -49,6 +49,7 @@ from cayu.storage import (
     KnowledgeEmbeddingProjection,
     KnowledgeEmbeddingProjectionConflict,
     KnowledgeEntry,
+    KnowledgeEntryReadLimitExceeded,
     KnowledgeEvidence,
     KnowledgeIndexReadinessUpdate,
     KnowledgeIndexState,
@@ -77,6 +78,93 @@ from cayu.storage.migrations import LATEST_REVISION, MIN_SUPPORTED_REVISION, Sch
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
 _ACCESS_SCOPE = KnowledgeAccessScope.privileged()
+
+
+def test_postgres_bounded_entry_read_refuses_before_loading_content(
+    postgres_dsn: str,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        store = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            entry = KnowledgeEntry(id="oversized-read", text="x" * 1_000_000)
+            await store.create_entry(entry)
+
+            async def fail_load(*_args, **_kwargs):
+                raise AssertionError("oversized entry content was loaded")
+
+            monkeypatch.setattr(store, "_load_entry_in_scope", fail_load)
+            with pytest.raises(KnowledgeEntryReadLimitExceeded):
+                await store.get_entry(entry.id, max_bytes=256)
+        finally:
+            await store.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_bounded_entry_read_reuses_one_authorization_time(
+    postgres_dsn: str,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        store = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            entry = KnowledgeEntry(id="bounded-read-time", text="bounded")
+            await store.create_entry(entry)
+            descriptor_times: list[datetime] = []
+            hydration_times: list[datetime] = []
+            load_descriptor = store._load_entry_payload_bytes_in_scope
+            load_entry = store._load_entry_in_scope
+
+            async def tracked_descriptor(*args, access_now: datetime, **kwargs):
+                descriptor_times.append(access_now)
+                return await load_descriptor(*args, access_now=access_now, **kwargs)
+
+            async def tracked_entry(*args, access_now: datetime | None = None, **kwargs):
+                assert access_now is not None
+                hydration_times.append(access_now)
+                return await load_entry(*args, access_now=access_now, **kwargs)
+
+            monkeypatch.setattr(
+                store,
+                "_load_entry_payload_bytes_in_scope",
+                tracked_descriptor,
+            )
+            monkeypatch.setattr(store, "_load_entry_in_scope", tracked_entry)
+
+            loaded = await store.get_entry(entry.id, max_bytes=10_000)
+            assert loaded == entry
+            assert descriptor_times == hydration_times
+            assert len(descriptor_times) == 1
+        finally:
+            await store.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
 
 _TABLES = (
     "cayu_knowledge_embeddings",
@@ -168,6 +256,70 @@ async def _initialize_historical_schema(
     finally:
         await historical_store.close()
         schema_migrations.REVISIONS = revisions
+
+
+async def _insert_pre_revision_65_entry(
+    postgres_dsn: str,
+    entry: KnowledgeEntry,
+) -> None:
+    """Seed an old schema without teaching the production adapter legacy writes."""
+    import psycopg
+    from psycopg.types.json import Jsonb
+
+    async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+        async with connection.cursor() as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO cayu_knowledge_entries (
+                    id, namespace, current_revision, created_at, updated_at
+                ) VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    entry.id,
+                    entry.namespace,
+                    entry.revision,
+                    entry.created_at,
+                    entry.updated_at,
+                ),
+            )
+            await cursor.execute(
+                """
+                INSERT INTO cayu_knowledge_revisions (
+                    entry_id, revision, text, kind, visibility, status,
+                    created_by_type, created_by, created_at, updated_at,
+                    source_type, source_uri, source_id, source_hash,
+                    importance, importance_source, confidence, last_used_at,
+                    expires_at, title, metadata
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
+                """,
+                (
+                    entry.id,
+                    entry.revision,
+                    entry.text,
+                    entry.kind,
+                    str(entry.visibility),
+                    str(entry.status),
+                    str(entry.created_by_type),
+                    entry.created_by,
+                    entry.created_at,
+                    entry.updated_at,
+                    entry.source_type,
+                    entry.source_uri,
+                    entry.source_id,
+                    entry.source_hash,
+                    entry.importance,
+                    entry.importance_source,
+                    entry.confidence,
+                    entry.last_used_at,
+                    entry.expires_at,
+                    entry.title,
+                    Jsonb(entry.metadata),
+                ),
+            )
+        await connection.commit()
 
 
 def test_postgres_knowledge_write_locks_are_batched_in_global_order(
@@ -337,6 +489,82 @@ def test_postgres_cancelled_relation_publication_rolls_back_atomically(
                 operation_id="cancelled-relation-operation",
             )
             assert committed.replayed is False
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_postgres_maintenance_candidate_routing_matches_exact_relation_state(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        from cayu import (
+            KnowledgeMaintenanceCandidateSignal,
+            KnowledgeMaintenanceRouter,
+            KnowledgeMaintenanceRoutingOmissionReason,
+            KnowledgeMaintenanceRoutingRequest,
+            KnowledgeMaintenanceSignalKind,
+            PostgresKnowledgeStore,
+        )
+
+        await _drop_all(postgres_dsn)
+        store = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            left = KnowledgeEntry(id="routing-postgres-left", text="left")
+            right = KnowledgeEntry(id="routing-postgres-right", text="right")
+            await store.create_entry(left)
+            await store.create_entry(right)
+            relation = KnowledgeRelation(
+                id="routing-postgres-contradiction",
+                subject=KnowledgeRevisionRef(entry_id=left.id, revision=1),
+                object=KnowledgeRevisionRef(entry_id=right.id, revision=1),
+                kind=KnowledgeRelationKind.CONTRADICTS,
+                created_by="test",
+                policy_id="routing-postgres-policy",
+            )
+            signal = KnowledgeMaintenanceCandidateSignal(
+                id="routing-postgres-signal",
+                kind=KnowledgeMaintenanceSignalKind.CONTRADICTION,
+                references=(relation.subject, relation.object),
+                producer_id="postgres-conformance",
+                producer_version="1",
+                reason_code="reviewed_contradiction",
+                relation_id=relation.id,
+                observed_at=datetime.now(UTC),
+            )
+            request = KnowledgeMaintenanceRoutingRequest(
+                id="routing-postgres-request",
+                policy_id="routing-postgres-policy",
+                namespace="default",
+                access_scope=_ACCESS_SCOPE,
+                signals=(signal,),
+                created_at=signal.observed_at,
+            )
+            before = await KnowledgeMaintenanceRouter(store).route(request)
+            assert before.candidates == ()
+            assert before.omissions[0].reason is (
+                KnowledgeMaintenanceRoutingOmissionReason.CONDITION_NOT_MET
+            )
+
+            await store.publish_relations(
+                [relation],
+                operation_id="routing-postgres-relation-publication",
+            )
+            after = await KnowledgeMaintenanceRouter(store).route(request)
+            assert {candidate.reference for candidate in after.candidates} == {
+                relation.subject,
+                relation.object,
+            }
+            assert after.omissions == ()
+            assert not after.truncated
         finally:
             await store.close()
             await _drop_all(postgres_dsn)
@@ -4099,22 +4327,11 @@ def test_postgres_revision_60_refuses_populated_knowledge_without_backfill(
 
         await _drop_all(postgres_dsn)
         await _initialize_historical_schema(postgres_dsn, through_revision=59)
-        historical = PostgresKnowledgeStore(
-            postgres_dsn,
-            min_size=1,
-            max_size=2,
-            schema_mode=SchemaMode.VALIDATE,
-            access_scope=_ACCESS_SCOPE,
-        )
-        historical._min_required_revision = 59
         entry = KnowledgeEntry(
             id="revision-59-entry",
             text="Revision 60 must not rewrite this populated store.",
         )
-        try:
-            await historical.create_entry(entry)
-        finally:
-            await historical.close()
+        await _insert_pre_revision_65_entry(postgres_dsn, entry)
 
         migrator = PostgresKnowledgeStore(
             postgres_dsn,
@@ -4207,22 +4424,11 @@ def test_postgres_revision_63_refuses_populated_knowledge_without_interpretation
 
         await _drop_all(postgres_dsn)
         await _initialize_historical_schema(postgres_dsn, through_revision=62)
-        historical = PostgresKnowledgeStore(
-            postgres_dsn,
-            min_size=1,
-            max_size=2,
-            schema_mode=SchemaMode.VALIDATE,
-            access_scope=_ACCESS_SCOPE,
-        )
-        historical._min_required_revision = 62
         entry = KnowledgeEntry(
             id="revision-62-entry",
             text="Revision 63 must not interpret this populated store.",
         )
-        try:
-            await historical.create_entry(entry)
-        finally:
-            await historical.close()
+        await _insert_pre_revision_65_entry(postgres_dsn, entry)
 
         migrator = PostgresKnowledgeStore(
             postgres_dsn,
@@ -4290,6 +4496,63 @@ def test_postgres_revision_63_initializes_empty_knowledge_schema_directly(
             assert await cursor.fetchone() == (schema_migrations.LATEST_REVISION,)
             await cursor.execute("SELECT to_regclass('cayu_knowledge_maintenance_decisions')")
             assert await cursor.fetchone() == ("cayu_knowledge_maintenance_decisions",)
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_revision_65_refuses_populated_knowledge_without_backfill(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        await _initialize_historical_schema(postgres_dsn, through_revision=64)
+        entry = KnowledgeEntry(id="revision-64-entry", text="Must remain untouched.")
+        await _insert_pre_revision_65_entry(postgres_dsn, entry)
+
+        migrator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            with pytest.raises(
+                schema_migrations.SchemaTooOld,
+                match="clean prerelease bounded-entry-read break",
+            ):
+                await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cursor.fetchone() == (64,)
+            await cursor.execute(
+                """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'cayu_knowledge_revisions'
+                  AND column_name = 'payload_bytes'
+                """
+            )
+            assert await cursor.fetchone() is None
+            await cursor.execute(
+                "SELECT text FROM cayu_knowledge_revisions WHERE entry_id = %s AND revision = 1",
+                (entry.id,),
+            )
+            assert await cursor.fetchone() == (entry.text,)
 
     try:
         asyncio.run(run())
@@ -4403,7 +4666,7 @@ def test_postgres_revision_43_preserves_revision_42_knowledge_without_fabricated
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
                 )
                 """,
-                postgres_storage._knowledge_entry_row_values(entry),
+                postgres_storage._knowledge_entry_row_values(entry)[:-1],
             )
             await cursor.execute(
                 """
@@ -4539,7 +4802,7 @@ def test_postgres_revision_43_preserves_migrated_expiration_cleanup_audiences(
                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
                     )
                     """,
-                    postgres_storage._knowledge_entry_row_values(entry),
+                    postgres_storage._knowledge_entry_row_values(entry)[:-1],
                 )
                 await cursor.execute(
                     """
@@ -4654,7 +4917,7 @@ def test_postgres_revision_43_rejects_out_of_contract_revision_42_identities(
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
                 )
                 """,
-                postgres_storage._knowledge_entry_row_values(entry),
+                postgres_storage._knowledge_entry_row_values(entry)[:-1],
             )
             await cursor.execute(
                 """

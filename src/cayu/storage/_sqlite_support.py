@@ -2993,6 +2993,38 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_eval_authored_suites_id_catalog
             ON cayu_eval_authored_suites(suite_id, created_at DESC, revision ASC);
     """,
+    65: """
+        DROP VIEW IF EXISTS cayu_knowledge_current_entries;
+        CREATE VIEW cayu_knowledge_current_entries AS
+        SELECT
+            logical.id AS id,
+            revision.revision AS revision,
+            logical.namespace AS namespace,
+            revision.text AS text,
+            revision.kind AS kind,
+            revision.visibility AS visibility,
+            revision.status AS status,
+            revision.created_by_type AS created_by_type,
+            revision.created_by AS created_by,
+            revision.created_at AS created_at,
+            revision.updated_at AS updated_at,
+            revision.source_type AS source_type,
+            revision.source_uri AS source_uri,
+            revision.source_id AS source_id,
+            revision.source_hash AS source_hash,
+            revision.importance AS importance,
+            revision.importance_source AS importance_source,
+            revision.confidence AS confidence,
+            revision.last_used_at AS last_used_at,
+            revision.expires_at AS expires_at,
+            revision.title AS title,
+            revision.metadata_json AS metadata_json,
+            revision.payload_bytes AS payload_bytes
+        FROM cayu_knowledge_entries AS logical
+        JOIN cayu_knowledge_revisions AS revision
+          ON revision.entry_id = logical.id
+         AND revision.revision = logical.current_revision;
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -3118,6 +3150,13 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
             "cayu_session_message_queue",
             "message_json",
             "TEXT CHECK (message_json IS NULL OR json_valid(message_json))",
+        ),
+    ),
+    65: (
+        (
+            "cayu_knowledge_revisions",
+            "payload_bytes",
+            "INTEGER NOT NULL DEFAULT 1 CHECK (payload_bytes > 0 AND payload_bytes <= 2147483647)",
         ),
     ),
 }
@@ -3304,6 +3343,17 @@ def _reject_populated_pre_knowledge_maintenance_database(
         candidates=_KNOWLEDGE_MAINTENANCE_CLEAN_BREAK_TABLES,
         revision=63,
         contract="reviewed-maintenance",
+    )
+
+
+def _reject_populated_pre_bounded_knowledge_entry_database(
+    connection: sqlite3.Connection,
+) -> None:
+    _reject_populated_pre_knowledge_contract_database(
+        connection,
+        candidates=_KNOWLEDGE_MAINTENANCE_CLEAN_BREAK_TABLES,
+        revision=65,
+        contract="bounded-entry-read",
     )
 
 
@@ -4361,6 +4411,12 @@ def reconcile_schema(
         _reject_populated_pre_knowledge_maintenance_database(connection)
     if (
         schema_mode is not schema.SchemaMode.VALIDATE
+        and state.revision < 65
+        and any(revision.revision == 65 for revision in schema.pending(state.revision))
+    ):
+        _reject_populated_pre_bounded_knowledge_entry_database(connection)
+    if (
+        schema_mode is not schema.SchemaMode.VALIDATE
         and state.revision == schema.UNINITIALIZED
         and any(revision.revision == 46 for revision in schema.pending(state.revision))
     ):
@@ -4416,7 +4472,10 @@ def reconcile_schema(
         # FTS census belongs to the one-time revision hook, never ordinary startup.
         _validate_revision_37_knowledge_fts_schema(connection)
     if current.revision >= 42:
-        _validate_revision_42_knowledge_schema(connection)
+        _validate_revision_42_knowledge_schema(
+            connection,
+            require_payload_bytes=current.revision >= 65,
+        )
     if current.revision >= 43:
         _validate_revision_43_knowledge_schema(
             connection,
@@ -4605,7 +4664,11 @@ def _validate_targeted_tool_grant_schema(connection: sqlite3.Connection) -> None
             )
 
 
-def _validate_revision_42_knowledge_schema(connection: sqlite3.Connection) -> None:
+def _validate_revision_42_knowledge_schema(
+    connection: sqlite3.Connection,
+    *,
+    require_payload_bytes: bool = False,
+) -> None:
     required_tables = {
         "cayu_knowledge_entries": (
             ("id", "TEXT", 0, 1),
@@ -4636,6 +4699,7 @@ def _validate_revision_42_knowledge_schema(connection: sqlite3.Connection) -> No
             ("expires_at", "TEXT", 0, 0),
             ("title", "TEXT", 0, 0),
             ("metadata_json", "TEXT", 1, 0),
+            *((("payload_bytes", "INTEGER", 1, 0),) if require_payload_bytes else ()),
         ),
         "cayu_knowledge_labels": (
             ("entry_id", "TEXT", 1, 1),
@@ -4831,6 +4895,7 @@ def _validate_revision_42_knowledge_schema(connection: sqlite3.Connection) -> No
             "expires_at",
             "title",
             "metadata_json",
+            *(("payload_bytes",) if require_payload_bytes else ()),
         )
         or "from cayu_knowledge_entries as logical" not in current_view_sql
         or "join cayu_knowledge_revisions as revision" not in current_view_sql
@@ -4864,7 +4929,17 @@ def _validate_revision_42_knowledge_schema(connection: sqlite3.Connection) -> No
             "check (current_revision > 0 and current_revision <= 2147483647)",
             "deferrable initially deferred",
         ),
-        "cayu_knowledge_revisions": ("check (revision > 0 and revision <= 2147483647)",),
+        "cayu_knowledge_revisions": (
+            "check (revision > 0 and revision <= 2147483647)",
+            *(
+                (
+                    "payload_bytes > 0",
+                    "payload_bytes <= 2147483647",
+                )
+                if require_payload_bytes
+                else ()
+            ),
+        ),
         "cayu_knowledge_chunks": (
             "check (entry_revision > 0 and entry_revision <= 2147483647)",
             "check (chunk_index >= 0)",
@@ -7045,6 +7120,8 @@ def _apply_pending(connection: sqlite3.Connection, state: schema.SchemaState) ->
         _reject_unprofiled_verified_work_records(connection)
     if current < 59 and any(revision.revision == 59 for revision in schema.pending(current)):
         _reject_populated_pre_result_resolver_database(connection)
+    if current < 65 and any(revision.revision == 65 for revision in schema.pending(current)):
+        _reject_populated_pre_bounded_knowledge_entry_database(connection)
     if current == schema.UNINITIALIZED:
         _apply_baseline(connection)
         current = schema.BASELINE_REVISION
@@ -7119,6 +7196,10 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             # Recheck while BEGIN IMMEDIATE excludes pre-63 writers. Populated
             # prerelease knowledge is never inferred into reviewed decisions.
             _reject_populated_pre_knowledge_maintenance_database(connection)
+        if rev.revision == 65:
+            # The stored size is authoritative for pre-content read rejection;
+            # deriving it for existing rows would be a forbidden backfill.
+            _reject_populated_pre_bounded_knowledge_entry_database(connection)
         for table, column, decl in _MIGRATION_ADD_COLUMNS.get(rev.revision, ()):
             _add_column_if_missing(connection, table, column, decl)
         for table, column in _MIGRATION_DROP_COLUMNS.get(rev.revision, ()):
@@ -7177,6 +7258,11 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_revision_63_knowledge_schema(connection)
         if rev.revision == 64:
             _validate_eval_authored_suite_schema(connection)
+        if rev.revision == 65:
+            _validate_revision_42_knowledge_schema(
+                connection,
+                require_payload_bytes=True,
+            )
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

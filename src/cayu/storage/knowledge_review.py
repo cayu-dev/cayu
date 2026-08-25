@@ -37,6 +37,7 @@ class _KnowledgeReviewStore(Protocol):
         entry_id: str,
         *,
         revision: int | None = None,
+        max_bytes: int | None = None,
         access_scope: KnowledgeAccessScope,
     ) -> KnowledgeEntry | None: ...
 

@@ -40,6 +40,7 @@ from cayu.storage import (
     KnowledgeAccessScope,
     KnowledgeChunk,
     KnowledgeEntry,
+    KnowledgeEntryReadLimitExceeded,
     KnowledgeListGroup,
     KnowledgeListQuery,
     KnowledgeMaintenanceDecisionKind,
@@ -63,10 +64,134 @@ from cayu.tools import RememberKnowledgeTool
 _ACCESS_SCOPE = KnowledgeAccessScope.privileged()
 
 
+def test_sqlite_bounded_entry_read_refuses_before_loading_content(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        store = SQLiteKnowledgeStore(
+            tmp_path / "bounded-entry-read.sqlite",
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            entry = KnowledgeEntry(id="oversized-read", text="x" * 1_000_000)
+            await store.create_entry(entry)
+
+            def fail_load(*_args, **_kwargs):
+                raise AssertionError("oversized entry content was loaded")
+
+            monkeypatch.setattr(store, "_load_entry_in_scope_unlocked", fail_load)
+            with pytest.raises(KnowledgeEntryReadLimitExceeded):
+                await store.get_entry(entry.id, max_bytes=256)
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_bounded_entry_read_reuses_one_authorization_time(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        store = SQLiteKnowledgeStore(
+            tmp_path / "bounded-entry-read-authorization-time.sqlite",
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            entry = KnowledgeEntry(id="bounded-read-time", text="bounded")
+            await store.create_entry(entry)
+            descriptor_times: list[datetime] = []
+            hydration_times: list[datetime] = []
+            load_descriptor = store._load_entry_payload_bytes_in_scope_unlocked
+            load_entry = store._load_entry_in_scope_unlocked
+
+            def tracked_descriptor(*args, access_now: datetime, **kwargs):
+                descriptor_times.append(access_now)
+                return load_descriptor(*args, access_now=access_now, **kwargs)
+
+            def tracked_entry(*args, access_now: datetime | None = None, **kwargs):
+                assert access_now is not None
+                hydration_times.append(access_now)
+                return load_entry(*args, access_now=access_now, **kwargs)
+
+            monkeypatch.setattr(
+                store,
+                "_load_entry_payload_bytes_in_scope_unlocked",
+                tracked_descriptor,
+            )
+            monkeypatch.setattr(store, "_load_entry_in_scope_unlocked", tracked_entry)
+
+            loaded = await store.get_entry(entry.id, max_bytes=10_000)
+            assert loaded == entry
+            assert descriptor_times == hydration_times
+            assert len(descriptor_times) == 1
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
 async def _close(store) -> None:
     close = getattr(store, "close", None)
     if close is not None:
         await close()
+
+
+def _insert_pre_revision_65_entry(
+    connection: sqlite3.Connection,
+    entry: KnowledgeEntry,
+) -> None:
+    """Seed an old schema without teaching the production adapter legacy writes."""
+
+    connection.execute(
+        """
+        INSERT INTO cayu_knowledge_entries (
+            id, namespace, current_revision, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            entry.id,
+            entry.namespace,
+            entry.revision,
+            sqlite_support.format_datetime(entry.created_at),
+            sqlite_support.format_datetime(entry.updated_at),
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO cayu_knowledge_revisions (
+            entry_id, revision, text, kind, visibility, status,
+            created_by_type, created_by, created_at, updated_at,
+            source_type, source_uri, source_id, source_hash,
+            importance, importance_source, confidence, last_used_at,
+            expires_at, title, metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            entry.id,
+            entry.revision,
+            entry.text,
+            entry.kind,
+            str(entry.visibility),
+            str(entry.status),
+            str(entry.created_by_type),
+            entry.created_by,
+            sqlite_support.format_datetime(entry.created_at),
+            sqlite_support.format_datetime(entry.updated_at),
+            entry.source_type,
+            entry.source_uri,
+            entry.source_id,
+            entry.source_hash,
+            entry.importance,
+            entry.importance_source,
+            entry.confidence,
+            sqlite_support.format_optional_datetime(entry.last_used_at),
+            sqlite_support.format_optional_datetime(entry.expires_at),
+            entry.title,
+            sqlite_support.json_dumps(entry.metadata),
+        ),
+    )
 
 
 def test_sqlite_index_readiness_conformance(tmp_path) -> None:
@@ -229,6 +354,21 @@ def _reconcile_sqlite_through_revision_62(connection: sqlite3.Connection) -> Non
             connection,
             schema_migrations.SchemaMode.MIGRATE,
             app_min_supported=62,
+        )
+    finally:
+        schema_migrations.REVISIONS = revisions
+
+
+def _reconcile_sqlite_through_revision_64(connection: sqlite3.Connection) -> None:
+    revisions = schema_migrations.REVISIONS
+    try:
+        schema_migrations.REVISIONS = tuple(
+            revision for revision in revisions if revision.revision <= 64
+        )
+        sqlite_support.reconcile_schema(
+            connection,
+            schema_migrations.SchemaMode.MIGRATE,
+            app_min_supported=63,
         )
     finally:
         schema_migrations.REVISIONS = revisions
@@ -1613,10 +1753,8 @@ def test_sqlite_revision_60_refuses_populated_knowledge_without_backfill(
     entry = KnowledgeEntry(id="preserved-entry", text="Must remain untouched.")
     try:
         _reconcile_sqlite_through_revision_59(connection)
-        seed_store = SQLiteKnowledgeStore.__new__(SQLiteKnowledgeStore)
-        seed_store._connection = connection
         with sqlite_support._transaction(connection):
-            seed_store._insert_entry_unlocked(entry)
+            _insert_pre_revision_65_entry(connection, entry)
     finally:
         connection.close()
 
@@ -1707,10 +1845,8 @@ def test_sqlite_revision_63_refuses_populated_knowledge_without_interpretation(
     entry = KnowledgeEntry(id="revision-62-entry", text="Must remain untouched.")
     try:
         _reconcile_sqlite_through_revision_62(connection)
-        seed_store = SQLiteKnowledgeStore.__new__(SQLiteKnowledgeStore)
-        seed_store._connection = connection
         with sqlite_support._transaction(connection):
-            seed_store._insert_entry_unlocked(entry)
+            _insert_pre_revision_65_entry(connection, entry)
     finally:
         connection.close()
 
@@ -1777,6 +1913,45 @@ def test_sqlite_revision_63_initializes_empty_knowledge_schema_directly(tmp_path
         connection.close()
 
 
+def test_sqlite_revision_65_refuses_populated_knowledge_without_backfill(tmp_path) -> None:
+    database = tmp_path / "revision-64-to-65-populated.sqlite"
+    connection = sqlite_support.connect(database)
+    entry = KnowledgeEntry(id="revision-64-entry", text="Must remain untouched.")
+    try:
+        _reconcile_sqlite_through_revision_64(connection)
+        with sqlite_support._transaction(connection):
+            _insert_pre_revision_65_entry(connection, entry)
+    finally:
+        connection.close()
+
+    with pytest.raises(
+        schema_migrations.SchemaTooOld,
+        match="clean prerelease bounded-entry-read break",
+    ):
+        SQLiteKnowledgeStore(
+            database,
+            schema_mode=schema_migrations.SchemaMode.MIGRATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+
+    connection = sqlite_support.connect(database)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 64
+        columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(cayu_knowledge_revisions)")
+        }
+        assert "payload_bytes" not in columns
+        assert (
+            connection.execute(
+                "SELECT text FROM cayu_knowledge_revisions WHERE entry_id = ? AND revision = 1",
+                (entry.id,),
+            ).fetchone()[0]
+            == entry.text
+        )
+    finally:
+        connection.close()
+
+
 def test_sqlite_revision_63_rejects_a_malformed_maintenance_table(tmp_path) -> None:
     database = tmp_path / "revision-63-malformed-maintenance.sqlite"
     store = SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
@@ -1834,10 +2009,8 @@ def test_sqlite_revision_43_rejects_out_of_contract_revision_42_identities(
     oversized_chunk_id = "c" * (MAX_KNOWLEDGE_CHUNK_ID_BYTES + 1)
     try:
         _reconcile_sqlite_through_revision_42(connection)
-        seed_store = SQLiteKnowledgeStore.__new__(SQLiteKnowledgeStore)
-        seed_store._connection = connection
         with sqlite_support._transaction(connection):
-            seed_store._insert_entry_unlocked(entry)
+            _insert_pre_revision_65_entry(connection, entry)
             connection.execute(
                 """
                 INSERT INTO cayu_knowledge_chunks (

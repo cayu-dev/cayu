@@ -51,6 +51,7 @@ from cayu.storage import (
     KnowledgeEmbeddingProjection,
     KnowledgeEmbeddingProjectionConflict,
     KnowledgeEntry,
+    KnowledgeEntryReadLimitExceeded,
     KnowledgeEvidence,
     KnowledgeFacet,
     KnowledgeHit,
@@ -76,6 +77,24 @@ from cayu.storage.memory import (
 )
 
 _ACCESS_SCOPE = KnowledgeAccessScope.privileged()
+
+
+def test_in_memory_bounded_entry_read_refuses_before_copy(monkeypatch) -> None:
+    from cayu.storage import memory as memory_storage
+
+    async def run() -> None:
+        store = InMemoryKnowledgeStore(access_scope=_ACCESS_SCOPE)
+        entry = KnowledgeEntry(id="oversized-read", text="x" * 1_000_000)
+        await store.create_entry(entry)
+
+        def fail_copy(_entry):
+            raise AssertionError("oversized entry content was copied")
+
+        monkeypatch.setattr(memory_storage, "copy_knowledge_entry", fail_copy)
+        with pytest.raises(KnowledgeEntryReadLimitExceeded):
+            await store.get_entry(entry.id, max_bytes=256)
+
+    asyncio.run(run())
 
 
 def test_in_memory_index_readiness_conformance() -> None:

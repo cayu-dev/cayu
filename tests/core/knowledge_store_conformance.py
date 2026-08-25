@@ -13,6 +13,7 @@ from cayu.storage import (
     KnowledgeChunkConflict,
     KnowledgeEmbeddingProjection,
     KnowledgeEntry,
+    KnowledgeEntryReadLimitExceeded,
     KnowledgeIndexReadinessUpdate,
     KnowledgeIndexState,
     KnowledgeListQuery,
@@ -30,6 +31,7 @@ KnowledgeStoreDurability = Literal["ephemeral", "durable"]
 KnowledgeStoreScenario = Literal[
     "revision_cas",
     "result_isolation",
+    "bounded_entry_read",
     "access_scope",
     "atomic_write",
     "change_outbox",
@@ -243,6 +245,37 @@ async def verify_result_isolation(store: KnowledgeStore, *, adapter: str) -> Non
     )
 
 
+async def verify_bounded_entry_read(store: KnowledgeStore, *, adapter: str) -> None:
+    entry = _entry(
+        "conformance-bounded-read",
+        text="bounded payload " * 128,
+        metadata={"marker": "must-not-be-partially-returned"},
+    )
+    await store.create_entry(entry, [_chunk(entry)])
+    failure: Exception | None = None
+    try:
+        await store.get_entry(entry.id, max_bytes=256)
+    except Exception as error:
+        failure = error
+    require_knowledge_conformance(
+        isinstance(failure, KnowledgeEntryReadLimitExceeded)
+        and failure.entry_id == entry.id
+        and failure.revision == entry.revision
+        and failure.payload_bytes > failure.max_bytes == 256,
+        adapter=adapter,
+        scenario="bounded_entry_read",
+        observed=failure,
+    )
+    assert isinstance(failure, KnowledgeEntryReadLimitExceeded)
+    loaded = await store.get_entry(entry.id, max_bytes=failure.payload_bytes)
+    require_knowledge_conformance(
+        loaded == entry,
+        adapter=adapter,
+        scenario="bounded_entry_read",
+        observed=loaded,
+    )
+
+
 async def verify_access_scope(store: KnowledgeStore, *, adapter: str) -> None:
     privileged = KnowledgeAccessScope.privileged()
     narrow = KnowledgeAccessScope.for_namespace("allowed")
@@ -252,12 +285,17 @@ async def verify_access_scope(store: KnowledgeStore, *, adapter: str) -> None:
         namespace="denied",
     )
     await store.create_entry(entry, [_chunk(entry)], access_scope=privileged)
-    loaded = await store.get_entry(entry.id, access_scope=narrow)
+    loaded: KnowledgeEntry | None = None
+    failure: Exception | None = None
+    try:
+        loaded = await store.get_entry(entry.id, max_bytes=1, access_scope=narrow)
+    except KnowledgeEntryReadLimitExceeded as error:
+        failure = error
     require_knowledge_conformance(
-        loaded is None,
+        loaded is None and failure is None,
         adapter=adapter,
         scenario="access_scope",
-        observed=loaded,
+        observed=(loaded, failure),
     )
 
 
@@ -450,6 +488,7 @@ async def verify_embedding_space_isolation(store: KnowledgeStore, *, adapter: st
 CORE_KNOWLEDGE_STORE_SCENARIOS = (
     verify_revision_cas,
     verify_result_isolation,
+    verify_bounded_entry_read,
     verify_atomic_invalid_write,
     verify_change_outbox,
     verify_change_page,

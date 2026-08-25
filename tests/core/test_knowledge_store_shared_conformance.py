@@ -288,8 +288,15 @@ def test_knowledge_store_shared_revision_contract(knowledge_store_case) -> None:
                 expected_revision=1,
             )
             assert appended.revision == 2
-            assert await store.get_entry(created.id) == revision_2
-            assert await store.get_entry(created.id, revision=1) == created
+            assert await store.get_entry(created.id, max_bytes=4 * 1024 * 1024) == revision_2
+            assert (
+                await store.get_entry(
+                    created.id,
+                    revision=1,
+                    max_bytes=4 * 1024 * 1024,
+                )
+                == created
+            )
             assert await store.read_chunks(created.id, revision=1) == [
                 chunk_1.model_copy(update={"metadata": {"nested": {"value": 1}}})
             ]

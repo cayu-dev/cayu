@@ -590,6 +590,7 @@ from cayu.storage.memory import (
     KnowledgeEmbeddingProjectionWriteResult,
     KnowledgeEmbeddingWorkerResult,
     KnowledgeEntry,
+    KnowledgeEntryReadLimitExceeded,
     KnowledgeEvidence,
     KnowledgeEvidenceConflict,
     KnowledgeEvidenceDisposition,
@@ -713,6 +714,7 @@ from cayu.storage.memory import (
     copy_knowledge_relation_publication_receipt,
     copy_knowledge_relation_query,
     knowledge_chunk_embedding_identity,
+    knowledge_entry_payload_bytes,
     prepare_knowledge_maintenance_decision,
     prepare_knowledge_publication,
     prepare_knowledge_relations,
@@ -3018,6 +3020,44 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "CREATE INDEX IF NOT EXISTS idx_cayu_eval_authored_suites_id_catalog "
         "ON cayu_eval_authored_suites(suite_id, created_at DESC, revision ASC)",
     ),
+    65: (
+        "DROP VIEW IF EXISTS cayu_knowledge_current_entries",
+        "ALTER TABLE cayu_knowledge_revisions ADD COLUMN IF NOT EXISTS "
+        "payload_bytes BIGINT NOT NULL DEFAULT 1 CHECK "
+        "(payload_bytes > 0 AND payload_bytes <= 2147483647)",
+        "ALTER TABLE cayu_knowledge_revisions ALTER COLUMN payload_bytes DROP DEFAULT",
+        """
+        CREATE VIEW cayu_knowledge_current_entries AS
+        SELECT
+            logical.id AS id,
+            revision.revision AS revision,
+            logical.namespace AS namespace,
+            revision.text,
+            revision.kind,
+            revision.visibility,
+            revision.status,
+            revision.created_by_type,
+            revision.created_by,
+            revision.created_at,
+            revision.updated_at,
+            revision.source_type,
+            revision.source_uri,
+            revision.source_id,
+            revision.source_hash,
+            revision.importance,
+            revision.importance_source,
+            revision.confidence,
+            revision.last_used_at,
+            revision.expires_at,
+            revision.title,
+            revision.metadata,
+            revision.payload_bytes
+        FROM cayu_knowledge_entries AS logical
+        JOIN cayu_knowledge_revisions AS revision
+          ON revision.entry_id = logical.id
+         AND revision.revision = logical.current_revision
+        """,
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -4149,6 +4189,15 @@ async def _reject_populated_pre_knowledge_maintenance_database(cur: Any) -> None
     )
 
 
+async def _reject_populated_pre_bounded_knowledge_entry_database(cur: Any) -> None:
+    await _reject_populated_pre_knowledge_contract_database(
+        cur,
+        candidates=_KNOWLEDGE_MAINTENANCE_CLEAN_BREAK_TABLES,
+        revision=65,
+        contract="bounded-entry-read",
+    )
+
+
 async def _reject_populated_pre_knowledge_contract_database(
     cur: Any,
     *,
@@ -4452,6 +4501,7 @@ class _PostgresStoreBase:
     async def _migrate_schema(self) -> None:
         relation_preflight_complete = False
         maintenance_preflight_complete = False
+        bounded_entry_preflight_complete = False
         while True:
             concurrent_revision: schema.Revision | None = None
             concurrent_indexes: tuple[_ConcurrentIndexMigration, ...] = ()
@@ -4528,6 +4578,13 @@ class _PostgresStoreBase:
                     ):
                         await _reject_populated_pre_knowledge_maintenance_database(cur)
                         maintenance_preflight_complete = True
+                    if (
+                        current < 65
+                        and any(revision.revision == 65 for revision in schema.pending(current))
+                        and (not bounded_entry_preflight_complete or current == 64)
+                    ):
+                        await _reject_populated_pre_bounded_knowledge_entry_database(cur)
+                        bounded_entry_preflight_complete = True
                     if current == schema.UNINITIALIZED:
                         await self._apply_baseline(cur)
                         current = schema.BASELINE_REVISION
@@ -4551,6 +4608,7 @@ class _PostgresStoreBase:
                             await self._validate_knowledge_revision_schema(
                                 cur,
                                 allow_revision_43=current_state.revision >= 43,
+                                require_payload_bytes=current_state.revision >= 65,
                             )
                         if self._min_required_revision >= 43:
                             await self._validate_knowledge_change_schema(
@@ -4611,6 +4669,8 @@ class _PostgresStoreBase:
                         revision = pending[0]
                         if revision.revision == 43:
                             await _reject_revision_43_knowledge_identity_overflow(cur)
+                        if revision.revision == 65:
+                            await _reject_populated_pre_bounded_knowledge_entry_database(cur)
                         concurrent_indexes = _CONCURRENT_INDEX_MIGRATIONS.get(
                             revision.revision,
                             (),
@@ -4752,6 +4812,7 @@ class _PostgresStoreBase:
             await self._validate_knowledge_revision_schema(
                 cur,
                 allow_revision_43=state.revision >= 43,
+                require_payload_bytes=state.revision >= 65,
             )
         if self._min_required_revision >= 43:
             await self._validate_knowledge_change_schema(
@@ -4916,6 +4977,12 @@ class _PostgresStoreBase:
             await self._validate_knowledge_maintenance_schema(cur)
         if revision.revision == 64:
             await self._validate_eval_authored_suite_schema(cur)
+        if revision.revision == 65:
+            await self._validate_knowledge_revision_schema(
+                cur,
+                allow_revision_43=True,
+                require_payload_bytes=True,
+            )
 
     async def _validate_session_instance_schema(self, cur: Any) -> None:
         await cur.execute(
@@ -5051,6 +5118,7 @@ class _PostgresStoreBase:
         cur: Any,
         *,
         allow_revision_43: bool = False,
+        require_payload_bytes: bool = False,
     ) -> None:
         expected_columns = {
             "cayu_knowledge_entries": (
@@ -5082,6 +5150,7 @@ class _PostgresStoreBase:
                 ("expires_at", "timestamp with time zone", "YES"),
                 ("title", "text", "YES"),
                 ("metadata", "jsonb", "NO"),
+                *((("payload_bytes", "bigint", "NO"),) if require_payload_bytes else ()),
             ),
             "cayu_knowledge_labels": (
                 ("entry_id", "text", "NO"),
@@ -5163,6 +5232,7 @@ class _PostgresStoreBase:
             "expires_at",
             "title",
             "metadata",
+            *(("payload_bytes",) if require_payload_bytes else ()),
         )
         await cur.execute(
             """
@@ -5219,6 +5289,11 @@ class _PostgresStoreBase:
                     ),
                 ),
                 ("c", ("revision", "> 0", "2147483647")),
+                *(
+                    (("c", ("payload_bytes", "> 0", "2147483647")),)
+                    if require_payload_bytes
+                    else ()
+                ),
             ),
             "cayu_knowledge_labels": (
                 ("p", ("primary key (entry_id, entry_revision, key)",)),
@@ -8183,12 +8258,16 @@ class _PostgresStoreBase:
             await _reject_populated_pre_verifier_profile_database(cur)
         if current < 59 and any(revision.revision == 59 for revision in schema.pending(current)):
             await _reject_populated_pre_result_resolver_database(cur)
+        if current < 65 and any(revision.revision == 65 for revision in schema.pending(current)):
+            await _reject_populated_pre_bounded_knowledge_entry_database(cur)
         if current == schema.UNINITIALIZED:
             await self._apply_baseline(cur)
             current = schema.BASELINE_REVISION
         for rev in schema.pending(current):
             if rev.revision == 43:
                 await _reject_revision_43_knowledge_identity_overflow(cur)
+            if rev.revision == 65:
+                await _reject_populated_pre_bounded_knowledge_entry_database(cur)
             for statement in _MIGRATION_STEPS.get(rev.revision, ()):
                 await cur.execute(statement)
             # Fresh CREATE owns empty tables under the schema lock, so hot-table
@@ -9886,7 +9965,7 @@ async def _lock_knowledge_change_sequence(cur: Any) -> None:
 class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
     """Postgres-backed durable knowledge store with full-text search."""
 
-    _min_required_revision = 63
+    _min_required_revision = 65
 
     def __init__(
         self,
@@ -10032,21 +10111,59 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         entry_id: str,
         *,
         revision: int | None = None,
+        max_bytes: int | None = None,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeEntry | None:
         scope = self._operation_access_scope(access_scope)
         entry_id = _knowledge_entry_id(entry_id)
         if revision is not None:
             _validate_knowledge_revision(revision, "revision")
+        if max_bytes is not None:
+            _validate_positive_int(max_bytes, "max_bytes")
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
-            return await self._load_entry_in_scope(
+            access_now = datetime.now(UTC)
+            if max_bytes is None:
+                return await self._load_entry_in_scope(
+                    cur,
+                    entry_id,
+                    scope,
+                    revision=revision,
+                    access_now=access_now,
+                )
+            descriptor = await self._load_entry_payload_bytes_in_scope(
                 cur,
                 entry_id,
                 scope,
                 revision=revision,
+                access_now=access_now,
             )
+            if descriptor is None:
+                return None
+            selected_revision, stored_payload_bytes = descriptor
+            if stored_payload_bytes > max_bytes:
+                raise KnowledgeEntryReadLimitExceeded(
+                    entry_id=entry_id,
+                    revision=selected_revision,
+                    payload_bytes=stored_payload_bytes,
+                    max_bytes=max_bytes,
+                )
+            entry = await self._load_entry_in_scope(
+                cur,
+                entry_id,
+                scope,
+                revision=revision,
+                access_now=access_now,
+            )
+            if entry is None:
+                raise RuntimeError("Knowledge entry disappeared inside a repeatable-read snapshot.")
+            actual_payload_bytes = knowledge_entry_payload_bytes(entry)
+            if actual_payload_bytes != stored_payload_bytes:
+                raise RuntimeError(
+                    "Knowledge entry payload size metadata does not match its canonical payload."
+                )
+            return entry
 
     async def transition_entry_status(
         self,
@@ -11930,11 +12047,12 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 last_used_at,
                 expires_at,
                 title,
-                metadata
+                metadata,
+                payload_bytes
             )
             VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
             )
             """,
             _knowledge_entry_row_values(entry),
@@ -13155,8 +13273,10 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         access_scope: KnowledgeAccessScope,
         *,
         revision: int | None = None,
+        access_now: datetime | None = None,
     ) -> KnowledgeEntry | None:
-        access_now = datetime.now(UTC)
+        if access_now is None:
+            access_now = datetime.now(UTC)
         access_sql, access_params = _postgres_knowledge_access_scope_filter_sql(
             access_scope,
             now=access_now,
@@ -13242,6 +13362,78 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 selected_revision,
             ),
         )
+
+    async def _load_entry_payload_bytes_in_scope(
+        self,
+        cur: Any,
+        entry_id: str,
+        access_scope: KnowledgeAccessScope,
+        *,
+        revision: int | None = None,
+        access_now: datetime,
+    ) -> tuple[int, int] | None:
+        access_sql, access_params = _postgres_knowledge_access_scope_filter_sql(
+            access_scope,
+            now=access_now,
+        )
+        if revision is None:
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    f"""
+                    SELECT e.revision, e.payload_bytes
+                    FROM cayu_knowledge_current_entries AS e
+                    WHERE e.id = %s
+                    {access_sql}
+                    """,
+                ),
+                (entry_id, *access_params),
+            )
+        else:
+            current_access_sql, current_access_params = _postgres_knowledge_access_scope_filter_sql(
+                access_scope,
+                entry_alias="current_entry",
+                now=access_now,
+            )
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    f"""
+                    SELECT e.revision, e.payload_bytes
+                    FROM (
+                        SELECT
+                            logical.id AS id,
+                            stored.revision AS revision,
+                            logical.namespace AS namespace,
+                            stored.visibility AS visibility,
+                            stored.status AS status,
+                            stored.source_type AS source_type,
+                            stored.source_id AS source_id,
+                            stored.expires_at AS expires_at,
+                            stored.payload_bytes AS payload_bytes
+                        FROM cayu_knowledge_entries AS logical
+                        JOIN cayu_knowledge_revisions AS stored
+                          ON stored.entry_id = logical.id
+                        WHERE logical.id = %s AND stored.revision = %s
+                    ) AS e
+                    JOIN cayu_knowledge_current_entries AS current_entry
+                      ON current_entry.id = e.id
+                    WHERE TRUE
+                    {access_sql}
+                    {current_access_sql}
+                    """,
+                ),
+                (
+                    entry_id,
+                    revision,
+                    *access_params,
+                    *current_access_params,
+                ),
+            )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return int(row[0]), int(row[1])
 
     async def _load_chunk(self, cur: Any, chunk_id: str) -> KnowledgeChunk | None:
         await cur.execute(
@@ -28559,6 +28751,7 @@ def _knowledge_entry_row_values(entry: KnowledgeEntry) -> tuple[object, ...]:
         pg_support.to_utc_optional(entry.expires_at),
         entry.title,
         _dumps(entry.metadata),
+        knowledge_entry_payload_bytes(entry),
     )
 
 

@@ -367,6 +367,23 @@ def test_revision_sixty_four_adds_authored_eval_suites_without_new_compatibility
     )
 
 
+def test_revision_sixty_five_breaks_for_bounded_knowledge_entry_reads() -> None:
+    revision = m.revision(65)
+    state = m.SchemaState(revision=65, compatible_from=65)
+
+    assert revision.kind is m.RevisionKind.BREAKING
+    assert revision.compatible_from == 65
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 65"):
+        m.validate(state, app_latest=64, app_min_supported=63)
+    m.validate(state, app_latest=65, app_min_supported=65)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 65"):
+        m.validate(
+            m.SchemaState(revision=64, compatible_from=63),
+            app_latest=65,
+            app_min_supported=65,
+        )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(
