@@ -56,7 +56,15 @@ from cayu.storage.memory import (
     KnowledgePublicationConflict,
     KnowledgePublicationReceipt,
     KnowledgeQuery,
+    KnowledgeRelation,
+    KnowledgeRelationConflict,
+    KnowledgeRelationDirection,
+    KnowledgeRelationKind,
+    KnowledgeRelationPublicationReceipt,
+    KnowledgeRelationQuery,
+    KnowledgeRelationResult,
     KnowledgeRevisionConflict,
+    KnowledgeRevisionRef,
     KnowledgeSearchMode,
     KnowledgeSearchResult,
     KnowledgeStatus,
@@ -64,9 +72,11 @@ from cayu.storage.memory import (
     KnowledgeVisibility,
     _bounded_knowledge_evidence,
     _bounded_knowledge_index_identity,
+    _bounded_knowledge_relation_result,
     _copy_chunks_for_revision,
     _copy_entry_evidence,
     _copy_evidence_for_revision,
+    _decode_knowledge_relation_cursor,
     _initialize_knowledge_change_consumer_state,
     _knowledge_access_scope_sha256,
     _knowledge_access_snapshot,
@@ -81,9 +91,17 @@ from cayu.storage.memory import (
     _knowledge_entry_id,
     _knowledge_index_readiness_update_sha256,
     _knowledge_publication_operation_id,
+    _knowledge_relation_access_snapshot,
+    _knowledge_relation_access_snapshot_json,
+    _knowledge_relation_change_audiences,
+    _knowledge_relation_identity,
+    _knowledge_relation_query_fingerprint,
+    _knowledge_scope_allows_relation_access_snapshot,
     _knowledge_scope_allows_snapshot,
+    _KnowledgeRelationAccessSnapshot,
     _next_knowledge_revision,
     _parse_knowledge_access_snapshot_json,
+    _parse_knowledge_relation_access_snapshot_json,
     _require_knowledge_entry_access,
     _require_knowledge_successor_access,
     _validate_knowledge_change_limit,
@@ -92,6 +110,7 @@ from cayu.storage.memory import (
     _validate_knowledge_index_readiness_transition,
     _validate_knowledge_index_sequence,
     _validate_knowledge_publication_replay,
+    _validate_knowledge_relation_publication_replay,
     _validate_knowledge_revision,
     _validate_revision_append,
     _validate_revision_successor,
@@ -105,14 +124,17 @@ from cayu.storage.memory import (
     copy_knowledge_list_query,
     copy_knowledge_publication_receipt,
     copy_knowledge_query,
+    copy_knowledge_relation_publication_receipt,
+    copy_knowledge_relation_query,
     prepare_knowledge_publication,
+    prepare_knowledge_relations,
 )
 
 _SEARCH_TOKEN_RE = re.compile(r"\w+")
 _SEARCH_PAGE_SIZE = 500
 _CHUNK_ID_LOOKUP_BATCH_SIZE = 400
 _EVIDENCE_ID_LOOKUP_BATCH_SIZE = 400
-_SQLITE_MIN_REQUIRED_REVISION = 44
+_SQLITE_MIN_REQUIRED_REVISION = 60
 
 
 class SQLiteKnowledgeStore(KnowledgeStore):
@@ -558,6 +580,234 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         async with self._lock:
             receipt = self._load_publication_receipt_in_scope_unlocked(operation_id, scope)
         return None if receipt is None else copy_knowledge_publication_receipt(receipt)
+
+    async def publish_relations(
+        self,
+        relations: list[KnowledgeRelation],
+        *,
+        operation_id: str,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeRelationPublicationReceipt:
+        scope = self._operation_access_scope(access_scope)
+        operation_id, copied_relations, request_sha256 = prepare_knowledge_relations(
+            relations,
+            operation_id=operation_id,
+        )
+        async with self._lock:
+            with sqlite_support._transaction(self._connection):
+                existing_receipt = self._load_relation_receipt_unlocked(
+                    operation_id,
+                    access_scope=scope,
+                    deny_inaccessible=True,
+                )
+                if existing_receipt is not None:
+                    _validate_knowledge_relation_publication_replay(
+                        existing_receipt,
+                        relations=copied_relations,
+                        request_sha256=request_sha256,
+                    )
+                    return copy_knowledge_relation_publication_receipt(
+                        existing_receipt,
+                        replayed=True,
+                    )
+
+                endpoint_entries: list[tuple[KnowledgeEntry, KnowledgeEntry]] = []
+                for relation in copied_relations:
+                    endpoints: list[KnowledgeEntry] = []
+                    for reference in (relation.subject, relation.object):
+                        entry = self._load_entry_in_scope_unlocked(
+                            reference.entry_id,
+                            scope,
+                            revision=reference.revision,
+                        )
+                        if entry is None:
+                            existing = self._load_entry_unlocked(
+                                reference.entry_id,
+                                revision=reference.revision,
+                            )
+                            if existing is None:
+                                raise KnowledgeRelationConflict("endpoint_missing")
+                            raise KnowledgeAccessDenied("publish_relations")
+                        endpoints.append(entry)
+                    endpoint_entries.append((endpoints[0], endpoints[1]))
+                current_entries = self._load_entries_unlocked(
+                    [
+                        reference.entry_id
+                        for relation in copied_relations
+                        for reference in (relation.subject, relation.object)
+                    ]
+                )
+                try:
+                    endpoint_access = [
+                        _knowledge_relation_access_snapshot(
+                            subject_exact=subject,
+                            subject_current=current_entries[relation.subject.entry_id],
+                            object_exact=object_,
+                            object_current=current_entries[relation.object.entry_id],
+                        )
+                        for relation, (subject, object_) in zip(
+                            copied_relations,
+                            endpoint_entries,
+                            strict=True,
+                        )
+                    ]
+                except KeyError:
+                    raise KnowledgeRelationConflict("endpoint_missing") from None
+
+                for relation in copied_relations:
+                    row = self._connection.execute(
+                        """
+                        SELECT *
+                        FROM cayu_knowledge_relations
+                        WHERE id = ? OR (
+                            kind = ?
+                            AND subject_entry_id = ?
+                            AND subject_revision = ?
+                            AND object_entry_id = ?
+                            AND object_revision = ?
+                        )
+                        LIMIT 1
+                        """,
+                        (
+                            relation.id,
+                            *_relation_semantic_row_values(relation),
+                        ),
+                    ).fetchone()
+                    if row is not None:
+                        occupied = _relation_from_row(row)
+                        if not self._relation_endpoints_in_scope_unlocked(occupied, scope):
+                            raise KnowledgeAccessDenied("publish_relations")
+                        raise KnowledgeRelationConflict("relation_exists")
+                    historic_change = self._connection.execute(
+                        "SELECT sequence FROM cayu_knowledge_changes WHERE relation_id = ?",
+                        (relation.id,),
+                    ).fetchone()
+                    if historic_change is not None:
+                        if (
+                            self._load_change_in_scope_unlocked(
+                                int(historic_change["sequence"]),
+                                scope,
+                            )
+                            is None
+                        ):
+                            raise KnowledgeAccessDenied("publish_relations")
+                        raise KnowledgeRelationConflict("relation_exists")
+
+                committed_at = self._clock()
+                receipt = KnowledgeRelationPublicationReceipt(
+                    operation_id=operation_id,
+                    relation_ids=[relation.id for relation in copied_relations],
+                    request_sha256=request_sha256,
+                    committed_at=committed_at,
+                )
+                try:
+                    self._connection.executemany(
+                        """
+                        INSERT INTO cayu_knowledge_relations (
+                            id,
+                            subject_entry_id,
+                            subject_revision,
+                            object_entry_id,
+                            object_revision,
+                            kind,
+                            created_by_type,
+                            created_by,
+                            policy_id,
+                            created_at,
+                            metadata_json
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [_relation_row_values(relation) for relation in copied_relations],
+                    )
+                    for relation, access_snapshot in zip(
+                        copied_relations,
+                        endpoint_access,
+                        strict=True,
+                    ):
+                        self._insert_relation_change_unlocked(
+                            relation,
+                            access_snapshot=access_snapshot,
+                            operation_id=operation_id,
+                            committed_at=committed_at,
+                        )
+                    self._insert_relation_receipt_unlocked(
+                        receipt,
+                        access_snapshots=endpoint_access,
+                    )
+                except sqlite3.IntegrityError:
+                    raise KnowledgeRelationConflict("relation_exists") from None
+            return copy_knowledge_relation_publication_receipt(receipt)
+
+    async def load_relation_publication_receipt(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeRelationPublicationReceipt | None:
+        scope = self._operation_access_scope(access_scope)
+        operation_id = _knowledge_relation_identity(operation_id, "operation_id")
+        async with self._lock:
+            receipt = self._load_relation_receipt_unlocked(
+                operation_id,
+                access_scope=scope,
+                deny_inaccessible=False,
+            )
+        return None if receipt is None else copy_knowledge_relation_publication_receipt(receipt)
+
+    async def read_relations(
+        self,
+        query: KnowledgeRelationQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeRelationResult | None:
+        scope = self._operation_access_scope(access_scope)
+        query = copy_knowledge_relation_query(query)
+        fingerprint = _knowledge_relation_query_fingerprint(query, scope)
+        cursor = _decode_knowledge_relation_cursor(query.cursor, fingerprint=fingerprint)
+        async with self._lock:
+            with sqlite_support._transaction(self._connection, begin_immediate=False):
+                reference = self._load_entry_in_scope_unlocked(
+                    query.reference.entry_id,
+                    scope,
+                    revision=query.reference.revision,
+                )
+                if reference is None:
+                    return None
+                relation_sql, relation_params = _sqlite_relation_query_filter_sql(query)
+                access_sql, access_params = _sqlite_relation_access_scope_filter_sql(scope)
+                cursor_sql = ""
+                cursor_params: list[object] = []
+                if cursor is not None:
+                    cursor_sql = (
+                        " AND (relation.created_at > ? OR "
+                        "(relation.created_at = ? AND relation.id COLLATE BINARY > ?))"
+                    )
+                    created_at = sqlite_support.format_datetime(cursor.created_at)
+                    cursor_params.extend([created_at, created_at, cursor.relation_id])
+                rows = self._connection.execute(
+                    f"""
+                    SELECT relation.*
+                    FROM cayu_knowledge_relations AS relation
+                    WHERE 1 = 1
+                    {relation_sql}
+                    {cursor_sql}
+                    {access_sql}
+                    ORDER BY relation.created_at ASC, relation.id COLLATE BINARY ASC
+                    LIMIT ?
+                    """,
+                    (
+                        *relation_params,
+                        *cursor_params,
+                        *access_params,
+                        query.limit + 1,
+                    ),
+                ).fetchall()
+        return _bounded_knowledge_relation_result(
+            query,
+            [_relation_from_row(row) for row in rows],
+            fingerprint=fingerprint,
+        )
 
     async def read_evidence(
         self,
@@ -1937,6 +2187,189 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             )
         return change
 
+    def _insert_relation_change_unlocked(
+        self,
+        relation: KnowledgeRelation,
+        *,
+        access_snapshot: _KnowledgeRelationAccessSnapshot,
+        operation_id: str,
+        committed_at: datetime,
+    ) -> KnowledgeChange:
+        change_id = f"kchg_{uuid4().hex}"
+        cursor = self._connection.execute(
+            """
+            INSERT INTO cayu_knowledge_changes (
+                id,
+                kind,
+                entry_id,
+                entry_revision,
+                committed_at,
+                operation_id,
+                relation_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                change_id,
+                KnowledgeChangeKind.RELATION_PUBLISHED.value,
+                relation.subject.entry_id,
+                relation.subject.revision,
+                sqlite_support.format_datetime(committed_at),
+                operation_id,
+                relation.id,
+            ),
+        )
+        if cursor.lastrowid is None:
+            raise RuntimeError("SQLite did not return a knowledge change sequence.")
+        change = KnowledgeChange(
+            id=change_id,
+            sequence=int(cursor.lastrowid),
+            kind=KnowledgeChangeKind.RELATION_PUBLISHED,
+            entry_id=relation.subject.entry_id,
+            entry_revision=relation.subject.revision,
+            committed_at=committed_at,
+            operation_id=operation_id,
+            relation_id=relation.id,
+        )
+        audiences = _knowledge_relation_change_audiences(
+            change,
+            access_snapshot=access_snapshot,
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO cayu_knowledge_change_audiences (
+                change_sequence,
+                audience_kind,
+                namespace,
+                visibility,
+                source_type,
+                source_id,
+                status,
+                requires_include_expired
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    change.sequence,
+                    audience.kind,
+                    audience.snapshot.namespace,
+                    audience.snapshot.visibility.value,
+                    audience.snapshot.source_type,
+                    audience.snapshot.source_id,
+                    audience.snapshot.status.value,
+                    int(audience.requires_include_expired),
+                )
+                for audience in audiences
+            ],
+        )
+        labels = [
+            (change.sequence, audience.kind, key, value)
+            for audience in audiences
+            for key, value in sorted(audience.snapshot.labels.items())
+        ]
+        if labels:
+            self._connection.executemany(
+                """
+                INSERT INTO cayu_knowledge_change_labels (
+                    change_sequence, audience_kind, key, value
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                labels,
+            )
+        return change
+
+    def _relation_endpoints_in_scope_unlocked(
+        self,
+        relation: KnowledgeRelation,
+        access_scope: KnowledgeAccessScope,
+    ) -> bool:
+        return all(
+            self._load_entry_in_scope_unlocked(
+                reference.entry_id,
+                access_scope,
+                revision=reference.revision,
+            )
+            is not None
+            for reference in (relation.subject, relation.object)
+        )
+
+    def _load_relation_receipt_unlocked(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope,
+        deny_inaccessible: bool,
+    ) -> KnowledgeRelationPublicationReceipt | None:
+        row = self._connection.execute(
+            """
+            SELECT operation_id, relation_ids_json, request_sha256,
+                   committed_at, access_snapshots_json
+            FROM cayu_knowledge_relation_publication_receipts
+            WHERE operation_id = ?
+            """,
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            relation_ids = json.loads(row["relation_ids_json"])
+            raw_snapshots = json.loads(row["access_snapshots_json"])
+            receipt = KnowledgeRelationPublicationReceipt(
+                operation_id=row["operation_id"],
+                relation_ids=relation_ids,
+                request_sha256=row["request_sha256"],
+                committed_at=sqlite_support.parse_datetime(row["committed_at"]),
+            )
+            if type(raw_snapshots) is not list or len(raw_snapshots) != len(receipt.relation_ids):
+                raise ValueError("Relation receipt access snapshots are malformed.")
+            snapshots = [
+                _parse_knowledge_relation_access_snapshot_json(json.dumps(raw_snapshot))
+                for raw_snapshot in raw_snapshots
+            ]
+        except Exception:
+            raise KnowledgeRelationConflict("malformed_receipt") from None
+        authorized = all(
+            _knowledge_scope_allows_relation_access_snapshot(access_scope, snapshot)
+            for snapshot in snapshots
+        )
+        if not authorized:
+            if deny_inaccessible:
+                raise KnowledgeAccessDenied("publish_relations")
+            return None
+        return receipt
+
+    def _insert_relation_receipt_unlocked(
+        self,
+        receipt: KnowledgeRelationPublicationReceipt,
+        *,
+        access_snapshots: list[_KnowledgeRelationAccessSnapshot],
+    ) -> None:
+        snapshots = [
+            json.loads(_knowledge_relation_access_snapshot_json(snapshot))
+            for snapshot in access_snapshots
+        ]
+        self._connection.execute(
+            """
+            INSERT INTO cayu_knowledge_relation_publication_receipts (
+                operation_id,
+                relation_ids_json,
+                request_sha256,
+                committed_at,
+                access_snapshots_json
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                receipt.operation_id,
+                json.dumps(receipt.relation_ids, ensure_ascii=False, separators=(",", ":")),
+                receipt.request_sha256,
+                sqlite_support.format_datetime(receipt.committed_at),
+                json.dumps(snapshots, ensure_ascii=False, separators=(",", ":")),
+            ),
+        )
+
     def _accessible_change_high_water_unlocked(
         self,
         scope: KnowledgeAccessScope,
@@ -1974,7 +2407,8 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 change_record.entry_id,
                 change_record.entry_revision,
                 change_record.committed_at,
-                change_record.operation_id
+                change_record.operation_id,
+                change_record.relation_id
             FROM cayu_knowledge_changes AS change_record
             WHERE change_record.sequence > ?
               AND change_record.sequence <= ?
@@ -2002,7 +2436,8 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 change_record.entry_id,
                 change_record.entry_revision,
                 change_record.committed_at,
-                change_record.operation_id
+                change_record.operation_id,
+                change_record.relation_id
             FROM cayu_knowledge_changes AS change_record
             WHERE change_record.sequence = ?
             """
@@ -2155,7 +2590,8 @@ class SQLiteKnowledgeStore(KnowledgeStore):
     ) -> None:
         row = self._connection.execute(
             """
-            SELECT id, sequence, kind, entry_id, entry_revision, committed_at, operation_id
+            SELECT id, sequence, kind, entry_id, entry_revision,
+                   committed_at, operation_id, relation_id
             FROM cayu_knowledge_changes
             WHERE sequence = ?
             """,
@@ -3227,6 +3663,52 @@ def _evidence_from_row(row: sqlite3.Row) -> KnowledgeEvidence:
     )
 
 
+def _relation_semantic_row_values(relation: KnowledgeRelation) -> tuple[object, ...]:
+    return (
+        relation.kind.value,
+        relation.subject.entry_id,
+        relation.subject.revision,
+        relation.object.entry_id,
+        relation.object.revision,
+    )
+
+
+def _relation_row_values(relation: KnowledgeRelation) -> tuple[object, ...]:
+    return (
+        relation.id,
+        relation.subject.entry_id,
+        relation.subject.revision,
+        relation.object.entry_id,
+        relation.object.revision,
+        relation.kind.value,
+        relation.created_by_type.value,
+        relation.created_by,
+        relation.policy_id,
+        sqlite_support.format_datetime(relation.created_at),
+        sqlite_support.json_dumps(relation.metadata),
+    )
+
+
+def _relation_from_row(row: sqlite3.Row) -> KnowledgeRelation:
+    return KnowledgeRelation(
+        id=row["id"],
+        subject=KnowledgeRevisionRef(
+            entry_id=row["subject_entry_id"],
+            revision=row["subject_revision"],
+        ),
+        object=KnowledgeRevisionRef(
+            entry_id=row["object_entry_id"],
+            revision=row["object_revision"],
+        ),
+        kind=KnowledgeRelationKind(row["kind"]),
+        created_by_type=KnowledgeActorType(row["created_by_type"]),
+        created_by=row["created_by"],
+        policy_id=row["policy_id"],
+        created_at=sqlite_support.parse_datetime(row["created_at"]),
+        metadata=json.loads(row["metadata_json"]),
+    )
+
+
 def _change_from_row(row: sqlite3.Row) -> KnowledgeChange:
     return KnowledgeChange(
         id=row["id"],
@@ -3236,6 +3718,7 @@ def _change_from_row(row: sqlite3.Row) -> KnowledgeChange:
         entry_revision=row["entry_revision"],
         committed_at=sqlite_support.parse_datetime(row["committed_at"]),
         operation_id=row["operation_id"],
+        relation_id=row["relation_id"],
     )
 
 
@@ -3253,6 +3736,98 @@ def _change_consumer_from_row(row: sqlite3.Row) -> KnowledgeChangeConsumerState:
         last_acknowledged_claim_id=row["last_acknowledged_claim_id"],
         updated_at=sqlite_support.parse_datetime(row["updated_at"]),
     )
+
+
+def _sqlite_relation_query_filter_sql(
+    query: KnowledgeRelationQuery,
+) -> tuple[str, list[object]]:
+    entry_id = query.reference.entry_id
+    revision = query.reference.revision
+    either = (
+        "((relation.subject_entry_id = ? AND relation.subject_revision = ?) "
+        "OR (relation.object_entry_id = ? AND relation.object_revision = ?))"
+    )
+    clauses: list[str]
+    params: list[object]
+    if query.direction is KnowledgeRelationDirection.BOTH:
+        clauses = [either]
+        params = [entry_id, revision, entry_id, revision]
+    elif query.direction is KnowledgeRelationDirection.OUTGOING:
+        clauses = [
+            "((relation.kind = 'contradicts' AND "
+            f"{either}) OR (relation.kind <> 'contradicts' "
+            "AND relation.subject_entry_id = ? AND relation.subject_revision = ?))"
+        ]
+        params = [entry_id, revision, entry_id, revision, entry_id, revision]
+    else:
+        clauses = [
+            "((relation.kind = 'contradicts' AND "
+            f"{either}) OR (relation.kind <> 'contradicts' "
+            "AND relation.object_entry_id = ? AND relation.object_revision = ?))"
+        ]
+        params = [entry_id, revision, entry_id, revision, entry_id, revision]
+    if query.kinds:
+        placeholders = ", ".join("?" for _ in query.kinds)
+        clauses.append(f"relation.kind IN ({placeholders})")
+        params.extend(kind.value for kind in query.kinds)
+    return " AND " + " AND ".join(clauses), params
+
+
+def _sqlite_relation_access_scope_filter_sql(
+    scope: KnowledgeAccessScope,
+) -> tuple[str, list[object]]:
+    clauses: list[str] = []
+    params: list[object] = []
+    access_now = datetime.now(UTC)
+    for entry_column, revision_column in (
+        ("subject_entry_id", "subject_revision"),
+        ("object_entry_id", "object_revision"),
+    ):
+        exact_access_sql, exact_access_params = _knowledge_access_scope_filter_sql(
+            scope,
+            now=access_now,
+        )
+        clauses.append(
+            f"""
+            EXISTS (
+                SELECT 1
+                FROM (
+                    SELECT
+                        logical.id AS id,
+                        stored.revision AS revision,
+                        logical.namespace AS namespace,
+                        stored.visibility AS visibility,
+                        stored.status AS status,
+                        stored.source_type AS source_type,
+                        stored.source_id AS source_id,
+                        stored.expires_at AS expires_at
+                    FROM cayu_knowledge_entries AS logical
+                    JOIN cayu_knowledge_revisions AS stored
+                      ON stored.entry_id = logical.id
+                ) AS e
+                WHERE e.id = relation.{entry_column}
+                  AND e.revision = relation.{revision_column}
+                {exact_access_sql}
+            )
+            """
+        )
+        params.extend(exact_access_params)
+        current_access_sql, current_access_params = _knowledge_access_scope_filter_sql(
+            scope,
+            now=access_now,
+        )
+        clauses.append(
+            f"""
+            EXISTS (
+                SELECT 1
+                FROM cayu_knowledge_current_entries AS e
+                WHERE e.id = relation.{entry_column}
+                {current_access_sql}
+            )
+            """
+        )
+        params.extend(current_access_params)
+    return " AND " + " AND ".join(clauses), params
 
 
 def _sqlite_change_access_scope_filter_sql(
@@ -3307,10 +3882,19 @@ def _sqlite_change_access_scope_filter_sql(
         clauses.append(f"{audience_alias}.requires_include_expired = 0")
     audience_filter = " AND ".join(clauses)
     return (
-        " AND EXISTS ("
-        "SELECT 1 FROM cayu_knowledge_change_audiences AS access_audience "
-        f"WHERE {audience_alias}.change_sequence = {alias}.sequence "
-        f"AND {audience_filter})",
+        " AND (SELECT CASE "
+        f"WHEN {alias}.kind = 'relation_published' THEN CASE "
+        "WHEN COUNT(*) = 4 "
+        "AND SUM(CASE WHEN candidate.audience_kind IN "
+        "('subject_exact', 'subject_current', 'object_exact', 'object_current') "
+        "THEN 1 ELSE 0 END) = 4 "
+        "AND MIN(candidate.allowed) = 1 THEN 1 ELSE 0 END "
+        "ELSE COALESCE(MAX(candidate.allowed), 0) END FROM ("
+        f"SELECT {audience_alias}.audience_kind, CASE WHEN "
+        f"{audience_filter} THEN 1 ELSE 0 END AS allowed "
+        "FROM cayu_knowledge_change_audiences AS access_audience "
+        f"WHERE {audience_alias}.change_sequence = {alias}.sequence"
+        ") AS candidate) = 1",
         params,
     )
 

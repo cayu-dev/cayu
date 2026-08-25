@@ -85,6 +85,7 @@ class KnowledgeStoreCapabilityClaim:
 @dataclass(frozen=True)
 class KnowledgeStoreCapabilities:
     owned_publication: KnowledgeStoreCapabilityClaim
+    revision_relations: KnowledgeStoreCapabilityClaim
     change_outbox: KnowledgeStoreCapabilityClaim
     index_readiness: KnowledgeStoreCapabilityClaim
     embedding_projections: KnowledgeStoreCapabilityClaim

@@ -1,0 +1,103 @@
+{
+  "ceiling_findings": [],
+  "ceilings": {
+    "memory_bounded_query_p95_ms": 50.0,
+    "memory_relation_publish_p95_ms_per_relation": 5.0,
+    "memory_unrelated_lookup_p95_ms": 2.0,
+    "memory_zero_relation_entry_publish_p95_ms": 10.0,
+    "preparation_p95_ms_per_relation": 2.0,
+    "sqlite_bounded_query_p95_ms": 75.0,
+    "sqlite_relation_publish_p95_ms_per_relation": 20.0,
+    "sqlite_storage_bytes_per_relation": 32768,
+    "sqlite_unrelated_lookup_p95_ms": 10.0,
+    "sqlite_zero_relation_entry_publish_p95_ms": 100.0
+  },
+  "control": {
+    "entry_count": 5053,
+    "historical_pre_feature": false,
+    "kind": "current_runtime_zero_relations",
+    "relation_count": 0
+  },
+  "environment": {
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "results": [
+    {
+      "backend": "memory",
+      "batch_count": 505,
+      "batch_size": 10,
+      "bounded_query_latency": {
+        "p50_ms": 14.250666,
+        "p95_ms": 14.40025
+      },
+      "matched_relation_count": 50,
+      "populated_relation_storage_bytes": null,
+      "preparation_latency_per_relation": {
+        "p50_ms": 0.194433,
+        "p95_ms": 0.213163
+      },
+      "published_relation_count": 5050,
+      "query_iteration_count": 30,
+      "relation_publish_latency_per_relation": {
+        "p50_ms": 0.454512,
+        "p95_ms": 0.502163
+      },
+      "storage_byte_overhead": null,
+      "storage_bytes_per_relation": null,
+      "unrelated_lookup_latency": {
+        "p50_ms": 0.130625,
+        "p95_ms": 0.149375
+      },
+      "unrelated_relation_count": 5000,
+      "zero_relation_entry_publish_latency": {
+        "p50_ms": 0.863875,
+        "p95_ms": 1.845292
+      },
+      "zero_relation_storage_bytes": null
+    },
+    {
+      "backend": "sqlite",
+      "batch_count": 505,
+      "batch_size": 10,
+      "bounded_query_latency": {
+        "p50_ms": 17.320146,
+        "p95_ms": 18.5455
+      },
+      "matched_relation_count": 50,
+      "populated_relation_storage_bytes": 24870912,
+      "preparation_latency_per_relation": {
+        "p50_ms": 0.195008,
+        "p95_ms": 0.20845
+      },
+      "published_relation_count": 5050,
+      "query_iteration_count": 30,
+      "relation_publish_latency_per_relation": {
+        "p50_ms": 0.555929,
+        "p95_ms": 0.902887
+      },
+      "storage_byte_overhead": 14819328,
+      "storage_bytes_per_relation": 2934.520396,
+      "unrelated_lookup_latency": {
+        "p50_ms": 0.365417,
+        "p95_ms": 0.481792
+      },
+      "unrelated_relation_count": 5000,
+      "zero_relation_entry_publish_latency": {
+        "p50_ms": 0.327417,
+        "p95_ms": 0.503334
+      },
+      "zero_relation_storage_bytes": 10051584
+    }
+  ],
+  "schema_version": "cayu.knowledge_relation_performance.v1",
+  "within_ceilings": true,
+  "workload": {
+    "batch_size": 10,
+    "matched_relation_count": 50,
+    "provider_calls": 0,
+    "published_relation_count": 5050,
+    "query_iterations": 30,
+    "unrelated_relation_count": 5000
+  }
+}

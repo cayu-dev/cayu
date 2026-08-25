@@ -83,3 +83,21 @@ ordinary test harness. Provider latency is deliberately absent. See
 for the fixed ceilings and interpretation. SQLite persistence enforces a sustained
 median ceiling separately from a wider emergency p95 cap because hosted-runner fsync
 scheduling is not a stable product-tail signal.
+
+## Revision-bound knowledge-relation overhead
+
+`knowledge-relation-performance-v1.json` is the hermetic baseline for 50 matching
+relations surrounded by 5,000 unrelated relations. Regenerate it, or check the
+exact-revision lineage regression ceilings without provider calls, with:
+
+```bash
+PYTHONPATH=src python scripts/run_knowledge_relation_performance.py \
+  --output benchmarks/memory/knowledge-relation-performance-v1.json \
+  --check
+```
+
+The current-runtime zero-relation control publishes the same 5,053 entries without
+relations; it is not a historical pre-feature comparison. The populated lane
+measures canonical preparation, atomic ten-relation batches, bounded 50-result
+queries, isolated-endpoint lookup across the unrelated background, and steady-state
+SQLite bytes after close. CI reruns the workload without coverage instrumentation.

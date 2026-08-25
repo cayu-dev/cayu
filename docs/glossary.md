@@ -51,10 +51,21 @@ disambiguates them so a name never sends you down the wrong path.
 
 - **Knowledge vs memory.** Knowledge is durable canonical semantic material
   (entries, chunks, source identity, lifecycle, immutable revisions, and
-  revision-bound evidence). Memory is the broader recall and context system that may
-  retrieve permitted knowledge, transcript episodes, and artifact-derived
-  documents. A `KnowledgeStore` is one memory source, not the whole memory
-  system. See [Memory foundation contracts](memory-foundation.md).
+  revision-bound evidence and cross-entry relations). Memory is the broader
+  recall and context system that may retrieve permitted knowledge, transcript
+  episodes, and artifact-derived documents. A `KnowledgeStore` is one memory
+  source, not the whole memory system. See
+  [Memory foundation contracts](memory-foundation.md).
+- **Revision lineage vs evidence vs knowledge relation.** Revision numbers order
+  immutable snapshots of the same logical entry. `KnowledgeEvidence` explains
+  the source of one exact revision. A `KnowledgeRelation` records a reviewed
+  `supersedes`, `derived_from`, or symmetric `contradicts` statement between
+  exact revisions of two different entries. None of these proves provider
+  exposure or automatically changes recall ranking, lifecycle, or truth.
+- **Curator.** `KnowledgeCurator` is an explicitly invoked application workflow
+  that turns bounded source-attributed learning signals into pending proposals
+  for review. It is not a background agent, retrieval manager, context manager,
+  or automatic truth decider.
 - **Recall receipt vs context exposure.** A recall receipt proves what a bounded
   retrieval/admission operation selected. A context exposure tracks whether one
   exact composition was merely planned/prepared/dispatched or was positively

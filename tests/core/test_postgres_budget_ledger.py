@@ -55,6 +55,8 @@ _TABLES = (
     "cayu_recall_item_exposures",
     "cayu_context_exposures",
     "cayu_recall_receipts",
+    "cayu_knowledge_relation_publication_receipts",
+    "cayu_knowledge_relations",
     "cayu_knowledge_change_acknowledgements",
     "cayu_knowledge_change_consumers",
     "cayu_knowledge_change_labels",
@@ -541,6 +543,8 @@ def test_postgres_budget_ledger_does_not_infer_identity_for_existing_rows(
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
+                await cur.execute("DROP TABLE cayu_knowledge_relation_publication_receipts")
+                await cur.execute("DROP TABLE cayu_knowledge_relations")
                 await cur.execute("DROP INDEX idx_cayu_budget_reservations_limit")
                 await cur.execute(
                     "ALTER TABLE cayu_budget_reservations DROP COLUMN budget_limit_id"

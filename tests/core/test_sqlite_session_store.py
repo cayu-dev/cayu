@@ -3181,6 +3181,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (57, 57),
         (58, 58),
         (59, 59),
+        (60, 60),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
@@ -3194,7 +3195,7 @@ def test_sqlite_revision_fifty_nine_migrates_an_empty_verified_work_registry(
 
     connection = sqlite3.connect(db_path)
     try:
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 59")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 59")
         connection.execute("PRAGMA user_version = 58")
         connection.commit()
     finally:
@@ -3215,8 +3216,8 @@ def test_sqlite_revision_fifty_nine_migrates_an_empty_verified_work_registry(
         version = connection.execute("PRAGMA user_version").fetchone()
     finally:
         connection.close()
-    assert revision == (59, 59)
-    assert version == (59,)
+    assert revision == (60, 60)
+    assert version == (60,)
 
 
 def test_sqlite_revision_fifty_nine_rejects_a_populated_verified_work_registry(
@@ -3233,7 +3234,7 @@ def test_sqlite_revision_fifty_nine_rejects_a_populated_verified_work_registry(
             "(contract_id, version, fingerprint, contract_json) VALUES (?, ?, ?, ?)",
             ("pre-59-contract", 1, "0" * 64, "{}"),
         )
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 59")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 59")
         connection.execute("PRAGMA user_version = 58")
         connection.commit()
     finally:
@@ -3267,7 +3268,7 @@ def test_sqlite_task_store_validation_requires_revision_fifty_nine(tmp_path) -> 
 
     connection = sqlite3.connect(db_path)
     try:
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 59")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 59")
         connection.execute("PRAGMA user_version = 58")
         connection.commit()
     finally:

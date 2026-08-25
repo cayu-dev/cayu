@@ -8184,6 +8184,17 @@ Postgres embedding operational contract:
   by another entry fails atomically: the existing entry and chunks remain
   unchanged, and the conflicting entry is not created. Built-in in-memory,
   SQLite, and PostgreSQL stores enforce the same identity scope.
+- `KnowledgeRevisionRef`: one exact immutable `(entry_id, revision)` endpoint.
+- `KnowledgeRelation`: one immutable cross-entry semantic statement. Its closed
+  kind is `supersedes`, `derived_from`, or symmetric `contradicts`; actor and
+  policy identities, timestamp, and metadata are bounded. The subject/object
+  orientation is semantic, except that contradictions canonicalize endpoint
+  order. Two revisions of the same logical entry cannot be related because
+  their numbered revision chain already supplies that lineage.
+- `KnowledgeRelationQuery` / `KnowledgeRelationResult`: exact-revision,
+  incoming/outgoing/both-direction lookup with optional kind filters, stable
+  count/byte bounds, honest truncation, and a cursor bound to the complete query
+  and access scope.
 - `KnowledgeQuery`: scoped retrieval request with simple query text, structured
   keyword fields (`any_terms`, `all_terms`, `none_terms`, `phrases`), namespace,
   labels, kinds, status/visibility filters, aspects, impact targets, source
@@ -8243,6 +8254,13 @@ receipt = await store.publish_entry_revision(
     expected_revision=None,
 )
 receipt = await store.load_entry_publication_receipt("tool-attempt-identity")
+relation_receipt = await store.publish_relations(
+    [relation],
+    operation_id="reviewed-lineage-operation",
+)
+relation_page = await store.read_relations(
+    KnowledgeRelationQuery(reference=relation.subject, limit=100)
+)
 await store.read_chunks(entry_id, revision=1, chunk_index=3, around=1)
 result = await store.search(query)
 listing = await store.list_entries(list_query)
@@ -8377,6 +8395,15 @@ sequence as its high-water independently of the caller's continuation cursor,
 rejects a cursor beyond the store's actual current sequence, and accepts at
 most `MAX_KNOWLEDGE_CHANGE_LIMIT` records per page.
 
+Relation publication extends that same canonical outbox without putting entry
+text, relation metadata, or evidence into a change. Each committed relation has
+one `relation_published` change carrying its opaque relation and operation IDs;
+the exact and publication-time current authorities for both endpoints must
+authorize the reader. A batch may
+therefore share one operation ID across multiple ordered changes. Entry changes
+retain their before/after any-audience behavior, while relation changes require
+all four subject/object authorities.
+
 `publish_entry_revision` and `load_entry_publication_receipt` are optional,
 non-abstract `KnowledgeStore` extension hooks. A custom implementation must
 create revision 1 or append exactly `expected_revision + 1`, commit its complete
@@ -8393,6 +8420,20 @@ before their transaction and persist the returned copied entry, ordered chunks,
 ordered evidence, and canonical request digest. The helper is available from both `cayu` and
 `cayu.storage`; independently reproducing its serialization envelope is not part
 of the extension contract.
+`publish_relations`, `load_relation_publication_receipt`, and `read_relations`
+are likewise non-abstract extension hooks. A supporting custom store must call
+`prepare_knowledge_relations(...)`, enforce the 100-record batch bound, require
+both exact endpoint revisions and both current logical entries to pass the
+scope inside the storage boundary, and atomically commit the copied relations,
+one ordered metadata-only change per relation, and one immutable receipt. Exact
+replay returns the original receipt with `replayed=true`; changed operation
+material, occupied IDs, and repeated semantic tuples fail closed. Symmetric
+contradictions must canonicalize before conflict/concurrency checks. Query
+ordering is `(created_at, id)` using portable bytewise ID ordering; pagination
+binds the cursor to reference, direction, kinds, and scope. Relations never
+retarget when a current revision advances and never by themselves mutate entry
+lifecycle, search ranking, recall admission, or context exposure.
+
 The receipt is historical commit evidence: later review, successor publication, or
 hard deletion does not invalidate an exact replay and an old replay never
 rewrites the entry's current state. A replay reports
@@ -8416,13 +8457,14 @@ migration ledger or a small column subset. Revision advancement is bounded by
 `MAX_KNOWLEDGE_REVISION`; exhaustion fails before a lifecycle mutation or
 backend write is attempted.
 
-Revision 43 is the breaking evidence/change boundary. It preserves revision-42
-knowledge and receipts, adds no fabricated historical changes, and requires
-custom stores to provide bounded evidence reads, bounded access-filtered change
+Revision 43 was the breaking evidence/change boundary. Its historical
+transition preserved revision-42 knowledge and receipts, added no fabricated
+historical changes, and required custom stores to provide bounded evidence
+reads, bounded access-filtered change
 pages, full-scan consumer baseline initialization, and scope-bound fenced
 consumer leases. Failed writes and exact receipt replays publish no change.
 
-Revision 44 is the derived-index identity/readiness boundary. A
+Revision 44 was the derived-index identity/readiness boundary. A
 `KnowledgeEmbeddingIdentity` contains the exact entry revision, optional chunk,
 projection type and Cayu-computed projected-text hash, embedding model and dimensions,
 preprocessing version, generator identity/version, and index-representation
@@ -8440,14 +8482,26 @@ results. The migration preserves canonical revision-43 knowledge and discards
 pre-identity vector rows as rebuildable derived data; it creates no fabricated
 readiness or legacy compatibility path.
 
+Revision 60 is the breaking exact-relation boundary. It adds relation records,
+relation publication receipts, four-authority outbox audiences, and relation IDs
+on metadata-only changes. Fresh databases and completely empty earlier
+knowledge schemas initialize directly. Any populated pre-60 knowledge,
+evidence, receipt, outbox, readiness, embedding, or relation table makes
+migration fail before DDL; the operator must explicitly replace the prerelease
+knowledge database. The migration performs no backfill, dual write, metadata
+fallback, or legacy relation interpretation. SQLite fences the final emptiness
+check with its writer transaction; PostgreSQL locks the inspected knowledge
+tables so an older writer cannot race the clean break. Revision 60 supersedes
+the historical revision-42-to-44 preservation behavior for current upgrades.
+
 The deterministic backend conformance registry lives in
 `tests/core/test_knowledge_store_shared_conformance.py`, with reusable scenarios
 and registration types in `tests/core/knowledge_store_conformance.py`. A
 registration names the concrete store type and factory, declares whether its
 lifecycle is process-bound or reopenable, pairs that with an explicit ephemeral
-or durable storage claim, and makes owned publication, change outbox, readiness,
-and embedding-projection capability claims explicit. This is a test extension
-point, not another runtime registry or public manager.
+or durable storage claim, and makes owned publication, revision relations,
+change outbox, readiness, and embedding-projection capability claims explicit.
+This is a test extension point, not another runtime registry or public manager.
 
 An out-of-tree `KnowledgeStore` should add a registration and run the complete
 shared suite before advertising parity. Semantic stores must additionally run

@@ -130,6 +130,29 @@ fixed intervention identity so variants for the same candidate cannot share
 mutable state. Snapshot requests without an intervention partition preserve
 the existing materialization identities and serialized record shape.
 
+### Knowledge relations bind reviewed lineage to exact revisions
+
+Built-in in-memory, SQLite, and PostgreSQL knowledge stores now publish and read
+immutable `supersedes`, `derived_from`, and symmetric `contradicts` relations
+between exact revisions of different logical entries. Bounded atomic batches,
+canonical contradiction orientation, immutable operation receipts, stable
+cursor pagination, two-endpoint access checks, and metadata-only relation events
+provide one backend-parity contract for later reviewed consolidation. A relation
+does not itself archive, approve, rerank, traverse, or inject either entry into
+model context.
+
+Breaking storage revision 60 installs the relation-aware knowledge schema and
+outbox. Stop older knowledge workers before upgrading. Fresh databases and empty
+earlier knowledge schemas initialize directly; migration refuses a populated
+pre-60 knowledge schema before changing data or DDL. Recreate or replace that
+prerelease knowledge database explicitly—there is no backfill, dual-write,
+metadata fallback, or legacy relation interpretation.
+
+The provider-free performance gate measures a current-runtime zero-relation
+entry-publication control, canonical relation preparation, atomic batch
+publication, endpoint-indexed reads across unrelated background relations, and
+incremental SQLite storage on every CI run.
+
 ### Memory interventions have portable, effect-bound evidence contracts
 
 Applications can now declare an explicit `as_declared`, recall-off, omission,

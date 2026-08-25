@@ -40,7 +40,6 @@ from cayu.storage import (
     MAX_KNOWLEDGE_CHUNK_INDEX,
     MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT,
     KnowledgeAccessScope,
-    KnowledgeChangeKind,
     KnowledgeChunk,
     KnowledgeEmbeddingProjection,
     KnowledgeEmbeddingProjectionConflict,
@@ -51,6 +50,10 @@ from cayu.storage import (
     KnowledgeListGroup,
     KnowledgeListQuery,
     KnowledgeQuery,
+    KnowledgeRelation,
+    KnowledgeRelationKind,
+    KnowledgeRelationQuery,
+    KnowledgeRevisionRef,
     KnowledgeRevisionResetRequired,
     KnowledgeSearchMode,
     KnowledgeStatus,
@@ -85,6 +88,8 @@ _TABLES = (
     "cayu_recall_item_exposures",
     "cayu_context_exposures",
     "cayu_recall_receipts",
+    "cayu_knowledge_relation_publication_receipts",
+    "cayu_knowledge_relations",
     "cayu_knowledge_change_acknowledgements",
     "cayu_knowledge_change_consumers",
     "cayu_knowledge_change_labels",
@@ -179,6 +184,8 @@ def test_postgres_knowledge_write_locks_are_batched_in_global_order(
             entry_ids=("entry-b", "entry-a"),
             chunk_ids=("chunk-b", "chunk-a", "chunk-b"),
             operation_ids=("operation-b", "operation-a"),
+            relation_ids=("relation-b", "relation-a"),
+            relation_semantics=("semantic-b", "semantic-a"),
         )
         bulk_cursor = RecordingCursor()
         await _lock_knowledge_write_identities(
@@ -202,10 +209,181 @@ def test_postgres_knowledge_write_locks_are_batched_in_global_order(
             "knowledge-entry:entry-b",
             "knowledge-operation:operation-a",
             "knowledge-operation:operation-b",
+            "knowledge-relation-semantic:semantic-a",
+            "knowledge-relation-semantic:semantic-b",
+            "knowledge-relation:relation-a",
+            "knowledge-relation:relation-b",
         ],
     )
     assert len(bulk_calls) == 1
     assert bulk_calls[0][1] == ([f"knowledge-chunk:chunk-{index:04d}" for index in range(1_000)],)
+
+
+def test_postgres_relation_write_locks_follow_category_order(
+    postgres_dsn: str,
+) -> None:
+    from cayu.storage.postgres import _lock_knowledge_relation_write_identities
+
+    class RecordingCursor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple[object, ...]]] = []
+
+        async def execute(self, query: str, params: tuple[object, ...]) -> None:
+            self.calls.append((query, params))
+
+    async def run() -> list[tuple[str, tuple[object, ...]]]:
+        cursor = RecordingCursor()
+        await _lock_knowledge_relation_write_identities(
+            cursor,
+            operation_id="operation-a",
+            relations=[
+                KnowledgeRelation(
+                    id="relation-a",
+                    subject=KnowledgeRevisionRef(entry_id="entry-b", revision=1),
+                    object=KnowledgeRevisionRef(entry_id="entry-a", revision=1),
+                    kind=KnowledgeRelationKind.DERIVED_FROM,
+                )
+            ],
+        )
+        return cursor.calls
+
+    calls = asyncio.run(run())
+
+    assert len(calls) == 3
+    assert calls[0][1] == (["knowledge-operation:operation-a"],)
+    assert calls[1][1] == (["knowledge-entry:entry-a", "knowledge-entry:entry-b"],)
+    relation_identities = calls[2][1][0]
+    assert isinstance(relation_identities, list)
+    assert relation_identities[0].startswith("knowledge-relation-semantic:")
+    assert relation_identities[1] == "knowledge-relation:relation-a"
+
+
+def test_postgres_cancelled_relation_publication_rolls_back_atomically(
+    postgres_dsn: str,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        store = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            subject = KnowledgeEntry(id="cancelled-relation-subject", text="subject")
+            object_ = KnowledgeEntry(id="cancelled-relation-object", text="object")
+            await store.create_entry(subject)
+            await store.create_entry(object_)
+            relation = KnowledgeRelation(
+                id="cancelled-relation",
+                subject=KnowledgeRevisionRef(entry_id=subject.id, revision=1),
+                object=KnowledgeRevisionRef(entry_id=object_.id, revision=1),
+                kind=KnowledgeRelationKind.DERIVED_FROM,
+            )
+            original_insert_change = store._insert_relation_change
+            entered = asyncio.Event()
+
+            async def pause_after_relation_insert(*args, **kwargs):
+                entered.set()
+                await asyncio.Future()
+
+            monkeypatch.setattr(
+                store,
+                "_insert_relation_change",
+                pause_after_relation_insert,
+            )
+            publication = asyncio.create_task(
+                store.publish_relations(
+                    [relation],
+                    operation_id="cancelled-relation-operation",
+                )
+            )
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            publication.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await publication
+            monkeypatch.setattr(
+                store,
+                "_insert_relation_change",
+                original_insert_change,
+            )
+
+            assert (
+                await store.load_relation_publication_receipt("cancelled-relation-operation")
+                is None
+            )
+            empty = await store.read_relations(KnowledgeRelationQuery(reference=relation.subject))
+            assert empty is not None
+            assert empty.relations == []
+            assert all(
+                change.relation_id is None for change in (await store.read_changes()).changes
+            )
+
+            committed = await store.publish_relations(
+                [relation],
+                operation_id="cancelled-relation-operation",
+            )
+            assert committed.replayed is False
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_postgres_relation_change_access_fails_closed_for_malformed_audiences(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        store = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            for entry_id in ("audience-subject", "audience-object"):
+                await store.create_entry(KnowledgeEntry(id=entry_id, text=entry_id))
+            relation = KnowledgeRelation(
+                id="audience-relation",
+                subject=KnowledgeRevisionRef(entry_id="audience-subject", revision=1),
+                object=KnowledgeRevisionRef(entry_id="audience-object", revision=1),
+                kind=KnowledgeRelationKind.DERIVED_FROM,
+            )
+            await store.publish_relations([relation], operation_id="audience-operation")
+            relation_change = next(
+                change
+                for change in (await store.read_changes()).changes
+                if change.relation_id == relation.id
+            )
+            async with store._pool.connection() as conn, conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE cayu_knowledge_change_audiences
+                    SET audience_kind = 'after'
+                    WHERE change_sequence = %s AND audience_kind = 'object_current'
+                    """,
+                    (relation_change.sequence,),
+                )
+                await conn.commit()
+
+            visible = await store.read_changes(
+                after_sequence=relation_change.sequence - 1,
+            )
+            assert all(change.relation_id != relation.id for change in visible.changes)
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
 
 
 class KeywordEmbeddingProvider(TextEmbeddingProvider):
@@ -3755,6 +3933,112 @@ def test_postgres_embedding_store_segregates_models_until_explicit_reindex(
     )
 
 
+def test_postgres_revision_60_refuses_populated_knowledge_without_backfill(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        await _initialize_historical_schema(postgres_dsn, through_revision=59)
+        historical = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        historical._min_required_revision = 59
+        entry = KnowledgeEntry(
+            id="revision-59-entry",
+            text="Revision 60 must not rewrite this populated store.",
+        )
+        try:
+            await historical.create_entry(entry)
+        finally:
+            await historical.close()
+
+        migrator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            with pytest.raises(
+                schema_migrations.SchemaTooOld,
+                match="clean prerelease knowledge-lineage break",
+            ):
+                await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cursor.fetchone() == (59,)
+            await cursor.execute(
+                "SELECT text FROM cayu_knowledge_revisions WHERE entry_id = %s AND revision = 1",
+                (entry.id,),
+            )
+            assert await cursor.fetchone() == (entry.text,)
+            await cursor.execute("SELECT to_regclass('cayu_knowledge_relations')")
+            assert await cursor.fetchone() == (None,)
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_revision_60_initializes_empty_pre_relation_schema_directly(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        await _initialize_historical_schema(postgres_dsn, through_revision=59)
+        migrator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cursor.fetchone() == (60,)
+            await cursor.execute(
+                "SELECT to_regclass('cayu_knowledge_relations'), "
+                "to_regclass('cayu_knowledge_relation_publication_receipts')"
+            )
+            assert await cursor.fetchone() == (
+                "cayu_knowledge_relations",
+                "cayu_knowledge_relation_publication_receipts",
+            )
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
 def test_postgres_revision_43_preserves_revision_42_knowledge_without_fabricated_changes(
     postgres_dsn: str,
 ) -> None:
@@ -3854,13 +4138,15 @@ def test_postgres_revision_43_preserves_revision_42_knowledge_without_fabricated
             )
             await connection.commit()
 
+        await _initialize_historical_schema(postgres_dsn, through_revision=43)
         store = PostgresKnowledgeStore(
             postgres_dsn,
             min_size=1,
             max_size=2,
-            schema_mode=SchemaMode.MIGRATE,
+            schema_mode=SchemaMode.VALIDATE,
             access_scope=_ACCESS_SCOPE,
         )
+        store._min_required_revision = 43
         try:
             replay = await store.publish_entry_revision(
                 entry,
@@ -3875,7 +4161,12 @@ def test_postgres_revision_43_preserves_revision_42_knowledge_without_fabricated
             assert evidence is not None
             assert evidence.evidence == []
             assert evidence.total_evidence_known == 0
-            assert (await store.read_changes()).changes == []
+            async with (
+                await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+                connection.cursor() as cursor,
+            ):
+                await cursor.execute("SELECT COUNT(*) FROM cayu_knowledge_changes")
+                assert await cursor.fetchone() == (0,)
         finally:
             await store.close()
             await _drop_all(postgres_dsn)
@@ -3954,13 +4245,15 @@ def test_postgres_revision_43_preserves_migrated_expiration_cleanup_audiences(
                 )
             await connection.commit()
 
+        await _initialize_historical_schema(postgres_dsn, through_revision=43)
         store = PostgresKnowledgeStore(
             postgres_dsn,
             min_size=1,
             max_size=2,
-            schema_mode=SchemaMode.MIGRATE,
+            schema_mode=SchemaMode.VALIDATE,
             access_scope=None,
         )
+        store._min_required_revision = 43
         future_scope = KnowledgeAccessScope.for_namespace(
             "default",
             required_labels={"expiry": "future"},
@@ -3993,12 +4286,23 @@ def test_postgres_revision_43_preserves_migrated_expiration_cleanup_audiences(
                 )
                 == 2
             )
-            future_changes = await store.read_changes(access_scope=future_scope)
-            assert [change.kind for change in future_changes.changes] == [
-                KnowledgeChangeKind.EXPIRED
-            ]
-            assert future_changes.changes[0].entry_id == entries[0].id
-            assert (await store.read_changes(access_scope=past_scope)).changes == []
+            async with (
+                await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+                connection.cursor() as cursor,
+            ):
+                await cursor.execute(
+                    "SELECT change_record.entry_id, audience.requires_include_expired "
+                    "FROM cayu_knowledge_changes AS change_record "
+                    "JOIN cayu_knowledge_change_audiences AS audience "
+                    "ON audience.change_sequence = change_record.sequence "
+                    "WHERE change_record.kind = 'expired' "
+                    "AND audience.audience_kind = 'before' "
+                    "ORDER BY change_record.entry_id"
+                )
+                assert await cursor.fetchall() == [
+                    ("migrated-future-expiry", False),
+                    ("migrated-past-expiry", True),
+                ]
         finally:
             await store.close()
             await _drop_all(postgres_dsn)
@@ -4012,7 +4316,6 @@ def test_postgres_revision_43_rejects_out_of_contract_revision_42_identities(
     async def run() -> None:
         import psycopg
 
-        from cayu import PostgresKnowledgeStore
         from cayu.storage import postgres as postgres_storage
 
         await _drop_all(postgres_dsn)
@@ -4067,18 +4370,8 @@ def test_postgres_revision_43_rejects_out_of_contract_revision_42_identities(
             )
             await connection.commit()
 
-        migration = PostgresKnowledgeStore(
-            postgres_dsn,
-            min_size=1,
-            max_size=2,
-            schema_mode=SchemaMode.MIGRATE,
-            access_scope=_ACCESS_SCOPE,
-        )
-        try:
-            with pytest.raises(schema_migrations.SchemaTooOld, match="bounds knowledge"):
-                await migration.ensure_schema()
-        finally:
-            await migration.close()
+        with pytest.raises(schema_migrations.SchemaTooOld, match="bounds knowledge"):
+            await _initialize_historical_schema(postgres_dsn, through_revision=43)
 
         async with (
             await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
@@ -4226,102 +4519,3 @@ def test_postgres_revision_migration_refuses_unversioned_knowledge_before_ddl(
         asyncio.run(run())
     finally:
         asyncio.run(_drop_all(postgres_dsn))
-
-
-def test_postgres_revision_44_preserves_canonical_knowledge_and_rebuilds_derived_index(
-    postgres_dsn: str,
-) -> None:
-    async def ops():
-        import psycopg
-
-        from cayu import (
-            PostgresEmbeddingKnowledgeStore,
-            PostgresKnowledgeStore,
-            PostgresSessionStore,
-        )
-
-        await _drop_all(postgres_dsn)
-        await _skip_if_pgvector_unavailable(postgres_dsn)
-        store = _new_store(postgres_dsn)
-        try:
-            await store.create_entry(
-                KnowledgeEntry(id="revision-44-doc", text="GitHub credential proxy runbook.")
-            )
-        finally:
-            await store.close()
-
-        # Simulate revision 43 with one populated pre-identity derived table.
-        async with (
-            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
-            conn.cursor() as cur,
-        ):
-            await cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-            await cur.execute("DROP TABLE cayu_knowledge_index_readiness_current")
-            await cur.execute("DROP TABLE cayu_knowledge_index_readiness_events")
-            await cur.execute(
-                """
-                CREATE TABLE cayu_knowledge_embeddings (
-                    chunk_id TEXT PRIMARY KEY,
-                    entry_id TEXT NOT NULL,
-                    content_hash TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    dimensions INTEGER NOT NULL,
-                    embedding vector(3) NOT NULL,
-                    embedding_space_version INTEGER NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL
-                )
-                """
-            )
-            await cur.execute(
-                """
-                INSERT INTO cayu_knowledge_embeddings VALUES (
-                    'revision-44-doc:r1:0', 'revision-44-doc', 'legacy-hash',
-                    'legacy-model', 3, '[1,0,0]'::vector, 1, NOW(), NOW()
-                )
-                """
-            )
-            await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 44")
-            await conn.commit()
-
-        session_store = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
-        try:
-            await session_store.ensure_schema()
-        finally:
-            await session_store.close()
-
-        canonical = PostgresKnowledgeStore(
-            postgres_dsn,
-            access_scope=_ACCESS_SCOPE,
-            schema_mode=SchemaMode.VALIDATE,
-        )
-        try:
-            loaded = await canonical.get_entry("revision-44-doc")
-            readiness = await canonical.read_index_readiness(limit=10)
-        finally:
-            await canonical.close()
-
-        rebuilt = PostgresEmbeddingKnowledgeStore(
-            postgres_dsn,
-            access_scope=_ACCESS_SCOPE,
-            schema_mode=SchemaMode.CREATE,
-            embedding_provider=KeywordEmbeddingProvider(),
-            embedding_model="test-embedding",
-            embedding_dimensions=3,
-        )
-        try:
-            backfill = await rebuilt.backfill_embeddings()
-            result = await rebuilt.search(
-                KnowledgeQuery(text="auth broker", mode=KnowledgeSearchMode.SEMANTIC)
-            )
-        finally:
-            await rebuilt.close()
-        return loaded, readiness, backfill, result
-
-    loaded, readiness, backfill, result = asyncio.run(ops())
-
-    assert loaded is not None
-    assert loaded.text == "GitHub credential proxy runbook."
-    assert readiness.readiness == []
-    assert backfill.indexed_records == 1
-    assert [hit.entry.id for hit in result.hits] == ["revision-44-doc"]

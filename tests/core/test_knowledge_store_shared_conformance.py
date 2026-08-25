@@ -14,6 +14,10 @@ from tests.core.knowledge_access_scope_conformance import (
 from tests.core.knowledge_index_readiness_conformance import (
     assert_index_readiness_conformance,
 )
+from tests.core.knowledge_relation_conformance import (
+    assert_knowledge_relation_conformance,
+    assert_knowledge_relation_scope_conformance,
+)
 from tests.core.knowledge_store_conformance import (
     CORE_KNOWLEDGE_STORE_SCENARIOS,
     KnowledgeStoreCapabilities,
@@ -66,6 +70,7 @@ def knowledge_store_case(
     supported = KnowledgeStoreCapabilityClaim.supported()
     lexical_capabilities = KnowledgeStoreCapabilities(
         owned_publication=supported,
+        revision_relations=supported,
         change_outbox=supported,
         index_readiness=supported,
         embedding_projections=KnowledgeStoreCapabilityClaim.not_applicable(
@@ -186,6 +191,25 @@ def test_knowledge_store_registered_closure_scenarios(knowledge_store_case) -> N
         unbound = await _open_store(knowledge_store_case, access_scope=None)
         try:
             await verify_access_scope(unbound, adapter=knowledge_store_case.name)
+        finally:
+            await _close_store(unbound)
+            await _reset_case(knowledge_store_case)
+
+    asyncio.run(run())
+
+
+def test_knowledge_store_shared_relation_contract(knowledge_store_case) -> None:
+    async def run() -> None:
+        await _reset_case(knowledge_store_case)
+        store = await _open_store(knowledge_store_case)
+        try:
+            await assert_knowledge_relation_conformance(store)
+        finally:
+            await _close_store(store)
+
+        unbound = await _open_store(knowledge_store_case, access_scope=None)
+        try:
+            await assert_knowledge_relation_scope_conformance(unbound)
         finally:
             await _close_store(unbound)
             await _reset_case(knowledge_store_case)
@@ -1380,6 +1404,77 @@ def test_durable_knowledge_store_rolls_back_when_change_publication_fails(
             assert await store.get_entry(entry.id) is None
             assert await store.read_evidence(entry.id) is None
             assert (await store.read_changes()).changes == []
+        finally:
+            await _close_store(store)
+            await _reset_case(knowledge_store_case)
+
+    asyncio.run(run())
+
+
+def test_durable_knowledge_relation_publication_rolls_back_when_outbox_fails(
+    knowledge_store_case,
+    monkeypatch,
+) -> None:
+    if not knowledge_store_case.durable:
+        pytest.skip("Transaction fault injection applies to durable stores.")
+
+    async def run() -> None:
+        from cayu.storage import (
+            KnowledgeRelation,
+            KnowledgeRelationKind,
+            KnowledgeRelationQuery,
+            KnowledgeRevisionRef,
+        )
+
+        await _reset_case(knowledge_store_case)
+        store = await _open_store(knowledge_store_case)
+        try:
+            subject = KnowledgeEntry(id="failed-relation-subject", text="subject")
+            object_ = KnowledgeEntry(id="failed-relation-object", text="object")
+            await store.create_entry(subject)
+            await store.create_entry(object_)
+
+            if knowledge_store_case.name == "sqlite":
+
+                def fail_change(*_args, **_kwargs):
+                    raise RuntimeError("injected relation change failure")
+
+            else:
+
+                async def fail_change(*_args, **_kwargs):
+                    raise RuntimeError("injected relation change failure")
+
+            monkeypatch.setattr(
+                store,
+                "_insert_relation_change_unlocked",
+                fail_change,
+                raising=False,
+            )
+            monkeypatch.setattr(
+                store,
+                "_insert_relation_change",
+                fail_change,
+                raising=False,
+            )
+            relation = KnowledgeRelation(
+                id="failed-relation",
+                subject=KnowledgeRevisionRef(entry_id=subject.id, revision=1),
+                object=KnowledgeRevisionRef(entry_id=object_.id, revision=1),
+                kind=KnowledgeRelationKind.DERIVED_FROM,
+            )
+            with pytest.raises(RuntimeError, match="injected relation change failure"):
+                await store.publish_relations(
+                    [relation],
+                    operation_id="failed-relation-operation",
+                )
+            assert (
+                await store.load_relation_publication_receipt("failed-relation-operation") is None
+            )
+            result = await store.read_relations(KnowledgeRelationQuery(reference=relation.subject))
+            assert result is not None
+            assert result.relations == []
+            changes = await store.read_changes()
+            assert all(change.relation_id is None for change in changes.changes)
         finally:
             await _close_store(store)
             await _reset_case(knowledge_store_case)

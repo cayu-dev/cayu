@@ -28,6 +28,8 @@ from cayu.evals.store import (
     EvalRunRequest,
     EvalRunStatus,
 )
+from cayu.storage import _sqlite_support as sqlite_support
+from cayu.storage import migrations as schema_migrations
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 from cayu.storage.migrations import SchemaMode
 from cayu.vaults.redaction import SecretRedactor
@@ -184,38 +186,40 @@ def test_sqlite_eval_store_creates_revision_fifty_eight_schema(tmp_path) -> None
     }
 
 
-def test_sqlite_eval_store_accepts_revision_fifty_six_without_verifier_profiles(
+def test_sqlite_eval_store_migrates_empty_revision_fifty_six_without_verifier_profiles(
     tmp_path,
 ) -> None:
     path = tmp_path / "evals-revision-56.db"
-
-    async def initialize() -> None:
-        store = SQLiteEvalStore(path)
-        await store.close()
-
-    asyncio.run(initialize())
-    connection = sqlite3.connect(path)
+    connection = sqlite_support.connect(path)
+    revisions = schema_migrations.REVISIONS
     try:
-        connection.executescript(
-            """
-            DROP TABLE cayu_completion_verifier_profiles;
-            ALTER TABLE cayu_completion_verification_claims
-                DROP COLUMN verifier_profile_fingerprint;
-            ALTER TABLE cayu_completion_decisions
-                DROP COLUMN verifier_profile_fingerprint;
-            DELETE FROM cayu_schema_migrations WHERE revision >= 57;
-            PRAGMA user_version = 56;
-            """
+        schema_migrations.REVISIONS = tuple(
+            revision for revision in revisions if revision.revision <= 56
         )
-        connection.commit()
+        sqlite_support.reconcile_schema(
+            connection,
+            SchemaMode.MIGRATE,
+            app_min_supported=56,
+        )
     finally:
+        schema_migrations.REVISIONS = revisions
         connection.close()
 
     async def validate() -> None:
-        store = SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
+        store = SQLiteEvalStore(path, schema_mode=SchemaMode.MIGRATE)
         await store.close()
 
     asyncio.run(validate())
+
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone() == (60,)
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'cayu_completion_verifier_profiles'"
+        ).fetchone() == (1,)
+    finally:
+        connection.close()
 
 
 def test_sqlite_revision_fifty_three_adds_scenarios_without_rewriting_corpora(

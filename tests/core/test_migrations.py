@@ -293,6 +293,22 @@ def test_revision_fifty_nine_breaks_for_result_resolver_authority() -> None:
         )
 
 
+def test_revision_sixty_breaks_for_revision_bound_knowledge_relations() -> None:
+    state = m.SchemaState(revision=60, compatible_from=60)
+
+    # Pre-60 knowledge workers cannot preserve relation records, receipts, or
+    # their atomic outbox events.
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 60"):
+        m.validate(state, app_latest=59, app_min_supported=59)
+    m.validate(state, app_latest=60, app_min_supported=60)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 60"):
+        m.validate(
+            m.SchemaState(revision=59, compatible_from=59),
+            app_latest=60,
+            app_min_supported=60,
+        )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

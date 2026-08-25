@@ -2658,6 +2658,216 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_sessions_instance_id
             ON cayu_sessions(instance_id);
     """,
+    60: """
+        DROP TABLE IF EXISTS cayu_knowledge_relation_publication_receipts;
+        DROP TABLE IF EXISTS cayu_knowledge_relations;
+        DROP TABLE IF EXISTS cayu_knowledge_change_acknowledgements;
+        DROP TABLE IF EXISTS cayu_knowledge_change_consumers;
+        DROP TABLE IF EXISTS cayu_knowledge_change_labels;
+        DROP TABLE IF EXISTS cayu_knowledge_change_audiences;
+        DROP TABLE IF EXISTS cayu_knowledge_changes;
+
+        CREATE TABLE cayu_knowledge_relations (
+            id TEXT PRIMARY KEY,
+            subject_entry_id TEXT NOT NULL,
+            subject_revision INTEGER NOT NULL
+                CHECK (subject_revision > 0 AND subject_revision <= 2147483647),
+            object_entry_id TEXT NOT NULL,
+            object_revision INTEGER NOT NULL
+                CHECK (object_revision > 0 AND object_revision <= 2147483647),
+            kind TEXT NOT NULL CHECK (
+                kind IN ('supersedes', 'derived_from', 'contradicts')
+            ),
+            created_by_type TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            policy_id TEXT,
+            created_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL CHECK (json_valid(metadata_json)),
+            CHECK (subject_entry_id <> object_entry_id),
+            CHECK (
+                kind <> 'contradicts'
+                OR subject_entry_id COLLATE BINARY < object_entry_id COLLATE BINARY
+            ),
+            UNIQUE (
+                kind,
+                subject_entry_id,
+                subject_revision,
+                object_entry_id,
+                object_revision
+            ),
+            FOREIGN KEY (subject_entry_id, subject_revision)
+                REFERENCES cayu_knowledge_revisions(entry_id, revision) ON DELETE CASCADE,
+            FOREIGN KEY (object_entry_id, object_revision)
+                REFERENCES cayu_knowledge_revisions(entry_id, revision) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_cayu_knowledge_relations_subject
+            ON cayu_knowledge_relations(
+                subject_entry_id, subject_revision, created_at, id COLLATE BINARY
+            );
+        CREATE INDEX idx_cayu_knowledge_relations_object
+            ON cayu_knowledge_relations(
+                object_entry_id, object_revision, created_at, id COLLATE BINARY
+            );
+        CREATE INDEX idx_cayu_knowledge_relations_subject_kind
+            ON cayu_knowledge_relations(
+                subject_entry_id, subject_revision, kind, created_at, id COLLATE BINARY
+            );
+        CREATE INDEX idx_cayu_knowledge_relations_object_kind
+            ON cayu_knowledge_relations(
+                object_entry_id, object_revision, kind, created_at, id COLLATE BINARY
+            );
+
+        CREATE TABLE cayu_knowledge_relation_publication_receipts (
+            operation_id TEXT PRIMARY KEY,
+            relation_ids_json TEXT NOT NULL CHECK (json_valid(relation_ids_json)),
+            request_sha256 TEXT NOT NULL CHECK (
+                length(request_sha256) = 64
+                AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            committed_at TEXT NOT NULL,
+            access_snapshots_json TEXT NOT NULL CHECK (json_valid(access_snapshots_json))
+        );
+
+        CREATE TABLE cayu_knowledge_changes (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT
+                CHECK (sequence > 0 AND sequence <= 9223372036854775807),
+            id TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL CHECK (
+                kind IN (
+                    'created',
+                    'revision_appended',
+                    'status_transitioned',
+                    'tombstoned',
+                    'hard_deleted',
+                    'expired',
+                    'relation_published'
+                )
+            ),
+            entry_id TEXT NOT NULL,
+            entry_revision INTEGER NOT NULL
+                CHECK (entry_revision > 0 AND entry_revision <= 2147483647),
+            committed_at TEXT NOT NULL,
+            operation_id TEXT,
+            relation_id TEXT,
+            CHECK (
+                (kind = 'relation_published' AND relation_id IS NOT NULL)
+                OR (kind <> 'relation_published' AND relation_id IS NULL)
+            )
+        );
+
+        CREATE TABLE cayu_knowledge_change_audiences (
+            change_sequence INTEGER NOT NULL,
+            audience_kind TEXT NOT NULL CHECK (
+                audience_kind IN (
+                    'before',
+                    'after',
+                    'subject_exact',
+                    'subject_current',
+                    'object_exact',
+                    'object_current'
+                )
+            ),
+            namespace TEXT NOT NULL,
+            visibility TEXT NOT NULL,
+            source_type TEXT,
+            source_id TEXT,
+            status TEXT NOT NULL,
+            requires_include_expired INTEGER NOT NULL CHECK (
+                requires_include_expired IN (0, 1)
+            ),
+            PRIMARY KEY (change_sequence, audience_kind),
+            FOREIGN KEY (change_sequence)
+                REFERENCES cayu_knowledge_changes(sequence) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_cayu_knowledge_changes_entry_revision
+            ON cayu_knowledge_changes(entry_id, entry_revision, sequence);
+        CREATE INDEX idx_cayu_knowledge_changes_operation
+            ON cayu_knowledge_changes(operation_id, sequence)
+            WHERE operation_id IS NOT NULL;
+        CREATE UNIQUE INDEX idx_cayu_knowledge_changes_relation
+            ON cayu_knowledge_changes(relation_id)
+            WHERE relation_id IS NOT NULL;
+        CREATE INDEX idx_cayu_knowledge_change_audiences_namespace
+            ON cayu_knowledge_change_audiences(
+                namespace, change_sequence, audience_kind
+            );
+        CREATE INDEX idx_cayu_knowledge_change_audiences_status
+            ON cayu_knowledge_change_audiences(status, change_sequence, audience_kind);
+        CREATE INDEX idx_cayu_knowledge_change_audiences_source
+            ON cayu_knowledge_change_audiences(
+                source_type, source_id, change_sequence, audience_kind
+            );
+
+        CREATE TABLE cayu_knowledge_change_labels (
+            change_sequence INTEGER NOT NULL,
+            audience_kind TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (change_sequence, audience_kind, key),
+            FOREIGN KEY (change_sequence, audience_kind)
+                REFERENCES cayu_knowledge_change_audiences(
+                    change_sequence, audience_kind
+                ) ON DELETE CASCADE
+        );
+
+        CREATE INDEX idx_cayu_knowledge_change_labels_lookup
+            ON cayu_knowledge_change_labels(
+                key, value, change_sequence, audience_kind
+            );
+
+        CREATE TABLE cayu_knowledge_change_consumers (
+            consumer_id TEXT PRIMARY KEY,
+            access_scope_sha256 TEXT NOT NULL,
+            cursor_sequence INTEGER NOT NULL DEFAULT 0 CHECK (cursor_sequence >= 0),
+            pending_change_sequence INTEGER,
+            pending_claim_id TEXT,
+            pending_worker_id TEXT,
+            pending_attempt INTEGER NOT NULL DEFAULT 0 CHECK (pending_attempt >= 0),
+            claimed_at TEXT,
+            lease_expires_at TEXT,
+            last_acknowledged_claim_id TEXT,
+            updated_at TEXT NOT NULL,
+            CHECK (
+                (pending_change_sequence IS NULL
+                    AND pending_claim_id IS NULL
+                    AND pending_worker_id IS NULL
+                    AND claimed_at IS NULL
+                    AND lease_expires_at IS NULL)
+                OR
+                (pending_change_sequence IS NOT NULL
+                    AND pending_change_sequence > cursor_sequence
+                    AND pending_claim_id IS NOT NULL
+                    AND pending_worker_id IS NOT NULL
+                    AND pending_attempt > 0
+                    AND claimed_at IS NOT NULL
+                    AND lease_expires_at IS NOT NULL
+                    AND lease_expires_at > claimed_at)
+            ),
+            FOREIGN KEY (pending_change_sequence)
+                REFERENCES cayu_knowledge_changes(sequence)
+        );
+        CREATE INDEX idx_cayu_knowledge_change_consumers_lease
+            ON cayu_knowledge_change_consumers(lease_expires_at)
+            WHERE pending_change_sequence IS NOT NULL;
+
+        CREATE TABLE cayu_knowledge_change_acknowledgements (
+            consumer_id TEXT NOT NULL,
+            claim_id TEXT NOT NULL,
+            claim_sha256 TEXT NOT NULL CHECK (
+                length(claim_sha256) = 64
+                AND claim_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            change_sequence INTEGER NOT NULL,
+            acknowledged_at TEXT NOT NULL,
+            PRIMARY KEY (consumer_id, claim_id),
+            FOREIGN KEY (consumer_id)
+                REFERENCES cayu_knowledge_change_consumers(consumer_id) ON DELETE CASCADE,
+            FOREIGN KEY (change_sequence)
+                REFERENCES cayu_knowledge_changes(sequence)
+        );
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -2921,6 +3131,47 @@ def _reject_populated_pre_knowledge_revision_database(
         counts,
         required_tables=inspected,
     )
+
+
+def _reject_populated_pre_knowledge_relation_database(
+    connection: sqlite3.Connection,
+) -> None:
+    candidates = (
+        "cayu_knowledge_entries",
+        "cayu_knowledge_revisions",
+        "cayu_knowledge_chunks",
+        "cayu_knowledge_chunks_fts",
+        "cayu_knowledge_labels",
+        "cayu_knowledge_aspects",
+        "cayu_knowledge_impact_targets",
+        "cayu_knowledge_evidence",
+        "cayu_knowledge_publication_receipts",
+        "cayu_knowledge_relations",
+        "cayu_knowledge_relation_publication_receipts",
+        "cayu_knowledge_changes",
+        "cayu_knowledge_change_audiences",
+        "cayu_knowledge_change_labels",
+        "cayu_knowledge_change_consumers",
+        "cayu_knowledge_change_acknowledgements",
+        "cayu_knowledge_index_readiness_events",
+        "cayu_knowledge_index_readiness_current",
+        "cayu_knowledge_embeddings",
+    )
+    existing = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'cayu_knowledge_%'"
+        )
+    }
+    for table in candidates:
+        if table not in existing:
+            continue
+        if connection.execute(f"SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)").fetchone()[0]:
+            raise schema.SchemaTooOld(
+                "Storage revision 60 is a clean prerelease knowledge-lineage break "
+                "and cannot migrate a populated Cayu knowledge database. Recreate "
+                "the Cayu knowledge database before starting this build."
+            )
 
 
 def _reject_populated_pre_transcript_search_database(
@@ -3828,6 +4079,12 @@ def reconcile_schema(
         _reject_populated_pre_knowledge_revision_database(connection)
     if (
         schema_mode is not schema.SchemaMode.VALIDATE
+        and state.revision < 60
+        and any(revision.revision == 60 for revision in schema.pending(state.revision))
+    ):
+        _reject_populated_pre_knowledge_relation_database(connection)
+    if (
+        schema_mode is not schema.SchemaMode.VALIDATE
         and state.revision == schema.UNINITIALIZED
         and any(revision.revision == 46 for revision in schema.pending(state.revision))
     ):
@@ -3885,9 +4142,14 @@ def reconcile_schema(
     if current.revision >= 42:
         _validate_revision_42_knowledge_schema(connection)
     if current.revision >= 43:
-        _validate_revision_43_knowledge_schema(connection)
+        _validate_revision_43_knowledge_schema(
+            connection,
+            relation_aware=current.revision >= 60,
+        )
     if current.revision >= 44:
         _validate_revision_44_knowledge_schema(connection)
+    if current.revision >= 60:
+        _validate_revision_60_knowledge_schema(connection)
     if app_min_supported >= 38:
         _validate_task_terminalization_receipt_table(connection)
     if app_min_supported >= 39:
@@ -4336,7 +4598,11 @@ def _validate_revision_42_knowledge_schema(connection: sqlite3.Connection) -> No
             _raise_revision_42_sqlite_schema_error(table)
 
 
-def _validate_revision_43_knowledge_schema(connection: sqlite3.Connection) -> None:
+def _validate_revision_43_knowledge_schema(
+    connection: sqlite3.Connection,
+    *,
+    relation_aware: bool = False,
+) -> None:
     expected_columns = {
         "cayu_knowledge_evidence": (
             "id",
@@ -4362,6 +4628,7 @@ def _validate_revision_43_knowledge_schema(connection: sqlite3.Connection) -> No
             "entry_revision",
             "committed_at",
             "operation_id",
+            *(("relation_id",) if relation_aware else ()),
         ),
         "cayu_knowledge_change_audiences": (
             "change_sequence",
@@ -4582,7 +4849,7 @@ def _validate_revision_43_knowledge_schema(connection: sqlite3.Connection) -> No
         ),
         "idx_cayu_knowledge_changes_operation": (
             "cayu_knowledge_changes",
-            ("operation_id",),
+            (("operation_id", "sequence") if relation_aware else ("operation_id",)),
         ),
         "idx_cayu_knowledge_change_consumers_lease": (
             "cayu_knowledge_change_consumers",
@@ -4632,11 +4899,21 @@ def _validate_revision_43_knowledge_schema(connection: sqlite3.Connection) -> No
         "cayu_knowledge_changes": (
             "check (sequence > 0 and sequence <= 9223372036854775807)",
             "check (entry_revision > 0 and entry_revision <= 2147483647)",
-            "kind in ( 'created', 'revision_appended', 'status_transitioned', "
-            "'tombstoned', 'hard_deleted', 'expired' )",
+            (
+                "kind in ( 'created', 'revision_appended', 'status_transitioned', "
+                "'tombstoned', 'hard_deleted', 'expired', 'relation_published' )"
+                if relation_aware
+                else "kind in ( 'created', 'revision_appended', 'status_transitioned', "
+                "'tombstoned', 'hard_deleted', 'expired' )"
+            ),
         ),
         "cayu_knowledge_change_audiences": (
-            "check (audience_kind in ('before', 'after'))",
+            (
+                "check ( audience_kind in ( 'before', 'after', 'subject_exact', "
+                "'subject_current', 'object_exact', 'object_current' ) )"
+                if relation_aware
+                else "check (audience_kind in ('before', 'after'))"
+            ),
             "check ( requires_include_expired in (0, 1) )",
         ),
         "cayu_knowledge_change_consumers": (
@@ -4662,6 +4939,176 @@ def _validate_revision_43_knowledge_schema(connection: sqlite3.Connection) -> No
 
 def _normalize_sqlite_schema_sql(value: object | None) -> str:
     return " ".join(str(value or "").lower().split())
+
+
+def _validate_revision_60_knowledge_schema(connection: sqlite3.Connection) -> None:
+    expected_columns = {
+        "cayu_knowledge_relations": (
+            "id",
+            "subject_entry_id",
+            "subject_revision",
+            "object_entry_id",
+            "object_revision",
+            "kind",
+            "created_by_type",
+            "created_by",
+            "policy_id",
+            "created_at",
+            "metadata_json",
+        ),
+        "cayu_knowledge_relation_publication_receipts": (
+            "operation_id",
+            "relation_ids_json",
+            "request_sha256",
+            "committed_at",
+            "access_snapshots_json",
+        ),
+    }
+    for table, columns in expected_columns.items():
+        if _sqlite_table_columns(connection, table) != columns:
+            _raise_revision_60_sqlite_schema_error(table)
+
+    relation_foreign_keys = tuple(
+        sorted(
+            (
+                str(row[2]),
+                str(row[3]),
+                str(row[4]),
+                str(row[6]).upper(),
+            )
+            for row in connection.execute("PRAGMA foreign_key_list(cayu_knowledge_relations)")
+        )
+    )
+    expected_foreign_keys = tuple(
+        sorted(
+            (
+                (
+                    "cayu_knowledge_revisions",
+                    "subject_entry_id",
+                    "entry_id",
+                    "CASCADE",
+                ),
+                (
+                    "cayu_knowledge_revisions",
+                    "subject_revision",
+                    "revision",
+                    "CASCADE",
+                ),
+                (
+                    "cayu_knowledge_revisions",
+                    "object_entry_id",
+                    "entry_id",
+                    "CASCADE",
+                ),
+                (
+                    "cayu_knowledge_revisions",
+                    "object_revision",
+                    "revision",
+                    "CASCADE",
+                ),
+            )
+        )
+    )
+    if relation_foreign_keys != expected_foreign_keys:
+        _raise_revision_60_sqlite_schema_error("cayu_knowledge_relations")
+    if tuple(
+        connection.execute("PRAGMA foreign_key_list(cayu_knowledge_relation_publication_receipts)")
+    ):
+        _raise_revision_60_sqlite_schema_error("cayu_knowledge_relation_publication_receipts")
+
+    for table, key in (
+        ("cayu_knowledge_relations", ("id",)),
+        (
+            "cayu_knowledge_relations",
+            (
+                "kind",
+                "subject_entry_id",
+                "subject_revision",
+                "object_entry_id",
+                "object_revision",
+            ),
+        ),
+        ("cayu_knowledge_relation_publication_receipts", ("operation_id",)),
+        ("cayu_knowledge_changes", ("relation_id",)),
+    ):
+        if not _sqlite_has_unique_index(connection, table, key):
+            _raise_revision_60_sqlite_schema_error(table)
+
+    required_indexes = {
+        "idx_cayu_knowledge_relations_subject": (
+            "cayu_knowledge_relations",
+            ("subject_entry_id", "subject_revision", "created_at", "id"),
+        ),
+        "idx_cayu_knowledge_relations_object": (
+            "cayu_knowledge_relations",
+            ("object_entry_id", "object_revision", "created_at", "id"),
+        ),
+        "idx_cayu_knowledge_relations_subject_kind": (
+            "cayu_knowledge_relations",
+            ("subject_entry_id", "subject_revision", "kind", "created_at", "id"),
+        ),
+        "idx_cayu_knowledge_relations_object_kind": (
+            "cayu_knowledge_relations",
+            ("object_entry_id", "object_revision", "kind", "created_at", "id"),
+        ),
+        "idx_cayu_knowledge_changes_relation": (
+            "cayu_knowledge_changes",
+            ("relation_id",),
+        ),
+    }
+    for index, (table, columns) in required_indexes.items():
+        row = connection.execute(
+            "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index,),
+        ).fetchone()
+        actual_columns = tuple(
+            str(column[2]) for column in connection.execute(f"PRAGMA index_info({index})")
+        )
+        if row is None or str(row[0]) != table or actual_columns != columns:
+            _raise_revision_60_sqlite_schema_error(index)
+        normalized = _normalize_sqlite_schema_sql(row[1])
+        if index.startswith("idx_cayu_knowledge_relations_") and (
+            "id collate binary" not in normalized
+        ):
+            _raise_revision_60_sqlite_schema_error(index)
+        if index == "idx_cayu_knowledge_changes_relation" and (
+            "where relation_id is not null" not in normalized
+        ):
+            _raise_revision_60_sqlite_schema_error(index)
+
+    required_sql = {
+        "cayu_knowledge_relations": (
+            "kind in ('supersedes', 'derived_from', 'contradicts')",
+            "subject_entry_id <> object_entry_id",
+            "kind <> 'contradicts' or subject_entry_id collate binary < object_entry_id collate binary",
+            "json_valid(metadata_json)",
+        ),
+        "cayu_knowledge_relation_publication_receipts": (
+            "json_valid(relation_ids_json)",
+            "json_valid(access_snapshots_json)",
+            "length(request_sha256) = 64",
+        ),
+        "cayu_knowledge_changes": (
+            "kind = 'relation_published' and relation_id is not null",
+            "kind <> 'relation_published' and relation_id is null",
+        ),
+    }
+    for table, fragments in required_sql.items():
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        normalized = _normalize_sqlite_schema_sql(None if row is None else row[0])
+        if any(fragment not in normalized for fragment in fragments):
+            _raise_revision_60_sqlite_schema_error(table)
+
+
+def _raise_revision_60_sqlite_schema_error(name: str) -> NoReturn:
+    raise RuntimeError(
+        "SQLite schema object "
+        f"{name!r} conflicts with Cayu's revision-bound knowledge relation contract. "
+        "Recreate the prerelease knowledge database with schema_mode=CREATE or MIGRATE."
+    )
 
 
 def _validate_revision_44_knowledge_schema(connection: sqlite3.Connection) -> None:
@@ -6098,6 +6545,12 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _reject_populated_pre_targeted_tool_grant_database(connection)
         if rev.revision == 59:
             _reject_populated_pre_result_resolver_database(connection)
+        if rev.revision == 60:
+            # Recheck while BEGIN IMMEDIATE excludes legacy writers. The earlier
+            # preflight preserves a populated database before any schema DDL;
+            # this fence closes the race between that check and replacement of
+            # the empty prerelease knowledge outbox/relation tables.
+            _reject_populated_pre_knowledge_relation_database(connection)
         for table, column, decl in _MIGRATION_ADD_COLUMNS.get(rev.revision, ()):
             _add_column_if_missing(connection, table, column, decl)
         for table, column in _MIGRATION_DROP_COLUMNS.get(rev.revision, ()):

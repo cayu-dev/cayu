@@ -25,23 +25,23 @@
       "backend": "memory",
       "incremental_projection_bytes": 125304,
       "incremental_projection_latency": {
-        "p50_ms": 163.461958,
-        "p95_ms": 188.544958
+        "p50_ms": 155.753812,
+        "p95_ms": 184.295458
       },
       "persistence_latency": {
-        "p50_ms": 1.425584,
-        "p95_ms": 2.305625
+        "p50_ms": 1.332271,
+        "p95_ms": 1.494458
       },
-      "populated_p95_ratio_to_zero_record": 419.875543,
+      "populated_p95_ratio_to_zero_record": 441.569397,
       "populated_report_bytes": 132080,
       "populated_runtime_evidence_latency": {
-        "p50_ms": 163.832583,
-        "p95_ms": 188.873875
+        "p50_ms": 156.092709,
+        "p95_ms": 184.64975
       },
       "populated_storage_bytes": null,
       "preparation_latency": {
-        "p50_ms": 0.890937,
-        "p95_ms": 1.122208
+        "p50_ms": 0.819063,
+        "p95_ms": 0.919375
       },
       "projection_bytes_per_pair": 2506.08,
       "projection_iteration_count": 30,
@@ -50,8 +50,8 @@
       "storage_bytes_per_pair": null,
       "zero_record_report_bytes": 6776,
       "zero_record_runtime_evidence_latency": {
-        "p50_ms": 0.343875,
-        "p95_ms": 0.449833
+        "p50_ms": 0.333438,
+        "p95_ms": 0.418167
       },
       "zero_record_storage_bytes": null
     },
@@ -59,23 +59,23 @@
       "backend": "sqlite",
       "incremental_projection_bytes": 125304,
       "incremental_projection_latency": {
-        "p50_ms": 238.326437,
-        "p95_ms": 271.703083
+        "p50_ms": 225.362687,
+        "p95_ms": 257.273208
       },
       "persistence_latency": {
-        "p50_ms": 3.092271,
-        "p95_ms": 5.332333
+        "p50_ms": 2.885667,
+        "p95_ms": 3.258208
       },
-      "populated_p95_ratio_to_zero_record": 182.616472,
+      "populated_p95_ratio_to_zero_record": 178.562564,
       "populated_report_bytes": 132080,
       "populated_runtime_evidence_latency": {
-        "p50_ms": 239.631604,
-        "p95_ms": 272.882333
+        "p50_ms": 226.503667,
+        "p95_ms": 258.640375
       },
-      "populated_storage_bytes": 1662976,
+      "populated_storage_bytes": 1744896,
       "preparation_latency": {
-        "p50_ms": 0.864979,
-        "p95_ms": 1.119625
+        "p50_ms": 0.811292,
+        "p95_ms": 0.944291
       },
       "projection_bytes_per_pair": 2506.08,
       "projection_iteration_count": 30,
@@ -84,10 +84,10 @@
       "storage_bytes_per_pair": 10158.08,
       "zero_record_report_bytes": 6776,
       "zero_record_runtime_evidence_latency": {
-        "p50_ms": 1.221542,
-        "p95_ms": 1.494292
+        "p50_ms": 1.232417,
+        "p95_ms": 1.448458
       },
-      "zero_record_storage_bytes": 1155072
+      "zero_record_storage_bytes": 1236992
     }
   ],
   "schema_version": "cayu.memory_evidence_performance.v1",

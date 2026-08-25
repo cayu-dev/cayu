@@ -51,6 +51,10 @@ MAX_KNOWLEDGE_ENTRY_ID_BYTES = 256
 MAX_KNOWLEDGE_REVISION = 2**31 - 1
 MAX_KNOWLEDGE_EVIDENCE_BYTES = DEFAULT_KNOWLEDGE_MAX_BYTES
 MAX_KNOWLEDGE_EVIDENCE_JSON_BYTES = 16_384
+MAX_KNOWLEDGE_RELATION_BATCH = 100
+MAX_KNOWLEDGE_RELATION_BYTES = 8_192
+MAX_KNOWLEDGE_RELATION_CURSOR_BYTES = 2_048
+MAX_KNOWLEDGE_RELATION_LIMIT = 1_000
 MAX_KNOWLEDGE_EMBEDDING_DIMENSIONS = 2**31 - 1
 MAX_KNOWLEDGE_INDEX_READINESS_LIMIT = 1_000
 MAX_KNOWLEDGE_EMBEDDING_WORK_RECORD_LIMIT = 10_000
@@ -140,6 +144,20 @@ class KnowledgeEvidenceDisposition(StrEnum):
     RETAINED = "retained"
 
 
+class KnowledgeRelationKind(StrEnum):
+    """Closed semantic vocabulary for exact cross-entry knowledge lineage."""
+
+    SUPERSEDES = "supersedes"
+    DERIVED_FROM = "derived_from"
+    CONTRADICTS = "contradicts"
+
+
+class KnowledgeRelationDirection(StrEnum):
+    OUTGOING = "outgoing"
+    INCOMING = "incoming"
+    BOTH = "both"
+
+
 class KnowledgeChangeKind(StrEnum):
     CREATED = "created"
     REVISION_APPENDED = "revision_appended"
@@ -147,6 +165,7 @@ class KnowledgeChangeKind(StrEnum):
     TOMBSTONED = "tombstoned"
     HARD_DELETED = "hard_deleted"
     EXPIRED = "expired"
+    RELATION_PUBLISHED = "relation_published"
 
 
 class KnowledgeIndexState(StrEnum):
@@ -189,6 +208,14 @@ class KnowledgeEvidenceConflict(RuntimeError):
     def __init__(self, operation: str) -> None:
         self.operation = require_clean_nonblank(operation, "operation")
         super().__init__("Knowledge evidence identity conflicts with durable state.")
+
+
+class KnowledgeRelationConflict(RuntimeError):
+    """A relation publication conflicts with immutable durable state."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = require_clean_nonblank(reason, "reason")
+        super().__init__("Knowledge relation publication conflicts with durable state.")
 
 
 class KnowledgeRevisionConflict(RuntimeError):
@@ -502,12 +529,45 @@ class _KnowledgeAccessSnapshot(BaseModel):
         return copy_label_map(value, "labels")
 
 
-class _KnowledgeChangeAudience(BaseModel):
-    """One immutable before/after authorization audience for a change."""
+class _KnowledgeRelationAccessSnapshot(BaseModel):
+    """Immutable exact-and-current authorization projection for one relation."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    kind: Literal["before", "after"]
+    subject_exact: _KnowledgeAccessSnapshot
+    subject_current: _KnowledgeAccessSnapshot
+    object_exact: _KnowledgeAccessSnapshot
+    object_current: _KnowledgeAccessSnapshot
+
+    @field_validator(
+        "subject_exact",
+        "subject_current",
+        "object_exact",
+        "object_current",
+        mode="before",
+    )
+    @classmethod
+    def copy_snapshot(cls, value) -> _KnowledgeAccessSnapshot:
+        if type(value) is _KnowledgeAccessSnapshot:
+            return value.model_copy(deep=True)
+        if type(value) is dict:
+            return _KnowledgeAccessSnapshot.model_validate(value)
+        raise TypeError("Relation access authorities require access snapshots.")
+
+
+class _KnowledgeChangeAudience(BaseModel):
+    """One immutable authorization audience for a knowledge change."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    kind: Literal[
+        "before",
+        "after",
+        "subject_exact",
+        "subject_current",
+        "object_exact",
+        "object_current",
+    ]
     snapshot: _KnowledgeAccessSnapshot
     requires_include_expired: bool = False
 
@@ -751,6 +811,319 @@ class KnowledgeEvidenceResult(BaseModel):
             if item.entry_id != self.entry_id or item.entry_revision != self.entry_revision:
                 raise ValueError("Evidence result contains another entry revision.")
         return self
+
+
+class KnowledgeRevisionRef(BaseModel):
+    """Stable reference to one immutable revision of one logical entry."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    entry_id: str
+    revision: int
+
+    @field_validator("entry_id")
+    @classmethod
+    def validate_entry_id(cls, value: str) -> str:
+        return _knowledge_entry_id(value)
+
+    @field_validator("revision")
+    @classmethod
+    def validate_revision(cls, value: int) -> int:
+        _validate_knowledge_revision(value, "revision")
+        return value
+
+
+class KnowledgeRelation(BaseModel):
+    """Immutable semantic lineage between two exact entry revisions.
+
+    Direction is meaningful: a replacement ``supersedes`` its predecessor and a
+    derived revision ``derived_from`` its source. ``contradicts`` is symmetric;
+    stores canonicalize its endpoint order before publication.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    id: str
+    subject: KnowledgeRevisionRef
+    object: KnowledgeRevisionRef
+    kind: KnowledgeRelationKind
+    created_by_type: KnowledgeActorType = KnowledgeActorType.APP
+    created_by: str = "app"
+    policy_id: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        return _knowledge_relation_identity(value, "id")
+
+    @field_validator("subject", "object", mode="before")
+    @classmethod
+    def copy_reference(cls, value):
+        if isinstance(value, KnowledgeRevisionRef):
+            return copy_knowledge_revision_ref(value)
+        return value
+
+    @field_validator("created_by")
+    @classmethod
+    def validate_created_by(cls, value: str) -> str:
+        return _knowledge_relation_identity(value, "created_by")
+
+    @field_validator("policy_id")
+    @classmethod
+    def validate_policy_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _knowledge_relation_identity(value, "policy_id")
+
+    @field_validator("created_at")
+    @classmethod
+    def validate_created_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("`created_at` must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        copied = copy_durable_json_object(value, "metadata")
+        if len(canonical_durable_json_bytes(copied, "knowledge relation metadata")) > (
+            MAX_KNOWLEDGE_RELATION_BYTES // 2
+        ):
+            raise ValueError("`metadata` exceeds the bounded knowledge relation metadata budget.")
+        return copied
+
+    @model_validator(mode="after")
+    def validate_relation(self) -> KnowledgeRelation:
+        if self.subject.entry_id == self.object.entry_id:
+            raise ValueError("Knowledge relations must connect different logical entries.")
+        if (
+            len(
+                canonical_durable_json_bytes(
+                    self.model_dump(mode="json"),
+                    "knowledge relation",
+                )
+            )
+            > MAX_KNOWLEDGE_RELATION_BYTES
+        ):
+            raise ValueError(
+                f"Knowledge relations must be at most {MAX_KNOWLEDGE_RELATION_BYTES} "
+                "canonical UTF-8 bytes."
+            )
+        return self
+
+
+class KnowledgeRelationPublicationReceipt(BaseModel):
+    """Immutable replay evidence for one atomic relation batch publication."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    operation_id: str
+    relation_ids: list[str]
+    request_sha256: str
+    committed_at: datetime
+    replayed: bool = False
+
+    @field_validator("operation_id")
+    @classmethod
+    def validate_operation_id(cls, value: str) -> str:
+        return _knowledge_relation_identity(value, "operation_id")
+
+    @field_validator("relation_ids", mode="before")
+    @classmethod
+    def validate_relation_ids(cls, value) -> list[str]:
+        if type(value) is not list:
+            raise ValueError("`relation_ids` must be a list.")
+        copied = [_knowledge_relation_identity(item, "relation_ids") for item in value]
+        if not copied or len(copied) > MAX_KNOWLEDGE_RELATION_BATCH:
+            raise ValueError(
+                "`relation_ids` must contain between 1 and "
+                f"{MAX_KNOWLEDGE_RELATION_BATCH} identities."
+            )
+        if copied != sorted(set(copied)):
+            raise ValueError("`relation_ids` must be unique and bytewise sorted.")
+        return copied
+
+    @field_validator("request_sha256")
+    @classmethod
+    def validate_request_sha256(cls, value: str) -> str:
+        if type(value) is not str or _SHA256_HEX_RE.fullmatch(value) is None:
+            raise ValueError("`request_sha256` must be lowercase SHA-256 hex.")
+        return value
+
+    @field_validator("committed_at")
+    @classmethod
+    def validate_committed_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("`committed_at` must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @field_validator("replayed", mode="before")
+    @classmethod
+    def validate_replayed(cls, value) -> bool:
+        if type(value) is not bool:
+            raise ValueError("`replayed` must be a boolean.")
+        return value
+
+
+class KnowledgeRelationQuery(BaseModel):
+    """Bounded exact-revision relation lookup."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    reference: KnowledgeRevisionRef
+    direction: KnowledgeRelationDirection = KnowledgeRelationDirection.BOTH
+    kinds: list[KnowledgeRelationKind] = Field(default_factory=list)
+    limit: int = DEFAULT_KNOWLEDGE_LIMIT
+    max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES
+    cursor: str | None = None
+
+    @field_validator("reference", mode="before")
+    @classmethod
+    def copy_reference(cls, value):
+        if isinstance(value, KnowledgeRevisionRef):
+            return copy_knowledge_revision_ref(value)
+        return value
+
+    @field_validator("kinds", mode="before")
+    @classmethod
+    def copy_kinds(cls, value) -> list[KnowledgeRelationKind]:
+        if type(value) is not list:
+            raise ValueError("`kinds` must be a list.")
+        copied = [
+            item if isinstance(item, KnowledgeRelationKind) else KnowledgeRelationKind(item)
+            for item in value
+        ]
+        return sorted(set(copied), key=lambda item: item.value)
+
+    @field_validator("limit")
+    @classmethod
+    def validate_limit(cls, value: int) -> int:
+        _validate_positive_int(value, "limit")
+        if value > MAX_KNOWLEDGE_RELATION_LIMIT:
+            raise ValueError(f"`limit` must be at most {MAX_KNOWLEDGE_RELATION_LIMIT}.")
+        return value
+
+    @field_validator("max_bytes")
+    @classmethod
+    def validate_max_bytes(cls, value: int) -> int:
+        _validate_positive_int(value, "max_bytes")
+        if value < MAX_KNOWLEDGE_RELATION_BYTES:
+            raise ValueError(
+                f"`max_bytes` must be at least {MAX_KNOWLEDGE_RELATION_BYTES} so "
+                "one valid relation can always advance the cursor."
+            )
+        return value
+
+    @field_validator("cursor")
+    @classmethod
+    def validate_cursor(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_knowledge_relation_cursor(value, "cursor")
+
+
+class KnowledgeRelationResult(BaseModel):
+    """One honest bounded page of accessible revision-bound relations."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    query: KnowledgeRelationQuery
+    relations: list[KnowledgeRelation] = Field(default_factory=list)
+    truncated: bool = False
+    next_cursor: str | None = None
+
+    @field_validator("query", mode="before")
+    @classmethod
+    def copy_query(cls, value):
+        if isinstance(value, KnowledgeRelationQuery):
+            return copy_knowledge_relation_query(value)
+        return value
+
+    @field_validator("relations", mode="before")
+    @classmethod
+    def copy_relations(cls, value):
+        if type(value) is not list:
+            raise ValueError("`relations` must be a list.")
+        return [
+            copy_knowledge_relation(item) if isinstance(item, KnowledgeRelation) else item
+            for item in value
+        ]
+
+    @field_validator("truncated", mode="before")
+    @classmethod
+    def validate_truncated(cls, value) -> bool:
+        if type(value) is not bool:
+            raise ValueError("`truncated` must be a boolean.")
+        return value
+
+    @field_validator("next_cursor")
+    @classmethod
+    def validate_next_cursor(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_knowledge_relation_cursor(value, "next_cursor")
+
+    @model_validator(mode="after")
+    def validate_page(self) -> KnowledgeRelationResult:
+        if len(self.relations) > self.query.limit:
+            raise ValueError("`relations` cannot contain more records than `query.limit`.")
+        if len({item.id for item in self.relations}) != len(self.relations):
+            raise ValueError("Knowledge relation identities must be unique within a page.")
+        keys = [(item.created_at, item.id) for item in self.relations]
+        if keys != sorted(set(keys)):
+            raise ValueError("Knowledge relations must have unique increasing page order.")
+        if any(
+            (self.query.kinds and item.kind not in self.query.kinds)
+            or not _knowledge_relation_matches_query(item, self.query)
+            for item in self.relations
+        ):
+            raise ValueError("Knowledge relations must match the result query.")
+        serialized_bytes = sum(
+            len(
+                canonical_durable_json_bytes(
+                    item.model_dump(mode="json"),
+                    "knowledge relation",
+                )
+            )
+            for item in self.relations
+        )
+        if serialized_bytes > self.query.max_bytes:
+            raise ValueError("Knowledge relation page exceeds `query.max_bytes`.")
+        if self.truncated != (self.next_cursor is not None):
+            raise ValueError("A truncated relation page requires exactly one next cursor.")
+        if self.next_cursor is not None and not self.relations:
+            raise ValueError("An empty relation page cannot have a next cursor.")
+        return self
+
+
+class _KnowledgeRelationCursor(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    version: Literal[1]
+    fingerprint: str
+    created_at: datetime
+    relation_id: str
+
+    @field_validator("fingerprint")
+    @classmethod
+    def validate_fingerprint(cls, value: str) -> str:
+        if type(value) is not str or _SHA256_HEX_RE.fullmatch(value) is None:
+            raise ValueError("`fingerprint` must be lowercase SHA-256 hex.")
+        return value
+
+    @field_validator("created_at")
+    @classmethod
+    def validate_created_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("`created_at` must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @field_validator("relation_id")
+    @classmethod
+    def validate_relation_id(cls, value: str) -> str:
+        return _knowledge_relation_identity(value, "relation_id")
 
 
 class KnowledgeEmbeddingIdentity(BaseModel):
@@ -1902,6 +2275,7 @@ class KnowledgeChange(BaseModel):
     entry_revision: int
     committed_at: datetime
     operation_id: str | None = None
+    relation_id: str | None = None
 
     @field_validator("id", "operation_id")
     @classmethod
@@ -1912,6 +2286,13 @@ class KnowledgeChange(BaseModel):
         if len(value.encode("utf-8")) > 256:
             raise ValueError(f"`{info.field_name}` must be at most 256 UTF-8 bytes.")
         return value
+
+    @field_validator("relation_id")
+    @classmethod
+    def validate_relation_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _knowledge_relation_identity(value, "relation_id")
 
     @field_validator("entry_id")
     @classmethod
@@ -1938,6 +2319,15 @@ class KnowledgeChange(BaseModel):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("`committed_at` must be timezone-aware.")
         return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_relation_change(self) -> KnowledgeChange:
+        if self.kind is KnowledgeChangeKind.RELATION_PUBLISHED:
+            if self.relation_id is None:
+                raise ValueError("Relation publication changes require `relation_id`.")
+        elif self.relation_id is not None:
+            raise ValueError("Only relation publication changes may carry `relation_id`.")
+        return self
 
 
 class KnowledgeChangeBatch(BaseModel):
@@ -2263,6 +2653,43 @@ class KnowledgeStore(ABC):
             "This KnowledgeStore does not support knowledge publication receipts."
         )
 
+    async def publish_relations(
+        self,
+        relations: list[KnowledgeRelation],
+        *,
+        operation_id: str,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeRelationPublicationReceipt:
+        """Atomically publish one bounded immutable relation batch exactly once."""
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support revision-bound knowledge relations."
+        )
+
+    async def load_relation_publication_receipt(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeRelationPublicationReceipt | None:
+        """Load immutable replay evidence for one relation publication."""
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support knowledge relation receipts."
+        )
+
+    async def read_relations(
+        self,
+        query: KnowledgeRelationQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeRelationResult | None:
+        """Read one bounded page around an exact authorized revision."""
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support revision-bound knowledge relations."
+        )
+
     @abstractmethod
     async def read_evidence(
         self,
@@ -2476,6 +2903,14 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._evidence: dict[tuple[str, int], list[KnowledgeEvidence]] = {}
         self._publication_receipts: dict[str, KnowledgePublicationReceipt] = {}
         self._publication_access: dict[str, _KnowledgeAccessSnapshot] = {}
+        self._relations: dict[str, KnowledgeRelation] = {}
+        self._relation_ids_by_endpoint: dict[tuple[str, int], set[str]] = {}
+        self._relation_semantics: dict[tuple[str, str, int, str, int], str] = {}
+        self._relation_publication_receipts: dict[str, KnowledgeRelationPublicationReceipt] = {}
+        self._relation_publication_access: dict[
+            str, tuple[_KnowledgeRelationAccessSnapshot, ...]
+        ] = {}
+        self._relation_change_sequences: dict[str, int] = {}
         self._changes: list[KnowledgeChange] = []
         self._changes_by_sequence: dict[int, KnowledgeChange] = {}
         self._change_access: dict[int, tuple[_KnowledgeChangeAudience, ...]] = {}
@@ -2682,6 +3117,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             )
         if hard:
             change = self._prepare_change(entry, kind=KnowledgeChangeKind.HARD_DELETED)
+            self._drop_relations_for_entry(clean_id)
             self._entries.pop(clean_id, None)
             self._current_revisions.pop(clean_id, None)
             for key in [key for key in self._chunks if key[0] == clean_id]:
@@ -2723,6 +3159,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         ]
         for entry, change in prepared_changes:
             entry_id = entry.id
+            self._drop_relations_for_entry(entry_id)
             self._entries.pop(entry_id, None)
             self._current_revisions.pop(entry_id, None)
             for key in [key for key in self._chunks if key[0] == entry_id]:
@@ -2987,9 +3424,8 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         result: list[KnowledgeChange] = []
         for change in self._changes:
             audiences = self._change_access.get(change.sequence, ())
-            if change.sequence <= after_sequence or not any(
-                _knowledge_scope_allows_change_audience(scope, audience) for audience in audiences
-            ):
+            authorized = _knowledge_scope_allows_change(scope, change, audiences)
+            if change.sequence <= after_sequence or not authorized:
                 continue
             result.append(change)
             if limit is not None and len(result) >= limit:
@@ -3025,6 +3461,35 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         if revision is None:
             return None
         return self._entries[entry_id][revision]
+
+    def _drop_relations_for_entry(self, entry_id: str) -> None:
+        relation_ids: set[str] = set()
+        for revision in self._entries.get(entry_id, {}):
+            relation_ids.update(self._relation_ids_by_endpoint.get((entry_id, revision), ()))
+        for relation_id in sorted(relation_ids):
+            self._drop_relation(relation_id)
+
+    def _index_relation(self, relation: KnowledgeRelation) -> None:
+        for endpoint in (relation.subject, relation.object):
+            key = (endpoint.entry_id, endpoint.revision)
+            self._relation_ids_by_endpoint.setdefault(key, set()).add(relation.id)
+
+    def _drop_relation(self, relation_id: str) -> None:
+        relation = self._relations[relation_id]
+        indexed_endpoints: list[tuple[tuple[str, int], set[str]]] = []
+        for endpoint in (relation.subject, relation.object):
+            key = (endpoint.entry_id, endpoint.revision)
+            indexed = self._relation_ids_by_endpoint.get(key)
+            if indexed is None or relation_id not in indexed:
+                raise RuntimeError("In-memory knowledge relation endpoint index is inconsistent.")
+            indexed_endpoints.append((key, indexed))
+
+        self._relations.pop(relation_id)
+        self._relation_semantics.pop(_knowledge_relation_semantic_key(relation), None)
+        for key, indexed in indexed_endpoints:
+            indexed.remove(relation_id)
+            if not indexed:
+                self._relation_ids_by_endpoint.pop(key)
 
     def _entry_revision(
         self,
@@ -3067,6 +3532,245 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         if snapshot is None or not _knowledge_scope_allows_snapshot(scope, snapshot):
             return None
         return copy_knowledge_publication_receipt(receipt)
+
+    async def publish_relations(
+        self,
+        relations: list[KnowledgeRelation],
+        *,
+        operation_id: str,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeRelationPublicationReceipt:
+        scope = self._operation_access_scope(access_scope)
+        operation_id, copied_relations, request_sha256 = prepare_knowledge_relations(
+            relations,
+            operation_id=operation_id,
+        )
+        existing_receipt = self._relation_publication_receipts.get(operation_id)
+        if existing_receipt is not None:
+            snapshots = self._relation_publication_access.get(operation_id)
+            if snapshots is None or not all(
+                _knowledge_scope_allows_relation_access_snapshot(scope, snapshot)
+                for snapshot in snapshots
+            ):
+                raise KnowledgeAccessDenied("publish_relations")
+            _validate_knowledge_relation_publication_replay(
+                existing_receipt,
+                relations=copied_relations,
+                request_sha256=request_sha256,
+            )
+            return copy_knowledge_relation_publication_receipt(
+                existing_receipt,
+                replayed=True,
+            )
+
+        endpoint_access: list[_KnowledgeRelationAccessSnapshot] = []
+        for relation in copied_relations:
+            subject_exact, subject_current, object_exact, object_current = (
+                self._require_relation_endpoints(
+                    relation,
+                    scope,
+                    operation="publish_relations",
+                )
+            )
+            endpoint_access.append(
+                _knowledge_relation_access_snapshot(
+                    subject_exact=subject_exact,
+                    subject_current=subject_current,
+                    object_exact=object_exact,
+                    object_current=object_current,
+                )
+            )
+            occupied_id = self._relations.get(relation.id)
+            occupied_semantic_id = self._relation_semantics.get(
+                _knowledge_relation_semantic_key(relation)
+            )
+            if occupied_id is None:
+                historic_sequence = self._relation_change_sequences.get(relation.id)
+                if historic_sequence is not None:
+                    historic_change = self._changes_by_sequence[historic_sequence]
+                    audiences = self._change_access.get(historic_sequence, ())
+                    if not _knowledge_scope_allows_change(
+                        scope,
+                        historic_change,
+                        audiences,
+                    ):
+                        raise KnowledgeAccessDenied("publish_relations")
+                    raise KnowledgeRelationConflict("relation_exists")
+            for occupied_relation_id in (
+                relation.id if occupied_id else None,
+                occupied_semantic_id,
+            ):
+                if occupied_relation_id is None:
+                    continue
+                occupied = self._relations.get(occupied_relation_id)
+                if occupied is not None:
+                    self._require_relation_endpoints(
+                        occupied,
+                        scope,
+                        operation="publish_relations",
+                    )
+                raise KnowledgeRelationConflict("relation_exists")
+
+        if self._next_change_sequence + len(copied_relations) - 1 > (MAX_KNOWLEDGE_CHANGE_SEQUENCE):
+            raise RuntimeError("Knowledge change sequence is exhausted.")
+        committed_at = self._clock()
+        receipt = KnowledgeRelationPublicationReceipt(
+            operation_id=operation_id,
+            relation_ids=[relation.id for relation in copied_relations],
+            request_sha256=request_sha256,
+            committed_at=committed_at,
+        )
+        prepared_changes = []
+        for index, (relation, access_snapshot) in enumerate(
+            zip(copied_relations, endpoint_access, strict=True)
+        ):
+            change = copy_knowledge_change(
+                self._prepare_relation_change(
+                    relation,
+                    sequence=self._next_change_sequence + index,
+                    operation_id=operation_id,
+                    committed_at=committed_at,
+                )
+            )
+            prepared_changes.append(
+                (
+                    change,
+                    _knowledge_relation_change_audiences(
+                        change,
+                        access_snapshot=access_snapshot,
+                    ),
+                )
+            )
+        publication_access = tuple(snapshot.model_copy(deep=True) for snapshot in endpoint_access)
+        for relation, (change, audiences) in zip(
+            copied_relations,
+            prepared_changes,
+            strict=True,
+        ):
+            self._relations[relation.id] = relation
+            self._index_relation(relation)
+            self._relation_semantics[_knowledge_relation_semantic_key(relation)] = relation.id
+            self._changes.append(change)
+            self._changes_by_sequence[change.sequence] = change
+            self._change_access[change.sequence] = audiences
+            assert change.relation_id is not None
+            self._relation_change_sequences[change.relation_id] = change.sequence
+        self._next_change_sequence += len(prepared_changes)
+        self._relation_publication_receipts[operation_id] = receipt
+        self._relation_publication_access[operation_id] = publication_access
+        return copy_knowledge_relation_publication_receipt(receipt)
+
+    async def load_relation_publication_receipt(
+        self,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeRelationPublicationReceipt | None:
+        scope = self._operation_access_scope(access_scope)
+        operation_id = _knowledge_relation_identity(operation_id, "operation_id")
+        receipt = self._relation_publication_receipts.get(operation_id)
+        if receipt is None:
+            return None
+        snapshots = self._relation_publication_access.get(operation_id)
+        if snapshots is None or not all(
+            _knowledge_scope_allows_relation_access_snapshot(scope, snapshot)
+            for snapshot in snapshots
+        ):
+            return None
+        return copy_knowledge_relation_publication_receipt(receipt)
+
+    async def read_relations(
+        self,
+        query: KnowledgeRelationQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeRelationResult | None:
+        scope = self._operation_access_scope(access_scope)
+        query = copy_knowledge_relation_query(query)
+        fingerprint = _knowledge_relation_query_fingerprint(query, scope)
+        cursor = _decode_knowledge_relation_cursor(query.cursor, fingerprint=fingerprint)
+        reference_entry = self._entry_revision(
+            query.reference.entry_id,
+            query.reference.revision,
+        )
+        reference_current = self._current_entry(query.reference.entry_id)
+        if (
+            reference_entry is None
+            or reference_current is None
+            or not _knowledge_scope_allows_entry(scope, reference_entry)
+            or not _knowledge_scope_allows_entry(scope, reference_current)
+        ):
+            return None
+        candidates: list[KnowledgeRelation] = []
+        endpoint = (query.reference.entry_id, query.reference.revision)
+        for relation_id in self._relation_ids_by_endpoint.get(endpoint, ()):
+            relation = self._relations.get(relation_id)
+            if relation is None:
+                raise RuntimeError("In-memory knowledge relation endpoint index is inconsistent.")
+            if query.kinds and relation.kind not in query.kinds:
+                continue
+            if not _knowledge_relation_matches_query(relation, query):
+                continue
+            if cursor is not None and (relation.created_at, relation.id) <= (
+                cursor.created_at,
+                cursor.relation_id,
+            ):
+                continue
+            try:
+                self._require_relation_endpoints(
+                    relation,
+                    scope,
+                    operation="read_relations",
+                )
+            except (KnowledgeAccessDenied, KnowledgeRelationConflict):
+                continue
+            candidates.append(relation)
+        candidates.sort(key=lambda item: (item.created_at, item.id))
+        return _bounded_knowledge_relation_result(
+            query,
+            candidates,
+            fingerprint=fingerprint,
+        )
+
+    def _require_relation_endpoints(
+        self,
+        relation: KnowledgeRelation,
+        scope: KnowledgeAccessScope,
+        *,
+        operation: str,
+    ) -> tuple[KnowledgeEntry, KnowledgeEntry, KnowledgeEntry, KnowledgeEntry]:
+        result: list[tuple[KnowledgeEntry, KnowledgeEntry]] = []
+        for reference in (relation.subject, relation.object):
+            exact = self._entry_revision(reference.entry_id, reference.revision)
+            current = self._current_entry(reference.entry_id)
+            if exact is None or current is None:
+                raise KnowledgeRelationConflict("endpoint_missing")
+            if not _knowledge_scope_allows_entry(
+                scope,
+                exact,
+            ) or not _knowledge_scope_allows_entry(scope, current):
+                raise KnowledgeAccessDenied(operation)
+            result.append((exact, current))
+        return result[0][0], result[0][1], result[1][0], result[1][1]
+
+    def _prepare_relation_change(
+        self,
+        relation: KnowledgeRelation,
+        *,
+        sequence: int,
+        operation_id: str,
+        committed_at: datetime,
+    ) -> KnowledgeChange:
+        return KnowledgeChange(
+            id=f"kchg_{uuid4().hex}",
+            sequence=sequence,
+            kind=KnowledgeChangeKind.RELATION_PUBLISHED,
+            entry_id=relation.subject.entry_id,
+            entry_revision=relation.subject.revision,
+            committed_at=committed_at,
+            operation_id=operation_id,
+            relation_id=relation.id,
+        )
 
     async def read_evidence(
         self,
@@ -3134,9 +3838,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         high_water = 0
         for change in self._changes:
             audiences = self._change_access.get(change.sequence, ())
-            if not any(
-                _knowledge_scope_allows_change_audience(scope, audience) for audience in audiences
-            ):
+            if not _knowledge_scope_allows_change(scope, change, audiences):
                 continue
             high_water = max(high_water, change.sequence)
             if change.sequence > after_sequence and len(selected) <= limit:
@@ -3180,8 +3882,10 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         if state.pending_change_sequence is not None:
             stored_change = self._change_by_sequence(state.pending_change_sequence)
             audiences = self._change_access.get(state.pending_change_sequence, ())
-            still_allowed = stored_change is not None and any(
-                _knowledge_scope_allows_change_audience(scope, audience) for audience in audiences
+            still_allowed = stored_change is not None and _knowledge_scope_allows_change(
+                scope,
+                stored_change,
+                audiences,
             )
             assert state.lease_expires_at is not None
             if still_allowed and state.lease_expires_at > current_time:
@@ -3780,6 +4484,10 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
                 break
             claimed_changes += 1
             try:
+                if claim.change.kind is KnowledgeChangeKind.RELATION_PUBLISHED:
+                    await self.acknowledge_change(claim, access_scope=scope)
+                    acknowledged_changes += 1
+                    continue
                 current = self._current_entry(claim.change.entry_id)
                 remaining = record_limit - processed_records
                 if current is None or current.status is KnowledgeStatus.DELETED:
@@ -4564,12 +5272,44 @@ def _knowledge_access_snapshot(entry: KnowledgeEntry) -> _KnowledgeAccessSnapsho
     )
 
 
+def _knowledge_relation_access_snapshot(
+    *,
+    subject_exact: KnowledgeEntry,
+    subject_current: KnowledgeEntry,
+    object_exact: KnowledgeEntry,
+    object_current: KnowledgeEntry,
+) -> _KnowledgeRelationAccessSnapshot:
+    for role, exact, current in (
+        ("subject", subject_exact, subject_current),
+        ("object", object_exact, object_current),
+    ):
+        if exact.id != current.id or exact.revision > current.revision:
+            raise ValueError(f"Relation {role} exact/current authorities do not match.")
+    return _KnowledgeRelationAccessSnapshot(
+        subject_exact=_knowledge_access_snapshot(subject_exact),
+        subject_current=_knowledge_access_snapshot(subject_current),
+        object_exact=_knowledge_access_snapshot(object_exact),
+        object_current=_knowledge_access_snapshot(object_current),
+    )
+
+
 def _knowledge_access_snapshot_json(snapshot: _KnowledgeAccessSnapshot) -> str:
     if type(snapshot) is not _KnowledgeAccessSnapshot:
         raise TypeError("snapshot must be a _KnowledgeAccessSnapshot.")
     return canonical_durable_json_bytes(
         snapshot.model_dump(mode="json"),
         "knowledge access snapshot",
+    ).decode("utf-8")
+
+
+def _knowledge_relation_access_snapshot_json(
+    snapshot: _KnowledgeRelationAccessSnapshot,
+) -> str:
+    if type(snapshot) is not _KnowledgeRelationAccessSnapshot:
+        raise TypeError("snapshot must be a _KnowledgeRelationAccessSnapshot.")
+    return canonical_durable_json_bytes(
+        snapshot.model_dump(mode="json"),
+        "knowledge relation access snapshot",
     ).decode("utf-8")
 
 
@@ -4597,6 +5337,14 @@ def _parse_knowledge_access_snapshot_json(value: str) -> _KnowledgeAccessSnapsho
     if type(value) is not str:
         raise TypeError("Knowledge access snapshot must be JSON text.")
     return _KnowledgeAccessSnapshot.model_validate_json(value)
+
+
+def _parse_knowledge_relation_access_snapshot_json(
+    value: str,
+) -> _KnowledgeRelationAccessSnapshot:
+    if type(value) is not str:
+        raise TypeError("Knowledge relation access snapshot must be JSON text.")
+    return _KnowledgeRelationAccessSnapshot.model_validate_json(value)
 
 
 def _knowledge_scope_allows_snapshot(
@@ -4632,6 +5380,22 @@ def _knowledge_scope_allows_snapshot_dimensions(
     return snapshot.status in scope.allowed_statuses
 
 
+def _knowledge_scope_allows_relation_access_snapshot(
+    scope: KnowledgeAccessScope,
+    snapshot: _KnowledgeRelationAccessSnapshot,
+) -> bool:
+    now = datetime.now(UTC)
+    return all(
+        _knowledge_scope_allows_snapshot(scope, authority, now=now)
+        for authority in (
+            snapshot.subject_exact,
+            snapshot.subject_current,
+            snapshot.object_exact,
+            snapshot.object_current,
+        )
+    )
+
+
 def _knowledge_scope_allows_change_audience(
     scope: KnowledgeAccessScope,
     audience: _KnowledgeChangeAudience,
@@ -4639,6 +5403,29 @@ def _knowledge_scope_allows_change_audience(
     return (
         scope.include_expired or not audience.requires_include_expired
     ) and _knowledge_scope_allows_snapshot_dimensions(scope, audience.snapshot)
+
+
+def _knowledge_scope_allows_change(
+    scope: KnowledgeAccessScope,
+    change: KnowledgeChange,
+    audiences: tuple[_KnowledgeChangeAudience, ...],
+) -> bool:
+    results = [_knowledge_scope_allows_change_audience(scope, audience) for audience in audiences]
+    if not results:
+        return False
+    if change.kind is KnowledgeChangeKind.RELATION_PUBLISHED:
+        return (
+            len(results) == 4
+            and {audience.kind for audience in audiences}
+            == {
+                "subject_exact",
+                "subject_current",
+                "object_exact",
+                "object_current",
+            }
+            and all(results)
+        )
+    return any(results)
 
 
 def _knowledge_change_audiences(
@@ -4688,6 +5475,32 @@ def _knowledge_change_audiences(
             )
         )
     return tuple(audiences)
+
+
+def _knowledge_relation_change_audiences(
+    change: KnowledgeChange,
+    *,
+    access_snapshot: _KnowledgeRelationAccessSnapshot,
+) -> tuple[_KnowledgeChangeAudience, ...]:
+    if change.kind is not KnowledgeChangeKind.RELATION_PUBLISHED:
+        raise ValueError("A relation audience requires a relation publication change.")
+    if type(access_snapshot) is not _KnowledgeRelationAccessSnapshot:
+        raise TypeError("A relation audience requires a relation access snapshot.")
+    return tuple(
+        _KnowledgeChangeAudience(
+            kind=kind,
+            snapshot=snapshot,
+            requires_include_expired=(
+                snapshot.expires_at is not None and snapshot.expires_at <= change.committed_at
+            ),
+        )
+        for kind, snapshot in (
+            ("subject_exact", access_snapshot.subject_exact),
+            ("subject_current", access_snapshot.subject_current),
+            ("object_exact", access_snapshot.object_exact),
+            ("object_current", access_snapshot.object_current),
+        )
+    )
 
 
 def _knowledge_scope_allows_entry(
@@ -4812,6 +5625,64 @@ def copy_knowledge_evidence(evidence: KnowledgeEvidence) -> KnowledgeEvidence:
     )
 
 
+def copy_knowledge_revision_ref(reference: KnowledgeRevisionRef) -> KnowledgeRevisionRef:
+    if type(reference) is not KnowledgeRevisionRef:
+        raise TypeError("KnowledgeRevisionRef instances must not be subclasses.")
+    return KnowledgeRevisionRef(entry_id=reference.entry_id, revision=reference.revision)
+
+
+def copy_knowledge_relation(relation: KnowledgeRelation) -> KnowledgeRelation:
+    if type(relation) is not KnowledgeRelation:
+        raise TypeError("KnowledgeRelation instances must not be subclasses.")
+    subject = copy_knowledge_revision_ref(relation.subject)
+    object_ = copy_knowledge_revision_ref(relation.object)
+    if relation.kind is KnowledgeRelationKind.CONTRADICTS and (
+        object_.entry_id,
+        object_.revision,
+    ) < (subject.entry_id, subject.revision):
+        subject, object_ = object_, subject
+    return KnowledgeRelation(
+        id=relation.id,
+        subject=subject,
+        object=object_,
+        kind=relation.kind,
+        created_by_type=relation.created_by_type,
+        created_by=relation.created_by,
+        policy_id=relation.policy_id,
+        created_at=relation.created_at,
+        metadata=copy_durable_json_object(relation.metadata, "metadata"),
+    )
+
+
+def copy_knowledge_relation_query(query: KnowledgeRelationQuery) -> KnowledgeRelationQuery:
+    if type(query) is not KnowledgeRelationQuery:
+        raise TypeError("KnowledgeRelationQuery instances must not be subclasses.")
+    return KnowledgeRelationQuery(
+        reference=copy_knowledge_revision_ref(query.reference),
+        direction=query.direction,
+        kinds=list(query.kinds),
+        limit=query.limit,
+        max_bytes=query.max_bytes,
+        cursor=query.cursor,
+    )
+
+
+def copy_knowledge_relation_publication_receipt(
+    receipt: KnowledgeRelationPublicationReceipt,
+    *,
+    replayed: bool | None = None,
+) -> KnowledgeRelationPublicationReceipt:
+    if type(receipt) is not KnowledgeRelationPublicationReceipt:
+        raise TypeError("KnowledgeRelationPublicationReceipt instances must not be subclasses.")
+    return KnowledgeRelationPublicationReceipt(
+        operation_id=receipt.operation_id,
+        relation_ids=list(receipt.relation_ids),
+        request_sha256=receipt.request_sha256,
+        committed_at=receipt.committed_at,
+        replayed=receipt.replayed if replayed is None else replayed,
+    )
+
+
 def copy_knowledge_embedding_identity(
     identity: KnowledgeEmbeddingIdentity,
 ) -> KnowledgeEmbeddingIdentity:
@@ -4900,6 +5771,7 @@ def copy_knowledge_change(change: KnowledgeChange) -> KnowledgeChange:
         entry_revision=change.entry_revision,
         committed_at=change.committed_at,
         operation_id=change.operation_id,
+        relation_id=change.relation_id,
     )
 
 
@@ -5028,6 +5900,188 @@ def _validate_knowledge_publication_replay(
         or receipt.entry_updated_at != entry.updated_at
     ):
         raise KnowledgePublicationConflict("operation_mismatch")
+
+
+def prepare_knowledge_relations(
+    relations: list[KnowledgeRelation],
+    *,
+    operation_id: str,
+) -> tuple[str, list[KnowledgeRelation], str]:
+    """Copy, canonicalize, bound, and fingerprint one relation publication."""
+
+    operation_id = _knowledge_relation_identity(operation_id, "operation_id")
+    if type(relations) is not list:
+        raise TypeError("`relations` must be a list.")
+    if not relations or len(relations) > MAX_KNOWLEDGE_RELATION_BATCH:
+        raise ValueError(
+            f"`relations` must contain between 1 and {MAX_KNOWLEDGE_RELATION_BATCH} records."
+        )
+    copied = sorted(
+        (copy_knowledge_relation(relation) for relation in relations),
+        key=lambda relation: relation.id,
+    )
+    ids = [relation.id for relation in copied]
+    if len(ids) != len(set(ids)):
+        raise ValueError("`relations` cannot contain duplicate identities.")
+    semantic_keys = [_knowledge_relation_semantic_key(relation) for relation in copied]
+    if len(semantic_keys) != len(set(semantic_keys)):
+        raise ValueError("`relations` cannot repeat one semantic relation.")
+    request_sha256 = sha256(
+        canonical_durable_json_bytes(
+            {
+                "contract": "cayu-knowledge-relation-publication-v1",
+                "relations": [relation.model_dump(mode="json") for relation in copied],
+            },
+            "knowledge relation publication",
+        )
+    ).hexdigest()
+    return operation_id, copied, request_sha256
+
+
+def _validate_knowledge_relation_publication_replay(
+    receipt: KnowledgeRelationPublicationReceipt,
+    *,
+    relations: list[KnowledgeRelation],
+    request_sha256: str,
+) -> None:
+    receipt = copy_knowledge_relation_publication_receipt(receipt)
+    if (
+        receipt.relation_ids != [relation.id for relation in relations]
+        or receipt.request_sha256 != request_sha256
+    ):
+        raise KnowledgeRelationConflict("operation_reuse")
+
+
+def _knowledge_relation_semantic_key(
+    relation: KnowledgeRelation,
+) -> tuple[str, str, int, str, int]:
+    relation = copy_knowledge_relation(relation)
+    return (
+        relation.kind.value,
+        relation.subject.entry_id,
+        relation.subject.revision,
+        relation.object.entry_id,
+        relation.object.revision,
+    )
+
+
+def _knowledge_relation_matches_query(
+    relation: KnowledgeRelation,
+    query: KnowledgeRelationQuery,
+) -> bool:
+    reference = query.reference
+    subject_matches = relation.subject == reference
+    object_matches = relation.object == reference
+    if relation.kind is KnowledgeRelationKind.CONTRADICTS:
+        return subject_matches or object_matches
+    if query.direction is KnowledgeRelationDirection.OUTGOING:
+        return subject_matches
+    if query.direction is KnowledgeRelationDirection.INCOMING:
+        return object_matches
+    return subject_matches or object_matches
+
+
+def _knowledge_relation_query_fingerprint(
+    query: KnowledgeRelationQuery,
+    access_scope: KnowledgeAccessScope,
+) -> str:
+    query = copy_knowledge_relation_query(query)
+    return sha256(
+        canonical_durable_json_bytes(
+            {
+                "contract": "cayu-knowledge-relation-query-v1",
+                "reference": query.reference.model_dump(mode="json"),
+                "direction": query.direction.value,
+                "kinds": [kind.value for kind in query.kinds],
+                "access_scope_sha256": _knowledge_access_scope_sha256(access_scope),
+            },
+            "knowledge relation query",
+        )
+    ).hexdigest()
+
+
+def _encode_knowledge_relation_cursor(
+    *,
+    fingerprint: str,
+    relation: KnowledgeRelation,
+) -> str:
+    cursor = _KnowledgeRelationCursor(
+        version=1,
+        fingerprint=fingerprint,
+        created_at=relation.created_at,
+        relation_id=relation.id,
+    )
+    raw = canonical_durable_json_bytes(
+        cursor.model_dump(mode="json"),
+        "knowledge relation cursor",
+    )
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return _bounded_knowledge_relation_cursor(encoded, "next_cursor")
+
+
+def _decode_knowledge_relation_cursor(
+    cursor: str | None,
+    *,
+    fingerprint: str,
+) -> _KnowledgeRelationCursor | None:
+    if cursor is None:
+        return None
+    cursor = _bounded_knowledge_relation_cursor(cursor, "cursor")
+    try:
+        encoded = cursor.encode("ascii")
+        padding = b"=" * (-len(encoded) % 4)
+        raw = base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
+        if base64.urlsafe_b64encode(raw).rstrip(b"=") != encoded:
+            raise ValueError("Non-canonical relation cursor encoding.")
+        parsed = _KnowledgeRelationCursor.model_validate_json(raw)
+    except (binascii.Error, TypeError, UnicodeError, ValueError) as exc:
+        raise ValueError("Invalid knowledge relation cursor.") from exc
+    if parsed.fingerprint != fingerprint:
+        raise ValueError(
+            "Knowledge relation cursor does not match this reference, direction, "
+            "kind filter, and access scope."
+        )
+    return parsed
+
+
+def _bounded_knowledge_relation_result(
+    query: KnowledgeRelationQuery,
+    candidates: list[KnowledgeRelation],
+    *,
+    fingerprint: str,
+) -> KnowledgeRelationResult:
+    selected: list[KnowledgeRelation] = []
+    used_bytes = 0
+    for relation in candidates:
+        if len(selected) >= query.limit:
+            break
+        relation_bytes = len(
+            canonical_durable_json_bytes(
+                relation.model_dump(mode="json"),
+                "knowledge relation",
+            )
+        )
+        if used_bytes + relation_bytes > query.max_bytes:
+            break
+        selected.append(copy_knowledge_relation(relation))
+        used_bytes += relation_bytes
+    truncated = len(selected) < len(candidates)
+    next_cursor = (
+        _encode_knowledge_relation_cursor(
+            fingerprint=fingerprint,
+            relation=selected[-1],
+        )
+        if truncated and selected
+        else None
+    )
+    if truncated and not selected:
+        raise RuntimeError("A valid relation did not fit the minimum relation byte budget.")
+    return KnowledgeRelationResult(
+        query=query,
+        relations=selected,
+        truncated=truncated,
+        next_cursor=next_cursor,
+    )
 
 
 def _knowledge_publication_request_sha256(
@@ -5899,6 +6953,10 @@ def _knowledge_chunk_id(value: str, field_name: str = "chunk_id") -> str:
     )
 
 
+def _knowledge_relation_identity(value: str, field_name: str) -> str:
+    return _bounded_knowledge_identity(value, field_name, max_bytes=256)
+
+
 def _bounded_knowledge_identity(value: str, field_name: str, *, max_bytes: int) -> str:
     clean = require_clean_nonblank(value, field_name)
     if len(clean.encode("utf-8")) > max_bytes:
@@ -6013,6 +7071,15 @@ def _bounded_knowledge_embedding_backfill_cursor(value: str, field_name: str) ->
         raise ValueError(
             f"`{field_name}` must be at most "
             f"{_MAX_KNOWLEDGE_EMBEDDING_BACKFILL_CURSOR_BYTES} UTF-8 bytes."
+        )
+    return value
+
+
+def _bounded_knowledge_relation_cursor(value: str, field_name: str) -> str:
+    value = require_clean_nonblank(value, field_name)
+    if len(value.encode("utf-8")) > MAX_KNOWLEDGE_RELATION_CURSOR_BYTES:
+        raise ValueError(
+            f"`{field_name}` must be at most {MAX_KNOWLEDGE_RELATION_CURSOR_BYTES} UTF-8 bytes."
         )
     return value
 

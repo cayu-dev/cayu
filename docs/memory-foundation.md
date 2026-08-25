@@ -355,8 +355,9 @@ deterministic evidence IDs and rebind chunk evidence by chunk index. A caller
 that materially changes content must supply evidence explicitly; omission means
 the new revision has no evidence. Exact publication replay writes nothing, and
 the publication request digest covers evidence as well as the entry and chunks.
-Receipts preserved from revision 42 remain exactly replayable after migration;
-their entry-and-chunks-only digest is accepted only for an empty-evidence retry.
+The historical revision-42-to-43 transition preserved exact empty-evidence
+receipt replay. Revision 60 supersedes that upgrade posture: a populated
+pre-60 knowledge schema is deliberately not migrated or interpreted.
 
 `read_evidence(...)` applies the same current-plus-historical authorization rule
 as entry and chunk reads and returns a record/byte-bounded result. Evidence IDs
@@ -398,6 +399,96 @@ database clock in production so worker clock skew cannot extend or revive a
 claim. SQLite/PostgreSQL cursor and acknowledgement state survives restart.
 This change stream is canonical mutation publication, not derived-index
 readiness.
+
+## Revision-bound cross-entry relations
+
+Four kinds of lineage remain deliberately separate:
+
+- consecutive revisions of one logical `KnowledgeEntry` already have implicit
+  same-entry lineage through their revision numbers;
+- `KnowledgeEvidence` explains which source material supports one exact
+  revision;
+- `KnowledgeRelation` records a reviewed semantic statement between exact
+  revisions of two different logical entries; and
+- recall receipts and `ContextExposure` record retrieval, selection, and actual
+  provider-facing use. A relation does not mean that the model saw either entry.
+
+`KnowledgeRevisionRef` is the exact `(entry_id, revision)` endpoint. The closed
+`KnowledgeRelationKind` vocabulary is intentionally small: a replacement
+`supersedes` its predecessor, a derived record `derived_from` its source, and
+`contradicts` is symmetric. Contradictions are stored in one canonical endpoint
+order, so concurrent opposite-order publications converge on one semantic
+identity. Relations cannot connect two revisions of the same logical entry;
+ordinary revision order already represents that case.
+
+```python
+from cayu import (
+    KnowledgeRelation,
+    KnowledgeRelationKind,
+    KnowledgeRelationQuery,
+    KnowledgeRevisionRef,
+)
+
+relation = KnowledgeRelation(
+    id="reviewed-replacement-2026-08",
+    subject=KnowledgeRevisionRef(entry_id="refund-policy-new", revision=2),
+    object=KnowledgeRevisionRef(entry_id="refund-policy-old", revision=4),
+    kind=KnowledgeRelationKind.SUPERSEDES,
+    created_by="policy-reviewer",
+    policy_id="knowledge-maintenance-v1",
+)
+receipt = await store.publish_relations(
+    [relation],
+    operation_id="reviewed-replacement-operation",
+)
+page = await store.read_relations(
+    KnowledgeRelationQuery(reference=relation.subject, limit=100)
+)
+```
+
+`publish_relations(...)` copies and canonicalizes at most 100 records, requires
+both exact endpoints and both current logical entries to be authorized, and
+commits the relations, one metadata-only `relation_published` change per
+relation, and one immutable operation receipt atomically. Exact operation replay
+returns the original receipt without writing again. Reusing an operation ID,
+relation ID, or semantic tuple for different material fails closed. Relation
+changes carry only the subject revision, relation ID, operation ID, sequence,
+and commit time; their four immutable endpoint authorities must all authorize
+an outbox reader through the exact and publication-time current state of each
+endpoint.
+
+`read_relations(...)` is a count- and byte-bounded incoming, outgoing, or
+both-direction exact-revision lookup. Stable `(created_at, id)` pagination binds
+its cursor to the reference, direction, kind filter, and access scope. Endpoint
+authorization is performed in the backend query before hydration. Advancing an
+entry never retargets an existing relation. Hard deletion or expiry removes
+relations whose exact endpoints no longer exist, while immutable publication
+receipts and already-published metadata-only changes remain reconciliation
+evidence and never recreate the relation on replay.
+
+A relation is not truth, similarity, approval, current-state activation,
+ranking weight, or context-placement authority. This slice performs no graph
+traversal and does not automatically archive a predecessor. Reviewed atomic
+supersession and relation-aware recall are separate later policies.
+
+Breaking storage revision 60 installs this final prerelease relation contract.
+Fresh databases and completely empty earlier knowledge schemas initialize
+directly. Any populated pre-60 canonical, evidence, receipt, outbox, readiness,
+embedding, or relation table makes migration fail before DDL. There is no
+backfill, metadata fallback, dual write, or legacy relation interpretation.
+
+The hermetic relation performance gate runs in CI with no provider calls:
+
+```bash
+PYTHONPATH=src python scripts/run_knowledge_relation_performance.py --check
+```
+
+Its checked report returns 50 matching relations from a store containing 5,000
+additional unrelated relations, so endpoint lookup must remain index-bound. The
+result is recorded in
+[`benchmarks/memory/knowledge-relation-performance-v1.json`](../benchmarks/memory/knowledge-relation-performance-v1.json).
+The zero-relation lane is a current-runtime control with the same canonical
+entries, not a historical binary comparison.
 
 ## Explicit reviewed knowledge curation
 
@@ -579,11 +670,11 @@ compatible projection space; vectors from different models, generators,
 preprocessing versions, dimensions, or index representations never share an
 ANN graph. Schema validation rejects a cross-space HNSW index.
 
-Breaking schema revision 44 adds the readiness event log and current pointer.
-It preserves revision-43 canonical entries, revisions, chunks, evidence,
-changes, consumers, and receipts. Pre-identity vector rows are deliberately
-discarded as rebuildable derived data; the migration does not fabricate
-readiness or retain a compatibility projection shape.
+Breaking schema revision 44 historically added the readiness event log and
+current pointer while preserving revision-43 canonical state. Pre-identity
+vector rows were deliberately discarded as rebuildable derived data. Current
+revision-60 startup does not use that preservation path for a populated
+pre-60 knowledge store.
 
 Evidence prefixes and multi-entry expiration changes use the same scalar
 identity ordering in every built-in backend. SQLite makes its binary collation
@@ -595,13 +686,10 @@ and canonical chunk IDs to `MAX_KNOWLEDGE_CHUNK_ID_BYTES`. The same limits apply
 to every receipt, evidence, and change reference, keeping identity behavior and
 indexed storage portable across the in-memory, SQLite, and PostgreSQL backends.
 
-Breaking schema revision 43 installs the evidence, change, and consumer tables
-and the exact chunk-owner key used by evidence foreign keys. The DDL preserves
-revision-42 entries, IDs, revisions, chunks, and receipts that satisfy the
-portable identity bounds; out-of-contract identities are rejected before any
-revision-43 DDL is applied. The migration deliberately does not fabricate
-evidence or historical change events for mutations that happened before
-revision 43.
+Breaking schema revision 43 historically installed the evidence, change, and
+consumer tables and the exact chunk-owner key used by evidence foreign keys.
+That transition did not fabricate evidence or historical change events. It is
+not a compatibility promise across the later revision-60 clean break.
 
 ## Revision-schema reset policy
 
@@ -624,6 +712,9 @@ Normal startup validates the complete authoritative revision layout, including
 table columns and types, keys and revision bounds, foreign keys, the current
 revision view, FTS structures, and required indexes. A recorded revision-42
 database with a missing or conflicting object fails before serving traffic.
+Revision 60 applies the same fail-before-DDL rule to every populated pre-relation
+knowledge schema. Empty old schemas are replaced atomically with the relation-aware
+outbox; populated schemas require an explicit application-owned replacement.
 
 ## Deterministic weighted rank fusion
 

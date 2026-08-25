@@ -335,6 +335,11 @@ REVISIONS: tuple[Revision, ...] = (
     # rows cannot acquire that authority by inference, so populated pre-59
     # verified-work registries are a clean prerelease break.
     Revision(revision=59, kind=RevisionKind.BREAKING, compatible_from=59),
+    # Exact cross-entry knowledge lineage adds immutable revision-bound
+    # relations, idempotent publication receipts, and relation events to the
+    # canonical knowledge outbox. Populated pre-60 knowledge stores are
+    # deliberately not rewritten or backfilled in this prerelease transition.
+    Revision(revision=60, kind=RevisionKind.BREAKING, compatible_from=60),
 )
 
 #: The revision an empty database is initialized to.

@@ -62,6 +62,7 @@ def test_every_ref_uses_balanced_shards_behind_the_stable_test_gate() -> None:
     workflow = _CI_WORKFLOW.read_text()
     shards = _job_block(workflow, "test_shards")
     specialists = _job_block(workflow, "test_specialists")
+    performance = _job_block(workflow, "memory-evidence-performance")
     test_gate = _job_block(workflow, "test")
 
     assert "github.event_name == 'pull_request'" not in shards
@@ -94,6 +95,9 @@ def test_every_ref_uses_balanced_shards_behind_the_stable_test_gate() -> None:
     assert "--cov-branch" in specialists
     assert "if: github.event_name != 'pull_request'" in specialists
     assert "uses: actions/upload-artifact@" in specialists
+
+    assert "scripts/run_memory_evidence_performance.py --check" in performance
+    assert "scripts/run_knowledge_relation_performance.py --check" in performance
 
     assert "name: Test (Python 3.14)" in test_gate
     assert "needs: [test_shards, test_specialists, memory-evidence-performance]" in test_gate

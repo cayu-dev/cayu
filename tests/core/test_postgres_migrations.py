@@ -302,7 +302,7 @@ def test_revision_fifty_nine_rejects_a_populated_verified_work_registry(
                     "VALUES (%s, %s, %s, %s::jsonb)",
                     ("pre-59-contract", 1, "0" * 64, "{}"),
                 )
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 59")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 59")
             await conn.commit()
 
         migrated = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
@@ -342,7 +342,7 @@ def test_postgres_task_store_validation_requires_revision_fifty_nine(
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 59")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 59")
             await conn.commit()
 
         validator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
@@ -1588,6 +1588,8 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
                 await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 19")
+                await cur.execute("DROP TABLE cayu_knowledge_relation_publication_receipts")
+                await cur.execute("DROP TABLE cayu_knowledge_relations")
                 await cur.execute("DROP TABLE cayu_mcp_manifest_baselines")
                 await cur.execute("DROP TABLE cayu_persisted_event_side_effects")
                 await cur.execute("DROP TABLE cayu_session_message_queue")
@@ -1978,6 +1980,8 @@ def test_revision_fourteen_requires_cascade_index_migration(postgres_dsn: str) -
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
                 await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 15")
+                await cur.execute("DROP TABLE cayu_knowledge_relation_publication_receipts")
+                await cur.execute("DROP TABLE cayu_knowledge_relations")
                 await cur.execute("DROP INDEX idx_cayu_checkpoints_pending_interruption_cascade")
             await conn.commit()
 
@@ -2025,6 +2029,8 @@ def test_revision_fifteen_requires_session_sequence_index_migration(postgres_dsn
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
                 await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 16")
+                await cur.execute("DROP TABLE cayu_knowledge_relation_publication_receipts")
+                await cur.execute("DROP TABLE cayu_knowledge_relations")
                 await cur.execute("DROP INDEX idx_cayu_events_session_sequence")
             await conn.commit()
 
@@ -2087,6 +2093,8 @@ def test_revision_seventeen_requires_session_operation_migration(postgres_dsn: s
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
                 await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 18")
+                await cur.execute("DROP TABLE cayu_knowledge_relation_publication_receipts")
+                await cur.execute("DROP TABLE cayu_knowledge_relations")
                 await cur.execute("DROP TABLE cayu_session_operations")
             await conn.commit()
 
