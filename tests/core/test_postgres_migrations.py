@@ -180,6 +180,8 @@ def test_revision_forty_nine_migrates_existing_ordinary_tasks(postgres_dsn: str)
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
                 for table in (
+                    "cayu_work_attempt_execution_claims",
+                    "cayu_work_attempt_admissions",
                     "cayu_completion_decision_application_receipts",
                     "cayu_completion_decisions",
                     "cayu_completion_verification_claims",
@@ -210,6 +212,120 @@ def test_revision_forty_nine_migrates_existing_ordinary_tasks(postgres_dsn: str)
                 "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 49"
             )
             assert await cur.fetchone() == ("breaking", 49)
+
+    asyncio.run(runner())
+
+
+def test_revision_sixty_one_migrates_work_attempt_admission_tables(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.create_task(TaskCreate(task_id="pre-61-task", type="ordinary"))
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP TABLE cayu_work_attempt_execution_claims")
+                await cur.execute("DROP TABLE cayu_work_attempt_admissions")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 61")
+            await conn.commit()
+
+        migrated = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            task = await migrated.load_task("pre-61-task")
+            assert task is not None
+        finally:
+            await migrated.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                "SELECT to_regclass('cayu_work_attempt_admissions'), "
+                "to_regclass('cayu_work_attempt_execution_claims')"
+            )
+            assert await cur.fetchone() == (
+                "cayu_work_attempt_admissions",
+                "cayu_work_attempt_execution_claims",
+            )
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 61"
+            )
+            assert await cur.fetchone() == ("breaking", 61)
+
+    asyncio.run(runner())
+
+
+def test_revision_sixty_two_migrates_deferred_interaction_payload(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        source = Message.text("user", "preserve source input")
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await creator.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="revision-62-session",
+                    messages=[source],
+                ),
+                identity=_identity(),
+                interaction_started_event=Event(
+                    id="revision-62-started",
+                    type=EventType.INTERACTION_STARTED,
+                    session_id="revision-62-session",
+                    interaction_id="revision-62-interaction",
+                ),
+                interaction_source_messages=[source],
+            )
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE cayu_deferred_interaction_inputs SET source_messages = %s::jsonb",
+                    (json.dumps([source.model_dump(mode="json")]),),
+                )
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 62")
+            await conn.commit()
+
+        migrated = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            deferred = await migrated.load_deferred_interaction_input("revision-62-session")
+            assert deferred is not None
+            assert deferred.source_messages == [source]
+            assert deferred.initial_transcript_messages is None
+        finally:
+            await migrated.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                "SELECT source_messages, "
+                "(SELECT kind FROM cayu_schema_migrations WHERE revision = 62), "
+                "(SELECT compatible_from FROM cayu_schema_migrations WHERE revision = 62) "
+                "FROM cayu_deferred_interaction_inputs"
+            )
+            row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == {
+            "source_messages": [source.model_dump(mode="json")],
+            "initial_transcript_messages": None,
+        }
+        assert row[1:] == ("breaking", 62)
 
     asyncio.run(runner())
 
@@ -327,7 +443,7 @@ def test_revision_fifty_nine_rejects_a_populated_verified_work_registry(
     asyncio.run(runner())
 
 
-def test_postgres_task_store_validation_requires_revision_fifty_nine(
+def test_postgres_task_store_validation_requires_revision_sixty_two(
     postgres_dsn: str,
 ) -> None:
     async def runner() -> None:
@@ -342,12 +458,12 @@ def test_postgres_task_store_validation_requires_revision_fifty_nine(
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 59")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 62")
             await conn.commit()
 
         validator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 59"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 62"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -772,6 +888,8 @@ _TABLES = (
     "cayu_completion_verification_claims",
     "cayu_completion_verifier_profiles",
     "cayu_completion_proposals",
+    "cayu_work_attempt_execution_claims",
+    "cayu_work_attempt_admissions",
     "cayu_work_attempts",
     "cayu_task_session_execution_authority",
     "cayu_work_contracts",

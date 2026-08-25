@@ -70,6 +70,26 @@ from cayu.runtime.invocation import (
     inherited_task_invocation,
 )
 from cayu.runtime.service_manifest import RuntimeStoreDurability
+from cayu.runtime.work_attempt_admission import (
+    AdmittedCompletionProposalRequest,
+    WorkAttemptAdmission,
+    WorkAttemptAdmissionActivate,
+    WorkAttemptAdmissionConflict,
+    WorkAttemptAdmissionPrepare,
+    WorkAttemptAdmissionState,
+    WorkAttemptContinuationContext,
+    WorkAttemptExecutionClaim,
+    WorkAttemptExecutionClaimLost,
+    WorkAttemptExecutionClaimRequest,
+    WorkAttemptRecoveryActivate,
+    copy_admitted_completion_proposal_request,
+    copy_work_attempt_admission_activate,
+    copy_work_attempt_admission_prepare,
+    copy_work_attempt_execution_claim_request,
+    copy_work_attempt_recovery_activate,
+    work_attempt_admission_prepare_sha256,
+    work_attempt_execution_claim_request_sha256,
+)
 from cayu.runtime.work_contracts import (
     WORK_COMPLETION_APPLICATION_RECEIPT_MAX_BYTES,
     WORK_COMPLETION_APPLICATION_RECEIPT_MAX_ITEMS,
@@ -2366,6 +2386,7 @@ class TaskStore(ABC):
     supports_idempotent_terminalization: ClassVar[bool] = False
     supports_task_retry_series: ClassVar[bool] = False
     supports_verified_work_contracts: ClassVar[bool] = False
+    supports_work_attempt_admission: ClassVar[bool] = False
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = False
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
 
@@ -2420,6 +2441,62 @@ class TaskStore(ABC):
     async def begin_work_attempt(self, request: WorkAttemptCreate) -> WorkAttempt:
         """Create or replay one bounded execution attempt under a task's frozen contract."""
         raise NotImplementedError("This TaskStore does not support verified work contracts.")
+
+    async def prepare_work_attempt_admission(
+        self,
+        request: WorkAttemptAdmissionPrepare,
+    ) -> WorkAttemptAdmission:
+        """Reserve one exact initial or continuation attempt before session mutation."""
+        raise NotImplementedError("This TaskStore does not support work-attempt admission.")
+
+    async def activate_work_attempt_admission(
+        self,
+        request: WorkAttemptAdmissionActivate,
+    ) -> WorkAttemptAdmission:
+        """Publish a prepared attempt after exact session admission evidence exists."""
+        raise NotImplementedError("This TaskStore does not support work-attempt admission.")
+
+    async def load_work_attempt_admission(
+        self,
+        admission_id: str,
+    ) -> WorkAttemptAdmission | None:
+        """Load one durable admission intent or receipt by stable identity."""
+        raise NotImplementedError("This TaskStore does not support work-attempt admission.")
+
+    async def load_work_attempt_execution_claim(
+        self,
+        claim_id: str,
+    ) -> WorkAttemptExecutionClaim | None:
+        """Load one immutable execution-claim generation by stable identity."""
+        raise NotImplementedError("This TaskStore does not support work-attempt admission.")
+
+    async def renew_work_attempt_execution_claim(
+        self,
+        request: WorkAttemptExecutionClaimRequest,
+    ) -> WorkAttemptAdmission:
+        """Renew one exact active execution claim without changing its generation."""
+        raise NotImplementedError("This TaskStore does not support work-attempt admission.")
+
+    async def claim_work_attempt_recovery(
+        self,
+        request: WorkAttemptExecutionClaimRequest,
+    ) -> WorkAttemptAdmission:
+        """Claim recovery after the prior execution generation has expired."""
+        raise NotImplementedError("This TaskStore does not support work-attempt admission.")
+
+    async def activate_work_attempt_recovery(
+        self,
+        request: WorkAttemptRecoveryActivate,
+    ) -> WorkAttemptAdmission:
+        """Activate a replacement only after positive session-settlement evidence."""
+        raise NotImplementedError("This TaskStore does not support work-attempt admission.")
+
+    async def submit_admitted_completion_proposal(
+        self,
+        request: AdmittedCompletionProposalRequest,
+    ) -> CompletionProposal:
+        """Publish one proposal under the exact current execution claim."""
+        raise NotImplementedError("This TaskStore does not support work-attempt admission.")
 
     async def load_work_attempt(self, attempt_id: str) -> WorkAttempt | None:
         """Load one work attempt by stable identity."""
@@ -2807,6 +2884,7 @@ class InMemoryTaskStore(TaskStore):
     supports_idempotent_terminalization: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
+    supports_work_attempt_admission: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
@@ -2823,6 +2901,12 @@ class InMemoryTaskStore(TaskStore):
         self._work_contracts: dict[tuple[str, int], WorkContract] = {}
         self._work_attempts: dict[str, WorkAttempt] = {}
         self._attempt_ids_by_task: dict[str, list[str]] = {}
+        self._work_attempt_admissions: dict[str, WorkAttemptAdmission] = {}
+        self._admission_id_by_attempt: dict[str, str] = {}
+        self._admission_id_by_session_interaction: dict[tuple[str, str], str] = {}
+        self._unreleased_admission_id_by_session: dict[str, str] = {}
+        self._latest_admission_id_by_task: dict[str, str] = {}
+        self._work_attempt_execution_claims: dict[str, WorkAttemptExecutionClaim] = {}
         self._completion_proposals: dict[str, CompletionProposal] = {}
         self._proposal_id_by_attempt: dict[str, str] = {}
         self._completion_verifier_profiles: dict[str, CompletionVerifierProfileRecord] = {}
@@ -2939,6 +3023,10 @@ class InMemoryTaskStore(TaskStore):
         request = copy_work_attempt_create(request)
         request_sha256 = work_attempt_request_sha256(request)
         async with self._lock:
+            if request.attempt_id in self._admission_id_by_attempt:
+                raise WorkAttemptAdmissionConflict(
+                    "Admitted work attempts must be created through their exact admission."
+                )
             existing = self._work_attempts.get(request.attempt_id)
             if existing is not None:
                 if existing.request_sha256 != request_sha256:
@@ -2947,6 +3035,10 @@ class InMemoryTaskStore(TaskStore):
                     )
                 return existing.model_copy(deep=True)
             task = self._require_task(request.task_id)
+            if task.id in self._latest_admission_id_by_task:
+                raise WorkAttemptAdmissionConflict(
+                    "Task is permanently governed by runtime-owned work-attempt admission."
+                )
             contract = self._ensure_task_contract_matches(task, request.contract)
             if task.status is not TaskStatus.RUNNING:
                 raise ValueError("Work attempts require a running contracted task.")
@@ -2989,6 +3081,519 @@ class InMemoryTaskStore(TaskStore):
             self._attempt_ids_by_task.setdefault(task.id, []).append(attempt.attempt_id)
             return attempt.model_copy(deep=True)
 
+    async def prepare_work_attempt_admission(
+        self,
+        request: WorkAttemptAdmissionPrepare,
+    ) -> WorkAttemptAdmission:
+        request = copy_work_attempt_admission_prepare(request)
+        if request.generation != 1:
+            raise WorkAttemptAdmissionConflict(
+                "A new work-attempt admission must start at execution generation 1."
+            )
+        request_sha256 = work_attempt_admission_prepare_sha256(request)
+        async with self._lock:
+            existing = self._work_attempt_admissions.get(request.admission_id)
+            if existing is not None:
+                if existing.prepare_request_sha256 != request_sha256:
+                    raise WorkAttemptAdmissionConflict(
+                        "Work-attempt admission identity is bound to another request."
+                    )
+                return self._copy_work_attempt_admission(existing)
+            prior_admission_id = self._admission_id_by_attempt.get(request.attempt_id)
+            if prior_admission_id is not None:
+                raise WorkAttemptAdmissionConflict(
+                    "Work-attempt identity is already bound to another admission."
+                )
+            if request.attempt_id in self._work_attempts:
+                raise WorkAttemptAdmissionConflict(
+                    "Work-attempt identity already exists without this admission."
+                )
+            if request.claim_id in self._work_attempt_execution_claims:
+                raise WorkAttemptAdmissionConflict(
+                    "Execution-claim identity is bound to another admission."
+                )
+            if (
+                request.session_id,
+                request.interaction_id,
+            ) in self._admission_id_by_session_interaction:
+                raise WorkAttemptAdmissionConflict(
+                    "Session interaction is already bound to another admission."
+                )
+            if request.session_id in self._unreleased_admission_id_by_session:
+                raise WorkAttemptAdmissionConflict(
+                    "Session already has an unreleased work-attempt admission."
+                )
+            latest_admission_id = self._latest_admission_id_by_task.get(request.task_id)
+            if latest_admission_id is not None:
+                latest_admission = self._work_attempt_admissions[latest_admission_id]
+                if latest_admission.state is not WorkAttemptAdmissionState.RELEASED:
+                    raise WorkAttemptAdmissionConflict(
+                        "Task already has an unreleased work-attempt admission."
+                    )
+
+            task = self._require_task(request.task_id)
+            contract = self._ensure_task_contract_matches(task, request.contract)
+            queue_now = datetime.now(UTC)
+            now = self._clock()
+            continuation = self._work_attempt_continuation_context(task, contract)
+            if continuation is None:
+                if request.kind != "initial":
+                    raise WorkAttemptAdmissionConflict(
+                        "Continuation admission requires a rejected/continue decision."
+                    )
+                if task.status not in {TaskStatus.PENDING, TaskStatus.CLAIMED}:
+                    raise WorkAttemptAdmissionConflict(
+                        "Initial admission requires a pending or claimed contracted task."
+                    )
+                if task.available_at is not None and task.available_at > now:
+                    raise WorkAttemptAdmissionConflict(
+                        "Contracted task is not yet available for admission."
+                    )
+                if task.status is TaskStatus.CLAIMED:
+                    _ensure_owned_active_task_lease(task, request.worker_id, now=queue_now)
+                elif task.worker_id is not None or task.lease_expires_at is not None:
+                    raise WorkAttemptAdmissionConflict(
+                        "Pending contracted task has conflicting worker ownership."
+                    )
+                if task.session_id not in {None, request.session_id}:
+                    raise WorkAttemptAdmissionConflict(
+                        "Initial admission conflicts with the task's session."
+                    )
+            else:
+                if request.kind != "continuation":
+                    raise WorkAttemptAdmissionConflict(
+                        "Initial admission cannot consume continuation authority."
+                    )
+                if continuation.prior_admission_id != request.predecessor_admission_id:
+                    raise WorkAttemptAdmissionConflict(
+                        "Continuation admission selected another predecessor admission."
+                    )
+                if (
+                    task.status is not TaskStatus.RUNNING
+                    or task.session_id != request.session_id
+                    or task.worker_id is not None
+                    or task.lease_expires_at is not None
+                ):
+                    raise WorkAttemptAdmissionConflict(
+                        "Continuation admission requires an unowned running task on its exact session."
+                    )
+                if (
+                    contract.continuation_policy.rejection_action
+                    is not CompletionRejectionAction.CONTINUE
+                ):
+                    raise WorkAttemptAdmissionConflict(
+                        "The frozen contract does not authorize continuation."
+                    )
+
+            self._ensure_contract_session_accepts_attachment(
+                request.contract,
+                request.session_id,
+            )
+            _task_invocation_for_attachment(
+                task.invocation,
+                session_id=request.session_id,
+                session_binding=request.session_invocation,
+            )
+            session_instance_id = _task_session_instance_for_attachment(
+                stored_session_instance_id=task.session_instance_id,
+                session_id=request.session_id,
+                session_binding=request.session_invocation,
+            )
+            claim_request = WorkAttemptExecutionClaimRequest(
+                admission_id=request.admission_id,
+                claim_id=request.claim_id,
+                worker_id=request.worker_id,
+                execution_owner_id=request.execution_owner_id,
+                generation=request.generation,
+                lease_seconds=request.lease_seconds,
+            )
+            claim = WorkAttemptExecutionClaim(
+                admission_id=request.admission_id,
+                claim_id=request.claim_id,
+                worker_id=request.worker_id,
+                execution_owner_id=request.execution_owner_id,
+                generation=request.generation,
+                request_sha256=work_attempt_execution_claim_request_sha256(claim_request),
+                claimed_at=now,
+                lease_expires_at=now + timedelta(seconds=request.lease_seconds),
+            )
+            admission = WorkAttemptAdmission(
+                admission_id=request.admission_id,
+                prepare_request_sha256=request_sha256,
+                state=WorkAttemptAdmissionState.PREPARING,
+                attempt_id=request.attempt_id,
+                task_id=request.task_id,
+                session_id=request.session_id,
+                interaction_id=request.interaction_id,
+                kind=request.kind,
+                source_request_sha256=request.source_request_sha256,
+                contract=request.contract,
+                session_invocation=request.session_invocation,
+                source_execution_profile_fingerprint=(request.source_execution_profile_fingerprint),
+                claim=claim,
+                continuation=continuation,
+                prepared_at=now,
+            )
+            updated_task = task.model_copy(
+                update={
+                    "status": TaskStatus.RUNNING,
+                    "session_id": request.session_id,
+                    "session_instance_id": session_instance_id,
+                    "worker_id": request.worker_id,
+                    "lease_expires_at": claim.lease_expires_at,
+                    "started_at": task.started_at or now,
+                    "updated_at": now,
+                }
+            )
+            self._store_task(updated_task)
+            self._work_attempt_admissions[admission.admission_id] = admission
+            self._admission_id_by_attempt[admission.attempt_id] = admission.admission_id
+            self._admission_id_by_session_interaction[
+                (admission.session_id, admission.interaction_id)
+            ] = admission.admission_id
+            self._unreleased_admission_id_by_session[admission.session_id] = admission.admission_id
+            self._latest_admission_id_by_task[admission.task_id] = admission.admission_id
+            self._work_attempt_execution_claims[claim.claim_id] = claim
+            return self._copy_work_attempt_admission(admission)
+
+    async def activate_work_attempt_admission(
+        self,
+        request: WorkAttemptAdmissionActivate,
+    ) -> WorkAttemptAdmission:
+        request = copy_work_attempt_admission_activate(request)
+        async with self._lock:
+            admission = self._require_work_attempt_admission(request.admission_id)
+            if admission.prepare_request_sha256 != request.prepare_request_sha256:
+                raise WorkAttemptAdmissionConflict(
+                    "Admission activation conflicts with its prepared request."
+                )
+            if admission.claim.claim_id != request.claim_id:
+                raise WorkAttemptExecutionClaimLost(
+                    "Admission activation no longer owns the prepared execution claim."
+                )
+            task = self._require_task(admission.task_id)
+            if (
+                task.session_id != admission.session_id
+                or task.session_instance_id != admission.session_invocation.session_instance_id
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Prepared admission conflicts with exact task-session authority."
+                )
+            if admission.state is WorkAttemptAdmissionState.ACTIVE:
+                if admission.session_evidence_sha256 != request.session_evidence_sha256:
+                    raise WorkAttemptAdmissionConflict(
+                        "Admission activation conflicts with durable session evidence."
+                    )
+                return self._copy_work_attempt_admission(admission)
+            if admission.state is not WorkAttemptAdmissionState.PREPARING:
+                raise WorkAttemptAdmissionConflict(
+                    "Only a prepared admission can publish its work attempt."
+                )
+            now = self._clock()
+            self._ensure_live_work_attempt_claim(admission, now=now)
+            if (
+                task.status is not TaskStatus.RUNNING
+                or task.worker_id != admission.claim.worker_id
+                or task.lease_expires_at != admission.claim.lease_expires_at
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Prepared admission conflicts with current task ownership."
+                )
+            attempt_ids = self._attempt_ids_by_task.get(task.id, [])
+            if (
+                len(attempt_ids)
+                >= self._require_work_contract(admission.contract).continuation_policy.max_attempts
+            ):
+                raise WorkAttemptAdmissionConflict(
+                    "Work-contract attempt limit forbids activation."
+                )
+            attempt_request = WorkAttemptCreate(
+                attempt_id=admission.attempt_id,
+                task_id=admission.task_id,
+                session_id=admission.session_id,
+                contract=admission.contract,
+                execution_profile_fingerprint=(admission.source_execution_profile_fingerprint),
+                worker_id=admission.claim.worker_id,
+            )
+            attempt = WorkAttempt(
+                **attempt_request.model_dump(mode="python"),
+                ordinal=len(attempt_ids) + 1,
+                request_sha256=work_attempt_request_sha256(attempt_request),
+                started_at=now,
+            )
+            activated = admission.model_copy(
+                update={
+                    "state": WorkAttemptAdmissionState.ACTIVE,
+                    "attempt": attempt,
+                    "session_evidence_sha256": request.session_evidence_sha256,
+                    "activated_at": now,
+                }
+            )
+            activated = self._copy_work_attempt_admission(activated)
+            self._work_attempts[attempt.attempt_id] = attempt
+            self._attempt_ids_by_task.setdefault(task.id, []).append(attempt.attempt_id)
+            self._work_attempt_admissions[activated.admission_id] = activated
+            return self._copy_work_attempt_admission(activated)
+
+    async def load_work_attempt_admission(
+        self,
+        admission_id: str,
+    ) -> WorkAttemptAdmission | None:
+        admission_id = require_clean_nonblank(admission_id, "admission_id")
+        async with self._lock:
+            admission = self._work_attempt_admissions.get(admission_id)
+            return None if admission is None else self._copy_work_attempt_admission(admission)
+
+    async def load_work_attempt_execution_claim(
+        self,
+        claim_id: str,
+    ) -> WorkAttemptExecutionClaim | None:
+        claim_id = require_clean_nonblank(claim_id, "claim_id")
+        async with self._lock:
+            claim = self._work_attempt_execution_claims.get(claim_id)
+            return (
+                None
+                if claim is None
+                else WorkAttemptExecutionClaim.model_validate(
+                    claim.model_dump(mode="python", warnings=False)
+                )
+            )
+
+    async def renew_work_attempt_execution_claim(
+        self,
+        request: WorkAttemptExecutionClaimRequest,
+    ) -> WorkAttemptAdmission:
+        request = copy_work_attempt_execution_claim_request(request)
+        async with self._lock:
+            admission = self._require_work_attempt_admission(request.admission_id)
+            if admission.state is not WorkAttemptAdmissionState.ACTIVE:
+                raise WorkAttemptExecutionClaimLost(
+                    "Only an active admission can renew execution authority."
+                )
+            claim = admission.claim
+            if (
+                claim.claim_id != request.claim_id
+                or claim.worker_id != request.worker_id
+                or claim.execution_owner_id != request.execution_owner_id
+                or claim.generation != request.generation
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Execution-claim renewal conflicts with current authority."
+                )
+            now = self._clock()
+            self._ensure_live_work_attempt_claim(admission, now=now)
+            if admission.attempt_id in self._proposal_id_by_attempt:
+                raise WorkAttemptExecutionClaimLost(
+                    "Completion proposal has already closed execution authority."
+                )
+            renewed_claim = claim.model_copy(
+                update={
+                    "lease_expires_at": max(
+                        claim.lease_expires_at,
+                        now + timedelta(seconds=request.lease_seconds),
+                    ),
+                }
+            )
+            renewed = self._copy_work_attempt_admission(
+                admission.model_copy(update={"claim": renewed_claim})
+            )
+            task = self._require_task(admission.task_id)
+            if (
+                task.status is not TaskStatus.RUNNING
+                or task.session_id != admission.session_id
+                or task.session_instance_id != admission.session_invocation.session_instance_id
+                or task.worker_id != claim.worker_id
+                or task.lease_expires_at != claim.lease_expires_at
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Execution-claim renewal lost exact task ownership."
+                )
+            self._store_task(
+                task.model_copy(
+                    update={
+                        "lease_expires_at": renewed_claim.lease_expires_at,
+                        "updated_at": now,
+                    }
+                )
+            )
+            self._work_attempt_admissions[renewed.admission_id] = renewed
+            self._work_attempt_execution_claims[renewed_claim.claim_id] = renewed_claim
+            return self._copy_work_attempt_admission(renewed)
+
+    async def claim_work_attempt_recovery(
+        self,
+        request: WorkAttemptExecutionClaimRequest,
+    ) -> WorkAttemptAdmission:
+        request = copy_work_attempt_execution_claim_request(request)
+        request_sha256 = work_attempt_execution_claim_request_sha256(request)
+        async with self._lock:
+            admission = self._require_work_attempt_admission(request.admission_id)
+            preparing = admission.state is WorkAttemptAdmissionState.PREPARING
+            if not preparing and (
+                admission.attempt is None
+                or admission.state
+                not in {
+                    WorkAttemptAdmissionState.ACTIVE,
+                    WorkAttemptAdmissionState.RECOVERING,
+                }
+            ):
+                raise WorkAttemptAdmissionConflict(
+                    "Only a prepared or published admission can enter recovery."
+                )
+            current = admission.claim
+            now = self._clock()
+            exact_current_request = (
+                current.claim_id == request.claim_id
+                and current.worker_id == request.worker_id
+                and current.execution_owner_id == request.execution_owner_id
+                and current.generation == request.generation
+                and current.request_sha256 == request_sha256
+            )
+            task = self._require_task(admission.task_id)
+            if (
+                task.status is not TaskStatus.RUNNING
+                or task.session_id != admission.session_id
+                or task.session_instance_id != admission.session_invocation.session_instance_id
+                or task.worker_id != current.worker_id
+                or task.lease_expires_at != current.lease_expires_at
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Recovery conflicts with current task ownership."
+                )
+            if preparing and exact_current_request:
+                if current.lease_expires_at <= now:
+                    raise WorkAttemptExecutionClaimLost(
+                        "The prepared execution claim expired and must be replaced."
+                    )
+                return self._copy_work_attempt_admission(admission)
+            if admission.state is WorkAttemptAdmissionState.ACTIVE and exact_current_request:
+                if current.lease_expires_at <= now:
+                    raise WorkAttemptExecutionClaimLost(
+                        "The active execution claim expired and must be replaced."
+                    )
+                return self._copy_work_attempt_admission(admission)
+            if admission.state is WorkAttemptAdmissionState.RECOVERING:
+                if exact_current_request:
+                    if current.lease_expires_at <= now:
+                        raise WorkAttemptExecutionClaimLost(
+                            "The recovery claim expired and must be replaced."
+                        )
+                    return self._copy_work_attempt_admission(admission)
+                if current.lease_expires_at > now:
+                    raise WorkAttemptExecutionClaimLost(
+                        "Another execution generation already owns live recovery."
+                    )
+            if current.lease_expires_at > now:
+                raise WorkAttemptExecutionClaimLost(
+                    "The prior execution generation still owns a live lease."
+                )
+            if request.generation != current.generation + 1:
+                raise WorkAttemptAdmissionConflict(
+                    "Recovery must advance the execution generation exactly once."
+                )
+            if admission.attempt_id in self._proposal_id_by_attempt:
+                raise WorkAttemptAdmissionConflict(
+                    "A proposed attempt cannot acquire replacement execution authority."
+                )
+            if request.claim_id in self._work_attempt_execution_claims:
+                raise WorkAttemptAdmissionConflict("Execution-claim identity is already bound.")
+            replacement = WorkAttemptExecutionClaim(
+                admission_id=request.admission_id,
+                claim_id=request.claim_id,
+                worker_id=request.worker_id,
+                execution_owner_id=request.execution_owner_id,
+                generation=request.generation,
+                request_sha256=request_sha256,
+                claimed_at=now,
+                lease_expires_at=now + timedelta(seconds=request.lease_seconds),
+            )
+            replacement_state = (
+                WorkAttemptAdmissionState.PREPARING
+                if preparing
+                else WorkAttemptAdmissionState.RECOVERING
+            )
+            recovering = self._copy_work_attempt_admission(
+                admission.model_copy(
+                    update={
+                        "state": replacement_state,
+                        "claim": replacement,
+                        "recovery_evidence_sha256": None,
+                    }
+                )
+            )
+            self._store_task(
+                task.model_copy(
+                    update={
+                        "worker_id": request.worker_id,
+                        "lease_expires_at": replacement.lease_expires_at,
+                        "updated_at": now,
+                    }
+                )
+            )
+            self._work_attempt_admissions[recovering.admission_id] = recovering
+            self._work_attempt_execution_claims[replacement.claim_id] = replacement
+            return self._copy_work_attempt_admission(recovering)
+
+    async def activate_work_attempt_recovery(
+        self,
+        request: WorkAttemptRecoveryActivate,
+    ) -> WorkAttemptAdmission:
+        request = copy_work_attempt_recovery_activate(request)
+        async with self._lock:
+            admission = self._require_work_attempt_admission(request.admission_id)
+            if admission.state is WorkAttemptAdmissionState.ACTIVE:
+                if not (
+                    admission.claim.claim_id == request.claim_id
+                    and admission.claim.generation == request.generation
+                    and admission.recovery_evidence_sha256 == request.recovery_evidence_sha256
+                ):
+                    raise WorkAttemptAdmissionConflict(
+                        "Recovery activation conflicts with current active authority."
+                    )
+            elif (
+                admission.state is not WorkAttemptAdmissionState.RECOVERING
+                or admission.claim.claim_id != request.claim_id
+                or admission.claim.generation != request.generation
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Recovery activation no longer owns the replacement claim."
+                )
+            task = self._require_task(admission.task_id)
+            if (
+                task.session_id != admission.session_id
+                or task.session_instance_id != admission.session_invocation.session_instance_id
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Recovery activation conflicts with exact task-session authority."
+                )
+            if admission.state is WorkAttemptAdmissionState.ACTIVE:
+                return self._copy_work_attempt_admission(admission)
+            now = self._clock()
+            self._ensure_live_work_attempt_claim(admission, now=now)
+            if (
+                task.status is not TaskStatus.RUNNING
+                or task.worker_id != admission.claim.worker_id
+                or task.lease_expires_at != admission.claim.lease_expires_at
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Recovery activation conflicts with current task ownership."
+                )
+            if admission.attempt is None:
+                raise WorkAttemptAdmissionConflict(
+                    "Recovery activation requires a published work attempt."
+                )
+            self._ensure_attempt_state_is_current(task, admission.attempt)
+            active = self._copy_work_attempt_admission(
+                admission.model_copy(
+                    update={
+                        "state": WorkAttemptAdmissionState.ACTIVE,
+                        "recovery_evidence_sha256": request.recovery_evidence_sha256,
+                    }
+                )
+            )
+            self._work_attempt_admissions[active.admission_id] = active
+            return self._copy_work_attempt_admission(active)
+
     async def load_work_attempt(self, attempt_id: str) -> WorkAttempt | None:
         attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
         async with self._lock:
@@ -3002,6 +3607,11 @@ class InMemoryTaskStore(TaskStore):
         request = copy_completion_proposal_create(request)
         request_sha256 = completion_proposal_request_sha256(request)
         async with self._lock:
+            admission_id = self._admission_id_by_attempt.get(request.attempt_id)
+            if admission_id is not None:
+                raise WorkAttemptAdmissionConflict(
+                    "Admitted work attempts require claim-fenced proposal publication."
+                )
             existing = self._completion_proposals.get(request.proposal_id)
             if existing is not None:
                 if existing.request_sha256 != request_sha256:
@@ -3029,6 +3639,99 @@ class InMemoryTaskStore(TaskStore):
             )
             self._completion_proposals[proposal.proposal_id] = proposal
             self._proposal_id_by_attempt[attempt.attempt_id] = proposal.proposal_id
+            return proposal.model_copy(deep=True)
+
+    async def submit_admitted_completion_proposal(
+        self,
+        request: AdmittedCompletionProposalRequest,
+    ) -> CompletionProposal:
+        request = copy_admitted_completion_proposal_request(request)
+        proposal_request = request.proposal
+        proposal_sha256 = completion_proposal_request_sha256(proposal_request)
+        async with self._lock:
+            admission = self._require_work_attempt_admission(request.admission_id)
+            exact_claim_authority = (
+                admission.attempt is not None
+                and admission.attempt_id == proposal_request.attempt_id
+                and admission.claim.claim_id == request.claim_id
+                and admission.claim.generation == request.generation
+            )
+            if not exact_claim_authority:
+                raise WorkAttemptExecutionClaimLost(
+                    "Completion proposal no longer owns the exact active admission."
+                )
+            existing = self._completion_proposals.get(proposal_request.proposal_id)
+            if admission.state is WorkAttemptAdmissionState.RELEASED:
+                if (
+                    existing is None
+                    or existing.request_sha256 != proposal_sha256
+                    or self._proposal_id_by_attempt.get(admission.attempt_id)
+                    != proposal_request.proposal_id
+                ):
+                    raise WorkCompletionConflict(
+                        "Released admission conflicts with the requested proposal replay."
+                    )
+                return existing.model_copy(deep=True)
+            if (
+                admission.state is not WorkAttemptAdmissionState.ACTIVE
+                or admission.claim.execution_owner_id != request.execution_owner_id
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Completion proposal no longer owns the exact active admission."
+                )
+            now = self._clock()
+            self._ensure_live_work_attempt_claim(admission, now=now)
+            if existing is not None:
+                if existing.request_sha256 != proposal_sha256:
+                    raise WorkCompletionConflict(
+                        "Completion-proposal identity is bound to another request."
+                    )
+                return existing.model_copy(deep=True)
+            prior_proposal_id = self._proposal_id_by_attempt.get(admission.attempt_id)
+            if prior_proposal_id is not None:
+                raise WorkCompletionConflict(
+                    "Work attempt already has a different completion proposal."
+                )
+            task = self._require_task(admission.task_id)
+            self._ensure_attempt_state_is_current(task, admission.attempt)
+            if (
+                task.session_instance_id != admission.session_invocation.session_instance_id
+                or task.worker_id != admission.claim.worker_id
+                or task.lease_expires_at != admission.claim.lease_expires_at
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Completion proposal lost exact task-worker lease ownership."
+                )
+            proposal = CompletionProposal(
+                proposal_id=proposal_request.proposal_id,
+                attempt_id=proposal_request.attempt_id,
+                result=proposal_request.result,
+                evidence_references=proposal_request.evidence_references,
+                task_id=admission.task_id,
+                contract=admission.contract,
+                request_sha256=proposal_sha256,
+                proposed_at=now,
+            )
+            released = self._copy_work_attempt_admission(
+                admission.model_copy(update={"state": WorkAttemptAdmissionState.RELEASED})
+            )
+            self._completion_proposals[proposal.proposal_id] = proposal
+            self._proposal_id_by_attempt[admission.attempt_id] = proposal.proposal_id
+            self._work_attempt_admissions[released.admission_id] = released
+            if (
+                self._unreleased_admission_id_by_session.get(released.session_id)
+                == released.admission_id
+            ):
+                del self._unreleased_admission_id_by_session[released.session_id]
+            self._store_task(
+                task.model_copy(
+                    update={
+                        "worker_id": None,
+                        "lease_expires_at": None,
+                        "updated_at": now,
+                    }
+                )
+            )
             return proposal.model_copy(deep=True)
 
     async def load_completion_proposal(self, proposal_id: str) -> CompletionProposal | None:
@@ -3837,6 +4540,15 @@ class InMemoryTaskStore(TaskStore):
                 )
 
             task = self._require_task(request.task_id)
+            if request.task_id in self._latest_admission_id_by_task:
+                raise WorkAttemptExecutionClaimLost(
+                    "Admitted work attempts cannot use ordinary terminalization."
+                )
+            if task.retry_series is not None:
+                raise ValueError(
+                    "Retry-series tasks require settle_task_retry_attempt for "
+                    "completion or failure."
+                )
             if task.status in {
                 TaskStatus.COMPLETED,
                 TaskStatus.FAILED,
@@ -3846,7 +4558,6 @@ class InMemoryTaskStore(TaskStore):
                     "Task is terminal without the matching terminalization receipt."
                 )
             _ensure_owned_active_task_lease(task, request.worker_id)
-
             status = (
                 TaskStatus.COMPLETED
                 if request.kind is TaskTerminalKind.COMPLETED
@@ -4108,6 +4819,11 @@ class InMemoryTaskStore(TaskStore):
         task_id = require_clean_nonblank(task_id, "task_id")
         async with self._lock:
             task = self._require_task(task_id)
+            admission_id = self._latest_admission_id_by_task.get(task_id)
+            if admission_id is not None:
+                raise WorkAttemptExecutionClaimLost(
+                    "Admitted work attempts cannot use ordinary task resumption."
+                )
             _ensure_can_resume_task(task)
             now = datetime.now(UTC)
             updated = task.model_copy(
@@ -4189,6 +4905,11 @@ class InMemoryTaskStore(TaskStore):
         extend_seconds = _validate_positive_int(extend_seconds, "extend_seconds")
         async with self._lock:
             task = self._require_owned_leased_task(task_id, worker_id)
+            admission_id = self._latest_admission_id_by_task.get(task_id)
+            if admission_id is not None:
+                raise WorkAttemptExecutionClaimLost(
+                    "Admitted work attempts require claim-fenced lease renewal."
+                )
             now = datetime.now(UTC)
             _ensure_active_task_lease(task, worker_id, now=now)
             updated = task.model_copy(
@@ -4205,6 +4926,11 @@ class InMemoryTaskStore(TaskStore):
         worker_id = require_clean_nonblank(worker_id, "worker_id")
         async with self._lock:
             task = self._require_owned_leased_task(task_id, worker_id)
+            admission_id = self._latest_admission_id_by_task.get(task_id)
+            if admission_id is not None:
+                raise WorkAttemptExecutionClaimLost(
+                    "Admitted work attempts release ownership through proposal publication."
+                )
             if task.session_id is not None:
                 raise ValueError(
                     f"Task {task.id} is already attached to session {task.session_id}."
@@ -4233,6 +4959,11 @@ class InMemoryTaskStore(TaskStore):
         worker_id = require_clean_nonblank(worker_id, "worker_id")
         async with self._lock:
             task = self._require_owned_leased_task(task_id, worker_id)
+            admission_id = self._latest_admission_id_by_task.get(task_id)
+            if admission_id is not None:
+                raise WorkAttemptExecutionClaimLost(
+                    "Admitted work attempts release ownership through proposal publication."
+                )
             if task.status is not TaskStatus.RUNNING:
                 raise ValueError(f"Task {task.id} is not running.")
             if task.session_id is None:
@@ -4292,6 +5023,102 @@ class InMemoryTaskStore(TaskStore):
         if task is None:
             raise KeyError(f"Task not found: {task_id}")
         return task
+
+    @staticmethod
+    def _copy_work_attempt_admission(
+        admission: WorkAttemptAdmission,
+    ) -> WorkAttemptAdmission:
+        return WorkAttemptAdmission.model_validate(
+            admission.model_dump(mode="python", warnings=False)
+        )
+
+    def _require_work_attempt_admission(
+        self,
+        admission_id: str,
+    ) -> WorkAttemptAdmission:
+        admission = self._work_attempt_admissions.get(admission_id)
+        if admission is None:
+            raise KeyError(f"Work-attempt admission not found: {admission_id}")
+        return admission
+
+    @staticmethod
+    def _ensure_live_work_attempt_claim(
+        admission: WorkAttemptAdmission,
+        *,
+        now: datetime,
+    ) -> None:
+        if admission.claim.lease_expires_at <= now:
+            raise WorkAttemptExecutionClaimLost("Work-attempt execution claim has expired.")
+
+    def _work_attempt_continuation_context(
+        self,
+        task: Task,
+        contract: WorkContract,
+    ) -> WorkAttemptContinuationContext | None:
+        attempt_ids = self._attempt_ids_by_task.get(task.id, [])
+        if not attempt_ids:
+            return None
+        prior_attempt_id = attempt_ids[-1]
+        prior_admission_id = self._admission_id_by_attempt.get(prior_attempt_id)
+        prior_admission = (
+            None
+            if prior_admission_id is None
+            else self._work_attempt_admissions.get(prior_admission_id)
+        )
+        if (
+            prior_admission is None
+            or prior_admission.state is not WorkAttemptAdmissionState.RELEASED
+            or prior_admission.task_id != task.id
+            or prior_admission.session_id != task.session_id
+        ):
+            raise WorkAttemptAdmissionConflict(
+                "The latest work attempt has no exact released admission authority."
+            )
+        prior_proposal_id = self._proposal_id_by_attempt.get(prior_attempt_id)
+        if prior_proposal_id is None:
+            raise WorkAttemptAdmissionConflict(
+                "The latest work attempt has no durable completion proposal."
+            )
+        prior_decision_id = self._decision_id_by_proposal.get(prior_proposal_id)
+        if prior_decision_id is None:
+            raise WorkAttemptAdmissionConflict(
+                "The latest work attempt has no durable completion decision."
+            )
+        decision = self._completion_decisions.get(prior_decision_id)
+        if decision is None:
+            raise WorkAttemptAdmissionConflict(
+                "The latest work-attempt decision index is incomplete."
+            )
+        receipt_key = self._decision_application_key_by_decision.get(prior_decision_id)
+        if receipt_key is None or receipt_key not in self._decision_application_receipts:
+            raise WorkAttemptAdmissionConflict(
+                "The latest completion decision has not been applied durably."
+            )
+        receipt = self._decision_application_receipts[receipt_key]
+        if (
+            receipt.decision_id != decision.decision_id
+            or receipt.task_id != task.id
+            or receipt.task != task
+        ):
+            raise WorkAttemptAdmissionConflict(
+                "The latest decision application conflicts with continuation authority."
+            )
+        if (
+            decision.verdict is not CompletionVerdict.REJECTED
+            or contract.continuation_policy.rejection_action
+            is not CompletionRejectionAction.CONTINUE
+        ):
+            raise WorkAttemptAdmissionConflict(
+                "The latest completion decision does not authorize continuation."
+            )
+        return WorkAttemptContinuationContext(
+            prior_admission_id=prior_admission.admission_id,
+            prior_attempt_id=prior_attempt_id,
+            proposal_id=prior_proposal_id,
+            decision=decision,
+            application_idempotency_key=receipt_key[1],
+            gap_fingerprint=decision.gap_fingerprint,
+        )
 
     def _require_work_contract(self, reference: WorkContractRef) -> WorkContract:
         contract = self._work_contracts.get((reference.contract_id, reference.version))
@@ -4460,6 +5287,15 @@ class InMemoryTaskStore(TaskStore):
         now: datetime,
     ) -> Task:
         task = self._require_task(task_id)
+        if worker_id is not None:
+            if task.worker_id != worker_id:
+                raise TaskClaimLost(f"Worker {worker_id} does not own task {task.id}.")
+            _ensure_active_task_lease(task, worker_id, now=now)
+        admission_id = self._latest_admission_id_by_task.get(task_id)
+        if admission_id is not None and accepted_decision_id is None:
+            raise WorkAttemptExecutionClaimLost(
+                "Admitted work attempts cannot use ordinary terminalization."
+            )
         if (
             status is TaskStatus.COMPLETED
             and task.work_contract is not None
@@ -4468,10 +5304,6 @@ class InMemoryTaskStore(TaskStore):
             raise TaskCompletionDecisionRequired(
                 "Contracted task completion requires an accepted durable verifier decision."
             )
-        if worker_id is not None:
-            if task.worker_id != worker_id:
-                raise TaskClaimLost(f"Worker {worker_id} does not own task {task.id}.")
-            _ensure_active_task_lease(task, worker_id, now=now)
         _ensure_can_transition(task, status)
         if task.retry_series is not None:
             if status is not TaskStatus.CANCELLED:
@@ -4586,6 +5418,11 @@ class InMemoryTaskStore(TaskStore):
         payload = _copy_optional_status_payload(payload)
         async with self._lock:
             task = self._require_task(task_id)
+            admission_id = self._latest_admission_id_by_task.get(task_id)
+            if admission_id is not None:
+                raise WorkAttemptExecutionClaimLost(
+                    "Admitted work attempts cannot use ordinary task holds."
+                )
             _ensure_can_hold_task(task, status)
             now = datetime.now(UTC)
             updated = task.model_copy(

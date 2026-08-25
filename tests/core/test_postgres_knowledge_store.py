@@ -82,6 +82,8 @@ _TABLES = (
     "cayu_completion_verification_claims",
     "cayu_completion_verifier_profiles",
     "cayu_completion_proposals",
+    "cayu_work_attempt_execution_claims",
+    "cayu_work_attempt_admissions",
     "cayu_work_attempts",
     "cayu_task_session_execution_authority",
     "cayu_work_contracts",
@@ -4023,7 +4025,7 @@ def test_postgres_revision_60_initializes_empty_pre_relation_schema_directly(
             connection.cursor() as cursor,
         ):
             await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
-            assert await cursor.fetchone() == (60,)
+            assert await cursor.fetchone() == (schema_migrations.LATEST_REVISION,)
             await cursor.execute(
                 "SELECT to_regclass('cayu_knowledge_relations'), "
                 "to_regclass('cayu_knowledge_relation_publication_receipts')"

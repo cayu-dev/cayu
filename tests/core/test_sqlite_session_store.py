@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextvars
+import json
 import sqlite3
 import threading
 from datetime import UTC, datetime, timedelta
@@ -1889,6 +1890,127 @@ def test_sqlite_session_store_validate_mode_fails_fast_on_uninitialized(tmp_path
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
 
+def test_sqlite_revision_62_migrates_deferred_interaction_payload(tmp_path) -> None:
+    db_path = tmp_path / "revision-62-deferred-input.sqlite"
+    source = Message.text("user", "preserve source input")
+
+    async def seed() -> None:
+        store = SQLiteSessionStore(db_path)
+        try:
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="revision-62-session",
+                    messages=[source],
+                ),
+                identity=_identity(),
+                interaction_started_event=Event(
+                    id="revision-62-started",
+                    type=EventType.INTERACTION_STARTED,
+                    session_id="revision-62-session",
+                    interaction_id="revision-62-interaction",
+                ),
+                interaction_source_messages=[source],
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            "UPDATE cayu_deferred_interaction_inputs SET source_messages_json = ?",
+            (sqlite_support.json_dumps([source.model_dump(mode="json")]),),
+        )
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 62")
+        connection.execute("PRAGMA user_version = 61")
+        connection.commit()
+    finally:
+        connection.close()
+
+    async def migrate() -> None:
+        store = SQLiteSessionStore(
+            db_path,
+            schema_mode=schema_migrations.SchemaMode.MIGRATE,
+        )
+        try:
+            deferred = await store.load_deferred_interaction_input("revision-62-session")
+            assert deferred is not None
+            assert deferred.source_messages == [source]
+            assert deferred.initial_transcript_messages is None
+        finally:
+            await store.close()
+
+    asyncio.run(migrate())
+    connection = sqlite3.connect(db_path)
+    try:
+        payload = json.loads(
+            connection.execute(
+                "SELECT source_messages_json FROM cayu_deferred_interaction_inputs"
+            ).fetchone()[0]
+        )
+        revision = connection.execute(
+            "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 62"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert payload == {
+        "source_messages": [source.model_dump(mode="json")],
+        "initial_transcript_messages": None,
+    }
+    assert revision == ("breaking", 62)
+
+    payload["interaction_id"] = "forged-interaction"
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            "UPDATE cayu_deferred_interaction_inputs SET source_messages_json = ?",
+            (sqlite_support.json_dumps(payload),),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
+
+    async def reject_corrupt_payload_at_its_indexed_read_boundary() -> None:
+        try:
+            with pytest.raises(ValueError, match="invalid durable payload"):
+                await reopened.load_deferred_interaction_input("revision-62-session")
+        finally:
+            await reopened.close()
+
+    asyncio.run(reject_corrupt_payload_at_its_indexed_read_boundary())
+
+
+def test_sqlite_revision_62_validate_startup_does_not_scan_payload_history(tmp_path) -> None:
+    db_path = tmp_path / "revision-62-bounded-validation.sqlite"
+    store = SQLiteSessionStore(db_path)
+    statements: list[str] = []
+    connection = store._connection
+    connection.set_trace_callback(statements.append)
+    try:
+        sqlite_support.reconcile_schema(
+            connection,
+            schema_migrations.SchemaMode.VALIDATE,
+            app_min_supported=62,
+        )
+    finally:
+        connection.set_trace_callback(None)
+        asyncio.run(store.close())
+
+    normalized = {" ".join(statement.lower().split()) for statement in statements}
+    assert not any(
+        statement.startswith(
+            "select interaction_id, source_messages_json from cayu_deferred_interaction_inputs"
+        )
+        for statement in normalized
+    )
+    assert not any(
+        statement.startswith("select admission_json from cayu_work_attempt_admissions")
+        for statement in normalized
+    )
+
+
 def test_sqlite_revision_52_rejects_a_conflicting_targeted_grant_index(tmp_path) -> None:
     db_path = tmp_path / "sessions.sqlite"
     creator = SQLiteSessionStore(db_path)
@@ -3182,6 +3304,8 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (58, 58),
         (59, 59),
         (60, 60),
+        (61, 61),
+        (62, 62),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
@@ -3216,8 +3340,8 @@ def test_sqlite_revision_fifty_nine_migrates_an_empty_verified_work_registry(
         version = connection.execute("PRAGMA user_version").fetchone()
     finally:
         connection.close()
-    assert revision == (60, 60)
-    assert version == (60,)
+    assert revision == (62, 62)
+    assert version == (62,)
 
 
 def test_sqlite_revision_fifty_nine_rejects_a_populated_verified_work_registry(
@@ -3261,20 +3385,20 @@ def test_sqlite_revision_fifty_nine_rejects_a_populated_verified_work_registry(
     assert version == (58,)
 
 
-def test_sqlite_task_store_validation_requires_revision_fifty_nine(tmp_path) -> None:
-    db_path = tmp_path / "pre-result-resolver-task-store.sqlite"
+def test_sqlite_task_store_validation_requires_revision_sixty_two(tmp_path) -> None:
+    db_path = tmp_path / "pre-continuation-authority-task-store.sqlite"
     store = SQLiteTaskStore(db_path)
     asyncio.run(store.close())
 
     connection = sqlite3.connect(db_path)
     try:
-        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 59")
-        connection.execute("PRAGMA user_version = 58")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 62")
+        connection.execute("PRAGMA user_version = 61")
         connection.commit()
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 59"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 62"):
         SQLiteTaskStore(
             db_path,
             schema_mode=schema_migrations.SchemaMode.VALIDATE,

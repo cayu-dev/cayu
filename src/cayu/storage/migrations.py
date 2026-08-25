@@ -340,6 +340,17 @@ REVISIONS: tuple[Revision, ...] = (
     # canonical knowledge outbox. Populated pre-60 knowledge stores are
     # deliberately not rewritten or backfilled in this prerelease transition.
     Revision(revision=60, kind=RevisionKind.BREAKING, compatible_from=60),
+    # Contract-bound execution now requires one durable admission intent and an
+    # immutable history of process-aware execution claims before any governed
+    # session work may begin. Pre-61 task workers do not maintain those fences,
+    # so mixed-version task execution is unsafe.
+    Revision(revision=61, kind=RevisionKind.BREAKING, compatible_from=61),
+    # Deferred interaction input now carries an authenticated complete initial
+    # transcript projection in addition to its source-only fallback, and
+    # continuation receipts bind the exact predecessor admission. Pre-62
+    # workers do not preserve those payload/authority fields and cannot share
+    # the migrated store safely.
+    Revision(revision=62, kind=RevisionKind.BREAKING, compatible_from=62),
 )
 
 #: The revision an empty database is initialized to.

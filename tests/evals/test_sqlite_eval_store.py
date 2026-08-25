@@ -213,7 +213,9 @@ def test_sqlite_eval_store_migrates_empty_revision_fifty_six_without_verifier_pr
 
     connection = sqlite3.connect(path)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone() == (60,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (
+            schema_migrations.LATEST_REVISION,
+        )
         assert connection.execute(
             "SELECT 1 FROM sqlite_master "
             "WHERE type = 'table' AND name = 'cayu_completion_verifier_profiles'"

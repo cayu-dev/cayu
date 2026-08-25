@@ -276,6 +276,7 @@ from cayu.runtime.sessions import (
     _deactivate_session_run_fence,
     _event_with_session_run_operation,
     _incomplete_recovery_claim_from_checkpoint,
+    _initial_transcript_pending_interaction_id,
     _queued_dispatch_session_instance_fingerprint,
     _session_run_operation_from_checkpoint,
     _SessionRunOperation,
@@ -9739,6 +9740,29 @@ class RecoveryCoordinator:
         deferred = await self._session_store.load_deferred_interaction_input(session_id)
         if deferred is None:
             return False
+        checkpoint = await self._session_store.load_checkpoint(session_id)
+        pending_initial_interaction_id = _initial_transcript_pending_interaction_id(checkpoint)
+        if pending_initial_interaction_id is not None:
+            if pending_initial_interaction_id != deferred.interaction_id:
+                raise RuntimeError(
+                    "Deferred initial transcript conflicts with its durable interaction authority."
+                )
+            initial = deferred.initial_transcript_messages
+            if initial is not None:
+                await self._session_store.replace_initial_transcript_messages(
+                    session_id,
+                    deferred.source_messages,
+                    initial,
+                    interaction_id=deferred.interaction_id,
+                )
+                return True
+            # Generic session recovery can expose the source tail without
+            # claiming that the missing runtime-rendered prefix was restored.
+            # The durable pending marker remains for explicit reconciliation.
+            return await self._session_store.materialize_deferred_interaction_input(
+                session_id,
+                interaction_id=deferred.interaction_id,
+            )
         return await self._session_store.materialize_deferred_interaction_input(
             session_id,
             interaction_id=deferred.interaction_id,

@@ -19,7 +19,7 @@ from decimal import Decimal
 from enum import StrEnum
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any, Literal, NoReturn, TypeVar
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from pydantic import (
     BaseModel,
@@ -237,9 +237,11 @@ from cayu.runtime._structured_output_tool_round import (
     _validate_structured_output_tool_round,
 )
 from cayu.runtime._task_store_operation_boundary import (
+    capture_sensitive_result_validation,
     capture_sensitive_validation,
     capture_task_store_operation,
     raise_task_store_operation_failure,
+    task_store_work_attempt_admission_capability_is_complete,
 )
 from cayu.runtime._terminal_evidence import interruption_request_id_from_payload
 from cayu.runtime._tool_round_executor import (
@@ -249,6 +251,15 @@ from cayu.runtime._tool_round_executor import (
     ToolRoundLimitRequest,
     UserInputRequired,
     ordered_tool_result_messages,
+)
+from cayu.runtime._work_attempt_session_mutation import (
+    capture_work_attempt_checkpoint_result,
+    capture_work_attempt_deferred_input_result,
+    capture_work_attempt_event_records_result,
+    capture_work_attempt_session_result,
+    read_work_attempt_session_store,
+    settle_work_attempt_owned_operation,
+    settle_work_attempt_session_mutation,
 )
 from cayu.runtime._workflow_structured_output_handoff import (
     WorkflowStructuredOutputHandoff,
@@ -446,6 +457,7 @@ from cayu.runtime.sessions import (
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
     PROMPT_ANATOMY_TRANSITION_METADATA_KEY,
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
+    CheckpointTransform,
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
@@ -470,6 +482,7 @@ from cayu.runtime.sessions import (
     ModelCompletionStageSettlement,
     ModelCompletionStageSettlementRequest,
     ModelTarget,
+    PersistedEventSideEffectStatus,
     ProfiledSessionForkResult,
     PromptAnatomyTransitionReceipt,
     ResumeRequest,
@@ -494,6 +507,7 @@ from cayu.runtime.sessions import (
     TranscriptQuery,
     TranscriptSnapshot,
     _activate_session_interaction,
+    _activate_session_run_fence,
     _checkpoint_after_session_run_operation_cleanup,
     _checkpoint_with_session_run_operation,
     _clear_session_interaction_recovered_active_through,
@@ -534,6 +548,8 @@ from cayu.runtime.sessions import (
     model_completion_stage_settlement_request,
     queued_session_message_input,
     run_request_authority_is_runtime_generated,
+    run_request_with_runtime_initial_transcript_authority,
+    run_request_with_runtime_session_instance_authority,
     run_request_with_task_invocation,
     runtime_prepared_session_authority,
     runtime_publication_checkpoint_mutation,
@@ -541,6 +557,7 @@ from cayu.runtime.sessions import (
     session_fork_profile_relationship,
     session_input_contract_evidence,
     session_input_messages_sha256,
+    session_invocation_for_run_request,
     session_model_projection_cursor,
     session_prompt_anatomy_transition,
     system_prompt_messages_sha256,
@@ -624,6 +641,25 @@ from cayu.runtime.user_input import (
     pending_user_input_from_checkpoint,
     pending_user_input_interruption_payload,
 )
+from cayu.runtime.work_attempt_admission import (
+    WORK_ATTEMPT_RECOVERY_CHECKPOINT_KEY,
+    WorkAttemptAdmission,
+    WorkAttemptAdmissionActivate,
+    WorkAttemptAdmissionConflict,
+    WorkAttemptAdmissionPrepare,
+    WorkAttemptAdmissionState,
+    WorkAttemptExecutionClaimLost,
+    WorkAttemptExecutionClaimRequest,
+    WorkAttemptExecutionRequest,
+    WorkAttemptRecoveryRequired,
+    require_work_attempt_activation_result,
+    require_work_attempt_admission_result,
+    require_work_attempt_claim_result,
+    require_work_attempt_preparation_result,
+    work_attempt_recovery_session_authority,
+    work_attempt_recovery_session_authority_from_checkpoint,
+)
+from cayu.runtime.work_contracts import WorkCompletionConflict
 from cayu.runtime.workspace_observation_recovery import (
     retain_workspace_observation_pending_cancellation_requests,
     workspace_observation_pending_cancellation_requests,
@@ -661,6 +697,8 @@ _RESUMABLE_SESSION_STATUSES = {
 _FORKABLE_SESSION_STATUSES = _RESUMABLE_SESSION_STATUSES
 _PROMPT_ANATOMY_TRANSITION_INTENTS_CHECKPOINT_KEY = "prompt_anatomy_transition_intents"
 _PROMPT_ANATOMY_TRANSITION_INTENT_LIMIT = 256
+_WORK_ATTEMPT_HANDOFF_RENEWAL_MAX_INTERVAL_SECONDS = 30.0
+_WORK_ATTEMPT_HANDOFF_RENEWAL_MIN_INTERVAL_SECONDS = 0.05
 
 
 def _validate_fork_source_checkpoint_state(
@@ -2353,10 +2391,15 @@ def _reject_unresumable_session_checkpoint(
     *,
     redactor: SecretRedactor,
     allow_active_operation: bool = False,
+    allowed_initial_transcript_interaction_id: str | None = None,
 ) -> None:
     _reject_prepared_prompt_transition_intent(checkpoint)
     _reject_pending_provider_operation_disposition(checkpoint)
-    if _initial_transcript_pending_interaction_id(checkpoint) is not None:
+    pending_initial_interaction_id = _initial_transcript_pending_interaction_id(checkpoint)
+    if pending_initial_interaction_id is not None and (
+        allowed_initial_transcript_interaction_id is None
+        or pending_initial_interaction_id != allowed_initial_transcript_interaction_id
+    ):
         raise RuntimeError(
             "Session setup did not publish its authoritative initial transcript; "
             "resume, fork, and compaction fail closed. Start a new session."
@@ -2867,6 +2910,20 @@ class _PreparedInitialRun:
     targeted_tool_grants: tuple[PreparedTargetedToolGrant, ...]
     budget_policy: BudgetPolicy | None
     session_identity: SessionIdentity
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkAttemptRuntimeAuthority:
+    """Private runtime provenance accompanying a public stable admission request."""
+
+    request: WorkAttemptExecutionRequest
+    execution_owner_id: str
+    kind: Literal["initial", "continuation"]
+    source_request_sha256: str
+
+
+class _WorkAttemptRecoveryAlreadyActive(RuntimeError):
+    """Internal control signal for an exact concurrently activated recovery."""
 
 
 def _session_identity(
@@ -4163,6 +4220,56 @@ class SessionEngine:
             for policy in policies
         )
 
+    def work_attempt_source_request_sha256(
+        self,
+        request: RunRequest | ResumeRequest,
+        *,
+        kind: Literal["initial", "continuation"],
+    ) -> str:
+        """Bind one public request and its otherwise excluded policy authority."""
+
+        if kind == "initial":
+            if type(request) is not RunRequest:
+                raise TypeError("Initial work-attempt authority requires a RunRequest.")
+        elif kind == "continuation":
+            if type(request) is not ResumeRequest:
+                raise TypeError("Continuation work-attempt authority requires a ResumeRequest.")
+        else:  # pragma: no cover - private literal invariant
+            raise ValueError("Unsupported work-attempt request kind.")
+        loop_policy_authority: list[dict[str, Any]] = []
+        for index, policy in enumerate(request.loop_policies):
+            identity = copy_secret_free_execution_profile_behavior_identity(
+                policy.execution_profile_identity,
+                redactor=self._secret_redactor,
+                field_name=f"request.loop_policies[{index}].execution_profile_identity",
+            )
+            if identity is None:
+                loop_policy_authority.append(
+                    {
+                        "kind": "process_local",
+                        "instance_identity": (
+                            self._invocation_loop_policy_identity_registry.identity_for(policy)
+                        ),
+                    }
+                )
+            else:
+                loop_policy_authority.append(
+                    {
+                        "kind": "application_versioned",
+                        "identity": identity.model_dump(mode="json", warnings=False),
+                    }
+                )
+        return hashlib.sha256(
+            canonical_durable_json_bytes(
+                {
+                    "kind": kind,
+                    "request": request.model_dump(mode="json", warnings=False),
+                    "loop_policy_authority": loop_policy_authority,
+                },
+                "work_attempt_source_request",
+            )
+        ).hexdigest()
+
     async def _require_active_egress_profile_cutover(
         self,
         *,
@@ -5287,19 +5394,77 @@ class SessionEngine:
                         "Contracted tasks require the verifier-aware execution entrance."
                     ) from None
 
-            result = await self._recovery_coordinator.recover_incomplete_session(
+            return await self._recover_incomplete_session_after_admission(
                 request,
+                interaction_id=interaction_id,
+                active_through=active_through,
                 before_mutation=admit_before_mutation,
-            )
-            if interaction_id is not None:
-                _activate_session_interaction(request.session_id, interaction_id)
-            return await self._reconcile_recovered_interaction(
-                result,
-                recovered_active_through=active_through,
             )
         finally:
             if interaction_id is not None:
                 _deactivate_session_interaction(request.session_id)
+
+    async def _recover_work_attempt_session(
+        self,
+        request: IncompleteSessionRecoveryRequest,
+        *,
+        before_mutation: Callable[[], Awaitable[None]],
+    ) -> IncompleteSessionRecoveryResult:
+        """Settle one contracted predecessor under authenticated attempt authority."""
+
+        request = copy_incomplete_session_recovery_request(request)
+        # A recovery generation replaces only the execution owner. Its durable
+        # WorkAttempt keeps the same interaction identity, so generic abandoned-
+        # session settlement must not publish an interaction terminal event that
+        # the replacement would then silently reopen.
+        _deactivate_session_interaction(request.session_id)
+        # Recovery is entered only after the task store has replaced the expired
+        # execution generation.  Retire any copied predecessor epoch in this
+        # caller before the owned settlement task is created; otherwise an
+        # in-process replacement can carry the crashed worker's context token
+        # into the new generation and reject its own post-settlement transition.
+        _deactivate_session_run_fence(request.session_id)
+
+        async def settle_predecessor() -> IncompleteSessionRecoveryResult:
+            return await self._recovery_coordinator.recover_incomplete_session(
+                request,
+                before_mutation=before_mutation,
+            )
+
+        try:
+            return await settle_work_attempt_owned_operation(
+                settle_predecessor,
+                operation_name="work-attempt-predecessor-settlement",
+                preserved_failure_types=(
+                    _WorkAttemptRecoveryAlreadyActive,
+                    WorkAttemptExecutionClaimLost,
+                    WorkAttemptRecoveryRequired,
+                ),
+                redactor=self._secret_redactor,
+            )
+        finally:
+            _deactivate_session_interaction(request.session_id)
+            _deactivate_session_run_fence(request.session_id)
+
+    async def _recover_incomplete_session_after_admission(
+        self,
+        request: IncompleteSessionRecoveryRequest,
+        *,
+        interaction_id: str | None,
+        active_through: datetime | None,
+        before_mutation: Callable[[], Awaitable[None]],
+    ) -> IncompleteSessionRecoveryResult:
+        result = await self._recovery_coordinator.recover_incomplete_session(
+            request,
+            before_mutation=before_mutation,
+        )
+        if interaction_id is not None:
+            _activate_session_interaction(request.session_id, interaction_id)
+        await before_mutation()
+        return await self._reconcile_recovered_interaction(
+            result,
+            recovered_active_through=active_through,
+        )
 
     async def recover_model_completion_stage(
         self,
@@ -7059,6 +7224,7 @@ class SessionEngine:
         expected_execution_profile: ExecutionProfileIdentity | None = None,
         expected_registered_environment: runtime_records.RegisteredEnvironment | None = None,
         expected_context_policy: object | None = None,
+        allow_work_attempt_admission: bool = False,
     ) -> _PreparedInitialRun | None:
         """Resolve one new-session request, optionally without ordinary admission."""
 
@@ -7079,8 +7245,18 @@ class SessionEngine:
             request = request.model_copy(update={"session_id": str(uuid4())})
         if request.session_id is None:
             raise AssertionError("Run request session identity was not assigned.")
-        if request.task_id is not None and self.task_store is not None:
-            source_task = await self.task_store.load_invocation_snapshot(request.task_id)
+        task_store = self.task_store
+        task_id = request.task_id
+        if task_id is not None and task_store is not None:
+            source_task_outcome = await capture_task_store_operation(
+                lambda: task_store.load_invocation_snapshot(task_id),
+                operation_name="Work-attempt task invocation lookup",
+                redactor=self._secret_redactor,
+            )
+            if source_task_outcome.failure is not None:
+                raise_task_store_operation_failure(source_task_outcome.failure)
+            source_task = source_task_outcome.result
+            del source_task_outcome
             if source_task is not None and source_task.session_id in {None, request.session_id}:
                 request = run_request_with_task_invocation(
                     request,
@@ -7113,7 +7289,7 @@ class SessionEngine:
         if admission_failure is not None:
             del request
             raise_task_store_operation_failure(admission_failure)
-        if requires_completion_decision:
+        if requires_completion_decision and not allow_work_attempt_admission:
             return None
         budget_policy = copy_budget_policy(self._get_budget_policy())
         registered_agent = (
@@ -7264,20 +7440,21 @@ class SessionEngine:
             model=model,
             execution_profile=execution_profile,
         )
-        (
-            requires_completion_decision,
-            admission_failure,
-        ) = await self._verifier_aware_task_execution_outcome(
-            request.task_id,
-            session_id=request.session_id,
-            admit_session=admit_session,
-            allow_missing_task=deferred_runtime_task_creation,
-        )
-        if admission_failure is not None:
-            del request, workspace_instructions, rendered_system_prompt, prompt_contributions
-            raise_task_store_operation_failure(admission_failure)
-        if requires_completion_decision:
-            return None
+        if not allow_work_attempt_admission:
+            (
+                requires_completion_decision,
+                admission_failure,
+            ) = await self._verifier_aware_task_execution_outcome(
+                request.task_id,
+                session_id=request.session_id,
+                admit_session=admit_session,
+                allow_missing_task=deferred_runtime_task_creation,
+            )
+            if admission_failure is not None:
+                del request, workspace_instructions, rendered_system_prompt, prompt_contributions
+                raise_task_store_operation_failure(admission_failure)
+            if requires_completion_decision:
+                return None
         return _PreparedInitialRun(
             request=request,
             registered_agent=registered_agent,
@@ -7291,6 +7468,1283 @@ class SessionEngine:
             targeted_tool_grants=targeted_tool_grants,
             budget_policy=budget_policy,
             session_identity=session_identity,
+        )
+
+    async def _prepare_runtime_work_attempt(
+        self,
+        *,
+        authority: _WorkAttemptRuntimeAuthority,
+        task_id: str | None,
+        session_binding: SessionInvocationBinding,
+        execution_profile: ExecutionProfileIdentity,
+    ) -> WorkAttemptAdmission:
+        if task_id is None:
+            raise ValueError("Work-attempt execution requires RunRequest.task_id.")
+        task_store = self.task_store
+        if task_store is None:
+            raise RuntimeError("task_store is required for work-attempt execution.")
+        if not task_store_work_attempt_admission_capability_is_complete(task_store):
+            raise NotImplementedError(
+                f"{type(task_store).__name__} does not implement the complete "
+                "work-attempt admission contract."
+            )
+        task_outcome = await capture_task_store_operation(
+            lambda: task_store.load_task(task_id),
+            operation_name="Work-attempt task lookup",
+            redactor=self._secret_redactor,
+        )
+        if task_outcome.failure is not None:
+            raise_task_store_operation_failure(task_outcome.failure)
+        raw_task = task_outcome.result
+        del task_outcome
+        if raw_task is None:
+            raise KeyError(f"Task not found: {task_id}")
+
+        def validate_task_result(value: object = raw_task) -> Task:
+            if type(value) is not Task:
+                raise RuntimeError("Task store returned invalid work-attempt authority.")
+            copied = copy_task(value)
+            if copied.id != task_id:
+                raise RuntimeError("Task store returned conflicting work-attempt authority.")
+            if copied.work_contract is None:
+                raise ValueError("Work-attempt execution requires a contract-bound task.")
+            return copied
+
+        task_validation = capture_sensitive_result_validation(
+            validate_task_result,
+            operation_name="Work-attempt task lookup result validation",
+            redactor=self._secret_redactor,
+        )
+        del raw_task, validate_task_result
+        if task_validation.failure is not None:
+            raise_task_store_operation_failure(task_validation.failure)
+        task = task_validation.result
+        del task_validation
+        if task is None:
+            raise RuntimeError("Work-attempt task lookup returned no task authority.")
+        contract = task.work_contract
+        assert contract is not None
+        del task
+        stable = authority.request
+        prepare = WorkAttemptAdmissionPrepare(
+            admission_id=stable.admission_id,
+            claim_id=stable.claim_id,
+            attempt_id=stable.attempt_id,
+            task_id=task_id,
+            session_id=session_binding.id,
+            interaction_id=stable.interaction_id,
+            worker_id=stable.worker_id,
+            execution_owner_id=authority.execution_owner_id,
+            generation=stable.generation,
+            lease_seconds=stable.lease_seconds,
+            kind=authority.kind,
+            predecessor_admission_id=stable.predecessor_admission_id,
+            source_request_sha256=authority.source_request_sha256,
+            contract=contract,
+            session_invocation=session_binding,
+            source_execution_profile_fingerprint=execution_profile.fingerprint,
+        )
+        del contract
+        outcome = await capture_task_store_operation(
+            lambda: task_store.prepare_work_attempt_admission(prepare),
+            operation_name="Work-attempt admission preparation",
+            redactor=self._secret_redactor,
+            mutation_store=task_store,
+            mutation_method_name="prepare_work_attempt_admission",
+        )
+        if outcome.failure is not None:
+            raise_task_store_operation_failure(outcome.failure)
+        validation = capture_sensitive_result_validation(
+            lambda value=outcome.result: require_work_attempt_preparation_result(value, prepare),
+            operation_name="Work-attempt admission preparation result validation",
+            redactor=self._secret_redactor,
+        )
+        del outcome
+        if validation.failure is not None:
+            raise_task_store_operation_failure(validation.failure)
+        admission = validation.result
+        del validation
+        if admission is None:
+            raise RuntimeError("Work-attempt admission preparation returned no authority.")
+        return admission
+
+    async def _activate_runtime_work_attempt(
+        self,
+        *,
+        admission: WorkAttemptAdmission,
+        session: Session,
+        execution_profile: ExecutionProfileIdentity,
+        lease_seconds: int,
+    ) -> WorkAttemptAdmission:
+        task_store = self.task_store
+        if task_store is None:
+            raise RuntimeError("task_store is required for work-attempt execution.")
+        stored_profile = execution_profile_from_session_metadata(session.metadata)
+        raw_deferred_input = await read_work_attempt_session_store(
+            lambda: self.session_store.load_deferred_interaction_input(session.id),
+            operation_name="Work-attempt deferred-input lookup",
+            redactor=self._secret_redactor,
+        )
+        deferred_validation = capture_work_attempt_deferred_input_result(
+            raw_deferred_input,
+            operation_name="Work-attempt deferred-input lookup",
+            redactor=self._secret_redactor,
+        )
+        del raw_deferred_input
+        if deferred_validation.failure is not None:
+            raise_task_store_operation_failure(deferred_validation.failure)
+        deferred_authority = deferred_validation.result
+        del deferred_validation
+        raw_checkpoint = await read_work_attempt_session_store(
+            lambda: self.session_store.load_checkpoint(session.id),
+            operation_name="Work-attempt activation checkpoint lookup",
+            redactor=self._secret_redactor,
+        )
+        checkpoint_validation = capture_work_attempt_checkpoint_result(
+            raw_checkpoint,
+            operation_name="Work-attempt activation checkpoint lookup",
+            redactor=self._secret_redactor,
+        )
+        del raw_checkpoint
+        if checkpoint_validation.failure is not None:
+            raise_task_store_operation_failure(checkpoint_validation.failure)
+        checkpoint = checkpoint_validation.result
+        del checkpoint_validation
+        active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        active_model_completion = await read_work_attempt_session_store(
+            lambda: self.session_store.load_active_model_completion_stage(session.id),
+            operation_name="Work-attempt active model-stage lookup",
+            redactor=self._secret_redactor,
+        )
+        has_active_model_completion = active_model_completion is not None
+        del active_model_completion
+        if (
+            session.id != admission.session_id
+            or session.status is not SessionStatus.RUNNING
+            or SessionInvocationBinding(
+                id=session.id,
+                session_instance_id=session.instance_id,
+                invocation=session.invocation,
+            )
+            != admission.session_invocation
+            or stored_profile != execution_profile
+            or execution_profile.fingerprint != admission.source_execution_profile_fingerprint
+            or (
+                admission.kind == "initial"
+                and (
+                    deferred_authority is None
+                    or deferred_authority != (admission.interaction_id, True)
+                )
+            )
+            or active_profile is None
+            or not active_invocation_execution_profile_matches_session_epoch(
+                active_profile,
+                session_id=session.id,
+                run_epoch=session.run_epoch,
+            )
+            or active_invocation_execution_profile_is_released(
+                active_profile,
+                session_id=session.id,
+                run_epoch=session.run_epoch,
+            )
+            or active_profile.interaction_id != admission.interaction_id
+            or active_profile.profile != execution_profile
+            or has_active_model_completion
+        ):
+            raise WorkAttemptRecoveryRequired(
+                "Session store did not publish the exact work-attempt interaction authority."
+            )
+        if admission.state not in {
+            WorkAttemptAdmissionState.PREPARING,
+            WorkAttemptAdmissionState.ACTIVE,
+        }:
+            raise WorkAttemptRecoveryRequired(
+                "Only prepared or exact active admission authority can be activated."
+            )
+        evidence = hashlib.sha256(
+            canonical_durable_json_bytes(
+                {
+                    "admission_id": admission.admission_id,
+                    "session_id": session.id,
+                    "interaction_id": admission.interaction_id,
+                    "run_epoch": session.run_epoch,
+                    "invocation": session.invocation.model_dump(mode="json", warnings=False),
+                    "execution_profile_fingerprint": execution_profile.fingerprint,
+                    "session_updated_at": session.updated_at.isoformat(),
+                    "session_last_activity_at": session.last_activity_at.isoformat(),
+                    "checkpoint_sha256": hashlib.sha256(
+                        canonical_durable_json_bytes(
+                            checkpoint,
+                            "work_attempt_activation_checkpoint",
+                        )
+                    ).hexdigest(),
+                },
+                "work_attempt_session_evidence",
+            )
+        ).hexdigest()
+        if (
+            admission.state is WorkAttemptAdmissionState.ACTIVE
+            and admission.session_evidence_sha256 != evidence
+        ):
+            raise WorkAttemptRecoveryRequired(
+                "Active admission conflicts with its exact session activation evidence."
+            )
+        # Session mutation already owns the durable run epoch. Publish its
+        # task-local interaction authority before the receipt write so an
+        # acknowledgement-lost activation can be retried without losing event
+        # attribution in the owning task.
+        _activate_session_run_fence(session)
+        _activate_session_interaction(session.id, admission.interaction_id)
+        activation = WorkAttemptAdmissionActivate(
+            admission_id=admission.admission_id,
+            claim_id=admission.claim.claim_id,
+            prepare_request_sha256=admission.prepare_request_sha256,
+            session_evidence_sha256=evidence,
+        )
+        outcome = await capture_task_store_operation(
+            lambda: task_store.activate_work_attempt_admission(activation),
+            operation_name="Work-attempt admission activation",
+            redactor=self._secret_redactor,
+            mutation_store=task_store,
+            mutation_method_name="activate_work_attempt_admission",
+        )
+        if outcome.failure is not None:
+            raise_task_store_operation_failure(outcome.failure)
+        validation = capture_sensitive_result_validation(
+            lambda value=outcome.result, prepared=admission: require_work_attempt_activation_result(
+                value,
+                prepared,
+                activation,
+            ),
+            operation_name="Work-attempt admission activation result validation",
+            redactor=self._secret_redactor,
+        )
+        del outcome, admission
+        if validation.failure is not None:
+            raise_task_store_operation_failure(validation.failure)
+        active = validation.result
+        del validation
+        if active is None:
+            raise RuntimeError("Work-attempt admission activation returned no authority.")
+        return await self._fan_out_work_attempt_interaction_started(
+            active,
+            lease_seconds=lease_seconds,
+        )
+
+    async def _renew_work_attempt_handoff_claim(
+        self,
+        admission: WorkAttemptAdmission,
+        *,
+        lease_seconds: int,
+    ) -> WorkAttemptAdmission:
+        """Refresh the exact active claim while its admission handoff is owned."""
+
+        task_store = self.task_store
+        if task_store is None:
+            raise RuntimeError("task_store is required for work-attempt handoff renewal.")
+        claim = admission.claim
+        request = WorkAttemptExecutionClaimRequest(
+            admission_id=admission.admission_id,
+            claim_id=claim.claim_id,
+            worker_id=claim.worker_id,
+            execution_owner_id=claim.execution_owner_id,
+            generation=claim.generation,
+            lease_seconds=lease_seconds,
+        )
+        outcome = await capture_task_store_operation(
+            lambda: task_store.renew_work_attempt_execution_claim(request),
+            operation_name="Work-attempt interaction-handoff claim renewal",
+            redactor=self._secret_redactor,
+            mutation_store=task_store,
+            mutation_method_name="renew_work_attempt_execution_claim",
+        )
+        if outcome.failure is not None:
+            raise_task_store_operation_failure(outcome.failure)
+        validation = capture_sensitive_result_validation(
+            lambda value=outcome.result, previous=admission: require_work_attempt_claim_result(
+                value,
+                previous,
+                request,
+                operation_name="Work-attempt interaction-handoff claim renewal",
+                allowed_states=frozenset({WorkAttemptAdmissionState.ACTIVE}),
+                allowed_previous_states=frozenset({WorkAttemptAdmissionState.ACTIVE}),
+                renewal=True,
+            ),
+            operation_name="Work-attempt interaction-handoff renewal result validation",
+            redactor=self._secret_redactor,
+        )
+        del outcome, admission
+        if validation.failure is not None:
+            raise_task_store_operation_failure(validation.failure)
+        renewed = validation.result
+        del validation
+        if renewed is None:
+            raise RuntimeError("Work-attempt interaction-handoff renewal returned no authority.")
+        return renewed
+
+    async def _require_live_work_attempt_handoff_claim(
+        self,
+        admission: WorkAttemptAdmission,
+        *,
+        lease_seconds: int,
+    ) -> WorkAttemptAdmission:
+        """Reconcile the exact claim after handoff without extending a fast replay."""
+
+        task_store = self.task_store
+        if task_store is None:
+            raise RuntimeError("task_store is required for work-attempt handoff reconciliation.")
+        claim = admission.claim
+        request = WorkAttemptExecutionClaimRequest(
+            admission_id=admission.admission_id,
+            claim_id=claim.claim_id,
+            worker_id=claim.worker_id,
+            execution_owner_id=claim.execution_owner_id,
+            generation=claim.generation,
+            lease_seconds=lease_seconds,
+        )
+        outcome = await capture_task_store_operation(
+            lambda: task_store.claim_work_attempt_recovery(request),
+            operation_name="Work-attempt interaction-handoff claim reconciliation",
+            redactor=self._secret_redactor,
+            mutation_store=task_store,
+            mutation_method_name="claim_work_attempt_recovery",
+        )
+        if outcome.failure is not None:
+            raise_task_store_operation_failure(outcome.failure)
+        validation = capture_sensitive_result_validation(
+            lambda value=outcome.result, previous=admission: require_work_attempt_claim_result(
+                value,
+                previous,
+                request,
+                operation_name="Work-attempt interaction-handoff claim reconciliation",
+                allowed_states=frozenset({WorkAttemptAdmissionState.ACTIVE}),
+                allowed_previous_states=frozenset({WorkAttemptAdmissionState.ACTIVE}),
+                renewal=True,
+            ),
+            operation_name=(
+                "Work-attempt interaction-handoff claim reconciliation result validation"
+            ),
+            redactor=self._secret_redactor,
+        )
+        del outcome, admission
+        if validation.failure is not None:
+            raise_task_store_operation_failure(validation.failure)
+        current = validation.result
+        del validation
+        if current is None:
+            raise RuntimeError(
+                "Work-attempt interaction-handoff reconciliation returned no authority."
+            )
+        return current
+
+    async def _fan_out_work_attempt_interaction_started(
+        self,
+        admission: WorkAttemptAdmission,
+        *,
+        lease_seconds: int,
+    ) -> WorkAttemptAdmission:
+        """Deliver the persisted event without spending the returned execution lease."""
+
+        async def finish_interaction_started_handoff() -> list[Event]:
+            raw_records = await read_work_attempt_session_store(
+                lambda: self.session_store.query_events(
+                    EventQuery(
+                        session_id=admission.session_id,
+                        interaction_id=admission.interaction_id,
+                        event_type=EventType.INTERACTION_STARTED,
+                        limit=2,
+                    )
+                ),
+                operation_name="Work-attempt interaction-event lookup",
+                redactor=self._secret_redactor,
+            )
+            records_validation = capture_work_attempt_event_records_result(
+                raw_records,
+                operation_name="Work-attempt interaction-event lookup",
+                redactor=self._secret_redactor,
+            )
+            del raw_records
+            if records_validation.failure is not None:
+                raise_task_store_operation_failure(records_validation.failure)
+            records = records_validation.result
+            del records_validation
+            if records is None:
+                raise RuntimeError("Work-attempt interaction-event lookup returned no records.")
+            if (
+                len(records) != 1
+                or records[0].event.session_id != admission.session_id
+                or records[0].event.interaction_id != admission.interaction_id
+                or records[0].event.type != EventType.INTERACTION_STARTED
+            ):
+                raise WorkAttemptRecoveryRequired(
+                    "Work-attempt admission has no unique durable interaction-start event."
+                )
+            interaction_started = records[0].event
+            delivered = await self._event_writer.fan_out_persisted([interaction_started])
+            while True:
+                delivery = await read_work_attempt_session_store(
+                    lambda: self.session_store.get_persisted_event_side_effect_delivery(
+                        session_id=interaction_started.session_id,
+                        event_id=interaction_started.id,
+                    ),
+                    operation_name="Work-attempt interaction-event delivery lookup",
+                    redactor=self._secret_redactor,
+                )
+                if delivery is None:
+                    raise WorkAttemptRecoveryRequired(
+                        "Work-attempt interaction event has no durable delivery authority."
+                    )
+                if delivery.status not in {
+                    PersistedEventSideEffectStatus.PENDING,
+                    PersistedEventSideEffectStatus.LEASED,
+                }:
+                    return delivered
+                await asyncio.sleep(0.01)
+                delivered = await self._event_writer.fan_out_persisted([interaction_started])
+
+        async def finish_live_interaction_handoff() -> WorkAttemptAdmission:
+            current = admission
+            handoff = asyncio.create_task(
+                capture_awaitable_outcome(finish_interaction_started_handoff),
+                name="cayu-work-attempt-interaction-event-delivery",
+            )
+            renewal_interval = min(
+                _WORK_ATTEMPT_HANDOFF_RENEWAL_MAX_INTERVAL_SECONDS,
+                max(
+                    _WORK_ATTEMPT_HANDOFF_RENEWAL_MIN_INTERVAL_SECONDS,
+                    lease_seconds / 3,
+                ),
+            )
+            # Give an ordinary in-process handoff a short grace period to finish
+            # without changing its exact replay receipt. A handoff that remains
+            # pending receives an early renewal before settling into the regular
+            # heartbeat cadence; this also protects a live claim that was already
+            # close to expiry when an exact replay entered the handoff.
+            next_renewal_delay = min(
+                _WORK_ATTEMPT_HANDOFF_RENEWAL_MIN_INTERVAL_SECONDS,
+                renewal_interval,
+            )
+            renewal_failure: BaseException | None = None
+            while not handoff.done():
+                completed, _pending = await asyncio.wait(
+                    {handoff},
+                    timeout=next_renewal_delay,
+                )
+                if completed:
+                    break
+                try:
+                    current = await self._renew_work_attempt_handoff_claim(
+                        current,
+                        lease_seconds=lease_seconds,
+                    )
+                except BaseException as failure:
+                    renewal_failure = failure
+                    break
+                next_renewal_delay = renewal_interval
+            handoff_outcome = await handoff
+            handoff_failure = handoff_outcome.error
+            if renewal_failure is not None and handoff_failure is not None:
+                raise BaseExceptionGroup(
+                    "Work-attempt interaction handoff and claim renewal failed.",
+                    [renewal_failure, handoff_failure],
+                )
+            if renewal_failure is not None:
+                raise renewal_failure
+            if handoff_failure is not None:
+                raise handoff_failure
+            return await self._require_live_work_attempt_handoff_claim(
+                current,
+                lease_seconds=lease_seconds,
+            )
+
+        return await settle_work_attempt_owned_operation(
+            finish_live_interaction_handoff,
+            operation_name="work-attempt-interaction-event-handoff",
+            preserved_failure_types=(
+                WorkAttemptAdmissionConflict,
+                WorkAttemptExecutionClaimLost,
+                WorkAttemptRecoveryRequired,
+            ),
+            redactor=self._secret_redactor,
+        )
+
+    async def _reconcile_runtime_work_attempt(
+        self,
+        authority: _WorkAttemptRuntimeAuthority,
+        *,
+        expected_task_id: str | None,
+        expected_session_id: str | None,
+    ) -> WorkAttemptAdmission | None:
+        task_store = self.task_store
+        if task_store is None:
+            return None
+        if not task_store_work_attempt_admission_capability_is_complete(task_store):
+            raise NotImplementedError(
+                f"{type(task_store).__name__} does not implement the complete "
+                "work-attempt admission contract."
+            )
+        stable = authority.request
+        outcome = await capture_task_store_operation(
+            lambda: task_store.load_work_attempt_admission(stable.admission_id),
+            operation_name="Work-attempt admission reconciliation lookup",
+            redactor=self._secret_redactor,
+        )
+        if outcome.failure is not None:
+            raise_task_store_operation_failure(outcome.failure)
+        admission = outcome.result
+        if admission is None:
+            return None
+        admission_validation = capture_sensitive_result_validation(
+            lambda value=admission: require_work_attempt_admission_result(
+                value,
+                operation_name="Work-attempt admission reconciliation lookup",
+            ),
+            operation_name="Work-attempt admission reconciliation validation",
+            redactor=self._secret_redactor,
+        )
+        del outcome, admission
+        if admission_validation.failure is not None:
+            raise_task_store_operation_failure(admission_validation.failure)
+        admission = admission_validation.result
+        del admission_validation
+        if admission is None:
+            raise RuntimeError("Work-attempt admission reconciliation returned no authority.")
+        if (
+            admission.attempt_id != stable.attempt_id
+            or admission.interaction_id != stable.interaction_id
+            or admission.kind != authority.kind
+            or admission.source_request_sha256 != authority.source_request_sha256
+            or (expected_task_id is not None and admission.task_id != expected_task_id)
+            or (expected_session_id is not None and admission.session_id != expected_session_id)
+            or (
+                authority.kind == "continuation"
+                and (
+                    admission.continuation is None
+                    or stable.task_id != admission.task_id
+                    or stable.predecessor_admission_id != admission.continuation.prior_admission_id
+                )
+            )
+        ):
+            raise WorkCompletionConflict(
+                "Work-attempt admission identity conflicts with this runtime request."
+            )
+        if admission.state is WorkAttemptAdmissionState.RELEASED:
+            raise WorkAttemptExecutionClaimLost(
+                "The work-attempt admission has already released execution authority."
+            )
+        exact_loaded_claim = (
+            admission.claim.claim_id == stable.claim_id
+            and admission.claim.worker_id == stable.worker_id
+            and admission.claim.execution_owner_id == authority.execution_owner_id
+            and admission.claim.generation == stable.generation
+        )
+        if admission.state is not WorkAttemptAdmissionState.PREPARING and not (
+            admission.state is WorkAttemptAdmissionState.ACTIVE and exact_loaded_claim
+        ):
+            raise WorkAttemptRecoveryRequired(
+                "Published work-attempt authority must be replaced through the "
+                "dedicated recovery entrance."
+            )
+        claim_request = WorkAttemptExecutionClaimRequest(
+            admission_id=stable.admission_id,
+            claim_id=stable.claim_id,
+            worker_id=stable.worker_id,
+            execution_owner_id=authority.execution_owner_id,
+            generation=stable.generation,
+            lease_seconds=stable.lease_seconds,
+        )
+        claim_outcome = await capture_task_store_operation(
+            lambda: task_store.claim_work_attempt_recovery(claim_request),
+            operation_name="Work-attempt admission claim reconciliation",
+            redactor=self._secret_redactor,
+            mutation_store=task_store,
+            mutation_method_name="claim_work_attempt_recovery",
+        )
+        if claim_outcome.failure is not None:
+            raise_task_store_operation_failure(claim_outcome.failure)
+        claim_validation = capture_sensitive_result_validation(
+            lambda value=claim_outcome.result, previous=admission: (
+                require_work_attempt_claim_result(
+                    value,
+                    previous,
+                    claim_request,
+                    operation_name="Work-attempt admission claim reconciliation",
+                    allowed_states=frozenset(
+                        {
+                            WorkAttemptAdmissionState.PREPARING,
+                            WorkAttemptAdmissionState.ACTIVE,
+                        }
+                    ),
+                    allowed_previous_states=frozenset(
+                        {
+                            WorkAttemptAdmissionState.PREPARING,
+                            WorkAttemptAdmissionState.ACTIVE,
+                        }
+                    ),
+                )
+            ),
+            operation_name="Work-attempt admission claim reconciliation result validation",
+            redactor=self._secret_redactor,
+        )
+        del claim_outcome, admission
+        if claim_validation.failure is not None:
+            raise_task_store_operation_failure(claim_validation.failure)
+        claimed = claim_validation.result
+        del claim_validation
+        if claimed is None:
+            raise RuntimeError("Work-attempt admission claim reconciliation returned no authority.")
+        admission = claimed
+        del claimed
+        if admission.state is WorkAttemptAdmissionState.ACTIVE:
+            raw_session = await read_work_attempt_session_store(
+                lambda: self.session_store.load(admission.session_id),
+                operation_name="Active work-attempt session lookup",
+                redactor=self._secret_redactor,
+            )
+            if raw_session is None:
+                raise WorkAttemptRecoveryRequired(
+                    "Active work-attempt admission has no durable session."
+                )
+            session_validation = capture_work_attempt_session_result(
+                raw_session,
+                operation_name="Active work-attempt session lookup",
+                redactor=self._secret_redactor,
+            )
+            del raw_session
+            if session_validation.failure is not None:
+                raise_task_store_operation_failure(session_validation.failure)
+            session = session_validation.result
+            del session_validation
+            if session is None:
+                raise RuntimeError("Active work-attempt session lookup returned no session.")
+            profile = execution_profile_from_session_metadata(session.metadata)
+            if (
+                SessionInvocationBinding(
+                    id=session.id,
+                    session_instance_id=session.instance_id,
+                    invocation=session.invocation,
+                )
+                != admission.session_invocation
+                or profile is None
+                or profile.fingerprint != admission.source_execution_profile_fingerprint
+            ):
+                raise WorkAttemptRecoveryRequired(
+                    "Active work-attempt receipt conflicts with immutable session authority."
+                )
+            # Mutable transcript, checkpoint, timestamps, and terminal state do
+            # not participate in exact receipt identity. Rebuild process-local
+            # fencing only when the same durable invocation is still running.
+            raw_checkpoint = await read_work_attempt_session_store(
+                lambda session_id=session.id: self.session_store.load_checkpoint(session_id),
+                operation_name="Active work-attempt checkpoint lookup",
+                redactor=self._secret_redactor,
+            )
+            checkpoint_validation = capture_work_attempt_checkpoint_result(
+                raw_checkpoint,
+                operation_name="Active work-attempt checkpoint lookup",
+                redactor=self._secret_redactor,
+            )
+            del raw_checkpoint
+            if checkpoint_validation.failure is not None:
+                raise_task_store_operation_failure(checkpoint_validation.failure)
+            checkpoint = checkpoint_validation.result
+            del checkpoint_validation
+            active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+            if (
+                session.status is SessionStatus.RUNNING
+                and active_profile is not None
+                and active_profile.interaction_id == admission.interaction_id
+                and active_profile.profile == profile
+                and active_invocation_execution_profile_matches_session_epoch(
+                    active_profile,
+                    session_id=session.id,
+                    run_epoch=session.run_epoch,
+                )
+                and not active_invocation_execution_profile_is_released(
+                    active_profile,
+                    session_id=session.id,
+                    run_epoch=session.run_epoch,
+                )
+            ):
+                _activate_session_run_fence(session)
+                _activate_session_interaction(session.id, admission.interaction_id)
+            return await self._fan_out_work_attempt_interaction_started(
+                admission,
+                lease_seconds=stable.lease_seconds,
+            )
+        if admission.state is not WorkAttemptAdmissionState.PREPARING:
+            raise WorkAttemptRecoveryRequired(
+                "Work-attempt admission is already owned by session recovery."
+            )
+        raw_session = await read_work_attempt_session_store(
+            lambda: self.session_store.load(admission.session_id),
+            operation_name="Prepared work-attempt session lookup",
+            redactor=self._secret_redactor,
+        )
+        if raw_session is None:
+            if admission.kind == "continuation":
+                raise WorkAttemptRecoveryRequired(
+                    "Prepared continuation authority has no source session."
+                )
+            return WorkAttemptAdmission.model_validate(
+                admission.model_dump(mode="python", warnings=False)
+            )
+        session_validation = capture_work_attempt_session_result(
+            raw_session,
+            operation_name="Prepared work-attempt session lookup",
+            redactor=self._secret_redactor,
+        )
+        del raw_session
+        if session_validation.failure is not None:
+            raise_task_store_operation_failure(session_validation.failure)
+        session = session_validation.result
+        del session_validation
+        if session is None:
+            raise RuntimeError("Prepared work-attempt session lookup returned no session.")
+        profile = execution_profile_from_session_metadata(session.metadata)
+        raw_deferred_input = await read_work_attempt_session_store(
+            lambda: self.session_store.load_deferred_interaction_input(session.id),
+            operation_name="Prepared work-attempt deferred-input lookup",
+            redactor=self._secret_redactor,
+        )
+        deferred_validation = capture_work_attempt_deferred_input_result(
+            raw_deferred_input,
+            operation_name="Prepared work-attempt deferred-input lookup",
+            redactor=self._secret_redactor,
+        )
+        del raw_deferred_input
+        if deferred_validation.failure is not None:
+            raise_task_store_operation_failure(deferred_validation.failure)
+        deferred_authority = deferred_validation.result
+        del deferred_validation
+        if (
+            profile is None
+            or profile.fingerprint != admission.source_execution_profile_fingerprint
+            or SessionInvocationBinding(
+                id=session.id,
+                session_instance_id=session.instance_id,
+                invocation=session.invocation,
+            )
+            != admission.session_invocation
+        ):
+            raise WorkAttemptRecoveryRequired(
+                "Prepared work-attempt admission has ambiguous session authority."
+            )
+        if admission.kind == "continuation" and session.status in _RESUMABLE_SESSION_STATUSES:
+            return WorkAttemptAdmission.model_validate(
+                admission.model_dump(mode="python", warnings=False)
+            )
+        if session.status is not SessionStatus.RUNNING or (
+            admission.kind == "initial"
+            and (
+                deferred_authority is None or deferred_authority != (admission.interaction_id, True)
+            )
+        ):
+            raise WorkAttemptRecoveryRequired(
+                "Prepared work-attempt admission has ambiguous interaction authority."
+            )
+        return await self._activate_runtime_work_attempt(
+            admission=admission,
+            session=session,
+            execution_profile=profile,
+            lease_seconds=stable.lease_seconds,
+        )
+
+    async def admit_initial_work_attempt(
+        self,
+        request: RunRequest,
+        *,
+        authority: _WorkAttemptRuntimeAuthority,
+    ) -> WorkAttemptAdmission:
+        """Create and activate one initial governed interaction without dispatching it."""
+
+        if request.parent_session_id is not None:
+            raise TaskCompletionDecisionRequired(
+                "Contracted session forks are rejected before work-attempt admission."
+            )
+        reconciled = await self._reconcile_runtime_work_attempt(
+            authority,
+            expected_task_id=request.task_id,
+            expected_session_id=request.session_id,
+        )
+        if reconciled is not None and reconciled.state is WorkAttemptAdmissionState.ACTIVE:
+            return reconciled
+        prepared = await self._prepare_initial_run(
+            request,
+            admit_session=False,
+            allow_work_attempt_admission=True,
+        )
+        if prepared is None:
+            raise RuntimeError("Work-attempt initial preparation unexpectedly failed closed.")
+        if prepared.targeted_tool_grants:
+            raise ValueError("Work-attempt admission cannot issue interaction-scoped tool grants.")
+        prepared_request = prepared.request
+        session_id = prepared_request.session_id
+        if session_id is None:
+            raise AssertionError("Work-attempt session identity was not assigned.")
+        interaction_id = authority.request.interaction_id
+        lease_seconds = authority.request.lease_seconds
+        interaction_started_event = self._interaction_started_event_from_identity(
+            session_id=session_id,
+            agent_name=prepared.registered_agent.spec.name,
+            environment_name=_environment_name(prepared.registered_environment),
+            interaction_id=interaction_id,
+            event_id=None,
+            targeted_tool_grants=prepared.targeted_tool_grants,
+        )
+        bind_runtime_session_create_claim(
+            prepared_request,
+            identity=prepared.session_identity,
+            interaction_started_event=interaction_started_event,
+        )
+        if reconciled is None:
+            session_instance_material = bytearray(
+                hashlib.sha256(
+                    canonical_durable_json_bytes(
+                        {
+                            "record_type": "cayu.work-attempt-session-instance",
+                            "admission_id": authority.request.admission_id,
+                            "session_id": session_id,
+                            "source_request_sha256": authority.source_request_sha256,
+                        },
+                        "work_attempt_session_instance",
+                    )
+                ).digest()[:16]
+            )
+            session_instance_material[6] = (session_instance_material[6] & 0x0F) | 0x40
+            session_instance_material[8] = (session_instance_material[8] & 0x3F) | 0x80
+            session_instance_id = str(UUID(bytes=bytes(session_instance_material)))
+        else:
+            session_instance_id = reconciled.session_invocation.session_instance_id
+        prepared_request = run_request_with_runtime_session_instance_authority(
+            prepared_request,
+            session_instance_id=session_instance_id,
+        )
+        initial_transcript_messages = transcript_helpers.initial_messages(
+            system_prompt=prepared.rendered_system_prompt,
+            request_messages=prepared_request.messages,
+        )
+        prepared_request = run_request_with_runtime_initial_transcript_authority(
+            prepared_request,
+            interaction_id=interaction_id,
+            initial_transcript_messages=initial_transcript_messages,
+        )
+        session_binding = SessionInvocationBinding(
+            id=session_id,
+            session_instance_id=session_instance_id,
+            invocation=session_invocation_for_run_request(
+                prepared_request,
+                session_id=session_id,
+                parent_session=None,
+            ),
+        )
+        admission = reconciled
+        if admission is None:
+            admission = await self._prepare_runtime_work_attempt(
+                authority=authority,
+                task_id=prepared_request.task_id,
+                session_binding=session_binding,
+                execution_profile=prepared.execution_profile,
+            )
+        elif (
+            admission.state is not WorkAttemptAdmissionState.PREPARING
+            or admission.task_id != prepared_request.task_id
+            or admission.session_invocation != session_binding
+            or admission.source_execution_profile_fingerprint
+            != prepared.execution_profile.fingerprint
+        ):
+            raise WorkAttemptRecoveryRequired(
+                "Prepared initial admission conflicts with reconstructed runtime authority."
+            )
+        if admission.continuation is not None:
+            raise WorkCompletionConflict(
+                "Rejected/continue work requires the continuation admission entrance."
+            )
+        execution_profile = prepared.execution_profile
+
+        def freeze_initial_invocation_profile(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+            *,
+            expected_interaction_id: str = interaction_id,
+            expected_profile: ExecutionProfileIdentity = execution_profile,
+        ) -> dict[str, Any]:
+            return checkpoint_with_active_invocation_execution_profile(
+                checkpoint,
+                session_id=current_session.id,
+                interaction_id=expected_interaction_id,
+                run_epoch=current_session.run_epoch,
+                profile=expected_profile,
+            )
+
+        def create_session(
+            request_to_create: RunRequest = prepared_request,
+            *,
+            identity: SessionIdentity = prepared.session_identity,
+            started_event: Event = interaction_started_event,
+            source_messages: list[Message] = prepared_request.messages,
+            checkpoint_transform: CheckpointTransform = freeze_initial_invocation_profile,
+        ) -> Awaitable[Session]:
+            return self.session_store.create(
+                request_to_create,
+                identity=identity,
+                interaction_started_event=started_event,
+                interaction_source_messages=source_messages,
+                checkpoint_transform=checkpoint_transform,
+            )
+
+        mutation = settle_work_attempt_session_mutation(
+            create_session,
+            operation_name="work-attempt-session-create",
+            preserved_failure_types=(
+                SessionRunFenced,
+                SessionStatusConflict,
+                WorkAttemptRecoveryRequired,
+            ),
+            redactor=self._secret_redactor,
+        )
+        del (
+            request,
+            authority,
+            reconciled,
+            prepared,
+            prepared_request,
+            session_id,
+            interaction_id,
+            interaction_started_event,
+            session_binding,
+            freeze_initial_invocation_profile,
+            create_session,
+        )
+        try:
+            raw_session = await mutation
+        except BaseException:
+            del admission, execution_profile, mutation
+            raise
+        del mutation
+        session_validation = capture_work_attempt_session_result(
+            raw_session,
+            operation_name="Work-attempt session creation",
+            redactor=self._secret_redactor,
+        )
+        del raw_session
+        if session_validation.failure is not None:
+            del admission, execution_profile
+            raise_task_store_operation_failure(session_validation.failure)
+        session = session_validation.result
+        del session_validation
+        if session is None:
+            del admission, execution_profile
+            raise RuntimeError("Work-attempt session creation returned no session.")
+        return await self._activate_runtime_work_attempt(
+            admission=admission,
+            session=session,
+            execution_profile=execution_profile,
+            lease_seconds=lease_seconds,
+        )
+
+    async def admit_continuation_work_attempt(
+        self,
+        request: ResumeRequest,
+        *,
+        authority: _WorkAttemptRuntimeAuthority,
+    ) -> WorkAttemptAdmission:
+        """Admit one rejected/continue attempt without dispatching provider work."""
+
+        request = session_request_boundary.prepare_resume_request(
+            request,
+            redactor=self._secret_redactor,
+        )
+        if (
+            request.profile_adoption is not None
+            or request.target is not None
+            or request.tool_capability_ceiling is not None
+            or request.metadata
+            or request.max_steps != 16
+            or request.limits != RunLimits()
+            or request.budget_limits
+            or request.retry_policy is not None
+            or request.structured_output is not None
+            or request.thinking is not None
+            or request.loop_policies
+        ):
+            raise ValueError(
+                "Work-attempt continuation accepts new messages only; execution controls "
+                "remain bound to the admitted source profile."
+            )
+        if request.tool_grants:
+            raise ValueError("Work-attempt continuation does not admit targeted tool grants.")
+        task_id = authority.request.task_id
+        predecessor_admission_id = authority.request.predecessor_admission_id
+        if task_id is None or predecessor_admission_id is None:
+            raise ValueError(
+                "Work-attempt continuation requires exact task and predecessor authority."
+            )
+        reconciled = await self._reconcile_runtime_work_attempt(
+            authority,
+            expected_task_id=task_id,
+            expected_session_id=request.session_id,
+        )
+        if reconciled is not None and reconciled.state is WorkAttemptAdmissionState.ACTIVE:
+            return reconciled
+        raw_session = await read_work_attempt_session_store(
+            lambda session_id=request.session_id: self.session_store.load(session_id),
+            operation_name="Continuation work-attempt session lookup",
+            redactor=self._secret_redactor,
+        )
+        if raw_session is None:
+            raise KeyError(f"Session not found: {request.session_id}")
+        session_validation = capture_work_attempt_session_result(
+            raw_session,
+            operation_name="Work-attempt continuation session lookup",
+            redactor=self._secret_redactor,
+        )
+        del raw_session
+        if session_validation.failure is not None:
+            raise_task_store_operation_failure(session_validation.failure)
+        session = session_validation.result
+        del session_validation
+        if session is None:
+            raise RuntimeError("Work-attempt continuation session lookup returned no session.")
+        profile = execution_profile_from_session_metadata(session.metadata)
+        if profile is None:
+            raise RuntimeError("Continuation session has no durable execution profile.")
+        session_binding = SessionInvocationBinding(
+            id=session.id,
+            session_instance_id=session.instance_id,
+            invocation=session.invocation,
+        )
+        if session.status not in _RESUMABLE_SESSION_STATUSES:
+            raise SessionStatusConflict(
+                "Work-attempt continuation requires a terminal resumable session."
+            )
+        task_store = self.task_store
+        if task_store is None:
+            raise RuntimeError("task_store is required for work-attempt execution.")
+        predecessor_outcome = await capture_task_store_operation(
+            lambda: task_store.load_work_attempt_admission(predecessor_admission_id),
+            operation_name="Continuation predecessor admission lookup",
+            redactor=self._secret_redactor,
+        )
+        if predecessor_outcome.failure is not None:
+            raise_task_store_operation_failure(predecessor_outcome.failure)
+        if predecessor_outcome.result is None:
+            raise WorkAttemptAdmissionConflict("Continuation predecessor admission is missing.")
+        predecessor_validation = capture_sensitive_result_validation(
+            lambda value=predecessor_outcome.result: require_work_attempt_admission_result(
+                value,
+                operation_name="Continuation predecessor admission lookup",
+            ),
+            operation_name="Continuation predecessor admission validation",
+            redactor=self._secret_redactor,
+        )
+        del predecessor_outcome
+        if predecessor_validation.failure is not None:
+            raise_task_store_operation_failure(predecessor_validation.failure)
+        predecessor = predecessor_validation.result
+        del predecessor_validation
+        if predecessor is None:
+            raise RuntimeError("Continuation predecessor validation returned no authority.")
+        if (
+            predecessor.admission_id != predecessor_admission_id
+            or predecessor.task_id != task_id
+            or predecessor.session_id != session.id
+            or predecessor.state is not WorkAttemptAdmissionState.RELEASED
+        ):
+            raise WorkAttemptAdmissionConflict(
+                "Continuation predecessor conflicts with released task-session authority."
+            )
+        predecessor_recovery_authority = work_attempt_recovery_session_authority(predecessor.claim)
+        raw_checkpoint = await read_work_attempt_session_store(
+            lambda session_id=session.id: self.session_store.load_checkpoint(session_id),
+            operation_name="Continuation work-attempt checkpoint lookup",
+            redactor=self._secret_redactor,
+        )
+        checkpoint_validation = capture_work_attempt_checkpoint_result(
+            raw_checkpoint,
+            operation_name="Work-attempt continuation checkpoint lookup",
+            redactor=self._secret_redactor,
+        )
+        del raw_checkpoint
+        if checkpoint_validation.failure is not None:
+            raise_task_store_operation_failure(checkpoint_validation.failure)
+        checkpoint = checkpoint_validation.result
+        del checkpoint_validation
+        checkpoint_recovery_authority = work_attempt_recovery_session_authority_from_checkpoint(
+            checkpoint
+        )
+        if (
+            checkpoint_recovery_authority is not None
+            and checkpoint_recovery_authority != predecessor_recovery_authority
+        ):
+            raise WorkAttemptRecoveryRequired(
+                "Continuation recovery marker belongs to another predecessor admission."
+            )
+        _reject_unresumable_session_checkpoint(
+            session,
+            checkpoint,
+            redactor=self._secret_redactor,
+        )
+        active_profile = active_invocation_execution_profile_from_checkpoint(checkpoint)
+        if active_profile is not None and not active_invocation_execution_profile_is_released(
+            active_profile,
+            session_id=session.id,
+            run_epoch=session.run_epoch,
+        ):
+            raise SessionRunFenced(
+                "The previous invocation still owns terminal hooks or trailing cleanup."
+            )
+        admission = reconciled
+        if admission is None:
+            admission = await self._prepare_runtime_work_attempt(
+                authority=authority,
+                task_id=task_id,
+                session_binding=session_binding,
+                execution_profile=profile,
+            )
+        elif (
+            admission.state is not WorkAttemptAdmissionState.PREPARING
+            or admission.task_id != task_id
+            or admission.session_invocation != session_binding
+            or admission.source_execution_profile_fingerprint != profile.fingerprint
+        ):
+            raise WorkAttemptRecoveryRequired(
+                "Prepared continuation conflicts with reconstructed runtime authority."
+            )
+        if admission.continuation is None:
+            raise WorkCompletionConflict(
+                "Continuation admission requires a rejected/continue decision."
+            )
+        if (
+            admission.continuation.prior_admission_id != predecessor.admission_id
+            or admission.continuation.prior_attempt_id != predecessor.attempt_id
+        ):
+            raise WorkAttemptRecoveryRequired(
+                "Continuation receipt conflicts with its selected predecessor admission."
+            )
+        interaction_started_event = self._interaction_started_event(
+            session=session,
+            registered_agent=self._get_registered_agent(session.agent_name),
+            environment_name=session.environment_name,
+            interaction_id=authority.request.interaction_id,
+        )
+        expected_session_id = session.id
+        expected_run_epoch = session.run_epoch
+        lease_seconds = authority.request.lease_seconds
+
+        def validate_continuation_checkpoint(
+            current_session: Session,
+            current_checkpoint: dict[str, Any] | None,
+            *,
+            source_session_id: str = expected_session_id,
+            source_run_epoch: int = expected_run_epoch,
+            expected_recovery_authority=predecessor_recovery_authority,
+        ) -> dict[str, Any] | None:
+            _reject_unresumable_session_checkpoint(
+                current_session,
+                current_checkpoint,
+                redactor=self._secret_redactor,
+            )
+            current_active = active_invocation_execution_profile_from_checkpoint(current_checkpoint)
+            if current_active is not None and not active_invocation_execution_profile_is_released(
+                current_active,
+                session_id=source_session_id,
+                run_epoch=source_run_epoch,
+            ):
+                raise SessionRunFenced("The previous invocation still owns trailing cleanup.")
+            if _active_session_operation_id(current_checkpoint) is not None:
+                raise RuntimeError("Session has an active durable operation.")
+            current_recovery_authority = work_attempt_recovery_session_authority_from_checkpoint(
+                current_checkpoint
+            )
+            if (
+                current_recovery_authority is not None
+                and current_recovery_authority != expected_recovery_authority
+            ):
+                raise WorkAttemptRecoveryRequired(
+                    "Continuation recovery marker belongs to another predecessor admission."
+                )
+            if current_checkpoint is None:
+                return None
+            updated = copy_json_value(current_checkpoint, "checkpoint")
+            # Recovery authority is scoped to the admission that published it.
+            # Retire the predecessor marker in the same session transaction that
+            # admits a distinct continuation interaction.
+            updated.pop(WORK_ATTEMPT_RECOVERY_CHECKPOINT_KEY, None)
+            return updated or None
+
+        invocation_admission = SessionInvocationAdmission(
+            from_statuses=frozenset(_RESUMABLE_SESSION_STATUSES),
+            checkpoint_transform=validate_continuation_checkpoint,
+            execution_profile=profile,
+            tool_capability_ceiling=tool_capability_ceiling_from_session_metadata(session.metadata),
+            interaction_started_event=interaction_started_event,
+            interaction_source_messages=tuple(request.messages),
+        )
+
+        def admit_session_invocation(
+            session_id: str = expected_session_id,
+            *,
+            exact_admission: SessionInvocationAdmission = invocation_admission,
+        ) -> Awaitable[Session]:
+            return self.session_store.admit_session_invocation(
+                session_id,
+                admission=exact_admission,
+            )
+
+        mutation = settle_work_attempt_session_mutation(
+            admit_session_invocation,
+            operation_name="work-attempt-continuation-admission",
+            preserved_failure_types=(
+                SessionRunFenced,
+                SessionStatusConflict,
+                WorkAttemptRecoveryRequired,
+            ),
+            redactor=self._secret_redactor,
+        )
+        del (
+            request,
+            authority,
+            reconciled,
+            session,
+            task_id,
+            session_binding,
+            checkpoint,
+            active_profile,
+            predecessor,
+            predecessor_recovery_authority,
+            interaction_started_event,
+            expected_session_id,
+            expected_run_epoch,
+            validate_continuation_checkpoint,
+            invocation_admission,
+            admit_session_invocation,
+        )
+        try:
+            raw_resumed = await mutation
+        except BaseException:
+            del admission, profile, mutation
+            raise
+        del mutation
+        resumed_validation = capture_work_attempt_session_result(
+            raw_resumed,
+            operation_name="Work-attempt continuation admission",
+            redactor=self._secret_redactor,
+        )
+        del raw_resumed
+        if resumed_validation.failure is not None:
+            del admission, profile
+            raise_task_store_operation_failure(resumed_validation.failure)
+        resumed = resumed_validation.result
+        del resumed_validation
+        if resumed is None:
+            del admission, profile
+            raise RuntimeError("Work-attempt continuation admission returned no session.")
+        return await self._activate_runtime_work_attempt(
+            admission=admission,
+            session=resumed,
+            execution_profile=profile,
+            lease_seconds=lease_seconds,
         )
 
     async def _verifier_aware_task_execution_outcome(

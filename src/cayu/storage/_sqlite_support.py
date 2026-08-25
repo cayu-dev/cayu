@@ -29,6 +29,8 @@ from cayu.runtime.sessions import (
     SessionIdentity,
     SessionOrder,
     SessionStatus,
+    deferred_interaction_input_from_storage_payload,
+    deferred_interaction_input_storage_payload,
     session_instance_id_for_run_request,
     session_invocation_for_run_request,
     session_metadata_for_creation,
@@ -2868,6 +2870,53 @@ _MIGRATION_STEPS: dict[int, str] = {
                 REFERENCES cayu_knowledge_changes(sequence)
         );
     """,
+    61: """
+        CREATE TABLE IF NOT EXISTS cayu_work_attempt_admissions (
+            admission_id TEXT PRIMARY KEY,
+            attempt_id TEXT NOT NULL UNIQUE,
+            task_id TEXT NOT NULL REFERENCES cayu_tasks(id) ON DELETE RESTRICT,
+            session_id TEXT NOT NULL,
+            interaction_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN (
+                'preparing', 'active', 'recovering', 'released'
+            )),
+            prepare_request_sha256 TEXT NOT NULL CHECK (
+                length(prepare_request_sha256) = 64
+                AND prepare_request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            current_claim_id TEXT NOT NULL,
+            current_generation INTEGER NOT NULL CHECK (
+                current_generation >= 1 AND current_generation <= 64
+            ),
+            lease_expires_at TEXT NOT NULL,
+            admission_json TEXT NOT NULL CHECK (json_valid(admission_json))
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_work_attempt_admission_interaction
+            ON cayu_work_attempt_admissions(session_id, interaction_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_work_attempt_admission_session_current
+            ON cayu_work_attempt_admissions(session_id)
+            WHERE state != 'released';
+        CREATE INDEX IF NOT EXISTS idx_cayu_work_attempt_admission_task
+            ON cayu_work_attempt_admissions(task_id, current_generation DESC);
+
+        CREATE TABLE IF NOT EXISTS cayu_work_attempt_execution_claims (
+            claim_id TEXT PRIMARY KEY,
+            admission_id TEXT NOT NULL
+                REFERENCES cayu_work_attempt_admissions(admission_id) ON DELETE RESTRICT,
+            generation INTEGER NOT NULL CHECK (generation >= 1 AND generation <= 64),
+            request_sha256 TEXT NOT NULL CHECK (
+                length(request_sha256) = 64
+                AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            lease_expires_at TEXT NOT NULL,
+            is_current INTEGER NOT NULL CHECK (is_current IN (0, 1)),
+            claim_json TEXT NOT NULL CHECK (json_valid(claim_json)),
+            UNIQUE (admission_id, generation)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_work_attempt_claim_current
+            ON cayu_work_attempt_execution_claims(admission_id)
+            WHERE is_current = 1;
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -3697,6 +3746,118 @@ def _migrate_revision_thirty_seven_knowledge_fts(connection: sqlite3.Connection)
     _validate_revision_37_knowledge_fts_data(connection)
 
 
+def _migrate_deferred_interaction_input_payloads(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        "SELECT session_id, interaction_id, source_messages_json "
+        "FROM cayu_deferred_interaction_inputs ORDER BY session_id"
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["source_messages_json"])
+            if type(payload) is list:
+                payload = {
+                    "source_messages": payload,
+                    "initial_transcript_messages": None,
+                }
+            stable = deferred_interaction_input_from_storage_payload(
+                row["interaction_id"],
+                payload,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "SQLite deferred interaction input cannot be migrated to revision 62."
+            ) from exc
+        connection.execute(
+            "UPDATE cayu_deferred_interaction_inputs SET source_messages_json = ? "
+            "WHERE session_id = ?",
+            (
+                json_dumps(deferred_interaction_input_storage_payload(stable)),
+                row["session_id"],
+            ),
+        )
+
+
+def _work_attempt_continuation_authority(
+    connection: sqlite3.Connection,
+    admission_json: object,
+) -> tuple[dict[str, Any], dict[str, Any] | None, str | None]:
+    if type(admission_json) is not dict:
+        raise ValueError("Work-attempt admission payload must be an object.")
+    stable_admission_json = cast("dict[str, Any]", admission_json)
+    continuation = stable_admission_json.get("continuation")
+    if continuation is None:
+        return stable_admission_json, None, None
+    if type(continuation) is not dict:
+        raise ValueError("Work-attempt continuation payload must be an object.")
+    stable_continuation = cast("dict[str, Any]", continuation)
+    prior_attempt_id = stable_continuation.get("prior_attempt_id")
+    if type(prior_attempt_id) is not str or not prior_attempt_id.strip():
+        raise ValueError("Work-attempt continuation has no prior attempt identity.")
+    row = connection.execute(
+        "SELECT admission_id FROM cayu_work_attempt_admissions WHERE attempt_id = ?",
+        (prior_attempt_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError("Work-attempt continuation predecessor is missing.")
+    return stable_admission_json, stable_continuation, str(row["admission_id"])
+
+
+def _migrate_work_attempt_continuation_authority(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        "SELECT admission_id, admission_json FROM cayu_work_attempt_admissions "
+        "ORDER BY admission_id"
+    ).fetchall()
+    for row in rows:
+        try:
+            admission_json, continuation, prior_admission_id = _work_attempt_continuation_authority(
+                connection,
+                json.loads(row["admission_json"]),
+            )
+            if continuation is None:
+                continue
+            if "prior_admission_id" in continuation:
+                stored_prior_admission_id = continuation["prior_admission_id"]
+                if stored_prior_admission_id != prior_admission_id:
+                    raise ValueError("Work-attempt continuation predecessor authority conflicts.")
+                continue
+            migrated_continuation = dict(continuation)
+            migrated_continuation["prior_admission_id"] = prior_admission_id
+            migrated_admission = dict(admission_json)
+            migrated_admission["continuation"] = migrated_continuation
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "SQLite work-attempt continuation cannot be migrated to revision 62."
+            ) from exc
+        connection.execute(
+            "UPDATE cayu_work_attempt_admissions SET admission_json = ? WHERE admission_id = ?",
+            (json_dumps(migrated_admission), row["admission_id"]),
+        )
+
+
+def _validate_revision_sixty_two_payload_schema(connection: sqlite3.Connection) -> None:
+    """Validate revision-62 storage shape without scanning durable history."""
+
+    deferred_columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(cayu_deferred_interaction_inputs)")
+    )
+    if deferred_columns != (
+        ("session_id", "TEXT", 0, 1),
+        ("interaction_id", "TEXT", 1, 0),
+        ("source_messages_json", "TEXT", 1, 0),
+    ):
+        raise RuntimeError(
+            "SQLite deferred interaction input schema conflicts with Cayu's "
+            "revision-62 durable payload contract. Run `cayu storage migrate` "
+            "or restore the database from a known-good backup."
+        )
+
+
+def _migrate_revision_sixty_two_payloads(connection: sqlite3.Connection) -> None:
+    _migrate_deferred_interaction_input_payloads(connection)
+    _migrate_work_attempt_continuation_authority(connection)
+
+
 # Per-revision Python follow-ups that cannot be expressed as unconditional DDL
 # (e.g. conditionally carrying data out of a legacy ad-hoc table). Each hook runs
 # after its revision's DDL and before the revision is recorded.
@@ -3708,6 +3869,7 @@ _MIGRATION_HOOKS: dict[int, Callable[[sqlite3.Connection], None]] = {
     25: _prepare_revision_twenty_five,
     37: _migrate_revision_thirty_seven_knowledge_fts,
     59: _backfill_session_instance_ids,
+    62: _migrate_revision_sixty_two_payloads,
 }
 
 _REVISION_17_INDEX_NAMES = frozenset(
@@ -4185,6 +4347,13 @@ def reconcile_schema(
         _validate_session_message_queue_typed_message_column(connection)
     if app_min_supported >= 59:
         _validate_session_instance_schema(connection)
+    if app_min_supported >= 61:
+        _validate_work_attempt_admission_schema(connection)
+    if app_min_supported >= 62:
+        # The revision hook performs the one-time complete payload census.
+        # Ordinary startup remains independent of durable history size; each
+        # payload is validated again at its indexed read boundary.
+        _validate_revision_sixty_two_payload_schema(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -5375,6 +5544,135 @@ def _validate_task_retry_reconciliation_schema(connection: sqlite3.Connection) -
             "SQLite task retry-reconciliation schema conflicts with Cayu's "
             "revision-55 durability contract. Run `cayu storage migrate` or "
             "restore the database from a known-good backup."
+        )
+
+
+def _validate_work_attempt_admission_schema(connection: sqlite3.Connection) -> None:
+    admission_columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(cayu_work_attempt_admissions)")
+    )
+    claim_columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(cayu_work_attempt_execution_claims)")
+    )
+    expected_admission_columns = (
+        ("admission_id", "TEXT", 0, 1),
+        ("attempt_id", "TEXT", 1, 0),
+        ("task_id", "TEXT", 1, 0),
+        ("session_id", "TEXT", 1, 0),
+        ("interaction_id", "TEXT", 1, 0),
+        ("state", "TEXT", 1, 0),
+        ("prepare_request_sha256", "TEXT", 1, 0),
+        ("current_claim_id", "TEXT", 1, 0),
+        ("current_generation", "INTEGER", 1, 0),
+        ("lease_expires_at", "TEXT", 1, 0),
+        ("admission_json", "TEXT", 1, 0),
+    )
+    expected_claim_columns = (
+        ("claim_id", "TEXT", 0, 1),
+        ("admission_id", "TEXT", 1, 0),
+        ("generation", "INTEGER", 1, 0),
+        ("request_sha256", "TEXT", 1, 0),
+        ("lease_expires_at", "TEXT", 1, 0),
+        ("is_current", "INTEGER", 1, 0),
+        ("claim_json", "TEXT", 1, 0),
+    )
+    named_index_properties: dict[str, tuple[int, int]] = {}
+    for table_name in (
+        "cayu_work_attempt_admissions",
+        "cayu_work_attempt_execution_claims",
+    ):
+        for row in connection.execute(f"PRAGMA index_list({table_name})"):
+            index_name = str(row[1])
+            if index_name.startswith("sqlite_autoindex_"):
+                continue
+            named_index_properties[index_name] = (int(row[2]), int(row[4]))
+    named_indexes = {
+        "idx_cayu_work_attempt_admission_interaction": (
+            *named_index_properties.get("idx_cayu_work_attempt_admission_interaction", (-1, -1)),
+            tuple(
+                str(column[2])
+                for column in connection.execute(
+                    "PRAGMA index_info(idx_cayu_work_attempt_admission_interaction)"
+                )
+            ),
+        ),
+        "idx_cayu_work_attempt_admission_task": (
+            *named_index_properties.get("idx_cayu_work_attempt_admission_task", (-1, -1)),
+            tuple(
+                str(column[2])
+                for column in connection.execute(
+                    "PRAGMA index_info(idx_cayu_work_attempt_admission_task)"
+                )
+            ),
+        ),
+        "idx_cayu_work_attempt_admission_session_current": (
+            *named_index_properties.get(
+                "idx_cayu_work_attempt_admission_session_current",
+                (-1, -1),
+            ),
+            tuple(
+                str(column[2])
+                for column in connection.execute(
+                    "PRAGMA index_info(idx_cayu_work_attempt_admission_session_current)"
+                )
+            ),
+        ),
+        "idx_cayu_work_attempt_claim_current": (
+            *named_index_properties.get("idx_cayu_work_attempt_claim_current", (-1, -1)),
+            tuple(
+                str(column[2])
+                for column in connection.execute(
+                    "PRAGMA index_info(idx_cayu_work_attempt_claim_current)"
+                )
+            ),
+        ),
+    }
+    table_sql = {
+        str(row[0]): " ".join(str(row[1]).lower().split())
+        for row in connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name IN (?, ?)",
+            (
+                "cayu_work_attempt_admissions",
+                "cayu_work_attempt_execution_claims",
+            ),
+        )
+    }
+    session_index_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' "
+        "AND name = 'idx_cayu_work_attempt_admission_session_current'"
+    ).fetchone()
+    session_index_sql = (
+        "" if session_index_row is None else " ".join(str(session_index_row[0]).lower().split())
+    )
+    admission_sql = table_sql.get("cayu_work_attempt_admissions", "")
+    claim_sql = table_sql.get("cayu_work_attempt_execution_claims", "")
+    if (
+        admission_columns != expected_admission_columns
+        or claim_columns != expected_claim_columns
+        or named_indexes.get("idx_cayu_work_attempt_admission_interaction")
+        != (1, 0, ("session_id", "interaction_id"))
+        or named_indexes.get("idx_cayu_work_attempt_admission_task")
+        != (0, 0, ("task_id", "current_generation"))
+        or named_indexes.get("idx_cayu_work_attempt_admission_session_current")
+        != (1, 1, ("session_id",))
+        or "where state != 'released'" not in session_index_sql
+        or named_indexes.get("idx_cayu_work_attempt_claim_current") != (1, 1, ("admission_id",))
+        or "references cayu_tasks(id) on delete restrict" not in admission_sql
+        or any(
+            state not in admission_sql
+            for state in ("'preparing'", "'active'", "'recovering'", "'released'")
+        )
+        or "'draining'" in admission_sql
+        or "unique (admission_id, generation)" not in claim_sql
+        or "references cayu_work_attempt_admissions(admission_id) on delete restrict"
+        not in claim_sql
+    ):
+        raise RuntimeError(
+            "SQLite work-attempt admission schema conflicts with Cayu's revision-61 "
+            "durability contract. Run `cayu storage migrate` or restore the "
+            "database from a known-good backup."
         )
 
 
@@ -6599,6 +6897,10 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             )
         if rev.revision == 59:
             _validate_session_instance_schema(connection)
+        if rev.revision == 61:
+            _validate_work_attempt_admission_schema(connection)
+        if rev.revision == 62:
+            _validate_revision_sixty_two_payload_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

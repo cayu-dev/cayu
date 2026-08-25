@@ -99,6 +99,8 @@ _TABLES = (
     "cayu_completion_verification_claims",
     "cayu_completion_verifier_profiles",
     "cayu_completion_proposals",
+    "cayu_work_attempt_execution_claims",
+    "cayu_work_attempt_admissions",
     "cayu_work_attempts",
     "cayu_task_session_execution_authority",
     "cayu_work_contracts",
@@ -190,6 +192,76 @@ def _new_store(dsn: str):
 
     # Tests own a throwaway database and (re)create the schema each run.
     return PostgresSessionStore(dsn, min_size=1, max_size=4, schema_mode=SchemaMode.CREATE)
+
+
+def test_postgres_deferred_input_accepts_textual_jsonb_loader(postgres_dsn: str) -> None:
+    async def scenario() -> None:
+        from psycopg.types.json import set_json_loads
+        from psycopg_pool import AsyncConnectionPool
+
+        from cayu import PostgresSessionStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _truncate(postgres_dsn)
+        source = Message.text("user", "textual JSONB remains supported")
+        session_id = "text-jsonb-deferred-session"
+        interaction_id = "text-jsonb-deferred-interaction"
+        creator = _new_store(postgres_dsn)
+        try:
+            await creator.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[source],
+                ),
+                identity=_identity(),
+                interaction_started_event=Event(
+                    id="text-jsonb-deferred-started",
+                    type=EventType.INTERACTION_STARTED,
+                    session_id=session_id,
+                    interaction_id=interaction_id,
+                ),
+                interaction_source_messages=[source],
+            )
+        finally:
+            await creator.close()
+
+        async def configure(connection) -> None:
+            connection.prepare_threshold = None
+            set_json_loads(
+                lambda value: value.decode("utf-8") if type(value) is bytes else str(value),
+                connection,
+            )
+
+        pool = AsyncConnectionPool(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            open=False,
+            configure=configure,
+        )
+        store = PostgresSessionStore(
+            pool=pool,
+            schema_mode=SchemaMode.VALIDATE,
+        )
+        try:
+            deferred = await store.load_deferred_interaction_input(session_id)
+            assert deferred is not None
+            assert deferred.source_messages == [source]
+            assert deferred.initial_transcript_messages is None
+            replacement = [Message.text("system", "restored prefix"), source]
+            await store.replace_initial_transcript_messages(
+                session_id,
+                [source],
+                replacement,
+                interaction_id=interaction_id,
+            )
+            assert await store.load_transcript(session_id) == replacement
+        finally:
+            await store.close()
+            await pool.close()
+
+    asyncio.run(scenario())
 
 
 async def _issue_targeted_grant_record(

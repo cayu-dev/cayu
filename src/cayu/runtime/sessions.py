@@ -858,6 +858,8 @@ SESSION_RUNTIME_METADATA_KEYS = frozenset({"subagent"})
 SESSION_RUNTIME_METADATA_PREFIX = "cayu:"
 
 _RUNTIME_SESSION_CREATE_CLAIM_TOKEN = object()
+_RUNTIME_SESSION_INSTANCE_AUTHORITY_TOKEN = object()
+_RUNTIME_INITIAL_TRANSCRIPT_AUTHORITY_TOKEN = object()
 _RUNTIME_PREPARED_SESSION_AUTHORITY_TOKEN = object()
 _RUNTIME_RESUME_TRANSPORT_METADATA_TOKEN = object()
 _RUNTIME_RESUME_TRANSPORT_METADATA_KEYS = frozenset({"traceparent", "tracestate"})
@@ -894,6 +896,51 @@ class _RuntimeSessionCreateClaim:
         # Generic deep copies are caller-controlled and must not duplicate
         # runtime authority. The explicit RunRequest copier authenticates and
         # preserves the original handoff instead.
+        return None
+
+
+class _RuntimeSessionInstanceAuthority:
+    """Authenticated process-local authority for one preallocated incarnation."""
+
+    __slots__ = ("session_id", "session_instance_id", "token")
+
+    def __init__(self, *, session_id: str, session_instance_id: str) -> None:
+        self.token = _RUNTIME_SESSION_INSTANCE_AUTHORITY_TOKEN
+        self.session_id = session_id
+        self.session_instance_id = session_instance_id
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> None:
+        return None
+
+
+class _RuntimeInitialTranscriptAuthority:
+    """Authenticated process-local handoff for an exact initial transcript."""
+
+    __slots__ = (
+        "initial_transcript_messages",
+        "interaction_id",
+        "session_id",
+        "source_messages",
+        "token",
+    )
+
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        interaction_id: str,
+        source_messages: list[Message],
+        initial_transcript_messages: list[Message],
+    ) -> None:
+        self.token = _RUNTIME_INITIAL_TRANSCRIPT_AUTHORITY_TOKEN
+        self.session_id = session_id
+        self.interaction_id = interaction_id
+        self.source_messages = tuple(detach_message(message) for message in source_messages)
+        self.initial_transcript_messages = tuple(
+            detach_message(message) for message in initial_transcript_messages
+        )
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> None:
         return None
 
 
@@ -1219,6 +1266,8 @@ class RunRequest(BaseModel):
         default_factory=_empty_run_request_authority
     )
     _runtime_session_create_claim: object | None = PrivateAttr(default=None)
+    _runtime_session_instance_authority: object | None = PrivateAttr(default=None)
+    _runtime_initial_transcript_authority: object | None = PrivateAttr(default=None)
     _input_redactions_applied: bool = PrivateAttr(default=False)
     _verified_invocation_origin: InvocationOrigin | None = PrivateAttr(default=None)
     _runtime_invocation_source: SessionExecutionSource | None = PrivateAttr(default=None)
@@ -6821,6 +6870,7 @@ class DeferredInteractionInput(BaseModel):
 
     interaction_id: str
     source_messages: list[Message]
+    initial_transcript_messages: list[Message] | None = None
 
     @field_validator("interaction_id")
     @classmethod
@@ -6831,6 +6881,77 @@ class DeferredInteractionInput(BaseModel):
     @classmethod
     def copy_source_messages(cls, value: list[Message]) -> list[Message]:
         return [copy_message(message) for message in value]
+
+    @field_validator("initial_transcript_messages")
+    @classmethod
+    def copy_initial_transcript_messages(
+        cls,
+        value: list[Message] | None,
+    ) -> list[Message] | None:
+        if value is None:
+            return None
+        return [copy_message(message) for message in value]
+
+    @model_validator(mode="after")
+    def validate_initial_transcript_projection(self) -> DeferredInteractionInput:
+        initial = self.initial_transcript_messages
+        source = self.source_messages
+        if initial is not None and (
+            len(initial) < len(source) or (source and initial[-len(source) :] != source)
+        ):
+            raise ValueError(
+                "Initial transcript projection must preserve the deferred source suffix."
+            )
+        return self
+
+
+def deferred_interaction_input_storage_payload(
+    value: DeferredInteractionInput,
+) -> dict[str, Any]:
+    if type(value) is not DeferredInteractionInput:
+        raise TypeError("Deferred interaction storage requires DeferredInteractionInput.")
+    stable = DeferredInteractionInput.model_validate(
+        value.model_dump(mode="python", warnings=False)
+    )
+    payload = stable.model_dump(mode="json", warnings=False)
+    payload.pop("interaction_id")
+    return payload
+
+
+def deferred_interaction_input_from_storage_payload(
+    interaction_id: str,
+    payload: object,
+) -> DeferredInteractionInput:
+    if type(payload) is not dict or set(payload) != {
+        "source_messages",
+        "initial_transcript_messages",
+    }:
+        raise ValueError("Deferred interaction input has invalid durable payload.")
+    stable_payload = cast("dict[str, object]", payload)
+    return DeferredInteractionInput.model_validate(
+        {
+            "interaction_id": interaction_id,
+            "source_messages": stable_payload["source_messages"],
+            "initial_transcript_messages": stable_payload["initial_transcript_messages"],
+        }
+    )
+
+
+def require_deferred_initial_transcript_replacement(
+    deferred: DeferredInteractionInput,
+    *,
+    expected_messages: list[Message],
+    replacement_messages: list[Message],
+) -> None:
+    """Require source identity and any retained complete transcript authority."""
+
+    if deferred.source_messages != expected_messages:
+        raise RuntimeError("Deferred interaction input changed before finalization.")
+    authenticated = deferred.initial_transcript_messages
+    if authenticated is not None and authenticated != replacement_messages:
+        raise RuntimeError(
+            "Initial transcript replacement conflicts with its authenticated projection."
+        )
 
 
 class TranscriptPage(BaseModel):
@@ -9607,7 +9728,9 @@ class SessionStore(ABC):
         bootstrap/system messages and before ``runtime_suffix_count`` runtime-owned
         messages. The bootstrap prefix is stored with null interaction attribution;
         the admitted source and runtime suffix are attributed to ``interaction_id``.
-        No partial or externally visible pre-finalization transcript is permitted.
+        When deferred input retains a runtime-authenticated complete initial
+        projection, the replacement must equal that projection exactly. No partial
+        or externally visible pre-finalization transcript is permitted.
         When supplied, ``checkpoint_transform`` runs inside the same write
         transaction before the initial-transcript authority marker is read.
         """
@@ -9995,7 +10118,7 @@ class InMemorySessionStore(SessionStore):
         self._transcript_indices_by_interaction: dict[str, dict[str | None, list[int]]] = {}
         self._transcript_search_documents: dict[str, list[tuple[MessageRole, str]]] = {}
         self._transcript_search_postings: dict[tuple[str, MessageRole], dict[str, list[int]]] = {}
-        self._deferred_interaction_inputs: dict[str, tuple[str, list[Message]]] = {}
+        self._deferred_interaction_inputs: dict[str, DeferredInteractionInput] = {}
         self._checkpoints: dict[str, dict[str, Any]] = {}
         self._recall_receipts: dict[str, RecallReceipt] = {}
         self._recall_receipt_ids_by_session: dict[str, set[str]] = {}
@@ -11400,8 +11523,12 @@ class InMemorySessionStore(SessionStore):
                     [started_event],
                 )
                 self._deferred_interaction_inputs[session.id] = (
-                    interaction_id,
-                    source_messages,
+                    deferred_interaction_input_for_run_request(
+                        request,
+                        session_id=session.id,
+                        interaction_id=interaction_id,
+                        source_messages=source_messages,
+                    )
                 )
                 self._store_checkpoint_unlocked(
                     session.id,
@@ -12247,7 +12374,7 @@ class InMemorySessionStore(SessionStore):
                 _, interaction_id, _, defer_source = admission
                 existing_deferred = self._deferred_interaction_inputs.get(session_id)
                 if existing_deferred is not None and (
-                    not defer_source or existing_deferred[0] != interaction_id
+                    not defer_source or existing_deferred.interaction_id != interaction_id
                 ):
                     raise RuntimeError("Session already has deferred interaction input.")
             if transition_metadata is not None:
@@ -12291,9 +12418,9 @@ class InMemorySessionStore(SessionStore):
                         prepared_events,
                     )
                 if defer_source:
-                    self._deferred_interaction_inputs[session_id] = (
-                        interaction_id,
-                        source_messages,
+                    self._deferred_interaction_inputs[session_id] = DeferredInteractionInput(
+                        interaction_id=interaction_id,
+                        source_messages=source_messages,
                     )
                 else:
                     self._transcripts[session_id].extend(source_messages)
@@ -15605,8 +15732,13 @@ class InMemorySessionStore(SessionStore):
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
             deferred = self._deferred_interaction_inputs.get(session_id)
-            if deferred != (interaction_id, expected):
+            if deferred is None or deferred.interaction_id != interaction_id:
                 raise RuntimeError("Deferred interaction input changed before finalization.")
+            require_deferred_initial_transcript_replacement(
+                deferred,
+                expected_messages=expected,
+                replacement_messages=replacement,
+            )
             self._register_private_authority_alias_unlocked(
                 interaction_id,
                 field_name="interaction_id",
@@ -15666,9 +15798,9 @@ class InMemorySessionStore(SessionStore):
             deferred = self._deferred_interaction_inputs.get(session_id)
             if deferred is None:
                 return False
-            deferred_interaction_id, messages = deferred
-            if deferred_interaction_id != interaction_id:
+            if deferred.interaction_id != interaction_id:
                 raise RuntimeError("Deferred interaction input belongs to another interaction.")
+            messages = deferred.source_messages
             self._transcripts[session_id].extend(messages)
             self._extend_transcript_search_unlocked(session_id, messages)
             self._extend_transcript_attribution_unlocked(
@@ -15692,10 +15824,8 @@ class InMemorySessionStore(SessionStore):
             deferred = self._deferred_interaction_inputs.get(session_id)
             if deferred is None:
                 return None
-            interaction_id, messages = deferred
-            return DeferredInteractionInput(
-                interaction_id=interaction_id,
-                source_messages=messages,
+            return DeferredInteractionInput.model_validate(
+                deferred.model_dump(mode="python", warnings=False)
             )
 
     async def append_transcript_messages_and_transform_checkpoint(
@@ -16705,6 +16835,23 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         and create_claim.token is _RUNTIME_SESSION_CREATE_CLAIM_TOKEN
         else None
     )
+    session_instance_authority = request._runtime_session_instance_authority
+    copied._runtime_session_instance_authority = (
+        session_instance_authority
+        if type(session_instance_authority) is _RuntimeSessionInstanceAuthority
+        and session_instance_authority.token is _RUNTIME_SESSION_INSTANCE_AUTHORITY_TOKEN
+        and session_instance_authority.session_id == request.session_id
+        else None
+    )
+    initial_transcript_authority = request._runtime_initial_transcript_authority
+    copied._runtime_initial_transcript_authority = (
+        initial_transcript_authority
+        if type(initial_transcript_authority) is _RuntimeInitialTranscriptAuthority
+        and initial_transcript_authority.token is _RUNTIME_INITIAL_TRANSCRIPT_AUTHORITY_TOKEN
+        and initial_transcript_authority.session_id == request.session_id
+        and initial_transcript_authority.source_messages == tuple(request.messages)
+        else None
+    )
     copied._input_redactions_applied = request._input_redactions_applied
     copied._verified_invocation_origin = (
         None
@@ -16906,6 +17053,109 @@ def run_request_with_runtime_session_create_claim(
     claim = _RuntimeSessionCreateClaim(session_id=session_id, claim_id=claim_id)
     copied._runtime_session_create_claim = claim
     return copied, claim
+
+
+def run_request_with_runtime_session_instance_authority(
+    request: RunRequest,
+    *,
+    session_instance_id: str,
+) -> RunRequest:
+    """Bind one trusted pre-create session incarnation to an internal request."""
+
+    if type(request) is not RunRequest:
+        raise TypeError("Runtime session-instance authority requires a RunRequest.")
+    session_id = request.session_id
+    if type(session_id) is not str:
+        raise ValueError("Runtime session-instance authority requires a session_id.")
+    session_instance_id = SessionInvocationBinding.validate_session_instance_id(session_instance_id)
+    current = request._runtime_session_instance_authority
+    if current is not None and (
+        type(current) is not _RuntimeSessionInstanceAuthority
+        or current.token is not _RUNTIME_SESSION_INSTANCE_AUTHORITY_TOKEN
+        or current.session_id != session_id
+        or current.session_instance_id != session_instance_id
+    ):
+        raise ValueError("Runtime session-instance authority conflicts with the request.")
+    copied = copy_run_request(request)
+    copied._runtime_session_instance_authority = _RuntimeSessionInstanceAuthority(
+        session_id=session_id,
+        session_instance_id=session_instance_id,
+    )
+    return copied
+
+
+def run_request_with_runtime_initial_transcript_authority(
+    request: RunRequest,
+    *,
+    interaction_id: str,
+    initial_transcript_messages: list[Message],
+) -> RunRequest:
+    """Bind the exact runtime-rendered initial transcript to session creation."""
+
+    if type(request) is not RunRequest:
+        raise TypeError("Runtime initial transcript authority requires a RunRequest.")
+    session_id = request.session_id
+    if type(session_id) is not str:
+        raise ValueError("Runtime initial transcript authority requires a session_id.")
+    interaction_id = require_clean_nonblank(interaction_id, "interaction_id")
+    initial = _detach_transcript_messages(initial_transcript_messages)
+    source = _detach_transcript_messages(request.messages)
+    DeferredInteractionInput(
+        interaction_id=interaction_id,
+        source_messages=source,
+        initial_transcript_messages=initial,
+    )
+    current = request._runtime_initial_transcript_authority
+    if current is not None and (
+        type(current) is not _RuntimeInitialTranscriptAuthority
+        or current.token is not _RUNTIME_INITIAL_TRANSCRIPT_AUTHORITY_TOKEN
+        or current.session_id != session_id
+        or current.interaction_id != interaction_id
+        or current.source_messages != tuple(source)
+        or current.initial_transcript_messages != tuple(initial)
+    ):
+        raise ValueError("Runtime initial transcript authority conflicts with the request.")
+    copied = copy_run_request(request)
+    copied._runtime_initial_transcript_authority = _RuntimeInitialTranscriptAuthority(
+        session_id=session_id,
+        interaction_id=interaction_id,
+        source_messages=source,
+        initial_transcript_messages=initial,
+    )
+    return copied
+
+
+def deferred_interaction_input_for_run_request(
+    request: RunRequest,
+    *,
+    session_id: str,
+    interaction_id: str,
+    source_messages: list[Message],
+) -> DeferredInteractionInput:
+    """Resolve an authenticated full initial projection or source-only fallback."""
+
+    if type(request) is not RunRequest:
+        raise TypeError("Deferred interaction input requires a RunRequest.")
+    source = _detach_transcript_messages(source_messages)
+    authority = request._runtime_initial_transcript_authority
+    if authority is None:
+        return DeferredInteractionInput(
+            interaction_id=interaction_id,
+            source_messages=source,
+        )
+    if (
+        type(authority) is not _RuntimeInitialTranscriptAuthority
+        or authority.token is not _RUNTIME_INITIAL_TRANSCRIPT_AUTHORITY_TOKEN
+        or authority.session_id != session_id
+        or authority.interaction_id != interaction_id
+        or authority.source_messages != tuple(source)
+    ):
+        raise ValueError("Runtime initial transcript authority conflicts with session creation.")
+    return DeferredInteractionInput(
+        interaction_id=interaction_id,
+        source_messages=source,
+        initial_transcript_messages=list(authority.initial_transcript_messages),
+    )
 
 
 def _session_create_claim_record(
@@ -17246,6 +17496,20 @@ def session_instance_id_for_run_request(
         raise TypeError("Session instance derivation requires a RunRequest.")
     session_id = _require_bounded_session_id(session_id, "session_id")
     task_invocation = request._runtime_task_invocation
+    authority = request._runtime_session_instance_authority
+    if authority is not None:
+        if (
+            type(authority) is not _RuntimeSessionInstanceAuthority
+            or authority.token is not _RUNTIME_SESSION_INSTANCE_AUTHORITY_TOKEN
+            or authority.session_id != session_id
+        ):
+            raise ValueError("Runtime session-instance authority conflicts with the request.")
+        if task_invocation is not None and (
+            task_invocation.session_id not in {None, session_id}
+            or task_invocation.session_instance_id not in {None, authority.session_instance_id}
+        ):
+            raise ValueError("Task session-instance authority conflicts with session creation.")
+        return authority.session_instance_id
     if task_invocation is not None and task_invocation.session_instance_id is not None:
         raise ValueError(
             "A task already bound to a session instance cannot create that session again."

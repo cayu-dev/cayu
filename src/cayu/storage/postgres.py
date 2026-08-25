@@ -407,6 +407,9 @@ from cayu.runtime.sessions import (
     decode_session_lineage_cursor,
     decode_session_topology_cursor,
     decode_transcript_search_cursor,
+    deferred_interaction_input_for_run_request,
+    deferred_interaction_input_from_storage_payload,
+    deferred_interaction_input_storage_payload,
     encode_session_cursor,
     encode_session_lineage_cursor,
     encode_transcript_search_cursor,
@@ -416,6 +419,7 @@ from cayu.runtime.sessions import (
     fork_transcript_is_accepted,
     queued_session_message_input,
     replace_session_user_metadata,
+    require_deferred_initial_transcript_replacement,
     resolve_interaction_attribution,
     restore_persisted_event_authority,
     session_instance_id_for_run_request,
@@ -542,6 +546,7 @@ from cayu.runtime.tool_grants import (
     validate_targeted_tool_unresolved_rejection_evidence,
     validate_targeted_tool_use_rejection_evidence,
 )
+from cayu.runtime.work_attempt_admission import WorkAttemptExecutionClaimLost
 from cayu.runtime.work_contracts import WorkCompletionConflict
 from cayu.storage import _postgres_aggregates as postgres_aggregates
 from cayu.storage import _postgres_support as pg_support
@@ -700,8 +705,8 @@ from cayu.storage.memory import (
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 54
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 59
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 62
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 62
 
 
 async def _postgres_lock_memory_evidence_id(cur: Any, lock_id: str) -> None:
@@ -2853,6 +2858,73 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         )
         """,
     ),
+    61: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_work_attempt_admissions (
+            admission_id TEXT PRIMARY KEY,
+            attempt_id TEXT NOT NULL UNIQUE,
+            task_id TEXT NOT NULL REFERENCES cayu_tasks(id) ON DELETE RESTRICT,
+            session_id TEXT NOT NULL,
+            interaction_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN (
+                'preparing', 'active', 'recovering', 'released'
+            )),
+            prepare_request_sha256 TEXT NOT NULL CHECK (prepare_request_sha256 ~ '^[0-9a-f]{64}$'),
+            current_claim_id TEXT NOT NULL,
+            current_generation BIGINT NOT NULL CHECK (
+                current_generation >= 1 AND current_generation <= 64
+            ),
+            lease_expires_at TIMESTAMPTZ NOT NULL,
+            admission_json JSONB NOT NULL
+        )
+        """,
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_work_attempt_admission_interaction "
+        "ON cayu_work_attempt_admissions(session_id, interaction_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_work_attempt_admission_session_current "
+        "ON cayu_work_attempt_admissions(session_id) WHERE state != 'released'",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_work_attempt_admission_task "
+        "ON cayu_work_attempt_admissions(task_id, current_generation DESC)",
+        """
+        CREATE TABLE IF NOT EXISTS cayu_work_attempt_execution_claims (
+            claim_id TEXT PRIMARY KEY,
+            admission_id TEXT NOT NULL
+                REFERENCES cayu_work_attempt_admissions(admission_id) ON DELETE RESTRICT,
+            generation BIGINT NOT NULL CHECK (generation >= 1 AND generation <= 64),
+            request_sha256 TEXT NOT NULL CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
+            lease_expires_at TIMESTAMPTZ NOT NULL,
+            is_current BOOLEAN NOT NULL,
+            claim_json JSONB NOT NULL,
+            UNIQUE (admission_id, generation)
+        )
+        """,
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_work_attempt_claim_current "
+        "ON cayu_work_attempt_execution_claims(admission_id) WHERE is_current",
+    ),
+    62: (
+        """
+        UPDATE cayu_deferred_interaction_inputs
+        SET source_messages = jsonb_build_object(
+            'source_messages', source_messages,
+            'initial_transcript_messages', NULL
+        )
+        WHERE jsonb_typeof(source_messages) = 'array'
+        """,
+        """
+        UPDATE cayu_work_attempt_admissions AS admission
+        SET admission_json = jsonb_set(
+            admission.admission_json,
+            '{continuation,prior_admission_id}',
+            to_jsonb(predecessor.admission_id),
+            true
+        )
+        FROM cayu_work_attempt_admissions AS predecessor
+        WHERE jsonb_typeof(admission.admission_json -> 'continuation') = 'object'
+          AND NOT (admission.admission_json -> 'continuation' ? 'prior_admission_id')
+          AND predecessor.attempt_id = (
+              admission.admission_json #>> '{continuation,prior_attempt_id}'
+          )
+        """,
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -4387,6 +4459,11 @@ class _PostgresStoreBase:
                             await self._validate_session_message_queue_typed_message_column(cur)
                         if self._min_required_revision >= 59:
                             await self._validate_session_instance_schema(cur)
+                        if self._min_required_revision >= 61:
+                            await self._validate_work_attempt_admission_schema(cur)
+                        if self._min_required_revision >= 62:
+                            await self._validate_deferred_interaction_input_payloads(cur)
+                            await self._validate_work_attempt_continuation_authority(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -4577,6 +4654,11 @@ class _PostgresStoreBase:
             await self._validate_eval_run_scenario_progress_column(cur)
         if self._min_required_revision >= 57:
             await self._validate_session_message_queue_typed_message_column(cur)
+        if self._min_required_revision >= 61:
+            await self._validate_work_attempt_admission_schema(cur)
+        if self._min_required_revision >= 62:
+            await self._validate_deferred_interaction_input_payloads(cur)
+            await self._validate_work_attempt_continuation_authority(cur)
         if state.revision >= 23:
             await self._validate_budget_reservation_identity_registry(
                 cur,
@@ -4686,6 +4768,11 @@ class _PostgresStoreBase:
         if revision.revision == 60:
             await self._validate_knowledge_change_schema(cur, relation_aware=True)
             await self._validate_knowledge_relation_schema(cur)
+        if revision.revision == 61:
+            await self._validate_work_attempt_admission_schema(cur)
+        if revision.revision == 62:
+            await self._validate_deferred_interaction_input_payloads(cur)
+            await self._validate_work_attempt_continuation_authority(cur)
 
     async def _validate_session_instance_schema(self, cur: Any) -> None:
         await cur.execute(
@@ -6023,6 +6110,234 @@ class _PostgresStoreBase:
                 "Postgres task retry-reconciliation schema conflicts with Cayu's "
                 "revision-55 durability contract. Run `cayu storage migrate` or "
                 "restore the database from a known-good backup."
+            )
+
+    async def _validate_work_attempt_admission_schema(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT table_name, column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name IN (
+                  'cayu_work_attempt_admissions',
+                  'cayu_work_attempt_execution_claims'
+              )
+            ORDER BY table_name, ordinal_position
+            """
+        )
+        columns = tuple(await cur.fetchall())
+        expected_columns = (
+            ("cayu_work_attempt_admissions", "admission_id", "text", "NO"),
+            ("cayu_work_attempt_admissions", "attempt_id", "text", "NO"),
+            ("cayu_work_attempt_admissions", "task_id", "text", "NO"),
+            ("cayu_work_attempt_admissions", "session_id", "text", "NO"),
+            ("cayu_work_attempt_admissions", "interaction_id", "text", "NO"),
+            ("cayu_work_attempt_admissions", "state", "text", "NO"),
+            (
+                "cayu_work_attempt_admissions",
+                "prepare_request_sha256",
+                "text",
+                "NO",
+            ),
+            ("cayu_work_attempt_admissions", "current_claim_id", "text", "NO"),
+            (
+                "cayu_work_attempt_admissions",
+                "current_generation",
+                "bigint",
+                "NO",
+            ),
+            (
+                "cayu_work_attempt_admissions",
+                "lease_expires_at",
+                "timestamp with time zone",
+                "NO",
+            ),
+            ("cayu_work_attempt_admissions", "admission_json", "jsonb", "NO"),
+            ("cayu_work_attempt_execution_claims", "claim_id", "text", "NO"),
+            ("cayu_work_attempt_execution_claims", "admission_id", "text", "NO"),
+            ("cayu_work_attempt_execution_claims", "generation", "bigint", "NO"),
+            (
+                "cayu_work_attempt_execution_claims",
+                "request_sha256",
+                "text",
+                "NO",
+            ),
+            (
+                "cayu_work_attempt_execution_claims",
+                "lease_expires_at",
+                "timestamp with time zone",
+                "NO",
+            ),
+            ("cayu_work_attempt_execution_claims", "is_current", "boolean", "NO"),
+            ("cayu_work_attempt_execution_claims", "claim_json", "jsonb", "NO"),
+        )
+        await cur.execute(
+            """
+            SELECT indexname, regexp_replace(indexdef, '\\s+', ' ', 'g')
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND indexname IN (
+                  'idx_cayu_work_attempt_admission_interaction',
+                  'idx_cayu_work_attempt_admission_session_current',
+                  'idx_cayu_work_attempt_admission_task',
+                  'idx_cayu_work_attempt_claim_current'
+              )
+            ORDER BY indexname
+            """
+        )
+        indexes = {str(row[0]): str(row[1]).lower() for row in await cur.fetchall()}
+        await cur.execute(
+            """
+            SELECT table_record.relname, constraint_record.contype,
+                   lower(pg_get_constraintdef(constraint_record.oid))
+            FROM pg_catalog.pg_constraint AS constraint_record
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = constraint_record.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname IN (
+                  'cayu_work_attempt_admissions',
+                  'cayu_work_attempt_execution_claims'
+              )
+            """
+        )
+        constraints = tuple(await cur.fetchall())
+        admission_constraints = tuple(
+            (str(kind), str(definition))
+            for table, kind, definition in constraints
+            if table == "cayu_work_attempt_admissions"
+        )
+        claim_constraints = tuple(
+            (str(kind), str(definition))
+            for table, kind, definition in constraints
+            if table == "cayu_work_attempt_execution_claims"
+        )
+        interaction_index = indexes.get("idx_cayu_work_attempt_admission_interaction", "")
+        session_index = indexes.get("idx_cayu_work_attempt_admission_session_current", "")
+        task_index = indexes.get("idx_cayu_work_attempt_admission_task", "")
+        current_index = indexes.get("idx_cayu_work_attempt_claim_current", "")
+        state_constraints = tuple(
+            definition
+            for kind, definition in admission_constraints
+            if kind == "c" and "state" in definition
+        )
+        constraints_valid = (
+            any(kind == "p" for kind, _definition in admission_constraints)
+            and any(
+                kind == "u" and "unique (attempt_id)" in definition
+                for kind, definition in admission_constraints
+            )
+            and any(
+                kind == "f"
+                and "foreign key (task_id) references cayu_tasks(id) on delete restrict"
+                in definition
+                for kind, definition in admission_constraints
+            )
+            and any(
+                all(
+                    state in definition
+                    for state in ("'preparing'", "'active'", "'recovering'", "'released'")
+                )
+                and "'draining'" not in definition
+                for definition in state_constraints
+            )
+            and any(kind == "p" for kind, _definition in claim_constraints)
+            and any(
+                kind == "u" and "unique (admission_id, generation)" in definition
+                for kind, definition in claim_constraints
+            )
+            and any(
+                kind == "f"
+                and "foreign key (admission_id) references cayu_work_attempt_admissions(admission_id) on delete restrict"
+                in definition
+                for kind, definition in claim_constraints
+            )
+        )
+        if (
+            columns != expected_columns
+            or "unique" not in interaction_index
+            or "(session_id, interaction_id)" not in interaction_index
+            or "unique" not in session_index
+            or "(session_id) where (state <> 'released'::text)" not in session_index
+            or "(task_id, current_generation desc)" not in task_index
+            or "unique" not in current_index
+            or "(admission_id) where is_current" not in current_index
+            or not constraints_valid
+        ):
+            raise RuntimeError(
+                "Postgres work-attempt admission schema conflicts with Cayu's "
+                "revision-61 durability contract. Run `cayu storage migrate` or "
+                "restore the database from a known-good backup."
+            )
+
+    async def _validate_deferred_interaction_input_payloads(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM cayu_deferred_interaction_inputs
+                WHERE jsonb_typeof(source_messages) IS DISTINCT FROM 'object'
+                   OR source_messages IS DISTINCT FROM jsonb_build_object(
+                       'source_messages', source_messages -> 'source_messages',
+                       'initial_transcript_messages',
+                       source_messages -> 'initial_transcript_messages'
+                   )
+                   OR jsonb_typeof(source_messages -> 'source_messages')
+                      IS DISTINCT FROM 'array'
+                   OR (
+                       jsonb_typeof(source_messages -> 'initial_transcript_messages')
+                       IS DISTINCT FROM 'array'
+                       AND jsonb_typeof(source_messages -> 'initial_transcript_messages')
+                           IS DISTINCT FROM 'null'
+                   )
+            )
+            """
+        )
+        row = await cur.fetchone()
+        if row is None or row[0] is True:
+            raise RuntimeError(
+                "Postgres deferred interaction input conflicts with Cayu's revision-62 "
+                "durable payload contract."
+            )
+
+    async def _validate_work_attempt_continuation_authority(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM cayu_work_attempt_admissions AS admission
+                LEFT JOIN cayu_work_attempt_admissions AS predecessor
+                  ON predecessor.attempt_id = (
+                      admission.admission_json #>> '{continuation,prior_attempt_id}'
+                  )
+                WHERE admission.admission_json -> 'continuation' IS NOT NULL
+                  AND jsonb_typeof(admission.admission_json -> 'continuation')
+                      IS DISTINCT FROM 'null'
+                  AND (
+                      jsonb_typeof(admission.admission_json -> 'continuation')
+                          IS DISTINCT FROM 'object'
+                      OR jsonb_typeof(
+                          admission.admission_json
+                              #> '{continuation,prior_attempt_id}'
+                      ) IS DISTINCT FROM 'string'
+                      OR jsonb_typeof(
+                          admission.admission_json
+                              #> '{continuation,prior_admission_id}'
+                      ) IS DISTINCT FROM 'string'
+                      OR predecessor.admission_id IS NULL
+                      OR admission.admission_json
+                          #>> '{continuation,prior_admission_id}'
+                          IS DISTINCT FROM predecessor.admission_id
+                  )
+            )
+            """
+        )
+        row = await cur.fetchone()
+        if row is None or row[0] is True:
+            raise RuntimeError(
+                "Postgres work-attempt continuation conflicts with Cayu's revision-62 "
+                "durable authority contract."
             )
 
     async def _validate_eval_result_baseline_schema(self, cur: Any) -> None:
@@ -16296,6 +16611,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         interaction_id = started_event.interaction_id
                         if interaction_id is None:
                             raise AssertionError("Interaction admission lost its identity.")
+                        deferred_input = deferred_interaction_input_for_run_request(
+                            request,
+                            session_id=session.id,
+                            interaction_id=interaction_id,
+                            source_messages=source_messages,
+                        )
                         lookup_key, projection, projection_bytes = (
                             pending_action_event_storage_values(started_event)
                         )
@@ -16346,9 +16667,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             (
                                 session.id,
                                 interaction_id,
-                                _dumps(
-                                    [message.model_dump(mode="json") for message in source_messages]
-                                ),
+                                _dumps(deferred_interaction_input_storage_payload(deferred_input)),
                             ),
                         )
                         await self._upsert_checkpoint(
@@ -17895,6 +18214,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 cur, session_id, admission_events
                             )
                         if defer_source:
+                            deferred_input = DeferredInteractionInput(
+                                interaction_id=interaction_id,
+                                source_messages=source_messages,
+                            )
                             await cur.execute(
                                 "INSERT INTO cayu_deferred_interaction_inputs "
                                 "(session_id, interaction_id, source_messages) "
@@ -17906,10 +18229,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                     session_id,
                                     interaction_id,
                                     _dumps(
-                                        [
-                                            message.model_dump(mode="json")
-                                            for message in source_messages
-                                        ]
+                                        deferred_interaction_input_storage_payload(deferred_input)
                                     ),
                                 ),
                             )
@@ -24320,11 +24640,15 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise RuntimeError(
                             "Deferred interaction input changed before finalization."
                         )
-                    stored = [Message(**item) for item in _json_list(row[1])]
-                    if stored != expected:
-                        raise RuntimeError(
-                            "Deferred interaction input changed before finalization."
-                        )
+                    stored = deferred_interaction_input_from_storage_payload(
+                        row[0],
+                        _json_obj(row[1]),
+                    )
+                    require_deferred_initial_transcript_replacement(
+                        stored,
+                        expected_messages=expected,
+                        replacement_messages=replacement,
+                    )
                     await cur.execute(
                         "SELECT 1 FROM cayu_transcript_messages WHERE session_id = %s LIMIT 1",
                         (session_id,),
@@ -24417,7 +24741,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise RuntimeError(
                             "Deferred interaction input belongs to another interaction."
                         )
-                    messages = [Message(**item) for item in _json_list(row[1])]
+                    deferred = deferred_interaction_input_from_storage_payload(
+                        row[0],
+                        _json_obj(row[1]),
+                    )
+                    messages = deferred.source_messages
                     if interaction_id is not None:
                         await self._register_public_authorities(
                             cur,
@@ -24466,10 +24794,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             row = await cur.fetchone()
         if row is None:
             return None
-        return DeferredInteractionInput(
-            interaction_id=row[0],
-            source_messages=[Message(**item) for item in _json_list(row[1])],
-        )
+        return deferred_interaction_input_from_storage_payload(row[0], _json_obj(row[1]))
 
     async def append_transcript_messages_and_transform_checkpoint(
         self,
@@ -25138,6 +25463,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     supports_idempotent_terminalization: ClassVar[bool] = True
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
+    supports_work_attempt_admission: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
     _min_required_revision = _POSTGRES_TASK_MIN_REQUIRED_REVISION
@@ -25851,6 +26177,14 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                         await conn.commit()
                         return replayed
 
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
+                        (request.task_id,),
+                    )
+                    if await cur.fetchone() is not None:
+                        raise WorkAttemptExecutionClaimLost(
+                            "Admitted work attempts cannot use ordinary terminalization."
+                        )
                     if task.retry_series is not None:
                         raise ValueError(
                             "Retry-series tasks require settle_task_retry_attempt for "
@@ -26461,6 +26795,15 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         now = datetime.now(UTC)
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
+                await self._load_task_locked(cur, task_id)
+                await cur.execute(
+                    "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
+                    (task_id,),
+                )
+                if await cur.fetchone() is not None:
+                    raise WorkAttemptExecutionClaimLost(
+                        "Admitted work attempts cannot use ordinary task resumption."
+                    )
                 await cur.execute(
                     f"""
                     UPDATE cayu_tasks
@@ -26712,6 +27055,14 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 task = await self._load_task_locked(cur, task_id)
                 now = await self._database_now(cur)
                 _ensure_owned_active_task_lease(task, worker_id, now=now)
+                await cur.execute(
+                    "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
+                    (task_id,),
+                )
+                if await cur.fetchone() is not None:
+                    raise WorkAttemptExecutionClaimLost(
+                        "Admitted work attempts require claim-fenced lease renewal."
+                    )
                 lease_expires_at = now + timedelta(seconds=extend_seconds)
                 await cur.execute(
                     f"""
@@ -26752,8 +27103,17 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
-                await self._load_task_locked(cur, task_id)
+                task = await self._load_task_locked(cur, task_id)
                 now = await self._database_now(cur)
+                _ensure_owned_active_task_lease(task, worker_id, now=now)
+                await cur.execute(
+                    "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
+                    (task_id,),
+                )
+                if await cur.fetchone() is not None:
+                    raise WorkAttemptExecutionClaimLost(
+                        "Admitted work attempts release ownership through proposal publication."
+                    )
                 await cur.execute(
                     f"""
                     UPDATE cayu_tasks
@@ -26797,8 +27157,17 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
-                await self._load_task_locked(cur, task_id)
+                task = await self._load_task_locked(cur, task_id)
                 now = await self._database_now(cur)
+                _ensure_owned_active_task_lease(task, worker_id, now=now)
+                await cur.execute(
+                    "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
+                    (task_id,),
+                )
+                if await cur.fetchone() is not None:
+                    raise WorkAttemptExecutionClaimLost(
+                        "Admitted work attempts release ownership through proposal publication."
+                    )
                 await cur.execute(
                     f"""
                     UPDATE cayu_tasks
@@ -26934,6 +27303,15 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
         now = datetime.now(UTC)
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
+                await self._load_task_locked(cur, task_id)
+                await cur.execute(
+                    "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
+                    (task_id,),
+                )
+                if await cur.fetchone() is not None:
+                    raise WorkAttemptExecutionClaimLost(
+                        "Admitted work attempts cannot use ordinary task holds."
+                    )
                 await cur.execute(
                     f"""
                     UPDATE cayu_tasks
@@ -27004,6 +27382,15 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 now = await self._database_now(cur)
                 if worker_id is not None:
                     _ensure_owned_active_task_lease(task, worker_id, now=now)
+                await cur.execute(
+                    "SELECT 1 FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
+                    (task_id,),
+                )
+                if await cur.fetchone() is not None:
+                    raise WorkAttemptExecutionClaimLost(
+                        "Admitted work attempts cannot use ordinary terminalization."
+                    )
+                if worker_id is not None:
                     owner_params = [worker_id, now]
                 verified_work_support.require_contracted_completion_authority(task, status)
                 cancellation = None

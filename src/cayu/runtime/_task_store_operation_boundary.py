@@ -19,6 +19,11 @@ from cayu.runtime._diagnostics import (
     runtime_owned_exception_renderings_are_credential_safe,
 )
 from cayu.runtime.tasks import TaskClaimLost, TaskStore
+from cayu.runtime.work_attempt_admission import (
+    WorkAttemptAdmissionConflict,
+    WorkAttemptExecutionClaimLost,
+    WorkAttemptRecoveryRequired,
+)
 from cayu.runtime.work_contracts import (
     CompletionVerificationClaimLost,
     TaskCompletionDecisionRequired,
@@ -33,6 +38,18 @@ from cayu.vaults import SecretRedactor
 _ResultT = TypeVar("_ResultT")
 _BASE_EXCEPTION_ARGS_DESCRIPTOR = BaseException.__dict__["args"]
 _BASE_EXCEPTION_CAUSE_DESCRIPTOR = BaseException.__dict__["__cause__"]
+_WORK_ATTEMPT_ADMISSION_MUTATIONS = (
+    "prepare_work_attempt_admission",
+    "activate_work_attempt_admission",
+    "renew_work_attempt_execution_claim",
+    "claim_work_attempt_recovery",
+    "activate_work_attempt_recovery",
+    "submit_admitted_completion_proposal",
+)
+_WORK_ATTEMPT_ADMISSION_READS = (
+    "load_work_attempt_admission",
+    "load_work_attempt_execution_claim",
+)
 
 
 class _TaskStoreOperationCancellationMarker:
@@ -120,6 +137,80 @@ def task_store_mutation_is_cancellation_quiescent(
         type(resolved) is MethodType
         and resolved.__self__ is task_store
         and resolved.__func__ is implementation
+    )
+
+
+def _task_store_method_has_stable_concrete_implementation(
+    task_store: TaskStore,
+    method_name: str,
+) -> bool:
+    """Prove that one method is not the base placeholder or dynamic dispatch."""
+
+    task_store_type = type(task_store)
+    mro = type.__getattribute__(task_store_type, "__mro__")
+    getattribute_owner = next(
+        (
+            candidate
+            for candidate in mro
+            if "__getattribute__" in type.__getattribute__(candidate, "__dict__")
+        ),
+        None,
+    )
+    if getattribute_owner is None:
+        return False
+    getattribute_implementation = type.__getattribute__(
+        getattribute_owner,
+        "__dict__",
+    )["__getattribute__"]
+    if getattribute_implementation is not object.__getattribute__:
+        return False
+    try:
+        instance_state = object.__getattribute__(task_store, "__dict__")
+    except AttributeError:
+        instance_state = None
+    if isinstance(instance_state, dict) and method_name in instance_state:
+        return False
+    implementation_owner = next(
+        (
+            candidate
+            for candidate in mro
+            if method_name in type.__getattribute__(candidate, "__dict__")
+        ),
+        None,
+    )
+    if implementation_owner is None:
+        return False
+    implementation = type.__getattribute__(implementation_owner, "__dict__")[method_name]
+    base_implementation = type.__getattribute__(TaskStore, "__dict__").get(method_name)
+    if type(implementation) is not FunctionType or implementation is base_implementation:
+        return False
+    resolved = object.__getattribute__(task_store, method_name)
+    return (
+        type(resolved) is MethodType
+        and resolved.__self__ is task_store
+        and resolved.__func__ is implementation
+    )
+
+
+def task_store_work_attempt_admission_capability_is_complete(
+    task_store: TaskStore,
+) -> bool:
+    """Return positive proof for the complete work-attempt extension family."""
+
+    try:
+        supported = object.__getattribute__(task_store, "supports_work_attempt_admission")
+    except BaseException:
+        return False
+    if supported is not True:
+        return False
+    if not all(
+        _task_store_method_has_stable_concrete_implementation(task_store, method_name)
+        for method_name in (*_WORK_ATTEMPT_ADMISSION_MUTATIONS, *_WORK_ATTEMPT_ADMISSION_READS)
+    ):
+        return False
+    return all(
+        task_store_mutation_is_cancellation_quiescent(task_store, method_name)
+        for method_name in _WORK_ATTEMPT_ADMISSION_MUTATIONS
     )
 
 
@@ -249,6 +340,9 @@ def _detached_task_store_failure(
         TimeoutError,
         ConnectionError,
         TaskClaimLost,
+        WorkAttemptAdmissionConflict,
+        WorkAttemptExecutionClaimLost,
+        WorkAttemptRecoveryRequired,
         CompletionVerificationClaimLost,
         TaskCompletionDecisionRequired,
         WorkContractConflict,
@@ -406,6 +500,9 @@ def _generic_task_store_failure(
         TimeoutError,
         ConnectionError,
         TaskClaimLost,
+        WorkAttemptAdmissionConflict,
+        WorkAttemptExecutionClaimLost,
+        WorkAttemptRecoveryRequired,
         CompletionVerificationClaimLost,
         TaskCompletionDecisionRequired,
         WorkContractConflict,
@@ -573,6 +670,39 @@ def capture_sensitive_validation(
         failure = RuntimeError(f"{operation_name} was cancelled without caller cancellation.")
     except Exception:
         return TaskStoreOperationOutcome()
+    except BaseException as error:
+        failure = _detached_task_store_failure(
+            error,
+            operation_name=operation_name,
+            redactor=redactor,
+        )
+    return TaskStoreOperationOutcome(failure=failure)
+
+
+def capture_sensitive_result_validation(
+    operation: Callable[[], _ResultT],
+    *,
+    operation_name: str,
+    redactor: SecretRedactor,
+) -> TaskStoreOperationOutcome[_ResultT]:
+    """Detach every failure raised while validating an extension result.
+
+    Unlike caller-input validation, a successful extension call can return a
+    well-formed but conflicting value. Preserve that stable classification and
+    message after redaction, while discarding the extension-owned model and the
+    validation traceback that retained it.
+    """
+
+    try:
+        return TaskStoreOperationOutcome(result=operation())
+    except BaseExceptionGroup as error:
+        failure = _detached_task_store_group(
+            error,
+            operation_name=operation_name,
+            redactor=redactor,
+        )
+    except asyncio.CancelledError:
+        failure = RuntimeError(f"{operation_name} was cancelled without caller cancellation.")
     except BaseException as error:
         failure = _detached_task_store_failure(
             error,
@@ -847,4 +977,5 @@ __all__ = [
     "capture_task_store_operation",
     "raise_task_store_operation_failure",
     "task_store_mutation_is_cancellation_quiescent",
+    "task_store_work_attempt_admission_capability_is_complete",
 ]

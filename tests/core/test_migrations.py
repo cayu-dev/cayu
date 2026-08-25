@@ -309,6 +309,36 @@ def test_revision_sixty_breaks_for_revision_bound_knowledge_relations() -> None:
         )
 
 
+def test_revision_sixty_one_breaks_for_work_attempt_admission() -> None:
+    state = m.SchemaState(revision=61, compatible_from=61)
+
+    # Pre-61 task workers do not maintain admission intents or process-aware
+    # execution claims, so they cannot share the migrated task store.
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 61"):
+        m.validate(state, app_latest=60, app_min_supported=60)
+    m.validate(state, app_latest=61, app_min_supported=61)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 61"):
+        m.validate(
+            m.SchemaState(revision=60, compatible_from=60),
+            app_latest=61,
+            app_min_supported=61,
+        )
+
+
+def test_revision_sixty_two_breaks_for_deferred_interaction_payloads() -> None:
+    state = m.SchemaState(revision=62, compatible_from=62)
+
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 62"):
+        m.validate(state, app_latest=61, app_min_supported=61)
+    m.validate(state, app_latest=62, app_min_supported=62)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 62"):
+        m.validate(
+            m.SchemaState(revision=61, compatible_from=61),
+            app_latest=62,
+            app_min_supported=62,
+        )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

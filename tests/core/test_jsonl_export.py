@@ -157,12 +157,14 @@ def test_export_sessions_preserves_private_deferred_interaction_input():
             assert line["deferred_interaction_input"] == {
                 "interaction_id": "interaction-deferred",
                 "source_messages": [source[0].model_dump(mode="json")],
+                "initial_transcript_messages": None,
             }
 
             [imported] = list(import_sessions(io.StringIO(stream.getvalue())))
             assert imported.deferred_interaction_input is not None
             assert imported.deferred_interaction_input.interaction_id == "interaction-deferred"
             assert imported.deferred_interaction_input.source_messages == source
+            assert imported.deferred_interaction_input.initial_transcript_messages is None
         finally:
             await store.release_run_fence("sess_deferred")
 

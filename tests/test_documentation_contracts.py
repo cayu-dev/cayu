@@ -216,6 +216,7 @@ def test_application_anatomy_guide_tracks_shipped_process_roles() -> None:
 
 def test_release_notes_preserve_storage_revision_chronology() -> None:
     release_notes = _REPO_ROOT / "docs" / "release-notes.md"
+    unreleased = _heading_section(release_notes, heading="Unreleased")
     v0_4_0 = _heading_section(release_notes, heading="v0.4.0")
     v0_3_0 = _heading_section(release_notes, heading="v0.3.0")
     v0_2_1 = _heading_section(release_notes, heading="v0.2.1")
@@ -241,6 +242,12 @@ def test_release_notes_preserve_storage_revision_chronology() -> None:
     assert "confirm revision 45 with no pending migrations" in v0_3_0
     assert "advances from revision 45 to revision 55" in v0_4_0
     assert "confirm revision 55 with no pending migrations" in v0_4_0
+    assert "Breaking storage revision 58 adds the profile registry" in unreleased
+    assert "Breaking storage revision 61 adds the admission" in unreleased
+    assert "confirm revision 61 before starting current workers" in unreleased
+    assert "Breaking storage revision 62 changes deferred interaction input" in unreleased
+    assert "confirm revision 62 before starting current workers" in unreleased
+    assert "revision 58" not in v0_4_0
     assert "Revision 47 adds the origin-aware immutable Evals result index" in v0_4_0
     assert "revision-46 workers must be stopped before migration" in v0_4_0
     assert "Breaking schema revision 39" in v0_3_0

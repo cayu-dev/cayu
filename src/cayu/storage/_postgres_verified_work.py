@@ -32,7 +32,29 @@ from cayu.runtime.tasks import (
     TaskStatus,
     TaskTopologyInconsistent,
     _ensure_owned_active_task_lease,
+    _task_invocation_for_attachment,
+    _task_session_instance_for_attachment,
     copy_task,
+)
+from cayu.runtime.work_attempt_admission import (
+    AdmittedCompletionProposalRequest,
+    WorkAttemptAdmission,
+    WorkAttemptAdmissionActivate,
+    WorkAttemptAdmissionConflict,
+    WorkAttemptAdmissionPrepare,
+    WorkAttemptAdmissionState,
+    WorkAttemptContinuationContext,
+    WorkAttemptExecutionClaim,
+    WorkAttemptExecutionClaimLost,
+    WorkAttemptExecutionClaimRequest,
+    WorkAttemptRecoveryActivate,
+    copy_admitted_completion_proposal_request,
+    copy_work_attempt_admission_activate,
+    copy_work_attempt_admission_prepare,
+    copy_work_attempt_execution_claim_request,
+    copy_work_attempt_recovery_activate,
+    work_attempt_admission_prepare_sha256,
+    work_attempt_execution_claim_request_sha256,
 )
 from cayu.runtime.work_contracts import (
     CompletionDecision,
@@ -40,6 +62,7 @@ from cayu.runtime.work_contracts import (
     CompletionDecisionCreate,
     CompletionProposal,
     CompletionProposalCreate,
+    CompletionRejectionAction,
     CompletionVerdict,
     CompletionVerificationClaim,
     CompletionVerificationClaimLost,
@@ -521,6 +544,165 @@ class PostgresVerifiedWorkMixin:
                 "Stored work-attempt indexes conflict with canonical content."
             )
         return attempt
+
+    async def _load_work_attempt_admission_row(
+        self,
+        cur: Any,
+        admission_id: str,
+        *,
+        for_update: bool = False,
+    ) -> WorkAttemptAdmission | None:
+        await cur.execute(
+            "SELECT admission.admission_id, admission.attempt_id, admission.task_id, "
+            "admission.session_id, admission.interaction_id, admission.state, "
+            "admission.prepare_request_sha256, admission.current_claim_id, "
+            "admission.current_generation, admission.lease_expires_at, "
+            "admission.admission_json, claim.claim_id, claim.admission_id, "
+            "claim.generation, claim.request_sha256, claim.lease_expires_at, "
+            "claim.is_current, claim.claim_json "
+            "FROM cayu_work_attempt_admissions AS admission "
+            "LEFT JOIN cayu_work_attempt_execution_claims AS claim "
+            "ON claim.admission_id = admission.admission_id AND claim.is_current "
+            "WHERE admission.admission_id = %s"
+            + (" FOR UPDATE OF admission" if for_update else ""),
+            (admission_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        admission = WorkAttemptAdmission.model_validate(_json_document(row[10]))
+        if (
+            admission.admission_id != row[0]
+            or admission.attempt_id != row[1]
+            or admission.task_id != row[2]
+            or admission.session_id != row[3]
+            or admission.interaction_id != row[4]
+            or admission.state.value != row[5]
+            or admission.prepare_request_sha256 != row[6]
+            or admission.claim.claim_id != row[7]
+            or admission.claim.generation != row[8]
+            or admission.claim.lease_expires_at != pg_support.to_utc(row[9])
+        ):
+            raise WorkAttemptAdmissionConflict(
+                "Stored work-attempt admission indexes conflict with canonical content."
+            )
+        if row[17] is None:
+            raise WorkAttemptAdmissionConflict(
+                "Stored admission has no durable current execution claim."
+            )
+        durable_claim = WorkAttemptExecutionClaim.model_validate(_json_document(row[17]))
+        if (
+            durable_claim != admission.claim
+            or durable_claim.claim_id != row[11]
+            or durable_claim.admission_id != row[12]
+            or durable_claim.generation != row[13]
+            or durable_claim.request_sha256 != row[14]
+            or durable_claim.lease_expires_at != pg_support.to_utc(row[15])
+            or row[16] is not True
+        ):
+            raise WorkAttemptAdmissionConflict(
+                "Stored execution-claim authority conflicts with its admission."
+            )
+        return admission
+
+    async def _load_work_attempt_admission_for_attempt(
+        self,
+        cur: Any,
+        attempt_id: str,
+        *,
+        for_update: bool = False,
+    ) -> WorkAttemptAdmission | None:
+        await cur.execute(
+            "SELECT admission_id FROM cayu_work_attempt_admissions WHERE attempt_id = %s"
+            + (" FOR UPDATE" if for_update else ""),
+            (attempt_id,),
+        )
+        row = await cur.fetchone()
+        return (
+            None
+            if row is None
+            else await self._load_work_attempt_admission_row(
+                cur,
+                row[0],
+                for_update=for_update,
+            )
+        )
+
+    async def _load_work_attempt_execution_claim_row(
+        self,
+        cur: Any,
+        claim_id: str,
+    ) -> WorkAttemptExecutionClaim | None:
+        await cur.execute(
+            "SELECT claim_id, admission_id, generation, request_sha256, "
+            "lease_expires_at, claim_json FROM cayu_work_attempt_execution_claims "
+            "WHERE claim_id = %s",
+            (claim_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        claim = WorkAttemptExecutionClaim.model_validate(_json_document(row[5]))
+        if (
+            claim.claim_id != row[0]
+            or claim.admission_id != row[1]
+            or claim.generation != row[2]
+            or claim.request_sha256 != row[3]
+            or claim.lease_expires_at != pg_support.to_utc(row[4])
+        ):
+            raise WorkAttemptAdmissionConflict(
+                "Stored execution-claim indexes conflict with canonical content."
+            )
+        return claim
+
+    async def _update_work_attempt_admission_row(
+        self,
+        cur: Any,
+        admission: WorkAttemptAdmission,
+    ) -> None:
+        await cur.execute(
+            "UPDATE cayu_work_attempt_admissions SET state = %s, current_claim_id = %s, "
+            "current_generation = %s, lease_expires_at = %s, admission_json = %s "
+            "WHERE admission_id = %s",
+            (
+                admission.state.value,
+                admission.claim.claim_id,
+                admission.claim.generation,
+                admission.claim.lease_expires_at,
+                json.dumps(admission.model_dump(mode="json", warnings=False)),
+                admission.admission_id,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise KeyError(f"Work-attempt admission not found: {admission.admission_id}")
+
+    async def _insert_work_attempt_execution_claim_row(
+        self,
+        cur: Any,
+        claim: WorkAttemptExecutionClaim,
+    ) -> None:
+        await cur.execute(
+            "INSERT INTO cayu_work_attempt_execution_claims "
+            "(claim_id, admission_id, generation, request_sha256, lease_expires_at, "
+            "is_current, claim_json) VALUES (%s, %s, %s, %s, %s, TRUE, %s)",
+            (
+                claim.claim_id,
+                claim.admission_id,
+                claim.generation,
+                claim.request_sha256,
+                claim.lease_expires_at,
+                json.dumps(claim.model_dump(mode="json", warnings=False)),
+            ),
+        )
+
+    @staticmethod
+    def _ensure_live_work_attempt_admission_claim(
+        admission: WorkAttemptAdmission,
+        *,
+        now: datetime,
+    ) -> None:
+        if admission.claim.lease_expires_at <= now:
+            raise WorkAttemptExecutionClaimLost("Work-attempt execution claim has expired.")
 
     async def _latest_attempt_id(self, cur: Any, task_id: str) -> str | None:
         await cur.execute(
@@ -1009,6 +1191,802 @@ class PostgresVerifiedWorkMixin:
 
         return await self._run_verified_work_mutation(operation)
 
+    async def _work_attempt_continuation_context(
+        self,
+        cur: Any,
+        task: Task,
+        contract: WorkContract,
+    ) -> WorkAttemptContinuationContext | None:
+        prior_attempt_id = await self._latest_attempt_id(cur, task.id)
+        if prior_attempt_id is None:
+            return None
+        prior_admission = await self._load_work_attempt_admission_for_attempt(
+            cur,
+            prior_attempt_id,
+            for_update=True,
+        )
+        if (
+            prior_admission is None
+            or prior_admission.state is not WorkAttemptAdmissionState.RELEASED
+            or prior_admission.task_id != task.id
+            or prior_admission.session_id != task.session_id
+        ):
+            raise WorkAttemptAdmissionConflict(
+                "The latest work attempt has no exact released admission authority."
+            )
+        await cur.execute(
+            "SELECT proposal.proposal_id, decision.decision_id, "
+            "receipt.idempotency_key FROM cayu_completion_proposals AS proposal "
+            "LEFT JOIN cayu_completion_decisions AS decision "
+            "ON decision.proposal_id = proposal.proposal_id "
+            "LEFT JOIN cayu_completion_decision_application_receipts AS receipt "
+            "ON receipt.decision_id = decision.decision_id "
+            "WHERE proposal.attempt_id = %s",
+            (prior_attempt_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise WorkAttemptAdmissionConflict(
+                "The latest work attempt has no durable completion proposal."
+            )
+        if row[1] is None:
+            raise WorkAttemptAdmissionConflict(
+                "The latest work attempt has no durable completion decision."
+            )
+        if row[2] is None:
+            raise WorkAttemptAdmissionConflict(
+                "The latest completion decision has not been applied durably."
+            )
+        decision = await self._load_decision_row(cur, row[1], for_update=True)
+        if decision is None:
+            raise WorkAttemptAdmissionConflict(
+                "The latest work-attempt decision index is incomplete."
+            )
+        receipt = await self._load_application_receipt(
+            cur,
+            task.id,
+            row[2],
+            for_update=True,
+        )
+        if receipt is None or receipt.decision_id != decision.decision_id or receipt.task != task:
+            raise WorkAttemptAdmissionConflict(
+                "The latest decision application conflicts with continuation authority."
+            )
+        if (
+            decision.verdict is not CompletionVerdict.REJECTED
+            or contract.continuation_policy.rejection_action
+            is not CompletionRejectionAction.CONTINUE
+        ):
+            raise WorkAttemptAdmissionConflict(
+                "The latest completion decision does not authorize continuation."
+            )
+        return WorkAttemptContinuationContext(
+            prior_admission_id=prior_admission.admission_id,
+            prior_attempt_id=prior_attempt_id,
+            proposal_id=row[0],
+            decision=decision,
+            application_idempotency_key=row[2],
+            gap_fingerprint=decision.gap_fingerprint,
+        )
+
+    async def prepare_work_attempt_admission(
+        self,
+        request: WorkAttemptAdmissionPrepare,
+    ) -> WorkAttemptAdmission:
+        request = copy_work_attempt_admission_prepare(request)
+        if request.generation != 1:
+            raise WorkAttemptAdmissionConflict(
+                "A new work-attempt admission must start at execution generation 1."
+            )
+        request_sha256 = work_attempt_admission_prepare_sha256(request)
+        await self._ensure_ready()
+
+        async def operation(conn: Any, cur: Any) -> WorkAttemptAdmission:
+            del conn
+            await self._lock_verified_work_identity(
+                cur,
+                "admission",
+                request.admission_id,
+            )
+            await self._lock_verified_work_identity(cur, "attempt", request.attempt_id)
+            existing = await self._load_work_attempt_admission_row(
+                cur,
+                request.admission_id,
+                for_update=True,
+            )
+            if existing is not None:
+                if existing.prepare_request_sha256 != request_sha256:
+                    raise WorkAttemptAdmissionConflict(
+                        "Work-attempt admission identity is bound to another request."
+                    )
+                return existing.model_copy(deep=True)
+            if (
+                await self._load_work_attempt_admission_for_attempt(
+                    cur,
+                    request.attempt_id,
+                    for_update=True,
+                )
+                is not None
+            ):
+                raise WorkAttemptAdmissionConflict(
+                    "Work-attempt identity is already bound to another admission."
+                )
+            if (
+                await self._load_attempt_row(
+                    cur,
+                    request.attempt_id,
+                    for_update=True,
+                )
+                is not None
+            ):
+                raise WorkAttemptAdmissionConflict(
+                    "Work-attempt identity already exists without this admission."
+                )
+            await self._lock_verified_work_identity(cur, "claim", request.claim_id)
+            await cur.execute(
+                "SELECT admission_id FROM cayu_work_attempt_execution_claims "
+                "WHERE claim_id = %s FOR UPDATE",
+                (request.claim_id,),
+            )
+            if await cur.fetchone() is not None:
+                raise WorkAttemptAdmissionConflict(
+                    "Execution-claim identity is bound to another admission."
+                )
+            # Serialize every admission for one session before consulting the
+            # unique session/interaction authority.  The broader session lock
+            # avoids constructing a composite advisory-lock identity whose
+            # textual encoding could itself be ambiguous.
+            await self._lock_verified_work_identity(
+                cur,
+                "admission-session",
+                request.session_id,
+            )
+            await cur.execute(
+                "SELECT admission_id FROM cayu_work_attempt_admissions "
+                "WHERE session_id = %s AND interaction_id = %s FOR UPDATE",
+                (request.session_id, request.interaction_id),
+            )
+            if await cur.fetchone() is not None:
+                raise WorkAttemptAdmissionConflict(
+                    "Session interaction is already bound to another admission."
+                )
+            await cur.execute(
+                "SELECT admission_id FROM cayu_work_attempt_admissions "
+                "WHERE session_id = %s AND state != 'released' LIMIT 1 FOR UPDATE",
+                (request.session_id,),
+            )
+            if await cur.fetchone() is not None:
+                raise WorkAttemptAdmissionConflict(
+                    "Session already has an unreleased work-attempt admission."
+                )
+            await self._lock_verified_work_task(cur, request.task_id)
+            task = await self._load_task_locked(cur, request.task_id)
+            await cur.execute(
+                "SELECT admission_id FROM cayu_work_attempt_admissions "
+                "WHERE task_id = %s AND state != 'released' LIMIT 1",
+                (request.task_id,),
+            )
+            if await cur.fetchone() is not None:
+                raise WorkAttemptAdmissionConflict(
+                    "Task already has an unreleased work-attempt admission."
+                )
+            contract = await self._require_task_contract(cur, task, request.contract)
+            now = await self._verified_now(cur)
+            continuation = await self._work_attempt_continuation_context(
+                cur,
+                task,
+                contract,
+            )
+            if continuation is None:
+                if request.kind != "initial":
+                    raise WorkAttemptAdmissionConflict(
+                        "Continuation admission requires a rejected/continue decision."
+                    )
+                if task.status not in {TaskStatus.PENDING, TaskStatus.CLAIMED}:
+                    raise WorkAttemptAdmissionConflict(
+                        "Initial admission requires a pending or claimed contracted task."
+                    )
+                if task.available_at is not None and task.available_at > now:
+                    raise WorkAttemptAdmissionConflict(
+                        "Contracted task is not yet available for admission."
+                    )
+                if task.status is TaskStatus.CLAIMED:
+                    # Task availability follows the injectable scheduling clock,
+                    # while an inherited queue-worker lease is wall-clock authority.
+                    # Sample the latter from PostgreSQL after every lock and lookup
+                    # that can delay the ownership decision.
+                    queue_now = await self._database_now(cur)
+                    _ensure_owned_active_task_lease(
+                        task,
+                        request.worker_id,
+                        now=queue_now,
+                    )
+                elif task.worker_id is not None or task.lease_expires_at is not None:
+                    raise WorkAttemptAdmissionConflict(
+                        "Pending contracted task has conflicting worker ownership."
+                    )
+                if task.session_id not in {None, request.session_id}:
+                    raise WorkAttemptAdmissionConflict(
+                        "Initial admission conflicts with the task's session."
+                    )
+            else:
+                if request.kind != "continuation":
+                    raise WorkAttemptAdmissionConflict(
+                        "Initial admission cannot consume continuation authority."
+                    )
+                if continuation.prior_admission_id != request.predecessor_admission_id:
+                    raise WorkAttemptAdmissionConflict(
+                        "Continuation admission selected another predecessor admission."
+                    )
+                if (
+                    task.status is not TaskStatus.RUNNING
+                    or task.session_id != request.session_id
+                    or task.worker_id is not None
+                    or task.lease_expires_at is not None
+                ):
+                    raise WorkAttemptAdmissionConflict(
+                        "Continuation admission requires an unowned running task on its exact session."
+                    )
+                if (
+                    contract.continuation_policy.rejection_action
+                    is not CompletionRejectionAction.CONTINUE
+                ):
+                    raise WorkAttemptAdmissionConflict(
+                        "The frozen contract does not authorize continuation."
+                    )
+
+            await self._ensure_session_authority(cur, request.session_id, "contracted")
+            _task_invocation_for_attachment(
+                task.invocation,
+                session_id=request.session_id,
+                session_binding=request.session_invocation,
+            )
+            session_instance_id = _task_session_instance_for_attachment(
+                stored_session_instance_id=task.session_instance_id,
+                session_id=request.session_id,
+                session_binding=request.session_invocation,
+            )
+            claim_request = WorkAttemptExecutionClaimRequest(
+                admission_id=request.admission_id,
+                claim_id=request.claim_id,
+                worker_id=request.worker_id,
+                execution_owner_id=request.execution_owner_id,
+                generation=request.generation,
+                lease_seconds=request.lease_seconds,
+            )
+            claim = WorkAttemptExecutionClaim(
+                admission_id=request.admission_id,
+                claim_id=request.claim_id,
+                worker_id=request.worker_id,
+                execution_owner_id=request.execution_owner_id,
+                generation=request.generation,
+                request_sha256=work_attempt_execution_claim_request_sha256(claim_request),
+                claimed_at=now,
+                lease_expires_at=now + timedelta(seconds=request.lease_seconds),
+            )
+            admission = WorkAttemptAdmission(
+                admission_id=request.admission_id,
+                prepare_request_sha256=request_sha256,
+                state=WorkAttemptAdmissionState.PREPARING,
+                attempt_id=request.attempt_id,
+                task_id=request.task_id,
+                session_id=request.session_id,
+                interaction_id=request.interaction_id,
+                kind=request.kind,
+                source_request_sha256=request.source_request_sha256,
+                contract=request.contract,
+                session_invocation=request.session_invocation,
+                source_execution_profile_fingerprint=(request.source_execution_profile_fingerprint),
+                claim=claim,
+                continuation=continuation,
+                prepared_at=now,
+            )
+            updated_task = task.model_copy(
+                update={
+                    "status": TaskStatus.RUNNING,
+                    "session_id": request.session_id,
+                    "session_instance_id": session_instance_id,
+                    "worker_id": request.worker_id,
+                    "lease_expires_at": claim.lease_expires_at,
+                    "started_at": task.started_at or now,
+                    "updated_at": now,
+                }
+            )
+            await self._update_task_snapshot(cur, updated_task)
+            await cur.execute(
+                "INSERT INTO cayu_work_attempt_admissions "
+                "(admission_id, attempt_id, task_id, session_id, interaction_id, state, "
+                "prepare_request_sha256, current_claim_id, current_generation, "
+                "lease_expires_at, admission_json) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (
+                    admission.admission_id,
+                    admission.attempt_id,
+                    admission.task_id,
+                    admission.session_id,
+                    admission.interaction_id,
+                    admission.state.value,
+                    admission.prepare_request_sha256,
+                    admission.claim.claim_id,
+                    admission.claim.generation,
+                    admission.claim.lease_expires_at,
+                    json.dumps(admission.model_dump(mode="json", warnings=False)),
+                ),
+            )
+            await self._insert_work_attempt_execution_claim_row(cur, claim)
+            return admission.model_copy(deep=True)
+
+        return await self._run_verified_work_mutation(operation)
+
+    async def activate_work_attempt_admission(
+        self,
+        request: WorkAttemptAdmissionActivate,
+    ) -> WorkAttemptAdmission:
+        request = copy_work_attempt_admission_activate(request)
+        await self._ensure_ready()
+
+        async def operation(conn: Any, cur: Any) -> WorkAttemptAdmission:
+            del conn
+            await self._lock_verified_work_identity(
+                cur,
+                "admission",
+                request.admission_id,
+            )
+            admission = await self._load_work_attempt_admission_row(
+                cur,
+                request.admission_id,
+                for_update=True,
+            )
+            if admission is None:
+                raise KeyError(f"Work-attempt admission not found: {request.admission_id}")
+            if admission.prepare_request_sha256 != request.prepare_request_sha256:
+                raise WorkAttemptAdmissionConflict(
+                    "Admission activation conflicts with its prepared request."
+                )
+            if admission.claim.claim_id != request.claim_id:
+                raise WorkAttemptExecutionClaimLost(
+                    "Admission activation no longer owns the prepared execution claim."
+                )
+            await self._lock_verified_work_task(cur, admission.task_id)
+            task = await self._load_task_locked(cur, admission.task_id)
+            if (
+                task.session_id != admission.session_id
+                or task.session_instance_id != admission.session_invocation.session_instance_id
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Prepared admission conflicts with exact task-session authority."
+                )
+            if admission.state is WorkAttemptAdmissionState.ACTIVE:
+                if admission.session_evidence_sha256 != request.session_evidence_sha256:
+                    raise WorkAttemptAdmissionConflict(
+                        "Admission activation conflicts with durable session evidence."
+                    )
+                return admission.model_copy(deep=True)
+            if admission.state is not WorkAttemptAdmissionState.PREPARING:
+                raise WorkAttemptAdmissionConflict(
+                    "Only a prepared admission can publish its work attempt."
+                )
+            now = await self._verified_now(cur)
+            self._ensure_live_work_attempt_admission_claim(admission, now=now)
+            if (
+                task.status is not TaskStatus.RUNNING
+                or task.worker_id != admission.claim.worker_id
+                or task.lease_expires_at != admission.claim.lease_expires_at
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Prepared admission conflicts with current task ownership."
+                )
+            contract = await self._require_task_contract(cur, task, admission.contract)
+            prior_id = await self._latest_attempt_id(cur, task.id)
+            prior = (
+                None
+                if prior_id is None
+                else await self._load_attempt_row(cur, prior_id, for_update=True)
+            )
+            ordinal = 1 if prior is None else prior.ordinal + 1
+            if ordinal > contract.continuation_policy.max_attempts:
+                raise WorkAttemptAdmissionConflict(
+                    "Work-contract attempt limit forbids activation."
+                )
+            attempt_request = WorkAttemptCreate(
+                attempt_id=admission.attempt_id,
+                task_id=admission.task_id,
+                session_id=admission.session_id,
+                contract=admission.contract,
+                execution_profile_fingerprint=(admission.source_execution_profile_fingerprint),
+                worker_id=admission.claim.worker_id,
+            )
+            attempt = WorkAttempt(
+                **attempt_request.model_dump(mode="python"),
+                ordinal=ordinal,
+                request_sha256=work_attempt_request_sha256(attempt_request),
+                started_at=now,
+            )
+            activated = WorkAttemptAdmission.model_validate(
+                admission.model_copy(
+                    update={
+                        "state": WorkAttemptAdmissionState.ACTIVE,
+                        "attempt": attempt,
+                        "session_evidence_sha256": request.session_evidence_sha256,
+                        "activated_at": now,
+                    }
+                ).model_dump(mode="python", warnings=False)
+            )
+            await cur.execute(
+                "INSERT INTO cayu_work_attempts "
+                "(attempt_id, task_id, ordinal, request_sha256, started_at, attempt_json) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (
+                    attempt.attempt_id,
+                    attempt.task_id,
+                    attempt.ordinal,
+                    attempt.request_sha256,
+                    attempt.started_at,
+                    json.dumps(attempt.model_dump(mode="json", warnings=False)),
+                ),
+            )
+            await self._update_work_attempt_admission_row(cur, activated)
+            return activated.model_copy(deep=True)
+
+        return await self._run_verified_work_mutation(operation)
+
+    async def load_work_attempt_admission(
+        self,
+        admission_id: str,
+    ) -> WorkAttemptAdmission | None:
+        admission_id = require_clean_nonblank(admission_id, "admission_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            admission = await self._load_work_attempt_admission_row(cur, admission_id)
+            return None if admission is None else admission.model_copy(deep=True)
+
+    async def load_work_attempt_execution_claim(
+        self,
+        claim_id: str,
+    ) -> WorkAttemptExecutionClaim | None:
+        claim_id = require_clean_nonblank(claim_id, "claim_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            claim = await self._load_work_attempt_execution_claim_row(cur, claim_id)
+            return None if claim is None else claim.model_copy(deep=True)
+
+    async def renew_work_attempt_execution_claim(
+        self,
+        request: WorkAttemptExecutionClaimRequest,
+    ) -> WorkAttemptAdmission:
+        request = copy_work_attempt_execution_claim_request(request)
+        await self._ensure_ready()
+
+        async def operation(conn: Any, cur: Any) -> WorkAttemptAdmission:
+            del conn
+            await self._lock_verified_work_identity(
+                cur,
+                "admission",
+                request.admission_id,
+            )
+            admission = await self._load_work_attempt_admission_row(
+                cur,
+                request.admission_id,
+                for_update=True,
+            )
+            if admission is None:
+                raise KeyError(f"Work-attempt admission not found: {request.admission_id}")
+            claim = admission.claim
+            if (
+                admission.state is not WorkAttemptAdmissionState.ACTIVE
+                or claim.claim_id != request.claim_id
+                or claim.worker_id != request.worker_id
+                or claim.execution_owner_id != request.execution_owner_id
+                or claim.generation != request.generation
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Execution-claim renewal conflicts with current authority."
+                )
+            await self._lock_verified_work_identity(cur, "claim", claim.claim_id)
+            await self._lock_verified_work_task(cur, admission.task_id)
+            task = await self._load_task_locked(cur, admission.task_id)
+            now = await self._verified_now(cur)
+            self._ensure_live_work_attempt_admission_claim(admission, now=now)
+            await cur.execute(
+                "SELECT 1 FROM cayu_completion_proposals WHERE attempt_id = %s",
+                (admission.attempt_id,),
+            )
+            if await cur.fetchone() is not None:
+                raise WorkAttemptExecutionClaimLost(
+                    "Completion proposal has already closed execution authority."
+                )
+            if (
+                task.status is not TaskStatus.RUNNING
+                or task.session_id != admission.session_id
+                or task.session_instance_id != admission.session_invocation.session_instance_id
+                or task.worker_id != claim.worker_id
+                or task.lease_expires_at != claim.lease_expires_at
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Execution-claim renewal lost exact task ownership."
+                )
+            renewed_claim = WorkAttemptExecutionClaim.model_validate(
+                claim.model_copy(
+                    update={
+                        "lease_expires_at": max(
+                            claim.lease_expires_at,
+                            now + timedelta(seconds=request.lease_seconds),
+                        )
+                    }
+                ).model_dump(mode="python", warnings=False)
+            )
+            renewed = WorkAttemptAdmission.model_validate(
+                admission.model_copy(update={"claim": renewed_claim}).model_dump(
+                    mode="python", warnings=False
+                )
+            )
+            await cur.execute(
+                "UPDATE cayu_work_attempt_execution_claims "
+                "SET lease_expires_at = %s, claim_json = %s "
+                "WHERE claim_id = %s AND is_current",
+                (
+                    renewed_claim.lease_expires_at,
+                    json.dumps(renewed_claim.model_dump(mode="json", warnings=False)),
+                    renewed_claim.claim_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise WorkAttemptExecutionClaimLost(
+                    "Execution-claim renewal lost durable current authority."
+                )
+            await self._update_work_attempt_admission_row(cur, renewed)
+            await self._update_task_snapshot(
+                cur,
+                task.model_copy(
+                    update={
+                        "lease_expires_at": renewed_claim.lease_expires_at,
+                        "updated_at": now,
+                    }
+                ),
+            )
+            return renewed.model_copy(deep=True)
+
+        return await self._run_verified_work_mutation(operation)
+
+    async def claim_work_attempt_recovery(
+        self,
+        request: WorkAttemptExecutionClaimRequest,
+    ) -> WorkAttemptAdmission:
+        request = copy_work_attempt_execution_claim_request(request)
+        request_sha256 = work_attempt_execution_claim_request_sha256(request)
+        await self._ensure_ready()
+
+        async def operation(conn: Any, cur: Any) -> WorkAttemptAdmission:
+            del conn
+            await self._lock_verified_work_identity(
+                cur,
+                "admission",
+                request.admission_id,
+            )
+            await self._lock_verified_work_identity(cur, "claim", request.claim_id)
+            admission = await self._load_work_attempt_admission_row(
+                cur,
+                request.admission_id,
+                for_update=True,
+            )
+            if admission is None:
+                raise KeyError(f"Work-attempt admission not found: {request.admission_id}")
+            preparing = admission.state is WorkAttemptAdmissionState.PREPARING
+            if not preparing and (
+                admission.attempt is None
+                or admission.state
+                not in {
+                    WorkAttemptAdmissionState.ACTIVE,
+                    WorkAttemptAdmissionState.RECOVERING,
+                }
+            ):
+                raise WorkAttemptAdmissionConflict(
+                    "Only a prepared or published admission can enter recovery."
+                )
+            await self._lock_verified_work_task(cur, admission.task_id)
+            task = await self._load_task_locked(cur, admission.task_id)
+            now = await self._verified_now(cur)
+            current = admission.claim
+            exact_current_request = (
+                current.claim_id == request.claim_id
+                and current.worker_id == request.worker_id
+                and current.execution_owner_id == request.execution_owner_id
+                and current.generation == request.generation
+                and current.request_sha256 == request_sha256
+            )
+            if (
+                task.status is not TaskStatus.RUNNING
+                or task.session_id != admission.session_id
+                or task.session_instance_id != admission.session_invocation.session_instance_id
+                or task.worker_id != current.worker_id
+                or task.lease_expires_at != current.lease_expires_at
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Recovery conflicts with current task ownership."
+                )
+            if preparing and exact_current_request:
+                if current.lease_expires_at <= now:
+                    raise WorkAttemptExecutionClaimLost(
+                        "The prepared execution claim expired and must be replaced."
+                    )
+                return admission.model_copy(deep=True)
+            if admission.state is WorkAttemptAdmissionState.ACTIVE and exact_current_request:
+                if current.lease_expires_at <= now:
+                    raise WorkAttemptExecutionClaimLost(
+                        "The active execution claim expired and must be replaced."
+                    )
+                return admission.model_copy(deep=True)
+            if admission.state is WorkAttemptAdmissionState.RECOVERING:
+                if exact_current_request:
+                    if current.lease_expires_at <= now:
+                        raise WorkAttemptExecutionClaimLost(
+                            "The recovery claim expired and must be replaced."
+                        )
+                    return admission.model_copy(deep=True)
+                if current.lease_expires_at > now:
+                    raise WorkAttemptExecutionClaimLost(
+                        "Another execution generation already owns live recovery."
+                    )
+            if current.lease_expires_at > now:
+                raise WorkAttemptExecutionClaimLost(
+                    "The prior execution generation still owns a live lease."
+                )
+            if request.generation != current.generation + 1:
+                raise WorkAttemptAdmissionConflict(
+                    "Recovery must advance the execution generation exactly once."
+                )
+            await cur.execute(
+                "SELECT 1 FROM cayu_completion_proposals WHERE attempt_id = %s",
+                (admission.attempt_id,),
+            )
+            if await cur.fetchone() is not None:
+                raise WorkAttemptAdmissionConflict(
+                    "A proposed attempt cannot acquire replacement execution authority."
+                )
+            await cur.execute(
+                "SELECT 1 FROM cayu_work_attempt_execution_claims WHERE claim_id = %s FOR UPDATE",
+                (request.claim_id,),
+            )
+            if await cur.fetchone() is not None:
+                raise WorkAttemptAdmissionConflict("Execution-claim identity is already bound.")
+            replacement = WorkAttemptExecutionClaim(
+                admission_id=request.admission_id,
+                claim_id=request.claim_id,
+                worker_id=request.worker_id,
+                execution_owner_id=request.execution_owner_id,
+                generation=request.generation,
+                request_sha256=request_sha256,
+                claimed_at=now,
+                lease_expires_at=now + timedelta(seconds=request.lease_seconds),
+            )
+            recovering = WorkAttemptAdmission.model_validate(
+                admission.model_copy(
+                    update={
+                        "state": (
+                            WorkAttemptAdmissionState.PREPARING
+                            if preparing
+                            else WorkAttemptAdmissionState.RECOVERING
+                        ),
+                        "claim": replacement,
+                        "recovery_evidence_sha256": None,
+                    }
+                ).model_dump(mode="python", warnings=False)
+            )
+            await cur.execute(
+                "UPDATE cayu_work_attempt_execution_claims SET is_current = FALSE "
+                "WHERE admission_id = %s AND is_current",
+                (admission.admission_id,),
+            )
+            if cur.rowcount != 1:
+                raise WorkAttemptAdmissionConflict(
+                    "Recovery could not retire the prior execution claim."
+                )
+            await self._insert_work_attempt_execution_claim_row(cur, replacement)
+            await self._update_work_attempt_admission_row(cur, recovering)
+            await self._update_task_snapshot(
+                cur,
+                task.model_copy(
+                    update={
+                        "worker_id": request.worker_id,
+                        "lease_expires_at": replacement.lease_expires_at,
+                        "updated_at": now,
+                    }
+                ),
+            )
+            return recovering.model_copy(deep=True)
+
+        return await self._run_verified_work_mutation(operation)
+
+    async def activate_work_attempt_recovery(
+        self,
+        request: WorkAttemptRecoveryActivate,
+    ) -> WorkAttemptAdmission:
+        request = copy_work_attempt_recovery_activate(request)
+        await self._ensure_ready()
+
+        async def operation(conn: Any, cur: Any) -> WorkAttemptAdmission:
+            del conn
+            await self._lock_verified_work_identity(
+                cur,
+                "admission",
+                request.admission_id,
+            )
+            admission = await self._load_work_attempt_admission_row(
+                cur,
+                request.admission_id,
+                for_update=True,
+            )
+            if admission is None:
+                raise KeyError(f"Work-attempt admission not found: {request.admission_id}")
+            if admission.state is WorkAttemptAdmissionState.ACTIVE:
+                if not (
+                    admission.claim.claim_id == request.claim_id
+                    and admission.claim.generation == request.generation
+                    and admission.recovery_evidence_sha256 == request.recovery_evidence_sha256
+                ):
+                    raise WorkAttemptAdmissionConflict(
+                        "Recovery activation conflicts with current active authority."
+                    )
+            elif (
+                admission.state is not WorkAttemptAdmissionState.RECOVERING
+                or admission.claim.claim_id != request.claim_id
+                or admission.claim.generation != request.generation
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Recovery activation no longer owns the replacement claim."
+                )
+            await self._lock_verified_work_task(cur, admission.task_id)
+            task = await self._load_task_locked(cur, admission.task_id)
+            if (
+                task.session_id != admission.session_id
+                or task.session_instance_id != admission.session_invocation.session_instance_id
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Recovery activation conflicts with exact task-session authority."
+                )
+            if admission.state is WorkAttemptAdmissionState.ACTIVE:
+                return admission.model_copy(deep=True)
+            now = await self._verified_now(cur)
+            self._ensure_live_work_attempt_admission_claim(
+                admission,
+                now=now,
+            )
+            if (
+                task.status is not TaskStatus.RUNNING
+                or task.worker_id != admission.claim.worker_id
+                or task.lease_expires_at != admission.claim.lease_expires_at
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Recovery activation conflicts with current task ownership."
+                )
+            if admission.attempt is None:
+                raise WorkAttemptAdmissionConflict(
+                    "Recovery activation requires a published work attempt."
+                )
+            contract = await self._load_work_contract_row(
+                cur,
+                admission.contract,
+                for_update=True,
+            )
+            verified_work_support.require_attempt_state_current(
+                task,
+                admission.attempt,
+                latest_attempt_id=await self._latest_attempt_id(cur, task.id),
+                contract=contract,
+            )
+            active = WorkAttemptAdmission.model_validate(
+                admission.model_copy(
+                    update={
+                        "state": WorkAttemptAdmissionState.ACTIVE,
+                        "recovery_evidence_sha256": request.recovery_evidence_sha256,
+                    }
+                ).model_dump(mode="python", warnings=False)
+            )
+            await self._update_work_attempt_admission_row(cur, active)
+            return active.model_copy(deep=True)
+
+        return await self._run_verified_work_mutation(operation)
+
     async def begin_work_attempt(self, request: WorkAttemptCreate) -> WorkAttempt:
         request = copy_work_attempt_create(request)
         request_sha256 = work_attempt_request_sha256(request)
@@ -1017,6 +1995,17 @@ class PostgresVerifiedWorkMixin:
         async def operation(conn: Any, cur: Any) -> WorkAttempt:
             del conn
             await self._lock_verified_work_identity(cur, "attempt", request.attempt_id)
+            if (
+                await self._load_work_attempt_admission_for_attempt(
+                    cur,
+                    request.attempt_id,
+                    for_update=True,
+                )
+                is not None
+            ):
+                raise WorkAttemptAdmissionConflict(
+                    "Admitted work attempts are published only by admission activation."
+                )
             existing = await self._load_attempt_row(cur, request.attempt_id, for_update=True)
             if existing is not None:
                 if existing.request_sha256 != request_sha256:
@@ -1026,6 +2015,14 @@ class PostgresVerifiedWorkMixin:
                 return existing.model_copy(deep=True)
             await self._lock_verified_work_task(cur, request.task_id)
             task = await self._load_task_locked(cur, request.task_id)
+            await cur.execute(
+                "SELECT admission_id FROM cayu_work_attempt_admissions WHERE task_id = %s LIMIT 1",
+                (task.id,),
+            )
+            if await cur.fetchone() is not None:
+                raise WorkAttemptAdmissionConflict(
+                    "Task is permanently governed by runtime-owned work-attempt admission."
+                )
             contract = await self._require_task_contract(cur, task, request.contract)
             if task.status is not TaskStatus.RUNNING:
                 raise ValueError("Work attempts require a running contracted task.")
@@ -1114,6 +2111,17 @@ class PostgresVerifiedWorkMixin:
         async def operation(conn: Any, cur: Any) -> CompletionProposal:
             del conn
             await self._lock_verified_work_identity(cur, "proposal", request.proposal_id)
+            if (
+                await self._load_work_attempt_admission_for_attempt(
+                    cur,
+                    request.attempt_id,
+                    for_update=True,
+                )
+                is not None
+            ):
+                raise WorkAttemptAdmissionConflict(
+                    "Admitted work attempts require claim-fenced proposal publication."
+                )
             existing = await self._load_proposal_row(cur, request.proposal_id, for_update=True)
             if existing is not None:
                 if existing.request_sha256 != request_sha256:
@@ -1171,6 +2179,153 @@ class PostgresVerifiedWorkMixin:
                     proposal.request_sha256,
                     proposal.proposed_at,
                     json.dumps(proposal.model_dump(mode="json", warnings=False)),
+                ),
+            )
+            return proposal.model_copy(deep=True)
+
+        return await self._run_verified_work_mutation(operation)
+
+    async def submit_admitted_completion_proposal(
+        self,
+        request: AdmittedCompletionProposalRequest,
+    ) -> CompletionProposal:
+        request = copy_admitted_completion_proposal_request(request)
+        proposal_request = request.proposal
+        proposal_sha256 = completion_proposal_request_sha256(proposal_request)
+        await self._ensure_ready()
+
+        async def operation(conn: Any, cur: Any) -> CompletionProposal:
+            del conn
+            await self._lock_verified_work_identity(
+                cur,
+                "admission",
+                request.admission_id,
+            )
+            await self._lock_verified_work_identity(
+                cur,
+                "proposal",
+                proposal_request.proposal_id,
+            )
+            admission = await self._load_work_attempt_admission_row(
+                cur,
+                request.admission_id,
+                for_update=True,
+            )
+            if admission is None:
+                raise KeyError(f"Work-attempt admission not found: {request.admission_id}")
+            exact_claim_authority = (
+                admission.attempt is not None
+                and admission.attempt_id == proposal_request.attempt_id
+                and admission.claim.claim_id == request.claim_id
+                and admission.claim.generation == request.generation
+            )
+            if not exact_claim_authority:
+                raise WorkAttemptExecutionClaimLost(
+                    "Completion proposal no longer owns the exact active admission."
+                )
+            existing = await self._load_proposal_row(
+                cur,
+                proposal_request.proposal_id,
+                for_update=True,
+            )
+            if admission.state is WorkAttemptAdmissionState.RELEASED:
+                await cur.execute(
+                    "SELECT proposal_id FROM cayu_completion_proposals "
+                    "WHERE attempt_id = %s FOR UPDATE",
+                    (admission.attempt_id,),
+                )
+                prior = await cur.fetchone()
+                if (
+                    existing is None
+                    or existing.request_sha256 != proposal_sha256
+                    or prior is None
+                    or prior[0] != proposal_request.proposal_id
+                ):
+                    raise WorkCompletionConflict(
+                        "Released admission conflicts with the requested proposal replay."
+                    )
+                return existing.model_copy(deep=True)
+            if (
+                admission.state is not WorkAttemptAdmissionState.ACTIVE
+                or admission.claim.execution_owner_id != request.execution_owner_id
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Completion proposal no longer owns the exact active admission."
+                )
+            await self._lock_verified_work_task(cur, admission.task_id)
+            task = await self._load_task_locked(cur, admission.task_id)
+            now = await self._verified_now(cur)
+            self._ensure_live_work_attempt_admission_claim(admission, now=now)
+            if existing is not None:
+                if existing.request_sha256 != proposal_sha256:
+                    raise WorkCompletionConflict(
+                        "Completion-proposal identity is bound to another request."
+                    )
+                return existing.model_copy(deep=True)
+            await cur.execute(
+                "SELECT 1 FROM cayu_completion_proposals WHERE attempt_id = %s FOR UPDATE",
+                (admission.attempt_id,),
+            )
+            if await cur.fetchone() is not None:
+                raise WorkCompletionConflict(
+                    "Work attempt already has a different completion proposal."
+                )
+            contract = await self._load_work_contract_row(
+                cur,
+                admission.contract,
+                for_update=True,
+            )
+            verified_work_support.require_attempt_state_current(
+                task,
+                admission.attempt,
+                latest_attempt_id=await self._latest_attempt_id(cur, task.id),
+                contract=contract,
+            )
+            if (
+                task.session_instance_id != admission.session_invocation.session_instance_id
+                or task.worker_id != admission.claim.worker_id
+                or task.lease_expires_at != admission.claim.lease_expires_at
+            ):
+                raise WorkAttemptExecutionClaimLost(
+                    "Completion proposal lost exact task-worker lease ownership."
+                )
+            proposal = CompletionProposal(
+                proposal_id=proposal_request.proposal_id,
+                attempt_id=proposal_request.attempt_id,
+                result=proposal_request.result,
+                evidence_references=proposal_request.evidence_references,
+                task_id=admission.task_id,
+                contract=admission.contract,
+                request_sha256=proposal_sha256,
+                proposed_at=now,
+            )
+            released = WorkAttemptAdmission.model_validate(
+                admission.model_copy(
+                    update={"state": WorkAttemptAdmissionState.RELEASED}
+                ).model_dump(mode="python", warnings=False)
+            )
+            await cur.execute(
+                "INSERT INTO cayu_completion_proposals "
+                "(proposal_id, attempt_id, task_id, request_sha256, proposed_at, "
+                "proposal_json) VALUES (%s, %s, %s, %s, %s, %s)",
+                (
+                    proposal.proposal_id,
+                    proposal.attempt_id,
+                    proposal.task_id,
+                    proposal.request_sha256,
+                    proposal.proposed_at,
+                    json.dumps(proposal.model_dump(mode="json", warnings=False)),
+                ),
+            )
+            await self._update_work_attempt_admission_row(cur, released)
+            await self._update_task_snapshot(
+                cur,
+                task.model_copy(
+                    update={
+                        "worker_id": None,
+                        "lease_expires_at": None,
+                        "updated_at": now,
+                    }
                 ),
             )
             return proposal.model_copy(deep=True)

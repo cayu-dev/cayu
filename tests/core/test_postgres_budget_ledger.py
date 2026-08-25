@@ -49,6 +49,8 @@ _TABLES = (
     "cayu_completion_verification_claims",
     "cayu_completion_verifier_profiles",
     "cayu_completion_proposals",
+    "cayu_work_attempt_execution_claims",
+    "cayu_work_attempt_admissions",
     "cayu_work_attempts",
     "cayu_task_session_execution_authority",
     "cayu_work_contracts",

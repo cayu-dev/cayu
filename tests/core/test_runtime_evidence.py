@@ -44,6 +44,15 @@ def _identity() -> SessionIdentity:
     return SessionIdentity(provider_name="provider", model="model")
 
 
+async def _reset_postgres_event_sequence(postgres_dsn: str) -> None:
+    import psycopg
+
+    async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+        async with connection.cursor() as cursor:
+            await cursor.execute("TRUNCATE cayu_events RESTART IDENTITY CASCADE")
+        await connection.commit()
+
+
 async def _create_session(
     store: SessionStore,
     session_id: str,
@@ -2473,11 +2482,14 @@ def test_runtime_evidence_postgres_matches_sqlite_projection(
         sqlite_store = SQLiteSessionStore(tmp_path / "runtime-evidence.sqlite")
         postgres_store = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
         try:
+            await postgres_store.ensure_schema()
+            await _reset_postgres_event_sequence(postgres_dsn)
             sqlite_report = await _minimal_golden_report(sqlite_store, session_id=session_id)
             postgres_report = await _minimal_golden_report(postgres_store, session_id=session_id)
         finally:
             await sqlite_store.close()
             await postgres_store.close()
+            await _reset_postgres_event_sequence(postgres_dsn)
         return sqlite_report, postgres_report
 
     sqlite_report, postgres_report = asyncio.run(scenario())

@@ -257,6 +257,63 @@ whose verified-work contract registry is populated. Empty registries migrate
 normally. Mixed revision-58/revision-59 task processes and application-only
 rollback are unsupported.
 
+### Contract-bound attempts have a dedicated admission and recovery boundary
+
+Applications can now reserve an initial or rejected/continue contract-bound
+attempt with `CayuApp.admit_work_attempt(...)` before any governed provider,
+tool, hook, or mutating environment work begins. Bounded read-only workspace
+instruction loading and side-effect-free provider preflights establish the
+source profile first. The receipt binds the exact task, contract, session,
+interaction, attempt, worker lease, process generation, source request, and
+source execution profile. Continuations stay on the same session, add a new
+interaction, and receive the prior rejected decision and bounded typed gaps
+without modifying the frozen contract.
+
+Exact retries reconcile preparation and session receipts. An expired process
+generation can be replaced without creating a second attempt, and active
+recovery requires positive session-quiescence evidence before the new owner may
+continue. A committed recovery-session transition whose task-store activation
+was interrupted is taken over only from its exact expired historical claim, and
+the replacement atomically advances the session epoch. Competing task or
+interaction identities cannot hold two unreleased admissions for one session.
+Mutable session progress does not invalidate an already-published exact
+admission receipt. Cancellation waits for dispatched session- and task-store
+mutations to settle before that caller reports a quiescent outcome; durable
+claim and session compare-and-set evidence governs cross-process replacement.
+Continuation receipts carry every valid bounded decision without duplicating
+its gap payload. Renewals and completion proposals are fenced to the current
+process, claim, generation, worker, and live lease; proposal publication
+releases that live authority atomically without removing the task's permanent
+governed marker. Initial preparation also persists the admission's exact
+session incarnation on the task so later result publication cannot resolve
+against a same-ID replacement session. Ordinary run, resume, recovery, worker,
+direct-attempt, fork, and terminal task entrances remain fail closed for
+governed sessions. Admission also completes the durable `interaction.started`
+side-effect handoff after attempt activation; exact activation retries deliver
+that same event without duplicating it.
+
+The automatic verified-work worker is still downstream work, so deployments
+must keep contract-bound tasks out of ordinary worker queues and invoke the
+dedicated admission entrance from application orchestration.
+
+Breaking storage revision 61 adds the admission and execution-claim tables.
+Stop pre-61 task workers, back up each SQLite or PostgreSQL task store, run
+`cayu storage migrate`, and confirm revision 61 before starting current workers.
+No historical admission or claim is synthesized, and mixed-version workers are
+unsupported.
+
+Breaking storage revision 62 changes deferred interaction input to a bounded
+object that can retain the runtime-authenticated complete initial transcript.
+Migration preserves revision-61 rows as source-only input and does not infer a
+missing system or workspace prefix. A migrated session that still awaits its
+initial transcript therefore remains recovery-fenced and must be replaced with
+a new session. The migration also backfills each revision-61
+continuation receipt's exact predecessor admission from the unique persisted
+prior-attempt index and rejects missing or conflicting authority. Stop pre-62
+session and task workers, back up each SQLite or PostgreSQL store, run
+`cayu storage migrate`, and confirm revision 62 before starting current workers.
+Mixed-version workers and application-only rollback are unsupported.
+
 ## v0.4.0
 
 `v0.4.0` turns Cayu's evaluation, memory, durable task, provider, and workspace

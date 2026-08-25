@@ -1552,7 +1552,10 @@ def test_sqlite_revision_60_initializes_empty_pre_relation_schema_directly(
 
     connection = sqlite_support.connect(database)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 60
+        assert (
+            connection.execute("PRAGMA user_version").fetchone()[0]
+            == schema_migrations.LATEST_REVISION
+        )
         assert (
             connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' "

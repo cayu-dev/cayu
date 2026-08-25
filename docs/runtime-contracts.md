@@ -1334,7 +1334,7 @@ Events emitted for an environment-backed run carry `environment_name` as a top-l
 
 Run ownership is a required part of the `SessionStore` contract. A successful `transition_status(..., to_status=RUNNING)` or `transition_status_and_checkpoint(..., to_status=RUNNING)` increments `Session.run_epoch` and binds that epoch to the current execution context. `fence_stalled_run(...)` atomically verifies status and inactivity, increments the epoch, refreshes activity, and binds the replacement claim. `fence_run_and_transform_checkpoint(...)` is the checkpoint-authorized counterpart: it persists a required checkpoint transform and advances the run epoch in the same transaction, or rolls back both when the transform returns `None` or raises. Cayu uses that stronger boundary when an exact expired recovery claim authorizes takeover, so the stale owner cannot write between claim replacement and epoch advancement. While a claim is active, runtime progress writes to status, model, labels, metadata, events, transcript, or checkpoint must compare the durable epoch and raise `SessionRunFenced` after ownership changes. `release_run_fence(...)` runs once after trailing writes; if the task still owns the durable epoch, it increments that epoch before clearing task-local ownership so child contexts that inherited the old claim cannot write late. Custom stores must implement both fence operations, fence release, and equivalent task-local ownership tracking.
 
-Custom `SessionStore` implementations must also implement the interaction-admission transaction. `create(...)` and `transition_status_and_checkpoint(...)` accept optional interaction admission data and must persist the run-epoch claim, `interaction.started` side-effect handoff, and either attributed transcript messages or a private deferred source batch as one commit. First-interaction creation must persist the pending initial-authority marker in that same commit. The transition can instead name an existing open interaction when crash recovery must precede the admitted source batch. `replace_initial_transcript_messages(...)` materializes the ordered initial transcript and clears its authority marker without an externally visible intermediate form; its bounded `runtime_suffix_count` places runtime-owned acquisition markers after the exact admitted source segment while attributing both segments to the interaction. `materialize_deferred_interaction_input(...)` appends the source-only fallback used before terminalization while retaining that marker, and `load_deferred_interaction_input(...)` exposes a detached snapshot for complete export. These methods are required; a store that cannot provide their atomicity is not interaction-safe. Prerelease pending model/tool recovery state without an open interaction is rejected rather than migrated into the new lifecycle.
+Custom `SessionStore` implementations must also implement the interaction-admission transaction. `create(...)` and `transition_status_and_checkpoint(...)` accept optional interaction admission data and must persist the run-epoch claim, `interaction.started` side-effect handoff, and either attributed transcript messages or a private deferred source batch as one commit. First-interaction creation must persist the pending initial-authority marker in that same commit; when runtime-authenticated initial-transcript authority is present, its complete initial projection must be retained in the same private deferred record. The transition can instead name an existing open interaction when crash recovery must precede the admitted source batch. `replace_initial_transcript_messages(...)` materializes the ordered initial transcript and clears its authority marker without an externally visible intermediate form; its bounded `runtime_suffix_count` places runtime-owned acquisition markers after the exact admitted source segment while attributing both segments to the interaction, and a retained authenticated projection must match the complete replacement exactly. `materialize_deferred_interaction_input(...)` appends the source-only fallback used before terminalization while retaining that marker, and `load_deferred_interaction_input(...)` exposes a detached snapshot for complete export. These methods are required; a store that cannot provide their atomicity is not interaction-safe. Prerelease pending model/tool recovery state without an open interaction is rejected rather than migrated into the new lifecycle.
 
 `Session.last_activity_at` is the durable recovery signal. Runtime progress writes refresh it, and inactive-session queries must apply `last_activity_before` in storage before `limit` so recent rows cannot hide older stalled work. Operator annotation writes through `update_labels(...)` or `update_metadata(...)` advance `updated_at` but leave `last_activity_at` unchanged, so editing a stalled session cannot postpone recovery. Recovery that needs only the inactivity predicate claims the run through `fence_stalled_run(...)`; recovery that also installs a durable checkpoint lease uses `fence_run_and_transform_checkpoint(...)` so lease ownership and epoch fencing cannot diverge. A plain status or checkpoint update is not an ownership transfer.
 
@@ -3101,9 +3101,167 @@ cancellation and discard the settlement evidence.
 The ordinary built-in task worker does not execute contract-bound tasks. After
 claiming one, it atomically parks the task in `needs_attention` with
 `status_reason="verified_work_contract_runner_required"`; that claimed item
-counts toward `max_tasks`. Until a verifier-aware worker entrance is available,
-deployments should keep contract-bound and ordinary work in separately filtered
-queues so ordinary worker capacity is not consumed by parked contract work.
+counts toward `max_tasks`. The runtime-owned admission primitive described
+below is not an automatic queue consumer. Until that worker is available,
+deployments must keep contract-bound and ordinary work in separately filtered
+queues and have application orchestration call the dedicated admission entrance;
+ordinary workers otherwise consume capacity by parking governed tasks.
+
+`CayuApp.admit_work_attempt(RunRequest | ResumeRequest, execution=...)` is the
+only runtime-owned entrance that admits contract-bound provider work. It ends at
+durable admission and deliberately dispatches no provider, tool, hook, or
+mutating environment work. Source-profile preparation may perform the same
+bounded, read-only workspace-instruction loading and side-effect-free provider
+preflights as ordinary session admission. Ordinary `run`, `resume`, session recovery, task-worker,
+direct `begin_work_attempt(...)`, direct proposal, and terminal task mutations
+remain fail closed while an admission owns the task. Initial admission accepts
+only a pending or validly claimed contract task and requires caller-stable task
+and session IDs so every acknowledgement-lost retry reconstructs the same
+operation. Continuation admission requires `WorkAttemptExecutionRequest.task_id`
+and `predecessor_admission_id`; these select one exact governed task and its
+released admission even when the session has other running contracted tasks. It
+accepts only a rejected decision whose frozen continuation policy is `continue`,
+after that decision was durably applied to the selected running task and its
+prior worker lease was released. It reuses the task's exact session, creates a new
+interaction, and returns the prior decision plus its bounded typed gaps; it
+never edits the objective, criteria, constraints, evidence requirements,
+continuation policy, or contract version. Before preparation and again inside
+the atomic session transition, the runtime requires any recovery marker to carry
+the released predecessor's exact admission, claim, generation, and claim-request
+digest. An absent marker is valid; malformed or foreign authority fails closed
+without publishing the new admission. The transition retires only that
+authenticated predecessor marker, so a later crash is reconciled only against
+the continuation's authority.
+
+This admission-only leaf cannot produce pending provider dispositions, tool
+rounds, approvals, user-input gates, interruption cascades, or general session
+operations. Recovery fails closed if extension or downstream code presents
+those states; the downstream governed worker must introduce their authenticated
+execution and recovery owners together rather than routing them through ordinary
+session recovery.
+
+The exact admission tuple is the admission, attempt, task, session, interaction,
+claim, worker, process execution-owner, generation, source request digest,
+immutable `WorkContractRef`, session invocation, and source execution-profile
+fingerprint; continuation adds the selected predecessor admission. The source
+request digest binds the canonical public request plus
+the ordered request-scoped loop-policy authority that public model serialization
+omits: an application-versioned declaration when one exists, otherwise the exact
+live policy object's process-local identity. Generation 1 first stores a
+`preparing` receipt and task lease in
+one task-store lock or transaction. Session creation or continuation admission
+then atomically publishes the interaction and source profile before the task
+store changes the admission to `active` and publishes its `WorkAttempt`. A retry
+with the same tuple reconciles those receipts; changing any content-bound field
+is a conflict. At most one unreleased admission may own a session, even when
+competing requests use different task, attempt, or interaction identities; the
+loser is rejected before its task lease or admission intent is published. Once
+the active receipt exists, mutable transcript, checkpoint,
+timestamp, and terminal-session progress does not change that exact operation;
+replay validates the immutable receipt, claim, invocation, and source profile
+rather than recomputing activation evidence from later session state. If the
+process disappears while `preparing`, the same exact
+source request may replace only an expired claim with generation N+1 and then
+finish or reconcile the original session mutation. It may not create a second
+attempt or interaction.
+
+Initial admission preallocates the session instance before publishing the
+`preparing` receipt and carries it to `SessionStore.create(...)` through
+token-authenticated process-local request authority. Supporting custom session
+stores must derive the created `Session.instance_id` with
+`cayu.runtime.sessions.session_instance_id_for_run_request(...)`; raw caller
+fields and ordinary already-attached task requests cannot select or reuse that
+authority. Exact concurrent preparations derive the same instance, while later
+retries restore it only from the durable admission receipt.
+
+The same authenticated create handoff carries the runtime-rendered initial
+transcript projection. Supporting built-in stores commit its exact system prefix
+(including workspace instructions) and admitted source suffix as private deferred
+input with the session and pending-transcript marker. First-crash recovery
+publishes that complete projection atomically; source-only fallback may expose the
+user tail for generic terminalization but does not clear the pending marker or
+claim that the reproducible system context was restored.
+
+The session mutation stores `interaction.started` and its durable side-effect
+handoff atomically. After the task store publishes the active attempt, the
+runtime claims and fans out that exact persisted event before returning the
+admission receipt. The runtime periodically renews the exact active claim only
+while that handoff remains pending, then performs a final store-authoritative
+freshness check after delivery settles. Initial admission, exact replay, and
+recovery therefore never return authority whose lease was consumed by event
+delivery, while a fast exact replay preserves its unchanged durable receipt.
+Losing the claim during handoff fails closed only after the dispatched delivery
+settles. If activation acknowledgement is lost, an exact retry or a later
+positively fenced recovery generation reads the active receipt and finishes the
+same handoff before returning authority; event delivery remains idempotent and
+never invents a replacement interaction event.
+
+The runtime owns each dispatched session creation, continuation admission, and
+recovery transition until the session store returns a definite outcome. Caller
+cancellation remains authoritative but is propagated only after that mutation
+settles, so the cancelled caller never reports a quiescent outcome or initiates
+replacement while its older opaque session-store commit is still in flight.
+Cross-process replacement remains governed by the exact durable claim and
+session compare-and-set evidence. Continuation receipts persist gaps once inside
+the bounded decision and expose the same typed tuple through
+`continuation.gaps`; their byte and item ceilings include the complete maximum-
+size valid decision plus fixed admission authority headroom.
+
+`renew_work_attempt_claim(...)` extends only the exact current live generation.
+After an active owner expires, `recover_work_attempt(...)` first installs the
+next generation under the task-store fence, then proves the prior session epoch,
+interaction, provider stage, checkpoint, hooks, and run fence are quiescent or
+exactly reconciled before returning the admission to `active`. On the first
+takeover of a still-running session, the exact recovering claim authorizes a
+private governed-settlement entrance: immediately before its first mutation the
+runtime exact-replays that claim through the task store so the store's clock
+proves the lease remains live, fences the predecessor session epoch, and uses
+the ordinary incomplete-session owner to reconcile durable provider, tool,
+workspace, interaction, and interruption state without executing new provider
+or tool work. When the crashed initial owner still has private source input,
+settlement publishes the authenticated complete initial transcript through the
+atomic initial-transcript boundary, clearing its setup marker before recovery can
+return active authority. A partial
+settlement that reached an interrupting or terminal
+session but did not release the prior invocation run fence re-enters this same
+governed owner on exact retry. A concurrent exact retry that observes the first
+settlement owner still active returns `WorkAttemptRecoveryRequired` without
+recursing or repeating the fence; retrying after that owner settles reconciles
+the durable outcome. Active or ambiguous settlement remains fenced;
+only a terminal session with its prior invocation run fence released can advance
+to the new active generation. This owner transfer interrupts the predecessor
+session epoch but does not publish a terminal lifecycle event for the work
+attempt's immutable interaction; the replacement generation resumes that same
+still-open interaction. Ordinary incomplete-session recovery remains unavailable
+to contracted sessions. If a predecessor
+committed the session recovery transition but failed before task-store
+activation, its exact checkpoint marker is reconciled only after the runtime
+loads that immutable historical claim and proves it expired before the current
+generation was issued; the takeover advances the session epoch and replaces the
+marker atomically. A stale process,
+claim, generation, worker, or lease cannot renew, recover, publish a proposal,
+or use ordinary task progress and terminalization paths. Public proposal
+publication goes through `submit_work_attempt_proposal(...)`, which adds the
+process-private owner identity and atomically writes the proposal, changes the
+admission to `released`, and clears the task worker lease. A changed retry is a
+conflict; an identical committed retry replays the same durable proposal.
+`released` relinquishes only that attempt's live execution occupancy. The
+durable admission continues to mark the task as governed, so ordinary task
+completion, failure, cancellation, holds, resumption, worker renewal, and worker
+release remain fenced; only exact verifier-decision application or a later
+dedicated governed boundary may mutate that lifecycle.
+Supporting `TaskStore` implementations opt in with
+`supports_work_attempt_admission = True` and implement the complete preparation,
+activation, renewal, recovery, and claim-fenced proposal request family exported
+by `cayu.runtime`. Each mutation must also satisfy the store's explicit
+cancellation-quiescence proof; partial capability implementations fail closed at
+the runtime boundary.
+
+Forking from a contracted session remains rejected before child or group
+publication. This slice defines no implicit inherited or replacement contract:
+a future fork entrance must either bind the complete exact lineage before the
+child executes, or accept an explicit superseding contract version only at a
+safe pre-attempt boundary.
 `CayuApp.create_task(...)` also requires a caller-stable `task_id` for a
 contract-bound task, so cancellation or acknowledgement loss cannot discard the
 only handle to a mutation that durably completed. The lower-level `TaskStore`
@@ -3272,12 +3430,16 @@ bounded to 64 active or draining adapters, and has an explicit timeout of at mos
 An adapter-owned cancellation is an ordinary resolver failure, and an adapter that
 does not settle after caller cancellation or timeout remains draining so the same
 application cannot overlap another exact read. Before adapter dispatch, Cayu
-atomically compares the task's attached, store-minted immutable session-instance ID
+atomically compares the task's attached, authenticated immutable session-instance ID
 and reserves that exact session incarnation for the deterministic result event. A
 missing or same-ID replacement session therefore fails before adapter work even when
 all public session and invocation fields are identical. Session stores mint a fresh
-instance ID for every creation and fork; task stores persist that exact ID when
-attaching work and never infer it from timestamps or caller-selected lineage.
+instance ID for every ordinary creation and fork; contract-bound pre-create
+admission instead derives one content-bound runtime instance ID and carries it
+through authenticated private request authority so the task-store reservation
+and later session creation bind the same incarnation. Task stores persist that
+exact ID when attaching work and never infer it from timestamps or
+caller-selected lineage.
 Concurrent attempts receive distinct runtime-minted,
 expiring owner identities. Each owner renews its exact claim while resolver or cleanup
 work may still be in flight; ordinary pre-application exit releases only that owner,
@@ -3399,6 +3561,28 @@ Stop older task/verifier workers, take an application-consistent backup, recreat
 such populated prerelease stores, run `cayu storage migrate`, and confirm revision
 58 before current workers start. Mixed revision-57/revision-58 verifier workers
 and application-only rollback are unsupported.
+
+Breaking schema revision 61 adds durable work-attempt admission and execution-
+claim generations for SQLite and PostgreSQL task stores. Stop all pre-61 task
+workers, back up the store, run `cayu storage migrate`, and confirm revision 61
+before starting current workers. Mixed-version operation is unsupported: an
+older worker does not honor the admission lease, recovery generation, or
+claim-fenced proposal boundary. No historical admission is inferred for
+existing tasks.
+
+Breaking schema revision 62 changes the private deferred-interaction payload
+from a source-message array to an object that also reserves the authenticated
+complete initial-transcript projection. Migration wraps every revision-61 array
+as source messages with no complete projection; it never infers missing system
+or workspace instructions. If such a migrated session still carries the pending
+initial-transcript marker, governed crash recovery fails closed and requires a
+new session instead of activating source-only context. The same migration derives each revision-61
+continuation receipt's `prior_admission_id` only from the unique admission row
+indexed by its persisted `prior_attempt_id`; missing or conflicting predecessor
+authority fails closed before revision 62 is recorded. Stop all pre-62 session
+and task workers, back up the store, run `cayu storage migrate`, and confirm
+revision 62 before starting current workers. Mixed revision-61/revision-62
+workers and application-only rollback are unsupported.
 
 `terminalize_task(...)` is the claim-fenced, replay-safe completion/failure
 boundary for worker-owned tasks. A request carries the exact task and worker,

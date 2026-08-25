@@ -133,6 +133,8 @@ _TABLES = (
     "cayu_completion_verification_claims",
     "cayu_completion_verifier_profiles",
     "cayu_completion_proposals",
+    "cayu_work_attempt_execution_claims",
+    "cayu_work_attempt_admissions",
     "cayu_work_attempts",
     "cayu_task_session_execution_authority",
     "cayu_work_contracts",
@@ -838,6 +840,8 @@ def test_postgres_downgraded_verified_work_records_fail_closed_before_migration(
                         "SET verifier_profile_fingerprint = NULL"
                     )
                 await conn.rollback()
+                await cur.execute("DROP TABLE cayu_work_attempt_execution_claims")
+                await cur.execute("DROP TABLE cayu_work_attempt_admissions")
                 await cur.execute("DROP TABLE cayu_completion_verifier_profiles")
                 await cur.execute(
                     "ALTER TABLE cayu_completion_verification_claims "

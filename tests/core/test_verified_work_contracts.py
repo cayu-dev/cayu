@@ -6541,6 +6541,8 @@ def test_sqlite_revision_49_migrates_existing_ordinary_tasks(tmp_path) -> None:
     connection = sqlite3.connect(path)
     try:
         for table in (
+            "cayu_work_attempt_execution_claims",
+            "cayu_work_attempt_admissions",
             "cayu_completion_decision_application_receipts",
             "cayu_completion_decisions",
             "cayu_completion_verification_claims",
@@ -6656,6 +6658,8 @@ def test_sqlite_downgraded_verified_work_records_fail_closed_before_migration(
                 "UPDATE cayu_completion_verification_claims SET verifier_profile_fingerprint = NULL"
             )
         connection.rollback()
+        connection.execute("DROP TABLE cayu_work_attempt_execution_claims")
+        connection.execute("DROP TABLE cayu_work_attempt_admissions")
         connection.execute("DROP TABLE cayu_completion_verifier_profiles")
         connection.execute(
             "ALTER TABLE cayu_completion_verification_claims "
