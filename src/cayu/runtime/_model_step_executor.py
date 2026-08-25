@@ -129,7 +129,11 @@ from cayu.providers import (
     normalize_model_completion,
 )
 from cayu.providers._credential_boundary import aclosing_provider_stream
-from cayu.providers.base import copy_model_completion
+from cayu.providers.base import (
+    TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
+    TargetedToolProjectionRequest,
+    copy_model_completion,
+)
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
@@ -320,6 +324,11 @@ from cayu.runtime.structured_output import (
     structured_output_tool_instruction,
     structured_output_tool_spec,
 )
+from cayu.runtime.targeted_tool_projection import (
+    TargetedToolProjectionKind,
+    openai_targeted_tool_projection,
+    resolve_targeted_tool_projection,
+)
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
 from cayu.runtime.tool_exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
@@ -340,6 +349,7 @@ from cayu.runtime.tool_gateway import (
     call_tool_spec,
     targeted_tool_gateway_projection,
 )
+from cayu.runtime.tool_grants import TargetedToolGrantRecord
 from cayu.runtime.usage import (
     ModelCompletionPurpose,
     durable_model_completed_payload,
@@ -853,6 +863,7 @@ def _durable_assistant_step_result(
     *,
     redactor: SecretRedactor,
     targeted_tool_reference_grant_ids: Mapping[str, str] | None = None,
+    targeted_tool_name_grant_ids: Mapping[str, str] | None = None,
 ) -> AssistantStepResult:
     """Project one assistant result across the durable publication boundary."""
 
@@ -872,6 +883,9 @@ def _durable_assistant_step_result(
     reference_grant_ids = (
         {} if targeted_tool_reference_grant_ids is None else dict(targeted_tool_reference_grant_ids)
     )
+    name_grant_ids = (
+        {} if targeted_tool_name_grant_ids is None else dict(targeted_tool_name_grant_ids)
+    )
     tool_calls: list[runtime_records.ToolCallRequest] = []
     for call in copied.tool_calls:
         projected_arguments = redactor.redact_json_values(call.arguments)
@@ -881,7 +895,12 @@ def _durable_assistant_step_result(
         targeted_tool_grant_id = (
             reference_grant_ids.get(tool_ref) if type(tool_ref) is str else None
         )
-        if targeted_tool_grant_id is not None:
+        native_grant_id = name_grant_ids.get(call.name)
+        if targeted_tool_grant_id is not None and native_grant_id is not None:
+            raise ValueError("A model tool call matched two targeted-tool projections.")
+        if native_grant_id is not None:
+            targeted_tool_grant_id = native_grant_id
+        if targeted_tool_grant_id is not None and tool_ref is not None:
             # The exact reference was issued in this request by the runtime.
             # Retain it only as private executable material paired with its
             # grant id; transcript projection below replaces it with a
@@ -916,11 +935,11 @@ def _durable_assistant_step_result(
     )
 
 
-def _assistant_step_result_with_published_gateway_authority(
+def _assistant_step_result_with_published_targeted_authority(
     live_result: AssistantStepResult,
     published_result: AssistantStepResult,
 ) -> AssistantStepResult:
-    """Pair live validation values with the exact published gateway authority."""
+    """Pair live validation values with exact published targeted-tool authority."""
 
     live = _copy_assistant_step_result(live_result)
     published = _copy_assistant_step_result(published_result)
@@ -4290,7 +4309,9 @@ class ModelStepExecutor:
         thinking: ThinkingConfig | None,
         step: int,
         tool_exposure: ResolvedToolExposure | None = None,
+        targeted_tool_projection_kind: TargetedToolProjectionKind | None = None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None = None,
+        targeted_tool_native: TargetedToolProjectionRequest | None = None,
     ) -> ModelRequest:
         resolved_tool_exposure = (
             _all_registered_tool_exposure(registered_agent)
@@ -4300,12 +4321,20 @@ class ModelStepExecutor:
         model_tools = _model_request_tools(
             tool_exposure=resolved_tool_exposure,
             structured_output=structured_output,
-            tool_gateway_enabled=registered_agent.tool_gateway_enabled,
+            targeted_tool_projection=targeted_tool_projection_kind,
         )
-        if targeted_tool_gateway is not None and not registered_agent.tool_gateway_enabled:
+        if targeted_tool_gateway is not None and (
+            targeted_tool_projection_kind is not TargetedToolProjectionKind.CALL_TOOL
+        ):
+            raise RuntimeError("Targeted gateway context requires the call_tool projection.")
+        if targeted_tool_native is not None and (
+            targeted_tool_projection_kind is not TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS
+        ):
             raise RuntimeError(
-                "Targeted tool context requires enable_tool_gateway=True at agent registration."
+                "Native targeted tools require the OpenAI additional_tools projection."
             )
+        if targeted_tool_gateway is not None and targeted_tool_native is not None:
+            raise RuntimeError("A model request cannot carry two targeted-tool projections.")
         model_messages = _model_request_messages(
             messages=context_messages,
             structured_output=structured_output,
@@ -4359,6 +4388,8 @@ class ModelStepExecutor:
         }
         if thinking_payload is not None:
             request_options["thinking"] = thinking_payload
+        if targeted_tool_projection_kind is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS:
+            request_options[TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION] = CALL_TOOL_NAME
         redacted_messages = [
             redact_runtime_message_for_boundary(
                 message,
@@ -4409,6 +4440,46 @@ class ModelStepExecutor:
             )
             for tool in model_tools
         ]
+        redacted_targeted_tool_projection = None
+        if targeted_tool_native is not None:
+            for index, tool in enumerate(targeted_tool_native.tools):
+                tool_name = tool.get("name")
+                if type(tool_name) is not str:
+                    raise AssertionError("A targeted model tool name must be a string.")
+                if self._secret_redactor.redact_text(tool_name) != tool_name:
+                    raise ValueError(
+                        f"targeted_tools[{index}].name contains a workload secret and "
+                        "cannot be sent as provider execution authority."
+                    )
+                self._secret_redactor.require_no_secret_keys(
+                    {
+                        "name": tool_name,
+                        "description": tool.get("description"),
+                        "input_schema": None,
+                    },
+                    field_name=f"targeted_tools[{index}]",
+                    preserve_keys={"name", "description", "input_schema"},
+                    match_short_substrings=True,
+                )
+                input_schema = tool.get("input_schema")
+                if type(input_schema) is not dict:
+                    raise AssertionError("A targeted model tool input_schema must be an object.")
+                require_secret_free_json_schema_keys(
+                    input_schema,
+                    redactor=self._secret_redactor,
+                    field_name=f"targeted_tools[{index}].input_schema",
+                )
+            projected_targeted_tools = self._secret_redactor.redact_json_values(
+                list(targeted_tool_native.tools),
+                preserve_string_fields={"name"},
+            )
+            if type(projected_targeted_tools) is not list:
+                raise AssertionError("Targeted tool redaction returned a non-list.")
+            redacted_targeted_tool_projection = TargetedToolProjectionRequest(
+                protocol=targeted_tool_native.protocol,
+                marker_id=targeted_tool_native.marker_id,
+                tools=tuple(projected_targeted_tools),
+            )
         for field_name, untyped_value in (
             ("provider_options", provider_options),
             ("agent_metadata", agent_metadata),
@@ -4467,6 +4538,7 @@ class ModelStepExecutor:
             messages=redacted_messages,
             tools=redacted_tools,
             hosted_tools=registered_agent.hosted_tools,
+            targeted_tool_projection=redacted_targeted_tool_projection,
             options=redacted_options,
         )
 
@@ -4506,6 +4578,7 @@ class ModelStepExecutor:
         tool_exposure_evidence: ToolExposure | None = None,
         targeted_tool_grants: TargetedToolGrantFootprint | None = None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None = None,
+        targeted_tool_native_grant_ids: Mapping[str, str] | None = None,
         memory_evidence_reference: MemoryEvidenceReference | None = None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         retry_policy = copy_retry_policy(retry_policy)
@@ -4530,6 +4603,14 @@ class ModelStepExecutor:
             raise TypeError(
                 "targeted_tool_gateway must be a TargetedToolGatewayProjection or None."
             )
+        native_grant_ids = (
+            {} if targeted_tool_native_grant_ids is None else dict(targeted_tool_native_grant_ids)
+        )
+        if any(
+            type(name) is not str or type(grant_id) is not str
+            for name, grant_id in native_grant_ids.items()
+        ):
+            raise TypeError("targeted_tool_native_grant_ids must map strings to strings.")
         if tool_exposure_evidence is not None:
             if type(tool_exposure_evidence) is not ToolExposure:
                 raise TypeError("tool_exposure_evidence must be a ToolExposure or None.")
@@ -4559,6 +4640,11 @@ class ModelStepExecutor:
             hosted_tools=model_request.hosted_tools,
             options=model_request.options,
         )
+        if model_request.targeted_tool_projection is not None:
+            provider.preflight_targeted_tool_projection(
+                model=model_request.model,
+                protocol=model_request.targeted_tool_projection.protocol,
+            )
         next_model_attempt_identity = (
             None
             if initial_model_attempt_identity is None
@@ -4767,6 +4853,7 @@ class ModelStepExecutor:
                 execution_profile=execution_profile,
                 tool_exposure=resolved_tool_exposure,
                 targeted_tool_gateway=targeted_tool_gateway,
+                targeted_tool_native_grant_ids=native_grant_ids,
                 memory_evidence_reference=memory_evidence_reference,
                 prepared_model_completion_dispatch=pre_count_completion_dispatch,
             )
@@ -5196,6 +5283,7 @@ class ModelStepExecutor:
         execution_profile: ExecutionProfileIdentity | None,
         tool_exposure: ResolvedToolExposure | None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None,
+        targeted_tool_native_grant_ids: Mapping[str, str],
         memory_evidence_reference: MemoryEvidenceReference | None,
         prepared_model_completion_dispatch: ModelCompletionDispatch | None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
@@ -5203,6 +5291,7 @@ class ModelStepExecutor:
         targeted_tool_reference_grant_ids = (
             None if targeted_tool_gateway is None else targeted_tool_gateway.reference_grant_ids()
         )
+        targeted_tool_name_grant_ids = dict(targeted_tool_native_grant_ids)
         if retry_policy.max_attempts != max_attempts:
             raise ValueError("Retry policy does not match the model-attempt ceiling.")
         assistant_parts: list[transcript_helpers.AssistantContentPart] = []
@@ -6766,11 +6855,12 @@ class ModelStepExecutor:
                         step_result,
                         redactor=self._secret_redactor,
                         targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
+                        targeted_tool_name_grant_ids=targeted_tool_name_grant_ids,
                     )
                     candidate_live_continuation = (
                         None
-                        if targeted_tool_gateway is None
-                        else _assistant_step_result_with_published_gateway_authority(
+                        if targeted_tool_gateway is None and not targeted_tool_name_grant_ids
+                        else _assistant_step_result_with_published_targeted_authority(
                             step_result,
                             candidate_step_result,
                         )
@@ -7061,6 +7151,18 @@ class ModelStepRun:
                 raise ValueError("Targeted tool grants require an active interaction identity.")
             interaction_id = require_durable_clean_nonblank(interaction_id, "interaction_id")
         self._interaction_id = interaction_id
+        self._targeted_tool_projection_kind = resolve_targeted_tool_projection(
+            registered_agent.targeted_tool_mode,
+            provider=provider,
+            model=session.model,
+        )
+        if (
+            targeted_tool_grants is not None
+            and targeted_tool_grants.projection is not self._targeted_tool_projection_kind
+        ):
+            raise ValueError(
+                "Targeted grant footprint conflicts with the resolved provider projection."
+            )
         contextual_limits = (
             *budget_limits_for_session(
                 policy=self._budget_policy,
@@ -7124,25 +7226,24 @@ class ModelStepRun:
             )
         return exposure
 
-    async def _targeted_gateway_projection(
+    async def _targeted_tool_projection_records(
         self,
-    ) -> TargetedToolGatewayProjection | None:
-        """Load the current callable subset of the invocation's exact grant batch."""
-
+    ) -> tuple[TargetedToolGrantRecord, ...]:
+        """Load and validate the invocation's exact durable grant batch."""
         if not self._targeted_tool_grant_ids:
-            return None
+            return ()
         if self._interaction_id is None:
-            raise RuntimeError("Targeted gateway projection lost its interaction identity.")
+            raise RuntimeError("Targeted tool projection lost its interaction identity.")
         records = await self._executor._session_store.list_targeted_tool_grants(
             self._session.id,
             interaction_id=self._interaction_id,
         )
         records_by_id = {record.grant_id: record for record in records}
         if len(records_by_id) != len(records):
-            raise RuntimeError("Targeted gateway durable state contains duplicate grants.")
+            raise RuntimeError("Targeted projection durable state contains duplicate grants.")
         expected_grant_ids = frozenset(self._targeted_tool_grant_ids)
         if not expected_grant_ids <= records_by_id.keys():
-            raise RuntimeError("Targeted gateway grant batch conflicts with durable state.")
+            raise RuntimeError("Targeted projection grant batch conflicts with durable state.")
         observed_at = self._executor._clock()
         omitted_records = tuple(
             record
@@ -7150,13 +7251,13 @@ class ModelStepRun:
             if grant_id not in expected_grant_ids
         )
         if any(observed_at < record.expires_at for record in omitted_records):
-            raise RuntimeError("Targeted gateway grant batch omitted a callable durable grant.")
+            raise RuntimeError("Targeted projection grant batch omitted a callable durable grant.")
         ordered_records = tuple(
             records_by_id[grant_id] for grant_id in self._targeted_tool_grant_ids
         )
         expected_generation = self._targeted_tool_generation_id
         if expected_generation is None:
-            raise RuntimeError("Targeted gateway projection lost its generation identity.")
+            raise RuntimeError("Targeted projection lost its generation identity.")
         if any(
             record.interaction_id != self._interaction_id
             or record.generation_id != expected_generation
@@ -7164,13 +7265,40 @@ class ModelStepRun:
             or record.tool_name not in self._tool_capability_ceiling.tool_names
             for record in ordered_records
         ):
-            raise RuntimeError("Targeted gateway grant scope conflicts with live authority.")
-        projection = targeted_tool_gateway_projection(
-            ordered_records,
-            catalogue=self._registered_agent.tool_catalogue,
-            observed_at=observed_at,
-        )
-        return projection
+            raise RuntimeError("Targeted projection grant scope conflicts with live authority.")
+        return ordered_records
+
+    async def _targeted_tool_projections(
+        self,
+    ) -> tuple[
+        TargetedToolGatewayProjection | None,
+        TargetedToolProjectionRequest | None,
+        dict[str, str],
+    ]:
+        records = await self._targeted_tool_projection_records()
+        if not records:
+            return None, None, {}
+        observed_at = self._executor._clock()
+        if self._targeted_tool_projection_kind is TargetedToolProjectionKind.CALL_TOOL:
+            return (
+                targeted_tool_gateway_projection(
+                    records,
+                    catalogue=self._registered_agent.tool_catalogue,
+                    observed_at=observed_at,
+                ),
+                None,
+                {},
+            )
+        if (
+            self._targeted_tool_projection_kind
+            is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS
+        ):
+            projection, grant_ids_by_name = openai_targeted_tool_projection(
+                records,
+                catalogue=self._registered_agent.tool_catalogue,
+            )
+            return None, projection, grant_ids_by_name
+        raise RuntimeError("Targeted grants have no resolved provider projection.")
 
     async def _abandon_pre_dispatch_model_stage(
         self,
@@ -7309,7 +7437,20 @@ class ModelStepRun:
             step=step,
             transcript_cursor=source_transcript_cursor,
         )
-        targeted_tool_gateway = await self._targeted_gateway_projection()
+        (
+            targeted_tool_gateway,
+            targeted_tool_native,
+            targeted_tool_native_grant_ids,
+        ) = await self._targeted_tool_projections()
+        if targeted_tool_native is not None:
+            exposed_names = frozenset(tool_exposure.tool_names)
+            overlap = sorted(
+                tool["name"] for tool in targeted_tool_native.tools if tool["name"] in exposed_names
+            )
+            if overlap:
+                raise RuntimeError(
+                    "Native targeted tools cannot also be directly exposed: " + ", ".join(overlap)
+                )
         exposure_profile_changed = (
             previous_tool_exposure_profile_id is not None
             and previous_tool_exposure_profile_id != tool_exposure.profile_id
@@ -7413,17 +7554,23 @@ class ModelStepRun:
                     thinking=self._thinking,
                     step=step,
                     tool_exposure=tool_exposure,
+                    targeted_tool_projection_kind=self._targeted_tool_projection_kind,
                     targeted_tool_gateway=targeted_tool_gateway,
+                    targeted_tool_native=targeted_tool_native,
                 ),
                 count_input_tokens=self._context_input_token_counter(
                     step=step,
                     tool_exposure=tool_exposure,
+                    targeted_tool_projection_kind=self._targeted_tool_projection_kind,
                     targeted_tool_gateway=targeted_tool_gateway,
+                    targeted_tool_native=targeted_tool_native,
                 ),
                 build_cache_prefix_request=self._cache_prefix_request_builder(
                     step=step,
                     tool_exposure=tool_exposure,
+                    targeted_tool_projection_kind=self._targeted_tool_projection_kind,
                     targeted_tool_gateway=targeted_tool_gateway,
+                    targeted_tool_native=targeted_tool_native,
                 ),
                 secret_redactor=self._executor._secret_redactor,
                 run_compaction=run_automatic_compaction,
@@ -7549,7 +7696,9 @@ class ModelStepRun:
             thinking=self._thinking,
             step=step,
             tool_exposure=tool_exposure,
+            targeted_tool_projection_kind=self._targeted_tool_projection_kind,
             targeted_tool_gateway=targeted_tool_gateway,
+            targeted_tool_native=targeted_tool_native,
         )
         if self._execution_profile is None:
             raise RuntimeError("Tool exposure evidence requires an execution profile.")
@@ -7587,6 +7736,7 @@ class ModelStepRun:
             memory_evidence_reference=memory_evidence_reference,
             memory_evidence_key=evidence_key,
             targeted_tool_gateway=targeted_tool_gateway,
+            targeted_tool_native_grant_ids=targeted_tool_native_grant_ids,
         )
         try:
             async for event, outcome in request_events:
@@ -7608,8 +7758,12 @@ class ModelStepRun:
         memory_evidence_reference: MemoryEvidenceReference | None = None,
         memory_evidence_key: MemoryEvidenceKey | None = None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None = None,
+        targeted_tool_native_grant_ids: Mapping[str, str] | None = None,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
+        native_grant_ids = (
+            {} if targeted_tool_native_grant_ids is None else dict(targeted_tool_native_grant_ids)
+        )
         if memory_evidence_reference is not None and self._model_completion_publisher is None:
             raise RuntimeError(
                 "Automatic recall dispatch requires durable model-completion publication."
@@ -8106,6 +8260,7 @@ class ModelStepRun:
             memory_evidence_reference=memory_evidence_reference,
             memory_evidence_key=memory_evidence_key,
             targeted_tool_gateway=targeted_tool_gateway,
+            targeted_tool_native_grant_ids=native_grant_ids,
         )
         guarded_events = controller.model_step_events_with_heartbeat(
             model_step_events,
@@ -8295,6 +8450,7 @@ class ModelStepRun:
         memory_evidence_reference: MemoryEvidenceReference | None,
         memory_evidence_key: MemoryEvidenceKey | None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None,
+        targeted_tool_native_grant_ids: Mapping[str, str],
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
         request_variant = RequestVariant(request_variant)
@@ -8360,6 +8516,7 @@ class ModelStepRun:
                 tool_exposure_evidence=tool_exposure_evidence,
                 targeted_tool_grants=self._targeted_tool_grants,
                 targeted_tool_gateway=targeted_tool_gateway,
+                targeted_tool_native_grant_ids=targeted_tool_native_grant_ids,
                 memory_evidence_reference=evidence_reference,
             )
 
@@ -8486,17 +8643,23 @@ class ModelStepRun:
                     thinking=self._thinking,
                     step=step,
                     tool_exposure=tool_exposure,
+                    targeted_tool_projection_kind=self._targeted_tool_projection_kind,
                     targeted_tool_gateway=targeted_tool_gateway,
+                    targeted_tool_native=model_request.targeted_tool_projection,
                 ),
                 count_input_tokens=self._context_input_token_counter(
                     step=step,
                     tool_exposure=tool_exposure,
+                    targeted_tool_projection_kind=self._targeted_tool_projection_kind,
                     targeted_tool_gateway=targeted_tool_gateway,
+                    targeted_tool_native=model_request.targeted_tool_projection,
                 ),
                 build_cache_prefix_request=self._cache_prefix_request_builder(
                     step=step,
                     tool_exposure=tool_exposure,
+                    targeted_tool_projection_kind=self._targeted_tool_projection_kind,
                     targeted_tool_gateway=targeted_tool_gateway,
+                    targeted_tool_native=model_request.targeted_tool_projection,
                 ),
                 secret_redactor=self._executor._secret_redactor,
                 run_compaction=run_automatic_compaction,
@@ -8660,7 +8823,9 @@ class ModelStepRun:
             thinking=self._thinking,
             step=step,
             tool_exposure=tool_exposure,
+            targeted_tool_projection_kind=self._targeted_tool_projection_kind,
             targeted_tool_gateway=targeted_tool_gateway,
+            targeted_tool_native=model_request.targeted_tool_projection,
         )
         yield (
             await self._executor._event_writer.emit(
@@ -9808,7 +9973,9 @@ class ModelStepRun:
         *,
         step: int,
         tool_exposure: ResolvedToolExposure,
+        targeted_tool_projection_kind: TargetedToolProjectionKind | None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None,
+        targeted_tool_native: TargetedToolProjectionRequest | None,
     ) -> Callable[[list[Message]], Awaitable[int | None]]:
         async def count_input_tokens(context_messages: list[Message]) -> int | None:
             request = await self._executor.build_request(
@@ -9820,7 +9987,9 @@ class ModelStepRun:
                 thinking=self._thinking,
                 step=step,
                 tool_exposure=tool_exposure,
+                targeted_tool_projection_kind=targeted_tool_projection_kind,
                 targeted_tool_gateway=targeted_tool_gateway,
+                targeted_tool_native=targeted_tool_native,
             )
             # Context-policy execution can await arbitrary application code.
             # Reject changed provider semantics at the final remote count seam.
@@ -9838,7 +10007,9 @@ class ModelStepRun:
         *,
         step: int,
         tool_exposure: ResolvedToolExposure,
+        targeted_tool_projection_kind: TargetedToolProjectionKind | None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None,
+        targeted_tool_native: TargetedToolProjectionRequest | None,
     ) -> Callable[[list[Message]], Awaitable[ModelRequest]]:
         async def build_cache_prefix_request(context_messages: list[Message]) -> ModelRequest:
             return await self._executor.build_request(
@@ -9850,7 +10021,9 @@ class ModelStepRun:
                 thinking=self._thinking,
                 step=step,
                 tool_exposure=tool_exposure,
+                targeted_tool_projection_kind=targeted_tool_projection_kind,
                 targeted_tool_gateway=targeted_tool_gateway,
+                targeted_tool_native=targeted_tool_native,
             )
 
         return build_cache_prefix_request
@@ -10253,12 +10426,14 @@ def _model_request_tools(
     *,
     tool_exposure: ResolvedToolExposure,
     structured_output: StructuredOutputSpec | None,
-    tool_gateway_enabled: bool = False,
+    targeted_tool_projection: TargetedToolProjectionKind | None = None,
 ) -> list[dict[str, Any]]:
     """Build detached tool declarations shared by preflight and model dispatch."""
 
-    if type(tool_gateway_enabled) is not bool:
-        raise TypeError("tool_gateway_enabled must be a bool.")
+    if targeted_tool_projection is not None and type(targeted_tool_projection) is not (
+        TargetedToolProjectionKind
+    ):
+        raise TypeError("targeted_tool_projection must be a TargetedToolProjectionKind or None.")
 
     tools = [
         {
@@ -10273,7 +10448,10 @@ def _model_request_tools(
         and structured_output.strategy == StructuredOutputStrategy.TOOL
     ):
         tools.append(structured_output_tool_spec(structured_output))
-    if tool_gateway_enabled:
+    if targeted_tool_projection in {
+        TargetedToolProjectionKind.CALL_TOOL,
+        TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS,
+    }:
         tools.append(call_tool_spec())
     return tools
 
@@ -10371,7 +10549,9 @@ def _context_pressure_overhead(
     thinking: ThinkingConfig | None,
     step: int,
     tool_exposure: ResolvedToolExposure,
+    targeted_tool_projection_kind: TargetedToolProjectionKind | None = None,
     targeted_tool_gateway: TargetedToolGatewayProjection | None = None,
+    targeted_tool_native: TargetedToolProjectionRequest | None = None,
 ) -> ContextPressureOverhead:
     profile = copy_model_context_pressure_profile(
         registered_provider.provider.context_pressure_profile
@@ -10379,8 +10559,10 @@ def _context_pressure_overhead(
     tools = _model_request_tools(
         tool_exposure=tool_exposure,
         structured_output=structured_output,
-        tool_gateway_enabled=registered_agent.tool_gateway_enabled,
+        targeted_tool_projection=targeted_tool_projection_kind,
     )
+    if targeted_tool_native is not None:
+        tools.extend(copy_json_value(list(targeted_tool_native.tools), "targeted tools"))
     structured_output_instruction: str | None = None
     if (
         structured_output is not None
@@ -11205,6 +11387,7 @@ def _detach_model_request(request: ModelRequest) -> ModelRequest:
         messages=request.messages,
         tools=request.tools,
         hosted_tools=request.hosted_tools,
+        targeted_tool_projection=request.targeted_tool_projection,
         options=request.options,
     )
 

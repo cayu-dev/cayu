@@ -160,6 +160,7 @@ def pending_action_evidence_round_from_checkpoint(
         agent_name=candidate.agent_name,
         environment_name=candidate.environment_name,
         task_id=candidate.task_id,
+        interaction_id=candidate.interaction_id,
         execution_profile_fingerprint=candidate.execution_profile_fingerprint,
         tool_exposure=candidate.tool_exposure,
         tool_calls=candidate.tool_calls,

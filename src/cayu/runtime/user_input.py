@@ -44,6 +44,7 @@ from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import StructuredOutputSpec, copy_structured_output_spec
+from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
 from cayu.runtime.tool_exposure import (
     ResolvedToolExposureAuthority,
     copy_resolved_tool_exposure_authority,
@@ -164,6 +165,7 @@ class PendingUserInput(BaseModel):
     environment_name: str | None = None
     workspace_id: str | None = None
     task_id: str | None = None
+    interaction_id: str | None = None
     execution_profile_fingerprint: str | None = Field(
         default=None,
         min_length=64,
@@ -207,6 +209,18 @@ class PendingUserInput(BaseModel):
             self.budget_limits,
         ):
             raise ValueError("run_limit_accounting requires active run-scoped authority.")
+        has_targeted_call = any(
+            call.tool_name == CALL_TOOL_NAME
+            or call.targeted_tool_grant_id is not None
+            or call.targeted_tool_invocation is not None
+            or call.targeted_tool_rejection is not None
+            for call in self.tool_calls
+        )
+        if has_targeted_call != (self.interaction_id is not None):
+            raise ValueError(
+                "Pending targeted calls and interaction identity authority must be present "
+                "together."
+            )
         if self.assistant_message_state == "quarantined":
             if self.quarantined_assistant_message is None:
                 raise ValueError(
@@ -258,6 +272,7 @@ class PendingUserInput(BaseModel):
             if any(
                 call.policy_evidence is ToolPolicyEvidence.AUTHORITATIVE
                 and call.tool_name not in exposed_names
+                and call.targeted_tool_invocation is None
                 for call in self.tool_calls
             ):
                 raise ValueError(
@@ -280,7 +295,7 @@ class PendingUserInput(BaseModel):
     def validate_question(cls, value: str, info) -> str:
         return require_durable_nonblank(value, info.field_name)
 
-    @field_validator("environment_name", "workspace_id", "task_id")
+    @field_validator("environment_name", "workspace_id", "task_id", "interaction_id")
     @classmethod
     def validate_optional_nonblank_fields(
         cls,
@@ -407,6 +422,11 @@ def public_pending_user_input_event_payload(
 
     payload = pending.model_dump(mode="json")
     payload.pop("run_limit_accounting", None)
+    # Interaction identity is private checkpoint authority for targeted
+    # continuation. The enclosing event carries its own attested interaction
+    # envelope, while this public descriptor deliberately omits targeted-call
+    # bindings and must not retain only half of that invariant.
+    payload.pop("interaction_id", None)
     # The profile reference is runtime authority for the enclosing event, not
     # untrusted pause content. Interruption payloads publish it once at the top
     # level through ``pending_user_input_interruption_payload``.
@@ -528,6 +548,7 @@ def copy_pending_user_input(pending: PendingUserInput) -> PendingUserInput:
         environment_name=pending.environment_name,
         workspace_id=pending.workspace_id,
         task_id=pending.task_id,
+        interaction_id=pending.interaction_id,
         execution_profile_fingerprint=pending.execution_profile_fingerprint,
         tool_exposure=pending.tool_exposure,
         tool_calls=[copy_pending_tool_call_approval(call) for call in pending.tool_calls],

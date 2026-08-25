@@ -1818,7 +1818,7 @@ def test_session_store_conformance_targeted_grant_lifecycle_survives_reopen(
             app.register_provider(provider, default=True)
             app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),
-                enable_tool_gateway=True,
+                targeted_tool_mode="call_tool",
                 tools=(_CeilingConformanceTool("remember"),),
             )
             stream = app.run(
@@ -2075,7 +2075,7 @@ def test_session_store_conformance_targeted_grant_replay_identity_is_interaction
             app.register_provider(provider, default=True)
             app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),
-                enable_tool_gateway=True,
+                targeted_tool_mode="call_tool",
                 tools=(
                     _CeilingConformanceTool("remember"),
                     _CeilingConformanceTool("recall"),
@@ -2193,7 +2193,7 @@ def test_session_store_conformance_targeted_grant_contention_is_bounded(
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
-            enable_tool_gateway=True,
+            targeted_tool_mode="call_tool",
             tools=(_CeilingConformanceTool("remember"),),
         )
         stream = app.run(
@@ -19041,12 +19041,30 @@ def test_session_store_conformance_initial_transcript_publication_clears_authori
             )
             assert await store.load_checkpoint(session.id) is not None
 
-            final = [Message.text("system", "authoritative"), *source]
+            runtime_marker = Message(
+                role=MessageRole.ASSISTANT,
+                content=(
+                    ProviderStatePart(
+                        provider="openai",
+                        state={"type": "runtime-test-marker"},
+                    ),
+                ),
+            )
+            final = [Message.text("system", "authoritative"), *source, runtime_marker]
+            with pytest.raises(ValueError, match="runtime_suffix_count"):
+                await store.replace_initial_transcript_messages(
+                    session.id,
+                    source,
+                    final,
+                    interaction_id=interaction_id,
+                    runtime_suffix_count=len(final) + 1,
+                )
             await store.replace_initial_transcript_messages(
                 session.id,
                 source,
                 final,
                 interaction_id=interaction_id,
+                runtime_suffix_count=1,
             )
 
             store = await _reopen_store(session_store_case, store)
@@ -19057,6 +19075,11 @@ def test_session_store_conformance_initial_transcript_publication_clears_authori
                 TranscriptQuery(session_id=session.id, limit=10)
             )
             assert [record.message for record in transcript.records] == final
+            assert [record.interaction_id for record in transcript.records] == [
+                None,
+                interaction_id,
+                interaction_id,
+            ]
         finally:
             await store.release_run_fence(session_id)
             await _close_store(store)

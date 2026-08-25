@@ -191,7 +191,7 @@ def build_demo(
             profile_id="targeted-only",
             tools=(),
         ),
-        enable_tool_gateway=True,
+        targeted_tool_mode="call_tool",
         tool_policy=tool_policy,
     )
     return ForkedKnowledgeDemo(

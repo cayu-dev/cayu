@@ -32,6 +32,7 @@ from cayu.runtime.tool_exposure import ToolCapabilityCeiling
 from cayu.vaults.redaction import REDACTED_SECRET
 
 TARGETED_TOOL_GRANT_SCHEMA_VERSION = 1
+TARGETED_TOOL_INVOCATION_SCHEMA_VERSION = 2
 TARGETED_TOOL_GRANT_MAX_REQUESTS = 32
 TARGETED_TOOL_GRANT_INSPECTION_MAX_RECORDS = 256
 TARGETED_TOOL_GRANT_MAX_CALLS = 32
@@ -1141,7 +1142,7 @@ class TargetedToolUseBinding(BaseModel):
         expected_use_id = _sha256_identity(
             {
                 "record_type": "cayu.targeted-tool-use",
-                "schema_version": self.schema_version,
+                "schema_version": TARGETED_TOOL_GRANT_SCHEMA_VERSION,
                 "grant_id": self.grant_id,
                 "session_id": self.session_id,
                 "interaction_id": self.interaction_id,
@@ -1158,12 +1159,12 @@ class TargetedToolUseBinding(BaseModel):
 
 
 class ResolvedTargetedToolInvocation(BaseModel):
-    """Durable dual identity for one accepted ``call_tool`` envelope.
+    """Durable dual identity for one accepted targeted-tool model call.
 
-    The provider transcript retains the outer ``call_tool`` call and identifier.
-    Policy and execution use the canonical effective target recorded here.  The
-    opaque reference is private checkpoint material required to rejoin the
-    already-bound consumption after process loss; it is never public evidence.
+    Policy and execution use the canonical effective target recorded here. Gateway
+    delivery retains an opaque reference as private checkpoint material; native
+    delivery retains only the runtime-selected grant identity. Both forms can rejoin
+    an already-bound consumption after process loss without trusting model input.
     """
 
     model_config = ConfigDict(
@@ -1173,10 +1174,10 @@ class ResolvedTargetedToolInvocation(BaseModel):
         revalidate_instances="always",
     )
 
-    schema_version: Literal[1] = TARGETED_TOOL_GRANT_SCHEMA_VERSION
-    dispatch_kind: Literal["gateway"] = "gateway"
-    model_tool_name: Literal["call_tool"] = "call_tool"
-    tool_ref: str
+    schema_version: Literal[2] = TARGETED_TOOL_INVOCATION_SCHEMA_VERSION
+    dispatch_kind: Literal["gateway", "native"] = "gateway"
+    model_tool_name: str = "call_tool"
+    tool_ref: str | None = None
     grant_id: str = Field(pattern=TARGETED_TOOL_DIGEST_PATTERN)
     use_id: str = Field(pattern=TARGETED_TOOL_DIGEST_PATTERN)
     session_id: str
@@ -1194,13 +1195,15 @@ class ResolvedTargetedToolInvocation(BaseModel):
     @field_validator("schema_version", mode="before")
     @classmethod
     def validate_schema_version(cls, value: object) -> object:
-        if type(value) is not int or value != TARGETED_TOOL_GRANT_SCHEMA_VERSION:
-            raise ValueError("Resolved targeted invocation schema_version must be 1.")
+        if type(value) is not int or value != TARGETED_TOOL_INVOCATION_SCHEMA_VERSION:
+            raise ValueError("Resolved targeted invocation schema_version must be 2.")
         return value
 
     @field_validator("tool_ref")
     @classmethod
-    def validate_tool_ref(cls, value: str) -> str:
+    def validate_tool_ref(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         return _bounded_utf8_text(
             value,
             "tool_ref",
@@ -1235,6 +1238,15 @@ class ResolvedTargetedToolInvocation(BaseModel):
             max_bytes=TARGETED_TOOL_GRANT_SCOPE_ID_MAX_BYTES,
         )
 
+    @field_validator("model_tool_name")
+    @classmethod
+    def validate_model_tool_name(cls, value: str) -> str:
+        return _bounded_utf8_text(
+            value,
+            "model_tool_name",
+            max_bytes=TARGETED_TOOL_GRANT_SCOPE_ID_MAX_BYTES,
+        )
+
     @field_validator("catalogue_revision")
     @classmethod
     def validate_catalogue_revision(cls, value: str) -> str:
@@ -1256,10 +1268,17 @@ class ResolvedTargetedToolInvocation(BaseModel):
 
     @model_validator(mode="after")
     def validate_use_id(self) -> ResolvedTargetedToolInvocation:
+        if self.dispatch_kind == "gateway":
+            if self.model_tool_name != "call_tool" or self.tool_ref is None:
+                raise ValueError("Gateway invocations require call_tool and an opaque reference.")
+        elif self.model_tool_name != self.effective_tool_name or self.tool_ref is not None:
+            raise ValueError(
+                "Native invocations require the effective model tool name and no reference."
+            )
         expected_use_id = _sha256_identity(
             {
                 "record_type": "cayu.targeted-tool-use",
-                "schema_version": self.schema_version,
+                "schema_version": TARGETED_TOOL_GRANT_SCHEMA_VERSION,
                 "grant_id": self.grant_id,
                 "session_id": self.session_id,
                 "interaction_id": self.interaction_id,
@@ -1276,7 +1295,7 @@ class ResolvedTargetedToolInvocation(BaseModel):
 
 
 class RejectedTargetedToolInvocation(BaseModel):
-    """Durable fail-closed outcome for a rejected ``call_tool`` envelope."""
+    """Durable fail-closed outcome for a rejected targeted-tool call."""
 
     model_config = ConfigDict(
         extra="forbid",
@@ -1285,18 +1304,35 @@ class RejectedTargetedToolInvocation(BaseModel):
         revalidate_instances="always",
     )
 
-    schema_version: Literal[1] = TARGETED_TOOL_GRANT_SCHEMA_VERSION
-    dispatch_kind: Literal["gateway"] = "gateway"
-    model_tool_name: Literal["call_tool"] = "call_tool"
+    schema_version: Literal[2] = TARGETED_TOOL_INVOCATION_SCHEMA_VERSION
+    dispatch_kind: Literal["gateway", "native"] = "gateway"
+    model_tool_name: str = "call_tool"
     reason: TargetedToolUseRejectionReason
     rejection_event_id: str
 
     @field_validator("schema_version", mode="before")
     @classmethod
     def validate_schema_version(cls, value: object) -> object:
-        if type(value) is not int or value != TARGETED_TOOL_GRANT_SCHEMA_VERSION:
-            raise ValueError("Rejected targeted invocation schema_version must be 1.")
+        if type(value) is not int or value != TARGETED_TOOL_INVOCATION_SCHEMA_VERSION:
+            raise ValueError("Rejected targeted invocation schema_version must be 2.")
         return value
+
+    @field_validator("model_tool_name")
+    @classmethod
+    def validate_model_tool_name(cls, value: str) -> str:
+        return _bounded_utf8_text(
+            value,
+            "model_tool_name",
+            max_bytes=TARGETED_TOOL_GRANT_SCOPE_ID_MAX_BYTES,
+        )
+
+    @model_validator(mode="after")
+    def validate_dispatch(self) -> RejectedTargetedToolInvocation:
+        if self.dispatch_kind == "gateway" and self.model_tool_name != "call_tool":
+            raise ValueError("Gateway rejections require the call_tool model identity.")
+        if self.dispatch_kind == "native" and self.model_tool_name == "call_tool":
+            raise ValueError("Native rejections require a canonical target tool identity.")
+        return self
 
     @field_validator("rejection_event_id")
     @classmethod

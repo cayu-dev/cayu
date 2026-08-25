@@ -157,7 +157,7 @@ def test_describe_returns_a_deterministic_public_application_manifest() -> None:
     manifest = _described_app().describe()
     reversed_manifest = _described_app(reverse=True).describe()
 
-    assert manifest.schema_version == "11"
+    assert manifest.schema_version == "12"
     assert manifest.defaults.provider == "primary"
     assert manifest.defaults.environment == "local"
     assert [agent.name for agent in manifest.agents] == ["reviewer", "writer"]
@@ -313,7 +313,7 @@ def test_request_footprint_config_is_safely_manifested_and_fingerprinted() -> No
         "enabled": True,
         "fingerprint_key_id": "manifest-key",
         "fingerprinting_enabled": True,
-        "footprint_schema_version": 4,
+        "footprint_schema_version": 5,
         "canonicalization_version": 1,
     }
     assert disabled.runtime.request_footprint.enabled is False
@@ -449,19 +449,19 @@ def test_manifest_reports_prompt_presence_without_exposing_prompt_content() -> N
     assert changed_prompt.describe().fingerprint == present.fingerprint
 
 
-def test_manifest_reports_and_fingerprints_tool_gateway_opt_in() -> None:
+def test_manifest_reports_and_fingerprints_targeted_tool_mode() -> None:
     disabled = CayuApp(enable_logging=False)
     disabled.register_agent(AgentSpec(name="writer", model="model"))
     enabled = CayuApp(enable_logging=False)
     enabled.register_agent(
         AgentSpec(name="writer", model="model"),
-        enable_tool_gateway=True,
+        targeted_tool_mode="call_tool",
     )
 
     disabled_manifest = disabled.describe()
     enabled_manifest = enabled.describe()
-    assert disabled_manifest.agents[0].tool_gateway_enabled is False
-    assert enabled_manifest.agents[0].tool_gateway_enabled is True
+    assert disabled_manifest.agents[0].targeted_tool_mode is None
+    assert enabled_manifest.agents[0].targeted_tool_mode == "call_tool"
     assert disabled_manifest.fingerprint != enabled_manifest.fingerprint
 
 
@@ -594,7 +594,7 @@ def test_manifest_is_public_versioned_redacted_and_deeply_read_only(tmp_path: Pa
     payload = manifest.model_dump_json()
     schema = AppManifest.model_json_schema(mode="serialization")
 
-    assert schema["properties"]["schema_version"]["const"] == "11"
+    assert schema["properties"]["schema_version"]["const"] == "12"
     assert "manifest-secret" not in payload
     assert str(tmp_path) not in payload
     assert factory.called is False
@@ -703,7 +703,7 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
     with pytest.raises(ValidationError, match="JSON-compatible"):
         AppManifest.model_validate(
             {
-                "schema_version": "11",
+                "schema_version": "12",
                 "fingerprint": "0" * 64,
                 "agents": [
                     {
@@ -769,7 +769,7 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
                         "enabled": True,
                         "fingerprint_key_id": None,
                         "fingerprinting_enabled": False,
-                        "footprint_schema_version": 4,
+                        "footprint_schema_version": 5,
                         "canonicalization_version": 1,
                     },
                     "max_file_attachment_bytes": 1,

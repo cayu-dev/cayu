@@ -34,6 +34,12 @@ from cayu import (
 from cayu.artifacts.attachments import RESOLVED_FILE_ATTACHMENTS_OPTION, file_attachment
 from cayu.core.messages import FilePart, ProviderStatePart, TextPart, ThinkingPart, ToolCallPart
 from cayu.providers.anthropic import build_anthropic_payload
+from cayu.providers.base import (
+    OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
+    TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
+    TARGETED_TOOL_PROJECTION_MARKER_TYPE,
+    TargetedToolProjectionRequest,
+)
 from cayu.providers.openai import build_openai_payload
 from cayu.runtime.request_footprints import (
     analyze_request_context_pressure,
@@ -44,6 +50,7 @@ from cayu.runtime.structured_output import (
     structured_output_tool_instruction,
     structured_output_tool_spec,
 )
+from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
 from cayu.runtime.tool_gateway import call_tool_spec
 
 _CATALOGUE_REVISION = f"sha256:{'c' * 64}"
@@ -150,13 +157,16 @@ def _build(
     )
 
 
-@pytest.mark.parametrize("invalid_version", [True, 1.0, "1", 5])
+@pytest.mark.parametrize("invalid_version", [True, 1.0, "1", 6])
 def test_request_footprint_versions_require_supported_exact_integers(
     invalid_version: object,
 ) -> None:
     footprint_payload = _build(_request()).model_dump(mode="python")
     footprint_payload["schema_version"] = invalid_version
-    with pytest.raises(ValidationError, match="schema_version must be integer 1, 2, 3, or 4"):
+    with pytest.raises(
+        ValidationError,
+        match="schema_version must be integer 1, 2, 3, 4, or 5",
+    ):
         RequestFootprint.model_validate(footprint_payload)
 
     fingerprint_payload = _build(
@@ -265,7 +275,7 @@ def test_request_footprint_v3_binds_the_prepared_tool_exposure() -> None:
         )
 
 
-def test_request_footprint_v4_adds_bounded_targeted_grants_without_tool_prefix_drift() -> None:
+def test_request_footprint_v5_adds_bounded_targeted_grants_without_tool_prefix_drift() -> None:
     execution_profile_fingerprint = "a" * 64
     exposure = ToolExposure(
         execution_profile_fingerprint=execution_profile_fingerprint,
@@ -282,6 +292,7 @@ def test_request_footprint_v4_adds_bounded_targeted_grants_without_tool_prefix_d
         model_step_id="mstep_00000000000000000000000000000001",
     )
     targeted = TargetedToolGrantFootprint(
+        projection="call_tool",
         generation_id=f"sha256:{'d' * 64}",
         catalogue_revision=_CATALOGUE_REVISION,
         grant_count=1,
@@ -312,21 +323,154 @@ def test_request_footprint_v4_adds_bounded_targeted_grants_without_tool_prefix_d
         targeted_tool_grants=targeted,
     )
 
-    assert footprint.schema_version == 4
+    assert footprint.schema_version == 5
     assert footprint.targeted_tool_grants == targeted
     assert footprint.targeted_tool_grants.direct_tool_prefix_changed is False
     assert request.model_dump(mode="python")["tools"] == direct_tools
 
     invalid = footprint.model_dump(mode="python")
     invalid["targeted_tool_grants"] = None
-    with pytest.raises(ValidationError, match="schema v4 requires"):
+    with pytest.raises(ValidationError, match="schema v5 requires"):
         RequestFootprint.model_validate(invalid)
+
+
+def test_native_targeted_item_keeps_the_direct_tool_cache_prefix_stable() -> None:
+    execution_profile_fingerprint = "a" * 64
+    marker_id = f"sha256:{'1' * 64}"
+    exposure = ToolExposure(
+        execution_profile_fingerprint=execution_profile_fingerprint,
+        profile_id="review",
+        catalogue_revision=_CATALOGUE_REVISION,
+        exposure_fingerprint="b" * 64,
+        registered_count=2,
+        ceiling_count=2,
+        exposed_count=1,
+        profile_changed=False,
+        step=1,
+        provider_name="provider-a",
+        model="model-a",
+        model_step_id="mstep_00000000000000000000000000000001",
+    )
+    targeted = TargetedToolGrantFootprint(
+        projection="openai_additional_tools",
+        native_marker_id=marker_id,
+        generation_id=f"sha256:{'d' * 64}",
+        catalogue_revision=_CATALOGUE_REVISION,
+        grant_count=1,
+        grant_ids=(f"sha256:{'e' * 64}",),
+        tool_ids=("cayu:remember",),
+        max_calls=1,
+        used_calls=0,
+        remaining_calls=1,
+    )
+    base_request = _request()
+    baseline_request = base_request.model_copy(
+        update={
+            "tools": [*base_request.model_dump(mode="python")["tools"], call_tool_spec()],
+            "options": {
+                **base_request.model_dump(mode="python")["options"],
+                TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION: CALL_TOOL_NAME,
+            },
+        },
+        deep=True,
+    )
+    native_request = baseline_request.model_copy(
+        update={
+            "messages": [
+                *baseline_request.messages,
+                Message(
+                    role="assistant",
+                    content=(
+                        ProviderStatePart(
+                            provider="openai",
+                            state={
+                                "type": TARGETED_TOOL_PROJECTION_MARKER_TYPE,
+                                "protocol": OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
+                                "marker_id": marker_id,
+                            },
+                        ),
+                    ),
+                ),
+            ],
+            "targeted_tool_projection": TargetedToolProjectionRequest(
+                marker_id=marker_id,
+                tools=(
+                    {
+                        "name": "remember",
+                        "description": "Native-only schema material",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"fact": {"type": "string"}},
+                        },
+                    },
+                ),
+            ),
+        },
+        deep=True,
+    )
+    config = RequestFootprintConfig(
+        fingerprint_key_id="native-cache-prefix-key",
+        fingerprint_key=SecretStr("z" * 32),
+    )
+
+    baseline = _build(baseline_request, config=config)
+    native = build_request_footprint(
+        native_request,
+        provider_name="provider-a",
+        step=1,
+        attempt=1,
+        max_attempts=1,
+        request_variant=RequestVariant.INITIAL,
+        observation_id="native-targeted-cache-prefix",
+        model_step_id=exposure.model_step_id,
+        model_attempt_id="matt_00000000000000000000000000000001",
+        execution_profile_fingerprint=execution_profile_fingerprint,
+        tool_exposure=exposure,
+        targeted_tool_grants=targeted,
+        config=config,
+        context_pressure_profile=ModelContextPressureProfile(),
+        cache_policy=CachePolicy(
+            breakpoints=(
+                CacheBreakpoint.SYSTEM_PROMPT,
+                CacheBreakpoint.TOOL_DEFINITIONS,
+                CacheBreakpoint.CONVERSATION_PREFIX,
+            ),
+            conversation_prefix_strategy="all_but_last",
+            ttl="extended",
+        ),
+    )
+
+    baseline_breakpoints = {
+        item.kind: item.fingerprint.value for item in baseline.cache_breakpoints
+    }
+    native_breakpoints = {item.kind: item.fingerprint.value for item in native.cache_breakpoints}
+    assert native.schema_version == 5
+    assert native.targeted_native_item_active is True
+    assert native.targeted_native_item_message_index == 3
+    assert (
+        native_breakpoints[CacheBreakpoint.SYSTEM_PROMPT]
+        == baseline_breakpoints[CacheBreakpoint.SYSTEM_PROMPT]
+    )
+    assert (
+        native_breakpoints[CacheBreakpoint.TOOL_DEFINITIONS]
+        == baseline_breakpoints[CacheBreakpoint.TOOL_DEFINITIONS]
+    )
+    assert native.fingerprints.tool_manifest.value != baseline.fingerprints.tool_manifest.value
+    assert "Native-only schema material" not in json.dumps(
+        native.model_dump(mode="json"),
+        sort_keys=True,
+    )
+    missing_native_item = native.model_dump(mode="python")
+    missing_native_item["targeted_native_item_active"] = False
+    missing_native_item["targeted_native_item_message_index"] = None
+    with pytest.raises(ValidationError, match="must match its resolved projection"):
+        RequestFootprint.model_validate(missing_native_item)
 
 
 @pytest.mark.parametrize(
     ("updates", "message"),
     [
-        ({"schema_version": True}, "schema_version must be the integer 1"),
+        ({"schema_version": True}, "schema_version must be the integer 2"),
         ({"direct_tool_prefix_changed": 0}, "cannot change the direct provider tool prefix"),
         ({"grant_ids": ("e" * 64,)}, "grant_ids must be SHA-256 identities"),
         ({"tool_ids": ("remember",)}, "canonical Cayu or MCP tool identity"),
@@ -337,6 +481,7 @@ def test_targeted_grant_footprint_rejects_coerced_or_noncanonical_identity(
     message: str,
 ) -> None:
     values: dict[str, object] = {
+        "projection": "call_tool",
         "generation_id": f"sha256:{'d' * 64}",
         "catalogue_revision": _CATALOGUE_REVISION,
         "grant_count": 1,
@@ -355,6 +500,7 @@ def test_targeted_grant_footprint_rejects_coerced_or_noncanonical_identity(
 def test_targeted_grant_footprint_rejects_unbounded_iterators_before_consuming() -> None:
     with pytest.raises(TypeError, match="grant_ids must be a sequence"):
         TargetedToolGrantFootprint(
+            projection="call_tool",
             generation_id=f"sha256:{'d' * 64}",
             catalogue_revision=_CATALOGUE_REVISION,
             grant_count=1,

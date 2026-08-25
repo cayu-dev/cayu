@@ -679,6 +679,7 @@ from cayu.runtime.structured_output import (
     StructuredOutputStrategy,
     StructuredOutputValidation,
 )
+from cayu.runtime.targeted_tool_projection import TargetedToolMode
 from cayu.runtime.task_worker import TaskHandlerOutcome, run_task_worker
 from cayu.runtime.tasks import (
     CompletionDecisionApplicationReceipt,
@@ -1475,6 +1476,7 @@ __all__ = [
     "TargetedToolGrantReconstructionResult",
     "TargetedToolGrantRecord",
     "TargetedToolGrantStateSnapshot",
+    "TargetedToolMode",
     "TargetedToolUseBinding",
     "TargetedToolUseDisposition",
     "TargetedToolUseRejectionReason",

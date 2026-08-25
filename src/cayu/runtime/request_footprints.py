@@ -38,10 +38,12 @@ from cayu.artifacts.attachments import (
 )
 from cayu.core.messages import FilePart, Message, MessageRole, ToolCallPart, ToolResultPart
 from cayu.providers.base import (
+    TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
     ModelContextPressureProfile,
     ModelProvider,
     ModelRequest,
     copy_model_context_pressure_profile,
+    targeted_tool_native_cache_anchor_name,
 )
 from cayu.providers.cache import CacheBreakpoint, CachePolicy, RequestCacheProjection
 from cayu.runtime.context import (
@@ -50,6 +52,11 @@ from cayu.runtime.context import (
     estimate_model_request_context_pressure,
 )
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
+from cayu.runtime.targeted_tool_projection import (
+    TargetedToolProjectionKind,
+    persisted_targeted_tool_projection_marker_id,
+    targeted_tool_projection_marker_id,
+)
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME, validate_canonical_tool_id
 from cayu.runtime.tool_exposure import (
     TOOL_EXPOSURE_MAX_REGISTERED_TOOLS,
@@ -64,7 +71,7 @@ from cayu.runtime.tool_grants import (
     copy_targeted_tool_grant_record,
 )
 
-REQUEST_FOOTPRINT_SCHEMA_VERSION = 4
+REQUEST_FOOTPRINT_SCHEMA_VERSION = 5
 PROMPT_CONTRIBUTION_MANIFEST_SCHEMA_VERSION = 1
 REQUEST_FOOTPRINT_CANONICALIZATION_VERSION = 1
 _HMAC_CONTEXT = b"cayu.request-footprint"
@@ -76,6 +83,7 @@ _RUNTIME_ONLY_OPTION_KEYS = frozenset(
         "environment_metadata",
         "step",
         "structured_output",
+        TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
         "thinking",
         RESOLVED_FILE_ATTACHMENTS_OPTION,
     }
@@ -459,7 +467,12 @@ class TargetedToolGrantFootprint(BaseModel):
         revalidate_instances="always",
     )
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
+    projection: TargetedToolProjectionKind
+    native_marker_id: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+    )
     generation_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     catalogue_revision: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     grant_count: StrictInt = Field(ge=1, le=TARGETED_TOOL_GRANT_MAX_REQUESTS)
@@ -482,9 +495,21 @@ class TargetedToolGrantFootprint(BaseModel):
     @field_validator("schema_version", mode="before")
     @classmethod
     def validate_schema_version(cls, value: object) -> object:
-        if type(value) is not int or value != 1:
-            raise ValueError("Targeted grant footprint schema_version must be the integer 1.")
+        if type(value) is not int or value != 2:
+            raise ValueError("Targeted grant footprint schema_version must be the integer 2.")
         return value
+
+    @field_validator("projection", mode="before")
+    @classmethod
+    def validate_projection(cls, value: object) -> TargetedToolProjectionKind:
+        if type(value) is TargetedToolProjectionKind:
+            return value
+        if type(value) is not str:
+            raise TypeError("Targeted grant footprint projection must be a string.")
+        try:
+            return TargetedToolProjectionKind(value)
+        except ValueError:
+            raise ValueError("Targeted grant footprint projection is unsupported.") from None
 
     @field_validator("direct_tool_prefix_changed", mode="before")
     @classmethod
@@ -544,11 +569,18 @@ class TargetedToolGrantFootprint(BaseModel):
             raise ValueError("Targeted grant footprint identities must be unique and canonical.")
         if self.used_calls + self.remaining_calls != self.max_calls:
             raise ValueError("Targeted grant footprint call totals are inconsistent.")
+        if self.projection is TargetedToolProjectionKind.CALL_TOOL:
+            if self.native_marker_id is not None:
+                raise ValueError("The call_tool projection cannot carry a native marker.")
+        elif self.native_marker_id is None:
+            raise ValueError("The OpenAI additional_tools projection requires a marker.")
         return self
 
 
 def targeted_tool_grant_footprint(
     records: tuple[TargetedToolGrantRecord, ...],
+    *,
+    projection: TargetedToolProjectionKind | None,
 ) -> TargetedToolGrantFootprint | None:
     """Build one stable footprint without projecting refs, schemas, or policy state."""
 
@@ -556,6 +588,8 @@ def targeted_tool_grant_footprint(
         raise TypeError("records must be a tuple of TargetedToolGrantRecord values.")
     if not records:
         return None
+    if type(projection) is not TargetedToolProjectionKind:
+        raise ValueError("Targeted grants require a resolved projection.")
     if len(records) > TARGETED_TOOL_GRANT_MAX_REQUESTS:
         raise ValueError("A request footprint cannot contain an unbounded targeted grant set.")
     copied = tuple(copy_targeted_tool_grant_record(record) for record in records)
@@ -565,6 +599,12 @@ def targeted_tool_grant_footprint(
     if len(generation_ids) != 1 or len(catalogue_revisions) != 1 or len(interaction_ids) != 1:
         raise ValueError("Targeted grant footprint records must share one request authority.")
     return TargetedToolGrantFootprint(
+        projection=projection,
+        native_marker_id=(
+            persisted_targeted_tool_projection_marker_id(copied)
+            if projection is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS
+            else None
+        ),
         generation_id=next(iter(generation_ids)),
         catalogue_revision=next(iter(catalogue_revisions)),
         grant_count=len(copied),
@@ -581,10 +621,12 @@ class RequestFootprint(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
-    schema_version: Literal[1, 2, 3, 4]
+    schema_version: Literal[1, 2, 3, 4, 5]
     execution_profile_fingerprint: str | None = None
     tool_exposure: ToolExposureFootprint | None = None
     targeted_tool_grants: TargetedToolGrantFootprint | None = None
+    targeted_native_item_active: StrictBool | None = None
+    targeted_native_item_message_index: StrictInt | None = Field(default=None, ge=0)
     observation_id: str
     provider_name: str
     model: str
@@ -611,8 +653,14 @@ class RequestFootprint(BaseModel):
     @field_validator("schema_version", mode="before")
     @classmethod
     def validate_schema_version(cls, value: object) -> object:
-        if type(value) is not int or value not in (1, 2, 3, REQUEST_FOOTPRINT_SCHEMA_VERSION):
-            raise ValueError("Request footprint schema_version must be integer 1, 2, 3, or 4.")
+        if type(value) is not int or value not in (
+            1,
+            2,
+            3,
+            4,
+            REQUEST_FOOTPRINT_SCHEMA_VERSION,
+        ):
+            raise ValueError("Request footprint schema_version must be integer 1, 2, 3, 4, or 5.")
         return value
 
     @field_validator("execution_profile_fingerprint")
@@ -685,6 +733,30 @@ class RequestFootprint(BaseModel):
             raise ValueError(
                 "Request footprint schema v4 requires tool exposure and targeted grants."
             )
+        if self.schema_version < 5 and (
+            self.targeted_native_item_active is not None
+            or self.targeted_native_item_message_index is not None
+        ):
+            raise ValueError("Request footprint schema v1-v4 cannot carry native item evidence.")
+        if self.schema_version == 5:
+            if self.tool_exposure is None or self.targeted_tool_grants is None:
+                raise ValueError(
+                    "Request footprint schema v5 requires tool exposure and targeted grants."
+                )
+            if self.targeted_native_item_active is None:
+                raise ValueError("Request footprint schema v5 requires native item state.")
+            is_native = (
+                self.targeted_tool_grants.projection
+                is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS
+            )
+            if self.targeted_native_item_active != is_native:
+                raise ValueError(
+                    "Request footprint native item state must match its resolved projection."
+                )
+            if (self.targeted_native_item_message_index is not None) != (
+                self.targeted_native_item_active
+            ):
+                raise ValueError("An active native item requires exactly one insertion position.")
         if self.attempt > self.max_attempts:
             raise ValueError("attempt cannot exceed max_attempts.")
         if (self.operation_id is None) != (self.attempt_id is None):
@@ -923,6 +995,30 @@ def build_request_footprint(
         if tool_exposure is None:
             raise ValueError("targeted_tool_grants requires tool_exposure evidence.")
 
+    targeted_native_item_active: bool | None = None
+    targeted_native_item_message_index: int | None = None
+    if targeted_tool_grants is not None:
+        targeted_native_item_active = model_request.targeted_tool_projection is not None
+        if targeted_tool_grants.projection is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS:
+            projection = model_request.targeted_tool_projection
+            if projection is not None:
+                if projection.marker_id != targeted_tool_grants.native_marker_id:
+                    raise ValueError(
+                        "Native targeted projection conflicts with its grant footprint marker."
+                    )
+                marker_indices = [
+                    index
+                    for index, message in enumerate(model_request.messages)
+                    if targeted_tool_projection_marker_id(message) == projection.marker_id
+                ]
+                if len(marker_indices) != 1:
+                    raise ValueError(
+                        "An active native targeted projection requires one exact marker."
+                    )
+                targeted_native_item_message_index = marker_indices[0]
+        elif model_request.targeted_tool_projection is not None:
+            raise ValueError("The call_tool footprint cannot carry a native projection.")
+
     resolved_attachments = resolved_file_attachments_from_options(model_request.options)
     attachment_occurrences = _attachment_occurrences(
         model_request.messages,
@@ -970,8 +1066,13 @@ def build_request_footprint(
         size=_request_size(message_payloads),
     )
     tool_manifest, hosted_tool_payloads = _request_tool_manifest(model_request)
+    projected_tool_count = (
+        0
+        if model_request.targeted_tool_projection is None
+        else len(model_request.targeted_tool_projection.tools)
+    )
     tools = RequestComponentFootprint(
-        count=len(model_request.tools) + len(hosted_tool_payloads),
+        count=len(model_request.tools) + len(hosted_tool_payloads) + projected_tool_count,
         size=_request_size(tool_manifest),
     )
     attachments = _attachment_footprint(attachment_occurrences)
@@ -1014,8 +1115,28 @@ def build_request_footprint(
         raise ValueError("ModelRequest.tools cannot contain duplicate call_tool definitions.")
     if tool_gateway_tools and tool_gateway_tools[0] != call_tool_spec():
         raise ValueError("ModelRequest.tools contains a non-canonical call_tool definition.")
-    if targeted_tool_grants is not None and not tool_gateway_tools:
-        raise ValueError("targeted_tool_grants requires the canonical call_tool definition.")
+    native_cache_anchor = targeted_tool_native_cache_anchor_name(model_request.options)
+    if native_cache_anchor is not None:
+        if native_cache_anchor != CALL_TOOL_NAME:
+            raise ValueError("The native targeted-tool cache anchor is not canonical.")
+        if not tool_gateway_tools:
+            raise ValueError("The native targeted-tool cache anchor definition is missing.")
+    if targeted_tool_grants is not None:
+        if (
+            targeted_tool_grants.projection is TargetedToolProjectionKind.CALL_TOOL
+            and not tool_gateway_tools
+        ):
+            raise ValueError("The call_tool targeted projection requires its canonical definition.")
+        if (
+            targeted_tool_grants.projection is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS
+            and native_cache_anchor is None
+        ):
+            raise ValueError("A native targeted projection requires its stable cache anchor.")
+        if (
+            targeted_tool_grants.projection is TargetedToolProjectionKind.CALL_TOOL
+            and native_cache_anchor is not None
+        ):
+            raise ValueError("The call_tool projection cannot use a native cache anchor.")
     if tool_exposure is not None and (
         len(model_request.tools) - len(structured_output_tools) - len(tool_gateway_tools)
         != tool_exposure.exposed_count
@@ -1050,6 +1171,10 @@ def build_request_footprint(
         "tools": model_request.tools,
         "options": measured_options,
     }
+    if model_request.targeted_tool_projection is not None:
+        measured_request_shape["targeted_tool_projection"] = (
+            model_request.targeted_tool_projection.model_dump(mode="json")
+        )
     if hosted_tool_payloads:
         measured_request_shape["hosted_tools"] = hosted_tool_payloads
     fingerprint_request_shape = {
@@ -1121,7 +1246,9 @@ def build_request_footprint(
             config=resolved_config,
             unavailable_reason=(
                 "tools_not_present"
-                if not model_request.tools and not hosted_tool_payloads
+                if not model_request.tools
+                and not hosted_tool_payloads
+                and model_request.targeted_tool_projection is None
                 else None
             ),
         ),
@@ -1158,6 +1285,8 @@ def build_request_footprint(
             )
         ),
         targeted_tool_grants=targeted_tool_grants,
+        targeted_native_item_active=targeted_native_item_active,
+        targeted_native_item_message_index=targeted_native_item_message_index,
         observation_id=observation_id,
         provider_name=provider_name,
         model=model_request.model,
@@ -1538,6 +1667,7 @@ def _estimate_projected_context_pressure(
         messages=messages,
         tools=model_request.tools,
         hosted_tools=model_request.hosted_tools,
+        targeted_tool_projection=model_request.targeted_tool_projection,
         options=measured_options,
     )
     pressure = estimate_model_request_context_pressure(
@@ -1766,14 +1896,25 @@ def _conversation_prefix_payload(
     return messages[:retained]
 
 
-def _request_tool_manifest(model_request: ModelRequest) -> tuple[Any, list[dict[str, Any]]]:
+def _request_tool_manifest(
+    model_request: ModelRequest,
+    *,
+    include_targeted_projection: bool = True,
+) -> tuple[Any, list[dict[str, Any]]]:
     hosted_tools = [tool.model_dump(mode="json") for tool in model_request.hosted_tools]
-    if not hosted_tools:
+    targeted_projection = (
+        model_request.targeted_tool_projection if include_targeted_projection else None
+    )
+    if not hosted_tools and targeted_projection is None:
         return model_request.tools, hosted_tools
-    return {
+    manifest: dict[str, Any] = {
         "function_tools": model_request.tools,
-        "hosted_tools": hosted_tools,
-    }, hosted_tools
+    }
+    if hosted_tools:
+        manifest["hosted_tools"] = hosted_tools
+    if targeted_projection is not None:
+        manifest["targeted_tool_projection"] = targeted_projection.model_dump(mode="json")
+    return manifest, hosted_tools
 
 
 def _cache_breakpoint_footprints(
@@ -1788,7 +1929,10 @@ def _cache_breakpoint_footprints(
         return ()
     breakpoints = tuple(sorted(set(cache_policy.breakpoints), key=lambda item: item.value))
     ttl = "extended" if cache_policy.ttl == "extended" else "standard"
-    tool_manifest, hosted_tool_payloads = _request_tool_manifest(model_request)
+    tool_manifest, hosted_tool_payloads = _request_tool_manifest(
+        model_request,
+        include_targeted_projection=False,
+    )
     payloads: dict[CacheBreakpoint, tuple[Any, str | None]] = {
         CacheBreakpoint.SYSTEM_PROMPT: (
             {"system": system_payloads, "ttl": ttl},

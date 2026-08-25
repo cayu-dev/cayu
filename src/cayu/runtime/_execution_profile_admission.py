@@ -31,6 +31,10 @@ from cayu.runtime.execution_profiles import (
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import Session
 from cayu.runtime.stop_policy import RunLimits
+from cayu.runtime.targeted_tool_projection import (
+    TargetedToolProjectionKind,
+    resolve_targeted_tool_projection,
+)
 from cayu.runtime.tool_gateway import call_tool_gateway_execution_profile_material
 from cayu.runtime.user_input import pending_user_input_from_checkpoint
 from cayu.vaults import SecretRedactor
@@ -499,6 +503,39 @@ def resolve_execution_profile_identity(
             process_identity=process_identity,
             slot="thinking",
         )
+    targeted_tool_projection = (
+        None
+        if registered_agent.targeted_tool_mode is None or registered_provider is None
+        else resolve_targeted_tool_projection(
+            registered_agent.targeted_tool_mode,
+            provider=registered_provider.provider,
+            model=model,
+        )
+    )
+    targeted_tool_delivery_material = (
+        None
+        if registered_agent.targeted_tool_mode is None
+        else {
+            "kind": "cayu:targeted-tool-delivery",
+            "schema_version": 2,
+            "configured_mode": registered_agent.targeted_tool_mode.value,
+            "resolved_projection": (
+                None if targeted_tool_projection is None else targeted_tool_projection.value
+            ),
+            **(
+                {
+                    "call_tool_core": {
+                        **call_tool_gateway_execution_profile_material(),
+                        "callable": (
+                            targeted_tool_projection is TargetedToolProjectionKind.CALL_TOOL
+                        ),
+                    }
+                }
+                if targeted_tool_projection is not None
+                else {}
+            ),
+        }
+    )
     return build_execution_profile_identity(
         runtime_name=runtime_name,
         runtime_version=runtime_version,
@@ -520,11 +557,9 @@ def resolve_execution_profile_identity(
             "command_policies": command_policy_material,
             "loop_policies": loop_policy_material,
             **(
-                {
-                    "tool_gateway": call_tool_gateway_execution_profile_material(),
-                }
-                if registered_agent.tool_gateway_enabled
-                else {}
+                {}
+                if targeted_tool_delivery_material is None
+                else {"targeted_tool_delivery": targeted_tool_delivery_material}
             ),
             **(
                 {}
@@ -1629,11 +1664,12 @@ def _cayu_provider_material(provider: object) -> dict[str, Any] | None:
             return None
         return {
             "adapter": "openai-responses",
-            "version": 2,
+            "version": 3,
             "base_url": provider.base_url,
             "default_route": provider.base_url == DEFAULT_OPENAI_BASE_URL,
             "reasoning_state": provider.reasoning_state,
             "background": provider.background,
+            "additional_tools_models": sorted(provider.additional_tools_models),
             "timeout_s": provider.timeout_s,
             "stream_idle_timeout_s": provider.stream_idle_timeout_s,
         }

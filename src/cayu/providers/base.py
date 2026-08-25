@@ -4,7 +4,7 @@ import math
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable, Mapping
 from enum import StrEnum
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -80,9 +80,25 @@ _DEFAULT_FINGERPRINT_RUNTIME_OPTION_KEYS = frozenset(
         "environment_metadata",
         "step",
         "structured_output",
+        "targeted_tool_native_cache_anchor",
         "thinking",
     }
 )
+
+OPENAI_ADDITIONAL_TOOLS_PROTOCOL = "openai.additional_tools.v1"
+TARGETED_TOOL_PROJECTION_MARKER_TYPE = "cayu.targeted-tool-projection-marker"
+TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION = "targeted_tool_native_cache_anchor"
+
+
+def targeted_tool_native_cache_anchor_name(options: Mapping[str, Any]) -> str | None:
+    """Return the runtime-owned stable tool name anchoring a native cache namespace."""
+
+    value = options.get(TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION)
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise ValueError("The targeted-tool native cache anchor must be a string.")
+    return require_durable_clean_nonblank(value, TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION)
 
 
 def privacy_safe_provider_option_projection(value: object) -> dict[str, Any]:
@@ -521,6 +537,52 @@ class ModelCompletion(BaseModel):
         raise ValueError("`end_turn` must be a boolean or null.")
 
 
+class TargetedToolProjectionRequest(BaseModel):
+    """Ephemeral provider projection anchored by one durable transcript marker."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    protocol: Literal["openai.additional_tools.v1"] = OPENAI_ADDITIONAL_TOOLS_PROTOCOL
+    marker_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    tools: tuple[dict[str, Any], ...] = Field(min_length=1, max_length=32)
+
+    @field_validator("tools", mode="before")
+    @classmethod
+    def copy_tools(cls, value: object) -> tuple[dict[str, Any], ...]:
+        if not isinstance(value, (list, tuple)):
+            raise TypeError("Targeted projection tools must be a sequence.")
+        copied = copy_durable_json_value(list(value), "targeted projection tools")
+        if type(copied) is not list or any(type(tool) is not dict for tool in copied):
+            raise TypeError("Targeted projection tools must contain objects.")
+        return tuple(copied)
+
+    @model_validator(mode="after")
+    def validate_tools(self) -> TargetedToolProjectionRequest:
+        if not self.tools:
+            raise ValueError("A targeted tool projection must contain at least one tool.")
+        names: list[str] = []
+        for tool in self.tools:
+            if set(tool) != {"name", "description", "input_schema"}:
+                raise ValueError("Targeted projection tools must use the canonical tool shape.")
+            name = tool.get("name")
+            description = tool.get("description")
+            input_schema = tool.get("input_schema")
+            if type(name) is not str or type(description) is not str:
+                raise ValueError("Targeted projection tool text fields must be strings.")
+            require_clean_nonblank(name, "targeted projection tool name")
+            if type(input_schema) is not dict:
+                raise ValueError("Targeted projection tool input_schema must be an object.")
+            names.append(name)
+        if len(names) != len(set(names)) or names != sorted(names):
+            raise ValueError("Targeted projection tools must have unique canonical names.")
+        return self
+
+
 class ModelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
@@ -528,7 +590,20 @@ class ModelRequest(BaseModel):
     messages: list[Message]
     tools: list[dict[str, Any]] = Field(default_factory=list)
     hosted_tools: tuple[OpenAIWebSearch, ...] = ()
+    targeted_tool_projection: TargetedToolProjectionRequest | None = None
     options: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("targeted_tool_projection", mode="before")
+    @classmethod
+    def copy_targeted_tool_projection(
+        cls,
+        value: object,
+    ) -> TargetedToolProjectionRequest | None:
+        if value is None:
+            return None
+        if isinstance(value, TargetedToolProjectionRequest):
+            value = value.model_dump(mode="python")
+        return TargetedToolProjectionRequest.model_validate(value)
 
     @field_validator("messages")
     @classmethod
@@ -1096,6 +1171,27 @@ class ModelProvider(ABC):
         if hosted_tools:
             raise HostedToolCapabilityError(
                 f"Provider-hosted web search is not supported by provider {self.name!r}."
+            )
+
+    def supports_targeted_tool_projection(self, *, model: str, protocol: str) -> bool:
+        """Report an explicitly established provider/model projection capability.
+
+        The conservative default is unsupported. Implementations must not infer
+        support from a model-name pattern because provider aliases and compatible
+        endpoints can expose different wire contracts under the same model name.
+        """
+
+        require_clean_nonblank(model, "model")
+        require_clean_nonblank(protocol, "protocol")
+        return False
+
+    def preflight_targeted_tool_projection(self, *, model: str, protocol: str) -> None:
+        """Reject targeted-tool authority that this provider cannot project."""
+
+        if not self.supports_targeted_tool_projection(model=model, protocol=protocol):
+            raise ValueError(
+                f"Targeted-tool projection {protocol!r} is not established for "
+                f"provider {self.name!r} and model {model!r}."
             )
 
     async def billing_identity_for_request(

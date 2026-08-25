@@ -299,6 +299,7 @@ from cayu.runtime.sessions import (
     _event_input_contract_is_runtime_owned,
     _execution_profile_rejection_events_equivalent,
     _initial_transcript_pending_checkpoint,
+    _initial_transcript_prefix_count,
     _interaction_transition_receipt_record,
     _interaction_transition_spec_from_receipt,
     _interaction_transition_storage_key,
@@ -24291,6 +24292,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         *,
         interaction_id: InteractionAttribution = INHERIT_INTERACTION,
         checkpoint_transform: CheckpointTransform | None = None,
+        runtime_suffix_count: int = 0,
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         interaction_id = resolve_interaction_attribution(session_id, interaction_id)
@@ -24329,13 +24331,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     )
                     if await cur.fetchone() is not None:
                         raise RuntimeError("Initial transcript changed before finalization.")
-                    if len(replacement) < len(expected) or (
-                        expected and replacement[-len(expected) :] != expected
-                    ):
-                        raise RuntimeError(
-                            "Initial transcript must preserve the admitted source suffix."
-                        )
-                    prefix_count = len(replacement) - len(expected)
+                    prefix_count = _initial_transcript_prefix_count(
+                        expected,
+                        replacement,
+                        runtime_suffix_count=runtime_suffix_count,
+                    )
                     current_checkpoint = await self._load_checkpoint(cur, session_id)
                     if checkpoint_transform is not None:
                         transformed = checkpoint_transform(

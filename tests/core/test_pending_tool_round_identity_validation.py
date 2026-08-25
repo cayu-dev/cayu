@@ -230,6 +230,38 @@ def test_pending_gateway_round_retains_its_interaction_authority() -> None:
 
 
 @pytest.mark.parametrize(
+    ("tool_name", "interaction_id"),
+    (
+        (CALL_TOOL_NAME, None),
+        ("ask_user", "interaction_1"),
+    ),
+)
+def test_pending_user_input_pairs_targeted_calls_with_interaction_authority(
+    tool_name: str,
+    interaction_id: str | None,
+) -> None:
+    arguments = {"question": "Continue?"}
+    with pytest.raises(ValidationError, match="must be present together"):
+        PendingUserInput(
+            input_id="input_1",
+            **_identity(),
+            tool_call_id="call_1",
+            tool_name=tool_name,
+            question="Continue?",
+            arguments=arguments,
+            agent_name="assistant",
+            interaction_id=interaction_id,
+            tool_calls=[
+                _authoritative_call(
+                    tool_call_id="call_1",
+                    tool_name=tool_name,
+                    arguments=arguments,
+                )
+            ],
+        )
+
+
+@pytest.mark.parametrize(
     "build",
     (
         lambda: PendingToolApproval(

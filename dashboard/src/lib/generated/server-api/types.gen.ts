@@ -68,9 +68,9 @@ export type AgentManifest = {
      */
     runtime_hooks?: Array<string>;
     /**
-     * Tool Gateway Enabled
+     * Targeted Tool Mode
      */
-    tool_gateway_enabled?: boolean;
+    targeted_tool_mode?: 'call_tool' | 'openai_additional_tools' | 'openai_additional_tools_or_call_tool' | null;
     /**
      * Tool Policy
      */
@@ -2108,7 +2108,7 @@ export type AppManifest = {
     /**
      * Schema Version
      */
-    schema_version?: '11';
+    schema_version?: '12';
     stores: StoreManifest;
 };
 

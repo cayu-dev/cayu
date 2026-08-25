@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime.app import CayuApp
 
-APP_MANIFEST_SCHEMA_VERSION = "11"
+APP_MANIFEST_SCHEMA_VERSION = "12"
 _ABSOLUTE_PATH_PLACEHOLDER = "[ABSOLUTE_PATH]"
 _MEMORY_ADDRESS_PLACEHOLDER = "[MEMORY_ADDRESS]"
 _OBJECT_REPRESENTATION_PLACEHOLDER = "[OBJECT_REPRESENTATION]"
@@ -193,7 +193,14 @@ class AgentManifest(_ManifestModel):
     execution_requirements: ExecutionRequirements
     tools: tuple[ToolManifest, ...] = ()
     hosted_tools: tuple[HostedToolManifest, ...] = ()
-    tool_gateway_enabled: bool = False
+    targeted_tool_mode: (
+        Literal[
+            "call_tool",
+            "openai_additional_tools",
+            "openai_additional_tools_or_call_tool",
+        ]
+        | None
+    ) = None
     tool_policy: str
     context_policy: str
     context_overflow_policy: str | None
@@ -282,7 +289,7 @@ class RuntimeManifest(_ManifestModel):
 
 
 class AppManifest(_ManifestModel):
-    schema_version: Literal["11"] = APP_MANIFEST_SCHEMA_VERSION
+    schema_version: Literal["12"] = APP_MANIFEST_SCHEMA_VERSION
     fingerprint: str
     agents: tuple[AgentManifest, ...]
     providers: tuple[ProviderManifest, ...]
@@ -523,7 +530,11 @@ def _describe_agent(
             HostedToolManifest.model_validate(tool.model_dump(mode="python"))
             for tool in registration.hosted_tools
         ),
-        tool_gateway_enabled=registration.tool_gateway_enabled,
+        targeted_tool_mode=(
+            None
+            if registration.targeted_tool_mode is None
+            else registration.targeted_tool_mode.value
+        ),
         tool_policy=_type_name(registration.tool_policy),
         context_policy=_type_name(registration.context_policy),
         context_overflow_policy=_optional_type_name(registration.context_overflow_policy),

@@ -155,13 +155,17 @@ class PendingToolRound(BaseModel):
             self.budget_limits,
         ):
             raise ValueError("run_limit_accounting requires active run-scoped authority.")
-        has_gateway_call = any(
-            call.tool_name == CALL_TOOL_NAME or call.model_tool_name == CALL_TOOL_NAME
+        has_targeted_call = any(
+            call.tool_name == CALL_TOOL_NAME
+            or call.targeted_tool_grant_id is not None
+            or call.targeted_tool_invocation is not None
+            or call.targeted_tool_rejection is not None
             for call in self.tool_calls
         )
-        if has_gateway_call != (self.interaction_id is not None):
+        if has_targeted_call != (self.interaction_id is not None):
             raise ValueError(
-                "Pending gateway calls and interaction identity authority must be present together."
+                "Pending targeted calls and interaction identity authority must be present "
+                "together."
             )
         return self
 

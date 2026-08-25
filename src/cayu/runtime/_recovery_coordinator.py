@@ -5087,6 +5087,14 @@ class RecoveryCoordinator:
                         raise RuntimeError(
                             "Pending user-input call has no authoritative policy decision."
                         )
+                    for rejoined_event in await self._tool_round_executor.rejoin_targeted_tool_call(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        tool_call=tool_call,
+                        task_id=pending.task_id,
+                    ):
+                        yield rejoined_event
                     idempotency_key = tool_execution.tool_idempotency_key(
                         session_id=session.id,
                         tool_round_id=tool_round_identity.tool_round_id,

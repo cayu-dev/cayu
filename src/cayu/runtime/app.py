@@ -365,6 +365,12 @@ from cayu.runtime.structured_output import (
     StructuredOutputSpec,
     StructuredOutputStrategy,
 )
+from cayu.runtime.targeted_tool_projection import (
+    TargetedToolMode,
+    TargetedToolProjectionKind,
+    copy_targeted_tool_mode,
+    resolve_targeted_tool_projection,
+)
 from cayu.runtime.tasks import (
     Task,
     TaskCreate,
@@ -1835,7 +1841,7 @@ class CayuApp:
         context_policy: ContextPolicy | None = None,
         context_overflow_policy: ContextPolicy | None = None,
         tool_exposure_policy: ToolExposurePolicy | None = None,
-        enable_tool_gateway: bool = False,
+        targeted_tool_mode: TargetedToolMode | str | None = None,
         tool_policy: ToolPolicy | None = None,
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         loop_policies: Iterable[LoopPolicy] | None = None,
@@ -1864,15 +1870,16 @@ class CayuApp:
             stored_tool_exposure_policy = tool_exposure_policy
         else:
             raise TypeError("tool_exposure_policy must be a ToolExposurePolicy.")
-        if type(enable_tool_gateway) is not bool:
-            raise TypeError("enable_tool_gateway must be a bool.")
-        if enable_tool_gateway and (
+        stored_targeted_tool_mode = (
+            None if targeted_tool_mode is None else copy_targeted_tool_mode(targeted_tool_mode)
+        )
+        if stored_targeted_tool_mode is not None and (
             not self.session_store.supports_targeted_tool_grants
             or not self.session_store.supports_public_authority_aliases
             or self.session_store.public_authority_alias_codec is None
         ):
             raise RuntimeError(
-                "enable_tool_gateway requires a SessionStore with durable targeted-grant "
+                "targeted_tool_mode requires a SessionStore with durable targeted-grant "
                 "state and configured public authority aliases."
             )
         if tool_policy is None:
@@ -1971,7 +1978,7 @@ class CayuApp:
                     field_name=("tool_exposure_policy.execution_profile_identity"),
                 )
             ),
-            tool_gateway_enabled=enable_tool_gateway,
+            targeted_tool_mode=stored_targeted_tool_mode,
             hosted_tools=stored_hosted_tools,
             context_policy=stored_context_policy,
             context_policy_execution_profile_identity=(
@@ -2140,7 +2147,7 @@ class CayuApp:
                 ),
                 tool_exposure_policy=AllRegisteredToolsExposurePolicy(),
                 tool_exposure_policy_execution_profile_identity=None,
-                tool_gateway_enabled=False,
+                targeted_tool_mode=None,
                 context_policy=evaluator_context_policy,
                 context_policy_execution_profile_identity=(
                     copy_secret_free_execution_profile_behavior_identity(
@@ -5560,6 +5567,11 @@ class CayuApp:
         preserve_failure_until_initial_provider_dispatch: bool = False,
     ) -> AsyncGenerator[Event, None]:
         interaction_id = _current_session_interaction_id(session.id)
+        targeted_tool_projection = resolve_targeted_tool_projection(
+            registered_agent.targeted_tool_mode,
+            provider=registered_provider.provider,
+            model=session.model,
+        )
         targeted_tool_grant_records: tuple[TargetedToolGrantRecord, ...] = ()
         targeted_tool_grant_events: tuple[Event, ...] = ()
         if interaction_id is not None:
@@ -5573,6 +5585,9 @@ class CayuApp:
                 registered_agent=registered_agent,
                 capability_ceiling=tool_capability_ceiling_from_session_metadata(session.metadata),
                 observed_at=self._clock(),
+                preserve_native_projection_snapshot=(
+                    targeted_tool_projection is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS
+                ),
             )
         stream = self._session_engine._run_session(
             session=session,
@@ -5592,7 +5607,10 @@ class CayuApp:
             request_loop_policies=request_loop_policies,
             request_metadata=request_metadata,
             request_trace_metadata=request_metadata,
-            targeted_tool_grants=targeted_tool_grant_footprint(targeted_tool_grant_records),
+            targeted_tool_grants=targeted_tool_grant_footprint(
+                targeted_tool_grant_records,
+                projection=targeted_tool_projection,
+            ),
             task_id=task_id,
             task_worker_id=task_worker_id,
             start_event_type=start_event_type,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterable, Mapping
 from typing import TYPE_CHECKING, Any, Protocol, cast
 from urllib.parse import quote, urlencode
 
@@ -12,6 +12,7 @@ from cayu._validation import (
     copy_json_value,
     escape_json_pointer_segment,
     require_clean_nonblank,
+    require_durable_clean_nonblank,
     unescape_json_pointer_segment,
 )
 from cayu.artifacts import (
@@ -70,6 +71,8 @@ from cayu.providers._http import (
     validate_url,
 )
 from cayu.providers.base import (
+    OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
+    TARGETED_TOOL_PROJECTION_MARKER_TYPE,
     InputTokenCountConfidence,
     InputTokenCountMethod,
     InputTokenCountResult,
@@ -83,9 +86,11 @@ from cayu.providers.base import (
     ModelStreamEvent,
     ModelStreamEventType,
     NativeStructuredOutputSchemaInvalid,
+    TargetedToolProjectionRequest,
     UsageDialect,
     _preflight_provider_portable_messages,
     privacy_safe_provider_option_projection,
+    targeted_tool_native_cache_anchor_name,
 )
 from cayu.providers.hosted import HostedToolCapabilityError, OpenAIWebSearch
 from cayu.providers.operations import (
@@ -158,6 +163,8 @@ _OPENAI_POINTER_INDEX_RE = re.compile(r"0|[1-9][0-9]*")
 # any schema OpenAI native mode accepts; NOT a model of OpenAI's (drifting)
 # nesting limit.
 _OPENAI_SCHEMA_PREFLIGHT_MAX_DEPTH = 128
+_OPENAI_ADDITIONAL_TOOLS_MAX_MODELS = 256
+_OPENAI_ADDITIONAL_TOOLS_MODEL_MAX_BYTES = 1024
 # OpenAI rejects every $ref sibling key except these containers.
 _OPENAI_REF_SIBLING_ALLOWLIST = frozenset({"$ref", "$defs", "definitions"})
 _VALID_REASONING_STATES = {"inline", "server"}
@@ -460,6 +467,7 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
     ) -> ProviderOperationConnection:
         if type(request) is not ProviderOperationStartRequest:
             raise TypeError("request must be a ProviderOperationStartRequest.")
+        self._provider._preflight_targeted_tool_request(request.request)
         payload = build_openai_payload(
             request.request,
             stream=True,
@@ -480,7 +488,14 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
                 raw_events,
                 empty_message="OpenAI background start ended before response.created.",
             )
-            state, status = _openai_background_created_state(created)
+            state, status = _openai_background_created_state(
+                created,
+                targeted_tool_marker_id=(
+                    None
+                    if request.request.targeted_tool_projection is None
+                    else request.request.targeted_tool_projection.marker_id
+                ),
+            )
         except asyncio.CancelledError as exc:
             if raw_events is not None:
                 await _close_openai_operation_stream(raw_events)
@@ -725,6 +740,44 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             endpoint_supported=self.hosted_web_search_supported,
         )
 
+    def supports_targeted_tool_projection(self, *, model: str, protocol: str) -> bool:
+        require_clean_nonblank(model, "model")
+        require_clean_nonblank(protocol, "protocol")
+        return (
+            protocol == OPENAI_ADDITIONAL_TOOLS_PROTOCOL and model in self.additional_tools_models
+        )
+
+    def preflight_targeted_tool_projection(self, *, model: str, protocol: str) -> None:
+        model = require_clean_nonblank(model, "model")
+        protocol = require_clean_nonblank(protocol, "protocol")
+        if protocol != OPENAI_ADDITIONAL_TOOLS_PROTOCOL:
+            raise ValueError(f"OpenAIProvider does not support projection {protocol!r}.")
+        if model not in self.additional_tools_models:
+            raise ValueError(
+                "OpenAI additional_tools support is not established for model "
+                f"{model!r}; list the exact verified model in additional_tools_models."
+            )
+
+    def _preflight_targeted_tool_request(self, request: ModelRequest) -> None:
+        if type(request) is not ModelRequest:
+            raise TypeError("request must be a ModelRequest.")
+        projection = request.targeted_tool_projection
+        cache_anchor = targeted_tool_native_cache_anchor_name(request.options)
+        if cache_anchor is not None:
+            self.preflight_targeted_tool_projection(
+                model=request.model,
+                protocol=OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
+            )
+        if projection is not None:
+            if cache_anchor is None:
+                raise ValueError(
+                    "OpenAI additional_tools projection requires a stable cache anchor."
+                )
+            self.preflight_targeted_tool_projection(
+                model=request.model,
+                protocol=projection.protocol,
+            )
+
     @property
     def context_pressure_profile(self) -> ModelContextPressureProfile:
         return ModelContextPressureProfile(
@@ -736,12 +789,12 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
 
     def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
         projected = privacy_safe_provider_option_projection(
-            _effective_openai_request_options(request.options)
+            _effective_openai_request_options_for_request(request)
         )
         return {"openai": projected} if projected else {}
 
     def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
-        effective = _effective_openai_request_options(request.options)
+        effective = _effective_openai_request_options_for_request(request)
         return {"openai": effective} if effective else {}
 
     def __init__(
@@ -756,6 +809,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         extra_headers: Mapping[str, str] | None = None,
         reasoning_state: str = "inline",
         hosted_web_search_supported: bool | None = None,
+        additional_tools_models: Iterable[str] | None = None,
         background: bool = False,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
@@ -779,6 +833,40 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             if hosted_web_search_supported is None
             else hosted_web_search_supported
         )
+        if isinstance(additional_tools_models, (str, bytes, bytearray, Mapping)):
+            raise TypeError("additional_tools_models must be an iterable of model names.")
+        try:
+            model_iterator = iter(
+                () if additional_tools_models is None else additional_tools_models
+            )
+        except TypeError as exc:
+            raise TypeError("additional_tools_models must be an iterable of model names.") from exc
+        copied_additional_tools_models: list[str] = []
+        for index, configured_model in enumerate(model_iterator):
+            if index >= _OPENAI_ADDITIONAL_TOOLS_MAX_MODELS:
+                raise ValueError(
+                    "additional_tools_models cannot contain more than "
+                    f"{_OPENAI_ADDITIONAL_TOOLS_MAX_MODELS} names."
+                )
+            if type(configured_model) is not str:
+                raise TypeError("additional_tools_models must contain strings.")
+            copied_additional_tools_models.append(configured_model)
+        normalized_models: list[str] = []
+        for configured_model in copied_additional_tools_models:
+            model_name = require_durable_clean_nonblank(
+                configured_model,
+                "additional_tools_models item",
+            )
+            if len(model_name.encode("utf-8")) > _OPENAI_ADDITIONAL_TOOLS_MODEL_MAX_BYTES:
+                raise ValueError(
+                    "additional_tools_models items cannot exceed "
+                    f"{_OPENAI_ADDITIONAL_TOOLS_MODEL_MAX_BYTES} UTF-8 bytes."
+                )
+            normalized_models.append(model_name)
+        normalized_additional_tools_models = tuple(normalized_models)
+        if len(normalized_additional_tools_models) != len(set(normalized_additional_tools_models)):
+            raise ValueError("additional_tools_models must contain unique model names.")
+        self.additional_tools_models = frozenset(normalized_additional_tools_models)
         if type(background) is not bool:
             raise TypeError("background must be a bool.")
         if background and self.base_url != _validate_base_url(DEFAULT_OPENAI_BASE_URL):
@@ -824,6 +912,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         error_event: ModelStreamEvent | None = None
         completion_emitted = False
         try:
+            self._preflight_targeted_tool_request(request)
             payload = build_openai_payload(
                 request, stream=True, reasoning_state=self.reasoning_state
             )
@@ -834,6 +923,15 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                     async for event in events:
                         yielded_any = True
                         completion_emitted = event.type == ModelStreamEventType.COMPLETED
+                        event = _event_with_server_targeted_tool_ownership(
+                            event,
+                            reasoning_state=self.reasoning_state,
+                            marker_id=(
+                                None
+                                if request.targeted_tool_projection is None
+                                else request.targeted_tool_projection.marker_id
+                            ),
+                        )
                         yield event
                         if completion_emitted:
                             break
@@ -854,6 +952,15 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             async with aclosing_provider_stream(events):
                 async for event in events:
                     completion_emitted = event.type == ModelStreamEventType.COMPLETED
+                    event = _event_with_server_targeted_tool_ownership(
+                        event,
+                        reasoning_state=self.reasoning_state,
+                        marker_id=(
+                            None
+                            if request.targeted_tool_projection is None
+                            else request.targeted_tool_projection.marker_id
+                        ),
+                    )
                     yield event
                     if completion_emitted:
                         break
@@ -928,6 +1035,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         self,
         request: ModelRequest,
     ) -> InputTokenCountResult | None:
+        self._preflight_targeted_tool_request(request)
         payload = build_openai_token_count_payload(
             request,
             reasoning_state=self.reasoning_state,
@@ -1058,7 +1166,7 @@ def build_openai_payload(
     if type(chain) is not bool:
         raise TypeError("OpenAI payload chain must be a bool.")
 
-    options = _effective_openai_request_options(request.options)
+    options = _effective_openai_request_options_for_request(request)
     structured_output_format = _openai_structured_output_format(request.options)
     if structured_output_format is not None and "text" in options:
         raise ValueError("OpenAI option text cannot be combined with native structured output.")
@@ -1078,8 +1186,31 @@ def build_openai_payload(
     use_provider_state = True
     if reasoning_state == "server" and chain:
         previous_response_id, messages_to_send = _server_chain(request.messages)
+        server_owned_count = len(request.messages) - len(messages_to_send)
+        if previous_response_id is not None and _server_prefix_owns_inactive_targeted_tools(
+            request.messages[:server_owned_count],
+            request.targeted_tool_projection,
+        ):
+            # A previous_response_id would keep an earlier interaction's
+            # additional_tools item alive on the provider. Rebuild neutrally so
+            # inactive targeted authority cannot remain model-addressable.
+            previous_response_id = None
+            messages_to_send = request.messages
+            use_provider_state = False
     elif reasoning_state == "server" and not chain:
         use_provider_state = False  # recovery: rebuild from neutral parts
+
+    _validate_targeted_tool_projection_marker(
+        request.messages,
+        request.targeted_tool_projection,
+    )
+    direct_tool_names = {name for tool in request.tools if type(name := tool.get("name")) is str}
+    if request.targeted_tool_projection is not None and any(
+        tool.get("name") in direct_tool_names for tool in request.targeted_tool_projection.tools
+    ):
+        raise ValueError(
+            "A targeted additional_tools function cannot also be a direct request tool."
+        )
 
     input_items: list[dict[str, Any]] = []
     for message in messages_to_send:
@@ -1089,6 +1220,7 @@ def build_openai_payload(
                 resolved_attachments=resolved_attachments,
                 reasoning_state=reasoning_state,
                 use_provider_state=use_provider_state,
+                targeted_tool_projection=request.targeted_tool_projection,
             )
         )
     if not input_items:
@@ -1375,11 +1507,30 @@ def _openai_recovery_sequence_number(metadata: ProviderOperationRecoveryMetadata
     return value
 
 
+def _openai_background_targeted_tool_marker_id(
+    metadata: ProviderOperationRecoveryMetadata,
+) -> str | None:
+    value = metadata.opaque.get("targeted_tool_marker_id")
+    if value is None:
+        return None
+    if (
+        type(value) is not str
+        or len(value) != 71
+        or not value.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in value[7:])
+    ):
+        raise OpenAIProtocolError(
+            "OpenAI background recovery metadata has an invalid targeted-tool marker id."
+        )
+    return value
+
+
 def _require_openai_background_state(state: ProviderOperationState) -> ProviderOperationState:
     state = copy_provider_operation_state(state)
     if state.stream_protocol != _OPENAI_BACKGROUND_STREAM_PROTOCOL:
         raise OpenAIProtocolError("OpenAI background operation uses an unknown stream protocol.")
     _openai_recovery_sequence_number(state.recovery_metadata)
+    _openai_background_targeted_tool_marker_id(state.recovery_metadata)
     return state
 
 
@@ -1399,6 +1550,8 @@ def _openai_response_operation_status(value: object) -> ProviderOperationStatus 
 
 def _openai_background_created_state(
     event: Mapping[str, Any],
+    *,
+    targeted_tool_marker_id: str | None,
 ) -> tuple[ProviderOperationState, ProviderOperationStatus]:
     if not isinstance(event, Mapping) or event.get("type") != "response.created":
         raise OpenAIProtocolError("OpenAI background start must begin with response.created.")
@@ -1417,7 +1570,10 @@ def _openai_background_created_state(
             recovery_metadata=ProviderOperationRecoveryMetadata.model_validate(
                 {
                     "cursor": 0,
-                    "opaque": {"sequence_number": sequence_number},
+                    "opaque": {
+                        "sequence_number": sequence_number,
+                        "targeted_tool_marker_id": targeted_tool_marker_id,
+                    },
                 }
             ),
         ),
@@ -1456,9 +1612,15 @@ def _openai_background_snapshot(
         return ProviderOperationSnapshot(state=state, status=status)
     cursor = state.recovery_metadata.cursor
     cursor = 0 if cursor is None else cursor
+    targeted_tool_marker_id = _openai_background_targeted_tool_marker_id(state.recovery_metadata)
     events: list[ModelStreamEvent] = []
     for event in parsed:
         cursor += 1
+        event = _event_with_server_targeted_tool_ownership(
+            event,
+            reasoning_state=reasoning_state,
+            marker_id=targeted_tool_marker_id,
+        )
         events.append(
             event.model_copy(
                 update={
@@ -1467,7 +1629,8 @@ def _openai_background_snapshot(
                         opaque={
                             "sequence_number": _openai_recovery_sequence_number(
                                 state.recovery_metadata
-                            )
+                            ),
+                            "targeted_tool_marker_id": targeted_tool_marker_id,
                         },
                     )
                 },
@@ -1546,8 +1709,12 @@ def _openai_background_recovery_metadata(
     sequence_number: int,
     pending_function_calls: Mapping[int, _PendingFunctionCall],
     pending_reasoning_items: set[int],
+    targeted_tool_marker_id: str | None,
 ) -> ProviderOperationRecoveryMetadata:
-    opaque: dict[str, object] = {"sequence_number": sequence_number}
+    opaque: dict[str, object] = {
+        "sequence_number": sequence_number,
+        "targeted_tool_marker_id": targeted_tool_marker_id,
+    }
     if pending_function_calls or pending_reasoning_items:
         calls: list[dict[str, object]] = []
         for output_index, pending in sorted(pending_function_calls.items()):
@@ -1573,6 +1740,7 @@ def _openai_background_event_with_recovery(
     sequence_number: int,
     pending_function_calls: Mapping[int, _PendingFunctionCall],
     pending_reasoning_items: set[int],
+    targeted_tool_marker_id: str | None,
 ) -> ModelStreamEvent:
     return event.model_copy(
         update={
@@ -1581,6 +1749,7 @@ def _openai_background_event_with_recovery(
                 sequence_number=sequence_number,
                 pending_function_calls=pending_function_calls,
                 pending_reasoning_items=pending_reasoning_items,
+                targeted_tool_marker_id=targeted_tool_marker_id,
             )
         },
         deep=True,
@@ -1597,6 +1766,7 @@ async def _openai_background_stream_events(
     cursor = state.recovery_metadata.cursor
     cursor = 0 if cursor is None else cursor
     last_sequence_number = _openai_recovery_sequence_number(state.recovery_metadata)
+    targeted_tool_marker_id = _openai_background_targeted_tool_marker_id(state.recovery_metadata)
     pending_function_calls, pending_reasoning_items = _openai_background_parser_state(
         state.recovery_metadata
     )
@@ -1662,12 +1832,18 @@ async def _openai_background_stream_events(
                 excluded_output_indexes=unfinished,
                 reasoning_state=reasoning_state,
             ):
+                terminal_event = _event_with_server_targeted_tool_ownership(
+                    terminal_event,
+                    reasoning_state=reasoning_state,
+                    marker_id=targeted_tool_marker_id,
+                )
                 yield _openai_background_event_with_recovery(
                     terminal_event,
                     cursor=cursor,
                     sequence_number=sequence_number,
                     pending_function_calls=pending_function_calls,
                     pending_reasoning_items=pending_reasoning_items,
+                    targeted_tool_marker_id=targeted_tool_marker_id,
                 )
             return
         elif event_type == "response.failed":
@@ -1705,6 +1881,7 @@ async def _openai_background_stream_events(
             sequence_number=sequence_number,
             pending_function_calls=pending_function_calls,
             pending_reasoning_items=pending_reasoning_items,
+            targeted_tool_marker_id=targeted_tool_marker_id,
         )
         if event_type in {
             "response.completed",
@@ -3137,6 +3314,150 @@ def _effective_openai_request_options(options: Mapping[str, Any]) -> dict[str, A
     return effective
 
 
+def _effective_openai_request_options_for_request(
+    request: ModelRequest,
+) -> dict[str, Any]:
+    """Apply runtime-owned native-tool callability without changing the stable tool list."""
+
+    if type(request) is not ModelRequest:
+        raise TypeError("request must be a ModelRequest.")
+    effective = _effective_openai_request_options(request.options)
+    anchor_name = targeted_tool_native_cache_anchor_name(request.options)
+    if anchor_name is None:
+        if request.targeted_tool_projection is not None:
+            raise ValueError("OpenAI additional_tools projection requires a stable cache anchor.")
+        return effective
+
+    anchor_matches = [tool for tool in request.tools if tool.get("name") == anchor_name]
+    if len(anchor_matches) != 1:
+        raise ValueError(
+            "OpenAI native targeted-tool requests require one exact stable cache anchor."
+        )
+    available = _openai_native_allowed_tool_selectors(
+        request,
+        cache_anchor_name=anchor_name,
+    )
+    configured = effective.pop("tool_choice", None)
+    effective["tool_choice"] = _openai_native_tool_choice(
+        configured,
+        available=available,
+    )
+    return effective
+
+
+def _openai_native_allowed_tool_selectors(
+    request: ModelRequest,
+    *,
+    cache_anchor_name: str,
+) -> tuple[dict[str, str], ...]:
+    selectors: list[dict[str, str]] = []
+    for tool in request.tools:
+        selector = _openai_function_tool_selector(tool)
+        if selector["name"] != cache_anchor_name:
+            selectors.append(selector)
+    for hosted_tool in request.hosted_tools:
+        if type(hosted_tool) is not OpenAIWebSearch:
+            raise TypeError("OpenAI hosted tools must be OpenAIWebSearch instances.")
+        selectors.append({"type": "web_search"})
+    projection = request.targeted_tool_projection
+    if projection is not None:
+        targeted_selectors = tuple(
+            _openai_function_tool_selector(tool) for tool in projection.tools
+        )
+        direct_function_names = {
+            selector["name"] for selector in selectors if selector["type"] == "function"
+        }
+        if any(selector["name"] in direct_function_names for selector in targeted_selectors):
+            raise ValueError(
+                "A targeted additional_tools function cannot also be a direct request tool."
+            )
+        selectors.extend(targeted_selectors)
+    identities = [tuple(sorted(selector.items())) for selector in selectors]
+    if len(identities) != len(set(identities)):
+        raise ValueError("OpenAI native targeted-tool callability contains duplicate tools.")
+    return tuple(selectors)
+
+
+def _openai_function_tool_selector(tool: Mapping[str, Any]) -> dict[str, str]:
+    return {"type": "function", "name": _openai_tool_name(tool)}
+
+
+def _openai_native_tool_choice(
+    configured: object,
+    *,
+    available: tuple[dict[str, str], ...],
+) -> str | dict[str, Any]:
+    available_identities = {tuple(sorted(selector.items())) for selector in available}
+    if configured is None or configured == "auto":
+        if not available:
+            return "none"
+        return {
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [dict(selector) for selector in available],
+        }
+    if configured == "none":
+        return "none"
+    if configured == "required":
+        if not available:
+            raise ValueError("OpenAI tool_choice='required' has no callable tools.")
+        return {
+            "type": "allowed_tools",
+            "mode": "required",
+            "tools": [dict(selector) for selector in available],
+        }
+    copied = copy_json_value(configured, "options.openai.tool_choice")
+    if type(copied) is not dict:
+        raise ValueError(
+            "OpenAI native targeted-tool mode supports tool_choice none, auto, required, "
+            "a named callable tool, or an allowed_tools subset."
+        )
+    choice_type = copied.get("type")
+    if choice_type == "allowed_tools":
+        if set(copied) != {"type", "mode", "tools"}:
+            raise ValueError("OpenAI allowed_tools tool_choice is not canonical.")
+        if copied.get("mode") not in {"auto", "required"}:
+            raise ValueError("OpenAI allowed_tools mode must be auto or required.")
+        selected = copied.get("tools")
+        if type(selected) is not list or not selected:
+            raise ValueError("OpenAI allowed_tools must contain at least one tool selector.")
+        selectors = tuple(_openai_allowed_tool_selector(item) for item in selected)
+        identities = [tuple(sorted(selector.items())) for selector in selectors]
+        if len(identities) != len(set(identities)):
+            raise ValueError("OpenAI allowed_tools cannot contain duplicate selectors.")
+        if any(identity not in available_identities for identity in identities):
+            raise ValueError(
+                "OpenAI allowed_tools contains a tool unavailable in the native request."
+            )
+        return {
+            "type": "allowed_tools",
+            "mode": copied["mode"],
+            "tools": [dict(selector) for selector in selectors],
+        }
+    selector = _openai_allowed_tool_selector(copied)
+    if tuple(sorted(selector.items())) not in available_identities:
+        raise ValueError("OpenAI tool_choice selects a tool unavailable in the native request.")
+    return selector
+
+
+def _openai_allowed_tool_selector(value: object) -> dict[str, str]:
+    if type(value) is not dict:
+        raise ValueError("OpenAI tool selectors must be objects.")
+    selector = cast("dict[str, Any]", value)
+    selector_type = selector.get("type")
+    if selector_type == "function":
+        if set(selector) != {"type", "name"}:
+            raise ValueError("OpenAI function tool selectors require only type and name.")
+        name = selector.get("name")
+        if type(name) is not str:
+            raise ValueError("OpenAI function tool selectors require a string name.")
+        _validate_openai_tool_name(name)
+        return {"type": "function", "name": name}
+    if selector_type == "web_search" and set(selector) == {"type"}:
+        return {"type": "web_search"}
+    raise ValueError("OpenAI native targeted-tool mode received an unsupported tool selector.")
+
+
 def preflight_openai_native_structured_output_schema(json_schema: dict[str, Any]) -> None:
     """Reject a NATIVE structured-output schema OpenAI strict mode always refuses.
 
@@ -3362,6 +3683,7 @@ def _openai_input_items(
     resolved_attachments: dict[str, dict[str, Any]],
     reasoning_state: str = "inline",
     use_provider_state: bool = True,
+    targeted_tool_projection: TargetedToolProjectionRequest | None = None,
 ) -> list[dict[str, Any]]:
     if message.role == MessageRole.SYSTEM:
         return []
@@ -3376,7 +3698,10 @@ def _openai_input_items(
         ]
     if message.role == MessageRole.ASSISTANT:
         provider_state_items = _openai_provider_state_items(
-            message, reasoning_state=reasoning_state, use_provider_state=use_provider_state
+            message,
+            reasoning_state=reasoning_state,
+            use_provider_state=use_provider_state,
+            targeted_tool_projection=targeted_tool_projection,
         )
         if provider_state_items:
             return provider_state_items
@@ -3570,11 +3895,84 @@ def _server_chain(messages: list[Message]) -> tuple[str | None, list[Message]]:
     return last_id, messages[last_index + 1 :]
 
 
+def _server_prefix_owns_inactive_targeted_tools(
+    server_owned_messages: list[Message],
+    projection: TargetedToolProjectionRequest | None,
+) -> bool:
+    """Return whether a server chain retains any non-current targeted item."""
+
+    active_marker_id = None if projection is None else projection.marker_id
+    latest_response_state: dict[str, Any] | None = None
+    for message in server_owned_messages:
+        if message.role is not MessageRole.ASSISTANT:
+            continue
+        for part in message.content:
+            if type(part) is not ProviderStatePart or part.provider != "openai":
+                continue
+            state = part.state
+            if state.get("type") == "response_ref":
+                latest_response_state = state
+    if latest_response_state is None or "targeted_tool_marker_id" not in latest_response_state:
+        # A chained response without explicit ownership evidence cannot prove
+        # that its provider-side prefix is safe to reuse. Rebuild neutrally.
+        return True
+    owned_marker_id = latest_response_state["targeted_tool_marker_id"]
+    if owned_marker_id is None:
+        return False
+    if (
+        type(owned_marker_id) is not str
+        or len(owned_marker_id) != 71
+        or not owned_marker_id.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in owned_marker_id[7:])
+    ):
+        return True
+    return owned_marker_id != active_marker_id
+
+
+def _event_with_server_targeted_tool_ownership(
+    event: ModelStreamEvent,
+    *,
+    reasoning_state: str,
+    marker_id: str | None,
+) -> ModelStreamEvent:
+    """Bind one server response reference to its retained targeted item, if any."""
+
+    if reasoning_state != "server" or event.type is not ModelStreamEventType.COMPLETED:
+        return event
+    payload = copy_json_value(event.payload, "completed event payload")
+    if type(payload) is not dict:  # pragma: no cover - ModelStreamEvent invariant
+        raise AssertionError("Completed OpenAI event payload must be an object.")
+    provider_state = payload.get("provider_state")
+    if type(provider_state) is not list:
+        raise OpenAIProtocolError("OpenAI server completion lost its provider state.")
+    response_refs = [
+        item
+        for item in provider_state
+        if type(item) is dict
+        and item.get("provider") == "openai"
+        and type(item.get("state")) is dict
+        and item["state"].get("type") == "response_ref"
+    ]
+    if len(response_refs) != 1:
+        raise OpenAIProtocolError("OpenAI server completion requires one exact response reference.")
+    response_refs[0]["state"]["targeted_tool_marker_id"] = marker_id
+    return ModelStreamEvent(
+        type=event.type,
+        delta=event.delta,
+        payload=payload,
+        completion=event.completion,
+        recovery_metadata=event.recovery_metadata,
+        provider_operation_status=event.provider_operation_status,
+    )
+
+
 def _openai_provider_state_items(
-    message: Message, *, reasoning_state: str = "inline", use_provider_state: bool = True
+    message: Message,
+    *,
+    reasoning_state: str = "inline",
+    use_provider_state: bool = True,
+    targeted_tool_projection: TargetedToolProjectionRequest | None = None,
 ) -> list[dict[str, Any]]:
-    if not use_provider_state:
-        return []
     items: list[dict[str, Any]] = []
     for part in message.content:
         if type(part) is not ProviderStatePart:
@@ -3585,6 +3983,22 @@ def _openai_provider_state_items(
         if type(state) is not dict:
             raise OpenAIProtocolError("OpenAI provider state must be an object.")
         item_type = state.get("type")
+        if item_type == TARGETED_TOOL_PROJECTION_MARKER_TYPE:
+            if (
+                targeted_tool_projection is not None
+                and state.get("protocol") == targeted_tool_projection.protocol
+                and state.get("marker_id") == targeted_tool_projection.marker_id
+            ):
+                items.append(
+                    {
+                        "type": "additional_tools",
+                        "role": "developer",
+                        "tools": [_openai_tool(tool) for tool in targeted_tool_projection.tools],
+                    }
+                )
+            continue
+        if not use_provider_state:
+            continue
         if item_type == "response_ref":
             continue  # synthetic chain marker, never sent as input
         if item_type == "reasoning":
@@ -3600,6 +4014,41 @@ def _openai_provider_state_items(
             )
         items.append(state)
     return items
+
+
+def _validate_targeted_tool_projection_marker(
+    messages: list[Message],
+    projection: TargetedToolProjectionRequest | None,
+) -> None:
+    """Require one exact durable acquisition marker for an active projection."""
+
+    if projection is None:
+        return
+    matching_markers = 0
+    for message in messages:
+        if message.role is not MessageRole.ASSISTANT:
+            continue
+        for part in message.content:
+            if type(part) is not ProviderStatePart or part.provider != "openai":
+                continue
+            state = part.state
+            if (
+                state.get("type") != TARGETED_TOOL_PROJECTION_MARKER_TYPE
+                or state.get("protocol") != projection.protocol
+                or state.get("marker_id") != projection.marker_id
+            ):
+                continue
+            if len(message.content) != 1 or set(state) != {
+                "type",
+                "protocol",
+                "marker_id",
+            }:
+                raise OpenAIProtocolError("The targeted-tool acquisition marker is not canonical.")
+            matching_markers += 1
+    if matching_markers != 1:
+        raise OpenAIProtocolError(
+            "An active targeted-tool projection requires one exact acquisition marker."
+        )
 
 
 def _user_input_part(
@@ -3718,10 +4167,7 @@ def _json_arguments(arguments: Mapping[str, Any]) -> str:
 
 
 def _openai_tool(tool: Mapping[str, Any]) -> dict[str, Any]:
-    if not isinstance(tool, Mapping):
-        raise ValueError("Tool definitions must be objects.")
-    name = _require_mapping_string(tool, "name")
-    _validate_openai_tool_name(name)
+    name = _openai_tool_name(tool)
     description = tool.get("description", "")
     if not isinstance(description, str):
         raise ValueError("Tool description must be a string.")
@@ -3735,6 +4181,14 @@ def _openai_tool(tool: Mapping[str, Any]) -> dict[str, Any]:
         "parameters": copy_json_value(input_schema, "input_schema"),
         "strict": False,
     }
+
+
+def _openai_tool_name(tool: Mapping[str, Any]) -> str:
+    if not isinstance(tool, Mapping):
+        raise ValueError("Tool definitions must be objects.")
+    name = _require_mapping_string(tool, "name")
+    _validate_openai_tool_name(name)
+    return name
 
 
 def _openai_hosted_tool(tool: OpenAIWebSearch) -> dict[str, Any]:

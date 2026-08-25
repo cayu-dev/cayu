@@ -373,15 +373,28 @@ def resolved_targeted_tool_invocation(
     *,
     record: TargetedToolGrantRecord,
     binding: TargetedToolUseBinding,
-    tool_ref: str,
+    tool_ref: str | None,
+    dispatch_kind: Literal["gateway", "native"] = "gateway",
+    model_tool_name: str = CALL_TOOL_NAME,
 ) -> ResolvedTargetedToolInvocation:
     record = copy_targeted_tool_grant_record(record)
     if binding.grant_id != record.grant_id:
         raise ValueError("Targeted tool binding belongs to a different grant.")
     if binding.session_id != record.session_id or binding.interaction_id != record.interaction_id:
         raise ValueError("Targeted tool binding belongs to a different grant scope.")
-    tool_ref = CallToolEnvelope.validate_tool_ref(tool_ref)
+    if dispatch_kind == "gateway":
+        if tool_ref is None:
+            raise ValueError("Gateway targeted invocations require a tool_ref.")
+        tool_ref = CallToolEnvelope.validate_tool_ref(tool_ref)
+    elif dispatch_kind == "native":
+        if tool_ref is not None:
+            raise ValueError("Native targeted invocations cannot carry a tool_ref.")
+        model_tool_name = require_durable_clean_nonblank(model_tool_name, "model_tool_name")
+    else:
+        raise ValueError("Unsupported targeted invocation dispatch kind.")
     return ResolvedTargetedToolInvocation(
+        dispatch_kind=dispatch_kind,
+        model_tool_name=model_tool_name,
         tool_ref=tool_ref,
         grant_id=record.grant_id,
         use_id=binding.use_id,
@@ -403,12 +416,19 @@ def rejected_targeted_tool_invocation(
     *,
     reason: TargetedToolUseRejectionReason,
     event: Event,
+    dispatch_kind: Literal["gateway", "native"] = "gateway",
+    model_tool_name: str = CALL_TOOL_NAME,
 ) -> RejectedTargetedToolInvocation:
     if event.type != EventType.TARGETED_TOOL_REFERENCE_REJECTED:
         raise ValueError("Gateway rejection requires targeted reference evidence.")
     if event.payload.get("rejection_reason") != reason.value:
         raise ValueError("Gateway rejection reason conflicts with its event evidence.")
-    return RejectedTargetedToolInvocation(reason=reason, rejection_event_id=event.id)
+    return RejectedTargetedToolInvocation(
+        dispatch_kind=dispatch_kind,
+        model_tool_name=model_tool_name,
+        reason=reason,
+        rejection_event_id=event.id,
+    )
 
 
 def unresolved_gateway_rejection_event(
@@ -470,6 +490,31 @@ def unresolved_gateway_rejection_event(
 
 def gateway_rejection_content(reason: TargetedToolUseRejectionReason) -> str:
     return CALL_TOOL_REJECTION_CONTENT.get(
+        reason,
+        "The targeted tool invocation was rejected by its durable authority boundary.",
+    )
+
+
+def targeted_tool_rejection_content(
+    reason: TargetedToolUseRejectionReason,
+    *,
+    dispatch_kind: Literal["gateway", "native"],
+) -> str:
+    """Return provider-facing rejection text for either targeted delivery path."""
+
+    if dispatch_kind == "gateway":
+        return gateway_rejection_content(reason)
+    native_content = {
+        TargetedToolUseRejectionReason.MALFORMED: ("The targeted tool invocation is malformed."),
+        TargetedToolUseRejectionReason.UNKNOWN: ("The targeted tool grant is no longer available."),
+        TargetedToolUseRejectionReason.EXPIRED: "The targeted tool grant has expired.",
+        TargetedToolUseRejectionReason.REVOKED: "The targeted tool grant was revoked.",
+        TargetedToolUseRejectionReason.EXHAUSTED: "The targeted tool grant is exhausted.",
+        TargetedToolUseRejectionReason.INVALID_ARGUMENTS: (
+            "The arguments do not satisfy the targeted tool schema."
+        ),
+    }
+    return native_content.get(
         reason,
         "The targeted tool invocation was rejected by its durable authority boundary.",
     )

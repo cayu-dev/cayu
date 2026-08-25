@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 import pytest
+from pydantic import ValidationError
 from tests.provider_traceback_assertions import assert_cayu_traceback_does_not_retain
 
 import cayu.providers.openai as openai_module
@@ -59,8 +60,16 @@ from cayu.providers import (
 )
 from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS
 from cayu.providers._sse import aiter_sse_json_events
+from cayu.providers.base import (
+    OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
+    TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
+    TARGETED_TOOL_PROJECTION_MARKER_TYPE,
+    TargetedToolProjectionRequest,
+)
 from cayu.providers.openai import openai_stream_events
 from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
+from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
+from cayu.runtime.tool_gateway import call_tool_spec
 
 
 async def _collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
@@ -5148,7 +5157,14 @@ def test_server_later_call_sends_delta_and_previous_response_id():
                     "content": [{"type": "output_text", "text": "ok"}],
                 },
             ),
-            ProviderStatePart(provider="openai", state={"type": "response_ref", "id": "resp_prev"}),
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": "response_ref",
+                    "id": "resp_prev",
+                    "targeted_tool_marker_id": None,
+                },
+            ),
         ],
     )
     request = ModelRequest(
@@ -5163,6 +5179,546 @@ def test_server_later_call_sends_delta_and_previous_response_id():
     assert payload["previous_response_id"] == "resp_prev"
     assert len(payload["input"]) == 1
     assert payload["input"][0]["content"][0]["text"] == "second"
+
+
+def _targeted_projection_fixture() -> tuple[Message, TargetedToolProjectionRequest]:
+    marker_id = f"sha256:{'a' * 64}"
+    marker = Message(
+        role=MessageRole.ASSISTANT,
+        content=(
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": TARGETED_TOOL_PROJECTION_MARKER_TYPE,
+                    "protocol": OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
+                    "marker_id": marker_id,
+                },
+            ),
+        ),
+    )
+    projection = TargetedToolProjectionRequest(
+        marker_id=marker_id,
+        tools=(
+            {
+                "name": "remember",
+                "description": "Remember one reviewed fact.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"fact": {"type": "string"}},
+                    "required": ["fact"],
+                    "additionalProperties": False,
+                },
+            },
+        ),
+    )
+    return marker, projection
+
+
+def _native_cache_anchor_fields() -> dict[str, object]:
+    return {
+        "tools": [call_tool_spec()],
+        "options": {TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION: CALL_TOOL_NAME},
+    }
+
+
+def test_openai_payload_renders_targeted_tools_at_the_exact_marker_position() -> None:
+    marker, projection = _targeted_projection_fixture()
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message.text("user", "inherited"),
+            Message.text("assistant", "reviewed"),
+            Message.text("user", "save gotchas"),
+            marker,
+        ],
+        targeted_tool_projection=projection,
+        **_native_cache_anchor_fields(),
+    )
+
+    payload = build_openai_payload(request)
+
+    assert payload["input"][-1] == {
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": [
+            {
+                "type": "function",
+                "name": "remember",
+                "description": "Remember one reviewed fact.",
+                "parameters": projection.tools[0]["input_schema"],
+                "strict": False,
+            }
+        ],
+    }
+    assert [item.get("role") for item in payload["input"][:-1]] == [
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert payload["tools"] == [
+        {
+            "type": "function",
+            "name": CALL_TOOL_NAME,
+            "description": call_tool_spec()["description"],
+            "parameters": call_tool_spec()["input_schema"],
+            "strict": False,
+        }
+    ]
+    assert payload["tool_choice"] == {
+        "type": "allowed_tools",
+        "mode": "auto",
+        "tools": [{"type": "function", "name": "remember"}],
+    }
+
+
+def test_openai_native_cache_anchor_is_inert_without_a_grant() -> None:
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "continue")],
+        **_native_cache_anchor_fields(),
+    )
+
+    payload = build_openai_payload(request)
+
+    assert [tool["name"] for tool in payload["tools"]] == [CALL_TOOL_NAME]
+    assert payload["tool_choice"] == "none"
+
+
+def test_openai_native_callability_excludes_only_the_cache_anchor() -> None:
+    from cayu.providers import OpenAIWebSearch
+
+    marker, projection = _targeted_projection_fixture()
+    inspect = {
+        "name": "inspect",
+        "description": "Inspect a path.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    }
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "inspect and remember"), marker],
+        tools=[inspect, call_tool_spec()],
+        hosted_tools=(OpenAIWebSearch(),),
+        targeted_tool_projection=projection,
+        options={TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION: CALL_TOOL_NAME},
+    )
+
+    payload = build_openai_payload(request)
+
+    assert payload["tool_choice"] == {
+        "type": "allowed_tools",
+        "mode": "auto",
+        "tools": [
+            {"type": "function", "name": "inspect"},
+            {"type": "web_search"},
+            {"type": "function", "name": "remember"},
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        ("none", "none"),
+        (
+            "required",
+            {
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [{"type": "function", "name": "remember"}],
+            },
+        ),
+        (
+            {"type": "function", "name": "remember"},
+            {"type": "function", "name": "remember"},
+        ),
+        (
+            {
+                "type": "allowed_tools",
+                "mode": "auto",
+                "tools": [{"type": "function", "name": "remember"}],
+            },
+            {
+                "type": "allowed_tools",
+                "mode": "auto",
+                "tools": [{"type": "function", "name": "remember"}],
+            },
+        ),
+    ],
+)
+def test_openai_native_mode_preserves_valid_explicit_tool_choice(
+    configured: object,
+    expected: object,
+) -> None:
+    marker, projection = _targeted_projection_fixture()
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "remember"), marker],
+        tools=[call_tool_spec()],
+        targeted_tool_projection=projection,
+        options={
+            TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION: CALL_TOOL_NAME,
+            "openai": {"tool_choice": configured},
+        },
+    )
+
+    assert build_openai_payload(request)["tool_choice"] == expected
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        {"type": "function", "name": CALL_TOOL_NAME},
+        {"type": "function", "name": "unavailable"},
+        {
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [{"type": "function", "name": CALL_TOOL_NAME}],
+        },
+    ],
+)
+def test_openai_native_mode_rejects_tool_choice_outside_callable_authority(
+    configured: object,
+) -> None:
+    marker, projection = _targeted_projection_fixture()
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "remember"), marker],
+        tools=[call_tool_spec()],
+        targeted_tool_projection=projection,
+        options={
+            TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION: CALL_TOOL_NAME,
+            "openai": {"tool_choice": configured},
+        },
+    )
+
+    with pytest.raises(ValueError, match="unavailable"):
+        build_openai_payload(request)
+
+
+def test_openai_payload_drops_an_inactive_targeted_marker() -> None:
+    marker, _projection = _targeted_projection_fixture()
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "inherited"), marker],
+    )
+
+    payload = build_openai_payload(request)
+
+    assert len(payload["input"]) == 1
+    assert payload["input"][0]["role"] == "user"
+
+
+@pytest.mark.parametrize("marker_case", ["missing", "duplicate", "noncanonical"])
+def test_openai_payload_rejects_unanchored_targeted_projection(marker_case: str) -> None:
+    marker, projection = _targeted_projection_fixture()
+    messages = [Message.text("user", "go")]
+    if marker_case == "duplicate":
+        messages.extend((marker, marker))
+    elif marker_case == "noncanonical":
+        messages.append(
+            Message(
+                role=MessageRole.ASSISTANT,
+                content=(*marker.content, TextPart(text="untrusted suffix")),
+            )
+        )
+
+    request = ModelRequest(
+        model="gpt-test",
+        messages=messages,
+        targeted_tool_projection=projection,
+        **_native_cache_anchor_fields(),
+    )
+
+    with pytest.raises(OpenAIProtocolError, match="marker"):
+        build_openai_payload(request)
+
+
+def test_openai_payload_rejects_native_and_direct_tool_overlap() -> None:
+    marker, projection = _targeted_projection_fixture()
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "go"), marker],
+        tools=[projection.tools[0], call_tool_spec()],
+        targeted_tool_projection=projection,
+        options={TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION: CALL_TOOL_NAME},
+    )
+
+    with pytest.raises(ValueError, match="cannot also be a direct request tool"):
+        build_openai_payload(request)
+
+
+def test_openai_server_chain_preserves_targeted_item_ownership_and_recovery_position() -> None:
+    marker, projection = _targeted_projection_fixture()
+    response_ref = Message(
+        role=MessageRole.ASSISTANT,
+        content=(
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": "response_ref",
+                    "id": "resp_with_targeted_item",
+                    "targeted_tool_marker_id": projection.marker_id,
+                },
+            ),
+        ),
+    )
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message.text("user", "inherited"),
+            marker,
+            response_ref,
+            Message.text("user", "continue"),
+        ],
+        targeted_tool_projection=projection,
+        **_native_cache_anchor_fields(),
+    )
+
+    chained = build_openai_payload(request, reasoning_state="server")
+    replayed = build_openai_payload(request, reasoning_state="server", chain=False)
+
+    assert chained["previous_response_id"] == "resp_with_targeted_item"
+    assert all(item.get("type") != "additional_tools" for item in chained["input"])
+    additional_tools_indices = [
+        index
+        for index, item in enumerate(replayed["input"])
+        if item.get("type") == "additional_tools"
+    ]
+    assert additional_tools_indices == [1]
+
+
+def test_openai_server_chain_drops_inactive_targeted_provider_authority() -> None:
+    marker, _projection = _targeted_projection_fixture()
+    response_ref = Message(
+        role=MessageRole.ASSISTANT,
+        content=(
+            ProviderStatePart(
+                provider="openai",
+                state={"type": "response_ref", "id": "resp_with_inactive_tool"},
+            ),
+        ),
+    )
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message.text("user", "inherited"),
+            marker,
+            response_ref,
+            Message.text("user", "new interaction"),
+        ],
+    )
+
+    payload = build_openai_payload(request, reasoning_state="server")
+
+    assert "previous_response_id" not in payload
+    assert [item["role"] for item in payload["input"]] == ["user", "user"]
+    assert all(item.get("type") != "additional_tools" for item in payload["input"])
+
+
+def test_openai_server_chain_rebuilds_before_a_new_targeted_acquisition() -> None:
+    old_marker, old_projection = _targeted_projection_fixture()
+    marker_id = f"sha256:{'b' * 64}"
+    new_marker = Message(
+        role=MessageRole.ASSISTANT,
+        content=(
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": TARGETED_TOOL_PROJECTION_MARKER_TYPE,
+                    "protocol": OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
+                    "marker_id": marker_id,
+                },
+            ),
+        ),
+    )
+    new_projection = old_projection.model_copy(update={"marker_id": marker_id})
+    response_ref = Message(
+        role=MessageRole.ASSISTANT,
+        content=(
+            ProviderStatePart(
+                provider="openai",
+                state={"type": "response_ref", "id": "resp_with_old_tool"},
+            ),
+        ),
+    )
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message.text("user", "inherited"),
+            old_marker,
+            response_ref,
+            Message.text("user", "new acquisition"),
+            new_marker,
+        ],
+        targeted_tool_projection=new_projection,
+        **_native_cache_anchor_fields(),
+    )
+
+    payload = build_openai_payload(request, reasoning_state="server")
+
+    assert "previous_response_id" not in payload
+    assert [
+        index
+        for index, item in enumerate(payload["input"])
+        if item.get("type") == "additional_tools"
+    ] == [2]
+
+
+def test_openai_server_chain_resumes_after_an_explicit_targeted_clear() -> None:
+    old_marker, _old_projection = _targeted_projection_fixture()
+    cleared_response = Message(
+        role=MessageRole.ASSISTANT,
+        content=(
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": "response_ref",
+                    "id": "resp_without_targeted_tools",
+                    "targeted_tool_marker_id": None,
+                },
+            ),
+        ),
+    )
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message.text("user", "old interaction"),
+            old_marker,
+            cleared_response,
+            Message.text("user", "ordinary continuation"),
+        ],
+    )
+
+    payload = build_openai_payload(request, reasoning_state="server")
+
+    assert payload["previous_response_id"] == "resp_without_targeted_tools"
+    assert len(payload["input"]) == 1
+    assert payload["input"][0]["role"] == "user"
+
+
+@pytest.mark.parametrize(
+    "owned_marker_id",
+    [f"sha256:{'b' * 64}", "not-a-marker"],
+)
+def test_openai_server_chain_rebuilds_for_conflicting_or_malformed_explicit_ownership(
+    owned_marker_id: str,
+) -> None:
+    marker, projection = _targeted_projection_fixture()
+    response_ref = Message(
+        role=MessageRole.ASSISTANT,
+        content=(
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": "response_ref",
+                    "id": "resp_with_other_targeted_tools",
+                    "targeted_tool_marker_id": owned_marker_id,
+                },
+            ),
+        ),
+    )
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message.text("user", "old interaction"),
+            marker,
+            response_ref,
+            Message.text("user", "continue"),
+        ],
+        targeted_tool_projection=projection,
+        **_native_cache_anchor_fields(),
+    )
+
+    payload = build_openai_payload(request, reasoning_state="server")
+
+    assert "previous_response_id" not in payload
+    assert any(item.get("type") == "additional_tools" for item in payload["input"])
+
+
+def test_openai_targeted_projection_capability_is_an_exact_explicit_opt_in() -> None:
+    provider = OpenAIProvider(
+        api_key="k",
+        additional_tools_models=("gpt-verified",),
+    )
+
+    assert provider.supports_targeted_tool_projection(
+        model="gpt-verified",
+        protocol=OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
+    )
+    assert not provider.supports_targeted_tool_projection(
+        model="gpt-verified-snapshot",
+        protocol=OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
+    )
+    with pytest.raises(ValueError, match="not established"):
+        provider.preflight_targeted_tool_projection(
+            model="gpt-verified-snapshot",
+            protocol=OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
+        )
+
+
+@pytest.mark.anyio
+async def test_openai_unverified_native_projection_never_reaches_provider_transport() -> None:
+    marker, projection = _targeted_projection_fixture()
+    request = ModelRequest(
+        model="gpt-unverified",
+        messages=[Message.text("user", "go"), marker],
+        targeted_tool_projection=projection,
+        **_native_cache_anchor_fields(),
+    )
+    transport = RecordingTransport()
+    provider = OpenAIProvider(api_key="k", transport=transport)
+
+    events = [event async for event in provider.stream(request)]
+
+    assert [event.type for event in events] == [ModelStreamEventType.ERROR]
+    assert events[0].payload["error"]
+    assert transport.calls == []
+
+    with pytest.raises(ValueError, match="not established"):
+        await provider.count_input_tokens(request)
+    assert transport.count_calls == []
+
+
+def test_openai_targeted_projection_configuration_is_bounded() -> None:
+    with pytest.raises(TypeError, match="iterable of model names"):
+        OpenAIProvider(api_key="k", additional_tools_models={"gpt-verified": True})
+
+    with pytest.raises(ValueError, match="cannot contain more than 256"):
+        OpenAIProvider(
+            api_key="k",
+            additional_tools_models=(f"model-{index}" for index in range(257)),
+        )
+
+    with pytest.raises(ValueError, match="unique"):
+        OpenAIProvider(
+            api_key="k",
+            additional_tools_models=("gpt-verified", "gpt-verified"),
+        )
+
+    with pytest.raises(ValueError, match="1024 UTF-8 bytes"):
+        OpenAIProvider(api_key="k", additional_tools_models=("m" * 1025,))
+
+    with pytest.raises(ValueError, match="surrogate"):
+        OpenAIProvider(api_key="k", additional_tools_models=("model-\ud800",))
+
+
+def test_targeted_projection_request_is_bounded() -> None:
+    with pytest.raises(ValidationError, match="at most 32 items"):
+        TargetedToolProjectionRequest(
+            marker_id=f"sha256:{'a' * 64}",
+            tools=tuple(
+                {
+                    "name": f"tool_{index:02d}",
+                    "description": "Bounded targeted tool.",
+                    "input_schema": {"type": "object"},
+                }
+                for index in range(33)
+            ),
+        )
 
 
 class StaleChainRecoveryTransport:
@@ -5236,7 +5792,12 @@ async def test_server_mode_recovers_from_stale_previous_response_id() -> None:
                 role=MessageRole.ASSISTANT,
                 content=[
                     ProviderStatePart(
-                        provider="openai", state={"type": "response_ref", "id": "resp_prev"}
+                        provider="openai",
+                        state={
+                            "type": "response_ref",
+                            "id": "resp_prev",
+                            "targeted_tool_marker_id": None,
+                        },
                     )
                 ],
             ),
@@ -5249,6 +5810,68 @@ async def test_server_mode_recovers_from_stale_previous_response_id() -> None:
     assert "previous_response_id" not in transport.payloads[1]
     assert transport.payloads[1]["store"] is True
     assert len(transport.payloads) == 2
+    completed = next(event for event in events if event.type is ModelStreamEventType.COMPLETED)
+    response_ref = next(
+        item["state"]
+        for item in completed.payload["provider_state"]
+        if item["state"].get("type") == "response_ref"
+    )
+    assert response_ref["targeted_tool_marker_id"] is None
+
+
+@pytest.mark.anyio
+async def test_server_mode_stale_chain_replays_targeted_item_at_its_exact_position() -> None:
+    marker, projection = _targeted_projection_fixture()
+    transport = StaleChainRecoveryTransport()
+    provider = OpenAIProvider(
+        api_key="k",
+        reasoning_state="server",
+        transport=transport,
+        additional_tools_models=("gpt-test",),
+    )
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message.text("user", "inherited"),
+            marker,
+            Message(
+                role=MessageRole.ASSISTANT,
+                content=(
+                    ProviderStatePart(
+                        provider="openai",
+                        state={
+                            "type": "response_ref",
+                            "id": "resp_prev",
+                            "targeted_tool_marker_id": projection.marker_id,
+                        },
+                    ),
+                ),
+            ),
+            Message.text("user", "continue"),
+        ],
+        targeted_tool_projection=projection,
+        **_native_cache_anchor_fields(),
+    )
+
+    events = [event async for event in provider.stream(request)]
+
+    assert any(event.type is ModelStreamEventType.COMPLETED for event in events)
+    assert len(transport.payloads) == 2
+    assert transport.payloads[0]["previous_response_id"] == "resp_prev"
+    assert all(item.get("type") != "additional_tools" for item in transport.payloads[0]["input"])
+    assert "previous_response_id" not in transport.payloads[1]
+    assert [
+        index
+        for index, item in enumerate(transport.payloads[1]["input"])
+        if item.get("type") == "additional_tools"
+    ] == [1]
+    completed = next(event for event in events if event.type is ModelStreamEventType.COMPLETED)
+    response_ref = next(
+        item["state"]
+        for item in completed.payload["provider_state"]
+        if item["state"].get("type") == "response_ref"
+    )
+    assert response_ref["targeted_tool_marker_id"] == projection.marker_id
 
 
 @pytest.mark.anyio
@@ -5307,7 +5930,14 @@ async def test_server_mode_stale_chain_rebuilds_completed_hosted_search_in_order
                 tool_name="read_file",
                 arguments={"path": "README.md"},
             ),
-            ProviderStatePart(provider="openai", state={"type": "response_ref", "id": "resp_prev"}),
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": "response_ref",
+                    "id": "resp_prev",
+                    "targeted_tool_marker_id": None,
+                },
+            ),
         ],
     )
     transport = StaleChainRecoveryTransport()
@@ -5377,7 +6007,12 @@ async def test_server_mode_does_not_recover_non_stale_previous_response_error() 
                 role=MessageRole.ASSISTANT,
                 content=[
                     ProviderStatePart(
-                        provider="openai", state={"type": "response_ref", "id": "resp_prev"}
+                        provider="openai",
+                        state={
+                            "type": "response_ref",
+                            "id": "resp_prev",
+                            "targeted_tool_marker_id": None,
+                        },
                     )
                 ],
             ),
@@ -5418,7 +6053,12 @@ async def test_server_mode_does_not_recover_conflicting_stale_chain_identity() -
                 role=MessageRole.ASSISTANT,
                 content=[
                     ProviderStatePart(
-                        provider="openai", state={"type": "response_ref", "id": "resp_prev"}
+                        provider="openai",
+                        state={
+                            "type": "response_ref",
+                            "id": "resp_prev",
+                            "targeted_tool_marker_id": None,
+                        },
                     )
                 ],
             ),
@@ -5463,7 +6103,12 @@ async def test_server_mode_recovers_from_in_band_stale_chain_identity() -> None:
                 role=MessageRole.ASSISTANT,
                 content=[
                     ProviderStatePart(
-                        provider="openai", state={"type": "response_ref", "id": "resp_prev"}
+                        provider="openai",
+                        state={
+                            "type": "response_ref",
+                            "id": "resp_prev",
+                            "targeted_tool_marker_id": None,
+                        },
                     )
                 ],
             ),

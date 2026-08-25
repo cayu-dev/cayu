@@ -205,6 +205,27 @@ def test_openai_background_mode_is_part_of_the_builtin_provider_profile() -> Non
     assert synchronous != background
 
 
+def test_openai_additional_tools_allowlist_is_part_of_the_builtin_provider_profile() -> None:
+    baseline = execution_profile_admission._cayu_provider_material(
+        OpenAIProvider(api_key="test-key")
+    )
+    verified = execution_profile_admission._cayu_provider_material(
+        OpenAIProvider(
+            api_key="test-key",
+            additional_tools_models=("gpt-verified-b", "gpt-verified-a"),
+        )
+    )
+
+    assert baseline is not None
+    assert verified is not None
+    assert baseline["additional_tools_models"] == []
+    assert verified["additional_tools_models"] == [
+        "gpt-verified-a",
+        "gpt-verified-b",
+    ]
+    assert baseline != verified
+
+
 def test_unknown_provider_retry_contract_is_an_explicit_finalization_migration() -> None:
     previous_retry_policy = RetryPolicy().model_dump(mode="json")
     previous_retry_policy.pop("max_unknown_attempts")

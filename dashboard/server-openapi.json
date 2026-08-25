@@ -123,10 +123,21 @@
             "title": "Runtime Hooks",
             "type": "array"
           },
-          "tool_gateway_enabled": {
-            "default": false,
-            "title": "Tool Gateway Enabled",
-            "type": "boolean"
+          "targeted_tool_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "call_tool",
+                  "openai_additional_tools",
+                  "openai_additional_tools_or_call_tool"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Targeted Tool Mode"
           },
           "tool_policy": {
             "title": "Tool Policy",
@@ -4241,8 +4252,8 @@
             "$ref": "#/components/schemas/RuntimeManifest"
           },
           "schema_version": {
-            "const": "11",
-            "default": "11",
+            "const": "12",
+            "default": "12",
             "title": "Schema Version",
             "type": "string"
           },
@@ -14774,7 +14785,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "25",
+            "default": "26",
             "title": "Contract Version",
             "type": "string"
           },
@@ -18652,7 +18663,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "25",
+            "default": "26",
             "title": "Contract Version",
             "type": "string"
           }

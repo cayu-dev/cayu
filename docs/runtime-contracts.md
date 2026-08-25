@@ -1334,7 +1334,7 @@ Events emitted for an environment-backed run carry `environment_name` as a top-l
 
 Run ownership is a required part of the `SessionStore` contract. A successful `transition_status(..., to_status=RUNNING)` or `transition_status_and_checkpoint(..., to_status=RUNNING)` increments `Session.run_epoch` and binds that epoch to the current execution context. `fence_stalled_run(...)` atomically verifies status and inactivity, increments the epoch, refreshes activity, and binds the replacement claim. `fence_run_and_transform_checkpoint(...)` is the checkpoint-authorized counterpart: it persists a required checkpoint transform and advances the run epoch in the same transaction, or rolls back both when the transform returns `None` or raises. Cayu uses that stronger boundary when an exact expired recovery claim authorizes takeover, so the stale owner cannot write between claim replacement and epoch advancement. While a claim is active, runtime progress writes to status, model, labels, metadata, events, transcript, or checkpoint must compare the durable epoch and raise `SessionRunFenced` after ownership changes. `release_run_fence(...)` runs once after trailing writes; if the task still owns the durable epoch, it increments that epoch before clearing task-local ownership so child contexts that inherited the old claim cannot write late. Custom stores must implement both fence operations, fence release, and equivalent task-local ownership tracking.
 
-Custom `SessionStore` implementations must also implement the interaction-admission transaction. `create(...)` and `transition_status_and_checkpoint(...)` accept optional interaction admission data and must persist the run-epoch claim, `interaction.started` side-effect handoff, and either attributed transcript messages or a private deferred source batch as one commit. First-interaction creation must persist the pending initial-authority marker in that same commit. The transition can instead name an existing open interaction when crash recovery must precede the admitted source batch. `replace_initial_transcript_messages(...)` materializes the ordered initial transcript and clears its authority marker without an externally visible intermediate form, `materialize_deferred_interaction_input(...)` appends the source-only fallback used before terminalization while retaining that marker, and `load_deferred_interaction_input(...)` exposes a detached snapshot for complete export. These methods are required; a store that cannot provide their atomicity is not interaction-safe. Prerelease pending model/tool recovery state without an open interaction is rejected rather than migrated into the new lifecycle.
+Custom `SessionStore` implementations must also implement the interaction-admission transaction. `create(...)` and `transition_status_and_checkpoint(...)` accept optional interaction admission data and must persist the run-epoch claim, `interaction.started` side-effect handoff, and either attributed transcript messages or a private deferred source batch as one commit. First-interaction creation must persist the pending initial-authority marker in that same commit. The transition can instead name an existing open interaction when crash recovery must precede the admitted source batch. `replace_initial_transcript_messages(...)` materializes the ordered initial transcript and clears its authority marker without an externally visible intermediate form; its bounded `runtime_suffix_count` places runtime-owned acquisition markers after the exact admitted source segment while attributing both segments to the interaction. `materialize_deferred_interaction_input(...)` appends the source-only fallback used before terminalization while retaining that marker, and `load_deferred_interaction_input(...)` exposes a detached snapshot for complete export. These methods are required; a store that cannot provide their atomicity is not interaction-safe. Prerelease pending model/tool recovery state without an open interaction is rejected rather than migrated into the new lifecycle.
 
 `Session.last_activity_at` is the durable recovery signal. Runtime progress writes refresh it, and inactive-session queries must apply `last_activity_before` in storage before `limit` so recent rows cannot hide older stalled work. Operator annotation writes through `update_labels(...)` or `update_metadata(...)` advance `updated_at` but leave `last_activity_at` unchanged, so editing a stalled session cannot postpone recovery. Recovery that needs only the inactivity predicate claims the run through `fence_stalled_run(...)`; recovery that also installs a durable checkpoint lease uses `fence_run_and_transform_checkpoint(...)` so lease ownership and epoch fencing cannot diverge. A plain status or checkpoint update is not an ownership transfer.
 
@@ -1524,13 +1524,13 @@ policy input, so adding this canonical index does not reorder existing model
 requests. Duplicate ids or model-visible names, malformed or oversized
 descriptors, inconsistent fingerprints, and application or MCP tools named
 `call_tool`, `search_tools`, or `__cayu_submit_structured_output` fail during
-registration. Those names form Cayu's framework namespace. An agent opts into
-the portable gateway with `enable_tool_gateway=True`; Cayu then projects the
-canonical `call_tool` definition on every request in that agent's execution
-profile. Registration requires targeted-grant-capable storage and configured
-public-alias authority, so an exposed gateway can always reject fabricated
-references durably. Generalized `search_tools` remains reserved and is not yet
-exposed.
+registration. Those names form Cayu's framework namespace. An agent selects one
+targeted-grant delivery policy with `targeted_tool_mode`; the portable
+`"call_tool"` mode projects the canonical gateway definition on every request in
+that agent's execution profile. Registration requires targeted-grant-capable
+storage and configured public-alias authority, so every selected projection can
+reject fabricated or replayed authority durably. Generalized `search_tools`
+remains reserved and is not yet exposed.
 
 The catalogue revision and descriptor versions join the existing direct-tools
 execution-profile component. Tool implementation behavior remains solely in
@@ -1645,8 +1645,9 @@ proof of lower whole-task cost.
 
 When request-footprint observation is enabled, conversational requests without
 targeted grants use `RequestFootprint.schema_version == 3`; a request carrying
-targeted grants uses schema version 4 and adds only their bounded identity and
-call-count summary. Both versions embed the same content-minimized direct-tool
+targeted grants uses schema version 5 and adds only their bounded identity,
+delivery projection, native marker position where applicable, and call-count
+summary. Both versions embed the same content-minimized direct-tool
 exposure profile/fingerprint/count summary. The keyed
 `fingerprints.tool_manifest` and cache-breakpoint fingerprints bind that summary
 to the exact prepared request without persisting tool definitions.
@@ -1718,7 +1719,7 @@ idempotency, or recovery checks.
 ```python
 from cayu import Message, ResumeRequest, TargetedToolGrant
 
-# The agent must have been registered with enable_tool_gateway=True before its
+# The agent must have been registered with targeted_tool_mode="call_tool" before its
 # session began. The registered target tool can remain outside direct exposure.
 
 request = ResumeRequest(
@@ -1758,6 +1759,112 @@ each exact runtime-issued reference is retained as separately attested
 authority. Model-authored lookalikes and unissued secret-bearing references do
 not receive that exemption.
 
+#### Targeted-grant delivery modes
+
+`targeted_tool_mode` is explicit and has no enabled-by-default native behavior:
+
+| Mode | Selection |
+| --- | --- |
+| `None` | Targeted grants are rejected; ordinary direct exposure is unchanged. |
+| `"call_tool"` | Always use the provider-independent gateway. |
+| `"openai_additional_tools"` | Require verified OpenAI Responses `additional_tools` support and fail before provider dispatch otherwise. |
+| `"openai_additional_tools_or_call_tool"` | Select native only when the registered provider reports the exact verified capability; otherwise freeze the gateway before dispatch. |
+
+OpenAI native support is an application assertion on one concrete provider
+registration. List exact model ids in `OpenAIProvider.additional_tools_models`;
+Cayu does not infer capability from a model prefix, marketing family, or an
+OpenAI-compatible endpoint. The provider base URL, exact model allow-list,
+configured mode, and resolved projection are included in execution-profile
+identity. Changing any of them is semantic drift, not an automatic retry
+fallback.
+
+```python
+from cayu import AgentSpec, OpenAIProvider, StaticToolExposurePolicy
+
+verified_model = "the-exact-model-id-verified-for-this-endpoint"
+app.register_provider(
+    OpenAIProvider(
+        api_key=openai_key,
+        additional_tools_models=(verified_model,),
+    ),
+    default=True,
+)
+app.register_agent(
+    AgentSpec(name="reviewer", model=verified_model),
+    tools=(remember_knowledge,),
+    tool_exposure_policy=StaticToolExposurePolicy(
+        profile_id="targeted-only",
+        tools=(),
+    ),
+    targeted_tool_mode="openai_additional_tools",
+)
+```
+
+For a native grant, the durable transcript stores one small runtime-owned
+OpenAI provider-state marker immediately after the admitted source messages at
+the grant-acquisition boundary. It stores no function schema or callable.
+Request construction revalidates that marker against the exact durable grant
+batch and canonical catalogue, then expands it in place to one Responses input
+item shaped as `{"type":"additional_tools","role":"developer","tools":[...]}`.
+Definitions are sorted by canonical name and derived only from registered
+descriptors. Copied provider items, message text, and caller-authored lookalikes
+cannot issue a grant. A native function name that was not in the frozen
+projection remains an ordinary direct-call candidate and still must be in the
+frozen direct exposure; it cannot acquire targeted authority by name.
+
+The marker is after inherited history, so a parent and fork retain the complete
+cacheable prefix that existed before the child grant. Generic retry,
+context-overflow recovery, tool-result continuation, approval continuation, and
+process reconstruction expand the same marker to the same item at the same
+position. In OpenAI's default Cayu configuration (`reasoning_state="inline"`,
+`store=False`), Cayu manually replays the item, native function call, and
+`function_call_output`. With explicitly configured server reasoning state,
+OpenAI owns items preceding `previous_response_id`; stale-chain recovery rebuilds
+the item from the marker at its original position. Cayu also breaks and neutrally
+replays a server chain before it could inherit an inactive item from an earlier
+interaction, so provider retention cannot extend Cayu addressability. Chaining
+remains enabled while the same grant batch is active. Native projection does not
+require provider-side conversation storage.
+
+Each completed server-mode response reference records only the retained marker
+id, or an explicit null when no targeted item was sent. Reconnectable OpenAI
+background operations carry that same scalar in their bounded continuation
+metadata. This proof lets Cayu break a chain exactly once to clear an old item,
+then resume `previous_response_id` chaining after the clear response instead of
+replaying the full transcript indefinitely. No schema, arguments, reference, or
+callable enters either ownership record.
+
+OpenAI documents dynamically loaded functions as callable after their
+`additional_tools` item. Cayu therefore preserves that historical item for all
+model steps and interruptions inside the issuing interaction even after its
+single call is consumed; the durable grant ledger still rejects any excess,
+expired, revoked, altered, or out-of-scope call before policy or target work.
+When the interaction ends, the grant loses addressability and a later ordinary
+interaction does not expand its inactive marker. That can change the provider
+suffix beginning at the old acquisition boundary, but never the inherited
+prefix before it. `store=False` asks OpenAI not to retain the response;
+`reasoning_state="server"` uses provider retention and must be selected only
+when that retention policy is acceptable. In either mode the canonical tool
+description and schema are sent to OpenAI when the native grant is active.
+
+Native mode also keeps the one canonical `call_tool` definition in OpenAI's
+top-level `tools` array on every request as a stable prompt-cache anchor. It is
+not a second authority path: Cayu owns `tool_choice`, excludes `call_tool` from
+the `allowed_tools` set, and sends `tool_choice="none"` when no other request
+tool is callable. An active grant adds only its
+canonical function definition through the later `additional_tools` item and
+adds that function—not the anchor—to the callable allow-list. Explicit
+provider-level `tool_choice` can narrow this set or require one of its members,
+but cannot re-enable the anchor or name an unavailable function. This fixed
+one-schema core is the cache-stable prefix; registering many targeted tools
+does not add their schemas to it.
+
+The fallback mode resolves once, before the logical model request exists. A
+capability error after dispatch never retries with a different projection,
+because provider acceptance may already be ambiguous. Native and gateway
+callability are mutually exclusive for one grant batch, and a native targeted
+name cannot also be directly exposed in the same request.
+
 The provider-facing gateway accepts exactly an opaque reference and an inner
 argument object:
 
@@ -1787,6 +1894,17 @@ continuation rejoin the original consumption instead of spending the call budget
 twice. General events never publish `tool_ref`; safe execution events link the
 outer call to the canonical target, grant, use, descriptor, arguments digest,
 and invocation identities.
+
+The native projection enters that same resolution boundary before policy. Its
+provider call id, canonical argument digest, grant, and stable invocation id are
+atomically bound exactly like the gateway form. The transcript keeps the native
+function name and direct argument object and returns an ordinary correlated
+`function_call_output`; no private reference enters either provider item.
+Invalid arguments, scope or catalogue drift, expiry, revocation, exhaustion,
+and replay mismatch return a provider-valid error result without policy,
+approval, hooks, secrets, environment access, or target execution. Lifecycle
+evidence records `dispatch_kind="native"` or `"gateway"` while keeping schemas,
+references, raw arguments, and results out of request footprints.
 
 The stores provide atomic issue-or-reuse, bounded inspection,
 consume-or-rejoin, revocation, expiry evidence, and reconstruction. First use
@@ -1820,6 +1938,21 @@ child-attributed pending knowledge entry, and approval continuation reuses the
 same grant consumption. The deterministic provider is an API-key-free fixture,
 not a Cayu memory product: real applications own the memory prompt, schedule,
 finding criteria, and grant policy while composing the same runtime primitives.
+
+The credential-gated
+[`openai_targeted_tools_live.py`](../examples/openai_targeted_tools_live.py)
+contract separately verifies a real exact allow-listed OpenAI model, native
+function execution, one durable grant consumption, and nonzero cached input on
+an inherited parent/fork prefix. One non-authoritative sibling first writes the
+exact inherited-history-and-user-message boundary without a grant; the single
+memory-writing child receives the same user message plus the runtime-owned
+native suffix. Both requests retain the same inert top-level `call_tool` cache
+anchor while runtime-owned `tool_choice` prevents that anchor from being
+called. The contract supplies one session-scoped `prompt_cache_key` and requests
+GPT-5.6 implicit caching so those related requests follow OpenAI's documented
+cache-routing contract. It requires `CAYU_OPENAI_TARGETED_LIVE=1`, limits the
+model to four small completion steps, and fails rather than claiming cache
+success when OpenAI reports zero cached tokens.
 
 Natural expiry, including interaction termination, is an expected loss of
 addressability rather than authority drift. Recovery records the expiry and
@@ -1861,7 +1994,7 @@ baseline but cannot be rewritten in place as governed egress profiles.
 | `direct_tools` | Ordered names, descriptions, schemas, parallel-safety, effects, and workspace-mutation declarations | Reject as authority-changing. |
 | `tool_implementations` | Ordered application or Cayu behavior/implementation identities | Reject as authority-changing; missing custom identity is `process_local`. |
 | `tool_view_grants` | View kind, generation, and ordered grant baseline | Reject as authority-changing. The current implementation is the direct-tool view; future catalogued tool views can implement this same seam. |
-| `execution_policies` | Tool exposure policy, stable tool-gateway opt-in and schema identity, tool policy, per-tool command policies, and ordered app/agent loop policies | Reject as authority-changing; missing custom identity is `process_local`. |
+| `execution_policies` | Tool exposure policy, configured targeted-grant delivery mode, resolved native-or-gateway projection and gateway schema identity where selected, tool policy, per-tool command policies, and ordered app/agent loop policies | Reject as authority-changing; missing custom identity is `process_local`. |
 | `invocation_policies` | Ordered request loop policies for this run, resume, or continuation | Reject as authority-changing; missing custom identity is `process_local`. Cleanup-only recovery retains the already-admitted component instead of inventing a replacement. |
 | `runtime_hooks` | Ordered app-then-agent hook names and behavior identities | Reject as authority-changing; order is semantic and missing custom identity is `process_local`. |
 | `execution_environment` | Environment/factory/runner identities, binding shape, workspace/runner presence, and execution requirements | Reject as authority-changing; missing custom environment, factory, or runner identity is `process_local`. |

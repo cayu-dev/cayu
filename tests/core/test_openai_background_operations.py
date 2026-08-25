@@ -11,6 +11,7 @@ import pytest
 
 from cayu import AgentSpec, CayuApp, InMemorySessionStore, RunRequest
 from cayu.core import EventType, Message
+from cayu.core.messages import MessageRole, ProviderStatePart
 from cayu.providers import (
     HttpxOpenAITransport,
     ModelRequest,
@@ -25,6 +26,12 @@ from cayu.providers import (
     ProviderOperationStartRequest,
     ProviderOperationState,
     ProviderOperationStatus,
+    TargetedToolProjectionRequest,
+)
+from cayu.providers.base import (
+    OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
+    TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
+    TARGETED_TOOL_PROJECTION_MARKER_TYPE,
 )
 from cayu.runtime import (
     IncompleteSessionRecoveryRequest,
@@ -36,12 +43,55 @@ from cayu.runtime.provider_operations import (
     ProviderOperationUnavailableReason,
     inspect_provider_operation,
 )
+from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
+from cayu.runtime.tool_gateway import call_tool_spec
 
 
 def _request() -> ModelRequest:
     return ModelRequest(
         model="gpt-test",
         messages=[Message.text("user", "finish this in the background")],
+    )
+
+
+def _targeted_request() -> tuple[ModelRequest, str]:
+    marker_id = f"sha256:{'a' * 64}"
+    marker = Message(
+        role=MessageRole.ASSISTANT,
+        content=(
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": TARGETED_TOOL_PROJECTION_MARKER_TYPE,
+                    "protocol": OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
+                    "marker_id": marker_id,
+                },
+            ),
+        ),
+    )
+    return (
+        ModelRequest(
+            model="gpt-test",
+            messages=[Message.text("user", "remember this"), marker],
+            tools=[call_tool_spec()],
+            targeted_tool_projection=TargetedToolProjectionRequest(
+                marker_id=marker_id,
+                tools=(
+                    {
+                        "name": "remember",
+                        "description": "Remember one reviewed fact.",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"fact": {"type": "string"}},
+                            "required": ["fact"],
+                            "additionalProperties": False,
+                        },
+                    },
+                ),
+            ),
+            options={TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION: CALL_TOOL_NAME},
+        ),
+        marker_id,
     )
 
 
@@ -296,6 +346,59 @@ async def test_openai_background_start_publishes_identity_before_output() -> Non
 
 
 @pytest.mark.anyio
+async def test_openai_background_retains_targeted_tool_ownership_through_stream() -> None:
+    transport = BackgroundTransport()
+    transport.start_batches.append([_created(), _completed(sequence_number=1)])
+    provider = OpenAIProvider(
+        api_key="test-key",
+        background=True,
+        reasoning_state="server",
+        additional_tools_models=("gpt-test",),
+        transport=transport,
+    )
+    adapter = provider.provider_operations
+    assert adapter is not None
+    request, marker_id = _targeted_request()
+
+    connection = await adapter.start(
+        ProviderOperationStartRequest(request=request, idempotency_key="targeted-start-id")
+    )
+    events = [event async for event in connection.events]
+
+    assert connection.state.recovery_metadata.opaque["targeted_tool_marker_id"] == marker_id
+    assert transport.start_calls[0]["payload"]["input"][-1]["type"] == "additional_tools"
+    completed = next(event for event in events if event.type is ModelStreamEventType.COMPLETED)
+    assert completed.recovery_metadata is not None
+    assert completed.recovery_metadata.opaque["targeted_tool_marker_id"] == marker_id
+    response_ref = next(
+        item["state"]
+        for item in completed.payload["provider_state"]
+        if item["state"].get("type") == "response_ref"
+    )
+    assert response_ref["targeted_tool_marker_id"] == marker_id
+
+
+@pytest.mark.anyio
+async def test_openai_background_rejects_unverified_native_projection_before_transport() -> None:
+    transport = BackgroundTransport()
+    provider = OpenAIProvider(
+        api_key="test-key",
+        background=True,
+        transport=transport,
+    )
+    adapter = provider.provider_operations
+    assert adapter is not None
+    request, _marker_id = _targeted_request()
+
+    with pytest.raises(ValueError, match="not established"):
+        await adapter.start(
+            ProviderOperationStartRequest(request=request, idempotency_key="targeted-start-id")
+        )
+
+    assert transport.start_calls == []
+
+
+@pytest.mark.anyio
 async def test_openai_background_reconnect_starts_after_last_accepted_sequence() -> None:
     transport = BackgroundTransport()
     transport.start_batches.append(
@@ -546,6 +649,45 @@ async def test_openai_background_retrieves_completion_that_finished_offline() ->
         "total_tokens": 5,
     }
     assert transport.retrieve_calls[0]["url"].endswith("/v1/responses/resp_background_123")
+
+
+@pytest.mark.anyio
+async def test_openai_background_retrieval_preserves_explicit_targeted_clear() -> None:
+    transport = BackgroundTransport()
+    provider = OpenAIProvider(
+        api_key="test-key",
+        background=True,
+        reasoning_state="server",
+        transport=transport,
+    )
+    adapter = provider.provider_operations
+    assert adapter is not None
+    state = ProviderOperationState(
+        operation_id="resp_background_123",
+        stream_protocol="openai-responses-background-v1",
+        recovery_metadata={
+            "cursor": 0,
+            "opaque": {
+                "sequence_number": 0,
+                "targeted_tool_marker_id": None,
+            },
+        },
+    )
+    transport.retrieve_responses.append(_completed()["response"])
+
+    snapshot = await adapter.retrieve(state)
+
+    completed = next(
+        event for event in snapshot.events if event.type is ModelStreamEventType.COMPLETED
+    )
+    response_ref = next(
+        item["state"]
+        for item in completed.payload["provider_state"]
+        if item["state"].get("type") == "response_ref"
+    )
+    assert response_ref["targeted_tool_marker_id"] is None
+    assert completed.recovery_metadata is not None
+    assert completed.recovery_metadata.opaque["targeted_tool_marker_id"] is None
 
 
 @pytest.mark.anyio

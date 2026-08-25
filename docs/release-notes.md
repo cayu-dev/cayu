@@ -375,6 +375,49 @@ instances require revision 53. That delivery slice established portable
 authoring and durable storage; the current unreleased build above adds
 target-bound execution.
 
+### OpenAI can project targeted grants as cache-stable native tools
+
+Agents now select targeted-grant delivery with `targeted_tool_mode`. The
+portable `"call_tool"` mode keeps one stable gateway definition, while
+`"openai_additional_tools"` projects a grant through the OpenAI Responses
+`additional_tools` input contract. The explicit
+`"openai_additional_tools_or_call_tool"` mode selects native delivery only for
+an exact model listed in that provider registration's
+`additional_tools_models`; unsupported providers and unverified model or
+endpoint combinations use the gateway before dispatch. Cayu does not infer
+native support from model-family names or compatible base URLs.
+
+Native definitions come only from the admitted canonical catalogue. Cayu
+commits a schema-free runtime marker immediately after the interaction input
+that acquires the grant and expands it at that exact position on every request,
+retry, overflow recovery, interruption continuation, and stateless replay. A
+fork therefore preserves its inherited prefix and gains addressability only
+from a fresh child-scoped grant. Server-state and background Responses
+continuations retain only the marker identity needed to prevent an inactive
+native item from surviving its Cayu authority.
+
+Returned native calls resolve and atomically consume the same durable grant as
+the gateway before entering the existing policy, approval, hook, effect,
+secret, environment, concurrency, idempotency, execution, receipt, and recovery
+path. Request footprints identify the selected projection and insertion
+position without retaining schemas, references, arguments, or results. The
+credential-gated `examples/openai_targeted_tools_live.py` contract checks a real
+native call and requires cached inherited-prefix tokens on the child's first
+request. A grant-free sibling first writes that exact prefix; the memory-writing
+child then adds only the native targeted-tool suffix. Native mode keeps one
+canonical `call_tool` definition as a stable top-level cache anchor, while a
+runtime-owned OpenAI `allowed_tools` choice always excludes that anchor and
+makes only ordinary or actively granted functions callable. Both requests use
+a session-scoped cache-routing key and GPT-5.6 implicit caching.
+
+This intentionally replaces the prerelease `enable_tool_gateway` registration
+argument and `tool_gateway_enabled` manifest field; use
+`targeted_tool_mode="call_tool"` for the portable behavior. The public
+application manifest and generator plan advance to schema version 12. Server
+contract version 26 replaces the agent manifest boolean with the nullable
+targeted-tool mode; independently deployed servers, generated clients, and
+dashboards must be upgraded together.
+
 ### Targeted grants can execute through the portable `call_tool` gateway
 
 `RunRequest` and `ResumeRequest` can now carry strict `TargetedToolGrant`
@@ -386,7 +429,7 @@ catalogue drift, task-boundary changes, and exhausted grants fail closed. Forks
 copy no targeted grant or consumption authority and record an explicit reset
 event.
 
-Agents opt into the portable gateway at registration. Cayu then keeps one exact
+Agents select `targeted_tool_mode="call_tool"` at registration. Cayu then keeps one exact
 provider-independent `call_tool(tool_ref, arguments)` definition in every
 request for that execution profile, while an active grant appends its bounded
 runtime-authored descriptor context after conversation history. This preserves

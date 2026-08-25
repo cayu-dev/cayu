@@ -175,7 +175,7 @@ def test_mcp_descriptor_identity_is_bounded_and_does_not_retain_source_name() ->
         ToolDescriptorProvenance.model_validate(malformed)
 
 
-def test_tool_gateway_opt_in_is_bound_without_changing_catalogued_tools() -> None:
+def test_targeted_delivery_mode_is_bound_without_changing_catalogued_tools() -> None:
     disabled = CayuApp(enable_logging=False)
     disabled.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -185,7 +185,7 @@ def test_tool_gateway_opt_in_is_bound_without_changing_catalogued_tools() -> Non
     enabled.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
         tools=(_DeclaredTool("remember"),),
-        enable_tool_gateway=True,
+        targeted_tool_mode="call_tool",
     )
 
     disabled_profile = _profile(disabled)

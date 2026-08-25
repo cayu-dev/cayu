@@ -421,6 +421,32 @@ def test_targeted_tool_invocation_linkage_requires_runtime_provenance() -> None:
     )
     assert {key: persisted.payload[key] for key in authority} == authority
 
+    native_authority = {
+        **authority,
+        "dispatch_kind": "native",
+        "model_tool_name": "remember",
+    }
+    native_event = Event(
+        type=EventType.TOOL_CALL_STARTED,
+        session_id="targeted-native-tool-provenance",
+        tool_name="remember",
+        payload=native_authority,
+    )
+    prepared_native = prepare_new_runtime_event(
+        event_with_runtime_payload_authority(native_event, *native_authority),
+        redactor=SecretRedactor(),
+    )
+    assert {key: prepared_native.payload[key] for key in native_authority} == native_authority
+
+    mismatched_native = native_event.model_copy(
+        update={"payload": {**native_authority, "model_tool_name": "other"}}
+    )
+    prepared_mismatch = prepare_new_runtime_event(
+        event_with_runtime_payload_authority(mismatched_native, *native_authority),
+        redactor=SecretRedactor(),
+    )
+    assert "model_tool_name" not in prepared_mismatch.payload
+
 
 def test_pause_projection_schemas_track_the_typed_checkpoint_models() -> None:
     assert (
@@ -441,6 +467,7 @@ def test_pause_projection_schemas_track_the_typed_checkpoint_models() -> None:
         frozenset(PendingUserInput.model_fields)
         - {
             "execution_profile_fingerprint",
+            "interaction_id",
             "run_limit_accounting",
             "staged_terminals",
             "tool_exposure",

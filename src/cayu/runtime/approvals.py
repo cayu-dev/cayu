@@ -439,11 +439,7 @@ class PendingToolCallApproval(BaseModel):
                 "Non-authoritative tool-policy evidence cannot carry a policy decision."
             )
         if self.targeted_tool_invocation is not None and self.targeted_tool_rejection is not None:
-            raise ValueError("A pending call cannot be both gateway-resolved and rejected.")
-        if self.targeted_tool_grant_id is not None and (
-            self.tool_name != "call_tool" and self.model_tool_name != "call_tool"
-        ):
-            raise ValueError("Pending grant selection requires a call_tool model call.")
+            raise ValueError("A pending call cannot be both targeted-resolved and rejected.")
         if self.targeted_tool_invocation is not None:
             invocation = self.targeted_tool_invocation
             if (
@@ -451,20 +447,23 @@ class PendingToolCallApproval(BaseModel):
                 or self.tool_name != invocation.effective_tool_name
                 or self.tool_call_id != invocation.outer_tool_call_id
             ):
-                raise ValueError("Pending gateway invocation conflicts with its effective call.")
+                raise ValueError("Pending targeted invocation conflicts with its effective call.")
             if (
                 self.targeted_tool_grant_id is not None
                 and self.targeted_tool_grant_id != invocation.grant_id
             ):
-                raise ValueError("Pending grant selection conflicts with its gateway invocation.")
+                raise ValueError("Pending grant selection conflicts with its targeted invocation.")
         if self.targeted_tool_rejection is not None:
             rejection = self.targeted_tool_rejection
-            if self.model_tool_name != rejection.model_tool_name or self.tool_name != "call_tool":
-                raise ValueError("Pending gateway rejection conflicts with its model call.")
+            if (
+                self.model_tool_name != rejection.model_tool_name
+                or self.tool_name != rejection.model_tool_name
+            ):
+                raise ValueError("Pending targeted rejection conflicts with its model call.")
         if self.model_tool_name is not None and (
             self.targeted_tool_invocation is None and self.targeted_tool_rejection is None
         ):
-            raise ValueError("Pending model tool alias requires gateway evidence.")
+            raise ValueError("Pending model tool alias requires targeted-tool evidence.")
         return self
 
     @property
@@ -472,6 +471,8 @@ class PendingToolCallApproval(BaseModel):
         """Return the non-authoritative provider-history argument projection."""
 
         if self.targeted_tool_invocation is not None:
+            if self.targeted_tool_invocation.dispatch_kind == "native":
+                return copy_durable_json_value(self.arguments, "arguments")
             return {
                 "tool_ref": TARGETED_TOOL_TRANSCRIPT_REFERENCE,
                 "arguments": copy_durable_json_value(self.arguments, "arguments"),

@@ -152,13 +152,32 @@ def pause_checkpoint_validation_view(
         # checkpoint parsing does not use this helper and still requires the
         # original explicit authority field.
         checkpoint["publish_arguments"] = not arguments_quarantined
-    elif "question" not in checkpoint:
-        # Dynamic-secret user-input events withhold their prompt.  Recovery
-        # validates only durable pause identity here; the private checkpoint,
-        # not this fixed model-compatible placeholder, remains authoritative
-        # for the actual question and options.
-        checkpoint["question"] = "Input required"
-        checkpoint["options"] = []
+    else:
+        # Targeted bindings are private and therefore absent from the public
+        # user-input descriptor. Downgrade the projected policy evidence for
+        # authoritative calls outside the frozen direct-exposure set so this
+        # non-executable view does not fabricate either a direct grant or a
+        # targeted binding merely to satisfy the private checkpoint model.
+        exposure = checkpoint.get("tool_exposure")
+        exposed_names = (
+            frozenset(exposure.get("tool_names", ())) if type(exposure) is dict else None
+        )
+        if exposed_names is not None:
+            for descriptor in tool_calls:
+                if (
+                    type(descriptor) is dict
+                    and descriptor.get("policy_evidence") == "authoritative"
+                    and descriptor.get("tool_name") not in exposed_names
+                ):
+                    descriptor["policy_evidence"] = None
+                    descriptor["policy_decision"] = None
+        if "question" not in checkpoint:
+            # Dynamic-secret user-input events withhold their prompt. Recovery
+            # validates only durable pause identity here; the private checkpoint,
+            # not this fixed model-compatible placeholder, remains authoritative
+            # for the actual question and options.
+            checkpoint["question"] = "Input required"
+            checkpoint["options"] = []
     return checkpoint, arguments_quarantined
 
 

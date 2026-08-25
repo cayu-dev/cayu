@@ -410,6 +410,7 @@ _REQUEST_CACHE_BREAKPOINT_KIND_VALUES = frozenset(
 _REQUEST_CACHE_BREAKPOINT_TTL_VALUES = frozenset({"standard", "extended"})
 _REQUEST_CONTEXT_METHOD_VALUES = frozenset({"local_full_request_estimate"})
 _REQUEST_CONTEXT_CONFIDENCE_VALUES = frozenset({"estimated"})
+_TARGETED_TOOL_PROJECTION_VALUES = frozenset({"call_tool", "openai_additional_tools"})
 _REQUEST_SAFE_OPTION_KEYS = frozenset(
     {
         "frequency_penalty",
@@ -634,7 +635,7 @@ _DECLARED_FIXED_CONTROLS: Mapping[
         ("duplicate_request_risk",): frozenset({True, False}),
     },
     EventType.REQUEST_FOOTPRINT_RECORDED: {
-        ("schema_version",): frozenset({1, 2, 3, 4}),
+        ("schema_version",): frozenset({1, 2, 3, 4, 5}),
         ("request_variant",): _REQUEST_VARIANT_VALUES,
         ("messages", "groups", "*", "role"): _REQUEST_MESSAGE_ROLE_VALUES,
         ("messages", "groups", "*", "part_type"): _REQUEST_MESSAGE_PART_TYPE_VALUES,
@@ -653,6 +654,8 @@ _DECLARED_FIXED_CONTROLS: Mapping[
             "*",
             "kind",
         ): _REQUEST_PROMPT_CONTRIBUTION_KIND_VALUES,
+        ("targeted_tool_grants", "projection"): _TARGETED_TOOL_PROJECTION_VALUES,
+        ("targeted_native_item_active",): frozenset({True, False}),
         (
             "prompt_contributions",
             "unavailable_reason",
@@ -1114,6 +1117,8 @@ _REQUEST_FOOTPRINT_NESTED_PATHS = frozenset(
         ("tool_exposure", "exposed_count"),
         ("tool_exposure", "profile_changed"),
         ("targeted_tool_grants", "schema_version"),
+        ("targeted_tool_grants", "projection"),
+        ("targeted_tool_grants", "native_marker_id"),
         ("targeted_tool_grants", "generation_id"),
         ("targeted_tool_grants", "catalogue_revision"),
         ("targeted_tool_grants", "grant_count"),
@@ -1819,7 +1824,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "attempt attempt_id attachments cache_breakpoints component_tokens context_pressure execution_profile_fingerprint "
         "fingerprints max_attempts messages model model_attempt_id model_step_id observation_id "
         "operation_id options provider_name prompt_contributions request_variant schema_version "
-        "step structured_output targeted_tool_grants tool_exposure tools total",
+        "step structured_output targeted_native_item_active targeted_native_item_message_index "
+        "targeted_tool_grants tool_exposure tools total",
         owned_nested_paths=_REQUEST_FOOTPRINT_NESTED_PATHS,
         authority_keys={"execution_profile_fingerprint"},
         public_authority_keys=_EXECUTION_PROFILE_PUBLIC_AUTHORITY_KEYS,
@@ -3458,12 +3464,15 @@ def _prepare_runtime_event(
                 f"event.payload.{key} contains a workload secret and cannot be "
                 "used as exact private recovery state."
             )
-    _remove_unattested_public_authority(
+    _restore_runtime_payload_authority(
         event,
         policy=policy,
         redacted_payload=redacted_payload,
     )
-    _restore_runtime_payload_authority(
+    # Runtime provenance is necessary but not sufficient: validate the exact
+    # public shape after restoration so an attested producer cannot publish an
+    # internally inconsistent attribution tuple.
+    _remove_unattested_public_authority(
         event,
         policy=policy,
         redacted_payload=redacted_payload,
@@ -3907,18 +3916,24 @@ def _restore_publication_safe_tool_footprints(
         return
     raw_exposure = event.payload.get("tool_exposure")
     raw_targeted_grants = event.payload.get("targeted_tool_grants")
+    raw_native_item_active = event.payload.get("targeted_native_item_active")
+    raw_native_item_message_index = event.payload.get("targeted_native_item_message_index")
     schema_version = event.payload.get("schema_version")
     if raw_exposure is None:
-        if schema_version in {3, 4} and reject_malformed:
+        if schema_version in {3, 4, 5} and reject_malformed:
             raise ValueError("Request footprint schema v3+ has no tool exposure summary.")
         redacted_payload.pop("tool_exposure", None)
         redacted_payload.pop("targeted_tool_grants", None)
+        redacted_payload.pop("targeted_native_item_active", None)
+        redacted_payload.pop("targeted_native_item_message_index", None)
         return
-    if schema_version not in {3, 4}:
+    if schema_version not in {3, 4, 5}:
         if reject_malformed:
             raise ValueError("Only request footprint schema v3+ may carry tool exposure.")
         redacted_payload.pop("tool_exposure", None)
         redacted_payload.pop("targeted_tool_grants", None)
+        redacted_payload.pop("targeted_native_item_active", None)
+        redacted_payload.pop("targeted_native_item_message_index", None)
         return
 
     from cayu.runtime.request_footprints import (
@@ -3930,7 +3945,7 @@ def _restore_publication_safe_tool_footprints(
         exposure = ToolExposureFootprint.model_validate(raw_exposure)
         targeted_grants = (
             TargetedToolGrantFootprint.model_validate(raw_targeted_grants)
-            if schema_version == 4
+            if schema_version in {4, 5}
             else None
         )
     except (TypeError, ValueError) as exc:
@@ -3938,18 +3953,50 @@ def _restore_publication_safe_tool_footprints(
             raise ValueError("Request footprint tool evidence is malformed.") from exc
         redacted_payload.pop("tool_exposure", None)
         redacted_payload.pop("targeted_tool_grants", None)
+        redacted_payload.pop("targeted_native_item_active", None)
+        redacted_payload.pop("targeted_native_item_message_index", None)
         return
-    if (schema_version == 4) != (targeted_grants is not None):
+    if (schema_version in {4, 5}) != (targeted_grants is not None):
         if reject_malformed:
-            raise ValueError("Only request footprint schema v4 may carry targeted grant evidence.")
+            raise ValueError("Only request footprint schema v4+ may carry targeted grant evidence.")
         redacted_payload.pop("targeted_tool_grants", None)
-        if schema_version == 4:
+        redacted_payload.pop("targeted_native_item_active", None)
+        redacted_payload.pop("targeted_native_item_message_index", None)
+        if schema_version in {4, 5}:
             redacted_payload.pop("tool_exposure", None)
         return
     if schema_version == 3 and raw_targeted_grants is not None:
         if reject_malformed:
-            raise ValueError("Only request footprint schema v4 may carry targeted grant evidence.")
+            raise ValueError("Only request footprint schema v4+ may carry targeted grant evidence.")
         redacted_payload.pop("targeted_tool_grants", None)
+    if schema_version == 5:
+        native_item_valid = (
+            type(raw_native_item_active) is bool
+            and (
+                raw_native_item_message_index is None
+                if raw_native_item_active is False
+                else type(raw_native_item_message_index) is int
+                and raw_native_item_message_index >= 0
+            )
+            and (
+                targeted_grants is not None
+                and raw_native_item_active
+                == (targeted_grants.projection.value == "openai_additional_tools")
+            )
+        )
+        if not native_item_valid:
+            if reject_malformed:
+                raise ValueError("Request footprint native item evidence is malformed.")
+            redacted_payload.pop("targeted_native_item_active", None)
+            redacted_payload.pop("targeted_native_item_message_index", None)
+            redacted_payload.pop("targeted_tool_grants", None)
+            redacted_payload.pop("tool_exposure", None)
+            return
+    elif raw_native_item_active is not None or raw_native_item_message_index is not None:
+        if reject_malformed:
+            raise ValueError("Only request footprint schema v5 may carry native item evidence.")
+        redacted_payload.pop("targeted_native_item_active", None)
+        redacted_payload.pop("targeted_native_item_message_index", None)
     if not _public_authority_is_trusted(
         event,
         field_name="execution_profile_fingerprint",
@@ -3959,6 +4006,8 @@ def _restore_publication_safe_tool_footprints(
             raise ValueError("Request footprint tool exposure lacks runtime provenance.")
         redacted_payload.pop("tool_exposure", None)
         redacted_payload.pop("targeted_tool_grants", None)
+        redacted_payload.pop("targeted_native_item_active", None)
+        redacted_payload.pop("targeted_native_item_message_index", None)
         return
 
     # profile_id is an explicitly public application label and exposure_fingerprint
@@ -3967,7 +4016,16 @@ def _restore_publication_safe_tool_footprints(
     # standalone tool.exposure.recorded contract.
     redacted_payload["tool_exposure"] = exposure.model_dump(mode="json")
     if targeted_grants is not None:
-        redacted_payload["targeted_tool_grants"] = targeted_grants.model_dump(mode="json")
+        redacted_payload["targeted_tool_grants"] = targeted_grants.model_dump(
+            mode="json",
+            exclude_none=True,
+        )
+    if schema_version == 5:
+        redacted_payload["targeted_native_item_active"] = raw_native_item_active
+        if raw_native_item_message_index is None:
+            redacted_payload.pop("targeted_native_item_message_index", None)
+        else:
+            redacted_payload["targeted_native_item_message_index"] = raw_native_item_message_index
 
 
 def _restore_publication_safe_execution_profile_decision(
@@ -4406,10 +4464,18 @@ def _public_authority_is_trusted(
                 validate_tool_descriptor_version(value)
         except (TypeError, ValueError):
             return False
-    if field_name == "dispatch_kind" and value != "gateway":
+    dispatch_kind = event.payload.get("dispatch_kind")
+    if field_name == "dispatch_kind" and value not in {"gateway", "native"}:
         return False
-    if field_name == "model_tool_name" and value != "call_tool":
-        return False
+    if field_name == "model_tool_name":
+        if type(value) is not str or not value.strip():
+            return False
+        if dispatch_kind == "gateway" and value != "call_tool":
+            return False
+        if dispatch_kind == "native" and value != event.tool_name:
+            return False
+        if dispatch_kind not in {"gateway", "native"}:
+            return False
     if trust_persisted_projection:
         return True
     assert type(value) is str

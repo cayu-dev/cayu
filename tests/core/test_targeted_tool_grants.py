@@ -4,12 +4,12 @@ import asyncio
 import base64
 import io
 import json
-import secrets
 import sqlite3
 import urllib.request
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import SecretStr, ValidationError
@@ -58,10 +58,13 @@ from cayu import (
     ToolPolicyResult,
     ToolResult,
     ToolSpec,
+    UserInputResponse,
+    UserInputTool,
 )
 from cayu.providers import (
     ModelContextOverflowError,
     ModelProviderError,
+    OpenAIProvider,
     ProviderOperationAdapter,
     ProviderOperationConnection,
     ProviderOperationMode,
@@ -291,6 +294,166 @@ class _GatewayProvider(_Provider):
         assert tool_result.content == "remembered: Keep the gateway identity stable."
         yield ModelStreamEvent.text_delta("done")
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _NativeOpenAITransport:
+    def __init__(
+        self,
+        *,
+        retry_first: bool = False,
+        overflow_first: bool = False,
+        tool_name: str = "remember",
+        arguments_json: str = '{"fact":"Keep native identity stable."}',
+    ) -> None:
+        if retry_first and overflow_first:
+            raise ValueError("Only one deterministic first-attempt failure may be selected.")
+        self.calls: list[dict[str, Any]] = []
+        self.retry_first = retry_first
+        self.overflow_first = overflow_first
+        self.tool_name = tool_name
+        self.arguments_json = arguments_json
+
+    async def stream_response_events(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+        stream_idle_timeout_s: float,
+    ) -> AsyncIterator[Mapping[str, Any]]:
+        del url, headers, timeout_s, stream_idle_timeout_s
+        self.calls.append(dict(payload))
+        if (self.retry_first or self.overflow_first) and len(self.calls) == 1:
+            status_code = 503 if self.retry_first else 400
+            yield {
+                "type": "response.failed",
+                "response": {
+                    "status_code": status_code,
+                    "error": {
+                        "type": ("server_error" if self.retry_first else "invalid_request_error"),
+                        "code": ("server_error" if self.retry_first else "context_length_exceeded"),
+                        "message": "retry this deterministic request",
+                    },
+                },
+            }
+            return
+        logical_call = len(self.calls) - (1 if self.retry_first or self.overflow_first else 0)
+        if logical_call == 1:
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_remember",
+                    "call_id": "native-remember-call",
+                    "name": self.tool_name,
+                    "arguments": "",
+                },
+            }
+            yield {
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_remember",
+                "output_index": 0,
+                "name": self.tool_name,
+                "arguments": self.arguments_json,
+            }
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_native_tool",
+                    "model": "fake-model",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "id": "fc_remember",
+                            "call_id": "native-remember-call",
+                            "name": self.tool_name,
+                            "arguments": self.arguments_json,
+                            "status": "completed",
+                        }
+                    ],
+                    "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+                },
+            }
+            return
+        if logical_call == 2:
+            yield {"type": "response.output_text.delta", "delta": "done"}
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_native_done",
+                    "model": "fake-model",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "done",
+                                    "annotations": [],
+                                }
+                            ],
+                        }
+                    ],
+                    "usage": {"input_tokens": 20, "output_tokens": 1, "total_tokens": 21},
+                },
+            }
+            return
+        raise AssertionError("Native targeted test dispatched an unexpected model step.")
+
+
+class _FinalOpenAITransport:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def stream_response_events(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_s: float,
+        stream_idle_timeout_s: float,
+    ) -> AsyncIterator[Mapping[str, Any]]:
+        del url, headers, timeout_s, stream_idle_timeout_s
+        self.calls.append(dict(payload))
+        yield {"type": "response.output_text.delta", "delta": "done"}
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_final",
+                "model": "fake-model",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "done",
+                                "annotations": [],
+                            }
+                        ],
+                    }
+                ],
+                "usage": {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6},
+            },
+        }
+
+
+class _NativeTestOpenAIProvider(OpenAIProvider):
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:targeted-tool-grants:openai-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
 
 
 def test_private_gateway_lifecycle_match_requires_the_safe_transcript_projection() -> None:
@@ -605,7 +768,7 @@ class _RecordingPolicy(ToolPolicy):
 
 
 def _codec() -> PublicAuthorityAliasCodec:
-    key = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
+    key = base64.urlsafe_b64encode(bytes([40]) * 32).decode("ascii").rstrip("=")
     return PublicAuthorityAliasCodec(
         PublicAuthorityAliasKeyring(
             active_key_id="test",
@@ -654,7 +817,7 @@ def _app(store) -> tuple[CayuApp, _Provider]:
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
-        enable_tool_gateway=True,
+        targeted_tool_mode="call_tool",
         tools=(_RememberTool(),),
     )
     return app, provider
@@ -923,9 +1086,10 @@ def test_runtime_issues_before_provider_and_store_binds_exact_replay(
         footprint_event = next(
             event for event in suffix if event.type is EventType.REQUEST_FOOTPRINT_RECORDED
         )
-        assert footprint_event.payload["schema_version"] == 4
+        assert footprint_event.payload["schema_version"] == 5
         assert footprint_event.payload["targeted_tool_grants"] == {
-            "schema_version": 1,
+            "schema_version": 2,
+            "projection": "call_tool",
             "generation_id": record.generation_id,
             "catalogue_revision": record.catalogue_revision,
             "grant_count": 1,
@@ -936,6 +1100,7 @@ def test_runtime_issues_before_provider_and_store_binds_exact_replay(
             "remaining_calls": 2,
             "direct_tool_prefix_changed": False,
         }
+        assert footprint_event.payload["targeted_native_item_active"] is False
         assert "tool_ref" not in footprint_event.model_dump_json()
         assert [tool["name"] for tool in provider.requests[0].tools] == [
             "remember",
@@ -1013,7 +1178,7 @@ async def _assert_call_tool_routes_outer_identity(
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
-        enable_tool_gateway=True,
+        targeted_tool_mode="call_tool",
         tools=(tool,),
         tool_policy=policy,
         tool_exposure_policy=StaticToolExposurePolicy(
@@ -1097,6 +1262,153 @@ async def _assert_call_tool_routes_outer_identity(
     )
 
 
+async def _assert_openai_native_routes_canonical_identity(
+    targeted_store,
+    *,
+    session_id: str,
+    retry_first: bool = False,
+    overflow_first: bool = False,
+) -> None:
+    transport = _NativeOpenAITransport(
+        retry_first=retry_first,
+        overflow_first=overflow_first,
+    )
+    provider = _NativeTestOpenAIProvider(
+        api_key="test-key",
+        transport=transport,
+        additional_tools_models=("fake-model",),
+    )
+    tool = _GatewayRememberTool()
+    policy = _RecordingPolicy()
+    app = CayuApp(
+        session_store=targeted_store,
+        retry_policy=(RetryPolicy(max_attempts=2, initial_delay_s=0.0) if retry_first else None),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        targeted_tool_mode="openai_additional_tools",
+        tools=(tool,),
+        tool_policy=policy,
+        context_overflow_policy=(
+            RecentTurnsContextPolicy(max_user_turns=1) if overflow_first else None
+        ),
+        tool_exposure_policy=StaticToolExposurePolicy(
+            profile_id="targeted-only",
+            tools=(),
+        ),
+    )
+
+    streamed = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "Review and remember one fact.")],
+                tool_grants=(
+                    TargetedToolGrant(
+                        request_id="remember-reviewed-fact",
+                        tool_id="cayu:remember",
+                        max_calls=1,
+                        lifetime_seconds=60,
+                    ),
+                ),
+            )
+        )
+    ]
+
+    assert streamed[-1].type is EventType.SESSION_COMPLETED
+    assert tool.calls == [{"fact": "Keep native identity stable."}]
+    assert len(policy.requests) == 1
+    assert policy.requests[0].tool_name == "remember"
+    assert policy.requests[0].arguments == {"fact": "Keep native identity stable."}
+    failed_first = retry_first or overflow_first
+    assert len(transport.calls) == (3 if failed_first else 2)
+    first_success_index = 1 if failed_first else 0
+    first_input = transport.calls[first_success_index]["input"]
+    second_input = transport.calls[first_success_index + 1]["input"]
+    if failed_first:
+        assert transport.calls[0]["input"] == first_input
+    first_additional_index = next(
+        index for index, item in enumerate(first_input) if item.get("type") == "additional_tools"
+    )
+    second_additional_index = next(
+        index for index, item in enumerate(second_input) if item.get("type") == "additional_tools"
+    )
+    assert first_additional_index == second_additional_index == 1
+    assert first_input[first_additional_index]["tools"] == [
+        {
+            "type": "function",
+            "name": "remember",
+            "description": _GatewayRememberTool.spec.description,
+            "parameters": _GatewayRememberTool.spec.input_schema,
+            "strict": False,
+        }
+    ]
+    for payload in transport.calls[first_success_index:]:
+        assert [tool["name"] for tool in payload["tools"]] == ["call_tool"]
+        assert payload["tool_choice"] == {
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [{"type": "function", "name": "remember"}],
+        }
+    assert [item["type"] for item in second_input[second_additional_index + 1 :]] == [
+        "function_call",
+        "function_call_output",
+    ]
+
+    [record] = await targeted_store.list_targeted_tool_grants(session_id)
+    assert record.used_calls == 1
+    assert record.remaining_calls == 0
+    durable_events = await targeted_store.load_events(session_id)
+    [consumed] = [
+        event
+        for event in durable_events
+        if event.type is EventType.TARGETED_TOOL_REFERENCE_CONSUMED
+    ]
+    [started] = [event for event in durable_events if event.type is EventType.TOOL_CALL_STARTED]
+    [completed] = [event for event in durable_events if event.type is EventType.TOOL_CALL_COMPLETED]
+    for event in (started, completed):
+        assert event.tool_name == "remember"
+        assert event.payload["dispatch_kind"] == "native"
+        assert event.payload["model_tool_name"] == "remember"
+        assert event.payload["grant_id"] == record.grant_id
+        assert event.payload["use_id"] == consumed.payload["use_id"]
+
+    transcript = await targeted_store.load_transcript(session_id)
+    assistant_call = next(
+        part
+        for message in transcript
+        if message.role == "assistant"
+        for part in message.content
+        if part.type == "tool_call"
+    )
+    tool_result = next(
+        part
+        for message in transcript
+        if message.role == "tool"
+        for part in message.content
+        if part.type == "tool_result"
+    )
+    assert assistant_call.tool_call_id == tool_result.tool_call_id == "native-remember-call"
+    assert assistant_call.tool_name == tool_result.tool_name == "remember"
+    assert assistant_call.arguments == {"fact": "Keep native identity stable."}
+
+    footprints = [
+        event.payload for event in streamed if event.type is EventType.REQUEST_FOOTPRINT_RECORDED
+    ]
+    assert len(footprints) == (3 if failed_first else 2)
+    assert all(
+        footprint["targeted_tool_grants"]["projection"] == "openai_additional_tools"
+        and footprint["targeted_native_item_active"] is True
+        and footprint["targeted_native_item_message_index"] == 1
+        for footprint in footprints
+    )
+    assert all("input_schema" not in json.dumps(footprint) for footprint in footprints)
+
+
 def test_call_tool_routes_outer_identity_through_the_effective_target(
     targeted_store,
 ) -> None:
@@ -1108,8 +1420,213 @@ def test_call_tool_routes_outer_identity_through_the_effective_target(
     )
 
 
+def test_openai_native_routes_through_one_canonical_executor(targeted_store) -> None:
+    asyncio.run(
+        _assert_openai_native_routes_canonical_identity(
+            targeted_store,
+            session_id="targeted-openai-native",
+        )
+    )
+
+
+def test_openai_native_retry_reuses_the_exact_projection(targeted_store) -> None:
+    asyncio.run(
+        _assert_openai_native_routes_canonical_identity(
+            targeted_store,
+            session_id="targeted-openai-native-retry",
+            retry_first=True,
+        )
+    )
+
+
+def test_openai_native_context_overflow_reuses_the_exact_projection(
+    targeted_store,
+) -> None:
+    asyncio.run(
+        _assert_openai_native_routes_canonical_identity(
+            targeted_store,
+            session_id="targeted-openai-native-overflow",
+            overflow_first=True,
+        )
+    )
+
+
+def test_openai_native_rejects_invalid_arguments_before_policy_or_execution(
+    targeted_store,
+) -> None:
+    async def run() -> None:
+        transport = _NativeOpenAITransport(arguments_json='{"fact":42}')
+        provider = _NativeTestOpenAIProvider(
+            api_key="test-key",
+            transport=transport,
+            additional_tools_models=("fake-model",),
+        )
+        tool = _GatewayRememberTool()
+        policy = _RecordingPolicy()
+        app = CayuApp(session_store=targeted_store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            targeted_tool_mode="openai_additional_tools",
+            tools=(tool,),
+            tool_policy=policy,
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="targeted-only",
+                tools=(),
+            ),
+        )
+        session_id = "targeted-openai-native-invalid-arguments"
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "Try the targeted tool.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="remember",
+                            tool_id="cayu:remember",
+                        ),
+                    ),
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert tool.calls == []
+        assert policy.requests == []
+        [record] = await targeted_store.list_targeted_tool_grants(session_id)
+        assert record.used_calls == 0
+        assert record.remaining_calls == 1
+        durable_events = await targeted_store.load_events(session_id)
+        [rejected] = [
+            event
+            for event in durable_events
+            if event.type is EventType.TARGETED_TOOL_REFERENCE_REJECTED
+        ]
+        assert rejected.payload["rejection_reason"] == "invalid_arguments"
+        [failed] = [event for event in durable_events if event.type is EventType.TOOL_CALL_FAILED]
+        assert failed.tool_name == "remember"
+        assert failed.payload["blocked_by"] == "targeted_tool_native"
+        assert failed.payload["model_tool_name"] == "remember"
+        assert failed.payload["reason"] == "invalid_arguments"
+        assert failed.payload["dispatch_kind"] == "native"
+        second_input = transport.calls[1]["input"]
+        function_output = next(
+            item for item in second_input if item.get("type") == "function_call_output"
+        )
+        assert function_output["call_id"] == "native-remember-call"
+
+    asyncio.run(run())
+
+
+def test_openai_native_does_not_authorize_an_unprojected_registered_name(
+    targeted_store,
+) -> None:
+    class RecordingOtherTool(_GatewayOtherTool):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[dict[str, Any]] = []
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            del ctx
+            self.calls.append(dict(args))
+            return ToolResult(content="unexpected")
+
+    async def run() -> None:
+        transport = _NativeOpenAITransport(tool_name="other", arguments_json="{}")
+        provider = _NativeTestOpenAIProvider(
+            api_key="test-key",
+            transport=transport,
+            additional_tools_models=("fake-model",),
+        )
+        remember = _GatewayRememberTool()
+        other = RecordingOtherTool()
+        policy = _RecordingPolicy()
+        app = CayuApp(session_store=targeted_store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            targeted_tool_mode="openai_additional_tools",
+            tools=(remember, other),
+            tool_policy=policy,
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="targeted-only",
+                tools=(),
+            ),
+        )
+        session_id = "targeted-openai-native-unprojected-name"
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "Use only available authority.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="remember",
+                            tool_id="cayu:remember",
+                        ),
+                    ),
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert remember.calls == []
+        assert other.calls == []
+        assert policy.requests == []
+        [record] = await targeted_store.list_targeted_tool_grants(session_id)
+        assert record.used_calls == 0
+        assert [
+            tool["name"]
+            for item in transport.calls[0]["input"]
+            if item.get("type") == "additional_tools"
+            for tool in item["tools"]
+        ] == ["remember"]
+        durable_events = await targeted_store.load_events(session_id)
+        assert not any(
+            event.type
+            in {
+                EventType.TARGETED_TOOL_REFERENCE_CONSUMED,
+                EventType.TARGETED_TOOL_REFERENCE_REJECTED,
+            }
+            for event in durable_events
+        )
+        [blocked] = [
+            event
+            for event in durable_events
+            if event.type is EventType.TOOL_CALL_BLOCKED and event.tool_name == "other"
+        ]
+        assert blocked.payload["blocked_by"] == "tool_exposure"
+
+    asyncio.run(run())
+
+
+async def _drop_postgres_cayu_tables(dsn: str) -> None:
+    import psycopg
+    from psycopg import sql
+
+    async with await psycopg.AsyncConnection.connect(dsn) as connection:
+        async with connection.cursor() as cursor:
+            await cursor.execute(
+                "SELECT tablename FROM pg_tables "
+                "WHERE schemaname = current_schema() AND tablename LIKE 'cayu\\_%' ESCAPE '\\'"
+            )
+            for (table_name,) in await cursor.fetchall():
+                await cursor.execute(
+                    sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(sql.Identifier(table_name))
+                )
+        await connection.commit()
+
+
 def test_call_tool_routes_through_postgres(postgres_dsn: str) -> None:
     async def run() -> None:
+        await _drop_postgres_cayu_tables(postgres_dsn)
         store = PostgresSessionStore(
             postgres_dsn,
             min_size=1,
@@ -1124,6 +1641,29 @@ def test_call_tool_routes_through_postgres(postgres_dsn: str) -> None:
             )
         finally:
             await store.close()
+            await _drop_postgres_cayu_tables(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_openai_native_routes_through_postgres(postgres_dsn: str) -> None:
+    async def run() -> None:
+        await _drop_postgres_cayu_tables(postgres_dsn)
+        store = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=4,
+            schema_mode=SchemaMode.CREATE,
+            public_authority_alias_codec=_codec(),
+        )
+        try:
+            await _assert_openai_native_routes_canonical_identity(
+                store,
+                session_id="targeted-openai-native-postgres",
+            )
+        finally:
+            await store.close()
+            await _drop_postgres_cayu_tables(postgres_dsn)
 
     asyncio.run(run())
 
@@ -1174,7 +1714,7 @@ def test_call_tool_preserves_unavailable_argument_projections(
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
-            enable_tool_gateway=True,
+            targeted_tool_mode="call_tool",
             tools=(tool,),
             tool_exposure_policy=StaticToolExposurePolicy(
                 profile_id="targeted-only",
@@ -1294,7 +1834,7 @@ def test_mixed_structured_output_round_preserves_private_targeted_selection(
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
-            enable_tool_gateway=True,
+            targeted_tool_mode="call_tool",
             tools=(tool,),
             tool_exposure_policy=StaticToolExposurePolicy(
                 profile_id="targeted-only",
@@ -1373,7 +1913,7 @@ def test_call_tool_approval_preserves_bound_gateway_identity(
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
-            enable_tool_gateway=True,
+            targeted_tool_mode="call_tool",
             tools=(tool,),
             tool_policy=AlwaysRequireApprovalToolPolicy(),
             tool_exposure_policy=StaticToolExposurePolicy(
@@ -1423,7 +1963,7 @@ def test_call_tool_approval_preserves_bound_gateway_identity(
         resumed_app.register_provider(provider, default=True)
         resumed_app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
-            enable_tool_gateway=True,
+            targeted_tool_mode="call_tool",
             tools=(tool,),
             tool_policy=AlwaysRequireApprovalToolPolicy(),
             tool_exposure_policy=StaticToolExposurePolicy(
@@ -1482,6 +2022,279 @@ def test_call_tool_approval_preserves_bound_gateway_identity(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("paused_lifecycle", ("active", "expired", "revoked"))
+def test_openai_native_approval_reconstructs_one_bound_invocation(
+    targeted_store,
+    paused_lifecycle: str,
+) -> None:
+    async def run() -> None:
+        now = [datetime(2026, 1, 1, tzinfo=UTC)]
+        transport = _NativeOpenAITransport()
+        provider = _NativeTestOpenAIProvider(
+            api_key="test-key",
+            transport=transport,
+            additional_tools_models=("fake-model",),
+        )
+        tool = _GatewayRememberTool()
+
+        def configured_app() -> CayuApp:
+            app = CayuApp(
+                session_store=targeted_store,
+                enable_logging=False,
+                clock=lambda: now[0],
+            )
+            app.register_provider(provider, default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                targeted_tool_mode="openai_additional_tools",
+                tools=(tool,),
+                tool_policy=AlwaysRequireApprovalToolPolicy(),
+                tool_exposure_policy=StaticToolExposurePolicy(
+                    profile_id="targeted-only",
+                    tools=(),
+                ),
+            )
+            return app
+
+        session_id = f"targeted-openai-native-approval-{paused_lifecycle}"
+        initial_events = [
+            event
+            async for event in configured_app().run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "Review and remember one fact.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="remember-reviewed-fact",
+                            tool_id="cayu:remember",
+                            max_calls=1,
+                            lifetime_seconds=60,
+                        ),
+                    ),
+                )
+            )
+        ]
+        approval = next(
+            event
+            for event in initial_events
+            if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
+        )
+        paused_session = await targeted_store.load(session_id)
+        assert paused_session is not None
+        assert paused_session.status.value == "interrupted"
+        assert approval.tool_name == "remember"
+        assert approval.payload["approval"]["tool_name"] == "remember"
+        assert tool.calls == []
+        [bound] = await targeted_store.list_targeted_tool_grants(session_id)
+        assert bound.used_calls == 1
+        if paused_lifecycle == "expired":
+            now[0] = bound.expires_at
+        elif paused_lifecycle == "revoked":
+            now[0] += timedelta(seconds=1)
+            revoked = await targeted_store.revoke_targeted_tool_grant(
+                bound.tool_ref,
+                session_id=session_id,
+                expected_run_epoch=paused_session.run_epoch,
+                reason="operator revoked while approval was pending",
+                revoked_at=now[0],
+            )
+            assert revoked is not None
+
+        resumed_events = [
+            event
+            async for event in configured_app().resolve_tool_approval(
+                ToolApprovalRequest(
+                    session_id=session_id,
+                    approval_id=approval.payload["approval"]["approval_id"],
+                    tool_round_id=approval.payload["tool_round_id"],
+                    tool_call_id=approval.payload["tool_call_id"],
+                    decision=ToolApprovalDecision.APPROVE,
+                )
+            )
+        ]
+
+        assert resumed_events[-1].type is EventType.SESSION_COMPLETED
+        assert tool.calls == [{"fact": "Keep native identity stable."}]
+        [consumed] = await targeted_store.list_targeted_tool_grants(session_id)
+        assert consumed.grant_id == bound.grant_id
+        assert consumed.used_calls == 1
+        assert consumed.remaining_calls == 0
+        assert (
+            sum(
+                event.type is EventType.TARGETED_TOOL_REFERENCE_REJOINED for event in resumed_events
+            )
+            == 1
+        )
+        assert len(transport.calls) == 2
+        additional_items = [
+            next(item for item in payload["input"] if item.get("type") == "additional_tools")
+            for payload in transport.calls
+        ]
+        assert additional_items[0] == additional_items[1]
+        assert [
+            next(
+                index
+                for index, item in enumerate(payload["input"])
+                if item.get("type") == "additional_tools"
+            )
+            for payload in transport.calls
+        ] == [1, 1]
+        transcript = await targeted_store.load_transcript(session_id)
+        assistant_call = next(
+            part
+            for message in transcript
+            if message.role == "assistant"
+            for part in message.content
+            if part.type == "tool_call"
+        )
+        tool_result = next(
+            part
+            for message in transcript
+            if message.role == "tool"
+            for part in message.content
+            if part.type == "tool_result"
+        )
+        assert assistant_call.tool_name == tool_result.tool_name == "remember"
+        assert assistant_call.tool_call_id == tool_result.tool_call_id == "native-remember-call"
+
+    asyncio.run(run())
+
+
+def test_openai_native_user_input_reconstructs_one_bound_invocation(
+    targeted_store,
+) -> None:
+    async def run() -> None:
+        transport = _NativeOpenAITransport(
+            tool_name="ask_user",
+            arguments_json='{"question":"Continue?","options":["yes","no"]}',
+        )
+        provider = _NativeTestOpenAIProvider(
+            api_key="test-key",
+            transport=transport,
+            additional_tools_models=("fake-model",),
+        )
+
+        def configured_app() -> CayuApp:
+            app = CayuApp(session_store=targeted_store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                targeted_tool_mode="openai_additional_tools",
+                tools=(UserInputTool(),),
+                tool_exposure_policy=StaticToolExposurePolicy(
+                    profile_id="targeted-only",
+                    tools=(),
+                ),
+            )
+            return app
+
+        session_id = "targeted-openai-native-user-input"
+        initial_events = [
+            event
+            async for event in configured_app().run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "Ask before continuing.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="ask-before-continuing",
+                            tool_id="cayu:ask_user",
+                            max_calls=1,
+                            lifetime_seconds=60,
+                        ),
+                    ),
+                )
+            )
+        ]
+        awaiting_input = next(
+            (
+                event
+                for event in initial_events
+                if event.type is EventType.SESSION_AWAITING_USER_INPUT
+            ),
+            None,
+        )
+        failure_detail = "\n".join(
+            str(event.payload.get("error", event.payload))
+            for event in initial_events
+            if event.type
+            in {
+                EventType.MODEL_ERROR,
+                EventType.SESSION_FAILED,
+                EventType.TOOL_CALL_BLOCKED,
+                EventType.TOOL_CALL_FAILED,
+            }
+        )
+        assert awaiting_input is not None, failure_detail
+        assert initial_events[-1].type is EventType.SESSION_INTERRUPTED
+        [bound] = await targeted_store.list_targeted_tool_grants(session_id)
+        assert bound.used_calls == 1
+        assert bound.remaining_calls == 0
+
+        resumed_events = [
+            event
+            async for event in configured_app().resolve_user_input(
+                UserInputResponse(
+                    session_id=session_id,
+                    input_id=awaiting_input.payload["input_id"],
+                    answer="yes",
+                )
+            )
+        ]
+
+        assert resumed_events[-1].type is EventType.SESSION_COMPLETED, (
+            ", ".join(event.type.value for event in resumed_events)
+            + "\n"
+            + str(resumed_events[-1].payload)
+        )
+        assert (
+            sum(
+                event.type is EventType.TARGETED_TOOL_REFERENCE_REJOINED for event in resumed_events
+            )
+            == 1
+        )
+        [consumed] = await targeted_store.list_targeted_tool_grants(session_id)
+        assert consumed.grant_id == bound.grant_id
+        assert consumed.used_calls == 1
+        assert consumed.remaining_calls == 0
+        assert len(transport.calls) == 2
+        additional_items = [
+            next(item for item in payload["input"] if item.get("type") == "additional_tools")
+            for payload in transport.calls
+        ]
+        assert additional_items[0] == additional_items[1]
+        assert [
+            next(
+                index
+                for index, item in enumerate(payload["input"])
+                if item.get("type") == "additional_tools"
+            )
+            for payload in transport.calls
+        ] == [1, 1]
+        transcript = await targeted_store.load_transcript(session_id)
+        assistant_call = next(
+            part
+            for message in transcript
+            if message.role == "assistant"
+            for part in message.content
+            if part.type == "tool_call"
+        )
+        tool_result = next(
+            part
+            for message in transcript
+            if message.role == "tool"
+            for part in message.content
+            if part.type == "tool_result"
+        )
+        assert assistant_call.tool_name == tool_result.tool_name == "ask_user"
+        assert assistant_call.tool_call_id == tool_result.tool_call_id == "native-remember-call"
+        assert tool_result.content == "yes"
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize(
     ("case", "reason"),
     (
@@ -1519,7 +2332,7 @@ def test_call_tool_rejects_before_policy_or_execution(
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
-            enable_tool_gateway=True,
+            targeted_tool_mode="call_tool",
             tools=(tool,),
             tool_policy=policy,
             tool_exposure_policy=StaticToolExposurePolicy(
@@ -1594,7 +2407,7 @@ def test_call_tool_does_not_trust_an_unissued_secret_bearing_reference(targeted_
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
-            enable_tool_gateway=True,
+            targeted_tool_mode="call_tool",
             tools=(tool,),
             tool_policy=policy,
             tool_exposure_policy=StaticToolExposurePolicy(
@@ -1664,7 +2477,7 @@ def test_provider_retry_reuses_one_prepared_targeted_grant_snapshot(targeted_sto
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
-            enable_tool_gateway=True,
+            targeted_tool_mode="call_tool",
             tools=(_RememberTool(),),
         )
 
@@ -1714,7 +2527,7 @@ def test_context_overflow_reuses_one_prepared_targeted_grant_snapshot(targeted_s
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
-            enable_tool_gateway=True,
+            targeted_tool_mode="call_tool",
             tools=(_RememberTool(),),
             context_overflow_policy=RecentTurnsContextPolicy(max_user_turns=1),
         )
@@ -1771,7 +2584,7 @@ def test_approval_continuation_reconstructs_the_same_targeted_grant_snapshot(
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
-            enable_tool_gateway=True,
+            targeted_tool_mode="call_tool",
             tools=(_RememberTool(),),
             tool_policy=AlwaysRequireApprovalToolPolicy(),
         )
@@ -1854,7 +2667,7 @@ def test_approval_continuation_omits_a_naturally_expired_targeted_grant(
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
-            enable_tool_gateway=True,
+            targeted_tool_mode="call_tool",
             tools=(_RememberTool(),),
             tool_policy=AlwaysRequireApprovalToolPolicy(),
         )
@@ -1935,7 +2748,7 @@ def test_approval_continuation_keeps_the_nonexpired_targeted_grant(
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
-            enable_tool_gateway=True,
+            targeted_tool_mode="call_tool",
             tools=(remember, _GatewayOtherTool()),
             tool_policy=AlwaysRequireApprovalToolPolicy(),
             tool_exposure_policy=StaticToolExposurePolicy(
@@ -2025,7 +2838,7 @@ def test_task_backed_targeted_grant_binds_task_scope(targeted_store) -> None:
         app.register_provider(provider, default=True)
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
-            enable_tool_gateway=True,
+            targeted_tool_mode="call_tool",
             tools=(_RememberTool(),),
         )
         stream = app.run(
@@ -2154,6 +2967,103 @@ def test_fork_copies_no_grant_authority_and_copied_references_are_inert(
     asyncio.run(run())
 
 
+def test_openai_native_fork_requires_a_fresh_child_scoped_grant(targeted_store) -> None:
+    async def run() -> None:
+        transport = _FinalOpenAITransport()
+        provider = _NativeTestOpenAIProvider(
+            api_key="test-key",
+            transport=transport,
+            additional_tools_models=("fake-model",),
+        )
+        app = CayuApp(session_store=targeted_store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            targeted_tool_mode="openai_additional_tools",
+            tools=(_GatewayRememberTool(),),
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="targeted-only",
+                tools=(),
+            ),
+        )
+        source_id = "targeted-native-fork-source"
+        child_id = "targeted-native-fork-child"
+
+        source_events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=source_id,
+                    messages=[Message.text("user", "Create source history.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="source-grant",
+                            tool_id="cayu:remember",
+                        ),
+                    ),
+                )
+            )
+        ]
+        assert source_events[-1].type is EventType.SESSION_COMPLETED
+        assert (
+            sum(item.get("type") == "additional_tools" for item in transport.calls[0]["input"]) == 1
+        )
+
+        fork_events = [
+            event
+            async for event in app.fork_session(
+                ForkSessionRequest(
+                    source_session_id=source_id,
+                    session_id=child_id,
+                )
+            )
+        ]
+        assert [event.type for event in fork_events] == [EventType.SESSION_FORKED]
+        assert await targeted_store.list_targeted_tool_grants(child_id) == ()
+
+        ordinary_child_events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=child_id,
+                    messages=[Message.text("user", "Continue without authority.")],
+                )
+            )
+        ]
+        assert ordinary_child_events[-1].type is EventType.SESSION_COMPLETED
+        assert all(item.get("type") != "additional_tools" for item in transport.calls[1]["input"])
+
+        granted_child_events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=child_id,
+                    messages=[Message.text("user", "Use fresh child authority.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="child-grant",
+                            tool_id="cayu:remember",
+                        ),
+                    ),
+                )
+            )
+        ]
+        assert granted_child_events[-1].type is EventType.SESSION_COMPLETED
+        child_items = transport.calls[2]["input"]
+        [child_additional] = [
+            item for item in child_items if item.get("type") == "additional_tools"
+        ]
+        assert [tool["name"] for tool in child_additional["tools"]] == ["remember"]
+        [child_grant] = await targeted_store.list_targeted_tool_grants(child_id)
+        [source_grant] = await targeted_store.list_targeted_tool_grants(source_id)
+        assert child_grant.session_id == child_id
+        assert source_grant.session_id == source_id
+        assert child_grant.grant_id != source_grant.grant_id
+
+    asyncio.run(run())
+
+
 def test_invalid_targeted_grant_fails_before_session_or_provider(targeted_store) -> None:
     async def run() -> None:
         app, provider = _app(targeted_store)
@@ -2180,7 +3090,7 @@ def test_invalid_targeted_grant_fails_before_session_or_provider(targeted_store)
     asyncio.run(run())
 
 
-def test_targeted_grant_requires_a_registration_wide_stable_gateway(targeted_store) -> None:
+def test_targeted_grant_requires_an_explicit_delivery_mode(targeted_store) -> None:
     async def run() -> None:
         provider = _Provider()
         app = CayuApp(session_store=targeted_store, enable_logging=False)
@@ -2190,11 +3100,11 @@ def test_targeted_grant_requires_a_registration_wide_stable_gateway(targeted_sto
             tools=(_RememberTool(),),
         )
 
-        with pytest.raises(ValueError, match="enable_tool_gateway=True"):
+        with pytest.raises(ValueError, match="targeted_tool_mode"):
             async for _event in app.run(
                 RunRequest(
                     agent_name="assistant",
-                    session_id="gateway-not-enabled",
+                    session_id="targeted-delivery-not-enabled",
                     messages=[Message.text("user", "Review this work.")],
                     tool_grants=(
                         TargetedToolGrant(
@@ -2207,7 +3117,97 @@ def test_targeted_grant_requires_a_registration_wide_stable_gateway(targeted_sto
                 pass
 
         assert provider.requests == []
-        assert await targeted_store.load("gateway-not-enabled") is None
+        assert await targeted_store.load("targeted-delivery-not-enabled") is None
+
+    asyncio.run(run())
+
+
+def test_required_openai_native_projection_fails_before_session_creation(
+    targeted_store,
+) -> None:
+    async def run() -> None:
+        provider = _Provider()
+        app = CayuApp(session_store=targeted_store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            targeted_tool_mode="openai_additional_tools",
+            tools=(_GatewayRememberTool(),),
+        )
+
+        with pytest.raises(ValueError, match="is not established"):
+            async for _event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="required-native-unsupported",
+                    messages=[Message.text("user", "Review this work.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="remember",
+                            tool_id="cayu:remember",
+                        ),
+                    ),
+                )
+            ):
+                pass
+
+        assert provider.requests == []
+        assert await targeted_store.load("required-native-unsupported") is None
+
+    asyncio.run(run())
+
+
+def test_explicit_openai_native_fallback_selects_call_tool_before_dispatch(
+    targeted_store,
+) -> None:
+    async def run() -> None:
+        provider = _GatewayProvider()
+        tool = _GatewayRememberTool()
+        app = CayuApp(session_store=targeted_store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            targeted_tool_mode="openai_additional_tools_or_call_tool",
+            tools=(tool,),
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="targeted-only",
+                tools=(),
+            ),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="native-fallback-call-tool",
+                    messages=[Message.text("user", "Review and remember one fact.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="remember",
+                            tool_id="cayu:remember",
+                        ),
+                    ),
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert tool.calls == [{"fact": "Keep the gateway identity stable."}]
+        assert all(request.targeted_tool_projection is None for request in provider.requests)
+        assert all(
+            [tool["name"] for tool in request.tools] == ["call_tool"]
+            for request in provider.requests
+        )
+        footprints = [
+            event.payload for event in events if event.type is EventType.REQUEST_FOOTPRINT_RECORDED
+        ]
+        assert footprints
+        assert all(
+            footprint["targeted_tool_grants"]["projection"] == "call_tool"
+            and footprint["targeted_native_item_active"] is False
+            for footprint in footprints
+        )
 
     asyncio.run(run())
 
@@ -2235,6 +3235,108 @@ def test_enabled_gateway_is_stable_without_an_active_grant(targeted_store) -> No
             for part in message.content
             if part.type == "text"
         )
+
+    asyncio.run(run())
+
+
+def test_openai_native_mode_keeps_only_the_inert_cache_anchor_without_an_active_grant(
+    targeted_store,
+) -> None:
+    async def run() -> None:
+        transport = _FinalOpenAITransport()
+        provider = _NativeTestOpenAIProvider(
+            api_key="test-key",
+            transport=transport,
+            additional_tools_models=("fake-model",),
+        )
+        app = CayuApp(session_store=targeted_store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            targeted_tool_mode="openai_additional_tools",
+            tools=(_GatewayRememberTool(),),
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="targeted-only",
+                tools=(),
+            ),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="native-without-grant",
+                    messages=[Message.text("user", "Continue ordinary work.")],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        [payload] = transport.calls
+        assert [tool["name"] for tool in payload["tools"]] == ["call_tool"]
+        assert payload["tool_choice"] == "none"
+        assert all(item.get("type") != "additional_tools" for item in payload["input"])
+        footprint = next(
+            event.payload for event in events if event.type is EventType.REQUEST_FOOTPRINT_RECORDED
+        )
+        assert "targeted_tool_grants" not in footprint
+        assert "targeted_native_item_active" not in footprint
+
+    asyncio.run(run())
+
+
+def test_openai_native_projection_orders_canonical_tools_deterministically(
+    targeted_store,
+) -> None:
+    async def run() -> None:
+        transport = _FinalOpenAITransport()
+        provider = _NativeTestOpenAIProvider(
+            api_key="test-key",
+            transport=transport,
+            additional_tools_models=("fake-model",),
+        )
+        app = CayuApp(session_store=targeted_store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            targeted_tool_mode="openai_additional_tools",
+            tools=(_GatewayRememberTool(), _GatewayOtherTool()),
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="targeted-only",
+                tools=(),
+            ),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="native-deterministic-tool-order",
+                    messages=[Message.text("user", "Inspect the available functions.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="remember-second-alphabetically",
+                            tool_id="cayu:remember",
+                        ),
+                        TargetedToolGrant(
+                            request_id="other-first-alphabetically",
+                            tool_id="cayu:other",
+                        ),
+                    ),
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        [additional_tools] = [
+            item for item in transport.calls[0]["input"] if item.get("type") == "additional_tools"
+        ]
+        assert [tool["name"] for tool in additional_tools["tools"]] == [
+            "other",
+            "remember",
+        ]
 
     asyncio.run(run())
 
@@ -2267,7 +3369,7 @@ def test_call_tool_without_an_active_grant_rejects_without_target_execution(
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             tools=(tool,),
-            enable_tool_gateway=True,
+            targeted_tool_mode="call_tool",
         )
 
         events = [

@@ -9599,13 +9599,15 @@ class SessionStore(ABC):
         *,
         interaction_id: InteractionAttribution = INHERIT_INTERACTION,
         checkpoint_transform: CheckpointTransform | None = None,
+        runtime_suffix_count: int = 0,
     ) -> None:
         """Atomically materialize deferred input as the ordered initial transcript.
 
-        The replacement must end with ``expected_messages``.  Any leading
-        bootstrap/system messages are stored with null interaction attribution;
-        the source suffix is attributed to ``interaction_id``.  No partial or
-        externally visible pre-finalization transcript is permitted.
+        The replacement must contain ``expected_messages`` after any leading
+        bootstrap/system messages and before ``runtime_suffix_count`` runtime-owned
+        messages. The bootstrap prefix is stored with null interaction attribution;
+        the admitted source and runtime suffix are attributed to ``interaction_id``.
+        No partial or externally visible pre-finalization transcript is permitted.
         When supplied, ``checkpoint_transform`` runs inside the same write
         transaction before the initial-transcript authority marker is read.
         """
@@ -15589,6 +15591,7 @@ class InMemorySessionStore(SessionStore):
         *,
         interaction_id: InteractionAttribution = INHERIT_INTERACTION,
         checkpoint_transform: CheckpointTransform | None = None,
+        runtime_suffix_count: int = 0,
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         interaction_id = resolve_interaction_attribution(session_id, interaction_id)
@@ -15611,11 +15614,11 @@ class InMemorySessionStore(SessionStore):
             )
             if self._transcripts.get(session_id):
                 raise RuntimeError("Initial transcript changed before finalization.")
-            if len(replacement) < len(expected) or (
-                expected and replacement[-len(expected) :] != expected
-            ):
-                raise RuntimeError("Initial transcript must preserve the admitted source suffix.")
-            prefix_count = len(replacement) - len(expected)
+            prefix_count = _initial_transcript_prefix_count(
+                expected,
+                replacement,
+                runtime_suffix_count=runtime_suffix_count,
+            )
             current_checkpoint = self._checkpoints.get(session_id)
             if checkpoint_transform is not None:
                 transformed = checkpoint_transform(
@@ -15635,7 +15638,7 @@ class InMemorySessionStore(SessionStore):
             self._replace_transcript_search_session_unlocked(session_id, replacement)
             self._transcript_interaction_ids[session_id] = [None] * prefix_count + [
                 interaction_id
-            ] * len(expected)
+            ] * (len(expected) + runtime_suffix_count)
             self._transcript_indices_by_interaction.pop(session_id, None)
             self._deferred_interaction_inputs.pop(session_id, None)
             if checkpoint is None:
@@ -16628,6 +16631,26 @@ def copy_transcript_messages(messages: list[Message]) -> list[Message]:
     if type(messages) is not list:
         raise TypeError("Transcript messages must be a list.")
     return [detach_message(message) for message in messages]
+
+
+def _initial_transcript_prefix_count(
+    expected: list[Message],
+    replacement: list[Message],
+    *,
+    runtime_suffix_count: int,
+) -> int:
+    """Validate the admitted source segment and return its bootstrap offset."""
+
+    if type(runtime_suffix_count) is not int:
+        raise TypeError("runtime_suffix_count must be an int.")
+    if runtime_suffix_count < 0 or runtime_suffix_count > len(replacement):
+        raise ValueError("runtime_suffix_count is outside the replacement transcript.")
+    prefix_count = len(replacement) - len(expected) - runtime_suffix_count
+    if prefix_count < 0 or replacement[prefix_count : prefix_count + len(expected)] != expected:
+        raise RuntimeError(
+            "Initial transcript must preserve the admitted source before its runtime suffix."
+        )
+    return prefix_count
 
 
 def _detach_transcript_messages(messages: list[Message]) -> list[Message]:
@@ -19331,6 +19354,13 @@ def _validate_tool_round_publication(
             part.arguments, expected_arguments
         )
         if terminal_is_gateway:
+            if terminal.payload.get("blocked_by") == "targeted_tool_gateway":
+                arguments_match = arguments_state == "unavailable" and not part.arguments
+                if not arguments_match:
+                    raise ValueError(
+                        "A rejected gateway assistant projection must quarantine its envelope."
+                    )
+                continue
             outer_arguments = part.arguments
             inner_arguments = outer_arguments.get("arguments")
             tool_ref = outer_arguments.get("tool_ref")

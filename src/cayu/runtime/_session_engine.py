@@ -567,6 +567,11 @@ from cayu.runtime.structured_output import (
 from cayu.runtime.structured_output import (
     _require_native_structured_output_support as _require_provider_native_output_support,
 )
+from cayu.runtime.targeted_tool_projection import (
+    TargetedToolProjectionKind,
+    resolve_targeted_tool_projection,
+    targeted_tool_projection_marker_message,
+)
 from cayu.runtime.tasks import (
     Task,
     TaskCompletionDecisionRequired,
@@ -6877,9 +6882,9 @@ class SessionEngine:
 
         if not grants:
             return ()
-        if not registered_agent.tool_gateway_enabled:
+        if registered_agent.targeted_tool_mode is None:
             raise ValueError(
-                "Targeted tool grants require enable_tool_gateway=True at agent registration."
+                "Targeted tool grants require targeted_tool_mode at agent registration."
             )
         if (
             not self.session_store.supports_targeted_tool_grants
@@ -6964,8 +6969,9 @@ class SessionEngine:
         registered_agent: runtime_records.RegisteredAgentState,
         capability_ceiling: ToolCapabilityCeiling,
         observed_at: datetime,
+        preserve_native_projection_snapshot: bool = False,
     ) -> tuple[tuple[TargetedToolGrantRecord, ...], tuple[Event, ...]]:
-        """Revalidate an interrupted interaction's durable references before dispatch."""
+        """Revalidate durable references and optionally retain a native replay snapshot."""
 
         if not self.session_store.supports_targeted_tool_grants:
             return (), ()
@@ -6997,16 +7003,49 @@ class SessionEngine:
         )
         if result.events:
             await self._event_writer.fan_out_persisted(list(result.events))
+        replay_only_rejections = (
+            frozenset(
+                {
+                    TargetedToolUseRejectionReason.EXPIRED,
+                    TargetedToolUseRejectionReason.REVOKED,
+                }
+            )
+            if preserve_native_projection_snapshot
+            else frozenset({TargetedToolUseRejectionReason.EXPIRED})
+        )
         blocking_rejections = tuple(
             (grant_id, reason)
             for grant_id, reason in result.rejected
-            if reason is not TargetedToolUseRejectionReason.EXPIRED
+            if reason not in replay_only_rejections
         )
         if blocking_rejections:
             reasons = ", ".join(sorted({reason.value for _grant_id, reason in blocking_rejections}))
             raise RuntimeError("Targeted tool grant reconstruction failed closed: " + reasons)
+        records = tuple(copy_targeted_tool_grant_record(record) for record in result.valid)
+        if preserve_native_projection_snapshot and result.rejected:
+            durable_records = await self.session_store.list_targeted_tool_grants(
+                session.id,
+                interaction_id=interaction_id,
+            )
+            durable_by_id = {record.grant_id: record for record in durable_records}
+            if len(durable_by_id) != len(durable_records):
+                raise RuntimeError(
+                    "Targeted tool grant reconstruction found duplicate durable records."
+                )
+            expected_ids = {record.grant_id for record in result.valid} | {
+                grant_id for grant_id, _reason in result.rejected
+            }
+            if durable_by_id.keys() != expected_ids:
+                raise RuntimeError(
+                    "Targeted tool grant reconstruction conflicts with durable state."
+                )
+            # OpenAI stateless replay must preserve the exact historical
+            # additional_tools item. Expiry and revocation still reject a new
+            # invocation in the atomic use-binding path; they do not rewrite a
+            # provider item that was already dispatched.
+            records = tuple(copy_targeted_tool_grant_record(record) for record in durable_records)
         return (
-            tuple(copy_targeted_tool_grant_record(record) for record in result.valid),
+            records,
             result.events,
         )
 
@@ -7575,6 +7614,11 @@ class SessionEngine:
                 ),
             )
         _activate_session_interaction(session.id, interaction_id)
+        targeted_tool_projection = resolve_targeted_tool_projection(
+            registered_agent.targeted_tool_mode,
+            provider=registered_provider.provider,
+            model=session.model,
+        )
         current_task = asyncio.current_task()
         active_factory_run: ActiveSessionRun[SessionUsageTracker] | None = None
         if current_task is not None:
@@ -7685,15 +7729,42 @@ class SessionEngine:
                     contributions=prompt_contributions,
                     config=self._request_footprint,
                 )
+            targeted_projection_marker = (
+                targeted_tool_projection_marker_message(
+                    targeted_tool_grants,
+                    interaction_id=interaction_id,
+                    generation_id=targeted_tool_view_generation_id(
+                        session_id=session.id,
+                        root_invocation_id=session.invocation.root_invocation_id,
+                    ),
+                )
+                if targeted_tool_grants
+                and targeted_tool_projection is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS
+                else None
+            )
+            initial_source_messages = [
+                *request.messages,
+                *(() if targeted_projection_marker is None else (targeted_projection_marker,)),
+            ]
             messages = transcript_helpers.initial_messages(
                 system_prompt=rendered_system_prompt,
-                request_messages=request.messages,
+                request_messages=initial_source_messages,
             )
-            await self.session_store.replace_initial_transcript_messages(
-                session.id,
-                request.messages,
-                messages,
-            )
+            if targeted_projection_marker is None:
+                # Preserve the established call shape for stores that do not
+                # participate in native targeted-tool projection.
+                await self.session_store.replace_initial_transcript_messages(
+                    session.id,
+                    request.messages,
+                    messages,
+                )
+            else:
+                await self.session_store.replace_initial_transcript_messages(
+                    session.id,
+                    request.messages,
+                    messages,
+                    runtime_suffix_count=1,
+                )
             release_before_run = False
         except asyncio.CancelledError as cancellation:
             if await self._session_control.interrupt_requested(session.id):
@@ -7957,7 +8028,10 @@ class SessionEngine:
                 request_loop_policies=request.loop_policies,
                 request_metadata=request.metadata,
                 request_trace_metadata=request.metadata,
-                targeted_tool_grants=targeted_tool_grant_footprint(targeted_tool_grant_records),
+                targeted_tool_grants=targeted_tool_grant_footprint(
+                    targeted_tool_grant_records,
+                    projection=targeted_tool_projection,
+                ),
                 task_id=request.task_id,
                 task_worker_id=request.task_worker_id,
                 start_event_type=EventType.SESSION_STARTED,
@@ -7965,7 +8039,7 @@ class SessionEngine:
                     "agent_name": registered_agent.spec.name,
                     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: session_input_contract_evidence(
                         request,
-                        message_start_index=len(messages) - len(request.messages),
+                        message_start_index=(len(messages) - len(initial_source_messages)),
                     ),
                     **(
                         {}
@@ -13146,7 +13220,11 @@ class SessionEngine:
                             effective_tool_capability_ceiling.tool_names,
                         ),
                         structured_output=request.structured_output,
-                        tool_gateway_enabled=registered_agent.tool_gateway_enabled,
+                        targeted_tool_projection=resolve_targeted_tool_projection(
+                            registered_agent.targeted_tool_mode,
+                            provider=registered_provider.provider,
+                            model=requested_target.model,
+                        ),
                     )
                     registered_provider.provider.preflight_portable_messages(
                         model=requested_target.model,
@@ -13244,6 +13322,29 @@ class SessionEngine:
             if continuing_recovery_boundary:
                 _deactivate_session_interaction(loaded_session.id)
             raise RuntimeError("Deferred interaction input belongs to another interaction.")
+        targeted_tool_projection = resolve_targeted_tool_projection(
+            registered_agent.targeted_tool_mode,
+            provider=registered_provider.provider,
+            model=(
+                requested_target.model
+                if target_changed and requested_target is not None
+                else loaded_session.model
+            ),
+        )
+        targeted_projection_marker = (
+            targeted_tool_projection_marker_message(
+                prepared_targeted_tool_grants,
+                interaction_id=interaction_id,
+                generation_id=targeted_tool_view_generation_id(
+                    session_id=loaded_session.id,
+                    root_invocation_id=loaded_session.invocation.root_invocation_id,
+                ),
+            )
+            if not continuing_recovery_boundary
+            and prepared_targeted_tool_grants
+            and targeted_tool_projection is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS
+            else None
+        )
         interaction_source_messages = [
             *(
                 existing_deferred_input.source_messages
@@ -13251,6 +13352,7 @@ class SessionEngine:
                 else []
             ),
             *request.messages,
+            *(() if targeted_projection_marker is None else (targeted_projection_marker,)),
         ]
         invocation_profile = (
             continuing_execution_profile_snapshot.profile
@@ -13360,6 +13462,10 @@ class SessionEngine:
                     registered_agent=registered_agent,
                     capability_ceiling=effective_tool_capability_ceiling,
                     observed_at=self._clock(),
+                    preserve_native_projection_snapshot=(
+                        targeted_tool_projection
+                        is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS
+                    ),
                 )
                 if continuing_recovery_boundary
                 else ((), ())
@@ -13649,7 +13755,10 @@ class SessionEngine:
             request_trace_metadata=(
                 _runtime_resume_transport_metadata(request) or request.metadata
             ),
-            targeted_tool_grants=targeted_tool_grant_footprint(targeted_tool_grant_records),
+            targeted_tool_grants=targeted_tool_grant_footprint(
+                targeted_tool_grant_records,
+                projection=targeted_tool_projection,
+            ),
             task_id=task_id,
             task_worker_id=None,
             start_event_type=EventType.SESSION_RESUMED,
@@ -13661,7 +13770,9 @@ class SessionEngine:
                         SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: (
                             session_input_contract_evidence(
                                 request,
-                                message_start_index=len(transcript) - len(request.messages),
+                                message_start_index=(
+                                    len(transcript) - len(interaction_source_messages)
+                                ),
                             )
                         )
                     }
@@ -14279,7 +14390,11 @@ class SessionEngine:
                                     effective_tool_capability_ceiling.tool_names,
                                 ),
                                 structured_output=None,
-                                tool_gateway_enabled=registered_agent.tool_gateway_enabled,
+                                targeted_tool_projection=resolve_targeted_tool_projection(
+                                    registered_agent.targeted_tool_mode,
+                                    provider=registered_provider.provider,
+                                    model=model,
+                                ),
                             )
                             registered_provider.provider.preflight_portable_messages(
                                 model=model,
@@ -15140,7 +15255,13 @@ class SessionEngine:
                     agent_name=registered_agent.spec.name,
                     interaction_id=(
                         publication.completion_event.interaction_id
-                        if any(call.name == CALL_TOOL_NAME for call in tool_calls)
+                        if any(
+                            call.name == CALL_TOOL_NAME
+                            or call.targeted_tool_grant_id is not None
+                            or call.targeted_tool_invocation is not None
+                            or call.targeted_tool_rejection is not None
+                            for call in tool_calls
+                        )
                         else None
                     ),
                     environment_name=_environment_name(registered_environment),

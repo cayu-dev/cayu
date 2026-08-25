@@ -7360,7 +7360,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "25",
+          "default": "26",
           "title": "Contract Version",
           "type": "string"
         },
@@ -10901,7 +10901,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "25",
+          "default": "26",
           "title": "Contract Version",
           "type": "string"
         }

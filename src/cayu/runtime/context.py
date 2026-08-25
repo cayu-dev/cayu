@@ -1930,7 +1930,14 @@ def estimate_model_request_context_pressure(
         usage=ContextUsageState(),
         messages=model_request.messages,
         overhead=ContextPressureOverhead(
-            tools=model_request.tools,
+            tools=[
+                *model_request.tools,
+                *(
+                    ()
+                    if model_request.targeted_tool_projection is None
+                    else model_request.targeted_tool_projection.tools
+                ),
+            ],
             request_options=model_request.options,
             image_min_tokens=image_min_tokens,
             document_min_tokens=document_min_tokens,
@@ -3838,6 +3845,7 @@ class PromptCacheCompactor(ContextCompactor):
             model=model,
             messages=compaction_messages,
             tools=tools,
+            targeted_tool_projection=cached_request.targeted_tool_projection,
             options=options,
         )
 
@@ -4199,6 +4207,7 @@ def _detach_compaction_model_request(request: ModelRequest) -> ModelRequest:
         messages=request.messages,
         tools=request.tools,
         hosted_tools=request.hosted_tools,
+        targeted_tool_projection=request.targeted_tool_projection,
         options=request.options,
     )
 

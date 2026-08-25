@@ -24,7 +24,7 @@ from cayu.runtime._child_session_identity import ChildSessionRecoveryMatcher
 from cayu.runtime._policy_evidence import ToolPolicyEvidence
 from cayu.runtime.context import ContextPolicy
 from cayu.runtime.hooks import RuntimeHook
-from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
+from cayu.runtime.targeted_tool_projection import TargetedToolMode
 from cayu.runtime.tool_grants import (
     TARGETED_TOOL_TRANSCRIPT_REFERENCE,
     RejectedTargetedToolInvocation,
@@ -59,7 +59,7 @@ class RegisteredAgentState:
     all_registered_tool_exposure: ResolvedToolExposure
     tool_exposure_policy: ToolExposurePolicy
     tool_exposure_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None
-    tool_gateway_enabled: bool
+    targeted_tool_mode: TargetedToolMode | None
     hosted_tools: tuple[OpenAIWebSearch, ...]
     context_policy: ContextPolicy
     context_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None
@@ -182,8 +182,14 @@ class ToolCallRequest:
                 self.targeted_tool_grant_id,
                 "targeted_tool_grant_id",
             )
-            if self.name != CALL_TOOL_NAME and self.model_tool_name != CALL_TOOL_NAME:
-                raise ValueError("Targeted grant selection requires a call_tool model call.")
+            if (
+                self.model_tool_name is not None
+                and self.targeted_tool_invocation is None
+                and self.targeted_tool_rejection is None
+            ):
+                raise ValueError(
+                    "An unresolved targeted grant selection cannot carry a model alias."
+                )
         if (self.targeted_tool_invocation is not None) and (
             self.targeted_tool_rejection is not None
         ):
@@ -203,7 +209,10 @@ class ToolCallRequest:
                 raise ValueError("Targeted grant selection conflicts with its resolved invocation.")
         if self.targeted_tool_rejection is not None:
             rejection = self.targeted_tool_rejection
-            if self.model_tool_name != rejection.model_tool_name or self.name != "call_tool":
+            if (
+                self.model_tool_name != rejection.model_tool_name
+                or self.name != rejection.model_tool_name
+            ):
                 raise ValueError("Rejected targeted invocation conflicts with its model call.")
         if self.model_tool_name is not None and (
             self.targeted_tool_invocation is None and self.targeted_tool_rejection is None
@@ -221,13 +230,15 @@ class ToolCallRequest:
             if self.targeted_tool_grant_id is not None and "tool_ref" in projected:
                 projected["tool_ref"] = TARGETED_TOOL_TRANSCRIPT_REFERENCE
             return projected
-        return {
-            "tool_ref": TARGETED_TOOL_TRANSCRIPT_REFERENCE,
-            "arguments": copy_durable_json_object(
-                self.arguments,
-                "tool_call.arguments",
-            ),
-        }
+        if self.targeted_tool_invocation.dispatch_kind == "gateway":
+            return {
+                "tool_ref": TARGETED_TOOL_TRANSCRIPT_REFERENCE,
+                "arguments": copy_durable_json_object(
+                    self.arguments,
+                    "tool_call.arguments",
+                ),
+            }
+        return copy_durable_json_object(self.arguments, "tool_call.arguments")
 
 
 def copy_tool_call_request(
@@ -235,7 +246,7 @@ def copy_tool_call_request(
     *,
     arguments: dict[str, Any] | None = None,
 ) -> ToolCallRequest:
-    """Return a detached copy without losing gateway dual identity."""
+    """Return a detached copy without losing targeted-tool dual identity."""
 
     if type(value) is not ToolCallRequest:
         raise TypeError("value must be a ToolCallRequest.")
