@@ -60,6 +60,7 @@ from cayu.core.messages import Message
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import (
     _TOOL_POLICY_DENIAL_SOURCE,
+    DurableToolOperationConflict,
     ToolContext,
     ToolEffect,
     ToolResult,
@@ -3600,7 +3601,9 @@ class ToolRoundExecutor:
                             "Durable tool operation lost its parent run authority."
                         )
                     if current != expected_copy:
-                        raise RuntimeError("Durable tool operation changed before publication.")
+                        raise DurableToolOperationConflict(
+                            "Durable tool operation changed before publication."
+                        )
                     records = {storage_key: desired_copy, **secondary_copy}
                     return SessionOperationPublication(
                         checkpoint={} if checkpoint is None else checkpoint,

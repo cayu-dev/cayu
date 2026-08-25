@@ -189,13 +189,22 @@ class _RuntimeCheckpointSessionStore:
         interaction_started_event: Any = None,
         interaction_source_messages: Any = None,
         checkpoint_transform: CheckpointTransform | None = None,
+        operation_initializer: Any = None,
     ) -> Session:
         if checkpoint_transform is None:
+            if operation_initializer is None:
+                return await self._store.create(
+                    request,
+                    identity=identity,
+                    interaction_started_event=interaction_started_event,
+                    interaction_source_messages=interaction_source_messages,
+                )
             return await self._store.create(
                 request,
                 identity=identity,
                 interaction_started_event=interaction_started_event,
                 interaction_source_messages=interaction_source_messages,
+                operation_initializer=operation_initializer,
             )
 
         def transform_initial_checkpoint(
@@ -207,12 +216,21 @@ class _RuntimeCheckpointSessionStore:
                 checkpoint_transform,
             )(session, checkpoint)
 
+        if operation_initializer is None:
+            return await self._store.create(
+                request,
+                identity=identity,
+                interaction_started_event=interaction_started_event,
+                interaction_source_messages=interaction_source_messages,
+                checkpoint_transform=transform_initial_checkpoint,
+            )
         return await self._store.create(
             request,
             identity=identity,
             interaction_started_event=interaction_started_event,
             interaction_source_messages=interaction_source_messages,
             checkpoint_transform=transform_initial_checkpoint,
+            operation_initializer=operation_initializer,
         )
 
     async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
@@ -343,6 +361,8 @@ class _RuntimeCheckpointSessionStore:
         checkpoint_transform: CheckpointTransform | None,
         **kwargs: Any,
     ) -> Session:
+        if kwargs.get("operation_initializer") is None:
+            kwargs.pop("operation_initializer", None)
         return await self._store.create_fork(
             source_session_id=source_session_id,
             checkpoint_transform=_optional_versioned_checkpoint_transform(
@@ -359,6 +379,8 @@ class _RuntimeCheckpointSessionStore:
         checkpoint_transform: CheckpointTransform | None,
         **kwargs: Any,
     ) -> Session:
+        if kwargs.get("operation_initializer") is None:
+            kwargs.pop("operation_initializer", None)
         return await self._store.create_fork_with_transcript_validation(
             source_session_id=source_session_id,
             checkpoint_transform=_optional_versioned_checkpoint_transform(
@@ -375,6 +397,9 @@ class _RuntimeCheckpointSessionStore:
         checkpoint_transform: CheckpointTransform | None,
         **kwargs: Any,
     ) -> ProfiledSessionForkResult:
+        if kwargs.get("operation_initializer") is None:
+            kwargs.pop("operation_initializer", None)
+
         def decode_profile_authority(
             checkpoint: dict[str, Any] | None,
         ) -> dict[str, Any] | None:

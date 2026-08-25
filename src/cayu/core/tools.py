@@ -42,6 +42,10 @@ if TYPE_CHECKING:
     from cayu.runners.base import ExecCommand, ExecResult
 
 
+class DurableToolOperationConflict(RuntimeError):
+    """A durable tool operation lost a compare-and-set race."""
+
+
 class ToolEffect(StrEnum):
     """Declared side-effect semantics for a tool execution.
 

@@ -169,6 +169,7 @@ from cayu.runtime.sessions import (
     SessionModelCompletionStageConflict,
     SessionModelTransition,
     SessionOperationalSnapshot,
+    SessionOperationInitializer,
     SessionOperationPublication,
     SessionOperationTransform,
     SessionOrder,
@@ -256,6 +257,7 @@ from cayu.runtime.sessions import (
     _ModelCompletionStagePromotionContext,
     _next_runtime_publication_timestamp,
     _prepare_execution_profile_rejection,
+    _prepare_initial_session_operation_records,
     _prepare_interaction_transition,
     _prepare_interaction_transition_receipt_lookup,
     _prepare_model_completion_stage_promotion,
@@ -1522,6 +1524,7 @@ class SQLiteSessionStore(SessionStore):
     supports_active_invocation_execution_profiles: ClassVar[bool] = True
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     supports_profiled_forks: ClassVar[bool] = True
+    supports_atomic_session_operation_initialization: ClassVar[bool] = True
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
     supports_completion_result_event_publication_reservations: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
@@ -3108,6 +3111,7 @@ class SQLiteSessionStore(SessionStore):
         interaction_started_event: Event | None = None,
         interaction_source_messages: list[Message] | None = None,
         checkpoint_transform: CheckpointTransform | None = None,
+        operation_initializer: SessionOperationInitializer | None = None,
     ) -> Session:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -3142,6 +3146,10 @@ class SQLiteSessionStore(SessionStore):
                         session = session.model_copy(
                             update={"status": SessionStatus.RUNNING, "run_epoch": 1}
                         )
+                    initial_operation_records = _prepare_initial_session_operation_records(
+                        session,
+                        operation_initializer,
+                    )
                     if session.parent_session_id == session.id:
                         raise ValueError("Session cannot be its own parent.")
                     self._connection.execute(
@@ -3187,6 +3195,21 @@ class SQLiteSessionStore(SessionStore):
                             sqlite_support.json_dumps(session.metadata),
                         ),
                     )
+                    if initial_operation_records:
+                        self._connection.executemany(
+                            "INSERT INTO cayu_session_operations "
+                            "(session_id, idempotency_key, record_json, updated_at) "
+                            "VALUES (?, ?, ?, ?)",
+                            [
+                                (
+                                    session.id,
+                                    key,
+                                    sqlite_support.json_dumps(record),
+                                    sqlite_support.format_datetime(session.updated_at),
+                                )
+                                for key, record in initial_operation_records.items()
+                            ],
+                        )
                     if session.labels:
                         self._connection.executemany(
                             """
@@ -3321,6 +3344,7 @@ class SQLiteSessionStore(SessionStore):
         checkpoint_transform: CheckpointTransform | None,
         system_prompt_replacement: ForkSystemPromptReplacement | None = None,
         expected_source_run_epoch: int,
+        operation_initializer: SessionOperationInitializer | None = None,
     ) -> Session:
         return await self._create_fork(
             source_session_id=source_session_id,
@@ -3331,6 +3355,7 @@ class SQLiteSessionStore(SessionStore):
             system_prompt_replacement=system_prompt_replacement,
             expected_source_run_epoch=expected_source_run_epoch,
             transcript_validator=None,
+            operation_initializer=operation_initializer,
         )
 
     async def create_fork_with_transcript_validation(
@@ -3344,6 +3369,7 @@ class SQLiteSessionStore(SessionStore):
         system_prompt_replacement: ForkSystemPromptReplacement | None = None,
         expected_source_run_epoch: int,
         transcript_validator: ForkTranscriptValidator,
+        operation_initializer: SessionOperationInitializer | None = None,
     ) -> Session:
         return await self._create_fork(
             source_session_id=source_session_id,
@@ -3354,6 +3380,7 @@ class SQLiteSessionStore(SessionStore):
             system_prompt_replacement=system_prompt_replacement,
             expected_source_run_epoch=expected_source_run_epoch,
             transcript_validator=transcript_validator,
+            operation_initializer=operation_initializer,
         )
 
     async def create_profiled_fork(
@@ -3370,6 +3397,7 @@ class SQLiteSessionStore(SessionStore):
         events: list[Event],
         transcript_validator: ForkTranscriptValidator | None = None,
         checkpoint_authority_decoder: ForkCheckpointAuthorityDecoder | None = None,
+        operation_initializer: SessionOperationInitializer | None = None,
     ) -> ProfiledSessionForkResult:
         relationship, copied_events = _copy_profiled_fork_authority(
             fork=fork,
@@ -3388,6 +3416,7 @@ class SQLiteSessionStore(SessionStore):
             profile_relationship=relationship,
             events=copied_events,
             checkpoint_authority_decoder=checkpoint_authority_decoder,
+            operation_initializer=operation_initializer,
         )
         return ProfiledSessionForkResult(session=created, events=tuple(copied_events))
 
@@ -3405,6 +3434,7 @@ class SQLiteSessionStore(SessionStore):
         profile_relationship: SessionForkProfileRelationship | None = None,
         events: list[Event] | None = None,
         checkpoint_authority_decoder: ForkCheckpointAuthorityDecoder | None = None,
+        operation_initializer: SessionOperationInitializer | None = None,
     ) -> Session:
         source_session_id, fork, allowed_statuses, transcript_cursor = (
             _prepare_session_fork_request(
@@ -3533,6 +3563,10 @@ class SQLiteSessionStore(SessionStore):
                         source_checkpoint_present=source_checkpoint_present,
                         copied_checkpoint=copied_checkpoint,
                     )
+                initial_operation_records = _prepare_initial_session_operation_records(
+                    fork,
+                    operation_initializer,
+                )
 
                 self._connection.execute(
                     """
@@ -3559,6 +3593,21 @@ class SQLiteSessionStore(SessionStore):
                     """,
                     sqlite_support.session_to_row_values(fork),
                 )
+                if initial_operation_records:
+                    self._connection.executemany(
+                        "INSERT INTO cayu_session_operations "
+                        "(session_id, idempotency_key, record_json, updated_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        [
+                            (
+                                fork.id,
+                                key,
+                                sqlite_support.json_dumps(record),
+                                sqlite_support.format_datetime(fork.updated_at),
+                            )
+                            for key, record in initial_operation_records.items()
+                        ],
+                    )
                 if fork.labels:
                     self._connection.executemany(
                         """

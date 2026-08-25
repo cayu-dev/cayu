@@ -94,7 +94,14 @@ from cayu.core.events import (
     event_payload_authority_is_runtime_generated,
     event_with_runtime_payload_authority,
 )
-from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+from cayu.core.tools import (
+    DurableToolOperationConflict,
+    Tool,
+    ToolContext,
+    ToolEffect,
+    ToolResult,
+    ToolSpec,
+)
 from cayu.environments import (
     BoundWorkspace,
     DeterministicWorkspaceBinding,
@@ -18959,6 +18966,191 @@ def test_session_store_conformance_create_atomically_stages_pending_checkpoint(
                     checkpoint_transform=reject_create,
                 )
             assert await store.load("sess_failed_atomic_pending_checkpoint") is None
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_atomically_initializes_branch_operation_records(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        source_id = f"discovery-view-source-{session_store_case[0]}"
+        child_id = f"discovery-view-child-{session_store_case[0]}"
+        failed_create_id = f"discovery-view-failed-create-{session_store_case[0]}"
+        failed_fork_id = f"discovery-view-failed-fork-{session_store_case[0]}"
+        operation_key = "branch-initial-state"
+
+        def initialize(current: Session) -> dict[str, dict[str, Any]]:
+            return {
+                operation_key: {
+                    "schema_version": 1,
+                    "session_id": current.id,
+                    "root_invocation_id": current.invocation.root_invocation_id,
+                    "revision": 0,
+                }
+            }
+
+        def reject(_current: Session) -> dict[str, dict[str, Any]]:
+            raise RuntimeError("reject initial operation records")
+
+        try:
+            assert store.supports_atomic_session_operation_initialization is True
+            source = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=source_id,
+                    messages=[],
+                ),
+                identity=_identity(),
+                operation_initializer=initialize,
+            )
+            source_state = await store.load_session_operation(
+                source.id,
+                operation_key,
+            )
+            assert source_state == {
+                "schema_version": 1,
+                "session_id": source.id,
+                "root_invocation_id": source.invocation.root_invocation_id,
+                "revision": 0,
+            }
+
+            with pytest.raises(RuntimeError, match="reject initial operation records"):
+                await store.create(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id=failed_create_id,
+                        messages=[],
+                    ),
+                    identity=_identity(),
+                    operation_initializer=reject,
+                )
+            assert await store.load(failed_create_id) is None
+
+            child_template = Session(
+                id=child_id,
+                agent_name=source.agent_name,
+                provider_name=source.provider_name,
+                model=source.model,
+                parent_session_id=source.id,
+                causal_budget_id=source.causal_budget_id,
+                invocation=fork_session_invocation(source),
+                status=source.status,
+                metadata=source.metadata,
+            )
+            child = await store.create_fork(
+                source_session_id=source.id,
+                fork=child_template,
+                source_statuses={SessionStatus.PENDING},
+                transcript_cursor=None,
+                checkpoint_transform=None,
+                expected_source_run_epoch=source.run_epoch,
+                operation_initializer=initialize,
+            )
+            child_state = await store.load_session_operation(
+                child.id,
+                operation_key,
+            )
+            assert child_state == {
+                "schema_version": 1,
+                "session_id": child.id,
+                "root_invocation_id": child.invocation.root_invocation_id,
+                "revision": 0,
+            }
+            assert child_state["session_id"] != source_state["session_id"]
+            assert await store.load_session_operation(source.id, operation_key) == source_state
+
+            failed_fork = child_template.model_copy(update={"id": failed_fork_id})
+            with pytest.raises(RuntimeError, match="reject initial operation records"):
+                await store.create_fork(
+                    source_session_id=source.id,
+                    fork=failed_fork,
+                    source_statuses={SessionStatus.PENDING},
+                    transcript_cursor=None,
+                    checkpoint_transform=None,
+                    expected_source_run_epoch=source.run_epoch,
+                    operation_initializer=reject,
+                )
+            assert await store.load(failed_fork_id) is None
+
+            store = await _reopen_store(session_store_case, store)
+            assert (
+                await store.load_session_operation(
+                    source.id,
+                    operation_key,
+                )
+                == source_state
+            )
+            assert (
+                await store.load_session_operation(
+                    child.id,
+                    operation_key,
+                )
+                == child_state
+            )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_serializes_operation_compare_and_set_contention(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = f"operation-contention-{session_store_case[0]}"
+        operation_key = "tool-view-contention"
+        try:
+            created = await store.create(
+                RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+                identity=_identity(),
+                operation_initializer=lambda _current: {
+                    operation_key: {"revision": 0, "writer": None}
+                },
+            )
+            expected = await store.load_session_operation(created.id, operation_key)
+            assert expected == {"revision": 0, "writer": None}
+
+            async def publish(writer: str) -> None:
+                desired = {"revision": 1, "writer": writer}
+
+                def compare_and_set(_current, checkpoint, current_record):
+                    if current_record != expected:
+                        raise DurableToolOperationConflict("simulated compare-and-set loss")
+                    return SessionOperationPublication(
+                        checkpoint={} if checkpoint is None else checkpoint,
+                        operation_records={operation_key: desired},
+                    )
+
+                await store.publish_session_operation(
+                    created.id,
+                    idempotency_key=operation_key,
+                    operation_transform=compare_and_set,
+                    events=[],
+                )
+
+            outcomes = await asyncio.gather(
+                publish("first"),
+                publish("second"),
+                return_exceptions=True,
+            )
+            assert sum(outcome is None for outcome in outcomes) == 1
+            [conflict] = [
+                outcome for outcome in outcomes if isinstance(outcome, DurableToolOperationConflict)
+            ]
+            assert str(conflict) == "simulated compare-and-set loss"
+            winning = await store.load_session_operation(created.id, operation_key)
+            assert winning in (
+                {"revision": 1, "writer": "first"},
+                {"revision": 1, "writer": "second"},
+            )
+
+            store = await _reopen_store(session_store_case, store)
+            assert await store.load_session_operation(created.id, operation_key) == winning
         finally:
             await _close_store(store)
 

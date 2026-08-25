@@ -3239,6 +3239,10 @@ CheckpointTransform = Callable[
     [Session, dict[str, Any] | None],
     dict[str, Any] | None,
 ]
+SessionOperationInitializer = Callable[
+    [Session],
+    Mapping[str, dict[str, Any]],
+]
 CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS = 32
 
 _COMPLETION_RESULT_EVENT_PUBLICATIONS_SCHEMA_VERSION = 2
@@ -7985,6 +7989,7 @@ class SessionStore(ABC):
     supports_active_invocation_execution_profiles: ClassVar[bool] = False
     supports_pending_session_initial_checkpoint: ClassVar[bool] = False
     supports_profiled_forks: ClassVar[bool] = False
+    supports_atomic_session_operation_initialization: ClassVar[bool] = False
     supports_atomic_model_completion_stage_release: ClassVar[bool] = False
     supports_completion_result_event_publication_reservations: ClassVar[bool] = False
     supports_transcript_search: ClassVar[bool] = False
@@ -8139,6 +8144,7 @@ class SessionStore(ABC):
         interaction_started_event: Event | None = None,
         interaction_source_messages: list[Message] | None = None,
         checkpoint_transform: CheckpointTransform | None = None,
+        operation_initializer: SessionOperationInitializer | None = None,
     ) -> Session:
         """Create a session, optionally admitting its first interaction atomically.
 
@@ -8156,6 +8162,12 @@ class SessionStore(ABC):
         ``PENDING`` session and no current checkpoint. Stores that do not
         advertise that capability must reject such a request before creating
         the session.
+
+        ``operation_initializer`` receives the final detached session and
+        synchronously returns bounded operation records that must commit
+        atomically with it. The callback runs inside the creation boundary and
+        must be deterministic and side-effect-free. Stores must reject the
+        callback or any record before exposing a partial session.
         """
 
     @abstractmethod
@@ -8169,6 +8181,7 @@ class SessionStore(ABC):
         checkpoint_transform: CheckpointTransform | None,
         system_prompt_replacement: ForkSystemPromptReplacement | None = None,
         expected_source_run_epoch: int,
+        operation_initializer: SessionOperationInitializer | None = None,
     ) -> Session:
         """Create a forked session with copied transcript/checkpoint state.
 
@@ -8188,6 +8201,7 @@ class SessionStore(ABC):
         system_prompt_replacement: ForkSystemPromptReplacement | None = None,
         expected_source_run_epoch: int,
         transcript_validator: ForkTranscriptValidator,
+        operation_initializer: SessionOperationInitializer | None = None,
     ) -> Session:
         """Create a fork after validating the final transcript inside the copy boundary.
 
@@ -8216,6 +8230,7 @@ class SessionStore(ABC):
         events: list[Event],
         transcript_validator: ForkTranscriptValidator | None = None,
         checkpoint_authority_decoder: ForkCheckpointAuthorityDecoder | None = None,
+        operation_initializer: SessionOperationInitializer | None = None,
     ) -> ProfiledSessionForkResult:
         """Atomically create a child and its immutable profile evidence."""
 
@@ -10002,6 +10017,7 @@ class InMemorySessionStore(SessionStore):
     supports_active_invocation_execution_profiles: ClassVar[bool] = True
     supports_pending_session_initial_checkpoint: ClassVar[bool] = True
     supports_profiled_forks: ClassVar[bool] = True
+    supports_atomic_session_operation_initialization: ClassVar[bool] = True
     supports_atomic_model_completion_stage_release: ClassVar[bool] = True
     supports_completion_result_event_publication_reservations: ClassVar[bool] = True
     supports_transcript_search: ClassVar[bool] = True
@@ -11423,6 +11439,7 @@ class InMemorySessionStore(SessionStore):
         interaction_started_event: Event | None = None,
         interaction_source_messages: list[Message] | None = None,
         checkpoint_transform: CheckpointTransform | None = None,
+        operation_initializer: SessionOperationInitializer | None = None,
     ) -> Session:
         if type(request) is not RunRequest:
             raise TypeError("Session creation requires a RunRequest.")
@@ -11482,6 +11499,10 @@ class InMemorySessionStore(SessionStore):
                 ),
                 run_epoch=1 if admission is not None else 0,
             )
+            initial_operation_records = _prepare_initial_session_operation_records(
+                session,
+                operation_initializer,
+            )
             pending_checkpoint: _PreparedInMemoryCheckpointStore | None = None
             if admission is None and checkpoint_transform is not None:
                 transformed = checkpoint_transform(session.model_copy(deep=True), None)
@@ -11509,7 +11530,7 @@ class InMemorySessionStore(SessionStore):
             self._latest_interaction_event_records[session.id] = {}
             self._latest_interaction_event_records_by_sequence[session.id] = []
             self._pending_action_event_records[session.id] = {}
-            self._session_operation_records[session.id] = {}
+            self._session_operation_records[session.id] = initial_operation_records
             self._transcripts[session.id] = []
             self._transcript_interaction_ids[session.id] = []
             self._transcript_search_documents[session.id] = []
@@ -11554,6 +11575,7 @@ class InMemorySessionStore(SessionStore):
         checkpoint_transform: CheckpointTransform | None,
         system_prompt_replacement: ForkSystemPromptReplacement | None = None,
         expected_source_run_epoch: int,
+        operation_initializer: SessionOperationInitializer | None = None,
     ) -> Session:
         return await self._create_fork(
             source_session_id=source_session_id,
@@ -11564,6 +11586,7 @@ class InMemorySessionStore(SessionStore):
             system_prompt_replacement=system_prompt_replacement,
             expected_source_run_epoch=expected_source_run_epoch,
             transcript_validator=None,
+            operation_initializer=operation_initializer,
         )
 
     async def create_fork_with_transcript_validation(
@@ -11577,6 +11600,7 @@ class InMemorySessionStore(SessionStore):
         system_prompt_replacement: ForkSystemPromptReplacement | None = None,
         expected_source_run_epoch: int,
         transcript_validator: ForkTranscriptValidator,
+        operation_initializer: SessionOperationInitializer | None = None,
     ) -> Session:
         return await self._create_fork(
             source_session_id=source_session_id,
@@ -11587,6 +11611,7 @@ class InMemorySessionStore(SessionStore):
             system_prompt_replacement=system_prompt_replacement,
             expected_source_run_epoch=expected_source_run_epoch,
             transcript_validator=transcript_validator,
+            operation_initializer=operation_initializer,
         )
 
     async def create_profiled_fork(
@@ -11603,6 +11628,7 @@ class InMemorySessionStore(SessionStore):
         events: list[Event],
         transcript_validator: ForkTranscriptValidator | None = None,
         checkpoint_authority_decoder: ForkCheckpointAuthorityDecoder | None = None,
+        operation_initializer: SessionOperationInitializer | None = None,
     ) -> ProfiledSessionForkResult:
         relationship, copied_events = _copy_profiled_fork_authority(
             fork=fork,
@@ -11621,6 +11647,7 @@ class InMemorySessionStore(SessionStore):
             profile_relationship=relationship,
             events=copied_events,
             checkpoint_authority_decoder=checkpoint_authority_decoder,
+            operation_initializer=operation_initializer,
         )
         return ProfiledSessionForkResult(session=created, events=tuple(copied_events))
 
@@ -11638,6 +11665,7 @@ class InMemorySessionStore(SessionStore):
         profile_relationship: SessionForkProfileRelationship | None = None,
         events: list[Event] | None = None,
         checkpoint_authority_decoder: ForkCheckpointAuthorityDecoder | None = None,
+        operation_initializer: SessionOperationInitializer | None = None,
     ) -> Session:
         source_session_id, fork, allowed_statuses, transcript_cursor = (
             _prepare_session_fork_request(
@@ -11749,6 +11777,10 @@ class InMemorySessionStore(SessionStore):
                     source_checkpoint_present=source_checkpoint_present,
                     copied_checkpoint=copied_checkpoint,
                 )
+            initial_operation_records = _prepare_initial_session_operation_records(
+                fork,
+                operation_initializer,
+            )
 
             self._register_private_authority_alias_unlocked(
                 fork.id,
@@ -11763,7 +11795,7 @@ class InMemorySessionStore(SessionStore):
             self._latest_interaction_event_records[fork.id] = {}
             self._latest_interaction_event_records_by_sequence[fork.id] = []
             self._pending_action_event_records[fork.id] = {}
-            self._session_operation_records[fork.id] = {}
+            self._session_operation_records[fork.id] = initial_operation_records
             self._transcripts[fork.id] = copied_transcript
             self._replace_transcript_search_session_unlocked(fork.id, copied_transcript)
             # Historical attribution remains tied to the source session's
@@ -18836,6 +18868,33 @@ def _reconstruct_interaction_transition_receipt(
 def _validate_session_operation_record_keys(records: Mapping[str, Any]) -> None:
     for key in records:
         _reject_reserved_runtime_publication_key(key, "operation_records key")
+
+
+def _prepare_initial_session_operation_records(
+    session: Session,
+    initializer: SessionOperationInitializer | None,
+) -> dict[str, dict[str, Any]]:
+    """Run one initializer against a detached session and validate its records."""
+
+    if initializer is None:
+        return {}
+    raw_records = initializer(session.model_copy(deep=True))
+    if not isinstance(raw_records, Mapping):
+        raise TypeError("Session operation initializer must return a mapping.")
+    if len(raw_records) > RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS:
+        raise ValueError(
+            "Initial session operation records cannot exceed "
+            f"{RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS} entries."
+        )
+    copied = copy_durable_json_object(
+        dict(raw_records),
+        "initial_session_operation_records",
+    )
+    _validate_session_operation_record_keys(copied)
+    for record in copied.values():
+        if type(record) is not dict:
+            raise ValueError("Initial session operation records must be objects.")
+    return copied
 
 
 def _runtime_publication_storage_key(publication_id: str) -> str:
