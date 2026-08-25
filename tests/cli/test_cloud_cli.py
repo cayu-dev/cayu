@@ -70,7 +70,12 @@ def test_cloud_help_exposes_first_party_customer_commands(
         "env",
         "evidence",
         "init",
+        "login",
+        "logout",
+        "rollback",
         "runtimes",
+        "service",
+        "whoami",
     ):
         assert command in help_text
     assert "--api-url" not in help_text

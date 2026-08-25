@@ -15,6 +15,20 @@ cayu cloud deployment logs DEPLOYMENT_ID --application my-agent
 cayu cloud service status --application my-agent
 ```
 
+## Command inventory
+
+`cayu cloud --help` is the authoritative summary. The top-level commands are:
+
+- `login`, `logout`, and `whoami` for interactive identity;
+- `applications list` for deployed Agent discovery;
+- `context use|show|clear` and `doctor` for connection selection and diagnosis;
+- `init` and `deploy` for local project setup and publication;
+- `deployment logs|status|timeline|wait|promote` and `rollback` for immutable releases;
+- `runtimes list|status` for retained runtime artifacts;
+- `service destroy|logs|restart|sleep|status|wake` for Agent infrastructure;
+- `env list|set|unset` for Agent-owned configuration; and
+- `evidence list|show|verify` for local content-free command records.
+
 `deployment timeline` shows the release pipeline milestones and whether a failed
 release can be retried or an active release can be cancelled. `deployment logs`
 returns the Cloud-owned structured publication activity for that exact immutable

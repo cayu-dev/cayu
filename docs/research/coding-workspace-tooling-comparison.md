@@ -20,14 +20,14 @@ the coding-workspace issue:
 It does not attempt to rank every product feature such as browser automation,
 subagents, task management, or provider integrations.
 
-The sources are local primary-source snapshots:
+The sources are revision-pinned primary-source snapshots:
 
 | System | Source | Revision |
 |---|---|---|
-| Cayu | `/Users/nurazem/work/cayu/cayu` | `009f65281a05b37feb8231fc6e7f5bf0ecc60d62` |
-| Pi coding agent | `/Users/nurazem/work/cayu/research/pi-mono` | `a5afc3f171e422e08a2ccc342827719f9952f38a`, package `0.81.1` |
-| Claude Code | `/Users/nurazem/work/cayu/research/claude-code` | extracted package `2.1.88`; the snapshot is not a Git checkout |
-| Codex | `/Users/nurazem/work/cayu/research/codex` | `6e5a2d6b8d148a5554fdceb6f399ca45bd1c78d9` |
+| Cayu | [public source](https://github.com/cayu-dev/cayu/tree/009f65281a05b37feb8231fc6e7f5bf0ecc60d62) | `009f65281a05b37feb8231fc6e7f5bf0ecc60d62` |
+| Pi coding agent | [public source](https://github.com/badlogic/pi-mono/tree/a5afc3f171e422e08a2ccc342827719f9952f38a) | `a5afc3f171e422e08a2ccc342827719f9952f38a`, package `0.81.1` |
+| Claude Code | [official package](https://www.npmjs.com/package/@anthropic-ai/claude-code/v/2.1.88) | extracted package `2.1.88`; file-level snapshot evidence is not redistributable |
+| Codex | [public source](https://github.com/openai/codex/tree/6e5a2d6b8d148a5554fdceb6f399ca45bd1c78d9) | `6e5a2d6b8d148a5554fdceb6f399ca45bd1c78d9` |
 
 Pi's package identifies itself as a coding agent with read, Bash, edit, and
 write tools, and reports version `0.81.1`.

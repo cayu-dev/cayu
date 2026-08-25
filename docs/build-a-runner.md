@@ -244,7 +244,7 @@ sandbox env, where they outlive the command and may be exfiltrated by sandboxed
 code. Modal's own guidance is explicit: never put secrets inside a sandbox. For
 credential brokering that keeps secrets off the sandbox entirely, see:
 
-- [Secret-injection research report](../research/secret-injection-report.html) — Cayu's deep dive on why plain env vars leak secrets and the proxy/credential-broker approaches
+- [Virtual egress](virtual-egress.md) — Cayu's maintained credential-broker contract for keeping provider credentials outside the runner
 - [Modal Secrets](https://modal.com/docs/guide/secrets)
 - [Infisical Agent Vault](https://infisical.com/blog/agent-vault-the-open-source-credential-proxy-and-vault-for-agents) — open-source credential proxy; recommended for platforms without built-in proxy support
 - [IETF CB4A draft](https://www.ietf.org/archive/id/draft-hartman-credential-broker-4-agents-00.html) — emerging credential-brokering standard

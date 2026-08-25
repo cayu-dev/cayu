@@ -288,6 +288,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     login = commands.add_parser(
         "login",
+        help="Sign in through WorkOS.",
         description="Sign in to Cayu Cloud through WorkOS in a web browser.",
     )
     login.add_argument(
@@ -297,15 +298,18 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
     )
     commands.add_parser(
         "logout",
+        help="Delete the local login.",
         description="Delete the local interactive Cayu Cloud login.",
     )
     commands.add_parser(
         "whoami",
+        help="Show the current user and Organization.",
         description="Show the current Cayu Cloud user and Organization.",
     )
 
     applications = commands.add_parser(
         "applications",
+        help="List deployed Agent applications.",
         description="List Agent applications deployed in the selected Cayu Cloud.",
     )
     application_commands = applications.add_subparsers(
@@ -319,6 +323,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     context = commands.add_parser(
         "context",
+        help="Select or inspect a private connection context.",
         description="Select or inspect the private Cayu Cloud connection context.",
     )
     context_commands = context.add_subparsers(dest="context_command", required=True)
@@ -338,11 +343,13 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     commands.add_parser(
         "doctor",
+        help="Verify authentication and API access.",
         description="Verify authentication and API access to the selected Cayu Cloud.",
     )
 
     initialize = commands.add_parser(
         "init",
+        help="Generate cayu-cloud.toml.",
         description="Generate cayu-cloud.toml from a Python Agent project.",
     )
     initialize.add_argument("path", nargs="?", default=Path("."), type=Path)
@@ -354,6 +361,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     deploy = commands.add_parser(
         "deploy",
+        help="Publish an immutable Agent release.",
         description="Publish and activate an immutable Agent release from a local directory or repository.",
     )
     deploy.add_argument("source", nargs="?", default=".")
@@ -375,6 +383,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     deployment = commands.add_parser(
         "deployment",
+        help="Inspect or operate an immutable release.",
         description="Inspect, wait for, or promote one immutable Agent release.",
     )
     deployment_commands = deployment.add_subparsers(
@@ -399,6 +408,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     rollback = commands.add_parser(
         "rollback",
+        help="Select an earlier immutable release.",
         description="Select an earlier immutable release and recreate the Agent service.",
     )
     rollback.add_argument("deployment_id")
@@ -406,6 +416,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     runtimes = commands.add_parser(
         "runtimes",
+        help="Inspect retained runtime artifacts.",
         description="Inspect retained immutable runtime artifacts for an Agent.",
     )
     runtime_commands = runtimes.add_subparsers(dest="runtime_command", required=True)
@@ -423,6 +434,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     service = commands.add_parser(
         "service",
+        help="Operate long-running Agent infrastructure.",
         description="Operate the long-running web, worker, and schedule infrastructure.",
     )
     service_commands = service.add_subparsers(dest="service_command", required=True)
@@ -444,6 +456,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     environment = commands.add_parser(
         "env",
+        help="Manage Agent environment variables and secrets.",
         description="Manage Agent-owned environment variables and write-only secrets.",
     )
     environment_commands = environment.add_subparsers(
@@ -476,6 +489,7 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
 
     evidence = commands.add_parser(
         "evidence",
+        help="Inspect local Cloud command evidence.",
         description="Inspect local content-free records produced by Cloud commands.",
     )
     evidence_commands = evidence.add_subparsers(dest="evidence_command", required=True)

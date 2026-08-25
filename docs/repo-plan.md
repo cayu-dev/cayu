@@ -1,5 +1,10 @@
 # Repo Plan
 
+> **Status: archived historical plan.** This document preserves the early May/June
+> repository scaffold and is not the current roadmap or runtime contract. Use the
+> [documentation index](README.md) and [runtime contracts](runtime-contracts.md)
+> for maintained guidance.
+
 This is a design/maintainer document for Cayu's production agent runtime. It records implementation direction; it is not a public roadmap or complete end-user guide.
 
 ## Naming

@@ -505,6 +505,10 @@ replay, approval, interruption, budget, provider, runner, or recovery behavior.
 
 ## Documentation
 
+Start with the [documentation index](https://github.com/cayu-dev/cayu/blob/main/docs/README.md)
+for maintained guides, operational references, design records, research evidence,
+and explicitly archived material.
+
 Start with the document that matches the job:
 
 | Goal | Guide |
