@@ -1970,6 +1970,53 @@ SESSION_TOPOLOGY_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
 }
 
 
+_TOOL_DISCOVERY_VIEW_NO_STORE_HEADER = {
+    "Cache-Control": {
+        "description": "Prevents authenticated discovery metadata from being cached.",
+        "schema": {"type": "string", "enum": ["private, no-store"]},
+    }
+}
+
+TOOL_DISCOVERY_VIEW_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
+    200: {
+        "description": "A bounded, content-minimized current discovery view.",
+        "headers": _TOOL_DISCOVERY_VIEW_NO_STORE_HEADER,
+    },
+    401: {
+        "description": "The request has no valid authenticated identity.",
+        "model": ApiErrorResponse,
+        "headers": _TOOL_DISCOVERY_VIEW_NO_STORE_HEADER,
+    },
+    403: {
+        "description": "The authenticated identity has no verified tenant.",
+        "model": ApiErrorResponse,
+        "headers": _TOOL_DISCOVERY_VIEW_NO_STORE_HEADER,
+    },
+    404: {
+        "description": (
+            "The session/view does not exist or belongs to a different verified tenant."
+        ),
+        "model": ApiErrorResponse,
+        "headers": _TOOL_DISCOVERY_VIEW_NO_STORE_HEADER,
+    },
+    409: {
+        "description": "The durable discovery view is inconsistent with current authority.",
+        "model": ApiErrorResponse,
+        "headers": _TOOL_DISCOVERY_VIEW_NO_STORE_HEADER,
+    },
+    422: {
+        "description": "The bounded tool-view inspection request is invalid.",
+        "model": ApiErrorResponse,
+        "headers": _TOOL_DISCOVERY_VIEW_NO_STORE_HEADER,
+    },
+    500: {
+        "description": "Tool-view inspection failed before a safe view could be returned.",
+        "model": ApiErrorResponse,
+        "headers": _TOOL_DISCOVERY_VIEW_NO_STORE_HEADER,
+    },
+}
+
+
 class ApiEventSummary(ApiBaseModel):
     total_events: StrictInt = Field(ge=0)
     counts_by_type: dict[str, StrictInt]

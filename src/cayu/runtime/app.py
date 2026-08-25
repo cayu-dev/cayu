@@ -422,10 +422,18 @@ from cayu.runtime.tool_catalogue import (
     validate_application_tool_name,
 )
 from cayu.runtime.tool_discovery import (
+    TOOL_DISCOVERY_INSPECTION_MAX_GRANTS,
     TOOL_DISCOVERY_ONLY_PROFILE_ID,
+    TOOL_DISCOVERY_VIEW_OPERATION_KEY,
     SearchToolsTool,
     ToolDiscoveryMode,
+    ToolDiscoveryViewInconsistentError,
+    ToolDiscoveryViewInspection,
+    ToolDiscoveryViewNotEnabledError,
     copy_tool_discovery_mode,
+    current_tool_discovery_view,
+    tool_discovery_generation_id,
+    tool_discovery_view_inspection,
 )
 from cayu.runtime.tool_exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
@@ -1930,6 +1938,81 @@ class CayuApp:
         if codec is None:
             raise RuntimeError("Targeted grant inspection requires public alias authority.")
         return tuple(targeted_tool_grant_inspection(record, codec) for record in records)
+
+    async def inspect_tool_discovery_view(
+        self,
+        session_id: str,
+        *,
+        limit: int = TOOL_DISCOVERY_INSPECTION_MAX_GRANTS,
+    ) -> ToolDiscoveryViewInspection:
+        """Return the current bounded view without refs, schemas, or query evidence."""
+
+        if type(limit) is not int or not 1 <= limit <= TOOL_DISCOVERY_INSPECTION_MAX_GRANTS:
+            raise ValueError(
+                f"limit must be an integer from 1 through {TOOL_DISCOVERY_INSPECTION_MAX_GRANTS}."
+            )
+        private_session_id = await self._resolve_public_session_id(
+            require_clean_nonblank(session_id, "session_id")
+        )
+        session = await self.session_store.load(private_session_id)
+        if session is None:
+            raise KeyError("Session not found.")
+        return await self._inspect_tool_discovery_view_for_session(session, limit=limit)
+
+    async def _inspect_tool_discovery_view_for_session(
+        self,
+        session: Session,
+        *,
+        limit: int = TOOL_DISCOVERY_INSPECTION_MAX_GRANTS,
+    ) -> ToolDiscoveryViewInspection:
+        """Inspect a view fenced to one already-authorized session incarnation."""
+
+        if type(limit) is not int or not 1 <= limit <= TOOL_DISCOVERY_INSPECTION_MAX_GRANTS:
+            raise ValueError(
+                f"limit must be an integer from 1 through {TOOL_DISCOVERY_INSPECTION_MAX_GRANTS}."
+            )
+        session = copy_session(session)
+        registered_agent = self._agents.get(session.agent_name)
+        if registered_agent is None:
+            raise ToolDiscoveryViewInconsistentError(
+                "The session's registered agent is unavailable."
+            )
+        if registered_agent.tool_discovery_mode is not ToolDiscoveryMode.SEARCH_TOOLS:
+            raise ToolDiscoveryViewNotEnabledError(
+                "Tool discovery is not enabled for this session."
+            )
+        try:
+            ceiling = tool_capability_ceiling_from_session_metadata(session.metadata)
+            state = current_tool_discovery_view(
+                await self.session_store.load_session_operation(
+                    session.id,
+                    TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+                ),
+                session_id=session.id,
+                generation_id=tool_discovery_generation_id(
+                    session_id=session.id,
+                    root_invocation_id=session.invocation.root_invocation_id,
+                ),
+                agent_name=registered_agent.spec.name,
+                catalogue=registered_agent.tool_catalogue,
+                ceiling=ceiling,
+            )
+            current_session = await self.session_store.load(session.id)
+            if current_session is None or current_session.instance_id != session.instance_id:
+                raise ToolDiscoveryViewInconsistentError(
+                    "The session incarnation changed during tool-view inspection."
+                )
+            return tool_discovery_view_inspection(
+                state,
+                session_id=self.project_session_id_for_exposure(session.id),
+                limit=limit,
+            )
+        except ToolDiscoveryViewInconsistentError:
+            raise
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ToolDiscoveryViewInconsistentError(
+                "The durable discovery view conflicts with current session authority."
+            ) from exc
 
     def register_agent(
         self,

@@ -9754,6 +9754,90 @@ export type ToolCalledAssertionSpec = {
 };
 
 /**
+ * ToolDiscoveryGrantInspection
+ *
+ * Content-minimized discovery grant state safe for control-plane reads.
+ */
+export type ToolDiscoveryGrantInspection = {
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Descriptor Version
+     */
+    descriptor_version: string;
+    /**
+     * Discovered Revision
+     */
+    discovered_revision: number;
+    /**
+     * Schema Fingerprint
+     */
+    schema_fingerprint: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Tool Id
+     */
+    tool_id: string;
+    /**
+     * Tool Name
+     */
+    tool_name: string;
+};
+
+/**
+ * ToolDiscoveryViewInspection
+ *
+ * Bounded current-view projection without schemas or callable references.
+ */
+export type ToolDiscoveryViewInspection = {
+    /**
+     * Agent Name
+     */
+    agent_name: string;
+    /**
+     * Catalogue Revision
+     */
+    catalogue_revision: string;
+    /**
+     * Ceiling Fingerprint
+     */
+    ceiling_fingerprint: string;
+    /**
+     * Generation Id
+     */
+    generation_id: string;
+    /**
+     * Grant Count
+     */
+    grant_count: number;
+    /**
+     * Grants
+     */
+    grants?: Array<ToolDiscoveryGrantInspection>;
+    /**
+     * Grants Truncated
+     */
+    grants_truncated: boolean;
+    /**
+     * Revision
+     */
+    revision: number;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Session Id
+     */
+    session_id: string;
+};
+
+/**
  * ToolManifest
  */
 export type ToolManifest = {
@@ -14340,6 +14424,61 @@ export type GetSessionSummaryApiSessionsSessionIdSummaryGetResponses = {
 };
 
 export type GetSessionSummaryApiSessionsSessionIdSummaryGetResponse = GetSessionSummaryApiSessionsSessionIdSummaryGetResponses[keyof GetSessionSummaryApiSessionsSessionIdSummaryGetResponses];
+
+export type GetSessionToolViewApiSessionsSessionIdToolViewGetData = {
+    body?: never;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: {
+        /**
+         * Limit
+         */
+        limit?: number;
+    };
+    url: '/api/sessions/{session_id}/tool-view';
+};
+
+export type GetSessionToolViewApiSessionsSessionIdToolViewGetErrors = {
+    /**
+     * The request has no valid authenticated identity.
+     */
+    401: ApiErrorResponse;
+    /**
+     * The authenticated identity has no verified tenant.
+     */
+    403: ApiErrorResponse;
+    /**
+     * The session/view does not exist or belongs to a different verified tenant.
+     */
+    404: ApiErrorResponse;
+    /**
+     * The durable discovery view is inconsistent with current authority.
+     */
+    409: ApiErrorResponse;
+    /**
+     * The bounded tool-view inspection request is invalid.
+     */
+    422: ApiErrorResponse;
+    /**
+     * Tool-view inspection failed before a safe view could be returned.
+     */
+    500: ApiErrorResponse;
+};
+
+export type GetSessionToolViewApiSessionsSessionIdToolViewGetError = GetSessionToolViewApiSessionsSessionIdToolViewGetErrors[keyof GetSessionToolViewApiSessionsSessionIdToolViewGetErrors];
+
+export type GetSessionToolViewApiSessionsSessionIdToolViewGetResponses = {
+    /**
+     * A bounded, content-minimized current discovery view.
+     */
+    200: ToolDiscoveryViewInspection;
+};
+
+export type GetSessionToolViewApiSessionsSessionIdToolViewGetResponse = GetSessionToolViewApiSessionsSessionIdToolViewGetResponses[keyof GetSessionToolViewApiSessionsSessionIdToolViewGetResponses];
 
 export type GetSessionTopologyApiSessionsSessionIdTopologyPostData = {
     body: SessionTopologyRequest;

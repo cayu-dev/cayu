@@ -300,6 +300,12 @@ from cayu.runtime.tasks import (
     decode_task_topology_cursor,
     task_create_with_runtime_invocation,
 )
+from cayu.runtime.tool_discovery import (
+    TOOL_DISCOVERY_INSPECTION_MAX_GRANTS,
+    ToolDiscoveryViewInconsistentError,
+    ToolDiscoveryViewInspection,
+    ToolDiscoveryViewNotEnabledError,
+)
 from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
 from cayu.runtime.usage import (
     AggregateUsageMetrics,
@@ -341,6 +347,7 @@ from cayu.server.contracts import (
     SERVER_API_PREFIX,
     SESSION_TOPOLOGY_ENDPOINT_RESPONSES,
     STREAMING_ENDPOINT_RESPONSES,
+    TOOL_DISCOVERY_VIEW_ENDPOINT_RESPONSES,
     USAGE_ROLLUP_ENDPOINT_RESPONSES,
     AgentsResponse,
     ApiForkGroupDetail,
@@ -831,6 +838,55 @@ class _BoundedSessionTopologyRoute(_BoundedPrivateJsonBodyRoute):
     max_request_bytes = MAX_SESSION_TOPOLOGY_REQUEST_BYTES
     invalid_request_detail = "Invalid session topology request."
     oversized_request_detail = "Session topology request exceeds the server byte limit."
+
+
+def _private_tool_discovery_view_route_class(cayu_app: Any) -> type[APIRoute]:
+    """Bind redacted diagnostics to an always-private tool-view route."""
+
+    class _PrivateToolDiscoveryViewRoute(APIRoute):
+        """Keep every tool-view response private and content-minimized."""
+
+        def get_route_handler(self):
+            route_handler = super().get_route_handler()
+
+            async def private_route_handler(request: Request) -> Response:
+                try:
+                    response = await route_handler(request)
+                except RequestValidationError:
+                    return _private_no_store_error_response(
+                        422,
+                        "Invalid tool-view inspection request.",
+                    )
+                except HTTPException as exc:
+                    headers = dict(exc.headers or {})
+                    headers["Cache-Control"] = "private, no-store"
+                    raise HTTPException(
+                        status_code=exc.status_code,
+                        detail=exc.detail,
+                        headers=headers,
+                    ) from exc
+                except Exception as exc:
+                    with contextlib.suppress(Exception):
+                        diagnostic = cayu_app.redact_exception_diagnostic(
+                            exc,
+                            empty_message="Tool-view inspection failed without a message.",
+                            nonportable_message="Tool-view inspection failed with a nonportable error.",
+                        )
+                        logger.error(
+                            "Tool-view inspection failed: error_type=%s error=%r",
+                            diagnostic.error_type,
+                            diagnostic.message,
+                        )
+                    return _private_no_store_error_response(
+                        500,
+                        "Tool-view inspection failed.",
+                    )
+                response.headers["Cache-Control"] = "private, no-store"
+                return response
+
+            return private_route_handler
+
+    return _PrivateToolDiscoveryViewRoute
 
 
 class _BoundedControlPlaneRequestRoute(_BoundedPrivateJsonBodyRoute):
@@ -4126,6 +4182,28 @@ def create_router(
         return await auth_dependency(request)
 
     optional_auth_context = Depends(_optional_auth_context)
+
+    async def _tool_view_auth_context(request: Request) -> AuthContext:
+        context = await _optional_auth_context(request)
+        if context is None or context.tenant is None:
+            raise HTTPException(
+                status_code=403,
+                detail="Tool-view inspection requires an authenticated tenant identity.",
+            )
+        return context
+
+    tool_view_auth_context = Depends(_tool_view_auth_context)
+
+    async def _resolve_tool_view_session_id(value: str) -> str:
+        try:
+            return await cayu_app._resolve_public_session_id(value)
+        except ValueError:
+            # Malformed and unmapped public identities must join the route's
+            # foreign and absent not-found behavior instead of becoming an oracle.
+            raise HTTPException(
+                status_code=404,
+                detail="Tool view not found.",
+            ) from None
 
     async def _resolve_public_session_id(value: str) -> str:
         try:
@@ -9201,6 +9279,55 @@ def create_router(
             "interruption_cascade": interruption_cascade,
             "provider_operation": provider_operation.model_dump(mode="json"),
         }
+
+    async def get_session_tool_view(
+        session_id: NonBlankString,
+        limit: Annotated[
+            int,
+            Query(ge=1, le=TOOL_DISCOVERY_INSPECTION_MAX_GRANTS),
+        ] = TOOL_DISCOVERY_INSPECTION_MAX_GRANTS,
+        auth_context: AuthContext = tool_view_auth_context,
+    ) -> ToolDiscoveryViewInspection:
+        """Inspect one tenant-bound current view without callable authority."""
+
+        private_session_id = await _resolve_tool_view_session_id(session_id)
+        session = await session_store.load(private_session_id)
+        if session is None or session.invocation.origin.tenant != auth_context.tenant:
+            # Do not disclose whether another tenant owns the supplied identity.
+            raise HTTPException(
+                status_code=404,
+                detail="Tool view not found.",
+            )
+        try:
+            inspection = await cayu_app._inspect_tool_discovery_view_for_session(
+                session,
+                limit=limit,
+            )
+        except KeyError:
+            raise HTTPException(
+                status_code=404,
+                detail="Tool view not found.",
+            ) from None
+        except ToolDiscoveryViewNotEnabledError:
+            raise HTTPException(
+                status_code=404,
+                detail="Tool view not found.",
+            ) from None
+        except ToolDiscoveryViewInconsistentError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="Tool view is inconsistent.",
+            ) from exc
+        return inspection
+
+    router.add_api_route(
+        "/sessions/{session_id}/tool-view",
+        get_session_tool_view,
+        methods=["GET"],
+        response_model=ToolDiscoveryViewInspection,
+        responses=TOOL_DISCOVERY_VIEW_ENDPOINT_RESPONSES,
+        route_class_override=_private_tool_discovery_view_route_class(cayu_app),
+    )
 
     @router.get(
         "/sessions/{session_id}/summary",

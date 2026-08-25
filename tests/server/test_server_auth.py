@@ -3,7 +3,9 @@ from __future__ import annotations
 # ruff: noqa: E402
 import asyncio
 import inspect
+import logging
 from collections.abc import AsyncIterator
+from uuid import uuid4
 
 import pytest
 
@@ -16,11 +18,13 @@ from fastapi.testclient import TestClient
 from cayu import (
     AgentSpec,
     CayuApp,
+    InMemorySessionStore,
     InMemoryTaskStore,
     InvocationOriginTrust,
     SessionExecutionSource,
 )
 from cayu.core.events import Event, EventType
+from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.server import (
     AuthContext,
@@ -35,6 +39,7 @@ from cayu.server import (
     mount_dashboard,
 )
 from cayu.server.auth import server_auth_dependency
+from cayu.vaults import SecretRedactor
 
 _TOKEN = "secret-token"
 _AUTH_HEADERS = {"Authorization": f"Bearer {_TOKEN}"}
@@ -58,6 +63,38 @@ class OneShotProvider(ModelProvider):
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         yield ModelStreamEvent.text_delta("done")
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _SearchThenStopProvider(ModelProvider):
+    name = "discovery-auth-test"
+
+    def __init__(self) -> None:
+        self.request_count = 0
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.request_count += 1
+        if self.request_count == 1:
+            yield ModelStreamEvent.tool_call(
+                id="search-call",
+                name="search_tools",
+                arguments={"query": "*", "limit": 1},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _TenantVisibleTool(Tool):
+    spec = ToolSpec(
+        name="tenant_visible_tool",
+        description="Perform one tenant-owned operation.",
+        input_schema={"type": "object", "additionalProperties": False},
+    )
+
+    async def run(self, ctx: ToolContext, args: dict[str, object]) -> ToolResult:
+        del ctx, args
+        return ToolResult(content="done")
 
 
 def _require_bearer_token(request: Request) -> AuthContext:
@@ -730,6 +767,189 @@ def test_authenticated_run_persists_only_the_verified_root_identity() -> None:
     )
     assert updated.status_code == 200
     assert "invocation" not in updated.json()
+
+
+def test_tool_view_inspection_is_authenticated_tenant_bound_and_content_minimized(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def tenant_auth(request: Request) -> AuthContext:
+        if request.headers.get("Authorization") != f"Bearer {_TOKEN}":
+            raise HTTPException(status_code=401, detail="Missing or invalid credentials.")
+        return AuthContext(
+            subject="tenant-operator",
+            tenant=request.headers.get("X-Tenant"),
+        )
+
+    private_failure_detail = "private-tool-view-store-failure"
+    app = CayuApp(
+        task_store=InMemoryTaskStore(),
+        secret_redactor=SecretRedactor([private_failure_detail]),
+    )
+    provider = _SearchThenStopProvider()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=(_TenantVisibleTool(),),
+        tool_discovery_mode="search_tools",
+    )
+    app.register_agent(AgentSpec(name="plain-assistant", model="fake-model"))
+    client = TestClient(create_server(app, config=ServerConfig.protected(tenant_auth)))
+    tenant_a_headers = {**_AUTH_HEADERS, "X-Tenant": "tenant-a"}
+
+    with client.stream(
+        "POST",
+        "/api/run",
+        headers=tenant_a_headers,
+        json={"prompt": "Find a tool.", "session_id": "tenant-tool-view"},
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+
+    denied = client.get("/api/sessions/tenant-tool-view/tool-view")
+    assert denied.status_code == 401
+    assert denied.headers["cache-control"] == "private, no-store"
+    missing_tenant = client.get(
+        "/api/sessions/tenant-tool-view/tool-view",
+        headers=_AUTH_HEADERS,
+    )
+    assert missing_tenant.status_code == 403
+    assert missing_tenant.headers["cache-control"] == "private, no-store"
+    wrong_tenant = client.get(
+        "/api/sessions/tenant-tool-view/tool-view",
+        headers={**_AUTH_HEADERS, "X-Tenant": "tenant-b"},
+    )
+    assert wrong_tenant.status_code == 404
+    assert wrong_tenant.headers["cache-control"] == "private, no-store"
+    alias_codec = app.session_store.public_authority_alias_codec
+    assert alias_codec is not None
+    unresolved_alias = alias_codec.encode(
+        "missing-tool-view-session",
+        field_name="session_id",
+    )
+    for unavailable_identity in (unresolved_alias, "cayu_authority_malformed"):
+        unavailable = client.get(
+            f"/api/sessions/{unavailable_identity}/tool-view",
+            headers=tenant_a_headers,
+        )
+        assert unavailable.status_code == wrong_tenant.status_code
+        assert unavailable.json() == wrong_tenant.json()
+        assert unavailable.headers["cache-control"] == "private, no-store"
+    invalid_limit = client.get(
+        "/api/sessions/tenant-tool-view/tool-view?limit=0",
+        headers=tenant_a_headers,
+    )
+    assert invalid_limit.status_code == 422
+    assert invalid_limit.headers["cache-control"] == "private, no-store"
+    assert invalid_limit.json() == {"detail": "Invalid tool-view inspection request."}
+
+    inspected = client.get(
+        "/api/sessions/tenant-tool-view/tool-view?limit=1",
+        headers=tenant_a_headers,
+    )
+    assert inspected.status_code == 200
+    assert inspected.headers["cache-control"] == "private, no-store"
+    payload = inspected.json()
+    assert payload["revision"] == 1
+    assert payload["grant_count"] == 1
+    assert payload["grants_truncated"] is False
+    assert [grant["tool_name"] for grant in payload["grants"]] == ["tenant_visible_tool"]
+    serialized = inspected.text
+    assert "tool_ref" not in serialized
+    assert "grant_id" not in serialized
+    assert "input_schema" not in serialized
+    assert "origin_query" not in serialized
+
+    registered_agent = app._agents.pop("assistant")
+    unavailable_agent = client.get(
+        "/api/sessions/tenant-tool-view/tool-view",
+        headers=tenant_a_headers,
+    )
+    app._agents["assistant"] = registered_agent
+    assert unavailable_agent.status_code == 409
+    assert unavailable_agent.headers["cache-control"] == "private, no-store"
+    assert unavailable_agent.json() == {"detail": "Tool view is inconsistent."}
+
+    original_load_operation = app.session_store.load_session_operation
+
+    async def replace_session_then_load_operation(
+        session_id: str,
+        idempotency_key: str,
+        *,
+        checkpoint_root_guard=None,
+    ):
+        store = app.session_store
+        assert isinstance(store, InMemorySessionStore)
+        async with store._lock:
+            original = store._sessions[session_id]
+            replacement_origin = original.invocation.origin.model_copy(
+                update={"tenant": "tenant-b"}
+            )
+            replacement_invocation = original.invocation.model_copy(
+                update={"origin": replacement_origin}
+            )
+            store._sessions[session_id] = original.model_copy(
+                update={
+                    "instance_id": str(uuid4()),
+                    "invocation": replacement_invocation,
+                }
+            )
+        return await original_load_operation(
+            session_id,
+            idempotency_key,
+            checkpoint_root_guard=checkpoint_root_guard,
+        )
+
+    monkeypatch.setattr(
+        app.session_store,
+        "load_session_operation",
+        replace_session_then_load_operation,
+    )
+    replaced_during_inspection = client.get(
+        "/api/sessions/tenant-tool-view/tool-view",
+        headers=tenant_a_headers,
+    )
+    assert replaced_during_inspection.status_code == 409
+    assert replaced_during_inspection.headers["cache-control"] == "private, no-store"
+    assert replaced_during_inspection.json() == {"detail": "Tool view is inconsistent."}
+    assert "tenant_visible_tool" not in replaced_during_inspection.text
+    monkeypatch.setattr(app.session_store, "load_session_operation", original_load_operation)
+
+    async def fail_view_load(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError(private_failure_detail)
+
+    monkeypatch.setattr(app.session_store, "load_session_operation", fail_view_load)
+    with caplog.at_level(logging.ERROR, logger="cayu.server.routes"):
+        failed = client.get(
+            "/api/sessions/tenant-tool-view/tool-view",
+            headers={**_AUTH_HEADERS, "X-Tenant": "tenant-b"},
+        )
+    assert failed.status_code == 500
+    assert failed.headers["cache-control"] == "private, no-store"
+    assert failed.json() == {"detail": "Tool-view inspection failed."}
+    assert private_failure_detail not in failed.text
+    assert private_failure_detail not in caplog.text
+    monkeypatch.setattr(app.session_store, "load_session_operation", original_load_operation)
+
+    with client.stream(
+        "POST",
+        "/api/run",
+        headers=tenant_a_headers,
+        json={
+            "agent": "plain-assistant",
+            "prompt": "No discovery.",
+            "session_id": "tenant-without-tool-view",
+        },
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+    disabled = client.get(
+        "/api/sessions/tenant-without-tool-view/tool-view",
+        headers=tenant_a_headers,
+    )
+    assert disabled.status_code == 404
+    assert disabled.headers["cache-control"] == "private, no-store"
 
 
 def test_authenticated_run_rejects_identity_that_cannot_be_persisted() -> None:

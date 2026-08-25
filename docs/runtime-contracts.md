@@ -1680,11 +1680,12 @@ over arbitrary per-turn schema churn because changing the tool array can split
 or invalidate provider prompt-cache prefixes; a smaller single request is not
 proof of lower whole-task cost.
 
-When request-footprint observation is enabled, conversational requests without
-targeted grants use `RequestFootprint.schema_version == 3`; a request carrying
-targeted grants uses schema version 5 and adds only their bounded identity,
-delivery projection, native marker position where applicable, and call-count
-summary. Both versions embed the same content-minimized direct-tool
+When request-footprint observation is enabled, ordinary conversational requests
+without targeted grants or discovery use `RequestFootprint.schema_version == 3`;
+a request carrying targeted grants uses schema version 5 and adds only their
+bounded identity, delivery projection, native marker position where applicable,
+and call-count summary. Discovery-enabled conversational requests use schema
+version 6. All three versions embed the same content-minimized direct-tool
 exposure profile/fingerprint/count summary. The keyed
 `fingerprints.tool_manifest` and cache-breakpoint fingerprints bind that summary
 to the exact prepared request without persisting tool definitions.
@@ -1762,8 +1763,33 @@ effect, environment, secret, idempotency, execution, result, and recovery path.
 The reference grants addressability only and is not a bearer credential. Exact
 references and schemas stay in the private model transcript. Generic public
 tool-completion events retain only the discovery result count, view revision,
-and truncation flag; request footprints continue to count only directly
-exposed application tools.
+and truncation flag. A discovery request footprint adds the current generation,
+view revision, catalogue revision, capability-ceiling fingerprint, and grant
+count. It contains no query, schema, grant id, or tool reference. Those view
+facts are observation metadata, not part of the provider request: discovered
+schemas continue to stay out of the top-level tool array, while the keyed tool
+manifest and cache-breakpoint fingerprints remain stable as the view changes.
+OpenAI Responses, Anthropic, Chat Completions, Bedrock, and Vertex preserve the
+same `search_tools`, `call_tool` prefix before any small direct exposure.
+
+`CayuApp.inspect_tool_discovery_view(session_id, limit=...)` returns a bounded
+typed current-view projection. It includes canonical tool identity, descriptor
+version, schema fingerprint, creation time, and discovery revision, but never
+the grant id, `tool_ref`, originating query digest, input schema, callable,
+credentials, policy, arguments, or results. The authenticated control-plane
+route `GET /api/sessions/{session_id}/tool-view` exposes that projection only
+when `AuthContext.tenant` is non-null and exactly matches the session's
+immutable invocation tenant. A missing tenant is forbidden and a foreign
+tenant receives the same not-found response as an unknown, malformed, or
+unmapped public session identity. This explicit endpoint check does not make
+`AuthContext.tenant` a global filter for other control-plane resources. Every
+response is marked `private, no-store`; unexpected failures are logged only
+through the application's bounded secret-redaction boundary and return a
+generic error. The bounded `limit` cannot exceed the durable 256-grant view
+maximum. Inspection is fenced to the exact tenant-authorized session
+incarnation: deletion or replacement during the read, a missing registered
+agent, and durable authority inconsistency return a content-minimized conflict
+without exposing a view.
 
 ```python
 app.register_agent(

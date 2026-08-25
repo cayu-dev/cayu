@@ -198,6 +198,28 @@ all provider adapters. In OpenAI native-targeting mode, runtime-owned
 `allowed_tools` keeps both discovery functions callable without changing the
 cache anchor.
 
+Discovery-enabled conversational request footprints advance to schema version
+6 and record only the current view generation/revision, catalogue and ceiling
+identities, and grant count. These observation fields do not enter the provider
+payload: keyed tool-manifest and cache-prefix fingerprints remain stable as
+grants are discovered. Adapter coverage verifies the same two-tool prefix for
+OpenAI Responses, Anthropic, Chat Completions, Bedrock, and Vertex.
+
+`CayuApp.inspect_tool_discovery_view(...)` and the authenticated
+`GET /api/sessions/{session_id}/tool-view` control-plane route expose a bounded,
+content-minimized current view. The HTTP route requires a verified non-null
+tenant matching immutable session provenance, returns not-found across tenant
+boundaries, and marks responses `private, no-store`. Inspection omits grant ids,
+opaque references, query hashes, and schemas. A session-incarnation fence also
+prevents delete/recreate races from returning replacement-session metadata;
+unavailable registered agents and inconsistent durable views return a
+content-minimized conflict. Malformed and unmapped public session aliases share
+the same not-found envelope, while unexpected failures retain
+`private, no-store` and expose only a generic error after bounded redacted
+logging. The additive route advances the server contract from version 28 to
+version 29; regenerate committed clients and upgrade separately deployed
+control-plane consumers together. No storage migration is required.
+
 ### Fixed memory interventions have an exact durable execution boundary
 
 Applications can now submit one frozen `MemoryInterventionTrialRequest` to

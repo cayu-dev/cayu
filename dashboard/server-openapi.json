@@ -16710,7 +16710,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "28",
+            "default": "29",
             "title": "Contract Version",
             "type": "string"
           },
@@ -18816,6 +18816,126 @@
         "title": "ToolCalledAssertionSpec",
         "type": "object"
       },
+      "ToolDiscoveryGrantInspection": {
+        "additionalProperties": false,
+        "description": "Content-minimized discovery grant state safe for control-plane reads.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "descriptor_version": {
+            "title": "Descriptor Version",
+            "type": "string"
+          },
+          "discovered_revision": {
+            "maximum": 256.0,
+            "minimum": 1.0,
+            "title": "Discovered Revision",
+            "type": "integer"
+          },
+          "schema_fingerprint": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Schema Fingerprint",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "tool_id": {
+            "title": "Tool Id",
+            "type": "string"
+          },
+          "tool_name": {
+            "title": "Tool Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool_id",
+          "tool_name",
+          "descriptor_version",
+          "schema_fingerprint",
+          "created_at",
+          "discovered_revision"
+        ],
+        "title": "ToolDiscoveryGrantInspection",
+        "type": "object"
+      },
+      "ToolDiscoveryViewInspection": {
+        "additionalProperties": false,
+        "description": "Bounded current-view projection without schemas or callable references.",
+        "properties": {
+          "agent_name": {
+            "title": "Agent Name",
+            "type": "string"
+          },
+          "catalogue_revision": {
+            "title": "Catalogue Revision",
+            "type": "string"
+          },
+          "ceiling_fingerprint": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Ceiling Fingerprint",
+            "type": "string"
+          },
+          "generation_id": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Generation Id",
+            "type": "string"
+          },
+          "grant_count": {
+            "maximum": 256.0,
+            "minimum": 0.0,
+            "title": "Grant Count",
+            "type": "integer"
+          },
+          "grants": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ToolDiscoveryGrantInspection"
+            },
+            "title": "Grants",
+            "type": "array"
+          },
+          "grants_truncated": {
+            "title": "Grants Truncated",
+            "type": "boolean"
+          },
+          "revision": {
+            "maximum": 256.0,
+            "minimum": 0.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "generation_id",
+          "agent_name",
+          "catalogue_revision",
+          "ceiling_fingerprint",
+          "revision",
+          "grant_count",
+          "grants_truncated"
+        ],
+        "title": "ToolDiscoveryViewInspection",
+        "type": "object"
+      },
       "ToolManifest": {
         "additionalProperties": false,
         "properties": {
@@ -20649,7 +20769,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "28",
+            "default": "29",
             "title": "Contract Version",
             "type": "string"
           }
@@ -26545,6 +26665,186 @@
           }
         },
         "summary": "Get Session Summary"
+      }
+    },
+    "/api/sessions/{session_id}/tool-view": {
+      "get": {
+        "description": "Inspect one tenant-bound current view without callable authority.",
+        "operationId": "get_session_tool_view_api_sessions__session_id__tool_view_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "minLength": 1,
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 256,
+              "maximum": 256,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolDiscoveryViewInspection"
+                }
+              }
+            },
+            "description": "A bounded, content-minimized current discovery view.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents authenticated discovery metadata from being cached.",
+                "schema": {
+                  "enum": [
+                    "private, no-store"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The request has no valid authenticated identity.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents authenticated discovery metadata from being cached.",
+                "schema": {
+                  "enum": [
+                    "private, no-store"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The authenticated identity has no verified tenant.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents authenticated discovery metadata from being cached.",
+                "schema": {
+                  "enum": [
+                    "private, no-store"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The session/view does not exist or belongs to a different verified tenant.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents authenticated discovery metadata from being cached.",
+                "schema": {
+                  "enum": [
+                    "private, no-store"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The durable discovery view is inconsistent with current authority.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents authenticated discovery metadata from being cached.",
+                "schema": {
+                  "enum": [
+                    "private, no-store"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "The bounded tool-view inspection request is invalid.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents authenticated discovery metadata from being cached.",
+                "schema": {
+                  "enum": [
+                    "private, no-store"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Tool-view inspection failed before a safe view could be returned.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Prevents authenticated discovery metadata from being cached.",
+                "schema": {
+                  "enum": [
+                    "private, no-store"
+                  ],
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Get Session Tool View"
       }
     },
     "/api/sessions/{session_id}/topology": {

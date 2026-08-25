@@ -75,6 +75,7 @@ TOOL_DISCOVERY_SCOPE_ID_MAX_BYTES = 2_048
 TOOL_DISCOVERY_MAX_SCHEMA_SEARCH_NODES = 4_096
 TOOL_DISCOVERY_MAX_SCHEMA_SEARCH_TERMS = 4_096
 TOOL_DISCOVERY_MAX_WRITE_ATTEMPTS = 8
+TOOL_DISCOVERY_INSPECTION_MAX_GRANTS = TOOL_DISCOVERY_MAX_GRANTS
 TOOL_DISCOVERY_REFERENCE_PREFIX = "cayu_tool_v1_"
 TOOL_DISCOVERY_REFERENCE_PATTERN = rf"^{TOOL_DISCOVERY_REFERENCE_PREFIX}[0-9a-f]{{64}}$"
 _WORD_PATTERN = re.compile(r"[^\W_]+", re.UNICODE)
@@ -84,6 +85,14 @@ class ToolDiscoveryMode(StrEnum):
     """Application-selected provider-neutral tool discovery mode."""
 
     SEARCH_TOOLS = SEARCH_TOOLS_NAME
+
+
+class ToolDiscoveryViewInconsistentError(RuntimeError):
+    """Raised when durable view state conflicts with current session authority."""
+
+
+class ToolDiscoveryViewNotEnabledError(RuntimeError):
+    """Raised when a session has no configured discovery view."""
 
 
 def copy_tool_discovery_mode(
@@ -361,6 +370,166 @@ class ToolDiscoveryViewState(BaseModel):
 
         tool_ref = require_durable_clean_nonblank(tool_ref, "tool_ref")
         return next((grant for grant in self.grants if grant.tool_ref == tool_ref), None)
+
+
+class ToolDiscoveryGrantInspection(BaseModel):
+    """Content-minimized discovery grant state safe for control-plane reads."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    schema_version: Literal[1] = TOOL_DISCOVERY_SCHEMA_VERSION
+    tool_id: str
+    tool_name: str
+    descriptor_version: str
+    schema_fingerprint: str = Field(pattern=TARGETED_TOOL_DIGEST_PATTERN)
+    created_at: datetime
+    discovered_revision: StrictInt = Field(ge=1, le=TOOL_DISCOVERY_MAX_GRANTS)
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version(cls, value: object) -> object:
+        if type(value) is not int or value != TOOL_DISCOVERY_SCHEMA_VERSION:
+            raise ValueError("Tool discovery inspection schema_version must be the integer 1.")
+        return value
+
+    @field_validator("tool_id")
+    @classmethod
+    def validate_tool_id(cls, value: str) -> str:
+        return validate_canonical_tool_id(value)
+
+    @field_validator("tool_name")
+    @classmethod
+    def validate_tool_name(cls, value: str) -> str:
+        return _bounded_utf8_text(
+            value,
+            "tool_name",
+            max_bytes=TOOL_DISCOVERY_SCOPE_ID_MAX_BYTES,
+        )
+
+    @field_validator("descriptor_version")
+    @classmethod
+    def validate_descriptor_version(cls, value: str) -> str:
+        return validate_tool_descriptor_version(value)
+
+    @field_validator("created_at")
+    @classmethod
+    def normalize_created_at(cls, value: datetime) -> datetime:
+        return _utc_datetime(value, "created_at")
+
+
+class ToolDiscoveryViewInspection(BaseModel):
+    """Bounded current-view projection without schemas or callable references."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    schema_version: Literal[1] = TOOL_DISCOVERY_SCHEMA_VERSION
+    session_id: str
+    generation_id: str = Field(pattern=TARGETED_TOOL_DIGEST_PATTERN)
+    agent_name: str
+    catalogue_revision: str
+    ceiling_fingerprint: str = Field(pattern=TARGETED_TOOL_DIGEST_PATTERN)
+    revision: StrictInt = Field(ge=0, le=TOOL_DISCOVERY_MAX_GRANTS)
+    grant_count: StrictInt = Field(ge=0, le=TOOL_DISCOVERY_MAX_GRANTS)
+    grants: tuple[ToolDiscoveryGrantInspection, ...] = ()
+    grants_truncated: StrictBool
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version(cls, value: object) -> object:
+        if type(value) is not int or value != TOOL_DISCOVERY_SCHEMA_VERSION:
+            raise ValueError("Tool discovery inspection schema_version must be the integer 1.")
+        return value
+
+    @field_validator("session_id", "generation_id", "agent_name")
+    @classmethod
+    def validate_required_text(cls, value: str, info) -> str:
+        return _bounded_utf8_text(
+            value,
+            info.field_name,
+            max_bytes=TOOL_DISCOVERY_SCOPE_ID_MAX_BYTES,
+        )
+
+    @field_validator("catalogue_revision")
+    @classmethod
+    def validate_catalogue_revision(cls, value: str) -> str:
+        return validate_tool_catalogue_revision(value)
+
+    @field_validator("grants", mode="before")
+    @classmethod
+    def bound_grants(cls, value: object) -> object:
+        if not isinstance(value, tuple | list):
+            raise TypeError("Tool discovery inspection grants must be a sequence.")
+        if len(value) > TOOL_DISCOVERY_INSPECTION_MAX_GRANTS:
+            raise ValueError(
+                "Tool discovery inspection grants cannot exceed "
+                f"{TOOL_DISCOVERY_INSPECTION_MAX_GRANTS} records."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_projection(self) -> ToolDiscoveryViewInspection:
+        if self.grants != tuple(sorted(self.grants, key=lambda item: item.tool_id)):
+            raise ValueError("Tool discovery inspection grants must preserve canonical order.")
+        if len({grant.tool_id for grant in self.grants}) != len(self.grants):
+            raise ValueError("Tool discovery inspection grants must have unique tool ids.")
+        if self.grant_count < len(self.grants):
+            raise ValueError("grant_count cannot be smaller than the inspected grant count.")
+        if self.grants_truncated != (self.grant_count > len(self.grants)):
+            raise ValueError("grants_truncated must match the bounded inspection result.")
+        if (self.revision == 0) != (self.grant_count == 0):
+            raise ValueError("Tool discovery revision must be zero exactly for an empty view.")
+        if any(grant.discovered_revision > self.revision for grant in self.grants):
+            raise ValueError("An inspected grant revision cannot exceed the view revision.")
+        return self
+
+
+def tool_discovery_view_inspection(
+    state: ToolDiscoveryViewState,
+    *,
+    session_id: str,
+    limit: int = TOOL_DISCOVERY_INSPECTION_MAX_GRANTS,
+) -> ToolDiscoveryViewInspection:
+    """Project one validated view without reference- or schema-bearing authority."""
+
+    if type(state) is not ToolDiscoveryViewState:
+        raise TypeError("state must be a ToolDiscoveryViewState.")
+    if type(limit) is not int or not 1 <= limit <= TOOL_DISCOVERY_INSPECTION_MAX_GRANTS:
+        raise ValueError(
+            f"limit must be an integer from 1 through {TOOL_DISCOVERY_INSPECTION_MAX_GRANTS}."
+        )
+    state = ToolDiscoveryViewState.model_validate(state.model_dump(mode="python"))
+    projected_grants = tuple(
+        ToolDiscoveryGrantInspection(
+            tool_id=grant.tool_id,
+            tool_name=grant.tool_name,
+            descriptor_version=grant.descriptor_version,
+            schema_fingerprint=grant.schema_fingerprint,
+            created_at=grant.created_at,
+            discovered_revision=grant.discovered_revision,
+        )
+        for grant in state.grants[:limit]
+    )
+    return ToolDiscoveryViewInspection(
+        session_id=session_id,
+        generation_id=state.generation_id,
+        agent_name=state.agent_name,
+        catalogue_revision=state.catalogue_revision,
+        ceiling_fingerprint=state.ceiling_fingerprint,
+        revision=state.revision,
+        grant_count=len(state.grants),
+        grants=projected_grants,
+        grants_truncated=len(projected_grants) < len(state.grants),
+    )
 
 
 def tool_discovery_grant_id(
@@ -1210,6 +1379,7 @@ class SearchToolsTool(Tool):
 
 __all__ = [
     "TOOL_DISCOVERY_DEFAULT_RESULTS",
+    "TOOL_DISCOVERY_INSPECTION_MAX_GRANTS",
     "TOOL_DISCOVERY_MAX_DESCRIPTION_CHARS",
     "TOOL_DISCOVERY_MAX_GRANTS",
     "TOOL_DISCOVERY_MAX_QUERY_CHARS",
@@ -1224,10 +1394,14 @@ __all__ = [
     "TOOL_DISCOVERY_SCHEMA_VERSION",
     "TOOL_DISCOVERY_VIEW_OPERATION_KEY",
     "SearchToolsTool",
+    "ToolDiscoveryGrantInspection",
     "ToolDiscoveryGrantRecord",
     "ToolDiscoveryMode",
     "ToolDiscoverySearchMatch",
     "ToolDiscoverySearchResult",
+    "ToolDiscoveryViewInconsistentError",
+    "ToolDiscoveryViewInspection",
+    "ToolDiscoveryViewNotEnabledError",
     "ToolDiscoveryViewState",
     "copy_tool_discovery_mode",
     "current_tool_discovery_view",
@@ -1244,4 +1418,5 @@ __all__ = [
     "tool_discovery_record_matches_descriptor",
     "tool_discovery_reference",
     "tool_discovery_reference_rejection_reason",
+    "tool_discovery_view_inspection",
 ]

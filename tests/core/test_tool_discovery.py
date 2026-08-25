@@ -27,6 +27,7 @@ from cayu.runtime.hooks import BeforeToolCallHookContext, RuntimeHook, ToolCallH
 from cayu.runtime.tool_catalogue import build_tool_catalog_snapshot, build_tool_descriptor
 from cayu.runtime.tool_discovery import (
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+    ToolDiscoveryViewInspection,
     ToolDiscoveryViewState,
     current_tool_discovery_view,
     initial_tool_discovery_operation_records,
@@ -306,6 +307,45 @@ def test_search_tools_vertical_keeps_catalogue_hidden_and_routes_effective_tool(
             [event.model_dump(mode="json") for event in events],
             sort_keys=True,
         )
+        request_footprints = [
+            event.payload for event in events if event.type is EventType.REQUEST_FOOTPRINT_RECORDED
+        ]
+        assert [footprint["schema_version"] for footprint in request_footprints] == [6] * 4
+        assert [
+            (
+                footprint["tool_discovery_view"]["revision"],
+                footprint["tool_discovery_view"]["grant_count"],
+            )
+            for footprint in request_footprints
+        ] == [(0, 0), (1, 1), (1, 1), (1, 1)]
+        assert (
+            len(
+                {
+                    json.dumps(footprint["fingerprints"]["tool_manifest"], sort_keys=True)
+                    for footprint in request_footprints
+                }
+            )
+            == 1
+        )
+        inspection = await app.inspect_tool_discovery_view("discovery-session")
+        assert isinstance(inspection, ToolDiscoveryViewInspection)
+        assert inspection.session_id == app.project_session_id_for_exposure(state.session_id)
+        assert inspection.generation_id == state.generation_id
+        assert inspection.revision == 1
+        assert inspection.grant_count == 1
+        assert inspection.grants_truncated is False
+        assert [grant.tool_name for grant in inspection.grants] == ["remember_knowledge"]
+        inspection_json = inspection.model_dump_json()
+        assert state.grants[0].tool_ref not in inspection_json
+        assert state.grants[0].grant_id not in inspection_json
+        assert state.grants[0].origin_query_sha256 not in inspection_json
+        assert "input_schema" not in inspection_json
+        for invalid_limit in (True, 0, 257):
+            with pytest.raises(ValueError, match="limit must be an integer from 1 through 256"):
+                await app.inspect_tool_discovery_view(
+                    "discovery-session",
+                    limit=invalid_limit,  # type: ignore[arg-type]
+                )
         public_search_result = next(
             event.payload["result"]
             for event in events
@@ -395,6 +435,27 @@ def test_search_tools_vertical_keeps_catalogue_hidden_and_routes_effective_tool(
         assert child_rejection.payload["authority_kind"] == "tool_discovery"
         assert child_rejection.payload["rejection_reason"] == "unknown"
         assert provider.tool_ref not in child_rejection.model_dump_json()
+        child_footprints = [
+            event.payload
+            for event in child_resumed
+            if event.type is EventType.REQUEST_FOOTPRINT_RECORDED
+        ]
+        expected_child_view = {
+            "generation_id": child_state.generation_id,
+            "revision": 0,
+            "catalogue_revision": child_state.catalogue_revision,
+            "ceiling_fingerprint": child_state.ceiling_fingerprint,
+            "grant_count": 0,
+        }
+        assert [footprint["tool_discovery_view"] for footprint in child_footprints] == [
+            expected_child_view,
+            expected_child_view,
+        ]
+        assert all(
+            footprint["fingerprints"]["tool_manifest"]
+            == request_footprints[0]["fingerprints"]["tool_manifest"]
+            for footprint in child_footprints
+        )
 
         resumed = [
             event
@@ -415,6 +476,12 @@ def test_search_tools_vertical_keeps_catalogue_hidden_and_routes_effective_tool(
             TOOL_DISCOVERY_VIEW_OPERATION_KEY,
         )
         assert ToolDiscoveryViewState.model_validate(resumed_state_raw) == state
+        resumed_footprints = [
+            event.payload for event in resumed if event.type is EventType.REQUEST_FOOTPRINT_RECORDED
+        ]
+        assert [
+            footprint["tool_discovery_view"]["grant_count"] for footprint in resumed_footprints
+        ] == [1, 1]
         assert [request.tools for request in provider.requests] == [
             [search_tools_spec(), call_tool_spec()]
         ] * 8
