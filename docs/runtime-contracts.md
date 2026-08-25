@@ -7197,6 +7197,12 @@ mutation and stages replacement of non-empty directories behind explicit `--repl
 deletes all existing destination contents. The staged tree is renamed into place. If publication
 fails after the previous directory has been renamed aside, Cayu preserves it at the backup path
 reported by the CLI for operator recovery; it does not attempt a second destructive rollback.
+The exporter pins the destination parent, original destination, private staging
+tree, and backup directory to captured filesystem identities. It rejects
+symbolic-link or junction traversal and revalidates those identities before
+publication and recursive cleanup. A concurrent replacement is never adopted
+as the export target or cleanup authority; conflicting operator content is
+preserved and the export fails with a bounded diagnostic.
 Filesystem roots, the current working directory and its ancestors, and the user's home directory
 and its ancestors are protected export targets.
 Artifact metadata is provenance, not a substitute for the authenticated runtime handshake.

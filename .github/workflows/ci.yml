@@ -660,6 +660,7 @@ jobs:
             "blocks_windows_writer_after_cleanup_is_pinned"
           ) -join " or "
           uv run pytest -q tests/cli/test_dashboard.py -k $windowsTests
+          uv run pytest -q tests/cli/test_lambda_microvm.py
       - run: uv build --wheel --out-dir dist/windows
       - name: Install and eject the built wheel
         shell: pwsh

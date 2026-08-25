@@ -3,4 +3,5 @@
 /NOTICE text eol=lf
 dashboard/** text=auto eol=lf
 src/cayu/server/dashboard/** text=auto eol=lf
+/examples/aws/lambda_microvm_sidecar/** text=auto eol=lf
 src/cayu/data/dashboard_source/*.zip binary
