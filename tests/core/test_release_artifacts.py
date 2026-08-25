@@ -70,6 +70,8 @@ def _valid_wheel_names(sidecar: dict[str, bytes] | None = None) -> set[str]:
         "cayu/guides/diagnostics.md",
         "cayu/guides/durable-operations.md",
         "cayu/guides/providers.md",
+        "cayu/guides/references.md",
+        "cayu/guides/structured-output.md",
         "cayu/guides/tool-effects.md",
         _WHEEL_DASHBOARD_SOURCE,
         *{f"cayu/server/dashboard/{name}" for name in compiled_dashboard},
@@ -222,6 +224,36 @@ def test_validate_wheel_requires_application_anatomy_guide(tmp_path: Path) -> No
     _write_wheel(wheel, names)
     with pytest.raises(ValueError, match=r"missing required wheel files: .*application-anatomy"):
         validate_wheel(wheel)
+
+
+@pytest.mark.parametrize(
+    ("kind", "metadata_name"),
+    [("wheel", f"{_WHEEL_DIST_INFO}/METADATA"), ("sdist", "PKG-INFO")],
+)
+def test_release_metadata_rejects_relative_local_document_links(
+    tmp_path: Path,
+    kind: str,
+    metadata_name: str,
+) -> None:
+    metadata = (
+        f"Metadata-Version: 2.4\nName: cayu\nVersion: {_VERSION}\n"
+        "Description-Content-Type: text/markdown\n\n"
+        "See [runtime contracts](docs/runtime-contracts.md).\n"
+    )
+    if kind == "wheel":
+        archive = tmp_path / "cayu.whl"
+        _write_wheel(
+            archive,
+            _valid_wheel_names(),
+            contents_by_name={metadata_name: metadata},
+        )
+        validator = validate_wheel
+    else:
+        archive = tmp_path / "cayu.tar.gz"
+        _write_sdist(archive, contents_by_name={metadata_name: metadata})
+        validator = validate_sdist
+    with pytest.raises(ValueError, match="relative local-document link"):
+        validator(archive)
 
 
 def test_validate_wheel_requires_provider_compatibility_guide(tmp_path: Path) -> None:

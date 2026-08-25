@@ -318,6 +318,31 @@ jobs:
       - run: uv run python scripts/check_release_artifacts.py dist/first/*
       - run: uv venv --python 3.11 .release-venv
       - run: uv pip install --python .release-venv/bin/python dist/first/*.whl
+      - name: Check every packaged guide from the built wheel
+        run: |
+          .release-venv/bin/python - <<'PY'
+          import subprocess
+          from cayu.cli.guide import _GUIDES
+
+          for topic in _GUIDES:
+              subprocess.run([".release-venv/bin/cayu", "guide", topic], check=True)
+          PY
+      - run: uv venv --python 3.11 .release-all-venv
+      - name: Install and import the built wheel with all runtime extras
+        run: |
+          wheel="$(realpath dist/first/*.whl)"
+          uv pip install --python .release-all-venv/bin/python "cayu[all] @ file://${wheel}"
+          .release-all-venv/bin/python - <<'PY'
+          import awscrt.auth
+          import boto3
+          import microsandbox
+          from cayu.runners.microsandbox import MicrosandboxRunner
+
+          assert boto3 is not None
+          assert awscrt.auth is not None
+          assert microsandbox is not None
+          assert MicrosandboxRunner is not None
+          PY
       - name: Check built-wheel Cayu Cloud CLI contract
         run: |
           .release-venv/bin/cayu cloud --help >/dev/null

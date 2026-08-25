@@ -378,6 +378,11 @@ deployment:
 | `cayu[egress]` | Virtual egress and credential-broker primitives |
 | `cayu[files]` | Image and PDF inspection |
 | `cayu[console]` | Interactive application console |
+| `cayu[otel]` | OpenTelemetry tracing and metrics support |
+| `cayu[all]` | Every runtime integration extra above |
+
+`cayu[all]` intentionally excludes `cayu[browser]`, which is dashboard and
+browser verification tooling rather than a runtime integration.
 
 Providers normalize text, thinking, tool calls, usage, completion reasons, and
 typed failures behind one runtime contract. Applications register providers
@@ -418,7 +423,7 @@ as a general third-party provider API, so support may change or stop.
 > multi-user services, use the OpenAI Platform API or another officially
 > supported provider. Do not share or resell credentials or bypass plan limits.
 
-See [OpenAI subscription authentication](docs/openai-subscription.md) for the
+See [OpenAI subscription authentication](https://github.com/cayu-dev/cayu/blob/main/docs/openai-subscription.md) for the
 support boundary, credential storage, and fallback options.
 
 The same agent can run in a local workspace, trusted Docker container, E2B,
@@ -443,7 +448,7 @@ Extraction uses package data only—no repository clone, GitHub access, or netwo
 the resulting `dist/` with `DashboardConfig(directory=...)`,
 `mount_cayu(..., dashboard_dir=...)`, or `mount_dashboard(..., dashboard_dir=...)`. Cayu never
 rewrites the extracted application-owned source during upgrades. See [Open and replaceable
-control plane](docs/control-plane.md) for the complete workflow, compatibility gate, and
+control plane](https://github.com/cayu-dev/cayu/blob/main/docs/control-plane.md) for the complete workflow, compatibility gate, and
 redistribution obligations.
 
 ## Production boundaries
@@ -473,7 +478,7 @@ Cayu makes safety boundaries explicit, but configuration still matters:
   Use `AuthenticatedAccess` for deployed operator surfaces; `OpenAccess` and
   `ServerConfig.local_development()` are deliberate local-only choices.
   Deployment names are descriptive metadata and never relax security policy.
-  See [server configuration](docs/server-configuration.md).
+  See [server configuration](https://github.com/cayu-dev/cayu/blob/main/docs/server-configuration.md).
   `AuthContext.tenant` records authenticated operator provenance but does not
   filter or isolate Cayu data. See [Server authentication and tenant
   isolation](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/server-auth-tenancy.md).
@@ -525,13 +530,13 @@ Start with the document that matches the job:
 | Let an agent search and read bounded public web evidence | [Web fetch and hosted search](https://github.com/cayu-dev/cayu/blob/main/docs/web-fetch.md) |
 | Run GitHub CLI without giving the runner a real token | [GitHub CLI through virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/github-cli-virtual-egress.md) |
 | Design assertions and trajectory evals | [Evals](https://github.com/cayu-dev/cayu/blob/main/docs/evals.md) |
-| Understand knowledge authorization, retrieval fusion, and memory baselines | [Memory foundation contracts](docs/memory-foundation.md) |
-| Reproduce bounded stateful agent evaluations | [Portable agent snapshots](docs/runtime-contracts.md#portable-agent-snapshots) |
+| Understand knowledge authorization, retrieval fusion, and memory baselines | [Memory foundation contracts](https://github.com/cayu-dev/cayu/blob/main/docs/memory-foundation.md) |
+| Reproduce bounded stateful agent evaluations | [Portable agent snapshots](https://github.com/cayu-dev/cayu/blob/main/docs/runtime-contracts.md#portable-agent-snapshots) |
 | Estimate and govern cost | [Cost optimization](https://github.com/cayu-dev/cayu/blob/main/docs/cost-optimization.md) |
 | Use the application console | [Console](https://github.com/cayu-dev/cayu/blob/main/docs/console.md) |
-| Start a configured server process | [Project server](docs/project-server.md) |
-| Use, customize, or replace the operator control plane | [Open and replaceable control plane](docs/control-plane.md) |
-| Start a named worker process | [Project workers](docs/project-workers.md) |
+| Start a configured server process | [Project server](https://github.com/cayu-dev/cayu/blob/main/docs/project-server.md) |
+| Use, customize, or replace the operator control plane | [Open and replaceable control plane](https://github.com/cayu-dev/cayu/blob/main/docs/control-plane.md) |
+| Start a named worker process | [Project workers](https://github.com/cayu-dev/cayu/blob/main/docs/project-workers.md) |
 | Configure CLI session-store discovery | [Session-store targets](https://github.com/cayu-dev/cayu/blob/main/docs/session-store-targets.md) |
 | Inspect durable sessions safely | [Session inspection](https://github.com/cayu-dev/cayu/blob/main/docs/session-inspection.md) |
 | Configure a control-plane server deployment | [Server configuration](https://github.com/cayu-dev/cayu/blob/main/docs/server-configuration.md) |

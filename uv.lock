@@ -147,12 +147,13 @@ dependencies = [
 
 [package.optional-dependencies]
 all = [
-    { name = "boto3" },
+    { name = "boto3", extra = ["crt"] },
     { name = "cryptography" },
     { name = "e2b" },
     { name = "fastapi" },
     { name = "google-auth", extra = ["requests"] },
     { name = "ipython" },
+    { name = "microsandbox" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-sdk" },
     { name = "pillow" },
@@ -179,6 +180,7 @@ dev = [
     { name = "hypothesis" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-sdk" },
+    { name = "packaging" },
     { name = "pillow" },
     { name = "psycopg", extra = ["binary"] },
     { name = "psycopg-pool" },
@@ -238,7 +240,7 @@ nightly = [
 
 [package.metadata]
 requires-dist = [
-    { name = "boto3", marker = "extra == 'all'", specifier = ">=1.43.44,<2" },
+    { name = "boto3", extras = ["crt"], marker = "extra == 'all'", specifier = ">=1.43.44,<2" },
     { name = "boto3", extras = ["crt"], marker = "extra == 'aws'", specifier = ">=1.43.44,<2" },
     { name = "certifi", specifier = ">=2024.0" },
     { name = "cryptography", marker = "extra == 'all'", specifier = ">=42" },
@@ -258,6 +260,7 @@ requires-dist = [
     { name = "ipython", marker = "extra == 'all'", specifier = ">=9,<10" },
     { name = "ipython", marker = "extra == 'console'", specifier = ">=9,<10" },
     { name = "jsonschema", specifier = ">=4.23" },
+    { name = "microsandbox", marker = "extra == 'all'", specifier = "==0.6.6" },
     { name = "microsandbox", marker = "extra == 'microsandbox'", specifier = "==0.6.6" },
     { name = "opentelemetry-api", marker = "extra == 'all'", specifier = ">=1.20" },
     { name = "opentelemetry-api", marker = "extra == 'dev'", specifier = ">=1.20" },
@@ -265,6 +268,7 @@ requires-dist = [
     { name = "opentelemetry-sdk", marker = "extra == 'all'", specifier = ">=1.20" },
     { name = "opentelemetry-sdk", marker = "extra == 'dev'", specifier = ">=1.20" },
     { name = "opentelemetry-sdk", marker = "extra == 'otel'", specifier = ">=1.20" },
+    { name = "packaging", marker = "extra == 'dev'", specifier = ">=24" },
     { name = "pillow", marker = "extra == 'all'", specifier = ">=10" },
     { name = "pillow", marker = "extra == 'dev'", specifier = ">=10" },
     { name = "pillow", marker = "extra == 'files'", specifier = ">=10" },
@@ -282,11 +286,11 @@ requires-dist = [
     { name = "pypdf", marker = "extra == 'all'", specifier = ">=4" },
     { name = "pypdf", marker = "extra == 'dev'", specifier = ">=4" },
     { name = "pypdf", marker = "extra == 'files'", specifier = ">=4" },
-    { name = "referencing", specifier = ">=0.35" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=7.1" },
     { name = "pytest-split", marker = "extra == 'dev'", specifier = ">=0.11,<1" },
     { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.8,<4" },
+    { name = "referencing", specifier = ">=0.35" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.11" },
     { name = "sse-starlette", marker = "extra == 'all'", specifier = ">=2.0" },
     { name = "sse-starlette", marker = "extra == 'dev'", specifier = ">=2.0" },

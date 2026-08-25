@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import stat
 import sys
 import tarfile
@@ -20,6 +21,7 @@ from cayu.cli.dashboard import (
     contents_digest,
     validate_dashboard_source_bundle,
 )
+from cayu.cli.guide import _GUIDES
 from cayu.cli.lambda_microvm import _SidecarArtifactError, _validate_artifact_contents
 
 _SIDECAR_MANIFEST = "cayu-lambda-microvm-sidecar-manifest.json"
@@ -28,6 +30,7 @@ _WHEEL_SIDECAR_PREFIX = "cayu/data/lambda_microvm_sidecar"
 _SDIST_DASHBOARD_SOURCE_PREFIX = "src/cayu/data/dashboard_source"
 _WHEEL_DASHBOARD_SOURCE_PREFIX = "cayu/data/dashboard_source"
 _DASHBOARD_SOURCE_REQUIRED = _REQUIRED_SOURCE_FILES
+_GUIDE_FILES = {filename for filename, _description in _GUIDES.values()}
 _SDIST_REQUIRED = {
     "LICENSE",
     "NOTICE",
@@ -38,8 +41,7 @@ _SDIST_REQUIRED = {
     "src/cayu/data/__init__.py",
     "src/cayu/data/default_model_catalog.json",
     "src/cayu/data/default_price_book.json",
-    "src/cayu/guides/durable-operations.md",
-    "src/cayu/guides/tool-effects.md",
+    *{f"src/cayu/guides/{filename}" for filename in _GUIDE_FILES},
     "src/cayu/server/dashboard/LICENSE",
     "src/cayu/server/dashboard/NOTICE",
     "src/cayu/server/dashboard/REDISTRIBUTION.md",
@@ -63,12 +65,7 @@ _WHEEL_REQUIRED = {
     "cayu/data/__init__.py",
     "cayu/data/default_model_catalog.json",
     "cayu/data/default_price_book.json",
-    "cayu/guides/application-anatomy.md",
-    "cayu/guides/authoring.md",
-    "cayu/guides/diagnostics.md",
-    "cayu/guides/durable-operations.md",
-    "cayu/guides/providers.md",
-    "cayu/guides/tool-effects.md",
+    *{f"cayu/guides/{filename}" for filename in _GUIDE_FILES},
     "cayu/server/dashboard/LICENSE",
     "cayu/server/dashboard/NOTICE",
     "cayu/server/dashboard/REDISTRIBUTION.md",
@@ -185,6 +182,22 @@ def _metadata_version(contents: bytes, *, archive: Path, member_name: str) -> st
     return version.strip()
 
 
+def _validate_metadata_document_links(contents: bytes, *, archive: Path, member_name: str) -> None:
+    description = BytesParser().parsebytes(contents).get_payload()
+    if not isinstance(description, str):
+        return
+    for match in re.finditer(r"\[[^\]]+\]\(([^)]+)\)", description):
+        destination = match.group(1).strip().strip("<>")
+        path = destination.split("#", 1)[0].split("?", 1)[0]
+        if (
+            path
+            and "://" not in path
+            and not path.startswith(("#", "mailto:"))
+            and path.casefold().endswith(".md")
+        ):
+            _fail(f"{archive}: {member_name} contains relative local-document link: {destination}")
+
+
 def _validate_sidecar(
     contents: dict[str, bytes],
     *,
@@ -249,6 +262,9 @@ def validate_sdist(archive: Path) -> ValidatedReleaseContents:
     notice_name = "src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md"
     _validate_third_party_licenses(contents_by_relative_name[notice_name], archive=archive)
     package_version = _metadata_version(
+        contents_by_relative_name["PKG-INFO"], archive=archive, member_name="PKG-INFO"
+    )
+    _validate_metadata_document_links(
         contents_by_relative_name["PKG-INFO"], archive=archive, member_name="PKG-INFO"
     )
     prefix = f"{_SDIST_SIDECAR_PREFIX}/"
@@ -343,6 +359,9 @@ def validate_wheel(archive: Path) -> ValidatedReleaseContents:
 
     metadata_name = f"{metadata_root}/METADATA"
     package_version = _metadata_version(
+        file_contents[metadata_name], archive=archive, member_name=metadata_name
+    )
+    _validate_metadata_document_links(
         file_contents[metadata_name], archive=archive, member_name=metadata_name
     )
     prefix = f"{_WHEEL_SIDECAR_PREFIX}/"
