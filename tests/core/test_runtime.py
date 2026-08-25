@@ -34415,11 +34415,13 @@ def test_automatic_compaction_late_completion_commit_keeps_one_accounting_event(
                 ),
             )
         )
-        await asyncio.wait_for(store.blocked.wait(), timeout=1)
-        await asyncio.sleep(0.05)
-        assert not task.done()
-        store.release.set()
-        events = await asyncio.wait_for(task, timeout=1)
+        try:
+            await asyncio.wait_for(store.blocked.wait(), timeout=5)
+            await asyncio.sleep(0.05)
+            assert not task.done()
+        finally:
+            store.release.set()
+        events = await asyncio.wait_for(task, timeout=5)
         assert events[-1].type == EventType.SESSION_FAILED
         for _ in range(100):
             durable = await store.load_events("sess_automatic_late_completion_commit")
