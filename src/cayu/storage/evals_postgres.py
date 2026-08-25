@@ -29,6 +29,10 @@ from cayu.evals.scenario import (
 )
 from cayu.evals.store import (
     TERMINAL_EVAL_RUN_STATUSES,
+    EvalAuthoredSuiteCatalogEntry,
+    EvalAuthoredSuiteCatalogPage,
+    EvalAuthoredSuiteCatalogQuery,
+    EvalAuthoredSuiteConflict,
     EvalBaselineConflict,
     EvalBaselineKey,
     EvalBaselineMutationRecord,
@@ -73,6 +77,7 @@ from cayu.evals.store import (
     EvalSuiteCatalogEntry,
     EvalSuiteCatalogPage,
     EvalSuiteCatalogQuery,
+    _bounded_authored_suite_page,
     _bounded_case_page,
     _bounded_corpus_page,
     _bounded_result_page,
@@ -83,6 +88,7 @@ from cayu.evals.store import (
     _copy_query,
     _exact_model,
     _lease_seconds,
+    _prepare_authored_suite_for_store,
     _prepare_baseline_update_for_store,
     _prepare_captured_result_for_store,
     _prepare_corpus_catalog_for_store,
@@ -93,6 +99,9 @@ from cayu.evals.store import (
     _scenario_progress_for_claim,
     _store_identifier,
     _validate_baseline_result,
+    authored_suite_catalog_entry,
+    authored_suite_scenario_cases,
+    decode_authored_suite_cursor,
     decode_case_cursor,
     decode_corpus_cursor,
     decode_result_cursor,
@@ -102,11 +111,17 @@ from cayu.evals.store import (
     eval_result_record,
     eval_run_invocation_from_json,
     result_summary,
+    validate_authored_suite_scenario,
     validate_result_for_run,
+)
+from cayu.evals.suite_authoring import (
+    EVAL_SUITE_AUTHORING_MAX_BYTES,
+    EvalSuiteDocumentV1,
+    eval_suite_document_from_json,
 )
 from cayu.storage.postgres import _PostgresStoreBase
 
-_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 56
+_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 64
 
 _RUN_COLUMNS = """
     run_id,
@@ -281,6 +296,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
     captured_results: ClassVar[bool] = True
     scenarios: ClassVar[bool] = True
     scenario_execution: ClassVar[bool] = True
+    suite_authoring: ClassVar[bool] = True
     _min_required_revision = _POSTGRES_EVAL_MIN_REQUIRED_REVISION
 
     async def save_corpus(
@@ -525,6 +541,185 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
             rows = await cur.fetchall()
         return _bounded_scenario_page(
             [self._scenario_entry_from_row(row) for row in rows],
+            query,
+        )
+
+    async def save_authored_suite(
+        self,
+        document: EvalSuiteDocumentV1,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalAuthoredSuiteCatalogEntry:
+        validated, payload = await asyncio.to_thread(
+            _prepare_authored_suite_for_store,
+            document,
+            redact_json=redact_json,
+        )
+        document_text = payload.decode("utf-8")
+        scenario_cases = authored_suite_scenario_cases(validated)
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    scenario_by_revision: dict[str, EvalScenarioDocumentV2] = {}
+                    if scenario_cases:
+                        await cur.execute(
+                            "SELECT revision, document_json FROM cayu_eval_scenarios "
+                            "WHERE revision = ANY(%s)",
+                            (
+                                list(
+                                    {reference.scenario_revision for _, reference in scenario_cases}
+                                ),
+                            ),
+                        )
+                        scenario_rows = await cur.fetchall()
+                        scenario_by_revision = await asyncio.to_thread(
+                            lambda: {
+                                str(revision): eval_scenario_from_json(scenario_json)
+                                for revision, scenario_json in scenario_rows
+                            }
+                        )
+                    for case, reference in scenario_cases:
+                        validate_authored_suite_scenario(
+                            validated,
+                            case,
+                            scenario_by_revision.get(reference.scenario_revision),
+                        )
+                    created_at = await _database_now(cur)
+                    entry = authored_suite_catalog_entry(
+                        validated,
+                        created_at=created_at,
+                        document_bytes=len(payload),
+                    )
+                    await cur.execute(
+                        """
+                        INSERT INTO cayu_eval_authored_suites (
+                            revision, suite_id, suite_revision, target_key, name,
+                            description, case_count, assertion_count,
+                            simple_input_count, scenario_count, trials,
+                            timeout_seconds, document_json, document_bytes, created_at
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s
+                        )
+                        ON CONFLICT (revision) DO NOTHING
+                        RETURNING revision
+                        """,
+                        (
+                            entry.revision,
+                            entry.id,
+                            entry.suite_revision,
+                            entry.target_key,
+                            entry.name,
+                            entry.description,
+                            entry.case_count,
+                            entry.assertion_count,
+                            entry.simple_input_count,
+                            entry.scenario_count,
+                            entry.trials,
+                            entry.timeout_seconds,
+                            document_text,
+                            entry.document_bytes,
+                            entry.created_at,
+                        ),
+                    )
+                    if await cur.fetchone() is None:
+                        await cur.execute(
+                            "SELECT document_json FROM cayu_eval_authored_suites "
+                            "WHERE revision = %s",
+                            (validated.revision,),
+                        )
+                        existing = await cur.fetchone()
+                        if existing is None or existing[0] != document_text:
+                            raise EvalAuthoredSuiteConflict(
+                                f"Authored eval suite revision {validated.revision} has "
+                                "conflicting content."
+                            )
+                        loaded = await self._load_authored_suite_entry(
+                            cur,
+                            validated.revision,
+                        )
+                        assert loaded is not None
+                        entry = loaded
+                await conn.commit()
+                return entry
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def load_authored_suite(
+        self,
+        revision: str,
+        *,
+        max_bytes: int = EVAL_SUITE_AUTHORING_MAX_BYTES,
+    ) -> EvalSuiteDocumentV1 | None:
+        revision = _sha256_revision(revision, "revision")
+        max_bytes = _read_limit(max_bytes, hard_max=EVAL_SUITE_AUTHORING_MAX_BYTES)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT document_json, document_bytes
+                FROM cayu_eval_authored_suites
+                WHERE revision = %s
+                """,
+                (revision,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            if row[1] > max_bytes:
+                raise EvalStoreResultTooLarge(max_bytes)
+            payload = row[0]
+        return await asyncio.to_thread(eval_suite_document_from_json, payload)
+
+    async def list_authored_suites(
+        self,
+        query: EvalAuthoredSuiteCatalogQuery | None = None,
+    ) -> EvalAuthoredSuiteCatalogPage:
+        query = _copy_query(query, EvalAuthoredSuiteCatalogQuery)
+        boundary = (
+            decode_authored_suite_cursor(
+                query.cursor,
+                query.target_key,
+                query.suite_id,
+            )
+            if query.cursor is not None
+            else None
+        )
+        clauses: list[str] = []
+        params: list[object] = []
+        if query.target_key is not None:
+            clauses.append("target_key = %s")
+            params.append(query.target_key)
+        if query.suite_id is not None:
+            clauses.append("suite_id = %s")
+            params.append(query.suite_id)
+        if boundary is not None:
+            clauses.append("(created_at < %s OR (created_at = %s AND revision > %s))")
+            params.extend((boundary[0], boundary[0], boundary[1]))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    f"""
+                    SELECT revision, suite_id, suite_revision, target_key, name,
+                           description, case_count, assertion_count,
+                           simple_input_count, scenario_count, trials,
+                           timeout_seconds, document_bytes, created_at
+                    FROM cayu_eval_authored_suites
+                    {where}
+                    ORDER BY created_at DESC, revision ASC
+                    LIMIT %s
+                    """,
+                ),
+                (*params, query.limit + 1),
+            )
+            rows = await cur.fetchall()
+        return _bounded_authored_suite_page(
+            [self._authored_suite_entry_from_row(row) for row in rows],
             query,
         )
 
@@ -2021,6 +2216,44 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
             part_count=row[9],
             artifact_requirement_count=row[10],
             secret_requirement_count=row[11],
+            document_bytes=row[12],
+            created_at=row[13],
+        )
+
+    @classmethod
+    async def _load_authored_suite_entry(
+        cls,
+        cur: Any,
+        revision: str,
+    ) -> EvalAuthoredSuiteCatalogEntry | None:
+        await cur.execute(
+            """
+            SELECT revision, suite_id, suite_revision, target_key, name,
+                   description, case_count, assertion_count, simple_input_count,
+                   scenario_count, trials, timeout_seconds, document_bytes, created_at
+            FROM cayu_eval_authored_suites
+            WHERE revision = %s
+            """,
+            (revision,),
+        )
+        row = await cur.fetchone()
+        return None if row is None else cls._authored_suite_entry_from_row(row)
+
+    @staticmethod
+    def _authored_suite_entry_from_row(row: Any) -> EvalAuthoredSuiteCatalogEntry:
+        return EvalAuthoredSuiteCatalogEntry(
+            revision=row[0],
+            id=row[1],
+            suite_revision=row[2],
+            target_key=row[3],
+            name=row[4],
+            description=row[5],
+            case_count=row[6],
+            assertion_count=row[7],
+            simple_input_count=row[8],
+            scenario_count=row[9],
+            trials=row[10],
+            timeout_seconds=row[11],
             document_bytes=row[12],
             created_at=row[13],
         )

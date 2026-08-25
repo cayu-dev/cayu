@@ -3614,6 +3614,86 @@ export type EnvironmentsResponse = {
 };
 
 /**
+ * EvalAuthoredSuiteCatalogEntry
+ */
+export type EvalAuthoredSuiteCatalogEntry = {
+    /**
+     * Assertion Count
+     */
+    assertion_count: number;
+    /**
+     * Case Count
+     */
+    case_count: number;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Document Bytes
+     */
+    document_bytes: number;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Scenario Count
+     */
+    scenario_count: number;
+    /**
+     * Simple Input Count
+     */
+    simple_input_count: number;
+    /**
+     * Suite Revision
+     */
+    suite_revision: string;
+    /**
+     * Target Key
+     */
+    target_key: string;
+    /**
+     * Timeout Seconds
+     */
+    timeout_seconds: number;
+    /**
+     * Trials
+     */
+    trials: number;
+};
+
+/**
+ * EvalAuthoredSuiteCatalogPage
+ */
+export type EvalAuthoredSuiteCatalogPage = {
+    /**
+     * Has More
+     */
+    has_more?: boolean;
+    /**
+     * Items
+     */
+    items: Array<EvalAuthoredSuiteCatalogEntry>;
+    /**
+     * Next Cursor
+     */
+    next_cursor?: string | null;
+};
+
+/**
  * EvalBaselineKey
  *
  * Stable scope of one explicit baseline pointer.
@@ -3775,6 +3855,76 @@ export type EvalCaseCatalogPage = {
      * Next Cursor
      */
     next_cursor?: string | null;
+};
+
+/**
+ * EvalCaseDefinitionV1
+ *
+ * One immutable authored case revision with truthful optional provenance.
+ */
+export type EvalCaseDefinitionV1 = {
+    /**
+     * Assertions
+     */
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    source?: EvaluationSourceIdentityV1 | null;
+    /**
+     * Stimulus
+     */
+    stimulus: ({
+        kind: 'simple_input';
+    } & EvalSimpleInputStimulusV1) | ({
+        kind: 'scenario';
+    } & EvalScenarioStimulusV1);
+};
+
+/**
+ * EvalCaseDraftV1
+ *
+ * Bounded, revision-free case material accepted by authoring previews.
+ */
+export type EvalCaseDraftV1 = {
+    /**
+     * Assertions
+     */
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Name
+     */
+    name: string;
+    source?: EvaluationSourceIdentityV1 | null;
+    /**
+     * Stimulus
+     */
+    stimulus: ({
+        kind: 'simple_input';
+    } & EvalSimpleInputStimulusV1) | ({
+        kind: 'scenario';
+    } & EvalScenarioStimulusV1);
 };
 
 /**
@@ -4613,6 +4763,26 @@ export type EvalScenarioSaveResponse = {
 };
 
 /**
+ * EvalScenarioStimulusV1
+ *
+ * A content-addressed reference to one separately persisted scenario.
+ */
+export type EvalScenarioStimulusV1 = {
+    /**
+     * Kind
+     */
+    kind?: 'scenario';
+    /**
+     * Scenario Id
+     */
+    scenario_id: string;
+    /**
+     * Scenario Revision
+     */
+    scenario_revision: string;
+};
+
+/**
  * EvalScenarioTrialFailureCode
  */
 export type EvalScenarioTrialFailureCode = 'execution_failed' | 'unexpected_session_state' | 'expected_approval_unavailable' | 'expected_user_input_unavailable';
@@ -4657,6 +4827,51 @@ export type EvalScenarioTrialProgress = {
      * Trial Number
      */
     trial_number: number;
+};
+
+/**
+ * EvalSelectedCaseV1
+ */
+export type EvalSelectedCaseV1 = {
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Revision
+     */
+    revision: string;
+};
+
+/**
+ * EvalSimpleInputStimulusV1
+ *
+ * One ordinary fresh invocation authored without captured provenance.
+ */
+export type EvalSimpleInputStimulusV1 = {
+    input: RunInputSpec;
+    /**
+     * Kind
+     */
+    kind?: 'simple_input';
+};
+
+/**
+ * EvalSuiteAuthoringDiagnostic
+ */
+export type EvalSuiteAuthoringDiagnostic = {
+    /**
+     * Case Id
+     */
+    case_id?: string | null;
+    /**
+     * Code
+     */
+    code: 'target_unavailable' | 'scenario_store_unavailable' | 'scenario_unavailable' | 'scenario_id_mismatch' | 'scenario_target_mismatch' | 'scenario_source_mismatch';
+    /**
+     * Message
+     */
+    message: string;
 };
 
 /**
@@ -4717,6 +4932,143 @@ export type EvalSuiteCatalogPage = {
      * Next Cursor
      */
     next_cursor?: string | null;
+};
+
+/**
+ * EvalSuiteDocumentV1
+ *
+ * One immutable, authority-free authored suite and its exact case revisions.
+ */
+export type EvalSuiteDocumentV1 = {
+    /**
+     * Cases
+     */
+    cases: Array<EvalCaseDefinitionV1>;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    suite: EvalSuiteSpec;
+    /**
+     * Target Key
+     */
+    target_key: string;
+};
+
+/**
+ * EvalSuiteDraftV1
+ *
+ * Revision-free suite material edited by an SDK or Control Plane client.
+ */
+export type EvalSuiteDraftV1 = {
+    /**
+     * Cases
+     */
+    cases: Array<EvalCaseDraftV1>;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Target Key
+     */
+    target_key: string;
+    trial_request?: TrialRequestSpec;
+};
+
+/**
+ * EvalSuitePreviewRequest
+ *
+ * Authority-free editor material; preview never persists or executes it.
+ */
+export type EvalSuitePreviewRequest = {
+    draft: EvalSuiteDraftV1;
+};
+
+/**
+ * EvalSuitePreviewResponse
+ */
+export type EvalSuitePreviewResponse = {
+    /**
+     * Diagnostics
+     */
+    diagnostics?: Array<EvalSuiteAuthoringDiagnostic>;
+    full_selection: EvalSuiteSelectionV1;
+    /**
+     * Ready
+     */
+    ready: boolean;
+    suite: EvalSuiteDocumentV1;
+};
+
+/**
+ * EvalSuiteSaveRequest
+ *
+ * One reviewed canonical suite revision guarded by optimistic identity.
+ */
+export type EvalSuiteSaveRequest = {
+    /**
+     * Expected Suite Revision
+     */
+    expected_suite_revision: string;
+    suite: EvalSuiteDocumentV1;
+};
+
+/**
+ * EvalSuiteSaveResponse
+ */
+export type EvalSuiteSaveResponse = {
+    entry: EvalAuthoredSuiteCatalogEntry;
+    full_selection: EvalSuiteSelectionV1;
+    suite: EvalSuiteDocumentV1;
+};
+
+/**
+ * EvalSuiteSelectionV1
+ *
+ * Content identity for a full-suite or explicit-subset launch request.
+ */
+export type EvalSuiteSelectionV1 = {
+    /**
+     * Cases
+     */
+    cases: Array<EvalSelectedCaseV1>;
+    /**
+     * Mode
+     */
+    mode: 'full_suite' | 'subset';
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Suite Document Revision
+     */
+    suite_document_revision: string;
+    /**
+     * Suite Id
+     */
+    suite_id: string;
+    /**
+     * Suite Revision
+     */
+    suite_revision: string;
 };
 
 /**
@@ -11836,6 +12188,230 @@ export type SaveCapturedEvaluationApiEvalsSessionsSessionIdEvaluationSavePostRes
 };
 
 export type SaveCapturedEvaluationApiEvalsSessionsSessionIdEvaluationSavePostResponse = SaveCapturedEvaluationApiEvalsSessionsSessionIdEvaluationSavePostResponses[keyof SaveCapturedEvaluationApiEvalsSessionsSessionIdEvaluationSavePostResponses];
+
+export type ListEvalAuthoredSuitesApiEvalsSuitesGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Target Key
+         */
+        target_key?: string | null;
+        /**
+         * Suite Id
+         */
+        suite_id?: string | null;
+        /**
+         * Cursor
+         */
+        cursor?: string | null;
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * Max Result Bytes
+         */
+        max_result_bytes?: number;
+    };
+    url: '/api/evals/suites';
+};
+
+export type ListEvalAuthoredSuitesApiEvalsSuitesGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type ListEvalAuthoredSuitesApiEvalsSuitesGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalAuthoredSuiteCatalogPage;
+};
+
+export type ListEvalAuthoredSuitesApiEvalsSuitesGetResponse = ListEvalAuthoredSuitesApiEvalsSuitesGetResponses[keyof ListEvalAuthoredSuitesApiEvalsSuitesGetResponses];
+
+export type SaveEvalSuiteApiEvalsSuitesPostData = {
+    body: EvalSuiteSaveRequest;
+    path?: never;
+    query?: never;
+    url: '/api/evals/suites';
+};
+
+export type SaveEvalSuiteApiEvalsSuitesPostErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type SaveEvalSuiteApiEvalsSuitesPostResponses = {
+    /**
+     * Successful Response
+     */
+    201: EvalSuiteSaveResponse;
+};
+
+export type SaveEvalSuiteApiEvalsSuitesPostResponse = SaveEvalSuiteApiEvalsSuitesPostResponses[keyof SaveEvalSuiteApiEvalsSuitesPostResponses];
+
+export type PreviewEvalSuiteApiEvalsSuitesPreviewPostData = {
+    body: EvalSuitePreviewRequest;
+    path?: never;
+    query?: never;
+    url: '/api/evals/suites/preview';
+};
+
+export type PreviewEvalSuiteApiEvalsSuitesPreviewPostErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type PreviewEvalSuiteApiEvalsSuitesPreviewPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalSuitePreviewResponse;
+};
+
+export type PreviewEvalSuiteApiEvalsSuitesPreviewPostResponse = PreviewEvalSuiteApiEvalsSuitesPreviewPostResponses[keyof PreviewEvalSuiteApiEvalsSuitesPreviewPostResponses];
+
+export type GetEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionGetData = {
+    body?: never;
+    path: {
+        /**
+         * Suite Revision
+         */
+        suite_revision: string;
+    };
+    query?: never;
+    url: '/api/evals/suites/{suite_revision}';
+};
+
+export type GetEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type GetEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalSuiteDocumentV1;
+};
+
+export type GetEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionGetResponse = GetEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionGetResponses[keyof GetEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionGetResponses];
+
+export type DownloadEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionDownloadGetData = {
+    body?: never;
+    path: {
+        /**
+         * Suite Revision
+         */
+        suite_revision: string;
+    };
+    query?: never;
+    url: '/api/evals/suites/{suite_revision}/download';
+};
+
+export type DownloadEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionDownloadGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type DownloadEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionDownloadGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
 
 export type ListEvalTargetsApiEvalsTargetsGetData = {
     body?: never;

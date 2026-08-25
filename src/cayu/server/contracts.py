@@ -57,6 +57,7 @@ from cayu.evals.scenario_preflight import (
 )
 from cayu.evals.store import (
     EVAL_STORE_MAX_CLAIM_TARGETS,
+    EvalAuthoredSuiteCatalogEntry,
     EvalBaselineMutationRecord,
     EvalBaselineRecord,
     EvalResultRecord,
@@ -64,6 +65,11 @@ from cayu.evals.store import (
     EvalRunRecord,
     EvalRunStatus,
     EvalScenarioCatalogEntry,
+)
+from cayu.evals.suite_authoring import (
+    EvalSuiteDocumentV1,
+    EvalSuiteDraftV1,
+    EvalSuiteSelectionV1,
 )
 from cayu.runtime.aggregates import (
     AggregateAccuracy,
@@ -1389,6 +1395,45 @@ class EvalScenarioSaveResponse(ApiBaseModel):
     entry: EvalScenarioCatalogEntry
     scenario: EvalScenarioDocumentV2
     preflight: ScenarioLaunchPreflightResultV2
+
+
+class EvalSuiteAuthoringDiagnostic(ApiBaseModel):
+    code: Literal[
+        "target_unavailable",
+        "scenario_store_unavailable",
+        "scenario_unavailable",
+        "scenario_id_mismatch",
+        "scenario_target_mismatch",
+        "scenario_source_mismatch",
+    ]
+    case_id: StrictStr | None = None
+    message: StrictStr
+
+
+class EvalSuitePreviewRequest(ApiBaseModel):
+    """Authority-free editor material; preview never persists or executes it."""
+
+    draft: EvalSuiteDraftV1
+
+
+class EvalSuitePreviewResponse(ApiBaseModel):
+    suite: EvalSuiteDocumentV1
+    full_selection: EvalSuiteSelectionV1
+    ready: StrictBool
+    diagnostics: tuple[EvalSuiteAuthoringDiagnostic, ...] = ()
+
+
+class EvalSuiteSaveRequest(ApiBaseModel):
+    """One reviewed canonical suite revision guarded by optimistic identity."""
+
+    expected_suite_revision: EvalRevision
+    suite: EvalSuiteDocumentV1
+
+
+class EvalSuiteSaveResponse(ApiBaseModel):
+    entry: EvalAuthoredSuiteCatalogEntry
+    suite: EvalSuiteDocumentV1
+    full_selection: EvalSuiteSelectionV1
 
 
 class EvalScenarioArtifactMaterializationRequest(ApiBaseModel):

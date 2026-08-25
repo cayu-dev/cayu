@@ -113,7 +113,7 @@ def test_postgres_eval_store_shared_conformance(postgres_dsn) -> None:
     asyncio.run(exercise())
 
 
-def test_postgres_eval_store_creates_revision_fifty_eight_schema(postgres_dsn) -> None:
+def test_postgres_eval_store_creates_revision_sixty_four_schema(postgres_dsn) -> None:
     async def exercise() -> None:
         import psycopg
 
@@ -133,7 +133,7 @@ def test_postgres_eval_store_creates_revision_fifty_eight_schema(postgres_dsn) -
         ):
             await cur.execute(
                 "SELECT revision, kind, compatible_from FROM cayu_schema_migrations "
-                "WHERE revision IN (47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58) "
+                "WHERE revision IN (47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64) "
                 "ORDER BY revision"
             )
             assert await cur.fetchall() == [
@@ -149,6 +149,12 @@ def test_postgres_eval_store_creates_revision_fifty_eight_schema(postgres_dsn) -
                 (56, "additive", 55),
                 (57, "breaking", 57),
                 (58, "breaking", 58),
+                (59, "breaking", 59),
+                (60, "breaking", 60),
+                (61, "breaking", 61),
+                (62, "breaking", 62),
+                (63, "breaking", 63),
+                (64, "additive", 63),
             ]
             await cur.execute(
                 "SELECT data_type, is_nullable, column_default "
@@ -186,10 +192,14 @@ def test_postgres_eval_store_creates_revision_fifty_eight_schema(postgres_dsn) -
                 "AND (indexname LIKE 'idx_cayu_eval_runs_target_%' "
                 "OR indexname LIKE 'idx_cayu_eval_result_records_%' "
                 "OR indexname LIKE 'idx_cayu_eval_scenarios_%' "
+                "OR indexname LIKE 'idx_cayu_eval_authored_suites_%' "
                 "OR indexname = 'idx_cayu_eval_baseline_mutations_scope') "
                 "ORDER BY indexname"
             )
             assert [row[0] for row in await cur.fetchall()] == [
+                "idx_cayu_eval_authored_suites_catalog",
+                "idx_cayu_eval_authored_suites_id_catalog",
+                "idx_cayu_eval_authored_suites_target_catalog",
                 "idx_cayu_eval_baseline_mutations_scope",
                 "idx_cayu_eval_result_records_contract",
                 "idx_cayu_eval_result_records_target_catalog",
@@ -206,6 +216,7 @@ def test_postgres_eval_store_creates_revision_fifty_eight_schema(postgres_dsn) -
             assert {row[0] for row in await cur.fetchall()} == {
                 "cayu_eval_baseline_mutations",
                 "cayu_eval_baselines",
+                "cayu_eval_authored_suites",
                 "cayu_eval_cases",
                 "cayu_eval_corpora",
                 "cayu_eval_result_records",
@@ -241,6 +252,48 @@ def test_postgres_eval_store_creates_revision_fifty_eight_schema(postgres_dsn) -
                 ("cayu_eval_runs", "run_id", "C"),
                 ("cayu_eval_suites", "suite_id", "C"),
             ]
+
+    asyncio.run(exercise())
+
+
+def test_postgres_revision_sixty_four_rejects_missing_authored_suite_constraint(
+    postgres_dsn,
+) -> None:
+    async def exercise() -> None:
+        import psycopg
+
+        from cayu.storage.evals_postgres import PostgresEvalStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _drop_eval_tables(postgres_dsn)
+        initialized = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            await initialized.list_authored_suites()
+        finally:
+            await initialized.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "ALTER TABLE cayu_eval_authored_suites DROP CONSTRAINT "
+                    "cayu_eval_authored_suites_document_size_check"
+                )
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 64")
+            await conn.commit()
+
+        conflicting = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(RuntimeError, match="authored suite constraints"):
+                await conflicting.list_authored_suites()
+        finally:
+            await conflicting.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT 1 FROM cayu_schema_migrations WHERE revision = 64")
+            assert await cur.fetchone() is None
 
     asyncio.run(exercise())
 

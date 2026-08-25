@@ -123,6 +123,10 @@ from cayu.evals.store import (
     EVAL_STORE_MAX_IDENTIFIER_CHARS,
     EVAL_STORE_MAX_PAGE_BYTES,
     EVAL_STORE_MAX_PAGE_SIZE,
+    EvalAuthoredSuiteCatalogPage,
+    EvalAuthoredSuiteCatalogQuery,
+    EvalAuthoredSuiteConflict,
+    EvalAuthoredSuiteReferenceError,
     EvalBaselineConflict,
     EvalBaselineKey,
     EvalBaselineUpdate,
@@ -155,6 +159,14 @@ from cayu.evals.store import (
     EvalStoreResultTooLarge,
     EvalSuiteCatalogPage,
     EvalSuiteCatalogQuery,
+    authored_suite_scenario_cases,
+)
+from cayu.evals.suite_authoring import (
+    EvalSuiteDocumentV1,
+    compile_eval_suite_draft,
+    eval_suite_document_to_json,
+    eval_suite_selection,
+    validate_expected_eval_suite_revision,
 )
 from cayu.evals.trajectory import (
     SessionTrajectoryError,
@@ -361,6 +373,11 @@ from cayu.server.contracts import (
     EvalScenarioRunCreateRequest,
     EvalScenarioSaveRequest,
     EvalScenarioSaveResponse,
+    EvalSuiteAuthoringDiagnostic,
+    EvalSuitePreviewRequest,
+    EvalSuitePreviewResponse,
+    EvalSuiteSaveRequest,
+    EvalSuiteSaveResponse,
     EvalTargetCatalogResponse,
     EvaluationPromotionDraft,
     EvaluationPromotionExportRequest,
@@ -5554,6 +5571,274 @@ def create_router(
             return CapturedEvaluationLaunchResponse(
                 captured=CapturedEvaluationSaveResponse(record=record, result=result),
                 run=run,
+            )
+
+        async def _authored_suite_diagnostics(
+            suite: EvalSuiteDocumentV1,
+        ) -> tuple[EvalSuiteAuthoringDiagnostic, ...]:
+            diagnostics: list[EvalSuiteAuthoringDiagnostic] = []
+            if active_eval_registry.get(suite.target_key) is None:
+                diagnostics.append(
+                    EvalSuiteAuthoringDiagnostic(
+                        code="target_unavailable",
+                        message="The authored suite target is not currently published.",
+                    )
+                )
+            scenario_cases = authored_suite_scenario_cases(suite)
+            if scenario_cases and not eval_store.scenarios:
+                return (
+                    *diagnostics,
+                    *(
+                        EvalSuiteAuthoringDiagnostic(
+                            code="scenario_store_unavailable",
+                            case_id=case.id,
+                            message="Durable scenario persistence is not available.",
+                        )
+                        for case, _ in scenario_cases
+                    ),
+                )
+            scenario_by_revision: dict[str, EvalScenarioDocumentV2 | None] = {}
+            if scenario_cases:
+                load_limit = asyncio.Semaphore(16)
+
+                async def load_scenario_for_preview(revision: str):
+                    async with load_limit:
+                        try:
+                            return await eval_store.load_scenario(revision)
+                        except (EvalStoreResultTooLarge, TypeError, ValueError):
+                            return None
+
+                unique_revisions = tuple(
+                    sorted({reference.scenario_revision for _, reference in scenario_cases})
+                )
+                loaded = await asyncio.gather(
+                    *(load_scenario_for_preview(revision) for revision in unique_revisions)
+                )
+                scenario_by_revision = dict(zip(unique_revisions, loaded, strict=True))
+            for case, reference in scenario_cases:
+                scenario = scenario_by_revision.get(reference.scenario_revision)
+                if scenario is None:
+                    diagnostics.append(
+                        EvalSuiteAuthoringDiagnostic(
+                            code="scenario_unavailable",
+                            case_id=case.id,
+                            message="The exact scenario revision is unavailable.",
+                        )
+                    )
+                elif scenario.id != reference.scenario_id:
+                    diagnostics.append(
+                        EvalSuiteAuthoringDiagnostic(
+                            code="scenario_id_mismatch",
+                            case_id=case.id,
+                            message="The scenario ID does not match its stored revision.",
+                        )
+                    )
+                elif scenario.target_key != suite.target_key:
+                    diagnostics.append(
+                        EvalSuiteAuthoringDiagnostic(
+                            code="scenario_target_mismatch",
+                            case_id=case.id,
+                            message="The scenario target does not match its authored suite.",
+                        )
+                    )
+                else:
+                    if case.source is not None and case.source != scenario.source:
+                        diagnostics.append(
+                            EvalSuiteAuthoringDiagnostic(
+                                code="scenario_source_mismatch",
+                                case_id=case.id,
+                                message=("The case source does not match its scenario provenance."),
+                            )
+                        )
+            return tuple(diagnostics)
+
+        async def _load_authored_suite(revision: str) -> EvalSuiteDocumentV1:
+            if not eval_store.suite_authoring:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Durable authored-suite persistence is not available.",
+                )
+            try:
+                suite = await eval_store.load_authored_suite(revision)
+            except EvalStoreResultTooLarge as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Authored eval suite exceeds the server byte limit.",
+                ) from exc
+            except (TypeError, ValueError):
+                _eval_query_error()
+            if suite is None or active_eval_registry.get(suite.target_key) is None:
+                raise HTTPException(status_code=404, detail="Authored eval suite not found.")
+            return suite
+
+        @bounded_evals_router.post(
+            "/evals/suites/preview",
+            response_model=EvalSuitePreviewResponse,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def preview_eval_suite(
+            body: EvalSuitePreviewRequest,
+        ) -> EvalSuitePreviewResponse:
+            try:
+                suite = compile_eval_suite_draft(body.draft)
+                selection = eval_suite_selection(suite)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Authored eval suite draft is invalid.",
+                ) from exc
+            diagnostics = await _authored_suite_diagnostics(suite)
+            return EvalSuitePreviewResponse(
+                suite=suite,
+                full_selection=selection,
+                ready=not diagnostics,
+                diagnostics=diagnostics,
+            )
+
+        @bounded_evals_router.post(
+            "/evals/suites",
+            response_model=EvalSuiteSaveResponse,
+            status_code=201,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def save_eval_suite(body: EvalSuiteSaveRequest) -> EvalSuiteSaveResponse:
+            if not eval_store.suite_authoring:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Durable authored-suite persistence is not available.",
+                )
+            try:
+                suite = validate_expected_eval_suite_revision(
+                    body.suite,
+                    body.expected_suite_revision,
+                )
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Authored eval suite changed after the reviewed revision.",
+                ) from exc
+            diagnostics = await _authored_suite_diagnostics(suite)
+            if diagnostics:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Authored eval suite is not ready to save.",
+                )
+            registration = active_eval_registry.registration(suite.target_key)
+            assert registration is not None
+            try:
+                entry = await eval_store.save_authored_suite(
+                    suite,
+                    redact_json=registration.target.app.redact_json,
+                )
+            except EvalAuthoredSuiteConflict as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Authored eval suite revision conflicts with stored content.",
+                ) from exc
+            except EvalAuthoredSuiteReferenceError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Authored eval suite scenario references changed before save.",
+                ) from exc
+            except EvalStorePublicationRejected as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Authored eval suite contains unsafe public data.",
+                ) from exc
+            except EvalStoreResultTooLarge as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Authored eval suite exceeds the server byte limit.",
+                ) from exc
+            return EvalSuiteSaveResponse(
+                entry=entry,
+                suite=suite,
+                full_selection=eval_suite_selection(suite),
+            )
+
+        @bounded_evals_router.get(
+            "/evals/suites",
+            response_model=EvalAuthoredSuiteCatalogPage,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def list_eval_authored_suites(
+            target_key: Annotated[
+                str | None,
+                Query(max_length=EVAL_STORE_MAX_IDENTIFIER_CHARS),
+            ] = None,
+            suite_id: Annotated[
+                str | None,
+                Query(max_length=EVAL_STORE_MAX_IDENTIFIER_CHARS),
+            ] = None,
+            cursor: Annotated[str | None, Query(max_length=EVAL_STORE_MAX_CURSOR_BYTES)] = None,
+            limit: Annotated[
+                int,
+                Query(ge=1, le=EVAL_STORE_MAX_PAGE_SIZE),
+            ] = EVAL_STORE_DEFAULT_PAGE_SIZE,
+            max_result_bytes: Annotated[
+                int,
+                Query(ge=1_024, le=EVAL_STORE_MAX_PAGE_BYTES),
+            ] = EVAL_STORE_DEFAULT_PAGE_BYTES,
+        ):
+            if not eval_store.suite_authoring:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Durable authored-suite persistence is not available.",
+                )
+            eval_target = _eval_target(target_key)
+            try:
+                return await eval_store.list_authored_suites(
+                    EvalAuthoredSuiteCatalogQuery(
+                        target_key=eval_target.key,
+                        suite_id=suite_id,
+                        cursor=cursor,
+                        limit=limit,
+                        max_result_bytes=max_result_bytes,
+                    )
+                )
+            except EvalStoreResultTooLarge as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Authored eval suite catalog exceeds the requested byte limit.",
+                ) from exc
+            except (TypeError, ValueError):
+                _eval_query_error()
+
+        @bounded_evals_router.get(
+            "/evals/suites/{suite_revision}",
+            response_model=EvalSuiteDocumentV1,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def get_eval_authored_suite(suite_revision: str):
+            suite = await _load_authored_suite(suite_revision)
+            return await _model_json_response(suite, EvalSuiteDocumentV1)
+
+        @bounded_evals_router.get(
+            "/evals/suites/{suite_revision}/download",
+            response_class=Response,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def download_eval_authored_suite(suite_revision: str) -> Response:
+            suite = await _load_authored_suite(suite_revision)
+            suite_json = await asyncio.to_thread(
+                _render_utf8,
+                eval_suite_document_to_json,
+                suite,
+            )
+            return Response(
+                content=suite_json,
+                media_type="application/json",
+                headers={
+                    "Content-Disposition": (
+                        f'attachment; filename="{suite.target_key}-'
+                        f'{suite.revision[7:19]}.eval-suite.json"'
+                    )
+                },
             )
 
         @bounded_evals_router.post(

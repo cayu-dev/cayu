@@ -32,6 +32,10 @@ from cayu.evals.scenario import (
 )
 from cayu.evals.store import (
     TERMINAL_EVAL_RUN_STATUSES,
+    EvalAuthoredSuiteCatalogEntry,
+    EvalAuthoredSuiteCatalogPage,
+    EvalAuthoredSuiteCatalogQuery,
+    EvalAuthoredSuiteConflict,
     EvalBaselineConflict,
     EvalBaselineKey,
     EvalBaselineMutationRecord,
@@ -76,6 +80,7 @@ from cayu.evals.store import (
     EvalSuiteCatalogEntry,
     EvalSuiteCatalogPage,
     EvalSuiteCatalogQuery,
+    _bounded_authored_suite_page,
     _bounded_case_page,
     _bounded_corpus_page,
     _bounded_result_page,
@@ -86,6 +91,7 @@ from cayu.evals.store import (
     _copy_query,
     _exact_model,
     _lease_seconds,
+    _prepare_authored_suite_for_store,
     _prepare_baseline_update_for_store,
     _prepare_captured_result_for_store,
     _prepare_corpus_catalog_for_store,
@@ -96,6 +102,9 @@ from cayu.evals.store import (
     _scenario_progress_for_claim,
     _store_identifier,
     _validate_baseline_result,
+    authored_suite_catalog_entry,
+    authored_suite_scenario_cases,
+    decode_authored_suite_cursor,
     decode_case_cursor,
     decode_corpus_cursor,
     decode_result_cursor,
@@ -105,13 +114,19 @@ from cayu.evals.store import (
     eval_result_record,
     eval_run_invocation_from_json,
     result_summary,
+    validate_authored_suite_scenario,
     validate_result_for_run,
+)
+from cayu.evals.suite_authoring import (
+    EVAL_SUITE_AUTHORING_MAX_BYTES,
+    EvalSuiteDocumentV1,
+    eval_suite_document_from_json,
 )
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage.sqlite import _run_off_thread_with_connection_ownership
 
-_SQLITE_EVAL_MIN_REQUIRED_REVISION = 56
+_SQLITE_EVAL_MIN_REQUIRED_REVISION = 64
 
 _RUN_COLUMNS = """
     run_id,
@@ -281,6 +296,7 @@ class SQLiteEvalStore(EvalStore):
     captured_results: ClassVar[bool] = True
     scenarios: ClassVar[bool] = True
     scenario_execution: ClassVar[bool] = True
+    suite_authoring: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -572,6 +588,181 @@ class SQLiteEvalStore(EvalStore):
             ).fetchall()
             return _bounded_scenario_page(
                 [self._scenario_entry_from_row(row) for row in rows],
+                query,
+            )
+
+        return await self._run(operation)
+
+    async def save_authored_suite(
+        self,
+        document: EvalSuiteDocumentV1,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalAuthoredSuiteCatalogEntry:
+        validated, payload = await asyncio.to_thread(
+            _prepare_authored_suite_for_store,
+            document,
+            redact_json=redact_json,
+        )
+        document_text = payload.decode("utf-8")
+
+        def operation(connection: sqlite3.Connection) -> EvalAuthoredSuiteCatalogEntry:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                scenario_cases = authored_suite_scenario_cases(validated)
+                scenario_revisions = tuple(
+                    sorted({reference.scenario_revision for _, reference in scenario_cases})
+                )
+                scenario_by_revision: dict[str, EvalScenarioDocumentV2] = {}
+                for start in range(0, len(scenario_revisions), 500):
+                    chunk = scenario_revisions[start : start + 500]
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = connection.execute(
+                        "SELECT revision, document_json FROM cayu_eval_scenarios "
+                        f"WHERE revision IN ({placeholders})",
+                        chunk,
+                    ).fetchall()
+                    scenario_by_revision.update(
+                        {
+                            row["revision"]: eval_scenario_from_json(row["document_json"])
+                            for row in rows
+                        }
+                    )
+                for case, reference in scenario_cases:
+                    validate_authored_suite_scenario(
+                        validated,
+                        case,
+                        scenario_by_revision.get(reference.scenario_revision),
+                    )
+                existing = connection.execute(
+                    "SELECT document_json FROM cayu_eval_authored_suites WHERE revision = ?",
+                    (validated.revision,),
+                ).fetchone()
+                if existing is not None:
+                    if existing["document_json"] != document_text:
+                        raise EvalAuthoredSuiteConflict(
+                            f"Authored eval suite revision {validated.revision} has "
+                            "conflicting content."
+                        )
+                    entry = self._load_authored_suite_entry(
+                        connection,
+                        validated.revision,
+                    )
+                    assert entry is not None
+                    connection.commit()
+                    return entry
+                entry = authored_suite_catalog_entry(
+                    validated,
+                    created_at=datetime.now(UTC),
+                    document_bytes=len(payload),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO cayu_eval_authored_suites (
+                        revision, suite_id, suite_revision, target_key, name,
+                        description, case_count, assertion_count,
+                        simple_input_count, scenario_count, trials,
+                        timeout_seconds, document_json, document_bytes, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        entry.revision,
+                        entry.id,
+                        entry.suite_revision,
+                        entry.target_key,
+                        entry.name,
+                        entry.description,
+                        entry.case_count,
+                        entry.assertion_count,
+                        entry.simple_input_count,
+                        entry.scenario_count,
+                        entry.trials,
+                        entry.timeout_seconds,
+                        document_text,
+                        entry.document_bytes,
+                        _format_datetime(entry.created_at),
+                    ),
+                )
+                connection.commit()
+                return entry
+            except BaseException:
+                connection.rollback()
+                raise
+
+        return await self._run(operation)
+
+    async def load_authored_suite(
+        self,
+        revision: str,
+        *,
+        max_bytes: int = EVAL_SUITE_AUTHORING_MAX_BYTES,
+    ) -> EvalSuiteDocumentV1 | None:
+        revision = _sha256_revision(revision, "revision")
+        max_bytes = _read_limit(max_bytes, hard_max=EVAL_SUITE_AUTHORING_MAX_BYTES)
+
+        def operation(connection: sqlite3.Connection) -> str | None:
+            row = connection.execute(
+                """
+                SELECT document_json, document_bytes
+                FROM cayu_eval_authored_suites
+                WHERE revision = ?
+                """,
+                (revision,),
+            ).fetchone()
+            if row is None:
+                return None
+            if row["document_bytes"] > max_bytes:
+                raise EvalStoreResultTooLarge(max_bytes)
+            return row["document_json"]
+
+        payload = await self._run(operation)
+        if payload is None:
+            return None
+        return await asyncio.to_thread(eval_suite_document_from_json, payload)
+
+    async def list_authored_suites(
+        self,
+        query: EvalAuthoredSuiteCatalogQuery | None = None,
+    ) -> EvalAuthoredSuiteCatalogPage:
+        query = _copy_query(query, EvalAuthoredSuiteCatalogQuery)
+        boundary = (
+            decode_authored_suite_cursor(
+                query.cursor,
+                query.target_key,
+                query.suite_id,
+            )
+            if query.cursor is not None
+            else None
+        )
+
+        def operation(connection: sqlite3.Connection) -> EvalAuthoredSuiteCatalogPage:
+            clauses: list[str] = []
+            params: list[object] = []
+            if query.target_key is not None:
+                clauses.append("target_key = ?")
+                params.append(query.target_key)
+            if query.suite_id is not None:
+                clauses.append("suite_id = ?")
+                params.append(query.suite_id)
+            if boundary is not None:
+                clauses.append("(created_at < ? OR (created_at = ? AND revision > ?))")
+                timestamp = _format_datetime(boundary[0])
+                params.extend((timestamp, timestamp, boundary[1]))
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            rows = connection.execute(
+                f"""
+                SELECT revision, suite_id, suite_revision, target_key, name,
+                       description, case_count, assertion_count, simple_input_count,
+                       scenario_count, trials, timeout_seconds, document_bytes, created_at
+                FROM cayu_eval_authored_suites
+                {where}
+                ORDER BY created_at DESC, revision ASC
+                LIMIT ?
+                """,
+                (*params, query.limit + 1),
+            ).fetchall()
+            return _bounded_authored_suite_page(
+                [self._authored_suite_entry_from_row(row) for row in rows],
                 query,
             )
 
@@ -2070,6 +2261,45 @@ class SQLiteEvalStore(EvalStore):
             part_count=row["part_count"],
             artifact_requirement_count=row["artifact_requirement_count"],
             secret_requirement_count=row["secret_requirement_count"],
+            document_bytes=row["document_bytes"],
+            created_at=sqlite_support.parse_datetime(row["created_at"]),
+        )
+
+    @classmethod
+    def _load_authored_suite_entry(
+        cls,
+        connection: sqlite3.Connection,
+        revision: str,
+    ) -> EvalAuthoredSuiteCatalogEntry | None:
+        row = connection.execute(
+            """
+            SELECT revision, suite_id, suite_revision, target_key, name,
+                   description, case_count, assertion_count, simple_input_count,
+                   scenario_count, trials, timeout_seconds, document_bytes, created_at
+            FROM cayu_eval_authored_suites
+            WHERE revision = ?
+            """,
+            (revision,),
+        ).fetchone()
+        return None if row is None else cls._authored_suite_entry_from_row(row)
+
+    @staticmethod
+    def _authored_suite_entry_from_row(
+        row: sqlite3.Row,
+    ) -> EvalAuthoredSuiteCatalogEntry:
+        return EvalAuthoredSuiteCatalogEntry(
+            revision=row["revision"],
+            id=row["suite_id"],
+            suite_revision=row["suite_revision"],
+            target_key=row["target_key"],
+            name=row["name"],
+            description=row["description"],
+            case_count=row["case_count"],
+            assertion_count=row["assertion_count"],
+            simple_input_count=row["simple_input_count"],
+            scenario_count=row["scenario_count"],
+            trials=row["trials"],
+            timeout_seconds=row["timeout_seconds"],
             document_bytes=row["document_bytes"],
             created_at=sqlite_support.parse_datetime(row["created_at"]),
         )

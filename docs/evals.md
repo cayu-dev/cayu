@@ -136,6 +136,39 @@ compared with each other through the same compatibility projection and stable
 exit contract. These commands operate only on the supplied paths and do not
 perform project discovery.
 
+## Author-first suite contracts
+
+`EvalSuiteDraftV1` is the bounded, authority-free SDK contract used to create a
+reusable evaluation without a prior production session. A draft contains one
+stable suite ID, a published target key, ordinary `TrialRequestSpec` settings,
+and one or more `EvalCaseDraftV1` values. Each case selects exactly one
+stimulus:
+
+- `EvalSimpleInputStimulusV1` carries the existing portable `RunInputSpec`;
+- `EvalScenarioStimulusV1` links an exact, separately persisted scenario ID and
+  content revision.
+
+`compile_eval_suite_draft(...)` sorts cases by stable ID and computes immutable
+case, suite-spec, and complete suite-document revisions. Captured source
+identity is optional for authored cases; Cayu does not fabricate production
+provenance for a fresh input. `add_eval_case(...)`, `duplicate_eval_case(...)`,
+and `revise_eval_case(...)` return new immutable suite revisions. Case revision
+checks reject stale edits without changing prior results.
+
+`eval_suite_selection(document)` freezes the full suite. Passing explicit case
+IDs freezes a non-empty subset instead. Both forms bind the suite document,
+suite settings, and every selected case revision, so later edits cannot silently
+change admitted work.
+
+Protected servers with durable Evals expose preview/save/catalog/download at
+`/api/evals/suites`. Preview canonicalizes a draft without persistence or
+execution and reports target or scenario-reference readiness. Save accepts only
+the exact reviewed revision, scans it through the target's credential-redaction
+boundary, and atomically verifies every scenario reference. SQLite and
+PostgreSQL persistence requires storage revision 64. These authoring contracts
+do not create provider, tool, environment, fixture, secret, or runtime
+authority, and they do not change the existing one-trial execution default.
+
 ## Portable corpus documents
 
 `EvalCorpusDocument` is Cayu's bounded, JSON-portable definition format for

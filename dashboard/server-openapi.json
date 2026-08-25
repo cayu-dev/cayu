@@ -7240,6 +7240,140 @@
         "title": "EnvironmentsResponse",
         "type": "object"
       },
+      "EvalAuthoredSuiteCatalogEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "assertion_count": {
+            "maximum": 64000.0,
+            "minimum": 1.0,
+            "title": "Assertion Count",
+            "type": "integer"
+          },
+          "case_count": {
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Case Count",
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "document_bytes": {
+            "maximum": 8388608.0,
+            "minimum": 1.0,
+            "title": "Document Bytes",
+            "type": "integer"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "scenario_count": {
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Scenario Count",
+            "type": "integer"
+          },
+          "simple_input_count": {
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Simple Input Count",
+            "type": "integer"
+          },
+          "suite_revision": {
+            "title": "Suite Revision",
+            "type": "string"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "maximum": 3600.0,
+            "minimum": 1.0,
+            "title": "Timeout Seconds",
+            "type": "integer"
+          },
+          "trials": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Trials",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "id",
+          "suite_revision",
+          "target_key",
+          "name",
+          "case_count",
+          "assertion_count",
+          "simple_input_count",
+          "scenario_count",
+          "trials",
+          "timeout_seconds",
+          "document_bytes",
+          "created_at"
+        ],
+        "title": "EvalAuthoredSuiteCatalogEntry",
+        "type": "object"
+      },
+      "EvalAuthoredSuiteCatalogPage": {
+        "additionalProperties": false,
+        "properties": {
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/EvalAuthoredSuiteCatalogEntry"
+            },
+            "maxItems": 200,
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "EvalAuthoredSuiteCatalogPage",
+        "type": "object"
+      },
       "EvalBaselineKey": {
         "additionalProperties": false,
         "description": "Stable scope of one explicit baseline pointer.",
@@ -7502,6 +7636,259 @@
           "items"
         ],
         "title": "EvalCaseCatalogPage",
+        "type": "object"
+      },
+      "EvalCaseDefinitionV1": {
+        "additionalProperties": false,
+        "description": "One immutable authored case revision with truthful optional provenance.",
+        "properties": {
+          "assertions": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "child_status": "#/components/schemas/ChildStatusAssertionSpec",
+                  "final_output_contains": "#/components/schemas/FinalOutputContainsAssertionSpec",
+                  "final_output_equals": "#/components/schemas/FinalOutputEqualsAssertionSpec",
+                  "max_estimated_cost": "#/components/schemas/MaxEstimatedCostAssertionSpec",
+                  "max_model_steps": "#/components/schemas/MaxModelStepsAssertionSpec",
+                  "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
+                  "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
+                  "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
+                  "root_status": "#/components/schemas/RootStatusAssertionSpec",
+                  "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
+                  "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
+                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/RootStatusAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ChildStatusAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/FinalOutputEqualsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/FinalOutputContainsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolCalledAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxModelStepsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/UsageRecordedAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxTotalTokensAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxEstimatedCostAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ModelJudgeAssertionSpec"
+                }
+              ]
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "title": "Assertions",
+            "type": "array"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvaluationSourceIdentityV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "stimulus": {
+            "discriminator": {
+              "mapping": {
+                "scenario": "#/components/schemas/EvalScenarioStimulusV1",
+                "simple_input": "#/components/schemas/EvalSimpleInputStimulusV1"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/EvalSimpleInputStimulusV1"
+              },
+              {
+                "$ref": "#/components/schemas/EvalScenarioStimulusV1"
+              }
+            ],
+            "title": "Stimulus"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "stimulus",
+          "assertions",
+          "revision"
+        ],
+        "title": "EvalCaseDefinitionV1",
+        "type": "object"
+      },
+      "EvalCaseDraftV1": {
+        "additionalProperties": false,
+        "description": "Bounded, revision-free case material accepted by authoring previews.",
+        "properties": {
+          "assertions": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "child_status": "#/components/schemas/ChildStatusAssertionSpec",
+                  "final_output_contains": "#/components/schemas/FinalOutputContainsAssertionSpec",
+                  "final_output_equals": "#/components/schemas/FinalOutputEqualsAssertionSpec",
+                  "max_estimated_cost": "#/components/schemas/MaxEstimatedCostAssertionSpec",
+                  "max_model_steps": "#/components/schemas/MaxModelStepsAssertionSpec",
+                  "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
+                  "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
+                  "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
+                  "root_status": "#/components/schemas/RootStatusAssertionSpec",
+                  "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
+                  "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
+                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/RootStatusAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ChildStatusAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/FinalOutputEqualsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/FinalOutputContainsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolCalledAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxModelStepsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/UsageRecordedAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxTotalTokensAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxEstimatedCostAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ModelJudgeAssertionSpec"
+                }
+              ]
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "title": "Assertions",
+            "type": "array"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvaluationSourceIdentityV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "stimulus": {
+            "discriminator": {
+              "mapping": {
+                "scenario": "#/components/schemas/EvalScenarioStimulusV1",
+                "simple_input": "#/components/schemas/EvalSimpleInputStimulusV1"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/EvalSimpleInputStimulusV1"
+              },
+              {
+                "$ref": "#/components/schemas/EvalScenarioStimulusV1"
+              }
+            ],
+            "title": "Stimulus"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "stimulus",
+          "assertions"
+        ],
+        "title": "EvalCaseDraftV1",
         "type": "object"
       },
       "EvalCaseSpec": {
@@ -9159,6 +9546,32 @@
         "title": "EvalScenarioSaveResponse",
         "type": "object"
       },
+      "EvalScenarioStimulusV1": {
+        "additionalProperties": false,
+        "description": "A content-addressed reference to one separately persisted scenario.",
+        "properties": {
+          "kind": {
+            "const": "scenario",
+            "default": "scenario",
+            "title": "Kind",
+            "type": "string"
+          },
+          "scenario_id": {
+            "title": "Scenario Id",
+            "type": "string"
+          },
+          "scenario_revision": {
+            "title": "Scenario Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scenario_id",
+          "scenario_revision"
+        ],
+        "title": "EvalScenarioStimulusV1",
+        "type": "object"
+      },
       "EvalScenarioTrialFailureCode": {
         "enum": [
           "execution_failed",
@@ -9287,6 +9700,83 @@
         "title": "EvalScenarioTrialProgress",
         "type": "object"
       },
+      "EvalSelectedCaseV1": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "revision"
+        ],
+        "title": "EvalSelectedCaseV1",
+        "type": "object"
+      },
+      "EvalSimpleInputStimulusV1": {
+        "additionalProperties": false,
+        "description": "One ordinary fresh invocation authored without captured provenance.",
+        "properties": {
+          "input": {
+            "$ref": "#/components/schemas/RunInputSpec"
+          },
+          "kind": {
+            "const": "simple_input",
+            "default": "simple_input",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "input"
+        ],
+        "title": "EvalSimpleInputStimulusV1",
+        "type": "object"
+      },
+      "EvalSuiteAuthoringDiagnostic": {
+        "additionalProperties": false,
+        "properties": {
+          "case_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Case Id"
+          },
+          "code": {
+            "enum": [
+              "target_unavailable",
+              "scenario_store_unavailable",
+              "scenario_unavailable",
+              "scenario_id_mismatch",
+              "scenario_target_mismatch",
+              "scenario_source_mismatch"
+            ],
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "EvalSuiteAuthoringDiagnostic",
+        "type": "object"
+      },
       "EvalSuiteCatalogEntry": {
         "additionalProperties": false,
         "properties": {
@@ -9387,6 +9877,237 @@
           "items"
         ],
         "title": "EvalSuiteCatalogPage",
+        "type": "object"
+      },
+      "EvalSuiteDocumentV1": {
+        "additionalProperties": false,
+        "description": "One immutable, authority-free authored suite and its exact case revisions.",
+        "properties": {
+          "cases": {
+            "items": {
+              "$ref": "#/components/schemas/EvalCaseDefinitionV1"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Cases",
+            "type": "array"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "suite": {
+            "$ref": "#/components/schemas/EvalSuiteSpec"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision",
+          "target_key",
+          "suite",
+          "cases"
+        ],
+        "title": "EvalSuiteDocumentV1",
+        "type": "object"
+      },
+      "EvalSuiteDraftV1": {
+        "additionalProperties": false,
+        "description": "Revision-free suite material edited by an SDK or Control Plane client.",
+        "properties": {
+          "cases": {
+            "items": {
+              "$ref": "#/components/schemas/EvalCaseDraftV1"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Cases",
+            "type": "array"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          },
+          "trial_request": {
+            "$ref": "#/components/schemas/TrialRequestSpec"
+          }
+        },
+        "required": [
+          "id",
+          "target_key",
+          "name",
+          "cases"
+        ],
+        "title": "EvalSuiteDraftV1",
+        "type": "object"
+      },
+      "EvalSuitePreviewRequest": {
+        "additionalProperties": false,
+        "description": "Authority-free editor material; preview never persists or executes it.",
+        "properties": {
+          "draft": {
+            "$ref": "#/components/schemas/EvalSuiteDraftV1"
+          }
+        },
+        "required": [
+          "draft"
+        ],
+        "title": "EvalSuitePreviewRequest",
+        "type": "object"
+      },
+      "EvalSuitePreviewResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "diagnostics": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalSuiteAuthoringDiagnostic"
+            },
+            "title": "Diagnostics",
+            "type": "array"
+          },
+          "full_selection": {
+            "$ref": "#/components/schemas/EvalSuiteSelectionV1"
+          },
+          "ready": {
+            "title": "Ready",
+            "type": "boolean"
+          },
+          "suite": {
+            "$ref": "#/components/schemas/EvalSuiteDocumentV1"
+          }
+        },
+        "required": [
+          "suite",
+          "full_selection",
+          "ready"
+        ],
+        "title": "EvalSuitePreviewResponse",
+        "type": "object"
+      },
+      "EvalSuiteSaveRequest": {
+        "additionalProperties": false,
+        "description": "One reviewed canonical suite revision guarded by optimistic identity.",
+        "properties": {
+          "expected_suite_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Expected Suite Revision",
+            "type": "string"
+          },
+          "suite": {
+            "$ref": "#/components/schemas/EvalSuiteDocumentV1"
+          }
+        },
+        "required": [
+          "expected_suite_revision",
+          "suite"
+        ],
+        "title": "EvalSuiteSaveRequest",
+        "type": "object"
+      },
+      "EvalSuiteSaveResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "entry": {
+            "$ref": "#/components/schemas/EvalAuthoredSuiteCatalogEntry"
+          },
+          "full_selection": {
+            "$ref": "#/components/schemas/EvalSuiteSelectionV1"
+          },
+          "suite": {
+            "$ref": "#/components/schemas/EvalSuiteDocumentV1"
+          }
+        },
+        "required": [
+          "entry",
+          "suite",
+          "full_selection"
+        ],
+        "title": "EvalSuiteSaveResponse",
+        "type": "object"
+      },
+      "EvalSuiteSelectionV1": {
+        "additionalProperties": false,
+        "description": "Content identity for a full-suite or explicit-subset launch request.",
+        "properties": {
+          "cases": {
+            "items": {
+              "$ref": "#/components/schemas/EvalSelectedCaseV1"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Cases",
+            "type": "array"
+          },
+          "mode": {
+            "enum": [
+              "full_suite",
+              "subset"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "suite_document_revision": {
+            "title": "Suite Document Revision",
+            "type": "string"
+          },
+          "suite_id": {
+            "title": "Suite Id",
+            "type": "string"
+          },
+          "suite_revision": {
+            "title": "Suite Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision",
+          "suite_document_revision",
+          "suite_id",
+          "suite_revision",
+          "mode",
+          "cases"
+        ],
+        "title": "EvalSuiteSelectionV1",
         "type": "object"
       },
       "EvalSuiteSpec": {
@@ -14785,7 +15506,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "26",
+            "default": "27",
             "title": "Contract Version",
             "type": "string"
           },
@@ -18663,7 +19384,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "26",
+            "default": "27",
             "title": "Contract Version",
             "type": "string"
           }
@@ -21707,6 +22428,281 @@
           }
         },
         "summary": "Save Captured Evaluation"
+      }
+    },
+    "/api/evals/suites": {
+      "get": {
+        "operationId": "list_eval_authored_suites_api_evals_suites_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "target_key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Target Key"
+            }
+          },
+          {
+            "in": "query",
+            "name": "suite_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Suite Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_result_bytes",
+            "required": false,
+            "schema": {
+              "default": 1048576,
+              "maximum": 8388608,
+              "minimum": 1024,
+              "title": "Max Result Bytes",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalAuthoredSuiteCatalogPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "List Eval Authored Suites"
+      },
+      "post": {
+        "operationId": "save_eval_suite_api_evals_suites_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalSuiteSaveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalSuiteSaveResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Save Eval Suite"
+      }
+    },
+    "/api/evals/suites/preview": {
+      "post": {
+        "operationId": "preview_eval_suite_api_evals_suites_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalSuitePreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalSuitePreviewResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Preview Eval Suite"
+      }
+    },
+    "/api/evals/suites/{suite_revision}": {
+      "get": {
+        "operationId": "get_eval_authored_suite_api_evals_suites__suite_revision__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "suite_revision",
+            "required": true,
+            "schema": {
+              "title": "Suite Revision",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalSuiteDocumentV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Get Eval Authored Suite"
+      }
+    },
+    "/api/evals/suites/{suite_revision}/download": {
+      "get": {
+        "operationId": "download_eval_authored_suite_api_evals_suites__suite_revision__download_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "suite_revision",
+            "required": true,
+            "schema": {
+              "title": "Suite Revision",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Download Eval Authored Suite"
       }
     },
     "/api/evals/targets": {

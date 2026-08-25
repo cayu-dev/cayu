@@ -355,6 +355,18 @@ def test_revision_sixty_three_breaks_for_reviewed_knowledge_maintenance() -> Non
         )
 
 
+def test_revision_sixty_four_adds_authored_eval_suites_without_new_compatibility_break() -> None:
+    revision = m.revision(64)
+
+    assert revision.kind is m.RevisionKind.ADDITIVE
+    assert revision.compatible_from == 63
+    m.validate(
+        m.SchemaState(revision=64, compatible_from=63),
+        app_latest=64,
+        app_min_supported=63,
+    )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

@@ -13,6 +13,7 @@ from cayu.evals.corpus import (
     CorpusUserMessageSpec,
     EvalCaseSpec,
     EvalCorpusDocument,
+    EvaluationSourceIdentityV1,
     RunInputSpec,
     _content_revision,
 )
@@ -36,6 +37,8 @@ from cayu.evals.scenario import (
     ScenarioUserMessageV2,
 )
 from cayu.evals.store import (
+    EvalAuthoredSuiteCatalogQuery,
+    EvalAuthoredSuiteReferenceError,
     EvalBaselineConflict,
     EvalBaselineKey,
     EvalBaselineMutationRecord,
@@ -61,6 +64,14 @@ from cayu.evals.store import (
     EvalStorePublicationRejected,
     EvalStoreResultTooLarge,
     EvalSuiteCatalogQuery,
+)
+from cayu.evals.suite_authoring import (
+    EvalCaseDraftV1,
+    EvalScenarioStimulusV1,
+    EvalSimpleInputStimulusV1,
+    EvalSuiteDocumentV1,
+    EvalSuiteDraftV1,
+    compile_eval_suite_draft,
 )
 from cayu.runtime.invocation import (
     InvocationOrigin,
@@ -530,6 +541,7 @@ async def assert_eval_store_conformance(
     """Pin backend-neutral catalog, lifecycle, fencing, and result semantics."""
 
     assert store.scenarios is True
+    assert store.suite_authoring is True
     first_scenario = _scenario(corpus, text="Buy the standard plan.")
     first_scenario_entry = await store.save_scenario(
         first_scenario,
@@ -607,6 +619,237 @@ async def assert_eval_store_conformance(
                 limit=1,
                 cursor=first_page.next_cursor,
             )
+        )
+
+    corpus_case = corpus.cases[0]
+    assert corpus_case.input is not None
+    authored_simple_case = EvalCaseDraftV1(
+        id="authored-simple",
+        name="Authored simple case",
+        source=None,
+        stimulus=EvalSimpleInputStimulusV1(input=corpus_case.input),
+        assertions=corpus_case.assertions,
+    )
+    authored_scenario_case = EvalCaseDraftV1(
+        id="authored-scenario",
+        name="Authored scenario case",
+        source=None,
+        stimulus=EvalScenarioStimulusV1(
+            scenario_id=first_scenario.id,
+            scenario_revision=first_scenario.revision,
+        ),
+        assertions=corpus_case.assertions,
+    )
+    authored_suite = compile_eval_suite_draft(
+        EvalSuiteDraftV1(
+            id="authored-regressions",
+            target_key=corpus.target_key,
+            name="Authored regressions",
+            cases=(authored_simple_case, authored_scenario_case),
+        )
+    )
+    authored_entry = await store.save_authored_suite(
+        authored_suite,
+        redact_json=_NO_SECRETS.redact_json,
+    )
+    assert (
+        await store.save_authored_suite(
+            authored_suite,
+            redact_json=_NO_SECRETS.redact_json,
+        )
+        == authored_entry
+    )
+    authored_bytes = len(
+        json.dumps(
+            authored_suite.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    assert authored_entry.document_bytes == authored_bytes
+    assert authored_entry.simple_input_count == 1
+    assert authored_entry.scenario_count == 1
+    assert (
+        await store.load_authored_suite(
+            authored_suite.revision,
+            max_bytes=authored_bytes,
+        )
+        == authored_suite
+    )
+    with pytest.raises(EvalStoreResultTooLarge):
+        await store.load_authored_suite(
+            authored_suite.revision,
+            max_bytes=authored_bytes - 1,
+        )
+    authored_page = await store.list_authored_suites(
+        EvalAuthoredSuiteCatalogQuery(
+            target_key=corpus.target_key,
+            suite_id=authored_suite.suite.id,
+        )
+    )
+    assert authored_page.items == (authored_entry,)
+
+    revised_authored_suite = compile_eval_suite_draft(
+        EvalSuiteDraftV1(
+            id=authored_suite.suite.id,
+            target_key=corpus.target_key,
+            name="Authored regressions revised",
+            cases=(authored_simple_case, authored_scenario_case),
+        )
+    )
+    revised_authored_entry = await store.save_authored_suite(
+        revised_authored_suite,
+        redact_json=_NO_SECRETS.redact_json,
+    )
+    first_authored_page = await store.list_authored_suites(
+        EvalAuthoredSuiteCatalogQuery(
+            target_key=corpus.target_key,
+            suite_id=authored_suite.suite.id,
+            limit=1,
+        )
+    )
+    assert len(first_authored_page.items) == 1
+    assert first_authored_page.has_more is True
+    assert first_authored_page.next_cursor is not None
+    second_authored_page = await store.list_authored_suites(
+        EvalAuthoredSuiteCatalogQuery(
+            target_key=corpus.target_key,
+            suite_id=authored_suite.suite.id,
+            limit=1,
+            cursor=first_authored_page.next_cursor,
+        )
+    )
+    assert second_authored_page.has_more is False
+    assert {
+        first_authored_page.items[0].revision,
+        second_authored_page.items[0].revision,
+    } == {authored_entry.revision, revised_authored_entry.revision}
+    with pytest.raises(ValueError, match="cursor does not match"):
+        await store.list_authored_suites(
+            EvalAuthoredSuiteCatalogQuery(
+                target_key="another-target",
+                limit=1,
+                cursor=first_authored_page.next_cursor,
+            )
+        )
+
+    unsafe_authored_suite = compile_eval_suite_draft(
+        EvalSuiteDraftV1(
+            id="unsafe-authored-suite",
+            target_key=corpus.target_key,
+            name="Unsafe authored suite",
+            cases=(
+                authored_simple_case.model_copy(
+                    update={
+                        "stimulus": EvalSimpleInputStimulusV1(
+                            input=RunInputSpec(messages=(CorpusUserMessageSpec(text=secret),))
+                        )
+                    }
+                ),
+            ),
+        )
+    )
+    with pytest.raises(EvalStorePublicationRejected, match="configured workload secret"):
+        await store.save_authored_suite(
+            unsafe_authored_suite,
+            redact_json=SecretRedactor(secret).redact_json,
+        )
+    assert await store.load_authored_suite(unsafe_authored_suite.revision) is None
+    with pytest.raises(EvalStorePublicationRejected, match="could not cross"):
+        await store.save_authored_suite(
+            authored_suite,
+            redact_json=_broken_redaction_boundary,
+        )
+
+    dangling = compile_eval_suite_draft(
+        EvalSuiteDraftV1(
+            id="dangling-scenario",
+            target_key=corpus.target_key,
+            name="Dangling scenario",
+            cases=(
+                authored_scenario_case.model_copy(
+                    update={
+                        "stimulus": EvalScenarioStimulusV1(
+                            scenario_id=first_scenario.id,
+                            scenario_revision="sha256:" + "f" * 64,
+                        )
+                    }
+                ),
+            ),
+        )
+    )
+    with pytest.raises(EvalAuthoredSuiteReferenceError, match="unavailable"):
+        await store.save_authored_suite(
+            dangling,
+            redact_json=_NO_SECRETS.redact_json,
+        )
+    assert await store.load_authored_suite(dangling.revision) is None
+
+    def suite_for_scenario_reference(
+        *,
+        suite_id: str,
+        reference: EvalScenarioStimulusV1,
+        source: EvaluationSourceIdentityV1 | None = None,
+    ) -> EvalSuiteDocumentV1:
+        return compile_eval_suite_draft(
+            EvalSuiteDraftV1(
+                id=suite_id,
+                target_key=corpus.target_key,
+                name="Invalid scenario reference",
+                cases=(
+                    authored_scenario_case.model_copy(
+                        update={"source": source, "stimulus": reference}
+                    ),
+                ),
+            )
+        )
+
+    wrong_id = suite_for_scenario_reference(
+        suite_id="wrong-scenario-id",
+        reference=EvalScenarioStimulusV1(
+            scenario_id="different-scenario",
+            scenario_revision=first_scenario.revision,
+        ),
+    )
+    with pytest.raises(EvalAuthoredSuiteReferenceError, match="ID does not match"):
+        await store.save_authored_suite(
+            wrong_id,
+            redact_json=_NO_SECRETS.redact_json,
+        )
+
+    wrong_source = suite_for_scenario_reference(
+        suite_id="wrong-scenario-source",
+        reference=authored_scenario_case.stimulus,
+        source=corpus_case.source,
+    )
+    with pytest.raises(EvalAuthoredSuiteReferenceError, match="source does not match"):
+        await store.save_authored_suite(
+            wrong_source,
+            redact_json=_NO_SECRETS.redact_json,
+        )
+
+    other_target_scenario = EvalScenarioDocumentV2.create(
+        id=first_scenario.id,
+        target_key="another-target",
+        name=first_scenario.name,
+        events=first_scenario.events,
+    )
+    await store.save_scenario(
+        other_target_scenario,
+        redact_json=_NO_SECRETS.redact_json,
+    )
+    wrong_target = suite_for_scenario_reference(
+        suite_id="wrong-scenario-target",
+        reference=EvalScenarioStimulusV1(
+            scenario_id=other_target_scenario.id,
+            scenario_revision=other_target_scenario.revision,
+        ),
+    )
+    with pytest.raises(EvalAuthoredSuiteReferenceError, match="target does not match"):
+        await store.save_authored_suite(
+            wrong_target,
+            redact_json=_NO_SECRETS.redact_json,
         )
 
     saved = await store.save_corpus(

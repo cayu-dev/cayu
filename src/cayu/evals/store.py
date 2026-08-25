@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Literal, cast
 from uuid import uuid4
 
 from pydantic import (
@@ -70,6 +70,13 @@ from cayu.evals.scenario import (
     EvalScenarioInspectionV2,
     eval_scenario_from_json,
     inspect_eval_scenario,
+)
+from cayu.evals.suite_authoring import (
+    EVAL_SUITE_AUTHORING_MAX_BYTES,
+    EvalCaseDefinitionV1,
+    EvalScenarioStimulusV1,
+    EvalSuiteDocumentV1,
+    eval_suite_document_from_json,
 )
 from cayu.runtime.invocation import (
     InvocationOrigin,
@@ -163,6 +170,14 @@ class EvalScenarioConflict(ValueError):
     """One immutable scenario revision resolves to contradictory stored content."""
 
 
+class EvalAuthoredSuiteConflict(ValueError):
+    """One immutable authored-suite revision resolves to contradictory content."""
+
+
+class EvalAuthoredSuiteReferenceError(ValueError):
+    """An authored suite references an unavailable or incompatible scenario."""
+
+
 class EvalStorePublicationRejected(ValueError):
     """Public eval data could not cross the active credential-redaction boundary."""
 
@@ -254,6 +269,31 @@ def _prepare_scenario_for_store(
     ).encode("utf-8")
     if len(wire_document) > EVAL_SCENARIO_MAX_BYTES:
         raise EvalStoreResultTooLarge(EVAL_SCENARIO_MAX_BYTES)
+    return validated, wire_document
+
+
+def _prepare_authored_suite_for_store(
+    document: EvalSuiteDocumentV1,
+    *,
+    redact_json: Callable[[Any], Any],
+) -> tuple[EvalSuiteDocumentV1, bytes]:
+    """Validate and serialize one authored suite after credential scanning."""
+
+    validated = _exact_model(document, EvalSuiteDocumentV1, "document")
+    payload = validated.model_dump(mode="json")
+    _require_publication_safe(
+        payload,
+        redact_json=redact_json,
+        resource_name="Authored eval suite",
+    )
+    wire_document = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(wire_document) > EVAL_SUITE_AUTHORING_MAX_BYTES:
+        raise EvalStoreResultTooLarge(EVAL_SUITE_AUTHORING_MAX_BYTES)
     return validated, wire_document
 
 
@@ -386,6 +426,36 @@ class EvalScenarioCatalogQuery(_EvalStoreModel):
     )
 
     @field_validator("target_key", "scenario_id")
+    @classmethod
+    def validate_ids(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _portable_id(value, info.field_name)
+
+    @field_validator("cursor")
+    @classmethod
+    def validate_cursor(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_cursor(value, info.field_name)
+
+
+class EvalAuthoredSuiteCatalogQuery(_EvalStoreModel):
+    target_key: StrictStr | None = None
+    suite_id: StrictStr | None = None
+    cursor: StrictStr | None = None
+    limit: StrictInt = Field(
+        default=EVAL_STORE_DEFAULT_PAGE_SIZE,
+        ge=1,
+        le=EVAL_STORE_MAX_PAGE_SIZE,
+    )
+    max_result_bytes: StrictInt = Field(
+        default=EVAL_STORE_DEFAULT_PAGE_BYTES,
+        ge=1_024,
+        le=EVAL_STORE_MAX_PAGE_BYTES,
+    )
+
+    @field_validator("target_key", "suite_id")
     @classmethod
     def validate_ids(cls, value: str | None, info) -> str | None:
         if value is None:
@@ -628,6 +698,79 @@ class EvalScenarioCatalogEntry(_EvalStoreModel):
         return self
 
 
+class EvalAuthoredSuiteCatalogEntry(_EvalStoreModel):
+    revision: StrictStr
+    id: StrictStr
+    suite_revision: StrictStr
+    target_key: StrictStr
+    name: StrictStr
+    description: StrictStr | None = None
+    case_count: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_CASES)
+    assertion_count: StrictInt = Field(
+        ge=1,
+        le=EVAL_CORPUS_MAX_CASES * EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
+    )
+    simple_input_count: StrictInt = Field(ge=0, le=EVAL_CORPUS_MAX_CASES)
+    scenario_count: StrictInt = Field(ge=0, le=EVAL_CORPUS_MAX_CASES)
+    trials: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
+    timeout_seconds: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TIMEOUT_SECONDS)
+    document_bytes: StrictInt = Field(ge=1, le=EVAL_SUITE_AUTHORING_MAX_BYTES)
+    created_at: datetime
+
+    @field_validator("revision", "suite_revision")
+    @classmethod
+    def validate_revisions(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("id", "target_key")
+    @classmethod
+    def validate_ids(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=256,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=2_048,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("created_at")
+    @classmethod
+    def validate_created_at(cls, value: datetime, info) -> datetime:
+        return _aware_utc(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> EvalAuthoredSuiteCatalogEntry:
+        if self.simple_input_count + self.scenario_count != self.case_count:
+            raise ValueError("Authored eval suite stimulus counts are inconsistent.")
+        if not (
+            self.case_count
+            <= self.assertion_count
+            <= self.case_count * EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE
+        ):
+            raise ValueError("Authored eval suite assertion count is impossible.")
+        if self.assertion_count * self.trials > EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_RESULTS:
+            raise ValueError("Authored eval suite expanded assertion count is impossible.")
+        return self
+
+
 class EvalSuiteCatalogEntry(_EvalStoreModel):
     corpus_revision: StrictStr
     id: StrictStr
@@ -797,6 +940,46 @@ class EvalScenarioCatalogPage(_EvalStoreModel):
                 raise ValueError("Eval scenario catalog cursor filter does not match its items.")
             if scenario_id and any(item.id != scenario_id for item in self.items):
                 raise ValueError("Eval scenario catalog cursor filter does not match its items.")
+        return self
+
+
+class EvalAuthoredSuiteCatalogPage(_EvalStoreModel):
+    items: tuple[EvalAuthoredSuiteCatalogEntry, ...] = Field(max_length=EVAL_STORE_MAX_PAGE_SIZE)
+    next_cursor: StrictStr | None = None
+    has_more: StrictBool = False
+
+    @model_validator(mode="after")
+    def validate_page(self) -> EvalAuthoredSuiteCatalogPage:
+        _validate_page_boundary(self.items, self.next_cursor, self.has_more)
+        if len({item.revision for item in self.items}) != len(self.items):
+            raise ValueError("Authored eval suite catalog page contains duplicate revisions.")
+        expected = list(self.items)
+        expected.sort(key=lambda item: item.revision)
+        expected.sort(key=lambda item: item.created_at, reverse=True)
+        if list(self.items) != expected:
+            raise ValueError("Authored eval suite catalog page is not in keyset order.")
+        if self.has_more:
+            assert self.next_cursor is not None
+            timestamp, revision, target_key, suite_id = _decode_cursor(
+                self.next_cursor,
+                "authored_suites",
+                ("created_at", "revision", "target_key", "suite_id"),
+            )
+            if (timestamp, revision) != (
+                self.items[-1].created_at.isoformat(),
+                self.items[-1].revision,
+            ):
+                raise ValueError(
+                    "Authored eval suite catalog cursor does not follow its last item."
+                )
+            if target_key and any(item.target_key != target_key for item in self.items):
+                raise ValueError(
+                    "Authored eval suite catalog cursor filter does not match its items."
+                )
+            if suite_id and any(item.id != suite_id for item in self.items):
+                raise ValueError(
+                    "Authored eval suite catalog cursor filter does not match its items."
+                )
         return self
 
 
@@ -1891,6 +2074,43 @@ def decode_scenario_cursor(
     )
 
 
+def _authored_suite_cursor(
+    entry: EvalAuthoredSuiteCatalogEntry,
+    query: EvalAuthoredSuiteCatalogQuery,
+) -> str:
+    return _encode_cursor(
+        "authored_suites",
+        {
+            "created_at": entry.created_at.isoformat(),
+            "revision": entry.revision,
+            "target_key": query.target_key or "",
+            "suite_id": query.suite_id or "",
+        },
+    )
+
+
+def decode_authored_suite_cursor(
+    cursor: str,
+    target_key: str | None,
+    suite_id: str | None,
+) -> tuple[datetime, str]:
+    timestamp, revision, cursor_target_key, cursor_suite_id = _decode_cursor(
+        cursor,
+        "authored_suites",
+        ("created_at", "revision", "target_key", "suite_id"),
+    )
+    if cursor_target_key != (target_key or "") or cursor_suite_id != (suite_id or ""):
+        raise ValueError("Eval-store authored-suite cursor does not match this query.")
+    try:
+        created_at = datetime.fromisoformat(timestamp)
+    except ValueError as exc:
+        raise ValueError("Invalid eval-store authored-suite cursor timestamp.") from exc
+    return _aware_utc(created_at, "cursor created_at"), _sha256_revision(
+        revision,
+        "cursor revision",
+    )
+
+
 def _suite_cursor(entry: EvalSuiteCatalogEntry) -> str:
     return _encode_cursor(
         "suites",
@@ -2138,6 +2358,71 @@ def _prepare_scenario_catalog_for_store(
     return validated, document, inspect_eval_scenario(validated)
 
 
+def authored_suite_catalog_entry(
+    document: EvalSuiteDocumentV1,
+    *,
+    created_at: datetime,
+    document_bytes: int,
+) -> EvalAuthoredSuiteCatalogEntry:
+    validated = _exact_model(document, EvalSuiteDocumentV1, "document")
+    simple_input_count = sum(case.stimulus.kind == "simple_input" for case in validated.cases)
+    return EvalAuthoredSuiteCatalogEntry(
+        revision=validated.revision,
+        id=validated.suite.id,
+        suite_revision=validated.suite.revision,
+        target_key=validated.target_key,
+        name=validated.suite.name,
+        description=validated.suite.description,
+        case_count=len(validated.cases),
+        assertion_count=sum(len(case.assertions) for case in validated.cases),
+        simple_input_count=simple_input_count,
+        scenario_count=len(validated.cases) - simple_input_count,
+        trials=validated.suite.trial_request.trials,
+        timeout_seconds=validated.suite.trial_request.timeout_seconds,
+        document_bytes=document_bytes,
+        created_at=created_at,
+    )
+
+
+def authored_suite_scenario_cases(
+    document: EvalSuiteDocumentV1,
+) -> tuple[tuple[EvalCaseDefinitionV1, EvalScenarioStimulusV1], ...]:
+    validated = _exact_model(document, EvalSuiteDocumentV1, "document")
+    return tuple(
+        (case, cast("EvalScenarioStimulusV1", case.stimulus))
+        for case in validated.cases
+        if type(case.stimulus) is EvalScenarioStimulusV1
+    )
+
+
+def validate_authored_suite_scenario(
+    document: EvalSuiteDocumentV1,
+    case: EvalCaseDefinitionV1,
+    scenario: EvalScenarioDocumentV2 | None,
+) -> None:
+    """Validate one content-addressed scenario reference without inferring fallback."""
+
+    if type(case) is not EvalCaseDefinitionV1 or type(case.stimulus) is not EvalScenarioStimulusV1:
+        raise TypeError("case must be an exact scenario-backed EvalCaseDefinitionV1.")
+    reference = case.stimulus
+    if scenario is None:
+        raise EvalAuthoredSuiteReferenceError(
+            f"Authored eval case {case.id!r} references an unavailable scenario revision."
+        )
+    if scenario.id != reference.scenario_id:
+        raise EvalAuthoredSuiteReferenceError(
+            f"Authored eval case {case.id!r} scenario ID does not match stored content."
+        )
+    if scenario.target_key != document.target_key:
+        raise EvalAuthoredSuiteReferenceError(
+            f"Authored eval case {case.id!r} scenario target does not match its suite."
+        )
+    if case.source is not None and case.source != scenario.source:
+        raise EvalAuthoredSuiteReferenceError(
+            f"Authored eval case {case.id!r} source does not match its scenario."
+        )
+
+
 def validate_run_request_for_corpus(
     request: EvalRunRequest,
     corpus: EvalCorpusDocument,
@@ -2258,6 +2543,7 @@ class EvalStore(ABC):
     captured_results: ClassVar[bool] = False
     scenarios: ClassVar[bool] = False
     scenario_execution: ClassVar[bool] = False
+    suite_authoring: ClassVar[bool] = False
 
     @abstractmethod
     async def close(self) -> None:
@@ -2318,6 +2604,37 @@ class EvalStore(ABC):
 
         del query
         raise NotImplementedError("Eval scenario persistence is not supported.")
+
+    async def save_authored_suite(
+        self,
+        document: EvalSuiteDocumentV1,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalAuthoredSuiteCatalogEntry:
+        """Scan and atomically save one reviewed immutable authored suite."""
+
+        del document, redact_json
+        raise NotImplementedError("Authored eval suite persistence is not supported.")
+
+    async def load_authored_suite(
+        self,
+        revision: str,
+        *,
+        max_bytes: int = EVAL_SUITE_AUTHORING_MAX_BYTES,
+    ) -> EvalSuiteDocumentV1 | None:
+        """Load one authored suite without crossing the caller byte ceiling."""
+
+        del revision, max_bytes
+        raise NotImplementedError("Authored eval suite persistence is not supported.")
+
+    async def list_authored_suites(
+        self,
+        query: EvalAuthoredSuiteCatalogQuery | None = None,
+    ) -> EvalAuthoredSuiteCatalogPage:
+        """List immutable authored suite revisions in newest-first keyset order."""
+
+        del query
+        raise NotImplementedError("Authored eval suite persistence is not supported.")
 
     @abstractmethod
     async def list_suites(self, query: EvalSuiteCatalogQuery) -> EvalSuiteCatalogPage:
@@ -2550,6 +2867,7 @@ class InMemoryEvalStore(EvalStore):
     captured_results: ClassVar[bool] = True
     scenarios: ClassVar[bool] = True
     scenario_execution: ClassVar[bool] = True
+    suite_authoring: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -2564,6 +2882,8 @@ class InMemoryEvalStore(EvalStore):
         self._corpora: dict[str, EvalCorpusCatalogEntry] = {}
         self._scenario_documents: dict[str, bytes] = {}
         self._scenarios: dict[str, EvalScenarioCatalogEntry] = {}
+        self._authored_suite_documents: dict[str, bytes] = {}
+        self._authored_suites: dict[str, EvalAuthoredSuiteCatalogEntry] = {}
         self._suites: dict[str, tuple[EvalSuiteCatalogEntry, ...]] = {}
         self._cases: dict[str, tuple[EvalCaseCatalogEntry, ...]] = {}
         self._runs: dict[str, _MemoryRunState] = {}
@@ -2741,6 +3061,98 @@ class InMemoryEvalStore(EvalStore):
                     or (item.created_at == created_at and item.revision > revision)
                 ]
             return _bounded_scenario_page(items, query)
+
+    async def save_authored_suite(
+        self,
+        document: EvalSuiteDocumentV1,
+        *,
+        redact_json: Callable[[Any], Any],
+    ) -> EvalAuthoredSuiteCatalogEntry:
+        validated, payload = _prepare_authored_suite_for_store(
+            document,
+            redact_json=redact_json,
+        )
+        async with self._lock:
+            scenario_cases = authored_suite_scenario_cases(validated)
+            scenario_by_revision: dict[str, EvalScenarioDocumentV2] = {}
+            revisions = {reference.scenario_revision for _, reference in scenario_cases}
+            for revision in revisions:
+                scenario_payload = self._scenario_documents.get(revision)
+                if scenario_payload is not None:
+                    scenario_by_revision[revision] = eval_scenario_from_json(
+                        scenario_payload.decode("utf-8")
+                    )
+            for case, reference in scenario_cases:
+                validate_authored_suite_scenario(
+                    validated,
+                    case,
+                    scenario_by_revision.get(reference.scenario_revision),
+                )
+            existing = self._authored_suite_documents.get(validated.revision)
+            if existing is not None:
+                if existing != payload:
+                    raise EvalAuthoredSuiteConflict(
+                        f"Authored eval suite revision {validated.revision} has "
+                        "conflicting content."
+                    )
+                return self._authored_suites[validated.revision].model_copy(deep=True)
+            entry = authored_suite_catalog_entry(
+                validated,
+                created_at=self._now(),
+                document_bytes=len(payload),
+            )
+            self._authored_suite_documents[validated.revision] = payload
+            self._authored_suites[validated.revision] = entry
+            return entry.model_copy(deep=True)
+
+    async def load_authored_suite(
+        self,
+        revision: str,
+        *,
+        max_bytes: int = EVAL_SUITE_AUTHORING_MAX_BYTES,
+    ) -> EvalSuiteDocumentV1 | None:
+        revision = _sha256_revision(revision, "revision")
+        max_bytes = _read_limit(max_bytes, hard_max=EVAL_SUITE_AUTHORING_MAX_BYTES)
+        async with self._lock:
+            payload = self._authored_suite_documents.get(revision)
+            if payload is None:
+                return None
+            if len(payload) > max_bytes:
+                raise EvalStoreResultTooLarge(max_bytes)
+            return eval_suite_document_from_json(payload.decode("utf-8"))
+
+    async def list_authored_suites(
+        self,
+        query: EvalAuthoredSuiteCatalogQuery | None = None,
+    ) -> EvalAuthoredSuiteCatalogPage:
+        query = _copy_query(query, EvalAuthoredSuiteCatalogQuery)
+        boundary = (
+            decode_authored_suite_cursor(
+                query.cursor,
+                query.target_key,
+                query.suite_id,
+            )
+            if query.cursor is not None
+            else None
+        )
+        async with self._lock:
+            items = [
+                item
+                for item in self._authored_suites.values()
+                if (query.target_key is None or item.target_key == query.target_key)
+                and (query.suite_id is None or item.id == query.suite_id)
+            ]
+            items.sort(key=lambda item: item.revision)
+            items.sort(key=lambda item: item.created_at, reverse=True)
+            if boundary is not None:
+                created_at, revision = boundary
+                items = [
+                    item
+                    for item in items
+                    if item.created_at < created_at
+                    or (item.created_at == created_at and item.revision > revision)
+                ]
+            return _bounded_authored_suite_page(items, query)
 
     async def list_suites(self, query: EvalSuiteCatalogQuery) -> EvalSuiteCatalogPage:
         query = _exact_model(query, EvalSuiteCatalogQuery, "query")
@@ -3557,6 +3969,23 @@ def _bounded_scenario_page(
     )
 
 
+def _bounded_authored_suite_page(
+    items: list[EvalAuthoredSuiteCatalogEntry],
+    query: EvalAuthoredSuiteCatalogQuery,
+) -> EvalAuthoredSuiteCatalogPage:
+    retained, next_cursor, has_more = _bounded_page(
+        items,
+        limit=query.limit,
+        max_bytes=query.max_result_bytes,
+        cursor=lambda item: _authored_suite_cursor(item, query),
+    )
+    return EvalAuthoredSuiteCatalogPage(
+        items=retained,
+        next_cursor=next_cursor,
+        has_more=has_more,
+    )
+
+
 def _bounded_case_page(
     items: list[EvalCaseCatalogEntry],
     query: EvalCaseCatalogQuery,
@@ -3618,6 +4047,11 @@ __all__ = [
     "EVAL_STORE_MAX_PAGE_BYTES",
     "EVAL_STORE_MAX_PAGE_SIZE",
     "TERMINAL_EVAL_RUN_STATUSES",
+    "EvalAuthoredSuiteCatalogEntry",
+    "EvalAuthoredSuiteCatalogPage",
+    "EvalAuthoredSuiteCatalogQuery",
+    "EvalAuthoredSuiteConflict",
+    "EvalAuthoredSuiteReferenceError",
     "EvalCaseCatalogEntry",
     "EvalCaseCatalogPage",
     "EvalCaseCatalogQuery",

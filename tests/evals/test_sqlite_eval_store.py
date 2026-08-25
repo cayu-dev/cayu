@@ -31,7 +31,7 @@ from cayu.evals.store import (
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
 from cayu.storage.evals_sqlite import SQLiteEvalStore
-from cayu.storage.migrations import SchemaMode
+from cayu.storage.migrations import SchemaMode, SchemaTooOld
 from cayu.vaults.redaction import SecretRedactor
 
 _NO_SECRETS = SecretRedactor()
@@ -101,7 +101,7 @@ def test_sqlite_eval_store_shared_conformance(tmp_path) -> None:
     asyncio.run(exercise())
 
 
-def test_sqlite_eval_store_creates_revision_fifty_eight_schema(tmp_path) -> None:
+def test_sqlite_eval_store_creates_revision_sixty_four_schema(tmp_path) -> None:
     path = tmp_path / "evals.db"
 
     async def initialize() -> None:
@@ -113,7 +113,7 @@ def test_sqlite_eval_store_creates_revision_fifty_eight_schema(tmp_path) -> None
     try:
         revisions = connection.execute(
             "SELECT revision, kind, compatible_from FROM cayu_schema_migrations "
-            "WHERE revision IN (47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58) "
+            "WHERE revision IN (47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64) "
             "ORDER BY revision"
         ).fetchall()
         invocation_column = connection.execute("PRAGMA table_info(cayu_eval_runs)").fetchall()
@@ -133,6 +133,7 @@ def test_sqlite_eval_store_creates_revision_fifty_eight_schema(tmp_path) -> None
                 "AND (name LIKE 'idx_cayu_eval_runs_target_%' "
                 "OR name LIKE 'idx_cayu_eval_result_records_%' "
                 "OR name LIKE 'idx_cayu_eval_scenarios_%' "
+                "OR name LIKE 'idx_cayu_eval_authored_suites_%' "
                 "OR name = 'idx_cayu_eval_baseline_mutations_scope')"
             ).fetchall()
         }
@@ -151,6 +152,12 @@ def test_sqlite_eval_store_creates_revision_fifty_eight_schema(tmp_path) -> None
         (56, "additive", 55),
         (57, "breaking", 57),
         (58, "breaking", 58),
+        (59, "breaking", 59),
+        (60, "breaking", 60),
+        (61, "breaking", 61),
+        (62, "breaking", 62),
+        (63, "breaking", 63),
+        (64, "additive", 63),
     ]
     assert next(row for row in invocation_column if row[1] == "invocation_json")[2:4] == (
         "TEXT",
@@ -166,6 +173,7 @@ def test_sqlite_eval_store_creates_revision_fifty_eight_schema(tmp_path) -> None
     assert tables == {
         "cayu_eval_baseline_mutations",
         "cayu_eval_baselines",
+        "cayu_eval_authored_suites",
         "cayu_eval_cases",
         "cayu_eval_corpora",
         "cayu_eval_result_records",
@@ -176,6 +184,9 @@ def test_sqlite_eval_store_creates_revision_fifty_eight_schema(tmp_path) -> None
     }
     assert indexes == {
         "idx_cayu_eval_baseline_mutations_scope",
+        "idx_cayu_eval_authored_suites_catalog",
+        "idx_cayu_eval_authored_suites_id_catalog",
+        "idx_cayu_eval_authored_suites_target_catalog",
         "idx_cayu_eval_result_records_contract",
         "idx_cayu_eval_result_records_target_catalog",
         "idx_cayu_eval_runs_target_catalog",
@@ -210,7 +221,6 @@ def test_sqlite_eval_store_migrates_empty_revision_fifty_six_without_verifier_pr
         await store.close()
 
     asyncio.run(validate())
-
     connection = sqlite3.connect(path)
     try:
         assert connection.execute("PRAGMA user_version").fetchone() == (
@@ -220,6 +230,83 @@ def test_sqlite_eval_store_migrates_empty_revision_fifty_six_without_verifier_pr
             "SELECT 1 FROM sqlite_master "
             "WHERE type = 'table' AND name = 'cayu_completion_verifier_profiles'"
         ).fetchone() == (1,)
+    finally:
+        connection.close()
+
+
+def test_sqlite_eval_store_requires_revision_sixty_four_authoring_schema(
+    tmp_path,
+) -> None:
+    path = tmp_path / "evals-revision-56-validate.db"
+    connection = sqlite_support.connect(path)
+    revisions = schema_migrations.REVISIONS
+    try:
+        schema_migrations.REVISIONS = tuple(
+            revision for revision in revisions if revision.revision <= 56
+        )
+        sqlite_support.reconcile_schema(
+            connection,
+            SchemaMode.MIGRATE,
+            app_min_supported=56,
+        )
+    finally:
+        schema_migrations.REVISIONS = revisions
+        connection.close()
+
+    with pytest.raises(SchemaTooOld, match="requires >= 64"):
+        SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
+
+
+def test_sqlite_revision_sixty_four_rejects_conflicting_authored_suite_table(
+    tmp_path,
+) -> None:
+    path = tmp_path / "evals.db"
+
+    async def initialize() -> None:
+        store = SQLiteEvalStore(path)
+        await store.close()
+
+    asyncio.run(initialize())
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            DROP TABLE cayu_eval_authored_suites;
+            CREATE TABLE cayu_eval_authored_suites (
+                revision TEXT COLLATE BINARY PRIMARY KEY,
+                suite_id TEXT COLLATE BINARY NOT NULL,
+                suite_revision TEXT NOT NULL,
+                target_key TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                case_count INTEGER NOT NULL,
+                assertion_count INTEGER NOT NULL,
+                simple_input_count INTEGER NOT NULL,
+                scenario_count INTEGER NOT NULL,
+                trials INTEGER NOT NULL,
+                timeout_seconds INTEGER NOT NULL,
+                document_json TEXT NOT NULL,
+                document_bytes INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            DELETE FROM cayu_schema_migrations WHERE revision = 64;
+            PRAGMA user_version = 63;
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="authored suite safety constraints"):
+        SQLiteEvalStore(path, schema_mode=SchemaMode.MIGRATE)
+    connection = sqlite3.connect(path)
+    try:
+        assert (
+            connection.execute(
+                "SELECT 1 FROM cayu_schema_migrations WHERE revision = 64"
+            ).fetchone()
+            is None
+        )
     finally:
         connection.close()
 

@@ -2946,6 +2946,53 @@ _MIGRATION_STEPS: dict[int, str] = {
             )
         );
     """,
+    64: """
+        CREATE TABLE IF NOT EXISTS cayu_eval_authored_suites (
+            revision TEXT COLLATE BINARY PRIMARY KEY,
+            suite_id TEXT COLLATE BINARY NOT NULL,
+            suite_revision TEXT NOT NULL,
+            target_key TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            case_count INTEGER NOT NULL
+                CONSTRAINT cayu_eval_authored_suites_case_count_check
+                CHECK (case_count >= 1 AND case_count <= 1000),
+            assertion_count INTEGER NOT NULL
+                CONSTRAINT cayu_eval_authored_suites_assertion_count_check
+                CHECK (assertion_count >= case_count AND assertion_count <= 64000),
+            simple_input_count INTEGER NOT NULL
+                CONSTRAINT cayu_eval_authored_suites_simple_input_count_check
+                CHECK (simple_input_count >= 0 AND simple_input_count <= case_count),
+            scenario_count INTEGER NOT NULL
+                CONSTRAINT cayu_eval_authored_suites_scenario_count_check
+                CHECK (scenario_count >= 0 AND scenario_count <= case_count),
+            trials INTEGER NOT NULL
+                CONSTRAINT cayu_eval_authored_suites_trials_check
+                CHECK (trials >= 1 AND trials <= 100),
+            timeout_seconds INTEGER NOT NULL
+                CONSTRAINT cayu_eval_authored_suites_timeout_check
+                CHECK (timeout_seconds >= 1 AND timeout_seconds <= 3600),
+            document_json TEXT NOT NULL
+                CONSTRAINT cayu_eval_authored_suites_document_json_check
+                CHECK (json_valid(document_json)),
+            document_bytes INTEGER NOT NULL
+                CONSTRAINT cayu_eval_authored_suites_document_bytes_check
+                CHECK (document_bytes >= 1 AND document_bytes <= 8388608)
+                CONSTRAINT cayu_eval_authored_suites_document_size_check
+                CHECK (document_bytes = length(CAST(document_json AS BLOB))),
+            created_at TEXT NOT NULL,
+            CONSTRAINT cayu_eval_authored_suites_stimulus_partition_check
+                CHECK (simple_input_count + scenario_count = case_count),
+            CONSTRAINT cayu_eval_authored_suites_expansion_check
+                CHECK (assertion_count * trials <= 10000)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_eval_authored_suites_catalog
+            ON cayu_eval_authored_suites(created_at DESC, revision ASC);
+        CREATE INDEX IF NOT EXISTS idx_cayu_eval_authored_suites_target_catalog
+            ON cayu_eval_authored_suites(target_key, created_at DESC, revision ASC);
+        CREATE INDEX IF NOT EXISTS idx_cayu_eval_authored_suites_id_catalog
+            ON cayu_eval_authored_suites(suite_id, created_at DESC, revision ASC);
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -4423,6 +4470,8 @@ def reconcile_schema(
         # Ordinary startup remains independent of durable history size; each
         # payload is validated again at its indexed read boundary.
         _validate_revision_sixty_two_payload_schema(connection)
+    if app_min_supported >= 64:
+        _validate_eval_authored_suite_schema(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -6175,6 +6224,99 @@ def _validate_eval_scenario_schema(connection: sqlite3.Connection) -> None:
             )
 
 
+def _validate_eval_authored_suite_schema(connection: sqlite3.Connection) -> None:
+    expected_columns = (
+        ("revision", "TEXT", 0, 1),
+        ("suite_id", "TEXT", 1, 0),
+        ("suite_revision", "TEXT", 1, 0),
+        ("target_key", "TEXT", 1, 0),
+        ("name", "TEXT", 1, 0),
+        ("description", "TEXT", 0, 0),
+        ("case_count", "INTEGER", 1, 0),
+        ("assertion_count", "INTEGER", 1, 0),
+        ("simple_input_count", "INTEGER", 1, 0),
+        ("scenario_count", "INTEGER", 1, 0),
+        ("trials", "INTEGER", 1, 0),
+        ("timeout_seconds", "INTEGER", 1, 0),
+        ("document_json", "TEXT", 1, 0),
+        ("document_bytes", "INTEGER", 1, 0),
+        ("created_at", "TEXT", 1, 0),
+    )
+    actual_columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute("PRAGMA table_info(cayu_eval_authored_suites)")
+    )
+    if actual_columns != expected_columns:
+        _raise_eval_authored_suite_schema_error("cayu_eval_authored_suites")
+    table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'cayu_eval_authored_suites'"
+    ).fetchone()
+    normalized = (
+        ""
+        if table_row is None or table_row[0] is None
+        else "".join(str(table_row[0]).lower().split())
+    )
+    required_fragments = (
+        "check(case_count>=1andcase_count<=1000)",
+        "check(assertion_count>=case_countandassertion_count<=64000)",
+        "check(simple_input_count>=0andsimple_input_count<=case_count)",
+        "check(scenario_count>=0andscenario_count<=case_count)",
+        "check(trials>=1andtrials<=100)",
+        "check(timeout_seconds>=1andtimeout_seconds<=3600)",
+        "check(json_valid(document_json))",
+        "check(document_bytes>=1anddocument_bytes<=8388608)",
+        "check(document_bytes=length(cast(document_jsonasblob)))",
+        "check(simple_input_count+scenario_count=case_count)",
+        "check(assertion_count*trials<=10000)",
+    )
+    if "collatenocase" in normalized or any(
+        fragment not in normalized for fragment in required_fragments
+    ):
+        _raise_eval_authored_suite_schema_error("authored suite safety constraints")
+    index_rows = tuple(connection.execute("PRAGMA index_list(cayu_eval_authored_suites)"))
+    if any(bool(row[2]) and str(row[3]) in {"c", "u"} for row in index_rows):
+        _raise_eval_authored_suite_schema_error("unexpected unique index")
+    expected_indexes = {
+        "idx_cayu_eval_authored_suites_catalog": (
+            ("created_at", 1, "BINARY"),
+            ("revision", 0, "BINARY"),
+        ),
+        "idx_cayu_eval_authored_suites_id_catalog": (
+            ("suite_id", 0, "BINARY"),
+            ("created_at", 1, "BINARY"),
+            ("revision", 0, "BINARY"),
+        ),
+        "idx_cayu_eval_authored_suites_target_catalog": (
+            ("target_key", 0, "BINARY"),
+            ("created_at", 1, "BINARY"),
+            ("revision", 0, "BINARY"),
+        ),
+    }
+    for index_name, expected in expected_indexes.items():
+        metadata = next((row for row in index_rows if str(row[1]) == index_name), None)
+        actual = tuple(
+            (str(row[2]), int(row[3]), str(row[4]).upper())
+            for row in connection.execute(f"PRAGMA index_xinfo({index_name})")
+            if bool(row[5])
+        )
+        if (
+            metadata is None
+            or bool(metadata[2])
+            or str(metadata[3]) != "c"
+            or bool(metadata[4])
+            or actual != expected
+        ):
+            _raise_eval_authored_suite_schema_error(index_name)
+
+
+def _raise_eval_authored_suite_schema_error(name: str) -> NoReturn:
+    raise RuntimeError(
+        f"SQLite schema object {name!r} conflicts with Cayu's revision-64 "
+        "authored-suite contract. Run `cayu storage migrate` or restore the "
+        "database from a known-good backup."
+    )
+
+
 def _validate_verified_work_schema(
     connection: sqlite3.Connection,
     *,
@@ -7033,6 +7175,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             _validate_revision_60_knowledge_schema(connection)
         if rev.revision == 63:
             _validate_revision_63_knowledge_schema(connection)
+        if rev.revision == 64:
+            _validate_eval_authored_suite_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

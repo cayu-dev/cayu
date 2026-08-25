@@ -355,6 +355,10 @@ REVISIONS: tuple[Revision, ...] = (
     # archival, lineage, outbox, and receipt commits. Populated pre-63 knowledge
     # stores are deliberately not rewritten or backfilled.
     Revision(revision=63, kind=RevisionKind.BREAKING, compatible_from=63),
+    # Add immutable authored-suite documents for Evals V3. Pre-64 writers do
+    # not touch this independent catalog, so mixed-version processes remain
+    # safe while suite-authoring EvalStore implementations require revision 64.
+    Revision(revision=64, kind=RevisionKind.ADDITIVE, compatible_from=63),
 )
 
 #: The revision an empty database is initialized to.
