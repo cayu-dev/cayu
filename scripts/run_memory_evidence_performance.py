@@ -60,10 +60,11 @@ _KEY_CONFIG = RequestFootprintConfig(
 _CEILINGS = {
     "preparation_p95_ms": 10.0,
     "memory_persistence_p95_ms": 15.0,
-    # Hosted-runner filesystem scheduling occasionally produces isolated SQLite
-    # fsync spikes. This remains far above the checked-in ~5 ms baseline while
-    # still failing order-of-magnitude regressions deterministically.
-    "sqlite_persistence_p95_ms": 100.0,
+    # The median detects sustained SQLite write regressions. The wider p95 is an
+    # emergency tail cap because shared hosted-runner fsync scheduling can stall
+    # several adjacent samples even when the ordinary write path is unchanged.
+    "sqlite_persistence_p50_ms": 25.0,
+    "sqlite_persistence_p95_ms": 500.0,
     "memory_zero_record_runtime_evidence_p95_ms": 5.0,
     "sqlite_zero_record_runtime_evidence_p95_ms": 10.0,
     # Projection timing is CPU-scheduler sensitive on shared hosted runners. The
@@ -401,6 +402,7 @@ def _ceiling_findings(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "projection_bytes_per_pair": result["projection_bytes_per_pair"],
         }
         if backend == "sqlite":
+            checks["sqlite_persistence_p50_ms"] = result["persistence_latency"]["p50_ms"]
             checks["sqlite_storage_bytes_per_pair"] = result["storage_bytes_per_pair"]
         for metric, observed in checks.items():
             ceiling = _CEILINGS[metric]

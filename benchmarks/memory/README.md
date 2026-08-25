@@ -80,4 +80,6 @@ code. A dedicated required CI lane reruns the workload without coverage instrume
 so an unchanged artifact cannot conceal a regression and timing is not distorted by the
 ordinary test harness. Provider latency is deliberately absent. See
 [Memory foundation contracts](../../docs/memory-foundation.md#bounded-public-memory-attribution)
-for the fixed ceilings and interpretation.
+for the fixed ceilings and interpretation. SQLite persistence enforces a sustained
+median ceiling separately from a wider emergency p95 cap because hosted-runner fsync
+scheduling is not a stable product-tail signal.

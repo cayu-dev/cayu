@@ -6,7 +6,8 @@
     "preparation_p95_ms": 10.0,
     "projection_bytes_per_pair": 6000,
     "projection_overhead_p95_ms_per_pair": 25.0,
-    "sqlite_persistence_p95_ms": 100.0,
+    "sqlite_persistence_p50_ms": 25.0,
+    "sqlite_persistence_p95_ms": 500.0,
     "sqlite_storage_bytes_per_pair": 32768,
     "sqlite_zero_record_runtime_evidence_p95_ms": 10.0
   },

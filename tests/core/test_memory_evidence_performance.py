@@ -60,6 +60,7 @@ def test_memory_evidence_performance_check_detects_each_regression_lane() -> Non
     regressed[0]["incremental_projection_latency"]["p95_ms"] = 10_000
     regressed[0]["projection_bytes_per_pair"] = 10_000
     regressed[1]["persistence_latency"]["p95_ms"] = 10_000
+    regressed[1]["persistence_latency"]["p50_ms"] = 10_000
     regressed[1]["zero_record_runtime_evidence_latency"]["p95_ms"] = 10_000
     regressed[1]["storage_bytes_per_pair"] = 100_000
 
@@ -71,6 +72,7 @@ def test_memory_evidence_performance_check_detects_each_regression_lane() -> Non
         "projection_bytes_per_pair",
         "projection_overhead_p95_ms_per_pair",
         "sqlite_persistence_p95_ms",
+        "sqlite_persistence_p50_ms",
         "sqlite_zero_record_runtime_evidence_p95_ms",
         "sqlite_storage_bytes_per_pair",
     }
