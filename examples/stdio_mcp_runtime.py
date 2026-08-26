@@ -12,6 +12,8 @@ from cayu import (
     McpServerSpec,
     Message,
     RunRequest,
+    StdioMcpClient,
+    StdioMcpProcessLifetime,
     connect_mcp_toolset,
 )
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
@@ -44,7 +46,15 @@ async def main() -> None:
         connection_id="example/stdio/local-mcp",
         command=[sys.executable, str(Path(__file__).resolve()), "--server"],
     )
-    toolset = await connect_mcp_toolset(server)
+    # This example is platform-neutral, so it explicitly accepts the weaker
+    # graceful-only lifecycle instead of silently downgrading the contained
+    # default on hosts without Linux parent-death enforcement.
+    toolset = await connect_mcp_toolset(
+        server,
+        client=StdioMcpClient(
+            process_lifetime=StdioMcpProcessLifetime.GRACEFUL_CLEANUP,
+        ),
+    )
     try:
         if not toolset.tools:
             raise RuntimeError("MCP server did not advertise tools.")

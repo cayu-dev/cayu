@@ -8237,6 +8237,103 @@ The first MCP implementation supports stdio servers:
   excluded by default. Use explicit `env` for non-secret configuration and
   `secret_env` for vault-resolved child secrets.
 - stderr is treated as server logging, not protocol output.
+- On supported Linux architectures with usable `pidfd_open` and
+  `pidfd_send_signal` process controls, `StdioMcpClient` defaults to
+  `process_lifetime="parent_death_containment"`. Cayu launches a private
+  supervisor outside an anchored process group containing the requested server,
+  package launcher, and descendants. A private liveness descriptor and the
+  verified direct-parent relationship identify the owning Cayu process; PID
+  equality alone is never accepted as ownership. If that owner exits abruptly,
+  the supervisor sends TERM to the anchored group, waits the configured bound,
+  sends KILL, and reaps its direct anchor before exiting. The anchor remains
+  unreaped until the final signal, so a reused PID or PGID cannot redirect
+  cleanup to an unrelated process. The server inherits the original stdio
+  descriptors directly; containment control traffic never enters stdin, stdout,
+  or stderr.
+- Before spawning the anchored server, the supervisor binds a Linux abstract
+  Unix-socket rendezvous derived from the exact command and the stable MCP
+  connection identity in a per-effective-user namespace. The supervisor and
+  anchor share the bound socket, but the contained server never inherits it, so
+  whichever process still owns cleanup retains the rendezvous until the complete
+  old tree is quiescent. Because the address has no filesystem pathname, a
+  same-UID contained server cannot unlink or replace the ownership boundary, while
+  otherwise-identical connectors owned by different host users do not interfere.
+  An abruptly started replacement with the
+  same identity therefore waits within its configured startup bound instead of
+  racing the old TERM/KILL sequence or dispatching a second server against
+  resources the old generation may still hold. Explicitly different connection
+  identities use independent domain-separated addresses; direct ID-less clients
+  use their server name and exact command as the fallback identity. The bounded
+  hash-derived kernel namespace creates no persistent per-identity host files.
+  After acquiring the rendezvous, the supervisor must publish that fact and wait
+  for an authenticated launch grant from the still-live Cayu owner before it may
+  spawn the anchor. Cancellation or timeout while waiting cannot dispatch the
+  replacement server.
+- Before resolving `secret_env`, Cayu launches a disposable trusted helper with
+  an empty environment and exercises the complete containment prerequisite set:
+  anonymous sealed environment transfer, non-dumpable cleanup ownership, child
+  subreaping, `/proc` process-group evidence, privilege/capability removal,
+  `no_new_privs`, seccomp installation, exact pidfd signaling, and duplicate-bind
+  exclusion and release for the abstract rendezvous. A configured client reports
+  parent-death containment as only `declared` until this preflight succeeds, then as
+  `available`; a failed preflight rejects the connection before secret lookup or
+  server dispatch.
+- The supervisor and anchor always start with a runtime-owned empty environment.
+  Cayu transfers the requested server environment through a sealed anonymous
+  descriptor and applies it only to the final server exec after the anchor is
+  non-dumpable and owns cleanup. Loader controls such as `LD_PRELOAD` and
+  `LD_AUDIT` therefore remain valid server configuration but cannot execute in
+  either trusted containment helper before the process-tree restrictions exist.
+- The contained command and every descendant inherit an irreversible Linux
+  process filter that denies process-group/session escape and prevents the
+  contained tree from signaling, tracing, or changing resource limits on either
+  cleanup owner. Before server exec, contained mode also locks out root/setuid
+  privilege semantics and clears the child's ambient, inheritable, permitted,
+  and effective Linux capability sets. This is part of the containment boundary:
+  a stdio server that requires inherited host capabilities must run under a
+  stronger external lifecycle authority or use an explicitly weaker lifetime.
+  Both cleanup owners are verified non-dumpable before server creation, so
+  same-UID `/proc` memory and descriptor access cannot bypass that syscall
+  boundary even when host ptrace restrictions are permissive. Cleanup opens an
+  exact pidfd and then revalidates process-group membership before signaling
+  each candidate, so process exit and PID reuse cannot redirect a signal. This is
+  what makes the complete-tree claim stronger than process-group creation alone:
+  a package launcher or server cannot move a worker outside the group that the
+  authenticated supervisor owns. The supervisor is itself a child subreaper and
+  takes over exact group settlement if the anchor crashes before publishing its
+  authenticated receipt. Fallback keeps the dead anchor unreaped as the PGID
+  reservation, stops every group member before the final group-wide KILL, reaps
+  adopted descendants, and releases the anchor identity last. Non-Linux POSIX hosts currently report the
+  capability as unsupported and require explicit `graceful_cleanup`; Cayu does
+  not silently substitute process-group-only cleanup.
+- Normal owner-loss settlement is bounded by the configured TERM and KILL
+  intervals plus the supervisor polling allowance. If the anchor itself loses
+  ownership before authenticating settlement, the replacement supervisor may
+  consume one additional TERM/KILL sequence; the client therefore waits at most
+  `2 * (containment_term_timeout_s + containment_kill_timeout_s) + 1` seconds at
+  that final boundary. If the kernel cannot establish quiescence within that
+  bound, close/startup fails instead of claiming settlement, while the exact
+  supervisor cleanup task remains retained until the tree actually settles.
+- `StdioMcpProcessLifetime.GRACEFUL_CLEANUP` is an explicit weaker mode that
+  retains root-process live-session close behavior but cannot prove complete-tree
+  descendant settlement. Its complete-tree `graceful_cleanup` capability is
+  therefore reported as unsupported. The contained Linux lifetime reports that
+  capability only because its live owner can terminate and await the anchored
+  descendant tree as well as handling abrupt parent death.
+  `PERSISTENT_DETACHED` explicitly permits the POSIX process to survive abrupt
+  owner death. Parent-death containment is not silently downgraded on unsupported
+  platforms: callers must explicitly select graceful cleanup before secret
+  resolution or process creation can proceed.
+- `StdioMcpClient.process_capability_evidence`,
+  `StdioMcpSession.process_capability_evidence`, and the corresponding
+  `McpToolset` property report bounded `graceful_cleanup`,
+  `parent_death_containment`, and `persistent_detached` claims for the selected
+  lifecycle. These claims describe this stdio process boundary; they are not
+  environment/runner execution-admission evidence. For the strong lifecycle,
+  both complete-tree claims remain `declared` until the exact process preflight
+  succeeds, become `unsupported` when that proof is unavailable, and become
+  `available` only after successful proof. Session evidence is `available` only
+  after that proof and contained startup.
 - The client rejects servers that negotiate an unsupported MCP protocol version.
 - Stdio writes are timeout-bounded separately from server response waits, so a
   broken or backpressured MCP subprocess cannot hang Cayu. The absolute call
@@ -8249,7 +8346,10 @@ The first MCP implementation supports stdio servers:
   best-effort and timeout-bounded; if it is interrupted, the stdio session is
   closed instead of being reused.
 - Session shutdown closes the child process stdin first, waits for graceful exit,
-  then escalates to terminate/kill if the server does not exit.
+  then escalates to terminate/kill if the server does not exit. In contained
+  mode, normal server exit also settles descendants that a launcher left behind.
+  Request cancellation, timeout, protocol EOF, initialization failure, and
+  explicit close all converge on the same owned settlement boundary.
 - `connect_mcp_toolset(...)` initializes the server, lists tools, and returns
   one `McpToolset` that owns the live MCP session and its `McpToolAdapter`
   instances.
@@ -8449,6 +8549,16 @@ future layers. MCP resources should remain explicit and policy-controlled instea
 of being dumped into model context automatically. MCP manifest hashes are
 audit/debug fingerprints, not signatures; tool policy still controls whether an
 allowed MCP tool call may execute.
+
+Stdio parent-death containment proves the local replacement prerequisite for the
+future connector-supervision direction: after abrupt owner loss, a new
+generation can acquire the same local process-owned resource without manual
+cleanup. It does not implement a durable connector registry or restart
+coordinator. Likewise, it complements rather than replaces deployment-wide
+graceful drain: drain coordinates an orderly service shutdown, while this
+boundary handles the case where the owning process cannot run graceful cleanup
+at all. General runner trees, Windows Job Objects, remote/container backends,
+and broad process-tree quiescence remain separate capabilities.
 
 ## KnowledgeStore
 

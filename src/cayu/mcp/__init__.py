@@ -10,6 +10,12 @@ from cayu.mcp._jsonrpc import (
     SUPPORTED_MCP_PROTOCOL_VERSIONS,
     McpProtocolError,
 )
+from cayu.mcp._stdio_process import (
+    DEFAULT_MCP_CONTAINMENT_KILL_TIMEOUT_S,
+    DEFAULT_MCP_CONTAINMENT_STARTUP_TIMEOUT_S,
+    DEFAULT_MCP_CONTAINMENT_TERM_TIMEOUT_S,
+    StdioMcpProcessLifetime,
+)
 from cayu.mcp._transport import (
     DEFAULT_MCP_MAX_MESSAGE_BYTES,
     DEFAULT_MCP_MAX_RESPONSE_BYTES,
@@ -60,6 +66,9 @@ __all__ = [
     "DEFAULT_MCP_CANCELLATION_NOTIFICATION_TIMEOUT_S",
     "DEFAULT_MCP_CLIENT_NAME",
     "DEFAULT_MCP_CLIENT_VERSION",
+    "DEFAULT_MCP_CONTAINMENT_KILL_TIMEOUT_S",
+    "DEFAULT_MCP_CONTAINMENT_STARTUP_TIMEOUT_S",
+    "DEFAULT_MCP_CONTAINMENT_TERM_TIMEOUT_S",
     "DEFAULT_MCP_GRACEFUL_SHUTDOWN_TIMEOUT_S",
     "DEFAULT_MCP_MAX_LIST_ITEMS",
     "DEFAULT_MCP_MAX_LIST_PAGES",
@@ -89,6 +98,7 @@ __all__ = [
     "McpToolset",
     "McpTransportLimits",
     "StdioMcpClient",
+    "StdioMcpProcessLifetime",
     "StdioMcpSession",
     "connect_mcp_toolset",
     "mcp_cayu_tool_name",

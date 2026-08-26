@@ -50,7 +50,7 @@ from cayu import (
     SessionIdentity,
     SessionStore,
     SQLiteSessionStore,
-    StdioMcpClient,
+    StdioMcpProcessLifetime,
     StdioMcpSession,
     ToolContext,
     ToolEffect,
@@ -60,7 +60,11 @@ from cayu import (
     mcp_tool_manifest_identity,
     mcp_tool_manifest_tools,
 )
+from cayu import (
+    StdioMcpClient as _StdioMcpClient,
+)
 from cayu.mcp._jsonrpc import MCP_PROTOCOL_VERSION
+from cayu.mcp._stdio_process import stdio_mcp_parent_death_containment_platform_candidate
 from cayu.mcp.base import _mcp_session_close_task, _retain_mcp_session_close
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
@@ -83,6 +87,17 @@ from cayu.storage import migrations as schema_migrations
 from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
 
 _FAKE_SERVER = Path(__file__).resolve().parents[1] / "fixtures" / "fake_mcp_server.py"
+
+
+def StdioMcpClient(*args: Any, **kwargs: Any) -> _StdioMcpClient:
+    """Use the strong default where supported; explicitly opt down elsewhere."""
+
+    if (
+        "process_lifetime" not in kwargs
+        and not stdio_mcp_parent_death_containment_platform_candidate()
+    ):
+        kwargs["process_lifetime"] = StdioMcpProcessLifetime.GRACEFUL_CLEANUP
+    return _StdioMcpClient(*args, **kwargs)
 
 
 class FakeProvider(ModelProvider):
@@ -213,7 +228,7 @@ def test_stdio_mcp_client_lists_calls_and_reads_resources() -> None:
 
 def test_connect_mcp_toolset_returns_cayu_tool_adapters() -> None:
     async def run():
-        toolset = await connect_mcp_toolset(_fake_server_spec())
+        toolset = await connect_mcp_toolset(_fake_server_spec(), client=StdioMcpClient())
         try:
             tools = toolset.tools
             result = await tools[0].run(
@@ -271,7 +286,7 @@ def test_agent_catalogue_reuses_authoritative_mcp_contract_identity() -> None:
 
 def test_mcp_tool_adapter_includes_structured_content_in_model_text() -> None:
     async def run():
-        toolset = await connect_mcp_toolset(_fake_server_spec())
+        toolset = await connect_mcp_toolset(_fake_server_spec(), client=StdioMcpClient())
         try:
             return await toolset.tools[0].run(
                 ToolContext(session_id="sess_1", agent_name="assistant"),
@@ -5512,7 +5527,8 @@ def test_mcp_toolset_internal_cancellation_preserves_redacted_cleanup_failure() 
 def test_mcp_tool_adapter_runs_through_cayu_runtime() -> None:
     async def run():
         toolset = await connect_mcp_toolset(
-            _fake_server_spec().model_copy(update={"connection_id": "local-mcp"})
+            _fake_server_spec().model_copy(update={"connection_id": "local-mcp"}),
+            client=StdioMcpClient(),
         )
         try:
             provider = FakeProvider(

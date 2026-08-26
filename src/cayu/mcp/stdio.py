@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import math
 import os
 from collections.abc import Callable
 from contextlib import suppress
@@ -40,6 +42,22 @@ from cayu.mcp._jsonrpc import (
     validate_positive_integer,
     validate_positive_number,
 )
+from cayu.mcp._stdio_process import (
+    DEFAULT_MCP_CONTAINMENT_KILL_TIMEOUT_S,
+    DEFAULT_MCP_CONTAINMENT_STARTUP_TIMEOUT_S,
+    DEFAULT_MCP_CONTAINMENT_TERM_TIMEOUT_S,
+    ContainedStdioMcpProcess,
+    StdioMcpProcessLifetime,
+    _prepare_stdio_mcp_containment_rendezvous,
+    create_contained_stdio_mcp_process,
+    create_direct_stdio_mcp_process,
+    preflight_stdio_mcp_parent_death_containment,
+    stdio_mcp_process_capability_evidence,
+    stdio_mcp_process_capability_evidence_for_process,
+    validate_containment_platform,
+    validate_stdio_mcp_containment_timeout,
+    validate_stdio_mcp_process_lifetime,
+)
 from cayu.mcp._transport import (
     McpCallDeadlineExceededError,
     McpIdleTimeoutError,
@@ -48,6 +66,7 @@ from cayu.mcp._transport import (
     McpTransportLimits,
     _capture_mcp_owned_task_fatal_signal,
     _unwrap_mcp_owned_task_result,
+    copy_mcp_transport_limits,
     credential_safe_mcp_fatal_signal,
     credential_safe_mcp_transport_failure,
     mcp_json_value_nesting_too_deep,
@@ -123,6 +142,36 @@ class _StdioPendingTiming:
     response_received: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _StdioClientConnectionConfig:
+    """One defensively owned stdio connection configuration."""
+
+    transport_limits: McpTransportLimits
+    request_timeout_s: float | None
+    write_timeout_s: float
+    graceful_shutdown_timeout_s: float
+    cancellation_notification_timeout_s: float
+    client_name: str
+    client_version: str
+    max_list_pages: int
+    max_list_items: int
+    inherit_env: bool
+    secret_resolver: SecretResolver | None
+    process_lifetime: StdioMcpProcessLifetime
+    containment_startup_timeout_s: float
+    containment_term_timeout_s: float
+    containment_kill_timeout_s: float
+
+
+def _validate_stdio_client_timeout(value: float, field_name: str) -> float:
+    """Own one finite positive timeout before any connection side effect."""
+
+    timeout_s = validate_positive_number(value, field_name)
+    if not math.isfinite(timeout_s):
+        raise ValueError(f"{field_name} must be finite and greater than zero.")
+    return timeout_s
+
+
 def _clear_completed_stdio_response(
     future: asyncio.Future[dict[str, Any]],
 ) -> None:
@@ -155,6 +204,28 @@ def _base_child_env(inherit_env: bool) -> dict[str, str]:
     return env
 
 
+def _stdio_containment_rendezvous_identity(server: McpServerSpec) -> str:
+    """Bind replacement admission to one secret-free logical command identity."""
+
+    assert server.command is not None
+    payload = {
+        "command": server.command,
+        "connection_identity": (
+            {"connection_id": server.connection_id, "kind": "connection_id"}
+            if server.connection_id is not None
+            else {"connection_id": server.name, "kind": "server_name"}
+        ),
+        "schema": "cayu.mcp.stdio_containment_rendezvous.v1",
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 class StdioMcpClient(McpClient):
     """MCP client for local stdio servers."""
 
@@ -172,6 +243,12 @@ class StdioMcpClient(McpClient):
         max_list_items: int = DEFAULT_MCP_MAX_LIST_ITEMS,
         inherit_env: bool = False,
         secret_resolver: SecretResolver | None = None,
+        process_lifetime: StdioMcpProcessLifetime | str = (
+            StdioMcpProcessLifetime.PARENT_DEATH_CONTAINMENT
+        ),
+        containment_startup_timeout_s: float = DEFAULT_MCP_CONTAINMENT_STARTUP_TIMEOUT_S,
+        containment_term_timeout_s: float = DEFAULT_MCP_CONTAINMENT_TERM_TIMEOUT_S,
+        containment_kill_timeout_s: float = DEFAULT_MCP_CONTAINMENT_KILL_TIMEOUT_S,
     ) -> None:
         self.transport_limits = resolve_mcp_transport_limits(
             transport_limits,
@@ -204,67 +281,184 @@ class StdioMcpClient(McpClient):
         if secret_resolver is not None:
             validate_secret_resolver(secret_resolver)
         self.secret_resolver = secret_resolver
+        self.process_lifetime = validate_stdio_mcp_process_lifetime(process_lifetime)
+        self.containment_startup_timeout_s = validate_stdio_mcp_containment_timeout(
+            containment_startup_timeout_s,
+            "containment_startup_timeout_s",
+        )
+        self.containment_term_timeout_s = validate_stdio_mcp_containment_timeout(
+            containment_term_timeout_s,
+            "containment_term_timeout_s",
+        )
+        self.containment_kill_timeout_s = validate_stdio_mcp_containment_timeout(
+            containment_kill_timeout_s,
+            "containment_kill_timeout_s",
+        )
 
-    async def connect(self, server: McpServerSpec) -> McpSession:
+    @property
+    def process_capability_evidence(self):
+        lifetime = validate_stdio_mcp_process_lifetime(self.process_lifetime)
+        return stdio_mcp_process_capability_evidence(lifetime).model_copy(deep=True)
+
+    def _snapshot_connection_config(self) -> _StdioClientConnectionConfig:
+        """Revalidate every mutable client field before the first suspension."""
+
+        transport_limits = copy_mcp_transport_limits(self.transport_limits)
+        if type(self._has_explicit_transport_limits) is not bool:
+            raise TypeError("_has_explicit_transport_limits must be a bool.")
+        request_timeout_s = (
+            None
+            if self._has_explicit_transport_limits
+            else _validate_stdio_client_timeout(self.request_timeout_s, "request_timeout_s")
+        )
+        inherit_env = self.inherit_env
+        if type(inherit_env) is not bool:
+            raise TypeError("inherit_env must be a bool.")
+        secret_resolver = self.secret_resolver
+        if secret_resolver is not None:
+            validate_secret_resolver(secret_resolver)
+        return _StdioClientConnectionConfig(
+            transport_limits=transport_limits,
+            request_timeout_s=request_timeout_s,
+            write_timeout_s=_validate_stdio_client_timeout(
+                self.write_timeout_s,
+                "write_timeout_s",
+            ),
+            graceful_shutdown_timeout_s=_validate_stdio_client_timeout(
+                self.graceful_shutdown_timeout_s,
+                "graceful_shutdown_timeout_s",
+            ),
+            cancellation_notification_timeout_s=_validate_stdio_client_timeout(
+                self.cancellation_notification_timeout_s,
+                "cancellation_notification_timeout_s",
+            ),
+            client_name=require_clean_nonblank(self.client_name, "client_name"),
+            client_version=require_clean_nonblank(self.client_version, "client_version"),
+            max_list_pages=validate_positive_integer(self.max_list_pages, "max_list_pages"),
+            max_list_items=validate_positive_integer(self.max_list_items, "max_list_items"),
+            inherit_env=inherit_env,
+            secret_resolver=secret_resolver,
+            process_lifetime=validate_stdio_mcp_process_lifetime(self.process_lifetime),
+            containment_startup_timeout_s=validate_stdio_mcp_containment_timeout(
+                self.containment_startup_timeout_s,
+                "containment_startup_timeout_s",
+            ),
+            containment_term_timeout_s=validate_stdio_mcp_containment_timeout(
+                self.containment_term_timeout_s,
+                "containment_term_timeout_s",
+            ),
+            containment_kill_timeout_s=validate_stdio_mcp_containment_timeout(
+                self.containment_kill_timeout_s,
+                "containment_kill_timeout_s",
+            ),
+        )
+
+    async def connect(self, server: McpServerSpec) -> StdioMcpSession:
         server = copy_mcp_server_spec(server)
+        # These public client attributes can be changed after construction.
+        # Own and revalidate one exact launch configuration before any secret
+        # lookup or process side effect, then carry it across every await.
+        config = self._snapshot_connection_config()
         if server.command is None:
             raise ValueError("StdioMcpClient requires an MCP server command.")
         if server.url is not None:
             raise ValueError("StdioMcpClient does not support URL MCP servers.")
-        if server.secret_env and self.secret_resolver is None:
+        if server.secret_env and config.secret_resolver is None:
             raise ValueError(
                 "StdioMcpClient cannot resolve MCP secret_env without a secret_resolver. "
                 "Pass secret_resolver= (a Vault or CredentialProxy) to the client."
             )
         if server.secret_headers:
             raise ValueError("StdioMcpClient does not support MCP secret_headers.")
-        child_env = _base_child_env(self.inherit_env)
+        # Platform support is caller-visible configuration and must be checked
+        # before secret lookup or process creation.
+        validate_containment_platform(config.process_lifetime)
+        # Own the selected host-environment view before preflight suspends. The
+        # process environment and the mutable client must not be able to change
+        # which host values the admitted launch receives.
+        child_env = _base_child_env(config.inherit_env)
         child_env.update(server.env)
         secret_redactor = SecretRedactor()
-        if server.secret_env and self.secret_resolver is not None:
-            # Secret values go straight into the child process env — never into
-            # argv — and stay wrapped until this final injection point.
-            resolved = await resolve_secret_env(
-                server.secret_env,
-                self.secret_resolver,
-                scope={"mcp_server": server.name},
-            )
-            for name, secret in resolved.items():
-                child_env[name] = secret.value.get_secret_value()
-            # A hostile server can echo these values back through tool output; scrub them.
-            secret_redactor = SecretRedactor(tuple(resolved.values()))
-            resolved.clear()
+        process_capability_evidence = None
+        process = None
+        prepared_containment_rendezvous = None
+        containment_rendezvous_identity = None
         try:
-            process = await asyncio.create_subprocess_exec(
-                *server.command,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=child_env,
-                limit=self.transport_limits.max_message_bytes + 2,
+            containment_preflight_proof = None
+            if config.process_lifetime is StdioMcpProcessLifetime.PARENT_DEATH_CONTAINMENT:
+                containment_preflight_proof = await preflight_stdio_mcp_parent_death_containment(
+                    config.containment_startup_timeout_s
+                )
+                containment_rendezvous_identity = _stdio_containment_rendezvous_identity(server)
+                prepared_containment_rendezvous = _prepare_stdio_mcp_containment_rendezvous(
+                    containment_rendezvous_identity
+                )
+            process_capability_evidence = stdio_mcp_process_capability_evidence(
+                config.process_lifetime,
+                _parent_death_containment_proved=containment_preflight_proof is not None,
             )
+            if server.secret_env and config.secret_resolver is not None:
+                # Secret values go straight into the child process env — never into
+                # argv — and stay wrapped until this final injection point.
+                resolved = await resolve_secret_env(
+                    server.secret_env,
+                    config.secret_resolver,
+                    scope={"mcp_server": server.name},
+                )
+                for name, secret in resolved.items():
+                    child_env[name] = secret.value.get_secret_value()
+                # A hostile server can echo these values back through tool output; scrub them.
+                secret_redactor = SecretRedactor(tuple(resolved.values()))
+                resolved.clear()
+            if config.process_lifetime is StdioMcpProcessLifetime.PARENT_DEATH_CONTAINMENT:
+                process = await create_contained_stdio_mcp_process(
+                    *server.command,
+                    env=child_env,
+                    limit=config.transport_limits.max_message_bytes + 2,
+                    startup_timeout_s=config.containment_startup_timeout_s,
+                    term_timeout_s=config.containment_term_timeout_s,
+                    kill_timeout_s=config.containment_kill_timeout_s,
+                    _preflight_proof=containment_preflight_proof,
+                    _rendezvous_identity=containment_rendezvous_identity,
+                    _prepared_rendezvous=prepared_containment_rendezvous,
+                )
+            else:
+                process = await create_direct_stdio_mcp_process(
+                    *server.command,
+                    env=child_env,
+                    limit=config.transport_limits.max_message_bytes + 2,
+                    lifetime=config.process_lifetime,
+                )
         finally:
             # The child owns its copied environment after a successful spawn. Do
             # not retain injected values if spawning or initialize later fails.
             child_env.clear()
+            if prepared_containment_rendezvous is not None:
+                prepared_containment_rendezvous.close()
+        assert process is not None
+        assert process_capability_evidence is not None
         session = StdioMcpSession(
             server=server,
             process=process,
-            request_timeout_s=(
-                None if self._has_explicit_transport_limits else self.request_timeout_s
-            ),
+            request_timeout_s=config.request_timeout_s,
             transport_limits=(
-                self.transport_limits if self._has_explicit_transport_limits else None
+                config.transport_limits if config.request_timeout_s is None else None
             ),
-            write_timeout_s=self.write_timeout_s,
-            graceful_shutdown_timeout_s=self.graceful_shutdown_timeout_s,
-            cancellation_notification_timeout_s=self.cancellation_notification_timeout_s,
-            client_name=self.client_name,
-            client_version=self.client_version,
-            max_list_pages=self.max_list_pages,
-            max_list_items=self.max_list_items,
+            write_timeout_s=config.write_timeout_s,
+            graceful_shutdown_timeout_s=config.graceful_shutdown_timeout_s,
+            cancellation_notification_timeout_s=config.cancellation_notification_timeout_s,
+            client_name=config.client_name,
+            client_version=config.client_version,
+            max_list_pages=config.max_list_pages,
+            max_list_items=config.max_list_items,
             secret_redactor=secret_redactor,
         )
+        if session.process_capability_evidence != process_capability_evidence:
+            # Process-derived evidence is authoritative. This assertion also
+            # makes a lost private direct-process registration fail closed
+            # before initialization can expose an incorrect lifecycle claim.
+            await session.close()
+            raise McpProtocolError("MCP stdio process lifecycle evidence did not match its launch.")
         cleanup_cancellation: asyncio.CancelledError | None = None
         try:
             await session.initialize()
@@ -296,7 +490,7 @@ class StdioMcpSession(McpSession):
         self,
         *,
         server: McpServerSpec,
-        process: asyncio.subprocess.Process,
+        process: asyncio.subprocess.Process | ContainedStdioMcpProcess,
         request_timeout_s: float | None = None,
         transport_limits: McpTransportLimits | None = None,
         write_timeout_s: float,
@@ -317,6 +511,9 @@ class StdioMcpSession(McpSession):
         )
         self.server = server
         self.process = process
+        self._process_capability_evidence = stdio_mcp_process_capability_evidence_for_process(
+            process
+        )
         self._secret_redactor = secret_redactor or SecretRedactor()
         self.transport_limits = resolved_limits
         self._uses_legacy_request_timeout = transport_limits is None
@@ -359,6 +556,10 @@ class StdioMcpSession(McpSession):
     @property
     def request_timeout_s(self) -> float:
         return self._request_timeout_s
+
+    @property
+    def process_capability_evidence(self):
+        return self._process_capability_evidence.model_copy(deep=True)
 
     @request_timeout_s.setter
     def request_timeout_s(self, value: float) -> None:
@@ -650,11 +851,22 @@ class StdioMcpSession(McpSession):
 
     async def _close_impl(self) -> None:
         failures: list[BaseException] = []
+        try:
+            # Logical closure is already authoritative. Settle callers before
+            # waiting on the external process tree so a bounded TERM/KILL
+            # sequence cannot turn their outcome into an unrelated call timeout.
+            self._fail_pending(McpProtocolError("MCP stdio session closed."))
+        except BaseException as error:
+            failures.append(error)
 
-        async def settle_shutdown_task(task: asyncio.Task[Any]) -> bool:
+        async def settle_shutdown_task(
+            task: asyncio.Task[Any],
+            *,
+            timeout_s: float | None = None,
+        ) -> bool:
             done, _pending = await asyncio.wait(
                 (task,),
-                timeout=self.graceful_shutdown_timeout_s,
+                timeout=(self.graceful_shutdown_timeout_s if timeout_s is None else timeout_s),
             )
             if task not in done:
                 _retain_cancelled_stdio_shutdown_task(task)
@@ -665,15 +877,36 @@ class StdioMcpSession(McpSession):
                 failures.append(error)
             return True
 
+        contained_settlement_checked = False
+
         async def wait_for_process_exit(*, final: bool = False) -> bool:
-            if self.process.returncode is not None:
+            nonlocal contained_settlement_checked
+            contained = isinstance(self.process, ContainedStdioMcpProcess)
+            if self.process.returncode is not None and not (final and contained):
                 return True
-            wait_task = asyncio.create_task(self.process.wait())
-            settled = await settle_shutdown_task(wait_task)
+            if final and contained:
+                wait_task = asyncio.create_task(self.process.wait_for_settlement())
+            else:
+                wait_task = asyncio.create_task(self.process.wait())
+            final_timeout_s = None
+            if final and contained:
+                # Await the complete configured process-tree settlement bound.
+                # A short transport grace period must not truncate a larger
+                # TERM/KILL and reaping allowance selected by the caller.
+                final_timeout_s = self.process.settlement_timeout_s
+            settled = await settle_shutdown_task(wait_task, timeout_s=final_timeout_s)
+            if contained and (settled or final):
+                # A final wait consumes this close operation's one complete
+                # settlement allowance even if the retained owner needs longer
+                # to reach quiescence. Do not spend that allowance twice.
+                contained_settlement_checked = True
             process_exited = self.process.returncode is not None
-            if final and not settled and not process_exited:
+            if final and not settled and (contained or not process_exited):
                 failures.append(
-                    McpProtocolError("MCP stdio process did not exit after it was killed.")
+                    McpProtocolError(
+                        "MCP stdio process did not provide authenticated settlement "
+                        "after it was killed."
+                    )
                 )
             return process_exited
 
@@ -682,6 +915,8 @@ class StdioMcpSession(McpSession):
             await settle_shutdown_task(stdin_close_task)
             process_exited = self.process.returncode is not None
             if not process_exited:
+                # Preserve the existing stdio contract: EOF receives one full
+                # graceful interval before TERM is requested.
                 process_exited = await wait_for_process_exit()
             if not process_exited and self.process.returncode is None:
                 try:
@@ -702,12 +937,13 @@ class StdioMcpSession(McpSession):
                     failures.append(error)
                 if self.process.returncode is None:
                     await wait_for_process_exit(final=True)
+        if isinstance(self.process, ContainedStdioMcpProcess) and not contained_settlement_checked:
+            # A supervisor can exit before close begins. Its exit code is not
+            # positive process-tree settlement evidence, so always validate the
+            # authenticated settled receipt before reporting successful close.
+            await wait_for_process_exit(final=True)
         try:
             self._stdout_buffer.clear()
-        except BaseException as error:
-            failures.append(error)
-        try:
-            self._fail_pending(McpProtocolError("MCP stdio session closed."))
         except BaseException as error:
             failures.append(error)
         for task in (self._reader_task, self._stderr_task):

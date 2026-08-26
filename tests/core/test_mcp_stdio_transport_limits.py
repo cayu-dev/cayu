@@ -30,17 +30,32 @@ from cayu import (
     SecretRedactor,
     SecretRef,
     StaticVault,
-    StdioMcpClient,
+    StdioMcpProcessLifetime,
     StdioMcpSession,
     ToolContext,
 )
+from cayu import (
+    StdioMcpClient as _StdioMcpClient,
+)
 from cayu.mcp import stdio as mcp_stdio_module
 from cayu.mcp import tools as mcp_tools_module
+from cayu.mcp._stdio_process import stdio_mcp_parent_death_containment_platform_candidate
 from cayu.mcp.base import _mcp_session_close_task
 from cayu.mcp.stdio import _StdioPendingTiming
 from cayu.vaults import REDACTED_SECRET
 
 _FAKE_SERVER = Path(__file__).parents[1] / "fixtures" / "fake_mcp_server.py"
+
+
+def StdioMcpClient(*args: Any, **kwargs: Any) -> _StdioMcpClient:
+    """Keep transport tests portable without weakening the product default."""
+
+    if (
+        "process_lifetime" not in kwargs
+        and not stdio_mcp_parent_death_containment_platform_candidate()
+    ):
+        kwargs["process_lifetime"] = StdioMcpProcessLifetime.GRACEFUL_CLEANUP
+    return _StdioMcpClient(*args, **kwargs)
 
 
 def _server_spec() -> McpServerSpec:
@@ -1541,6 +1556,37 @@ def test_stdio_peer_closure_precedes_optional_stderr_enrichment_deadline() -> No
                 idle_timeout_s=0.5,
                 total_call_timeout_s=0.1,
             )
+        ).connect(_server_spec())
+        assert isinstance(session, StdioMcpSession)
+        try:
+            with pytest.raises(McpPeerClosedError) as exc_info:
+                await session.call_tool(
+                    "echo",
+                    {"close_stdout_keep_stderr_s": 0.3},
+                )
+            await asyncio.wait_for(session.process.wait(), timeout=1)
+            return exc_info.value, session.process.returncode
+        finally:
+            await session.close()
+
+    error, returncode = asyncio.run(run())
+
+    assert "closed stdout" in str(error)
+    assert returncode is not None
+
+
+@pytest.mark.skipif(
+    not stdio_mcp_parent_death_containment_platform_candidate(),
+    reason="parent-death containment requires supported Linux process controls",
+)
+def test_contained_stdio_peer_closure_is_not_masked_by_anchor_ownership() -> None:
+    async def run() -> tuple[BaseException, int | None]:
+        session = await _StdioMcpClient(
+            process_lifetime=StdioMcpProcessLifetime.PARENT_DEATH_CONTAINMENT,
+            transport_limits=_limits(
+                idle_timeout_s=0.5,
+                total_call_timeout_s=0.1,
+            ),
         ).connect(_server_spec())
         assert isinstance(session, StdioMcpSession)
         try:

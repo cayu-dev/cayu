@@ -510,6 +510,14 @@ class McpToolset:
         """Redactor for secrets injected into this server's session (empty if none)."""
         return self.__session.secret_redactor
 
+    @property
+    def process_capability_evidence(self):
+        """Configured process-lifecycle evidence for stdio-backed toolsets."""
+
+        if isinstance(self.__session, StdioMcpSession):
+            return self.__session.process_capability_evidence
+        return None
+
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
         # Built-in sessions own a bounded preflight before their defensive copy.
         # Third-party sessions have no common limits contract, so retain the
