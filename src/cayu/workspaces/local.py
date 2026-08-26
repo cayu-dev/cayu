@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import os
+from collections.abc import Iterable
 from os import PathLike
 from pathlib import Path
 
-from cayu._validation import require_clean_nonblank
+from cayu._validation import require_clean_nonblank, require_unicode_scalar_text
 from cayu.workspaces._local_guard import (
+    _require_descriptor_guard_support,
     create_regular,
     delete_regular,
     delete_regular_if_revision,
@@ -52,13 +55,20 @@ from cayu.workspaces.branches import (
 
 
 class LocalWorkspace(Workspace):
-    """Filesystem workspace rooted at one local directory."""
+    """Filesystem workspace rooted at one local directory.
+
+    ``excluded_directory_names`` removes matching path segments from listing
+    and rejects every direct read, resolution, or mutation beneath them. This
+    opt-in projected view does not advertise workspace branching because a
+    branch must not regain access to excluded source authority.
+    """
 
     def __init__(
         self,
         root: str | Path,
         *,
         workspace_id: str | None = None,
+        excluded_directory_names: Iterable[str] = (),
         branch_store: WorkspaceBranchStore | None = None,
         branch_authority_resolver: WorkspaceBranchBindingAuthorityProvider | None = None,
     ) -> None:
@@ -75,6 +85,17 @@ class LocalWorkspace(Workspace):
         else:
             self.id = require_clean_nonblank(workspace_id, "workspace_id")
         self.root = root_path
+        self.excluded_directory_names = _validate_excluded_directory_names(excluded_directory_names)
+        self._excluded_directory_keys = frozenset(
+            _directory_name_key(value) for value in self.excluded_directory_names
+        )
+        if self.excluded_directory_names and (
+            branch_store is not None or branch_authority_resolver is not None
+        ):
+            raise ValueError(
+                "LocalWorkspace excluded directories cannot be combined with "
+                "workspace branch persistence."
+            )
         if branch_store is not None and not isinstance(branch_store, WorkspaceBranchStore):
             raise TypeError("LocalWorkspace branch_store must implement WorkspaceBranchStore.")
         self._branch_store = branch_store
@@ -114,6 +135,12 @@ class LocalWorkspace(Workspace):
     def resource_key(self) -> tuple[object, ...]:
         return _local_resource_key(self.root)
 
+    @staticmethod
+    def require_path_operations_supported() -> None:
+        """Require the primitives used by secure path-addressed operations."""
+
+        _require_descriptor_guard_support()
+
     def bounded_read_limit(self, max_bytes: int) -> int:
         validated = _validate_limit(max_bytes, "max_bytes")
         if validated is None:
@@ -121,7 +148,7 @@ class LocalWorkspace(Workspace):
         return validated
 
     def branch_capabilities(self) -> WorkspaceBranchCapabilities:
-        if type(self) is not LocalWorkspace:
+        if type(self) is not LocalWorkspace or self.excluded_directory_names:
             return WorkspaceBranchCapabilities()
         durable = (
             self._branch_store is not None
@@ -168,6 +195,8 @@ class LocalWorkspace(Workspace):
         self,
         request: WorkspaceBranchRequest,
     ) -> WorkspaceBranchCreationResult:
+        if self.excluded_directory_names:
+            return await Workspace.create_branch(self, request)
         from cayu.workspaces._local_branch import create_local_workspace_branch
 
         result = await create_local_workspace_branch(self, request)
@@ -179,6 +208,11 @@ class LocalWorkspace(Workspace):
         request: WorkspaceBranchRecoveryRequest,
     ) -> WorkspaceBranchRecoveryResult:
         """Recover one durable local branch from store and filesystem evidence."""
+
+        if self.excluded_directory_names:
+            raise ValueError(
+                "Local workspace branch recovery is unavailable when directories are excluded."
+            )
 
         from cayu.workspaces._local_branch import recover_local_workspace_branch
 
@@ -194,6 +228,7 @@ class LocalWorkspace(Workspace):
         max_bytes: int | None = None,
     ) -> WorkspaceReadResult:
         relative_path = _validate_workspace_relative_path(path)
+        self._require_path_allowed(relative_path)
         validated_offset = _validate_offset(offset)
         limit = _validate_limit(max_bytes, "max_bytes")
         return await asyncio.to_thread(
@@ -208,16 +243,19 @@ class LocalWorkspace(Workspace):
         if type(content) is not bytes:
             raise TypeError("Workspace write content must be bytes.")
         relative_path = _validate_workspace_relative_path(path)
+        self._require_path_allowed(relative_path)
         await asyncio.to_thread(_write_file, self.root, relative_path, content)
 
     async def delete(self, path: str) -> None:
         relative_path = _validate_workspace_relative_path(path)
+        self._require_path_allowed(relative_path)
         await asyncio.to_thread(_delete_file, self.root, relative_path)
 
     async def create_bytes(self, path: str, content: bytes) -> WorkspaceMutationResult:
         if type(content) is not bytes:
             raise TypeError("Workspace create content must be bytes.")
         relative_path = _validate_workspace_relative_path(path)
+        self._require_path_allowed(relative_path)
         return await asyncio.to_thread(_create_file, self.root, relative_path, content)
 
     async def replace_bytes(
@@ -231,6 +269,7 @@ class LocalWorkspace(Workspace):
             raise TypeError("Workspace replace content must be bytes.")
         expected_revision = _validate_revision(expected_revision)
         relative_path = _validate_workspace_relative_path(path)
+        self._require_path_allowed(relative_path)
         return await asyncio.to_thread(
             _replace_file,
             self.root,
@@ -247,6 +286,7 @@ class LocalWorkspace(Workspace):
     ) -> WorkspaceMutationResult:
         expected_revision = _validate_revision(expected_revision)
         relative_path = _validate_workspace_relative_path(path)
+        self._require_path_allowed(relative_path)
         return await asyncio.to_thread(
             _delete_file_if_revision,
             self.root,
@@ -268,14 +308,18 @@ class LocalWorkspace(Workspace):
             self.root,
             pattern,
             validated_limit,
+            self._excluded_directory_keys,
         )
 
     def resolve(self, path: str) -> Path:
-        candidate = Path(_validate_workspace_relative_path(path))
+        relative_path = _validate_workspace_relative_path(path)
+        self._require_path_allowed(relative_path)
+        candidate = Path(relative_path)
         resolved = (self.root / candidate).resolve()
         self._ensure_inside_root(resolved)
         if resolved == self.root:
             raise ValueError("Workspace paths must reference a file.")
+        self._require_path_allowed(resolved.relative_to(self.root).as_posix())
         return resolved
 
     def _ensure_inside_root(self, path: Path) -> None:
@@ -285,7 +329,9 @@ class LocalWorkspace(Workspace):
             raise ValueError("Workspace path escapes the workspace root.") from exc
 
     def resolve_no_symlinks(self, path: str) -> Path:
-        candidate = Path(_validate_workspace_relative_path(path))
+        relative_path = _validate_workspace_relative_path(path)
+        self._require_path_allowed(relative_path)
+        candidate = Path(relative_path)
         target = self._resolve_without_symlinks(candidate)
         resolved = target.resolve(strict=False)
         self._ensure_inside_root(resolved)
@@ -306,6 +352,10 @@ class LocalWorkspace(Workspace):
             if current.is_symlink():
                 raise ValueError("Workspace path escapes the workspace root.")
         return current
+
+    def _require_path_allowed(self, relative_path: str) -> None:
+        if _path_has_excluded_directory(relative_path, self._excluded_directory_keys):
+            raise ValueError("Workspace path is inside an excluded directory.")
 
 
 def _write_file(root: Path, relative_path: str, content: bytes) -> None:
@@ -405,20 +455,100 @@ def _list_files(
     root: Path,
     pattern: str,
     limit: int | None,
+    excluded_directory_keys: frozenset[str],
 ) -> WorkspaceListResult:
     with workspace_source_lock(root, exclusive=False):
         collector = _WorkspaceListCollector(limit)
-        for path in root.rglob("*"):
+        for path in _iter_list_file_candidates(root, excluded_directory_keys):
             if _has_symlink_component(root, path):
                 continue
             resolved = path.resolve()
             _ensure_inside_root(root, resolved)
             if resolved == root or not resolved.is_file():
                 continue
-            if not matches_list_pattern(resolved.relative_to(root).as_posix(), pattern):
+            relative_path = resolved.relative_to(root).as_posix()
+            if _path_has_excluded_directory(relative_path, excluded_directory_keys):
                 continue
-            collector.add(resolved.relative_to(root).as_posix())
+            if not matches_list_pattern(relative_path, pattern):
+                continue
+            collector.add(relative_path)
         return collector.result(exact_total_when_truncated=False)
+
+
+def _iter_list_file_candidates(
+    root: Path,
+    excluded_directory_keys: frozenset[str],
+) -> Iterable[Path]:
+    if not excluded_directory_keys:
+        yield from root.rglob("*")
+        return
+
+    for directory, child_directories, filenames in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+        onerror=_raise_workspace_walk_error,
+    ):
+        parent = Path(directory)
+        child_directories[:] = [
+            name
+            for name in child_directories
+            if _directory_name_key(name) not in excluded_directory_keys
+            and not (parent / name).is_symlink()
+        ]
+        for filename in filenames:
+            yield parent / filename
+
+
+def _raise_workspace_walk_error(error: OSError) -> None:
+    raise error
+
+
+def _validate_excluded_directory_names(values: Iterable[str]) -> tuple[str, ...]:
+    if isinstance(values, str | bytes):
+        raise TypeError("LocalWorkspace excluded_directory_names must be an iterable of strings.")
+    try:
+        copied = tuple(values)
+    except TypeError as exc:
+        raise TypeError(
+            "LocalWorkspace excluded_directory_names must be an iterable of strings."
+        ) from exc
+    validated: list[str] = []
+    seen: set[str] = set()
+    for value in copied:
+        if type(value) is not str:
+            raise TypeError("LocalWorkspace excluded_directory_names entries must be strings.")
+        value = require_unicode_scalar_text(
+            require_clean_nonblank(value, "excluded directory name"),
+            "excluded directory name",
+        )
+        if value in {".", ".."} or "/" in value or "\\" in value:
+            raise ValueError(
+                "LocalWorkspace excluded directory names must be single path segments."
+            )
+        key = _directory_name_key(value)
+        if key in seen:
+            raise ValueError("LocalWorkspace excluded directory names must be unique.")
+        seen.add(key)
+        validated.append(value)
+    return tuple(validated)
+
+
+def _directory_name_key(value: str) -> str:
+    return value.rstrip(" .").casefold()
+
+
+def _path_has_excluded_directory(
+    relative_path: str,
+    excluded_directory_keys: frozenset[str],
+) -> bool:
+    if not excluded_directory_keys:
+        return False
+    return any(
+        _directory_name_key(part) in excluded_directory_keys
+        for part in relative_path.replace("\\", "/").split("/")
+        if part
+    )
 
 
 def _has_symlink_component(root: Path, path: Path) -> bool:

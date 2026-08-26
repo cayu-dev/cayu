@@ -11,6 +11,7 @@ from cayu import (
     AgentSpec,
     AllowlistRule,
     DenyPatternRule,
+    ExecutionProfileBehaviorIdentity,
     ParameterConstrainedToolPolicy,
     RequiredAllowlistRule,
     RequiredFieldRule,
@@ -252,6 +253,21 @@ def test_parameter_constrained_policy_can_require_approval_on_violation() -> Non
     assert result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
     assert result.reason == "Parameter 'url' matches a denied pattern."
     assert result.metadata["policy"] == "parameter_constrained"
+
+
+def test_parameter_constrained_policy_copies_execution_profile_identity() -> None:
+    identity = ExecutionProfileBehaviorIdentity(
+        name="application.tool_policy",
+        behavior_version="1",
+        implementation_version="release-1",
+    )
+    policy = ParameterConstrainedToolPolicy(
+        {"send_email": [RequiredAllowlistRule("to", values=["ops@example.com"])]},
+        execution_profile_identity=identity,
+    )
+
+    assert policy.execution_profile_identity == identity
+    assert policy.execution_profile_identity is not identity
 
 
 def test_parameter_constrained_policy_rejects_invalid_configuration() -> None:

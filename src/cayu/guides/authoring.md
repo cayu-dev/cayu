@@ -50,6 +50,7 @@ only when the requested behavior requires it.
 | Developer and operator inspection | `cayu inspect`, `cayu check`, console, dashboard, tracing | `cayu guide references#observability` |
 | An HTTP control plane | `cayu[server]`, authenticated FastAPI application | `cayu guide references#server` |
 | A public or multi-user agent product | `cayu new NAME --template service`, maintained tenant-safe service factory | `cayu guide references#server` |
+| A maintained repository-coding starter | `cayu new NAME --composition coding`, explicit workspace, knowledge, reviewer, and input composition | `cayu guide authoring#coding-composition` |
 | Advanced authority, isolation, caching, or speculation | composed runtime strategies with explicit evidence boundaries | `cayu guide references#advanced-runtime` |
 
 This map is a menu, not a checklist. A conversational, classification,
@@ -67,6 +68,23 @@ application that already owns FastAPI embeds Cayu explicitly with
 `mount_cayu(..., path="/cayu")`. Never use `OpenAccess()` on a public listener.
 Client-IP and forwarded-header checks are not authentication; public or deployed
 mounts require `AuthenticatedAccess(...)` with application-owned authorization.
+
+## Coding composition
+
+For a repository-coding application that needs the same explicit capabilities
+on day one, use `cayu new NAME --composition coding`. The opt-in project assembles
+existing public tools and stores in ordinary `composition.py`: bounded file and
+`rg` search operations, Git change review, local artifacts, reviewed durable
+knowledge, a bounded background reviewer with result recovery, and human input.
+It requires `git` and `rg`, creates a clean initial Git commit, and ships one
+credential-free smoke for the complete composition. Its trusted-host local
+workspace and runner are not a sandbox. Keep the default scaffold for jobs that
+do not need these capabilities, and do not combine the coding composition with
+the multi-user service template.
+
+Selecting this composition chooses implementations; it does not grant authority.
+Its exposure policy separately controls model-visible tools, and its ordinary
+tool policy, approval policy, and runtime gates independently authorize calls.
 
 For a public or multi-user product, start with
 `cayu new NAME --template service`. That template keeps customer authentication,

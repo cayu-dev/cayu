@@ -31,6 +31,7 @@ from tests.workspaces.conformance import (
 )
 
 import cayu.workspaces as workspaces_module
+import cayu.workspaces._local_guard as local_guard_module
 import cayu.workspaces.runner as runner_workspace_module
 from cayu.runners import E2BRunner, LocalRunner, MicrosandboxRunner
 from cayu.workspaces import (
@@ -592,6 +593,131 @@ def test_local_workspace_read_directory_preserves_file_not_found_error(tmp_path:
 
     with pytest.raises(FileNotFoundError, match="Workspace file not found: directory"):
         asyncio.run(workspace.read_bytes("directory"))
+
+
+def test_local_workspace_excluded_directories_are_removed_before_limits_and_dispatch(
+    tmp_path: Path,
+) -> None:
+    protected_git = tmp_path / ".git"
+    protected_git.mkdir()
+    (protected_git / "HEAD").write_bytes(b"ref: refs/heads/main\n")
+    for index in range(8):
+        (protected_git / f"private-{index}.txt").write_bytes(b"private")
+    protected_data = tmp_path / "data"
+    protected_data.mkdir()
+    protected_file = protected_data / "private.txt"
+    protected_file.write_bytes(b"visible")
+    visible = tmp_path / "visible.txt"
+    visible.write_bytes(b"visible")
+    workspace = LocalWorkspace(
+        tmp_path,
+        excluded_directory_names=(".git", "data"),
+    )
+
+    listing = asyncio.run(workspace.list("**/*", limit=1))
+    assert listing.paths == ("visible.txt",)
+    assert listing.total_count == 1
+    assert listing.truncated is False
+
+    visible_read = asyncio.run(workspace.read_bytes("visible.txt"))
+    assert visible_read.revision is not None
+    protected_paths = (
+        ".git/HEAD",
+        ".GIT/HEAD",
+        "data/private.txt",
+        "DATA/private.txt",
+        r".git\HEAD",
+    )
+    for path in protected_paths:
+        with pytest.raises(ValueError, match="excluded directory"):
+            asyncio.run(workspace.read_bytes(path))
+        with pytest.raises(ValueError, match="excluded directory"):
+            workspace.resolve(path)
+        with pytest.raises(ValueError, match="excluded directory"):
+            workspace.resolve_no_symlinks(path)
+
+    with pytest.raises(ValueError, match="excluded directory"):
+        asyncio.run(workspace.write_bytes("data/private.txt", b"changed"))
+    with pytest.raises(ValueError, match="excluded directory"):
+        asyncio.run(workspace.create_bytes("data/new.txt", b"new"))
+    with pytest.raises(ValueError, match="excluded directory"):
+        asyncio.run(
+            workspace.replace_bytes(
+                ".git/HEAD",
+                b"changed",
+                expected_revision=visible_read.revision,
+            )
+        )
+    with pytest.raises(ValueError, match="excluded directory"):
+        asyncio.run(workspace.delete("data/private.txt"))
+    with pytest.raises(ValueError, match="excluded directory"):
+        asyncio.run(
+            workspace.delete_if_revision(
+                ".git/HEAD",
+                expected_revision=visible_read.revision,
+            )
+        )
+
+    assert protected_file.read_bytes() == b"visible"
+    assert (protected_git / "HEAD").read_bytes() == b"ref: refs/heads/main\n"
+    assert workspace.branch_capabilities().isolation is False
+
+
+def test_local_workspace_path_operation_capability_preflight_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(local_guard_module, "_SUPPORTS_DIR_FD", False)
+
+    with pytest.raises(RuntimeError, match="POSIX descriptor-relative"):
+        LocalWorkspace.require_path_operations_supported()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation is platform-dependent")
+@pytest.mark.parametrize("protected_name", [".git", ".cayu"])
+def test_local_workspace_resolve_rechecks_exclusions_after_following_symlinks(
+    tmp_path: Path,
+    protected_name: str,
+) -> None:
+    protected = tmp_path / protected_name
+    protected.mkdir()
+    (protected / "private.txt").write_text("private", encoding="utf-8")
+    visible = tmp_path / "visible"
+    visible.mkdir()
+    visible_file = visible / "public.txt"
+    visible_file.write_text("public", encoding="utf-8")
+    (tmp_path / "protected-alias").symlink_to(protected_name, target_is_directory=True)
+    (tmp_path / "visible-alias").symlink_to("visible", target_is_directory=True)
+    workspace = LocalWorkspace(
+        tmp_path,
+        excluded_directory_names=(protected_name,),
+    )
+
+    with pytest.raises(ValueError, match="excluded directory"):
+        workspace.resolve("protected-alias/private.txt")
+
+    assert workspace.resolve("visible-alias/public.txt") == visible_file.resolve()
+
+
+@pytest.mark.parametrize(
+    "excluded",
+    [
+        ".git",
+        ("",),
+        (".",),
+        ("..",),
+        ("nested/data",),
+        (r"nested\data",),
+        ("data", "data"),
+        ("data", "DATA"),
+        (1,),
+    ],
+)
+def test_local_workspace_rejects_invalid_excluded_directory_names(
+    tmp_path: Path,
+    excluded: object,
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        LocalWorkspace(tmp_path, excluded_directory_names=excluded)  # type: ignore[arg-type]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor traversal")

@@ -645,6 +645,15 @@ def test_search_text_schema_and_registration_limits_are_finite() -> None:
         SearchTextTool(default_limit=10, max_limit=5)
     with pytest.raises(ValueError, match="max_result_bytes"):
         SearchTextTool(max_preview_bytes=500, max_result_bytes=540)
+    with pytest.raises(TypeError, match="protected_entry_names"):
+        SearchTextTool(protected_entry_names=".git")
+    with pytest.raises(TypeError, match="protected_entry_names"):
+        SearchTextTool(protected_entry_names=(1,))  # type: ignore[arg-type]
+    for invalid in ("", ".", "..", "nested/.git", r"nested\.git", "*"):
+        with pytest.raises(ValueError, match="protected_entry_names|protected entry name"):
+            SearchTextTool(protected_entry_names=(invalid,))
+    with pytest.raises(ValueError, match="unique"):
+        SearchTextTool(protected_entry_names=(".git", ".GIT"))
 
 
 @pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep is not installed")
@@ -682,6 +691,7 @@ def test_search_text_registration_controls_the_bounded_runner_request() -> None:
             capture_limit_bytes=12_345,
             max_file_size_bytes=54_321,
             exclude_directories=("generated",),
+            protected_entry_names=(".git",),
         ).run(
             ToolContext(session_id="sess_1", runner=runner),
             {
@@ -711,7 +721,15 @@ def test_search_text_registration_controls_the_bounded_runner_request() -> None:
         + 2
     ] == ["--max-filesize", "54321"]
     assert "!generated/**" in runner.command.argv
+    assert "!generated" not in runner.command.argv
     assert "!dist/**" not in runner.command.argv
+    assert "--iglob" in runner.command.argv
+    assert "!.git" in runner.command.argv
+    assert "!**/.git/**" in runner.command.argv
+    for command in runner.commands:
+        assert command.argv is not None
+        assert "!generated" not in command.argv
+        assert "!.git" in command.argv
     assert runner.command.argv[-1] == "."
     assert "src/**/*.py" in runner.command.argv
     assert "src/a.py" not in runner.command.argv
@@ -955,6 +973,79 @@ def test_search_text_generated_exclusions_cannot_be_reenabled_by_model_glob(
 
     assert result.is_error is False
     assert result.content == "No matches."
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep is not installed")
+def test_search_text_preserves_files_while_excluding_directories_and_protected_entries(
+    tmp_path,
+) -> None:
+    (tmp_path / ".git").write_text("needle in root control file\n", encoding="utf-8")
+    nested = tmp_path / "linked-worktree"
+    nested.mkdir()
+    (nested / ".GiT").write_text("needle in nested control file\n", encoding="utf-8")
+    state_file_parent = tmp_path / "state-file"
+    state_file_parent.mkdir()
+    (state_file_parent / ".CAYU").write_text(
+        "needle in private state file\n",
+        encoding="utf-8",
+    )
+    for directory_name in ("build", "target"):
+        (tmp_path / directory_name).write_text(
+            f"needle in ordinary {directory_name} file\n",
+            encoding="utf-8",
+        )
+        excluded = nested / directory_name
+        excluded.mkdir()
+        (excluded / "private.txt").write_text(
+            "needle in excluded directory\n",
+            encoding="utf-8",
+        )
+    state_directory_parent = tmp_path / "state-directory"
+    state_directory_parent.mkdir()
+    mixed_case_private = state_directory_parent / ".CaYu"
+    mixed_case_private.mkdir()
+    (mixed_case_private / "private.txt").write_text(
+        "needle in protected directory\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "visible.txt").write_text("needle remains visible\n", encoding="utf-8")
+
+    result = asyncio.run(
+        SearchTextTool(
+            exclude_directories=("build", "target"),
+            protected_entry_names=(".git", ".cayu"),
+        ).run(
+            ToolContext(session_id="sess_1", runner=LocalRunner(tmp_path)),
+            {"pattern": "needle", "mode": "files", "glob": "*"},
+        )
+    )
+
+    assert result.is_error is False
+    assert result.structured is not None
+    assert result.structured["matches"] == [
+        {"path": "build"},
+        {"path": "target"},
+        {"path": "visible.txt"},
+    ]
+
+
+def test_search_text_rejects_mixed_case_explicit_protected_entry_path() -> None:
+    runner = _ResultRunner(ExecResult())
+
+    result = asyncio.run(
+        SearchTextTool(protected_entry_names=(".git", ".cayu")).run(
+            ToolContext(session_id="sess_1", runner=runner),
+            {"pattern": "needle", "path": "nested/.CAYU/private.txt"},
+        )
+    )
+
+    assert result.is_error is True
+    assert result.structured == {
+        "error": "search_path_protected",
+        "path": "nested/.CAYU/private.txt",
+        "protected_entry": ".cayu",
+    }
+    assert runner.command is None
 
 
 def test_search_text_rejects_an_explicit_path_inside_an_excluded_directory() -> None:

@@ -473,14 +473,21 @@ async def _exec_git(
     filter_names: tuple[str, ...] = (),
     output_limit_bytes: int,
 ) -> ExecResult | ToolResult:
+    null_device = "NUL" if ntpath.splitdrive(cwd)[0] else "/dev/null"
     try:
         result = await runner.exec(
-            ExecCommand.process(*_safe_git_argv(argv, filter_names=filter_names)),
+            ExecCommand.process(
+                *_safe_git_argv(
+                    argv,
+                    filter_names=filter_names,
+                    null_device=null_device,
+                )
+            ),
             cwd=cwd,
             env={
                 "GIT_ATTR_NOSYSTEM": "1",
                 "GIT_CEILING_DIRECTORIES": cwd,
-                "GIT_CONFIG_GLOBAL": "NUL" if ntpath.splitdrive(cwd)[0] else "/dev/null",
+                "GIT_CONFIG_GLOBAL": null_device,
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_DISCOVERY_ACROSS_FILESYSTEM": "0",
                 "GIT_OPTIONAL_LOCKS": "0",
@@ -554,7 +561,7 @@ async def _configured_filter_names(
         runner,
         [
             "config",
-            "--local",
+            "--includes",
             "--null",
             "--name-only",
             "--get-regexp",
@@ -579,16 +586,63 @@ async def _configured_filter_names(
         )
     names: set[str] = set()
     for key in result.stdout.split("\0"):
-        if not key.startswith("filter."):
+        if not key:
             continue
+        # The exact query may return only executable filter keys. A record that
+        # lost its grammar to UTF-8 projection, secret redaction, or an
+        # incompatible adapter is ambiguous authority and must fail closed.
+        if not key.startswith("filter."):
+            return _unsupported_filter_name_result()
         driver, separator, field = key.removeprefix("filter.").rpartition(".")
-        if separator and driver and field in {"clean", "smudge", "process"}:
-            names.add(driver)
+        # Runner output is a public redacted UTF-8 projection. Reissuing a
+        # transformed key as ``git -c`` authority could leave its original
+        # executable filter enabled, so accept only one complete portable form.
+        if (
+            not separator
+            or not _portable_git_filter_name(driver)
+            or field not in {"clean", "smudge", "process"}
+        ):
+            return _unsupported_filter_name_result()
+        names.add(driver)
+    if (result.exit_code == 0 and not names) or (result.exit_code == 1 and names):
+        return _unsupported_filter_name_result()
     return tuple(sorted(names))
 
 
-def _safe_git_argv(argv: list[str], *, filter_names: tuple[str, ...]) -> list[str]:
-    command = ["git", "--no-pager", "-c", "core.fsmonitor=false"]
+def _unsupported_filter_name_result() -> ToolResult:
+    return ToolResult(
+        content="Git filter configuration cannot be disabled safely.",
+        structured={"error": "git_filter_name_unsupported"},
+        is_error=True,
+    )
+
+
+def _portable_git_filter_name(value: str) -> bool:
+    return (
+        bool(value)
+        and value.isascii()
+        and value[0].isalnum()
+        and value[-1].isalnum()
+        and all(character.isalnum() or character in "._-" for character in value)
+    )
+
+
+def _safe_git_argv(
+    argv: list[str],
+    *,
+    filter_names: tuple[str, ...],
+    null_device: str,
+) -> list[str]:
+    command = [
+        "git",
+        "--no-pager",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        f"core.excludesFile={null_device}",
+        "-c",
+        f"core.attributesFile={null_device}",
+    ]
     for driver in filter_names:
         command.extend(
             (

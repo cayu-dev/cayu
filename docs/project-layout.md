@@ -86,6 +86,32 @@ when the requested behavior actually needs them. `AGENTS.md` is the generated
 project-local source of truth for inspection, safe generation, testing, evals,
 and evidence reporting.
 
+`cayu new NAME --composition coding` is the maintained opt-in starter for a
+repository-coding application. It keeps provider selection in `app.py` and puts
+the explicit assembly in `composition.py`. That module registers existing public
+APIs for bounded file inspection and mutation, `rg` search, Git change review,
+local artifacts, SQLite knowledge with pending writes, a bounded background
+reviewer plus result recovery, and human-input pauses. The generator preflights
+`git`, `rg`, and the POSIX descriptor-relative primitives required by secure
+`LocalWorkspace` path operations, then creates a clean initial Git commit so
+change review has a deterministic baseline. Unsupported hosts fail during
+generation or application construction instead of a later tool call.
+
+The composition selects concrete implementations; selection is not authority.
+The registered exposure policy separately decides which tools are model-visible,
+and ordinary tool policy, approval policy, and runtime gates independently
+authorize calls.
+
+The coding workspace defaults to the generated project root. An explicit
+`CAYU_WORKSPACE_ROOT` may be relative to that project or absolute, but it must
+resolve to an existing Git repository root and never a filesystem root. The
+generated `LocalWorkspace` and minimal-environment `LocalRunner` are trusted-host
+development adapters, not a sandbox. With `inherit_env=False`, the runner still
+forwards Cayu's operational allow-list for command resolution, home, locale, and
+temporary-directory behavior; it does not inherit arbitrary host variables. The
+composition is ordinary editable Python; do not replace it with an implicit agent
+kind, registry, permission grant, or post-start mutation.
+
 ## Large User Project
 
 Large projects should support vertical domain modules:

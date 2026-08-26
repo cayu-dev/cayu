@@ -9,13 +9,13 @@ from pathlib import Path
 import pytest
 
 import cayu.tools.git as git_module
-from cayu.core.tools import ToolContext
-from cayu.runners import LocalRunner
+from cayu.core.tools import ToolContext, ToolResult
+from cayu.runners import ExecResult, LocalRunner
 from cayu.tools import GitChangesTool
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import InvocationRunnerHandle
 from cayu.tools.git import _workspace_cwd
-from cayu.vaults import SecretRedactor
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 from cayu.workspaces import (
     E2BWorkspace,
     LocalWorkspace,
@@ -347,6 +347,204 @@ def test_git_changes_disables_repository_configured_executables(tmp_path: Path) 
 
 
 @pytest.mark.skipif(os.name == "nt", reason="requires a POSIX executable hook")
+def test_git_changes_disables_filters_from_included_repository_config(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _repository(repository)
+    marker = tmp_path / "included-filter-executed"
+    helper = tmp_path / "included-helper.sh"
+    helper.write_text(f"#!/bin/sh\ntouch {marker}\ncat\n")
+    helper.chmod(0o755)
+    included = tmp_path / "included.gitconfig"
+    included.write_text(f'[filter "evil"]\n\tclean = {helper}\n\trequired = true\n')
+    _git(repository, "config", "include.path", str(included))
+    (repository / ".gitattributes").write_text("tracked.txt filter=evil\n")
+    (repository / "tracked.txt").write_text("change\n")
+    ctx = ToolContext(session_id="session", runner=LocalRunner(repository))
+
+    result = asyncio.run(GitChangesTool().run(ctx, {"mode": "diff"}))
+
+    assert result.is_error is False
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires a POSIX executable hook")
+def test_git_changes_disables_worktree_configured_filters(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _repository(repository)
+    marker = tmp_path / "worktree-filter-executed"
+    helper = tmp_path / "worktree-helper.sh"
+    helper.write_text(f"#!/bin/sh\ntouch {marker}\ncat\n")
+    helper.chmod(0o755)
+    _git(repository, "config", "extensions.worktreeConfig", "true")
+    _git(repository, "config", "--worktree", "filter.evil.clean", str(helper))
+    _git(repository, "config", "--worktree", "filter.evil.required", "true")
+    (repository / ".gitattributes").write_text("tracked.txt filter=evil\n")
+    (repository / "tracked.txt").write_text("change\n")
+    ctx = ToolContext(session_id="session", runner=LocalRunner(repository))
+
+    result = asyncio.run(GitChangesTool().run(ctx, {"mode": "diff"}))
+
+    assert result.is_error is False
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires a POSIX executable hook")
+def test_git_changes_rejects_ambiguous_filter_names_before_diff(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _repository(repository)
+    marker = tmp_path / "ambiguous-filter-executed"
+    helper = tmp_path / "ambiguous-helper.sh"
+    helper.write_text(f"#!/bin/sh\ntouch {marker}\ncat\n")
+    helper.chmod(0o755)
+    _git(repository, "config", "filter.evil=driver.clean", str(helper))
+    _git(repository, "config", "filter.evil=driver.required", "true")
+    (repository / ".gitattributes").write_text("tracked.txt filter=evil=driver\n")
+    (repository / "tracked.txt").write_text("change\n")
+    ctx = ToolContext(session_id="session", runner=LocalRunner(repository))
+
+    result = asyncio.run(GitChangesTool().run(ctx, {"mode": "diff"}))
+
+    assert result.is_error is True
+    assert result.structured["error"] == "git_filter_name_unsupported"
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires a POSIX executable hook")
+@pytest.mark.parametrize(
+    "secret_value",
+    [
+        "private-filter-driver-canary",
+        "filter.",
+        ".clean",
+    ],
+)
+def test_git_changes_rejects_redacted_filter_authority_before_diff(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+    secret_value: str,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _repository(repository)
+    driver = "private-filter-driver-canary"
+    marker = tmp_path / "redacted-filter-executed"
+    helper = tmp_path / "redacted-filter-helper.sh"
+    helper.write_text(f"#!/bin/sh\ntouch {marker}\ncat\n")
+    helper.chmod(0o755)
+    _git(repository, "config", f"filter.{driver}.clean", str(helper))
+    _git(repository, "config", f"filter.{driver}.required", "true")
+    (repository / ".gitattributes").write_text(f"tracked.txt filter={driver}\n")
+    (repository / "tracked.txt").write_text("change\n")
+    runner = LocalRunner(repository)
+    handle = InvocationRunnerHandle(
+        runner,
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(secret_value),
+        ),
+    )
+    ctx = ToolContext(session_id="session", runner=handle)
+
+    result = asyncio.run(GitChangesTool().run(ctx, {"mode": "diff"}))
+
+    assert result.is_error is True
+    assert result.structured == {"error": "git_filter_name_unsupported"}
+    assert REDACTED_SECRET not in result.content
+    assert driver not in json.dumps(result.model_dump(mode="json"))
+    assert secret_value not in json.dumps(result.model_dump(mode="json"))
+    assert driver not in caplog.text
+    assert secret_value not in caplog.text
+    captured = capsys.readouterr()
+    assert driver not in captured.out
+    assert driver not in captured.err
+    assert secret_value not in captured.out
+    assert secret_value not in captured.err
+    assert all(driver not in str(warning.message) for warning in recwarn)
+    assert all(secret_value not in str(warning.message) for warning in recwarn)
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "projected_name",
+    [
+        "hostile\ufffdname",
+        REDACTED_SECRET,
+        f"hostile-{REDACTED_SECRET}-name",
+        "hostile/name",
+        ".hostile",
+        "hostile.",
+    ],
+)
+def test_git_changes_rejects_nonportable_projected_filter_names(
+    projected_name: str,
+) -> None:
+    class ConfigRunner:
+        async def exec(self, command, **kwargs):
+            del command, kwargs
+            return ExecResult(
+                exit_code=0,
+                stdout=f"filter.{projected_name}.clean\0",
+                stderr="",
+            )
+
+    result = asyncio.run(git_module._configured_filter_names(ConfigRunner(), cwd="/workspace"))
+
+    assert isinstance(result, ToolResult)
+    assert result.structured == {"error": "git_filter_name_unsupported"}
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        f"{REDACTED_SECRET}.hostile.clean",
+        f"filter.hostile.{REDACTED_SECRET}",
+        "unrelated.hostile.clean",
+        "filter.hostile.required",
+    ],
+)
+def test_git_changes_rejects_malformed_projected_filter_records(
+    record: str,
+) -> None:
+    class ConfigRunner:
+        async def exec(self, command, **kwargs):
+            del command, kwargs
+            return ExecResult(exit_code=0, stdout=f"{record}\0", stderr="")
+
+    result = asyncio.run(git_module._configured_filter_names(ConfigRunner(), cwd="/workspace"))
+
+    assert isinstance(result, ToolResult)
+    assert result.structured == {"error": "git_filter_name_unsupported"}
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "stdout"),
+    [
+        (0, ""),
+        (0, "\0"),
+        (1, "filter.safe.clean\0"),
+    ],
+)
+def test_git_changes_rejects_inconsistent_filter_query_status(
+    exit_code: int,
+    stdout: str,
+) -> None:
+    class ConfigRunner:
+        async def exec(self, command, **kwargs):
+            del command, kwargs
+            return ExecResult(exit_code=exit_code, stdout=stdout, stderr="")
+
+    result = asyncio.run(git_module._configured_filter_names(ConfigRunner(), cwd="/workspace"))
+
+    assert isinstance(result, ToolResult)
+    assert result.structured == {"error": "git_filter_name_unsupported"}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires a POSIX executable hook")
 def test_git_changes_ignores_global_filter_configuration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -373,6 +571,41 @@ def test_git_changes_ignores_global_filter_configuration(
 
     assert result.is_error is False
     assert not marker.exists()
+
+
+def test_git_changes_ignores_default_global_ignore_and_attributes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _repository(repository)
+    home = tmp_path / "home"
+    global_git = home / ".config" / "git"
+    global_git.mkdir(parents=True)
+    (global_git / "ignore").write_text("*.py\n", encoding="utf-8")
+    (global_git / "attributes").write_text("tracked.txt binary\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    (repository / "hidden.py").write_text("visible to Cayu\n", encoding="utf-8")
+    (repository / "tracked.txt").write_text("after\n", encoding="utf-8")
+    ctx = ToolContext(session_id="session", runner=LocalRunner(repository))
+
+    status = asyncio.run(GitChangesTool().run(ctx, {"mode": "status"}))
+    diff = asyncio.run(
+        GitChangesTool().run(
+            ctx,
+            {"mode": "diff", "paths": ["tracked.txt"]},
+        )
+    )
+
+    assert status.is_error is False
+    assert {change["path"] for change in status.structured["changes"]} == {
+        "hidden.py",
+        "tracked.txt",
+    }
+    assert diff.is_error is False
+    assert diff.structured["binary_omitted"] is False
+    assert "+after" in diff.content
 
 
 def test_git_changes_numstat_is_filename_safe_and_distinguishes_count_kinds(

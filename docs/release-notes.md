@@ -89,6 +89,31 @@ guard.
 
 ## Unreleased
 
+### Generated projects can opt in to an explicit coding composition
+
+`cayu new NAME --composition coding` now generates one runnable, ordinary-Python
+composition for repository work. It assembles existing bounded file/search/Git
+tools, local artifacts, durable reviewed knowledge, background reviewer
+delegation with result recovery, and human-input pause/resume. The generated
+manifest and control plane expose the ordinary agents, tools, environment, and
+stores; no new agent kind, registry, implicit permission, or post-start mutation
+is introduced.
+
+Starter selection only chooses implementations. The registered exposure policy
+separately governs model visibility, while tool policy, approval policy, and the
+ordinary runtime gates remain the independent call-authorization boundary.
+
+Generation requires `git`, `rg`, and the POSIX descriptor-relative filesystem
+primitives used by secure `LocalWorkspace` path operations, initializes a clean
+Git baseline, and emits a credential-free smoke that exercises the whole
+composition. Unsupported hosts fail during generation or application
+construction. The selected workspace defaults to the project root and may be
+overridden with `CAYU_WORKSPACE_ROOT`, subject to explicit existing-Git-root and
+non-filesystem-root checks. The trusted-host local runner does not inherit
+arbitrary ambient variables, but still forwards Cayu's minimal operational
+allow-list, and is documented as non-sandboxed. The default and service scaffolds
+remain unchanged, and service plus coding composition is rejected.
+
 ### Trusted host tools can opt into a hard POSIX process deadline
 
 `ProcessIsolatedTool` adds an explicit reconstructable JSON-only adapter for

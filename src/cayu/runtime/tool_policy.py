@@ -18,7 +18,10 @@ from cayu._validation import (
     require_nonblank,
 )
 from cayu.core.agents import AgentSpec
-from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.core.execution_identity import (
+    ExecutionProfileBehaviorIdentity,
+    copy_execution_profile_behavior_identity,
+)
 from cayu.core.tools import ToolEffect
 from cayu.runtime.sessions import Session
 
@@ -405,6 +408,7 @@ class ParameterConstrainedToolPolicy(ToolPolicy):
         rules: dict[str, Iterable[ParameterRule]],
         *,
         decision: ToolPolicyDecision = ToolPolicyDecision.DENY,
+        execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
     ) -> None:
         if type(rules) is not dict:
             raise TypeError("ParameterConstrainedToolPolicy rules must be a dict.")
@@ -416,6 +420,13 @@ class ParameterConstrainedToolPolicy(ToolPolicy):
         for tool_name, tool_rules in rules.items():
             name = require_clean_nonblank(tool_name, "tool_name")
             self.rules[name] = _copy_parameter_rules(tool_rules, f"rules[{name!r}]")
+        self._execution_profile_identity = copy_execution_profile_behavior_identity(
+            execution_profile_identity
+        )
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity | None:
+        return copy_execution_profile_behavior_identity(self._execution_profile_identity)
 
     def _execution_profile_material(self) -> dict[str, Any] | None:
         """Return material only when every rule has a safe exact-type extractor."""

@@ -7,6 +7,7 @@ import importlib
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +20,7 @@ from cayu import (
     EvalStatus,
     InMemorySessionStore,
     InMemoryTaskStore,
+    LocalWorkspace,
     Message,
     ModelStreamEvent,
     RunRequest,
@@ -28,16 +30,74 @@ from cayu import (
 )
 from cayu import __version__ as cayu_version
 from cayu.cli import main
+from cayu.cli._bounded_command import BoundedCommandResult
 from cayu.cli.project import project_context
 
 _RESERVED_TEMPLATE_TOKENS = (
     "__PROJECT_NAME__",
     "__AGENT_NAME__",
+    "__REVIEWER_NAME__",
     "__CAYU_VERSION__",
     "__PROVIDER_DISPLAY__",
     "__PROVIDER_LITERAL__",
     "__PROVIDER_GUIDE_POINTER__",
 )
+
+
+def _bypass_coding_dependency_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep non-probe scaffold tests independent of host ripgrep availability."""
+
+    from cayu.cli import scaffold
+
+    git = shutil.which("git")
+    assert git is not None
+
+    def bypass(*, parent: Path) -> tuple[str, str]:
+        del parent
+        return git, "test-owned-rg"
+
+    monkeypatch.setattr(scaffold, "_preflight_coding_commands", bypass)
+
+
+def _compatible_coding_probe_result() -> BoundedCommandResult:
+    """Return all positive evidence consumed by one dependency-preflight test."""
+
+    evidence = (
+        b"probe.txt\0staged.txt\0search.txt\0"
+        b" M probe.txt\0A  staged.txt\0AM probe.txt\0"
+        b"-cayu scaffold probe\n+cayu scaffold semantic probe\n"
+        b"-cayu dependency baseline\n+cayu dependency changed\n"
+        b"staged.txt\n+cayu staged semantic probe\n"
+        b"1\t1\tprobe.txt\0"
+        b"1\t0\tprobe.txt\0"
+        b"1\t0\tstaged.txt\0"
+        b"probe.txt|1|cayu scaffold semantic probe\n"
+        b"search.txt|1|cayu dependency needle\n"
+        b"probe.txt\01\nsearch.txt\01\n"
+    )
+    return BoundedCommandResult(
+        returncode=0,
+        output=evidence,
+        output_truncated=False,
+    )
+
+
+def _install_hermetic_coding_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide exact test-owned Git/rg probe seams without invoking host tools."""
+
+    from cayu.cli import scaffold
+
+    monkeypatch.setattr(
+        scaffold.shutil,
+        "which",
+        lambda command: f"/test-bin/{command}" if command in {"git", "rg"} else None,
+    )
+
+    def compatible(argv, **kwargs) -> BoundedCommandResult:
+        del argv, kwargs
+        return _compatible_coding_probe_result()
+
+    monkeypatch.setattr(scaffold, "run_bounded_command", compatible)
 
 
 def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> None:
@@ -150,6 +210,616 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "uv run cayu serve --dev" in output
     assert "http://127.0.0.1:8000/cayu/" in output
     assert "none selected" in output
+
+
+def test_cayu_new_coding_emits_explicit_composition_and_clean_git_baseline(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _bypass_coding_dependency_preflight(monkeypatch)
+    assert main(["new", "coder", "--composition", "coding", "--dir", str(tmp_path)]) == 0
+    project = tmp_path / "coder"
+
+    for filename in (
+        "command_probe.py",
+        "composition.py",
+        "agents/reviewer.py",
+        "tests/test_coding_composition.py",
+    ):
+        assert (project / filename).is_file()
+    assert (
+        subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=project,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == ""
+    )
+    assert (
+        subprocess.run(
+            ["git", "log", "-1", "--format=%s"],
+            cwd=project,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "Initial Cayu coding composition"
+    )
+
+    composition = (project / "composition.py").read_text(encoding="utf-8")
+    command_probe = (project / "command_probe.py").read_text(encoding="utf-8")
+    assert (project / ".gitignore").read_text(encoding="utf-8").startswith(".cayu/\n")
+    assert "from command_probe import" in composition
+    assert "cayu.cli._bounded_command" not in composition
+    assert "run_bounded_command" in command_probe
+    for public_surface in (
+        "LocalWorkspace",
+        "LocalRunner",
+        "LocalArtifactStore",
+        "SQLiteKnowledgeStore",
+        "SearchTextTool",
+        "GitChangesTool",
+        "SubagentTool",
+        "SubagentResultTool",
+        "UserInputTool",
+        "AllRegisteredToolsExposurePolicy",
+        "ParameterConstrainedToolPolicy",
+    ):
+        assert public_surface in composition
+    assert "mode=SubagentExecutionMode.BACKGROUND" in composition
+    assert 'os.environ.get("CAYU_WORKSPACE_ROOT", ".")' in composition
+    assert "inherit_env=False" in composition
+    assert '_STATE_ROOT = _PROJECT_ROOT / ".cayu" / "runtime"' in composition
+    assert "excluded_directory_names=_PROTECTED_WORKSPACE_DIRECTORY_NAMES" in composition
+    assert "LocalWorkspace.require_path_operations_supported()" in composition
+    assert "exclude_directories=_SEARCH_EXCLUDED_DIRECTORIES" in composition
+    assert "protected_entry_names=_PROTECTED_WORKSPACE_DIRECTORY_NAMES" in composition
+    readme = (project / "README.md").read_text(encoding="utf-8")
+    instructions = (project / "AGENTS.md").read_text(encoding="utf-8")
+    for identity in (
+        "_PRIMARY_TOOL_POLICY_IDENTITY",
+        "_SUBAGENT_RESULT_TOOL_IDENTITY",
+        "_coding_environment_identity()",
+        "REVIEWER_EXECUTION_PROFILE_IDENTITY",
+        "_subagent_tool_identity()",
+    ):
+        assert identity in readme
+        assert identity in instructions
+    assert "older continuations fail closed" in " ".join(readme.split())
+    assert "stale durable continuations fail closed" in " ".join(instructions.split())
+    assert "project-owned standard-library support" in " ".join(readme.split())
+    assert "state is stored below that protected `.cayu` boundary" in " ".join(readme.split())
+    assert "runtime-private `.cayu` directories excluded" in " ".join(instructions.split())
+    assert "do not replace it with an import from Cayu's private modules" in " ".join(
+        instructions.split()
+    )
+
+    spec = importlib.util.spec_from_file_location("coding_scaffolded_app", project / "app.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    with project_context(project):
+        spec.loader.exec_module(module)
+        monkeypatch.setitem(
+            module.build_coding_app.__globals__,
+            "_verify_coding_dependencies",
+            lambda root: None,
+        )
+        app = module.build_app(
+            provider=ScriptedModelProvider([]),
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+        )
+    manifest = app.describe()
+    assert {agent.name for agent in manifest.agents} == {"coder", "coder-reviewer"}
+    registered_primary = app._agents["coder"]
+    assert registered_primary.tools["subagent"].tool.spec.execution_profile_identity is None
+    assert registered_primary.tools["subagent_result"].tool.spec.execution_profile_identity is None
+    primary = next(agent for agent in manifest.agents if agent.name == "coder")
+    assert {tool.name for tool in primary.tools} >= {
+        "list_files",
+        "search_text",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "delete_file",
+        "git_changes",
+        "list_artifacts",
+        "list_knowledge",
+        "search_knowledge",
+        "read_knowledge",
+        "remember_knowledge",
+        "subagent",
+        "subagent_result",
+        "ask_user",
+    }
+    assert manifest.defaults.environment == "coding"
+    assert manifest.stores.knowledge == "SQLiteKnowledgeStore"
+
+    output = capsys.readouterr().out
+    assert "pytest -q tests/test_coding_composition.py" in output
+    assert '--agent coder --message "YOUR REQUEST"' in output
+
+
+def test_cayu_new_coding_rejects_unsupported_local_workspace_before_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def unsupported() -> None:
+        raise RuntimeError(
+            "LocalWorkspace requires POSIX descriptor-relative filesystem primitives."
+        )
+
+    monkeypatch.setattr(
+        LocalWorkspace,
+        "require_path_operations_supported",
+        staticmethod(unsupported),
+    )
+
+    assert main(["new", "coder", "--composition", "coding", "--dir", str(tmp_path)]) == 1
+
+    assert not (tmp_path / "coder").exists()
+    assert "requires POSIX descriptor-relative filesystem primitives" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows capability evidence")
+def test_cayu_new_coding_rejects_native_windows_workspace_before_creation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["new", "coder", "--composition", "coding", "--dir", str(tmp_path)]) == 1
+
+    assert not (tmp_path / "coder").exists()
+    assert "requires POSIX descriptor-relative filesystem primitives" in capsys.readouterr().err
+
+
+def test_cayu_new_coding_rejects_service_and_missing_dependencies(
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    assert (
+        main(
+            [
+                "new",
+                "service-coder",
+                "--composition",
+                "coding",
+                "--template",
+                "service",
+                "--dir",
+                str(tmp_path),
+            ]
+        )
+        == 1
+    )
+    assert not (tmp_path / "service-coder").exists()
+    assert "cannot be combined" in capsys.readouterr().err
+
+    from cayu.cli import scaffold
+
+    real_which = scaffold.shutil.which
+    monkeypatch.setattr(
+        scaffold.shutil,
+        "which",
+        lambda command: None if command == "rg" else real_which(command),
+    )
+    assert main(["new", "missing-rg", "--composition", "coding", "--dir", str(tmp_path)]) == 1
+    assert not (tmp_path / "missing-rg").exists()
+    assert "requires these commands on PATH: rg" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("command", "unsupported_flag"),
+    [
+        ("git", "--force"),
+        ("git", "ls-files"),
+        ("git", "--cached"),
+        ("git", "--numstat"),
+        ("rg", "--files-with-matches"),
+        ("rg", "--count-matches"),
+        ("rg", "--glob"),
+        ("rg", "--iglob"),
+        ("rg", "--ignore-case"),
+    ],
+)
+def test_cayu_new_coding_rejects_incompatible_runtime_command_dialects(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    unsupported_flag: str,
+) -> None:
+    from cayu.cli import scaffold
+    from cayu.cli._bounded_command import BoundedCommandResult
+
+    _install_hermetic_coding_preflight(monkeypatch)
+
+    def incompatible(argv, **kwargs):
+        if Path(argv[0]).name == command and unsupported_flag in argv:
+            return BoundedCommandResult(
+                returncode=7,
+                output=b"",
+                output_truncated=False,
+            )
+        return _compatible_coding_probe_result()
+
+    monkeypatch.setattr(scaffold, "run_bounded_command", incompatible)
+    project_name = f"incompatible-{command}-{unsupported_flag.removeprefix('--')}"
+    assert (
+        main(
+            [
+                "new",
+                project_name,
+                "--composition",
+                "coding",
+                "--dir",
+                str(tmp_path),
+            ]
+        )
+        == 1
+    )
+    assert not (tmp_path / project_name).exists()
+    assert f"{command} failed with exit code 7" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("command", "semantic_argument"),
+    [
+        ("git", "status"),
+        ("rg", "--files"),
+    ],
+)
+def test_cayu_new_coding_rejects_false_success_dependency_shims(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    semantic_argument: str,
+) -> None:
+    from cayu.cli import scaffold
+    from cayu.cli._bounded_command import BoundedCommandResult
+
+    _install_hermetic_coding_preflight(monkeypatch)
+
+    def false_success(argv, **kwargs):
+        if Path(argv[0]).name == command and semantic_argument in argv:
+            return BoundedCommandResult(
+                returncode=0,
+                output=b"",
+                output_truncated=False,
+            )
+        return _compatible_coding_probe_result()
+
+    monkeypatch.setattr(scaffold, "run_bounded_command", false_success)
+    project_name = f"false-success-{command}"
+    assert (
+        main(
+            [
+                "new",
+                project_name,
+                "--composition",
+                "coding",
+                "--dir",
+                str(tmp_path),
+            ]
+        )
+        == 1
+    )
+    assert not (tmp_path / project_name).exists()
+    assert f"{command} semantic probe failed" in capsys.readouterr().err
+
+
+def test_cayu_new_coding_confines_git_authority_and_ignores_global_hooks(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cayu.cli import scaffold
+
+    _bypass_coding_dependency_preflight(monkeypatch)
+
+    canary = tmp_path / "canary"
+    canary.mkdir()
+    setup_hooks = tmp_path / "setup-hooks"
+    setup_hooks.mkdir()
+    git = scaffold.shutil.which("git")
+    assert git is not None
+    setup_environment = scaffold._sanitized_scaffold_git_environment(cwd=canary)
+    scaffold._run_scaffold_command(
+        scaffold._safe_git_argv(
+            git,
+            "init",
+            "-b",
+            "main",
+            f"--template={setup_hooks}",
+            hooks_dir=setup_hooks,
+        ),
+        cwd=canary,
+        env=setup_environment,
+    )
+    (canary / "owned.txt").write_text("unchanged\n", encoding="utf-8")
+    scaffold._run_scaffold_command(
+        scaffold._safe_git_argv(git, "add", "--", ".", hooks_dir=setup_hooks),
+        cwd=canary,
+        env=setup_environment,
+    )
+    scaffold._run_scaffold_command(
+        scaffold._safe_git_argv(
+            git,
+            "-c",
+            "user.name=Cayu Test",
+            "-c",
+            "user.email=test@cayu.local",
+            "commit",
+            "-m",
+            "canary",
+            hooks_dir=setup_hooks,
+        ),
+        cwd=canary,
+        env=setup_environment,
+    )
+    ambient_index = tmp_path / "ambient-index"
+    ambient_index.write_bytes((canary / ".git" / "index").read_bytes())
+    before = ambient_index.read_bytes()
+
+    fake_home = tmp_path / "home"
+    hooks = fake_home / "hooks"
+    hooks.mkdir(parents=True)
+    global_git = fake_home / ".config" / "git"
+    global_git.mkdir(parents=True)
+    (global_git / "ignore").write_text("*.py\n", encoding="utf-8")
+    (global_git / "attributes").write_text("*.md binary\n", encoding="utf-8")
+    hook_marker = tmp_path / "ambient-hook-ran"
+    hook = hooks / "pre-commit"
+    hook.write_text(f"#!/bin/sh\ntouch {hook_marker}\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+    (fake_home / ".gitconfig").write_text(
+        f"[core]\n\thooksPath = {hooks}\n[commit]\n\tgpgSign = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("GIT_DIR", str(canary / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(canary))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(ambient_index))
+
+    assert main(["new", "safe-coder", "--composition", "coding", "--dir", str(tmp_path)]) == 0
+    assert ambient_index.read_bytes() == before
+    assert not hook_marker.exists()
+    project = tmp_path / "safe-coder"
+    assert (project / ".git").is_dir()
+    tracked_output = scaffold._run_scaffold_command(
+        scaffold._safe_git_argv(
+            git,
+            "ls-files",
+            "--cached",
+            "-z",
+            "--",
+            hooks_dir=setup_hooks,
+        ),
+        cwd=project,
+        env=scaffold._sanitized_scaffold_git_environment(cwd=project),
+    )
+    assert {path for path in tracked_output.split("\0") if path} == set(
+        scaffold.project_files("safe-coder", composition="coding")
+    )
+    assert "Scaffolded" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX sticky-directory modes")
+def test_cayu_new_coding_rejects_nonsticky_shared_parent(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o777)
+
+    assert main(["new", "unsafe-coder", "--composition", "coding", "--dir", str(shared)]) == 1
+    assert not (shared / "unsafe-coder").exists()
+    assert "group/world-writable unless it is sticky" in capsys.readouterr().err
+
+
+def test_scaffold_parent_mode_does_not_apply_posix_bits_on_windows() -> None:
+    from cayu.cli import scaffold
+
+    assert scaffold._unsafe_shared_scaffold_parent_mode(0o777, platform="posix") is True
+    assert scaffold._unsafe_shared_scaffold_parent_mode(0o1777, platform="posix") is False
+    assert scaffold._unsafe_shared_scaffold_parent_mode(0o777, platform="nt") is False
+
+
+def test_cayu_new_coding_removes_generated_files_after_git_failure(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cayu.cli import scaffold
+
+    _bypass_coding_dependency_preflight(monkeypatch)
+
+    original = scaffold._run_scaffold_command
+
+    def fail_target_commit(argv, *, cwd, env=None, allowed_exit_codes=frozenset({0})):
+        if cwd.name.startswith(".broken-coder.cayu-scaffold-") and "commit" in argv:
+            raise scaffold._ScaffoldCommandError("forced commit failure")
+        return original(
+            argv,
+            cwd=cwd,
+            env=env,
+            allowed_exit_codes=allowed_exit_codes,
+        )
+
+    monkeypatch.setattr(scaffold, "_run_scaffold_command", fail_target_commit)
+    assert main(["new", "broken-coder", "--composition", "coding", "--dir", str(tmp_path)]) == 1
+    assert (tmp_path / "broken-coder").is_dir()
+    assert list((tmp_path / "broken-coder").iterdir()) == []
+    assert "forced commit failure" in capsys.readouterr().err
+
+
+def test_cayu_new_coding_preserves_preexisting_empty_target_after_git_failure(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cayu.cli import scaffold
+
+    _bypass_coding_dependency_preflight(monkeypatch)
+
+    target = tmp_path / "existing-coder"
+    target.mkdir(mode=0o700)
+    before = target.stat()
+    original = scaffold._run_scaffold_command
+
+    def fail_target_commit(argv, *, cwd, env=None, allowed_exit_codes=frozenset({0})):
+        if cwd.name.startswith(".existing-coder.cayu-scaffold-") and "commit" in argv:
+            raise scaffold._ScaffoldCommandError("forced commit failure")
+        return original(
+            argv,
+            cwd=cwd,
+            env=env,
+            allowed_exit_codes=allowed_exit_codes,
+        )
+
+    monkeypatch.setattr(scaffold, "_run_scaffold_command", fail_target_commit)
+    assert main(["new", target.name, "--composition", "coding", "--dir", str(tmp_path)]) == 1
+    after = target.stat()
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert after.st_mode == before.st_mode
+    assert list(target.iterdir()) == []
+    assert "forced commit failure" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlink semantics")
+def test_cayu_new_coding_cleanup_does_not_follow_replaced_generated_directory(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cayu.cli import scaffold
+
+    _bypass_coding_dependency_preflight(monkeypatch)
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    canary = outside / "reviewer.py"
+    canary.write_text("outside-owned\n", encoding="utf-8")
+    original = scaffold._run_scaffold_command
+
+    def replace_agents_then_fail(argv, *, cwd, env=None, allowed_exit_codes=frozenset({0})):
+        if cwd.name.startswith(".symlink-coder.cayu-scaffold-") and "commit" in argv:
+            shutil.rmtree(cwd / "agents")
+            (cwd / "agents").symlink_to(outside, target_is_directory=True)
+            raise scaffold._ScaffoldCommandError("forced commit failure")
+        return original(
+            argv,
+            cwd=cwd,
+            env=env,
+            allowed_exit_codes=allowed_exit_codes,
+        )
+
+    monkeypatch.setattr(scaffold, "_run_scaffold_command", replace_agents_then_fail)
+    assert main(["new", "symlink-coder", "--composition", "coding", "--dir", str(tmp_path)]) == 1
+    assert canary.read_text(encoding="utf-8") == "outside-owned\n"
+    assert list((tmp_path / "symlink-coder").iterdir()) == []
+    assert "forced commit failure" in capsys.readouterr().err
+
+
+def test_cayu_new_coding_does_not_clean_replacement_target(
+    tmp_path: Path,
+    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cayu.cli import scaffold
+
+    _bypass_coding_dependency_preflight(monkeypatch)
+
+    target = tmp_path / "replaced-coder"
+    moved = tmp_path / "original-coder"
+    replacement_canary = "replacement-owned\n"
+    original = scaffold._publish_staged_scaffold
+
+    def replace_before_publish(*, staging, target, expected_target_identity, target_mode):
+        target.rename(moved)
+        target.mkdir()
+        (target / ".git").mkdir()
+        (target / ".git" / "replacement-owned").write_text(
+            replacement_canary,
+            encoding="utf-8",
+        )
+        (target / "pyproject.toml").write_text(replacement_canary, encoding="utf-8")
+        (target / "owned.txt").write_text(replacement_canary, encoding="utf-8")
+        return original(
+            staging=staging,
+            target=target,
+            expected_target_identity=expected_target_identity,
+            target_mode=target_mode,
+        )
+
+    monkeypatch.setattr(scaffold, "_publish_staged_scaffold", replace_before_publish)
+    assert main(["new", target.name, "--composition", "coding", "--dir", str(tmp_path)]) == 1
+    assert (target / "pyproject.toml").read_text(encoding="utf-8") == replacement_canary
+    assert (target / "owned.txt").read_text(encoding="utf-8") == replacement_canary
+    assert (target / ".git" / "replacement-owned").read_text(encoding="utf-8") == (
+        replacement_canary
+    )
+    assert moved.is_dir()
+    assert "target identity changed" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("failure", "detail"),
+    [
+        ("start", "could not start"),
+        ("timeout", "timed out"),
+        ("read", "output could not be read"),
+    ],
+)
+def test_scaffold_command_probe_bounds_start_and_timeout_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    detail: str,
+) -> None:
+    from cayu.cli import scaffold
+
+    def fail(*args, **kwargs):
+        del args, kwargs
+        if failure == "start":
+            raise scaffold.BoundedCommandStartError
+        if failure == "timeout":
+            raise scaffold.BoundedCommandTimeoutError
+        raise scaffold.BoundedCommandReadError
+
+    monkeypatch.setattr(scaffold, "run_bounded_command", fail)
+    with pytest.raises(scaffold._ScaffoldCommandError, match=detail):
+        scaffold._run_scaffold_command(["rg", "--version"], cwd=tmp_path)
+
+
+def test_scaffold_command_probe_reports_incompatible_exit_without_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cayu.cli import scaffold
+    from cayu.cli._bounded_command import BoundedCommandResult
+
+    canary = "PRIVATE_COMMAND_OUTPUT"
+
+    def incompatible(argv, **kwargs):
+        del argv, kwargs
+        return BoundedCommandResult(
+            returncode=9,
+            output=canary.encode(),
+            output_truncated=False,
+        )
+
+    monkeypatch.setattr(scaffold, "run_bounded_command", incompatible)
+    with pytest.raises(scaffold._ScaffoldCommandError) as raised:
+        scaffold._run_scaffold_command(["rg", "--version"], cwd=tmp_path)
+    assert "exit code 9" in str(raised.value)
+    assert canary not in str(raised.value)
 
 
 def test_cayu_new_service_emits_the_supported_secure_product_shell(

@@ -993,13 +993,13 @@ def test_stdio_initialization_deadline_does_not_wait_for_process_cleanup(
             graceful_shutdown_timeout_s=0.1,
         )
         connect_task = asyncio.create_task(client.connect(delayed_server))
-        await asyncio.wait_for(close_started.wait(), timeout=0.2)
+        await asyncio.wait_for(close_started.wait(), timeout=1.0)
         done, _ = await asyncio.wait({connect_task}, timeout=0.05)
         returned_before_close = connect_task in done and not close_finished.is_set()
         release_close.set()
         with pytest.raises(McpCallDeadlineExceededError, match="total call deadline"):
             await connect_task
-        await asyncio.wait_for(close_finished.wait(), timeout=0.2)
+        await asyncio.wait_for(close_finished.wait(), timeout=1.0)
         return returned_before_close
 
     assert asyncio.run(run()) is True

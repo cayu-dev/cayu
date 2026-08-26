@@ -159,6 +159,7 @@ class SearchTextTool(Tool):
             "capture_limit_bytes": self.capture_limit_bytes,
             "max_file_size_bytes": self.max_file_size_bytes,
             "exclude_directories": list(self.exclude_directories),
+            "protected_entry_names": list(self.protected_entry_names),
         }
 
     def __init__(
@@ -172,6 +173,7 @@ class SearchTextTool(Tool):
         capture_limit_bytes: int = DEFAULT_SEARCH_CAPTURE_LIMIT_BYTES,
         max_file_size_bytes: int = DEFAULT_SEARCH_MAX_FILE_SIZE_BYTES,
         exclude_directories: Iterable[str] = DEFAULT_SEARCH_EXCLUDE_DIRECTORIES,
+        protected_entry_names: Iterable[str] = (),
         spec: ToolSpec | None = None,
     ) -> None:
         self.default_limit = _configuration_int(
@@ -217,6 +219,7 @@ class SearchTextTool(Tool):
             maximum=MAX_SEARCH_MAX_FILE_SIZE_BYTES,
         )
         self.exclude_directories = _validate_exclude_directories(exclude_directories)
+        self.protected_entry_names = _validate_protected_entry_names(protected_entry_names)
         super().__init__(
             spec
             or _search_text_tool_spec(
@@ -271,6 +274,21 @@ class SearchTextTool(Tool):
                 },
                 is_error=True,
             )
+        protected_path = _matching_protected_entry(path, self.protected_entry_names)
+        if protected_path is not None:
+            return ToolResult(
+                content=_bounded_message(
+                    f"Search path contains the protected `{protected_path}` entry. "
+                    "Narrow the search elsewhere or change the tool registration.",
+                    self.max_result_bytes,
+                ),
+                structured={
+                    "error": "search_path_protected",
+                    "path": path,
+                    "protected_entry": protected_path,
+                },
+                is_error=True,
+            )
 
         scope_globs = _search_scope_globs(path, glob)
         visible_paths: set[str] | None = None
@@ -282,6 +300,7 @@ class SearchTextTool(Tool):
                 runner,
                 _file_listing_argv(
                     exclude_directories=self.exclude_directories,
+                    protected_entry_names=self.protected_entry_names,
                     max_file_size_bytes=self.max_file_size_bytes,
                 ),
                 timeout_s=self.timeout_s,
@@ -343,9 +362,11 @@ class SearchTextTool(Tool):
             argv.append("--ignore-case")
         for scope_glob in scope_globs:
             argv.extend(["--glob", scope_glob])
-        for directory in self.exclude_directories:
-            argv.extend(["--glob", f"!{directory}/**"])
-            argv.extend(["--glob", f"!**/{directory}/**"])
+        _append_search_exclusions(
+            argv,
+            exclude_directories=self.exclude_directories,
+            protected_entry_names=self.protected_entry_names,
+        )
         argv.extend(["--", pattern, "."])
         raw = await _run_search_command(
             ctx,
@@ -571,6 +592,7 @@ async def _run_search_command(
 def _file_listing_argv(
     *,
     exclude_directories: tuple[str, ...],
+    protected_entry_names: tuple[str, ...],
     max_file_size_bytes: int,
 ) -> list[str]:
     argv = [
@@ -585,11 +607,31 @@ def _file_listing_argv(
         "--max-filesize",
         str(max_file_size_bytes),
     ]
+    _append_search_exclusions(
+        argv,
+        exclude_directories=exclude_directories,
+        protected_entry_names=protected_entry_names,
+    )
+    argv.extend(["--", "."])
+    return argv
+
+
+def _append_search_exclusions(
+    argv: list[str],
+    *,
+    exclude_directories: tuple[str, ...],
+    protected_entry_names: tuple[str, ...],
+) -> None:
+    """Append directory-only and case-insensitive protected-entry exclusions."""
+
     for directory in exclude_directories:
         argv.extend(["--glob", f"!{directory}/**"])
         argv.extend(["--glob", f"!**/{directory}/**"])
-    argv.extend(["--", "."])
-    return argv
+    for entry in protected_entry_names:
+        argv.extend(["--iglob", f"!{entry}"])
+        argv.extend(["--iglob", f"!**/{entry}"])
+        argv.extend(["--iglob", f"!{entry}/**"])
+        argv.extend(["--iglob", f"!**/{entry}/**"])
 
 
 def _preflight_search_failure(
@@ -935,6 +977,17 @@ def _matching_excluded_directory(
     return None
 
 
+def _matching_protected_entry(
+    path: str,
+    protected_entry_names: tuple[str, ...],
+) -> str | None:
+    path_parts = tuple(part.casefold() for part in path.strip("/").split("/") if part)
+    for entry in protected_entry_names:
+        if entry.casefold() in path_parts:
+            return entry
+    return None
+
+
 def _validate_balanced_glob_operators(value: str) -> None:
     stack: list[str] = []
     escaped = False
@@ -1118,4 +1171,35 @@ def _validate_exclude_directories(values: Iterable[str]) -> tuple[str, ...]:
         if any(character in value for character in "*?[]{}!"):
             raise ValueError("exclude_directories entries must not contain glob operators.")
         validated.append(value.rstrip("/"))
+    return tuple(validated)
+
+
+def _validate_protected_entry_names(values: Iterable[str]) -> tuple[str, ...]:
+    if isinstance(values, str | bytes):
+        raise TypeError("protected_entry_names must be an iterable of strings.")
+    try:
+        copied = tuple(values)
+    except TypeError as exc:
+        raise TypeError("protected_entry_names must be an iterable of strings.") from exc
+    validated: list[str] = []
+    seen: set[str] = set()
+    for value in copied:
+        if type(value) is not str:
+            raise TypeError("protected_entry_names entries must be strings.")
+        value = _validate_no_nul(
+            require_unicode_scalar_text(
+                require_nonblank(value, "protected entry name"),
+                "protected entry name",
+            ),
+            "protected entry name",
+        )
+        if value in {".", ".."} or "/" in value or "\\" in value:
+            raise ValueError("protected_entry_names entries must be single path segments.")
+        if any(character in value for character in "*?[]{}!"):
+            raise ValueError("protected_entry_names entries must not contain glob operators.")
+        key = value.casefold()
+        if key in seen:
+            raise ValueError("protected_entry_names entries must be unique.")
+        seen.add(key)
+        validated.append(value)
     return tuple(validated)

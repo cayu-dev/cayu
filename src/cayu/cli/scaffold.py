@@ -4,17 +4,480 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
+import stat
 import sys
+import tempfile
+from contextlib import suppress
 from pathlib import Path
 
 from cayu._version import package_version
+from cayu.cli._bounded_command import (
+    BoundedCommandOutputOverflowError,
+    BoundedCommandReadError,
+    BoundedCommandStartError,
+    BoundedCommandTimeoutError,
+    run_bounded_command,
+)
+from cayu.workspaces import LocalWorkspace
 
 _NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
 _TEMPLATE_TOKEN_RE = re.compile(
-    r"__(?:PROJECT_NAME|AGENT_NAME|CAYU_VERSION|PROVIDER_DISPLAY|PROVIDER_LITERAL|"
+    r"__(?:PROJECT_NAME|AGENT_NAME|REVIEWER_NAME|CAYU_VERSION|PROVIDER_DISPLAY|PROVIDER_LITERAL|"
     r"PROVIDER_GUIDE_POINTER)__"
 )
+
+_SCAFFOLD_COMMAND_TIMEOUT_S = 10.0
+_SCAFFOLD_COMMAND_OUTPUT_LIMIT_BYTES = 64 * 1024
+_SAFE_SCAFFOLD_ENV_KEYS = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "TZ",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+)
+
+
+class _ScaffoldCommandError(RuntimeError):
+    """Bounded, content-safe command failure used by coding scaffolding."""
+
+
+def _sanitized_scaffold_git_environment(*, cwd: Path) -> dict[str, str]:
+    """Return Git authority confined to ``cwd`` and repository-local config."""
+
+    environment = {key: os.environ[key] for key in _SAFE_SCAFFOLD_ENV_KEYS if key in os.environ}
+    environment.update(
+        {
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CEILING_DIRECTORIES": str(cwd.parent.resolve()),
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "LC_ALL": "C",
+        }
+    )
+    return environment
+
+
+def _run_scaffold_command(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+    allowed_exit_codes: frozenset[int] = frozenset({0}),
+) -> str:
+    """Run a bounded scaffold command and return bounded combined output."""
+
+    try:
+        completed = run_bounded_command(
+            argv,
+            cwd=cwd,
+            env=env,
+            timeout_s=_SCAFFOLD_COMMAND_TIMEOUT_S,
+            output_limit_bytes=_SCAFFOLD_COMMAND_OUTPUT_LIMIT_BYTES,
+        )
+    except BoundedCommandStartError:
+        raise _ScaffoldCommandError(f"{Path(argv[0]).name} could not start") from None
+    except BoundedCommandTimeoutError:
+        raise _ScaffoldCommandError(f"{Path(argv[0]).name} timed out") from None
+    except BoundedCommandOutputOverflowError:  # pragma: no cover - capture truncates here
+        raise _ScaffoldCommandError(f"{Path(argv[0]).name} produced excessive output") from None
+    except BoundedCommandReadError:
+        raise _ScaffoldCommandError(f"{Path(argv[0]).name} output could not be read") from None
+    rendered = completed.output.decode("utf-8", errors="replace")
+    if completed.output_truncated:
+        rendered += "\n[command output truncated]"
+    if completed.returncode not in allowed_exit_codes:
+        raise _ScaffoldCommandError(
+            f"{Path(argv[0]).name} failed with exit code {completed.returncode}"
+        )
+    return rendered
+
+
+def _safe_git_argv(git: str, *arguments: str, hooks_dir: Path) -> list[str]:
+    return [
+        git,
+        "--no-pager",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        f"core.excludesFile={os.devnull}",
+        "-c",
+        f"core.attributesFile={os.devnull}",
+        "-c",
+        f"core.hooksPath={hooks_dir}",
+        "-c",
+        "commit.gpgSign=false",
+        "-c",
+        "tag.gpgSign=false",
+        *arguments,
+    ]
+
+
+def _scaffold_directory_identity(path: Path) -> tuple[int, int]:
+    try:
+        identity = path.stat(follow_symlinks=False)
+    except OSError:
+        raise _ScaffoldCommandError("scaffold target is no longer available") from None
+    if not stat.S_ISDIR(identity.st_mode):
+        raise _ScaffoldCommandError("scaffold target identity changed")
+    return identity.st_dev, identity.st_ino
+
+
+def _require_safe_scaffold_parent(parent: Path) -> None:
+    """Reject shared parents where another OS user can replace temp trees."""
+
+    try:
+        parent_stat = parent.stat(follow_symlinks=False)
+    except OSError:
+        raise _ScaffoldCommandError("scaffold parent is unavailable") from None
+    if not stat.S_ISDIR(parent_stat.st_mode):
+        raise _ScaffoldCommandError("scaffold parent is not a directory")
+    if _unsafe_shared_scaffold_parent_mode(parent_stat.st_mode, platform=os.name):
+        raise _ScaffoldCommandError(
+            "scaffold parent must not be group/world-writable unless it is sticky"
+        )
+
+
+def _unsafe_shared_scaffold_parent_mode(mode: int, *, platform: str) -> bool:
+    """Interpret shared-write and sticky bits only where POSIX modes are authoritative."""
+
+    if platform == "nt":
+        return False
+    shared_write = mode & (stat.S_IWGRP | stat.S_IWOTH)
+    return bool(shared_write and not mode & stat.S_ISVTX)
+
+
+def _run_scaffold_git_command(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    expected_directory_identity: tuple[int, int],
+) -> str:
+    if _scaffold_directory_identity(cwd) != expected_directory_identity:
+        raise _ScaffoldCommandError("scaffold target identity changed")
+    output = _run_scaffold_command(argv, cwd=cwd, env=env)
+    if _scaffold_directory_identity(cwd) != expected_directory_identity:
+        raise _ScaffoldCommandError("scaffold target identity changed")
+    return output
+
+
+def _require_scaffold_probe_evidence(
+    output: str,
+    *,
+    command: str,
+    required_fragments: tuple[str, ...],
+) -> None:
+    """Require positive, content-bound evidence from one dependency probe."""
+
+    if any(fragment not in output for fragment in required_fragments):
+        raise _ScaffoldCommandError(f"{command} semantic probe failed")
+
+
+def _preflight_coding_commands(*, parent: Path) -> tuple[str, str]:
+    """Verify the Git and ripgrep dialects used by the generated project."""
+
+    resolved: dict[str, str] = {}
+    missing: list[str] = []
+    for command in ("git", "rg"):
+        executable = shutil.which(command)
+        if executable is None:
+            missing.append(command)
+        else:
+            resolved[command] = executable
+    if missing:
+        raise _ScaffoldCommandError("requires these commands on PATH: " + ", ".join(missing))
+
+    with tempfile.TemporaryDirectory(prefix="cayu-scaffold-probe-", dir=parent) as raw:
+        probe = Path(raw)
+        hooks = probe / "hooks"
+        hooks.mkdir()
+        git_env = _sanitized_scaffold_git_environment(cwd=probe)
+        _run_scaffold_command(
+            _safe_git_argv(
+                resolved["git"],
+                "init",
+                "-b",
+                "main",
+                f"--template={hooks}",
+                hooks_dir=hooks,
+            ),
+            cwd=probe,
+            env=git_env,
+        )
+        (probe / "probe.txt").write_text("cayu scaffold probe\n", encoding="utf-8")
+        _run_scaffold_command(
+            _safe_git_argv(
+                resolved["git"],
+                "add",
+                "--force",
+                "--",
+                "probe.txt",
+                hooks_dir=hooks,
+            ),
+            cwd=probe,
+            env=git_env,
+        )
+        _run_scaffold_command(
+            _safe_git_argv(
+                resolved["git"],
+                "-c",
+                "user.name=Cayu Scaffold",
+                "-c",
+                "user.email=scaffold@cayu.local",
+                "commit",
+                "-m",
+                "probe",
+                hooks_dir=hooks,
+            ),
+            cwd=probe,
+            env=git_env,
+        )
+        (probe / "probe.txt").write_text(
+            "cayu scaffold semantic probe\n",
+            encoding="utf-8",
+        )
+        (probe / "staged.txt").write_text(
+            "cayu staged semantic probe\n",
+            encoding="utf-8",
+        )
+        protected = probe / ".CaYu"
+        protected.mkdir()
+        (protected / "ignored.txt").write_text(
+            "cayu scaffold semantic probe\n",
+            encoding="utf-8",
+        )
+        _run_scaffold_command(
+            _safe_git_argv(
+                resolved["git"],
+                "add",
+                "--force",
+                "--",
+                "staged.txt",
+                hooks_dir=hooks,
+            ),
+            cwd=probe,
+            env=git_env,
+        )
+        git_probes = (
+            (
+                ("ls-files", "--cached", "-z", "--"),
+                ("probe.txt\0", "staged.txt\0"),
+            ),
+            (
+                ("status", "--porcelain=v1", "-z", "--untracked-files=normal", "--"),
+                (" M probe.txt\0", "A  staged.txt\0"),
+            ),
+            (
+                (
+                    "diff",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--unified=3",
+                    "--",
+                ),
+                ("-cayu scaffold probe", "+cayu scaffold semantic probe"),
+            ),
+            (
+                (
+                    "diff",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--cached",
+                    "--unified=3",
+                    "--",
+                ),
+                ("staged.txt", "+cayu staged semantic probe"),
+            ),
+            (
+                (
+                    "diff",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--numstat",
+                    "-z",
+                    "--",
+                ),
+                ("1\t1\tprobe.txt\0",),
+            ),
+            (
+                (
+                    "diff",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--cached",
+                    "--numstat",
+                    "-z",
+                    "--",
+                ),
+                ("1\t0\tstaged.txt\0",),
+            ),
+        )
+        for arguments, required_fragments in git_probes:
+            output = _run_scaffold_command(
+                _safe_git_argv(
+                    resolved["git"],
+                    *arguments,
+                    hooks_dir=hooks,
+                ),
+                cwd=probe,
+                env=git_env,
+            )
+            _require_scaffold_probe_evidence(
+                output,
+                command="git",
+                required_fragments=required_fragments,
+            )
+        command_env = {key: os.environ[key] for key in _SAFE_SCAFFOLD_ENV_KEYS if key in os.environ}
+        files_output = _run_scaffold_command(
+            [
+                resolved["rg"],
+                "--no-config",
+                "--hidden",
+                "--no-require-git",
+                "--sort",
+                "path",
+                "--files",
+                "--null",
+                "--max-filesize",
+                "1048576",
+                "--iglob",
+                "!.git",
+                "--iglob",
+                "!**/.git",
+                "--iglob",
+                "!.git/**",
+                "--iglob",
+                "!**/.git/**",
+                "--iglob",
+                "!.cayu",
+                "--iglob",
+                "!**/.cayu",
+                "--iglob",
+                "!.cayu/**",
+                "--iglob",
+                "!**/.cayu/**",
+                "--",
+                ".",
+            ],
+            cwd=probe,
+            env=command_env,
+        )
+        _require_scaffold_probe_evidence(
+            files_output,
+            command="rg",
+            required_fragments=("probe.txt\0", "staged.txt\0"),
+        )
+        if ".CaYu/ignored.txt" in files_output:
+            raise _ScaffoldCommandError("rg semantic probe failed")
+        rg_probes = (
+            (("--files-with-matches", "--null"), ("probe.txt\0",)),
+            (
+                (
+                    "--with-filename",
+                    "--line-number",
+                    "--null",
+                    "--field-match-separator",
+                    "|",
+                    "--max-columns",
+                    "1024",
+                    "--max-columns-preview",
+                ),
+                ("probe.txt", "cayu scaffold semantic probe"),
+            ),
+            (("--with-filename", "--count-matches", "--null"), ("probe.txt", "1")),
+        )
+        for mode_arguments, required_fragments in rg_probes:
+            output = _run_scaffold_command(
+                [
+                    resolved["rg"],
+                    "--no-config",
+                    "--hidden",
+                    "--no-require-git",
+                    "--sort",
+                    "path",
+                    "--color",
+                    "never",
+                    "--max-filesize",
+                    "1048576",
+                    *mode_arguments,
+                    "--ignore-case",
+                    "--glob",
+                    "probe.txt",
+                    "--iglob",
+                    "!.git",
+                    "--iglob",
+                    "!**/.git",
+                    "--iglob",
+                    "!.git/**",
+                    "--iglob",
+                    "!**/.git/**",
+                    "--iglob",
+                    "!.cayu",
+                    "--iglob",
+                    "!**/.cayu",
+                    "--iglob",
+                    "!.cayu/**",
+                    "--iglob",
+                    "!**/.cayu/**",
+                    "--",
+                    "CAYU SCAFFOLD SEMANTIC PROBE",
+                    ".",
+                ],
+                cwd=probe,
+                env=command_env,
+            )
+            _require_scaffold_probe_evidence(
+                output,
+                command="rg",
+                required_fragments=required_fragments,
+            )
+            if ".CaYu/ignored.txt" in output:
+                raise _ScaffoldCommandError("rg semantic probe failed")
+    return resolved["git"], resolved["rg"]
+
+
+def _publish_staged_scaffold(
+    *,
+    staging: Path,
+    target: Path,
+    expected_target_identity: tuple[int, int],
+    target_mode: int,
+) -> None:
+    """Publish a complete private staging tree over the reserved empty target."""
+
+    if _scaffold_directory_identity(target) != expected_target_identity:
+        raise _ScaffoldCommandError("scaffold target identity changed")
+    staging.chmod(target_mode)
+    try:
+        target.rmdir()
+    except OSError:
+        raise _ScaffoldCommandError("scaffold target is no longer empty") from None
+    try:
+        staging.rename(target)
+    except OSError:
+        # Restore only the empty reservation we removed. Never remove or alter a
+        # concurrently created replacement in order to complete publication.
+        with suppress(FileExistsError):
+            target.mkdir(mode=target_mode)
+        raise _ScaffoldCommandError("could not publish completed scaffold") from None
+
 
 GENERATED_IMPORTS_START = "# <cayu:generated-imports>"
 GENERATED_IMPORTS_END = "# </cayu:generated-imports>"
@@ -2927,6 +3390,14 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
         default="agent",
         help=("Project shape: minimal agent (default) or maintained public-agent service."),
     )
+    parser.add_argument(
+        "--composition",
+        choices=("coding",),
+        help=(
+            "Opt in to an explicit maintained starter composition. "
+            "The coding composition requires git and rg."
+        ),
+    )
 
 
 def _installed_cayu_version() -> str:
@@ -2939,8 +3410,10 @@ def project_files(
     agent_name: str | None = None,
     provider: str | None = None,
     template: str = "agent",
+    composition: str | None = None,
 ) -> dict[str, str]:
     resolved_agent_name = name if agent_name is None else agent_name
+    reviewer_name = f"{resolved_agent_name}-reviewer"
 
     def render(template: str) -> str:
         provider_display = provider or "no live provider"
@@ -2948,6 +3421,7 @@ def project_files(
         replacements = {
             "__PROJECT_NAME__": name,
             "__AGENT_NAME__": resolved_agent_name,
+            "__REVIEWER_NAME__": reviewer_name,
             "__CAYU_VERSION__": _installed_cayu_version(),
             "__PROVIDER_DISPLAY__": provider_display,
             "__PROVIDER_LITERAL__": provider_literal,
@@ -2972,6 +3446,15 @@ def project_files(
         "AGENTS.md": render(_AGENTS_MD),
         ".gitignore": _GITIGNORE,
     }
+    if composition is not None:
+        if composition != "coding":
+            raise ValueError("composition must be 'coding'.")
+        if template != "agent":
+            raise ValueError("the coding composition cannot be combined with a service template.")
+        from cayu.cli.coding_composition import coding_project_files
+
+        files.update(coding_project_files(files=files, render=render))
+        return files
     if template == "agent":
         return files
     if template != "service":
@@ -3021,24 +3504,169 @@ def run_new(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-
+    composition = getattr(args, "composition", None)
+    if composition is not None and args.template != "agent":
+        print(
+            "error: --composition coding cannot be combined with --template service.",
+            file=sys.stderr,
+        )
+        return 1
     target = Path(args.dir) / name
+    if target.is_symlink():
+        print(f"error: {target} cannot be a symbolic link.", file=sys.stderr)
+        return 1
     if target.exists() and not target.is_dir():
         print(f"error: {target} already exists and is not a directory.", file=sys.stderr)
         return 1
     if target.exists() and any(target.iterdir()):
         print(f"error: {target} already exists and is not empty.", file=sys.stderr)
         return 1
+    coding_git: str | None = None
+    coding_target_identity: tuple[int, int] | None = None
+    coding_target_mode: int | None = None
+    if composition == "coding":
+        try:
+            LocalWorkspace.require_path_operations_supported()
+        except RuntimeError as exc:
+            print(f"error: --composition coding {exc}", file=sys.stderr)
+            return 1
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            _require_safe_scaffold_parent(target.parent)
+            coding_git, _ = _preflight_coding_commands(parent=target.parent)
+            target.mkdir(parents=True, exist_ok=True)
+            target_stat = target.stat(follow_symlinks=False)
+            coding_target_identity = (target_stat.st_dev, target_stat.st_ino)
+            coding_target_mode = stat.S_IMODE(target_stat.st_mode)
+        except (_ScaffoldCommandError, OSError) as exc:
+            print(f"error: --composition coding {exc}", file=sys.stderr)
+            return 1
 
-    for rel, content in project_files(
+    files = project_files(
         name,
         agent_name=agent_name,
         provider=args.provider,
         template=args.template,
-    ).items():
-        path = target / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        composition=composition,
+    )
+    if composition == "coding":
+        assert coding_git is not None
+        assert coding_target_identity is not None
+        assert coding_target_mode is not None
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix=f".{name}.cayu-scaffold-",
+                dir=target.parent,
+            ) as raw_staging:
+                staging = Path(raw_staging)
+                staging_identity = _scaffold_directory_identity(staging)
+                for rel, content in files.items():
+                    path = staging / rel
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(content, encoding="utf-8")
+                with tempfile.TemporaryDirectory(
+                    prefix="cayu-scaffold-hooks-", dir=target.parent
+                ) as raw_hooks:
+                    hooks = Path(raw_hooks)
+                    git_env = _sanitized_scaffold_git_environment(cwd=staging)
+                    _run_scaffold_git_command(
+                        _safe_git_argv(
+                            coding_git,
+                            "init",
+                            "-b",
+                            "main",
+                            f"--template={hooks}",
+                            hooks_dir=hooks,
+                        ),
+                        cwd=staging,
+                        env=git_env,
+                        expected_directory_identity=staging_identity,
+                    )
+                    repository_root = _run_scaffold_git_command(
+                        _safe_git_argv(
+                            coding_git,
+                            "rev-parse",
+                            "--show-toplevel",
+                            hooks_dir=hooks,
+                        ),
+                        cwd=staging,
+                        env=git_env,
+                        expected_directory_identity=staging_identity,
+                    ).strip()
+                    try:
+                        resolved_repository_root = Path(repository_root).resolve(strict=True)
+                    except (OSError, ValueError):
+                        raise _ScaffoldCommandError(
+                            "git repository root verification failed"
+                        ) from None
+                    if resolved_repository_root != staging.resolve(strict=True):
+                        raise _ScaffoldCommandError(
+                            "git repository authority escaped the scaffold staging directory"
+                        )
+                    _run_scaffold_git_command(
+                        _safe_git_argv(
+                            coding_git,
+                            "add",
+                            "--force",
+                            "--",
+                            ".",
+                            hooks_dir=hooks,
+                        ),
+                        cwd=staging,
+                        env=git_env,
+                        expected_directory_identity=staging_identity,
+                    )
+                    tracked_output = _run_scaffold_git_command(
+                        _safe_git_argv(
+                            coding_git,
+                            "ls-files",
+                            "--cached",
+                            "-z",
+                            "--",
+                            hooks_dir=hooks,
+                        ),
+                        cwd=staging,
+                        env=git_env,
+                        expected_directory_identity=staging_identity,
+                    )
+                    tracked_files = frozenset(path for path in tracked_output.split("\0") if path)
+                    if tracked_files != frozenset(files):
+                        raise _ScaffoldCommandError(
+                            "git index does not contain the complete generated project"
+                        )
+                    _run_scaffold_git_command(
+                        _safe_git_argv(
+                            coding_git,
+                            "-c",
+                            "user.name=Cayu Scaffold",
+                            "-c",
+                            "user.email=scaffold@cayu.local",
+                            "commit",
+                            "-m",
+                            "Initial Cayu coding composition",
+                            hooks_dir=hooks,
+                        ),
+                        cwd=staging,
+                        env=git_env,
+                        expected_directory_identity=staging_identity,
+                    )
+                _publish_staged_scaffold(
+                    staging=staging,
+                    target=target,
+                    expected_target_identity=coding_target_identity,
+                    target_mode=coding_target_mode,
+                )
+        except (_ScaffoldCommandError, OSError, ValueError) as exc:
+            print(
+                f"error: could not initialize coding workspace: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        for rel, content in files.items():
+            path = target / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
 
     print(f"Scaffolded {target}/ — credential-free proof:")
     print(f"  cd {target}")
@@ -3047,6 +3675,9 @@ def run_new(args: argparse.Namespace) -> int:
     if args.template == "service":
         print("  uv run cayu check --deploy --fail-on warning --json")
         print("  uv run pytest -q tests/test_public_service_security.py")
+    elif composition == "coding":
+        print("  uv run cayu check --json")
+        print("  uv run pytest -q tests/test_coding_composition.py")
     else:
         print("  uv run cayu check --json")
         print("  uv run pytest")
@@ -3055,6 +3686,10 @@ def run_new(args: argparse.Namespace) -> int:
         print("  Local public service: uv run cayu serve --dev")
         print("  Product API: http://127.0.0.1:8000/api/operations")
         print("  Operator control plane: http://127.0.0.1:8000/cayu/")
+    elif composition == "coding":
+        print(f'  Live run: uv run python run.py --agent {agent_name} --message "YOUR REQUEST"')
+        print("  Local control plane: uv run cayu serve --dev")
+        print("  Open: http://127.0.0.1:8000/cayu/")
     else:
         print("  Local control plane: uv run cayu serve --dev")
         print("  Open: http://127.0.0.1:8000/cayu/")

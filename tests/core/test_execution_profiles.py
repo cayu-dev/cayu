@@ -3000,6 +3000,9 @@ def test_cayu_profile_material_extractors_require_exact_registered_types(tmp_pat
         pass
 
     assert execution_profile_admission._cayu_tool_material(SearchTextTool()) is not None
+    assert execution_profile_admission._cayu_tool_material(
+        SearchTextTool(protected_entry_names=(".git",))
+    ) != execution_profile_admission._cayu_tool_material(SearchTextTool())
     assert execution_profile_admission._cayu_tool_material(DerivedSearchTextTool()) is None
     assert execution_profile_admission._cayu_runner_material(LocalRunner(tmp_path)) is not None
     assert execution_profile_admission._cayu_runner_material(DerivedLocalRunner(tmp_path)) is None
@@ -3814,6 +3817,7 @@ def test_egress_authority_copy_rejects_mutated_values_without_diagnostics(
     ("material_kind", "component_class"),
     [
         ("tool", ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS),
+        ("tool_protected_entry", ExecutionProfileComponentClass.TOOL_IMPLEMENTATIONS),
         ("policy", ExecutionProfileComponentClass.EXECUTION_POLICIES),
         ("runner", ExecutionProfileComponentClass.EXECUTION_ENVIRONMENT),
     ],
@@ -3836,6 +3840,8 @@ def test_redactor_known_builtin_material_is_process_local(
         tool_policy: ToolPolicy | None = None
         if material_kind == "tool":
             tools.append(SearchTextTool(exclude_directories=(secret,)))
+        elif material_kind == "tool_protected_entry":
+            tools.append(SearchTextTool(protected_entry_names=(secret,)))
         elif material_kind == "policy":
             tool_policy = TaintAwareToolPolicy(
                 taint_sources={"read_email": (secret,)},

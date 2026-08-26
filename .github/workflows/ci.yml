@@ -282,6 +282,10 @@ jobs:
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
       - run: uv python install 3.11
+      - name: Install coding-composition system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep
       - name: Verify immutable release state
         run: >-
           uv run --no-project --offline --no-python-downloads --python 3.11
@@ -548,6 +552,43 @@ jobs:
           check = json.loads(Path("completed-check.json").read_text())
           assert check["diagnostics"] == []
           PY
+          coding_root="$(mktemp -d)"
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" new proof-coding \
+            --composition coding --dir "$coding_root"
+          cd "$coding_root/proof-coding"
+          unset CAYU_PROVIDER CAYU_MODEL OPENAI_API_KEY ANTHROPIC_API_KEY \
+            OPENROUTER_API_KEY
+          test -z "$(git status --porcelain)"
+          test "$(git log -1 --format=%s)" = 'Initial Cayu coding composition'
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" inspect --json > coding-inspect.json
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" check --json > coding-check.json
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" - <<'PY'
+          import json
+          from pathlib import Path
+
+          inspect = json.loads(Path("coding-inspect.json").read_text())
+          assert {agent["name"] for agent in inspect["agents"]} == {
+              "proof-coding",
+              "proof-coding-reviewer",
+          }
+          primary = next(
+              agent for agent in inspect["agents"] if agent["name"] == "proof-coding"
+          )
+          assert {tool["name"] for tool in primary["tools"]} >= {
+              "search_text",
+              "git_changes",
+              "remember_knowledge",
+              "subagent",
+              "subagent_result",
+              "ask_user",
+          }
+          assert inspect["defaults"]["environment"] == "coding"
+          assert inspect["stores"]["knowledge"] == "SQLiteKnowledgeStore"
+          check = json.loads(Path("coding-check.json").read_text())
+          assert check["diagnostics"] == []
+          PY
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" \
+            -m pytest -q tests/test_coding_composition.py
           openrouter_root="$(mktemp -d)"
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" new proof-openrouter \
             --provider openrouter --dir "$openrouter_root"

@@ -106,6 +106,26 @@ The scaffold is credential-free and includes:
 Open the generated project, describe the requested job in the existing agent,
 and keep its public test/eval seam intact.
 
+For an explicit, editable repository-coding starter with bounded file and Git
+tools, durable knowledge, background review delegation, and human input, opt in
+to the maintained composition:
+
+```bash
+cayu new mycoder --composition coding
+cd mycoder
+cayu check --json
+pytest -q tests/test_coding_composition.py
+python run.py --agent mycoder --message "Implement the requested change."
+```
+
+The generated repository starts from a clean Git commit and requires `git`, `rg`,
+and the POSIX descriptor-relative filesystem primitives used by secure
+`LocalWorkspace` path operations. Unsupported hosts fail during generation or
+application construction. Its local workspace and runner are trusted-host
+development adapters, not a hostile-code sandbox. The default scaffold remains
+the minimal one-agent project, and the coding composition cannot be combined
+with `--template service`.
+
 ### Deploy with Cayu Cloud
 
 Cloud commands ship in the same `cayu` package; no additional CLI package is
