@@ -13,6 +13,7 @@ from cayu.evals.execution_comparison import (
     compare_eval_results,
     eval_result_compatibility,
 )
+from cayu.evals.execution_reporting import render_captured_evaluation_html
 from cayu.evals.results import (
     CapturedEvaluationResultV1,
     EvalResultOrigin,
@@ -51,10 +52,21 @@ def test_captured_and_fresh_results_share_one_comparison_projection() -> None:
     assert fresh_projection.origin is EvalResultOrigin.FRESH_EXECUTION
     assert captured_projection.target.application_release_id == "captured-release"
     assert fresh_projection.target.application_release_id == "release-2026-08-06"
+    assert captured.score.memory_attribution == (fresh.run.cases[0].trials[0].memory_attribution)
+    assert captured_projection.memory_attribution_support == "unsupported"
+    assert fresh_projection.memory_attribution_support == "unsupported"
     assert eval_result_compatibility(captured, fresh).comparable is True
 
     comparison = compare_eval_results(captured, fresh)
     assert comparison.compatibility.comparable is True
+    assert comparison.baseline.memory_attribution_support == "unsupported"
+    assert comparison.current.memory_attribution_support == "unsupported"
+    rendered = render_captured_evaluation_html(captured)
+    assert "Memory attribution complete" in rendered
+    assert "limitations none" in rendered
+    assert "lifecycle none" in rendered
+    assert "record inspection is unsupported in HTML" in rendered
+    assert captured.score.memory_attribution.revision in rendered
     assert comparison.regressions == ()
     with pytest.raises(TypeError, match="baseline must be an exact CorpusExecutionResult"):
         compare_corpus_execution_results(captured, fresh)  # type: ignore[arg-type]

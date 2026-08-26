@@ -184,6 +184,9 @@ def captured_result_for_corpus(
         "pricing_profile_fingerprint": (
             None if corpus.pricing_profile is None else corpus.pricing_profile.fingerprint
         ),
+        "memory_attribution": fresh_result.run.cases[0]
+        .trials[0]
+        .memory_attribution.model_dump(mode="json"),
         "status": fresh_result.run.cases[0].status,
         "score": fresh_result.run.cases[0].score,
         "assertions": [item.model_dump(mode="json") for item in assertions],
@@ -1137,7 +1140,10 @@ async def assert_captured_eval_store_conformance(
         == saved
     )
     assert await store.load_corpus(corpus.revision) == corpus
-    assert await store.load_result_by_revision(captured.revision) == captured
+    loaded_captured = await store.load_result_by_revision(captured.revision)
+    assert loaded_captured == captured
+    assert type(loaded_captured) is CapturedEvaluationResultV1
+    assert loaded_captured.score.memory_attribution == captured.score.memory_attribution
     assert await store.load_result_record(captured.revision) == saved
     with pytest.raises(EvalStoreResultTooLarge):
         await store.load_result_by_revision(
@@ -1148,7 +1154,12 @@ async def assert_captured_eval_store_conformance(
     fresh_record = await store.load_result_record(result.revision)
     assert fresh_record is not None
     assert fresh_record.origin is EvalResultOrigin.FRESH_EXECUTION
-    assert await store.load_result_by_revision(result.revision) == result
+    loaded_fresh = await store.load_result_by_revision(result.revision)
+    assert loaded_fresh == result
+    assert type(loaded_fresh) is CorpusExecutionResult
+    assert loaded_fresh.run.cases[0].trials[0].memory_attribution == (
+        result.run.cases[0].trials[0].memory_attribution
+    )
 
     first_result_page = await store.list_results(
         EvalResultQuery(target_key=corpus.target_key, limit=1)

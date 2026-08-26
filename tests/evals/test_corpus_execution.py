@@ -7,13 +7,16 @@ from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
+from tests.evals.eval_store_conformance import captured_result_for_corpus
 
 import cayu.evals.execution as execution_module
 import cayu.evals.runner as runner_module
 from cayu import (
     AgentSpec,
+    ContextExposurePage,
     Environment,
     EnvironmentSpec,
+    InMemorySessionStore,
     LocalWorkspace,
     Message,
     ModelProvider,
@@ -73,8 +76,25 @@ from cayu.evals.execution_reporting import (
 )
 from cayu.evals.result_contract import EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES
 from cayu.evals.runner import EvalPlan, run_eval_plan
+from cayu.memory import AutomaticRecallPolicy
+from cayu.memory_evidence import ContextExposureState
+from cayu.recall import (
+    KNOWLEDGE_LEXICAL_CHANNEL,
+    KNOWLEDGE_SEMANTIC_CHANNEL,
+    TRANSCRIPT_LEXICAL_CHANNEL,
+)
+from cayu.retrieval import (
+    WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
+    WeightedReciprocalRankFusionConfig,
+)
 from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import ModelPrice, PriceBook
+from cayu.runtime.memory_context import (
+    AutomaticRecallContextPolicy,
+    AutomaticRecallSourceConfig,
+)
+from cayu.runtime.request_footprints import RequestFootprintConfig
+from cayu.storage.memory import InMemoryKnowledgeStore, KnowledgeAccessScope, KnowledgeEntry
 from cayu.vaults import SecretRedactor
 from cayu.workspaces.revisions import (
     WorkspaceRevisionObservationLimits,
@@ -182,6 +202,79 @@ def _provider(*, trials: int = 2, output: str = "Approved") -> ScriptedModelProv
     return ScriptedModelProvider([batch for _ in range(trials)])
 
 
+class _MissingExposureEvidenceStore(InMemorySessionStore):
+    async def list_context_exposures(self, query):
+        del query
+        return ContextExposurePage(items=(), truncated=False)
+
+
+async def _run_nonempty_memory_corpus(
+    *,
+    session_store: InMemorySessionStore | None = None,
+):
+    scope = KnowledgeAccessScope.for_namespace("project:cayu")
+    knowledge = InMemoryKnowledgeStore(access_scope=scope)
+    await knowledge.create_entry(
+        KnowledgeEntry(
+            id="atlas-eval-memory",
+            namespace="project:cayu",
+            text="Atlas release evidence says Friday.",
+        )
+    )
+    provider = _provider(trials=1, output="Friday")
+    app = CayuApp(
+        session_store=session_store or InMemorySessionStore(),
+        enable_logging=False,
+        request_footprint=RequestFootprintConfig(
+            fingerprint_key_id="eval-memory-key",
+            fingerprint_key="eval-memory-secret-material-32-bytes",
+        ),
+    )
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="local"), knowledge_store=knowledge),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="agent", model="fixture-model"),
+        context_policy=AutomaticRecallContextPolicy(
+            admission_policy=AutomaticRecallPolicy(
+                calibration_version="eval-memory-calibration-v1",
+                fusion_strategy_version=WEIGHTED_RECIPROCAL_RANK_FUSION_VERSION,
+                fusion_configuration_version="eval-memory-fusion-v1",
+                minimum_inject_score=0.01,
+                minimum_offer_score=0.005,
+            ),
+            fusion_config=WeightedReciprocalRankFusionConfig(
+                configuration_version="eval-memory-fusion-v1",
+                channel_weights={
+                    KNOWLEDGE_LEXICAL_CHANNEL: 1.0,
+                    KNOWLEDGE_SEMANTIC_CHANNEL: 1.0,
+                    TRANSCRIPT_LEXICAL_CHANNEL: 1.0,
+                },
+                max_candidates_per_channel=20,
+                fused_head_limit=20,
+            ),
+            sources=AutomaticRecallSourceConfig(knowledge_namespace="project:cayu"),
+        ),
+    )
+    target = CorpusTarget(
+        key="refund-agent",
+        app=app,
+        request_base=RunRequest(agent_name="agent", messages=[], max_steps=1),
+        bootstrap_messages=(Message.text("system", "Answer from admitted evidence."),),
+        application_release_id="release-memory-attribution",
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+        limits=CorpusExecutionLimits(),
+    )
+    corpus = _corpus(
+        trials=1,
+        input_text="When is the Atlas release?",
+        expected_output="Friday",
+    )
+    return corpus, await run_corpus_suite(target, corpus, "refund-regressions")
+
+
 def _model_judge_target(
     *,
     output: str = '{"score": 0.8, "rationale": "correct and useful"}',
@@ -287,8 +380,8 @@ def test_run_corpus_suite_retains_every_trial_and_fresh_target_identity():
     result = asyncio.run(run_corpus_suite(target, corpus, "refund-regressions"))
 
     assert result.target == evaluation_target_identity(target)
-    assert result.schema_version == 1
-    assert result.run.schema_version == 2
+    assert result.schema_version == 2
+    assert result.run.schema_version == 3
     assert result.target.application_release_id == "release-2026-08-06"
     assert result.target.app_manifest_fingerprint == target.app.describe().fingerprint
     assert result.run.corpus_revision == corpus.revision
@@ -296,6 +389,14 @@ def test_run_corpus_suite_retains_every_trial_and_fresh_target_identity():
     assert result.run.score == 1.0
     assert len(result.run.cases[0].trials) == 2
     assert [trial.status for trial in result.run.cases[0].trials] == ["passed", "passed"]
+    for trial in result.run.cases[0].trials:
+        assert trial.memory_attribution.completeness.value == "complete"
+        assert trial.memory_attribution.proves_empty is True
+        assert trial.memory_attribution.total_source_count == 1
+        assert trial.memory_attribution.retained_source_count == 1
+        assert trial.memory_attribution.sources[0].source.tree_path == ()
+        assert trial.memory_attribution.sources[0].attribution is not None
+        assert trial.memory_attribution.sources[0].attribution.status.value == "complete"
     assert len(provider.requests) == 2
 
     encoded = result.model_dump_json()
@@ -320,6 +421,86 @@ def test_run_corpus_suite_retains_every_trial_and_fresh_target_identity():
     )
     with pytest.raises(ValidationError, match="Scored corpus execution trials"):
         CorpusExecutionResult.model_validate_json(json.dumps(document))
+
+
+def test_nonempty_runtime_memory_attribution_reaches_portable_and_captured_results(
+    monkeypatch,
+):
+    prepared_views = []
+    runtime_session_ids: set[str] = set()
+    original_prepare = runner_module._prepare_portable_evidence
+    original_promote = runner_module._promote_memory_attribution
+
+    def capture_prepare(*args, **kwargs):
+        prepared, error = original_prepare(*args, **kwargs)
+        if prepared is not None:
+            prepared_views.append(prepared)
+        return prepared, error
+
+    async def capture_promote(app, trajectory, *, bounds, before_store_read=None):
+        assert trajectory.session is not None
+        runtime_session_ids.add(trajectory.session.id)
+        return await original_promote(
+            app,
+            trajectory,
+            bounds=bounds,
+            before_store_read=before_store_read,
+        )
+
+    monkeypatch.setattr(runner_module, "_prepare_portable_evidence", capture_prepare)
+    monkeypatch.setattr(runner_module, "_promote_memory_attribution", capture_promote)
+
+    corpus, result = asyncio.run(_run_nonempty_memory_corpus())
+
+    assert result.run.status == "passed"
+    trial = result.run.cases[0].trials[0]
+    evidence = trial.memory_attribution
+    assert evidence.completeness.value == "complete"
+    assert evidence.proves_empty is False
+    assert evidence.total_source_count == 1
+    source = evidence.sources[0]
+    assert source.source.session_alias is not None
+    assert source.source.session_alias.key_id == "eval-memory-key"
+    assert source.attribution_fingerprint is not None
+    assert source.attribution is not None
+    assert source.attribution.observed_receipt_count == 1
+    assert source.attribution.observed_exposure_count == 1
+    assert len(source.attribution.receipts) == 1
+    assert len(source.attribution.exposures) == 1
+    assert source.attribution.exposures[0].state is ContextExposureState.COMPLETED
+    assert prepared_views and prepared_views[0].memory_attribution == evidence
+
+    encoded = corpus_execution_result_to_json(result)
+    assert corpus_execution_result_from_json(encoded) == result
+    assert runtime_session_ids
+    assert all(session_id not in encoded for session_id in runtime_session_ids)
+
+    captured = captured_result_for_corpus(corpus, result)
+    assert captured.score.memory_attribution == evidence
+
+
+def test_missing_runtime_exposure_evidence_fails_closed_at_publication() -> None:
+    corpus, result = asyncio.run(
+        _run_nonempty_memory_corpus(session_store=_MissingExposureEvidenceStore())
+    )
+
+    trial = result.run.cases[0].trials[0]
+    evidence = trial.memory_attribution
+    source = evidence.sources[0]
+    assert evidence.completeness.value == "unavailable"
+    assert evidence.proves_empty is False
+    assert source.expected_receipt_count == 1
+    assert source.expected_exposure_count == 1
+    assert source.attribution is not None
+    assert source.attribution.observed_receipt_count == 1
+    assert source.attribution.observed_exposure_count == 0
+    assert tuple(limitation.value for limitation in source.limitations) == ("deleted",)
+    encoded = corpus_execution_result_to_json(result)
+    assert (
+        corpus_execution_result_from_json(encoded).run.cases[0].trials[0].memory_attribution
+        == evidence
+    )
+    assert captured_result_for_corpus(corpus, result).score.memory_attribution == evidence
 
 
 def test_run_corpus_suite_resolves_trusted_model_judge_and_publishes_its_contract():
@@ -880,6 +1061,10 @@ def test_published_execution_html_escapes_identity_and_shows_only_redacted_outpu
     assert "secret-token" not in report
     assert "session_id" not in report
     assert result.target.app_manifest_fingerprint in report
+    assert "Memory attribution: complete" in report
+    assert "limitations none" in report
+    assert "lifecycle none" in report
+    assert "record inspection is unsupported in HTML" in report
 
 
 def test_corpus_execution_bounds_long_redacted_output_and_explains_unavailability():
@@ -1117,6 +1302,7 @@ def test_contract_aware_comparison_reports_typed_regressions_across_releases():
     assert "release-2026-08-07" in rendered
     assert comparison.current.app_manifest_fingerprint in rendered
     assert "Score regression tolerance <code>0</code>" in rendered
+    assert "Memory-attribution comparison: <code>unsupported</code>" in rendered
     assert "passed → failed" in rendered
 
     tolerant = compare_corpus_execution_results(baseline, current, score_tolerance=1.0)

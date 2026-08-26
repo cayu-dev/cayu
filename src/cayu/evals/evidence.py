@@ -11,6 +11,9 @@ from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator, m
 from cayu._validation import json_utf8_size_within_limit
 from cayu.core.events import EventType
 from cayu.core.messages import ToolCallPart
+from cayu.evals._memory_attribution import (
+    eval_memory_attribution_evidence_from_trajectory,
+)
 from cayu.evals.corpus import (
     _CURRENCY_PATTERN,
     EVIDENCE_MAX_CHILD_SESSIONS,
@@ -27,19 +30,25 @@ from cayu.evals.corpus import (
     _ordered_sequence_input,
     _PortableModel,
     _pricing_profile_identity_from_validated_price_book,
-    _SchemaV1PortableModel,
+    _SchemaV2PortableModel,
     _sha256_revision,
+)
+from cayu.evals.memory_attribution import (
+    EVAL_MEMORY_ATTRIBUTION_MAX_BYTES,
+    EVAL_MEMORY_ATTRIBUTION_MAX_SOURCES,
+    EvalMemoryAttributionEvidenceV1,
 )
 from cayu.evals.models import (
     Trajectory,
     _model_instance_python_input,
     _validate_trajectory_record_contract,
 )
+from cayu.runtime._memory_evidence import memory_evidence_key
 from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import PriceBook, _estimate_session_cost
 from cayu.runtime.usage import AggregateCount
 
-ASSERTION_EVIDENCE_SCHEMA_VERSION = 1
+ASSERTION_EVIDENCE_SCHEMA_VERSION = 2
 ASSERTION_EVIDENCE_MAX_BYTES = 10 << 20
 ASSERTION_EVIDENCE_MAX_TOOL_NAME_CHARS = 256
 ASSERTION_EVIDENCE_MAX_COST_CURRENCIES = 32
@@ -121,10 +130,10 @@ class AssertionCostEvidenceV1(_PortableModel):
         return self
 
 
-class AssertionEvidenceView(_SchemaV1PortableModel):
-    """The bounded, alias-free data consumed by every portable assertion."""
+class AssertionEvidenceView(_SchemaV2PortableModel):
+    """The bounded, content-minimized data consumed by every portable assertion."""
 
-    schema_version: Literal[1] = ASSERTION_EVIDENCE_SCHEMA_VERSION
+    schema_version: Literal[2] = ASSERTION_EVIDENCE_SCHEMA_VERSION
     revision: StrictStr
     policy_revision: StrictStr
     pricing_profile_fingerprint: StrictStr | None = None
@@ -155,6 +164,7 @@ class AssertionEvidenceView(_SchemaV1PortableModel):
     costs: tuple[AssertionCostEvidenceV1, ...] = Field(
         max_length=ASSERTION_EVIDENCE_MAX_COST_CURRENCIES
     )
+    memory_attribution: EvalMemoryAttributionEvidenceV1
 
     @field_validator(
         "child_statuses",
@@ -538,6 +548,7 @@ def _build_assertion_evidence_view(
     allow_event_count_fallback: bool = False,
     expected_pricing_profile_fingerprint: str | None = None,
     bind_pricing_profile: bool = False,
+    memory_attribution_evidence: EvalMemoryAttributionEvidenceV1 | None = None,
 ) -> AssertionEvidenceView:
     session = trajectory.session
     root_status = None if session is None else session.status.value
@@ -620,6 +631,7 @@ def _build_assertion_evidence_view(
                 pricing=pricing_snapshot.price_book,
                 currency=currency,
             )
+
             costs.append(
                 AssertionCostEvidenceV1(
                     currency=summary.currency,
@@ -629,6 +641,44 @@ def _build_assertion_evidence_view(
                     unpriced_model_steps=summary.unpriced_model_steps,
                 )
             )
+
+    alias_key = None if app is None else memory_evidence_key(app._request_footprint)
+    projected_memory_attribution = eval_memory_attribution_evidence_from_trajectory(
+        trajectory,
+        effective_bounds=(
+            None
+            if memory_attribution_evidence is None
+            else memory_attribution_evidence.effective_bounds
+        ),
+        effective_source_limit=(
+            EVAL_MEMORY_ATTRIBUTION_MAX_SOURCES
+            if memory_attribution_evidence is None
+            else memory_attribution_evidence.effective_source_limit
+        ),
+        effective_max_bytes=(
+            EVAL_MEMORY_ATTRIBUTION_MAX_BYTES
+            if memory_attribution_evidence is None
+            else memory_attribution_evidence.effective_max_bytes
+        ),
+        source_alias_key_id=None if alias_key is None else alias_key.key_id,
+        source_alias_key=None if alias_key is None else alias_key.key,
+    )
+    if memory_attribution_evidence is None:
+        memory_attribution = projected_memory_attribution
+    else:
+        if type(memory_attribution_evidence) is not EvalMemoryAttributionEvidenceV1:
+            raise TypeError(
+                "memory_attribution_evidence must be exact eval memory evidence or None."
+            )
+        memory_attribution = EvalMemoryAttributionEvidenceV1.model_validate(
+            memory_attribution_evidence.model_dump(
+                mode="python",
+                round_trip=True,
+                warnings="none",
+            )
+        )
+        if memory_attribution != projected_memory_attribution:
+            raise ValueError("Prepared memory attribution does not match the assertion trajectory.")
 
     document: dict[str, Any] = {
         "schema_version": ASSERTION_EVIDENCE_SCHEMA_VERSION,
@@ -649,6 +699,7 @@ def _build_assertion_evidence_view(
         "total_tokens": total_tokens,
         "usage_evidence_state": usage_state,
         "costs": [cost.model_dump(mode="json") for cost in costs],
+        "memory_attribution": memory_attribution.model_dump(mode="json"),
     }
     revision_document = dict(document)
     if total_tokens is not None:
@@ -668,6 +719,7 @@ def project_assertion_evidence_view(
     evidence_policy: EvaluationEvidencePolicySpec,
     pricing: PriceBook | None = None,
     cost_currencies: Sequence[str] = (),
+    memory_attribution_evidence: EvalMemoryAttributionEvidenceV1 | None = None,
 ) -> AssertionEvidenceView:
     """Build a detached, redacted assertion view from one validated trajectory."""
 
@@ -686,4 +738,5 @@ def project_assertion_evidence_view(
         pricing_snapshot=pricing_snapshot,
         cost_currencies=currencies,
         app=app,
+        memory_attribution_evidence=memory_attribution_evidence,
     )

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import Enum, StrEnum
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar, cast
 from uuid import uuid4
 
 from pydantic import (
@@ -34,12 +34,18 @@ from cayu._validation import (
 from cayu.artifacts import ArtifactMetadata, ArtifactScope
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole, TextPart
+from cayu.evals.memory_attribution import (
+    EvalMemoryAttributionEvidenceV1,
+    EvalMemoryEvidenceLimitation,
+    eval_memory_attribution_fingerprint,
+)
 from cayu.memory_attribution import MemoryAttribution
 from cayu.runtime.costs import SessionCostSummary
 from cayu.runtime.sessions import Session, SessionStatus
 from cayu.runtime.usage import (
     AggregateCacheUsageMetrics,
     AggregateUsageMetrics,
+    ModelCompletionPurpose,
     SessionUsageSummary,
     aggregate_usage_metrics_from_durable_payload,
     session_usage_summary,
@@ -51,7 +57,7 @@ from cayu.runtime.usage import (
 # written for a different contract instead of silently misreading it. Version 7
 # binds portable runs to the corpus contract present before provider dispatch;
 # earlier prerelease formats are intentionally not migrated.
-EVAL_SCHEMA_VERSION = 7
+EVAL_SCHEMA_VERSION = 8
 
 # Version of the standalone trajectory JSON document written by
 # write_trajectory_json. Version 4 adds bounded memory attribution;
@@ -69,6 +75,14 @@ _EVAL_CONTENT_REVISION_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
 _EVAL_PORTABLE_ID_PATTERN = re.compile(r"[a-z][a-z0-9._-]{0,127}\Z", re.ASCII)
 _EVAL_RUN_CONTRACT_MAX_CASES = 1_000
 
+_MEMORY_EXPOSURE_ATTEMPT_EVENT_TYPES = frozenset(
+    {
+        EventType.CONTEXT_COUNTED,
+        EventType.CONTEXT_COUNT_FAILED,
+        EventType.MODEL_STARTED,
+    }
+)
+
 
 def _revalidate_model_instance(value: Any, model_type: type[_ModelT]) -> Any:
     """Rebuild an existing model that may have bypassed its field validators."""
@@ -76,6 +90,34 @@ def _revalidate_model_instance(value: Any, model_type: type[_ModelT]) -> Any:
     if isinstance(value, model_type):
         return model_type.model_validate(_model_instance_python_input(value))
     return value
+
+
+def _memory_source_expected_counts(events: Iterable[Event]) -> tuple[int, int]:
+    """Return positive terminal authority for retained recall and exposure records."""
+
+    retained = tuple(events)
+    expected_receipts = sum(
+        event.type == EventType.AUTOMATIC_RECALL_COMPLETED for event in retained
+    )
+    admitted_model_steps = {
+        model_step_id
+        for event in retained
+        if event.type == EventType.AUTOMATIC_RECALL_ADMITTED
+        and type(model_step_id := event.payload.get("model_step_id")) is str
+    }
+    expected_exposure_attempts = {
+        (model_step_id, model_attempt_id)
+        for event in retained
+        if event.type in _MEMORY_EXPOSURE_ATTEMPT_EVENT_TYPES
+        and not (
+            event.type == EventType.MODEL_STARTED
+            and event.payload.get("purpose") == ModelCompletionPurpose.CONTEXT_COMPACTION.value
+        )
+        and type(model_step_id := event.payload.get("model_step_id")) is str
+        and model_step_id in admitted_model_steps
+        and type(model_attempt_id := event.payload.get("model_attempt_id")) is str
+    }
+    return expected_receipts, len(expected_exposure_attempts)
 
 
 def _model_instance_python_input(value: BaseModel) -> dict[str, Any]:
@@ -273,6 +315,11 @@ class EvalTrialResult(BaseModel):
     evidence_complete: StrictBool = False
     events_count: StrictInt = Field(default=0, ge=0)
     usage_summary: dict[str, Any] | None = None
+    memory_attribution: EvalMemoryAttributionEvidenceV1 = Field(
+        default_factory=lambda: EvalMemoryAttributionEvidenceV1.unavailable(
+            EvalMemoryEvidenceLimitation.MISSING
+        )
+    )
     started_at: datetime
     completed_at: datetime
     duration_ms: StrictInt = Field(default=0, ge=0)
@@ -295,6 +342,11 @@ class EvalTrialResult(BaseModel):
     @classmethod
     def revalidate_trajectory(cls, value):
         return _revalidate_model_instance(value, Trajectory)
+
+    @field_validator("memory_attribution", mode="before")
+    @classmethod
+    def revalidate_eval_memory_attribution(cls, value):
+        return _revalidate_model_instance(value, EvalMemoryAttributionEvidenceV1)
 
     @field_validator("error", "unavailable_reason", mode="before")
     @classmethod
@@ -392,6 +444,93 @@ class EvalTrialResult(BaseModel):
             )
             if self.usage_summary != trajectory_usage:
                 raise ValueError("usage_summary must match the retained trajectory.")
+            attributed_sources = tuple(
+                (
+                    source.source.tree_path,
+                    source.terminal_status,
+                    source.expected_receipt_count,
+                    source.expected_exposure_count,
+                    source.attribution_fingerprint,
+                )
+                for source in self.memory_attribution.sources
+            )
+            retained_sources: list[tuple[tuple[int, ...], str, int, int, str | None]] = []
+            total_trajectory_sources = 0
+            trajectory_tree_incomplete = False
+            trajectory_source_missing = False
+
+            def retain_memory(
+                node: Trajectory,
+                path: tuple[int, ...],
+            ) -> None:
+                nonlocal total_trajectory_sources, trajectory_source_missing
+                nonlocal trajectory_tree_incomplete
+                total_trajectory_sources += 1
+                trajectory_tree_incomplete = trajectory_tree_incomplete or node.children_incomplete
+                if (
+                    total_trajectory_sources <= self.memory_attribution.effective_source_limit
+                    and node.session is not None
+                    and node.session.status
+                    in {
+                        SessionStatus.COMPLETED,
+                        SessionStatus.FAILED,
+                        SessionStatus.INTERRUPTED,
+                    }
+                ):
+                    expected_receipts, expected_exposures = _memory_source_expected_counts(
+                        node.events
+                    )
+                    retained_sources.append(
+                        (
+                            path,
+                            node.session.status.value,
+                            expected_receipts,
+                            expected_exposures,
+                            None
+                            if node.memory_attribution is None
+                            else eval_memory_attribution_fingerprint(node.memory_attribution),
+                        )
+                    )
+                elif total_trajectory_sources <= self.memory_attribution.effective_source_limit:
+                    trajectory_source_missing = True
+                for index, child in enumerate(node.children):
+                    retain_memory(child, (*path, index))
+
+            retain_memory(self.trajectory, ())
+            expected_retained_sources = tuple(
+                retained_sources[: self.memory_attribution.retained_source_count]
+            )
+            if attributed_sources != expected_retained_sources:
+                raise ValueError(
+                    "memory_attribution must match the retained trajectory source evidence."
+                )
+            if (
+                len(expected_retained_sources) < len(retained_sources)
+                and EvalMemoryEvidenceLimitation.PROJECTION_BYTES_LIMIT
+                not in self.memory_attribution.limitations
+            ):
+                raise ValueError("Byte-omitted trajectory memory sources must retain their limit.")
+            if self.memory_attribution.total_source_count != total_trajectory_sources:
+                raise ValueError(
+                    "memory_attribution must retain the exact trajectory source count."
+                )
+            if trajectory_tree_incomplete and (
+                EvalMemoryEvidenceLimitation.SOURCE_TREE_INCOMPLETE
+                not in self.memory_attribution.limitations
+            ):
+                raise ValueError(
+                    "Incomplete trajectory memory evidence must remain explicitly unavailable."
+                )
+            if trajectory_source_missing and (
+                EvalMemoryEvidenceLimitation.MISSING not in self.memory_attribution.limitations
+            ):
+                raise ValueError(
+                    "Missing trajectory memory sources must remain explicitly unavailable."
+                )
+            if total_trajectory_sources > self.memory_attribution.effective_source_limit and (
+                EvalMemoryEvidenceLimitation.SOURCE_LIMIT not in self.memory_attribution.limitations
+            ):
+                raise ValueError("Omitted trajectory memory sources must retain their limit.")
         expected_status = _status_from_assertions(self.assertions)
         # Execution/evidence can fail before assertions exist. Once assertion
         # outcomes do exist, however, their fail-closed precedence is exact:
@@ -634,7 +773,7 @@ class EvalRun(BaseModel):
 
     # Type checkers require the literal token here rather than the exported
     # EVAL_SCHEMA_VERSION constant.
-    schema_version: Literal[7] = EVAL_SCHEMA_VERSION
+    schema_version: Literal[8] = EVAL_SCHEMA_VERSION
     run_id: str = Field(default_factory=lambda: str(uuid4()))
     suite_id: str
     status: EvalStatus
@@ -647,6 +786,40 @@ class EvalRun(BaseModel):
     duration_ms: StrictInt = Field(default=0, ge=0)
     metadata: dict[str, Any] = Field(default_factory=dict)
     run_contract: EvalRunContractV1 | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_versioned_memory_evidence(cls, value: object) -> object:
+        """Reject schema-v8 mappings that silently omit the required section.
+
+        Standalone Python ``EvalTrialResult`` construction retains its explicit
+        typed-unavailable default for extension boundaries.  A durable EvalRun
+        mapping has a schema discriminator, so absence there is malformed rather
+        than evidence that may be inferred as missing.
+        """
+
+        if not isinstance(value, dict):
+            return value
+        document = cast("dict[str, object]", value)
+        cases = document.get("cases")
+        if not isinstance(cases, list | tuple):
+            return value
+        for case_index, case in enumerate(cases):
+            if not isinstance(case, dict):
+                continue
+            case_document = cast("dict[str, object]", case)
+            trials = case_document.get("trials")
+            if not isinstance(trials, list | tuple):
+                continue
+            for trial_index, trial in enumerate(trials):
+                if isinstance(trial, dict) and "memory_attribution" not in cast(
+                    "dict[str, object]", trial
+                ):
+                    raise ValueError(
+                        "EvalRun schema-v8 trial memory_attribution is required "
+                        f"at cases[{case_index}].trials[{trial_index}]."
+                    )
+        return value
 
     @field_validator("run_id", "suite_id")
     @classmethod

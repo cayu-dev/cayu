@@ -8,6 +8,7 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 
+import cayu.evals.published as published_module
 from cayu.evals.corpus import (
     ChildStatusAssertionSpec,
     CorpusUserMessageSpec,
@@ -231,8 +232,8 @@ def test_published_graph_preserves_trials_and_reproducible_aggregates_only():
     run = _run()
     published = publish_eval_run(corpus, run)
 
-    assert PUBLISHED_EVAL_SCHEMA_VERSION == 2
-    assert published.schema_version == 2
+    assert PUBLISHED_EVAL_SCHEMA_VERSION == 3
+    assert published.schema_version == 3
     assert published.corpus_revision == corpus.revision
     assert published.status == "unavailable"
     assert published.score is None
@@ -243,6 +244,9 @@ def test_published_graph_preserves_trials_and_reproducible_aggregates_only():
     ]
     assert published.cases[0].trials[0].usage is not None
     assert published.cases[0].trials[0].usage.total_tokens == 15
+    assert published.cases[0].trials[0].memory_attribution == (
+        run.cases[0].trials[0].memory_attribution
+    )
     assert published.cases[0].trials[1].assertions[-1].score is None
     assert all(trial.output.evidence_state == "unavailable" for trial in published.cases[0].trials)
     assert run.cases[0].assertions[0].assertion_revision == assertion_spec_revision(
@@ -265,6 +269,18 @@ def test_published_graph_preserves_trials_and_reproducible_aggregates_only():
         assert forbidden not in encoded
     assert PublishedEvalRun.model_validate_json(encoded) == published
 
+    missing_memory = published.model_dump(mode="json")
+    del missing_memory["cases"][0]["trials"][0]["memory_attribution"]
+    with pytest.raises(ValidationError, match="memory_attribution"):
+        PublishedEvalRun.model_validate(missing_memory)
+
+
+def test_published_eval_run_enforces_aggregate_memory_evidence_budget(monkeypatch):
+    monkeypatch.setattr(published_module, "EVAL_MEMORY_ATTRIBUTION_RESULT_BUDGET_BYTES", 1)
+
+    with pytest.raises(ValidationError, match="aggregate memory-attribution limit"):
+        publish_eval_run(_corpus(), _run())
+
 
 def test_published_eval_run_rejects_v1_before_validating_its_obsolete_shape():
     published = publish_eval_run(_corpus(), _run())
@@ -278,7 +294,7 @@ def test_published_eval_run_rejects_v1_before_validating_its_obsolete_shape():
     with pytest.raises(ValidationError, match="other versions are unsupported"):
         PublishedEvalRun.model_validate(document)
 
-    with pytest.raises(ValidationError, match="schema_version must be the integer 2"):
+    with pytest.raises(ValidationError, match="schema_version must be the integer 3"):
         PublishedEvalRun.model_validate(
             {**published.model_dump(mode="json"), "schema_version": "2"}
         )

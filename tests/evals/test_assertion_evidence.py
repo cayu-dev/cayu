@@ -8,6 +8,7 @@ from tests._session_provenance import fixture_session_invocation
 
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, ToolCallPart
+from cayu.evals._memory_attribution import eval_memory_attribution_evidence_from_trajectory
 from cayu.evals.corpus import (
     EVIDENCE_MAX_FINAL_OUTPUT_CHARS,
     EvaluationEvidencePolicySpec,
@@ -18,7 +19,9 @@ from cayu.evals.evidence import (
     _canonical_decimal,
     project_assertion_evidence_view,
 )
+from cayu.evals.memory_attribution import standard_eval_memory_attribution_bounds
 from cayu.evals.models import Trajectory
+from cayu.memory_attribution import MemoryAttribution, MemoryAttributionStatus
 from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.sessions import Session, SessionStatus
@@ -176,6 +179,40 @@ def _large_usage_trajectory() -> Trajectory:
         events=events,
         usage_summary=session_usage_summary(session_id, list(events)),
     )
+
+
+def test_assertion_evidence_reuses_the_authoritative_eval_memory_bounds() -> None:
+    attribution = MemoryAttribution(
+        status=MemoryAttributionStatus.COMPLETE,
+        truncated=False,
+        observed_receipt_count=0,
+        observed_exposure_count=0,
+        observed_item_count=0,
+        omitted_receipt_count_at_least=0,
+        omitted_exposure_count_at_least=0,
+        omitted_item_count_at_least=0,
+    )
+    trajectory = _trajectory().model_copy(
+        update={"children": (), "memory_attribution": attribution}
+    )
+    standard_bounds = standard_eval_memory_attribution_bounds()
+    selected_bounds = standard_bounds.model_copy(
+        update={"max_source_bytes": 1024, "max_projection_bytes": 1024}
+    )
+    selected = eval_memory_attribution_evidence_from_trajectory(
+        trajectory,
+        effective_bounds=selected_bounds,
+    )
+
+    view = project_assertion_evidence_view(
+        CayuApp(enable_logging=False),
+        trajectory,
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+        memory_attribution_evidence=selected,
+    )
+
+    assert view.memory_attribution == selected
+    assert view.memory_attribution.effective_bounds == selected_bounds
 
 
 def test_pricing_identity_is_canonical_and_behavior_versioned():
@@ -424,7 +461,7 @@ def test_evidence_rejects_stale_revision_and_numeric_schema_version():
 
     wrong_version = view.model_dump(mode="python")
     wrong_version["schema_version"] = True
-    with pytest.raises(ValidationError, match="integer 1"):
+    with pytest.raises(ValidationError, match="integer 2"):
         type(view).model_validate(wrong_version)
 
     unknown_policy = view.model_dump(mode="python")

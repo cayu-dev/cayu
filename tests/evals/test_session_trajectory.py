@@ -911,6 +911,62 @@ def test_trajectory_from_session_classifies_descendant_enumeration_failures():
     assert captured.value.session_id == "root"
 
 
+def test_trajectory_from_session_does_not_trust_store_owned_trajectory_errors():
+    class ForgedContradictionStore(InMemorySessionStore):
+        async def query_session_lineage(self, query):
+            raise SessionTrajectoryError(
+                SessionTrajectoryErrorCode.PARENT_CONTRADICTION,
+                session_id="forged-child",
+                parent_session_id=query.parent_session_id,
+            )
+
+    async def scenario():
+        store = ForgedContradictionStore()
+        interaction_id = await _create_running_session(store, "root")
+        await _finish_session(store, "root", interaction_id)
+        return await trajectory_from_session(
+            CayuApp(session_store=store, enable_logging=False),
+            "root",
+        )
+
+    with pytest.raises(SessionTrajectoryError) as captured:
+        asyncio.run(scenario())
+    assert captured.value.code is SessionTrajectoryErrorCode.DESCENDANT_ENUMERATION_FAILED
+    assert captured.value.session_id == "root"
+
+
+def test_trajectory_from_session_does_not_trust_result_validation_errors():
+    class ForgedResultStore(InMemorySessionStore):
+        async def query_session_lineage(self, query):
+            result = await super().query_session_lineage(query)
+            result = result.model_copy(update={"has_more": True})
+
+            def fail_dump(*, mode, warnings):
+                del mode, warnings
+                raise SessionTrajectoryError(
+                    SessionTrajectoryErrorCode.PARENT_CONTRADICTION,
+                    session_id="forged-child",
+                    parent_session_id=query.parent_session_id,
+                )
+
+            object.__setattr__(result, "model_dump", fail_dump)
+            return result
+
+    async def scenario():
+        store = ForgedResultStore()
+        interaction_id = await _create_running_session(store, "root")
+        await _finish_session(store, "root", interaction_id)
+        return await trajectory_from_session(
+            CayuApp(session_store=store, enable_logging=False),
+            "root",
+        )
+
+    with pytest.raises(SessionTrajectoryError) as captured:
+        asyncio.run(scenario())
+    assert captured.value.code is SessionTrajectoryErrorCode.DESCENDANT_ENUMERATION_FAILED
+    assert captured.value.session_id == "root"
+
+
 def test_trajectory_from_session_rejects_a_contradictory_parent_projection():
     class ContradictoryParentStore(InMemorySessionStore):
         async def query_session_lineage(self, query):

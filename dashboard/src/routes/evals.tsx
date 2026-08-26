@@ -2113,6 +2113,10 @@ function ResultInspector({
               label="Evidence"
               value={selectedTrial.evidence_complete ? "complete" : "incomplete"}
             />
+            <RunFact
+              label="Memory evidence"
+              value={`${selectedTrial.memory_attribution.completeness} · ${formatCount(selectedTrial.memory_attribution.retained_source_count)}/${formatCount(selectedTrial.memory_attribution.total_source_count)} sources`}
+            />
             <RunFact label="Diagnostic" value={selectedTrial.code.replaceAll("_", " ")} />
             <RunFact
               label="Usage"

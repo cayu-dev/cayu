@@ -21,6 +21,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictInt,
     StrictStr,
     field_validator,
@@ -1019,6 +1020,9 @@ class MemoryInterventionTrialBinding(_FingerprintRecord):
     receipt: MemoryInterventionReceipt
     trial: AgentSnapshotTrialBinding
     result: AgentSnapshotResultBinding
+    terminal_evidence_available: StrictBool = False
+    expected_receipt_count: StrictInt | None = Field(default=None, ge=0)
+    expected_exposure_count: StrictInt | None = Field(default=None, ge=0)
     attribution: MemoryAttribution
     attribution_fingerprint: StrictStr
 
@@ -1132,6 +1136,13 @@ class MemoryInterventionTrialBinding(_FingerprintRecord):
             raise ValueError("Attribution fingerprint does not match its exact projection.")
         if self.result.memory_evidence_fingerprint != expected_attribution:
             raise ValueError("AgentSnapshot result does not bind the supplied memory attribution.")
+        if (self.expected_receipt_count is None) is not (self.expected_exposure_count is None):
+            raise ValueError("Terminal memory counts must be present or absent together.")
+        counts_available = self.expected_receipt_count is not None
+        if self.terminal_evidence_available is not counts_available:
+            raise ValueError(
+                "Terminal memory counts must be present exactly when terminal evidence is available."
+            )
         return self
 
     @property
@@ -1139,7 +1150,10 @@ class MemoryInterventionTrialBinding(_FingerprintRecord):
         """Whether complete attribution proves that this trial exposed no memory."""
 
         return (
-            self.attribution.status is MemoryAttributionStatus.COMPLETE
+            self.terminal_evidence_available
+            and self.expected_receipt_count == 0
+            and self.expected_exposure_count == 0
+            and self.attribution.status is MemoryAttributionStatus.COMPLETE
             and self.attribution.observed_receipt_count == 0
             and self.attribution.observed_exposure_count == 0
             and self.attribution.observed_item_count == 0
@@ -1155,6 +1169,9 @@ class MemoryInterventionTrialBinding(_FingerprintRecord):
         trial: AgentSnapshotTrialBinding,
         result: AgentSnapshotResultBinding,
         attribution: MemoryAttribution,
+        terminal_evidence_available: bool = False,
+        expected_receipt_count: int | None = None,
+        expected_exposure_count: int | None = None,
     ) -> MemoryInterventionTrialBinding:
         attribution_fingerprint = memory_attribution_fingerprint(attribution)
         values: dict[str, Any] = {
@@ -1163,6 +1180,9 @@ class MemoryInterventionTrialBinding(_FingerprintRecord):
             "receipt": receipt,
             "trial": trial,
             "result": result,
+            "terminal_evidence_available": terminal_evidence_available,
+            "expected_receipt_count": expected_receipt_count,
+            "expected_exposure_count": expected_exposure_count,
             "attribution": attribution,
             "attribution_fingerprint": attribution_fingerprint,
         }
@@ -1230,6 +1250,16 @@ def _comparability_mismatches(
     if (
         baseline.attribution.status not in required_attribution_statuses
         or intervention.attribution.status not in required_attribution_statuses
+        or not baseline.terminal_evidence_available
+        or not intervention.terminal_evidence_available
+        or baseline.expected_receipt_count is None
+        or baseline.expected_exposure_count is None
+        or intervention.expected_receipt_count is None
+        or intervention.expected_exposure_count is None
+        or baseline.attribution.observed_receipt_count < baseline.expected_receipt_count
+        or baseline.attribution.observed_exposure_count < baseline.expected_exposure_count
+        or intervention.attribution.observed_receipt_count < intervention.expected_receipt_count
+        or intervention.attribution.observed_exposure_count < intervention.expected_exposure_count
     ):
         reasons.add(MemoryInterventionMismatchReason.REQUIRED_ATTRIBUTION_AVAILABILITY)
     return tuple(sorted(reasons, key=str))

@@ -35,12 +35,21 @@ from cayu.evals.execution import (
     _finalize_compiled_corpus_result,
     evaluation_target_identity,
 )
+from cayu.evals.memory_attribution import (
+    eval_memory_attribution_bounds_for_trial_count,
+    eval_memory_attribution_max_bytes_for_trial_count,
+    eval_memory_attribution_source_limit_for_trial_count,
+)
 from cayu.evals.models import EvalRun, aggregate_eval_score, aggregate_eval_status
 from cayu.evals.result_contract import (
     EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES,
     PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES,
 )
-from cayu.evals.runner import _aggregate_trials, _run_case_once_with_public_projection
+from cayu.evals.runner import (
+    _aggregate_trials,
+    _FreshMemoryAttributionReadLifecycle,
+    _run_case_once_with_public_projection,
+)
 from cayu.evals.scenario import (
     EvalScenarioDocumentV2,
     ScenarioApprovalCheckpointEventV2,
@@ -768,8 +777,16 @@ async def run_compiled_eval_scenario(
         EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES,
         PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES // binding.trials,
     )
+    memory_attribution_bounds = eval_memory_attribution_bounds_for_trial_count(binding.trials)
+    memory_attribution_source_limit = eval_memory_attribution_source_limit_for_trial_count(
+        binding.trials
+    )
+    memory_attribution_max_bytes = eval_memory_attribution_max_bytes_for_trial_count(binding.trials)
     slots = [None] * binding.trials
     semaphore = asyncio.Semaphore(max_concurrency)
+    memory_attribution_read_lifecycle = _FreshMemoryAttributionReadLifecycle(
+        max_operations=max_concurrency
+    )
 
     async def execute_trial(trial_number: int) -> None:
         driver = _ScenarioTrialDriver(
@@ -791,13 +808,17 @@ async def run_compiled_eval_scenario(
                 retain_final_output=False,
                 timeout_seconds=binding.timeout_seconds,
                 public_output_preview_bytes=output_preview_bytes,
+                memory_attribution_bounds=memory_attribution_bounds,
+                memory_attribution_source_limit=memory_attribution_source_limit,
+                memory_attribution_max_bytes=memory_attribution_max_bytes,
                 run_stream=driver,
+                memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
             )
             await driver.reconcile_terminal_progress()
             slots[trial_number - 1] = execution
 
     started_at = datetime.now(UTC)
-    async with asyncio.TaskGroup() as group:
+    async with memory_attribution_read_lifecycle, asyncio.TaskGroup() as group:
         for trial_number in range(1, binding.trials + 1):
             group.create_task(execute_trial(trial_number))
     completed_at = datetime.now(UTC)

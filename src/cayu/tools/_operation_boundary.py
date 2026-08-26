@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from math import isfinite
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Protocol, TypeVar
 
 from cayu._exception_groups import exception_tree_contains
 
@@ -84,6 +84,18 @@ class _RetainedInvocationOperationProbe:
             return None
         return outcome if type(outcome) is InvocationOperationOutcome else None
 
+    def outcome_if_done(self) -> InvocationOperationOutcome[Any] | None:
+        """Return the exact terminal outcome without waiting or dispatching callbacks."""
+
+        child = self.__child
+        if not child.done() or child.cancelled():
+            return None
+        try:
+            outcome = child.result()
+        except BaseException:
+            return None
+        return outcome if type(outcome) is InvocationOperationOutcome else None
+
 
 def retained_invocation_operation_settlement_probe(
     retained: _RetainedInvocationOperationProbe,
@@ -113,6 +125,16 @@ def retained_invocation_operation_settlement_probe(
         return True
 
     return settle
+
+
+def retained_invocation_operation_outcome_if_done(
+    retained: _RetainedInvocationOperationProbe,
+) -> InvocationOperationOutcome[Any] | None:
+    """Inspect a retained child only after positive task settlement."""
+
+    if type(retained) is not _RetainedInvocationOperationProbe:
+        raise TypeError("retained must be a runtime-owned invocation-operation probe.")
+    return retained.outcome_if_done()
 
 
 def _observe_retained_invocation_operation(
@@ -242,6 +264,18 @@ class BoundedInvocationOperationRegistry:
         operation.exception()
 
 
+class _InvocationOperationRegistry(Protocol):
+    """Structural registry contract used by cancellation-abandonable operations."""
+
+    def reserve(self) -> bool: ...
+
+    def release_reservation(self) -> None: ...
+
+    def track(self, operation: asyncio.Future[Any]) -> None: ...
+
+    def release(self, operation: asyncio.Future[Any]) -> None: ...
+
+
 def _observe_invocation_registry_close(task: asyncio.Task[bool]) -> None:
     if task.cancelled():
         return
@@ -293,12 +327,15 @@ async def await_invocation_operation(
     request_child_cancellation: bool = True,
     cancellation: asyncio.CancelledError | None = None,
     abandon_on_caller_cancellation: bool = False,
-    operation_registry: BoundedInvocationOperationRegistry | None = None,
+    operation_registry: _InvocationOperationRegistry | None = None,
     on_unsettled_supervisory_exit: (
         Callable[[_RetainedInvocationOperationProbe], None] | None
     ) = None,
     on_abandoned_caller_cancellation: (
         Callable[[Callable[[], Awaitable[bool]]], None] | None
+    ) = None,
+    on_abandoned_caller_operation: (
+        Callable[[_RetainedInvocationOperationProbe], None] | None
     ) = None,
 ) -> InvocationOperationOutcome[_ResultT]:
     """Run an extension in an owned task without surrendering caller cancellation.
@@ -321,7 +358,9 @@ async def await_invocation_operation(
     delivery alone cannot prove that executor, subprocess, remote, or other
     opaque work stopped. A mutation whose settlement owns retry or cleanup
     authority must additionally transfer the returned retained probe through
-    ``on_abandoned_caller_cancellation`` to a shared-resource fence.
+    ``on_abandoned_caller_cancellation`` to a shared-resource fence. Read-only
+    owners that must retain the exact late child outcome may additionally use
+    ``on_abandoned_caller_operation``.
     """
 
     if not callable(operation_factory):
@@ -338,6 +377,8 @@ async def await_invocation_operation(
         on_abandoned_caller_cancellation
     ):
         raise TypeError("on_abandoned_caller_cancellation must be callable or None.")
+    if on_abandoned_caller_operation is not None and not callable(on_abandoned_caller_operation):
+        raise TypeError("on_abandoned_caller_operation must be callable or None.")
     if abandon_on_caller_cancellation != (operation_registry is not None):
         raise ValueError(
             "abandon_on_caller_cancellation requires exactly one bounded operation registry."
@@ -424,11 +465,12 @@ async def await_invocation_operation(
                     # becoming a merely historical fence outcome.
                     if child.done():
                         break
+                    retained_operation = _RetainedInvocationOperationProbe(child)
+                    if on_abandoned_caller_operation is not None:
+                        on_abandoned_caller_operation(retained_operation)
                     if on_abandoned_caller_cancellation is not None:
                         on_abandoned_caller_cancellation(
-                            retained_invocation_operation_settlement_probe(
-                                _RetainedInvocationOperationProbe(child)
-                            )
+                            retained_invocation_operation_settlement_probe(retained_operation)
                         )
                     return InvocationOperationOutcome(
                         # The retained child can still begin after this caller

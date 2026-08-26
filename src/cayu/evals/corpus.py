@@ -118,6 +118,19 @@ class _SchemaV1PortableModel(_PortableModel):
         return value
 
 
+class _SchemaV2PortableModel(_PortableModel):
+    """Portable schema root whose v2 discriminator never coerces JSON types."""
+
+    schema_version: Literal[2] = 2
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be the integer 2.")
+        return value
+
+
 def _bounded_durable_text(
     value: str,
     field_name: str,

@@ -296,6 +296,7 @@ class EvalResultProjectionV1(_SchemaV1PortableModel):
     evidence_policy_revision: StrictStr
     pricing_profile_fingerprint: StrictStr | None = None
     uses_pricing: StrictBool
+    memory_attribution_support: Literal["unsupported"] = "unsupported"
     status: PublishedStatus
     score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
     cases: tuple[EvalResultCaseProjectionV1, ...] = Field(

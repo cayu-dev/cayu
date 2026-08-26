@@ -30,6 +30,7 @@ from cayu.evals.evidence import (
     _ValidatedPricingSnapshot,
 )
 from cayu.evals.judges import LLMJudge, _first_user_text, _render_transcript
+from cayu.evals.memory_attribution import EvalMemoryAttributionEvidenceV1
 from cayu.evals.models import EvalAssertionResult, EvalContext
 from cayu.evals.portable_evaluation import _evaluate_validated_assertion_spec
 from cayu.runtime.app import CayuApp
@@ -387,6 +388,7 @@ def _prepare_portable_assertion_evidence(
     context: EvalContext,
     *,
     runtime_app: CayuApp | None = None,
+    memory_attribution_evidence: EvalMemoryAttributionEvidenceV1 | None = None,
 ) -> AssertionEvidenceView | None:
     trajectory = context.trajectory
     portable_assertions = tuple(
@@ -446,6 +448,7 @@ def _prepare_portable_assertion_evidence(
         allow_event_count_fallback=True,
         expected_pricing_profile_fingerprint=pricing_fingerprint,
         bind_pricing_profile=True,
+        memory_attribution_evidence=memory_attribution_evidence,
     )
 
 

@@ -22,6 +22,7 @@ from cayu.evals.execution_comparison import (
     CorpusExecutionRegression,
     CorpusRegressionKind,
 )
+from cayu.evals.memory_attribution import eval_memory_attribution_summary
 from cayu.evals.results import CapturedEvaluationResultV1
 
 CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES = 48 << 20
@@ -294,6 +295,8 @@ def render_captured_evaluation_html(result: CapturedEvaluationResultV1) -> str:
     )
     score = result.score
     assertion_rows = "\n".join(_assertion_row(assertion) for assertion in score.assertions)
+    memory = score.memory_attribution
+    memory_summary = eval_memory_attribution_summary(memory)
     rendered = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -333,6 +336,8 @@ def render_captured_evaluation_html(result: CapturedEvaluationResultV1) -> str:
       <p>AppManifest schema <code>{_escape(result.target.app_manifest_schema_version)}</code> · fingerprint <code>{_escape(result.target.app_manifest_fingerprint)}</code></p>
       <p>Corpus <code>{_escape(result.corpus_revision)}</code> · suite <code>{_escape(result.suite_revision)}</code></p>
       <p>Case <code>{_escape(score.case_id)}</code> · evidence <code>{_escape(score.evidence_revision)}</code> · evidence policy <code>{_escape(score.evidence_policy_revision)}</code></p>
+      <p>Memory attribution {_escape(memory_summary)} · revision <code>{_escape(memory.revision)}</code></p>
+      <p>Full memory-attribution record inspection is unsupported in HTML; use the JSON result for aliases, fingerprints, source references, and complete lifecycle transitions.</p>
     </section>
     <h2>Captured assertion evidence</h2>
     <section class="card">{assertion_rows}</section>
@@ -438,6 +443,7 @@ def render_corpus_execution_comparison_html(
     <h1>Cayu Eval Comparison</h1>
     <p>Baseline <code>{_escape(comparison.baseline.result_revision)}</code> vs current <code>{_escape(comparison.current.result_revision)}</code></p>
     <p>Score regression tolerance <code>{_escape(format(comparison.score_tolerance, ".15g"))}</code></p>
+    <p>Memory-attribution comparison: <code>{_escape(comparison.baseline.memory_attribution_support)}</code> in this compact report.</p>
     <section class="notice"><strong>{_escape(compatibility_text)}</strong>{compatibility_details}</section>
     <h2>Outcome</h2>
     <table>
@@ -503,12 +509,19 @@ def _trial_section(trial: Any) -> str:
     )
     if output.text:
         output_block += f"<pre>{_escape(output.text)}</pre>"
+    memory = trial.memory_attribution
+    memory_summary = eval_memory_attribution_summary(memory)
     return (
         f'<section class="trial"><h4>Trial {trial.trial_number} {_badge(trial.status)}</h4>'
         f"<p>Score {_score(trial.score)} · {trial.duration_ms} ms · "
         f"evidence {'complete' if trial.evidence_complete else 'incomplete'} · "
         f"usage {_escape(usage)} · reason <code>{_escape(trial.code)}</code></p>"
         f"<p>{_escape(trial.message)}</p>"
+        f"<p>Memory attribution: {_escape(memory_summary)} · revision "
+        f"<code>{_escape(memory.revision)}</code></p>"
+        "<p>Full memory-attribution record inspection is unsupported in HTML; "
+        "use the JSON result for aliases, fingerprints, source references, and complete "
+        "lifecycle transitions.</p>"
         f"{output_block}{assertions}</section>"
     )
 

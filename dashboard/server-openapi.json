@@ -4533,7 +4533,7 @@
       },
       "AssertionEvidenceView": {
         "additionalProperties": false,
-        "description": "The bounded, alias-free data consumed by every portable assertion.",
+        "description": "The bounded, content-minimized data consumed by every portable assertion.",
         "properties": {
           "child_evidence_state": {
             "enum": [
@@ -4577,6 +4577,9 @@
             ],
             "title": "Final Output State",
             "type": "string"
+          },
+          "memory_attribution": {
+            "$ref": "#/components/schemas/EvalMemoryAttributionEvidenceV1"
           },
           "model_step_evidence_state": {
             "enum": [
@@ -4648,8 +4651,8 @@
             "title": "Root Status"
           },
           "schema_version": {
-            "const": 1,
-            "default": 1,
+            "const": 2,
+            "default": 2,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -4719,7 +4722,8 @@
           "tool_evidence_state",
           "model_step_evidence_state",
           "usage_evidence_state",
-          "costs"
+          "costs",
+          "memory_attribution"
         ],
         "title": "AssertionEvidenceView",
         "type": "object"
@@ -5623,6 +5627,9 @@
             "title": "Evidence Revision",
             "type": "string"
           },
+          "memory_attribution": {
+            "$ref": "#/components/schemas/EvalMemoryAttributionEvidenceV1"
+          },
           "pricing_profile_fingerprint": {
             "anyOf": [
               {
@@ -5675,6 +5682,7 @@
           "case_revision",
           "evidence_revision",
           "evidence_policy_revision",
+          "memory_attribution",
           "status",
           "assertions"
         ],
@@ -6204,6 +6212,37 @@
         "title": "CompactSessionBody",
         "type": "object"
       },
+      "ContextExposureEvidenceKind": {
+        "enum": [
+          "composition_planned",
+          "request_prepared",
+          "dispatch_intent_committed",
+          "provider_acknowledgement",
+          "recovery_acknowledgement",
+          "provider_completion",
+          "recovery_completion",
+          "conclusive_failure",
+          "conclusive_cancellation",
+          "ambiguous_transport",
+          "recovery_indeterminate"
+        ],
+        "title": "ContextExposureEvidenceKind",
+        "type": "string"
+      },
+      "ContextExposureState": {
+        "enum": [
+          "planned",
+          "prepared",
+          "dispatch_started",
+          "acknowledged",
+          "completed",
+          "failed",
+          "cancelled",
+          "indeterminate"
+        ],
+        "title": "ContextExposureState",
+        "type": "string"
+      },
       "ContextualPricingRequirement": {
         "additionalProperties": false,
         "description": "Commercial constraints every contextual price for one provider must declare.",
@@ -6516,6 +6555,12 @@
             "title": "Application Release Id",
             "type": "string"
           },
+          "memory_attribution_support": {
+            "const": "unsupported",
+            "default": "unsupported",
+            "title": "Memory Attribution Support",
+            "type": "string"
+          },
           "result_revision": {
             "title": "Result Revision",
             "type": "string"
@@ -6707,8 +6752,8 @@
             "$ref": "#/components/schemas/PublishedEvalRun"
           },
           "schema_version": {
-            "const": 1,
-            "default": 1,
+            "const": 2,
+            "default": 2,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -8200,6 +8245,342 @@
           "cases"
         ],
         "title": "EvalCorpusDocument",
+        "type": "object"
+      },
+      "EvalMemoryAttributionCapturePolicyV1": {
+        "additionalProperties": false,
+        "description": "One fixed eval-owned projection contract.",
+        "properties": {
+          "max_document_bytes": {
+            "const": 1048576,
+            "default": 1048576,
+            "title": "Max Document Bytes",
+            "type": "integer"
+          },
+          "max_exposures": {
+            "const": 100,
+            "default": 100,
+            "title": "Max Exposures",
+            "type": "integer"
+          },
+          "max_items": {
+            "const": 1000,
+            "default": 1000,
+            "title": "Max Items",
+            "type": "integer"
+          },
+          "max_projection_bytes": {
+            "const": 524288,
+            "default": 524288,
+            "title": "Max Projection Bytes",
+            "type": "integer"
+          },
+          "max_receipts": {
+            "const": 100,
+            "default": 100,
+            "title": "Max Receipts",
+            "type": "integer"
+          },
+          "max_source_bytes": {
+            "const": 4194304,
+            "default": 4194304,
+            "title": "Max Source Bytes",
+            "type": "integer"
+          },
+          "max_sources": {
+            "const": 100,
+            "default": 100,
+            "title": "Max Sources",
+            "type": "integer"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "runtime_projection": {
+            "const": "cayu.memory_attribution.v1",
+            "default": "cayu.memory_attribution.v1",
+            "title": "Runtime Projection",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision"
+        ],
+        "title": "EvalMemoryAttributionCapturePolicyV1",
+        "type": "object"
+      },
+      "EvalMemoryAttributionEvidenceV1": {
+        "additionalProperties": false,
+        "description": "Complete portable memory evidence for one eval trial's session tree.",
+        "properties": {
+          "completeness": {
+            "$ref": "#/components/schemas/EvalMemoryEvidenceCompleteness"
+          },
+          "effective_bounds": {
+            "$ref": "#/components/schemas/MemoryAttributionBounds"
+          },
+          "effective_max_bytes": {
+            "maximum": 1048576.0,
+            "minimum": 1.0,
+            "title": "Effective Max Bytes",
+            "type": "integer"
+          },
+          "effective_source_limit": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Effective Source Limit",
+            "type": "integer"
+          },
+          "has_indeterminate_exposure": {
+            "title": "Has Indeterminate Exposure",
+            "type": "boolean"
+          },
+          "limitations": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalMemoryEvidenceLimitation"
+            },
+            "title": "Limitations",
+            "type": "array"
+          },
+          "omitted_source_count_at_least": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Omitted Source Count At Least",
+            "type": "integer"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/EvalMemoryAttributionCapturePolicyV1"
+          },
+          "proves_empty": {
+            "title": "Proves Empty",
+            "type": "boolean"
+          },
+          "retained_source_count": {
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Retained Source Count",
+            "type": "integer"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "sources": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalMemoryAttributionSourceV1"
+            },
+            "maxItems": 100,
+            "title": "Sources",
+            "type": "array"
+          },
+          "total_source_count": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Total Source Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "policy",
+          "effective_bounds",
+          "effective_source_limit",
+          "effective_max_bytes",
+          "completeness",
+          "total_source_count",
+          "retained_source_count",
+          "omitted_source_count_at_least",
+          "proves_empty",
+          "has_indeterminate_exposure"
+        ],
+        "title": "EvalMemoryAttributionEvidenceV1",
+        "type": "object"
+      },
+      "EvalMemoryAttributionSourceV1": {
+        "additionalProperties": false,
+        "properties": {
+          "attribution": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryAttribution"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "attribution_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attribution Fingerprint"
+          },
+          "expected_exposure_count": {
+            "anyOf": [
+              {
+                "maximum": 9.223372036854776e+18,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Exposure Count"
+          },
+          "expected_receipt_count": {
+            "anyOf": [
+              {
+                "maximum": 9.223372036854776e+18,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Receipt Count"
+          },
+          "limitations": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalMemoryEvidenceLimitation"
+            },
+            "title": "Limitations",
+            "type": "array"
+          },
+          "source": {
+            "$ref": "#/components/schemas/EvalMemorySourceReferenceV1"
+          },
+          "terminal_status": {
+            "enum": [
+              "completed",
+              "failed",
+              "interrupted"
+            ],
+            "title": "Terminal Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "terminal_status"
+        ],
+        "title": "EvalMemoryAttributionSourceV1",
+        "type": "object"
+      },
+      "EvalMemoryEvidenceCompleteness": {
+        "enum": [
+          "complete",
+          "truncated",
+          "unavailable"
+        ],
+        "title": "EvalMemoryEvidenceCompleteness",
+        "type": "string"
+      },
+      "EvalMemoryEvidenceLimitation": {
+        "enum": [
+          "source_limit",
+          "source_bytes_limit",
+          "projection_bytes_limit",
+          "runtime_attribution_truncated",
+          "store_unsupported",
+          "evidence_read_failed",
+          "alias_key_unavailable",
+          "missing",
+          "deleted",
+          "legacy",
+          "contradictory_lineage",
+          "source_tree_incomplete",
+          "closure_changed",
+          "deadline_expired"
+        ],
+        "title": "EvalMemoryEvidenceLimitation",
+        "type": "string"
+      },
+      "EvalMemorySourceAliasV1": {
+        "additionalProperties": false,
+        "properties": {
+          "algorithm": {
+            "const": "hmac-sha256",
+            "default": "hmac-sha256",
+            "title": "Algorithm",
+            "type": "string"
+          },
+          "digest": {
+            "maxLength": 64,
+            "minLength": 64,
+            "title": "Digest",
+            "type": "string"
+          },
+          "key_id": {
+            "maxLength": 64,
+            "title": "Key Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key_id",
+          "digest"
+        ],
+        "title": "EvalMemorySourceAliasV1",
+        "type": "object"
+      },
+      "EvalMemorySourceReferenceV1": {
+        "additionalProperties": false,
+        "properties": {
+          "role": {
+            "enum": [
+              "root",
+              "descendant"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "session_alias": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalMemorySourceAliasV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tree_path": {
+            "items": {
+              "type": "integer"
+            },
+            "maxItems": 32,
+            "title": "Tree Path",
+            "type": "array"
+          }
+        },
+        "required": [
+          "role",
+          "tree_path"
+        ],
+        "title": "EvalMemorySourceReferenceV1",
         "type": "object"
       },
       "EvalResultComparisonResponse": {
@@ -11717,6 +12098,554 @@
         "title": "MaxTotalTokensAssertionSpec",
         "type": "object"
       },
+      "MemoryAttribution": {
+        "additionalProperties": false,
+        "description": "Versioned bounded projection of one session's durable memory-use truth.",
+        "properties": {
+          "exposures": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryContextExposureAttribution"
+            },
+            "maxItems": 1000,
+            "title": "Exposures",
+            "type": "array"
+          },
+          "observed_exposure_count": {
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Observed Exposure Count",
+            "type": "integer"
+          },
+          "observed_item_count": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Observed Item Count",
+            "type": "integer"
+          },
+          "observed_receipt_count": {
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Observed Receipt Count",
+            "type": "integer"
+          },
+          "omitted_exposure_count_at_least": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Omitted Exposure Count At Least",
+            "type": "integer"
+          },
+          "omitted_item_count_at_least": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Omitted Item Count At Least",
+            "type": "integer"
+          },
+          "omitted_receipt_count_at_least": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Omitted Receipt Count At Least",
+            "type": "integer"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryAttributionUnavailableReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "receipts": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryRecallAttribution"
+            },
+            "maxItems": 1000,
+            "title": "Receipts",
+            "type": "array"
+          },
+          "schema_version": {
+            "const": "cayu.memory_attribution.v1",
+            "default": "cayu.memory_attribution.v1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MemoryAttributionStatus"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "status",
+          "truncated",
+          "observed_receipt_count",
+          "observed_exposure_count",
+          "observed_item_count",
+          "omitted_receipt_count_at_least",
+          "omitted_exposure_count_at_least",
+          "omitted_item_count_at_least"
+        ],
+        "title": "MemoryAttribution",
+        "type": "object"
+      },
+      "MemoryAttributionBounds": {
+        "additionalProperties": false,
+        "description": "Global bounds shared by every session in one evidence capture.",
+        "properties": {
+          "max_exposures": {
+            "default": 100,
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Max Exposures",
+            "type": "integer"
+          },
+          "max_items": {
+            "default": 1000,
+            "maximum": 10000.0,
+            "minimum": 1.0,
+            "title": "Max Items",
+            "type": "integer"
+          },
+          "max_projection_bytes": {
+            "default": 4194304,
+            "maximum": 16777216.0,
+            "minimum": 1.0,
+            "title": "Max Projection Bytes",
+            "type": "integer"
+          },
+          "max_receipts": {
+            "default": 100,
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Max Receipts",
+            "type": "integer"
+          },
+          "max_source_bytes": {
+            "default": 16777216,
+            "maximum": 67108864.0,
+            "minimum": 1.0,
+            "title": "Max Source Bytes",
+            "type": "integer"
+          }
+        },
+        "title": "MemoryAttributionBounds",
+        "type": "object"
+      },
+      "MemoryAttributionStatus": {
+        "description": "Trust state of one session's projected memory evidence.",
+        "enum": [
+          "complete",
+          "truncated",
+          "unavailable",
+          "redacted",
+          "contradictory"
+        ],
+        "title": "MemoryAttributionStatus",
+        "type": "string"
+      },
+      "MemoryAttributionUnavailableReason": {
+        "description": "Stable reason memory attribution could not be represented.",
+        "enum": [
+          "store_unsupported",
+          "evidence_read_failed",
+          "alias_key_unavailable",
+          "contradictory_evidence"
+        ],
+        "title": "MemoryAttributionUnavailableReason",
+        "type": "string"
+      },
+      "MemoryContextExposureAttribution": {
+        "additionalProperties": false,
+        "description": "Secret-free structural and lifecycle facts from one context exposure.",
+        "properties": {
+          "contributor_count": {
+            "maximum": 64.0,
+            "minimum": 0.0,
+            "title": "Contributor Count",
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "exposure_alias": {
+            "$ref": "#/components/schemas/MemoryEvidenceAlias"
+          },
+          "interaction_alias": {
+            "$ref": "#/components/schemas/MemoryEvidenceAlias"
+          },
+          "items": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryExposureItemAttribution"
+            },
+            "maxItems": 64,
+            "title": "Items",
+            "type": "array"
+          },
+          "items_truncated": {
+            "default": false,
+            "title": "Items Truncated",
+            "type": "boolean"
+          },
+          "model_attempt_id": {
+            "maxLength": 256,
+            "title": "Model Attempt Id",
+            "type": "string"
+          },
+          "model_step_id": {
+            "maxLength": 256,
+            "title": "Model Step Id",
+            "type": "string"
+          },
+          "omitted_item_count_at_least": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Omitted Item Count At Least",
+            "type": "integer"
+          },
+          "projection_ordinal": {
+            "exclusiveMaximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Projection Ordinal",
+            "type": "integer"
+          },
+          "provider_attempt_id": {
+            "maxLength": 256,
+            "title": "Provider Attempt Id",
+            "type": "string"
+          },
+          "provider_exposure_proven": {
+            "title": "Provider Exposure Proven",
+            "type": "boolean"
+          },
+          "receipt_aliases": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryEvidenceAlias"
+            },
+            "maxItems": 32,
+            "title": "Receipt Aliases",
+            "type": "array"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ContextExposureState"
+          },
+          "state_revision": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "State Revision",
+            "type": "integer"
+          },
+          "transitions": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryExposureTransitionAttribution"
+            },
+            "maxItems": 16,
+            "title": "Transitions",
+            "type": "array"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "exposure_alias",
+          "interaction_alias",
+          "projection_ordinal",
+          "model_step_id",
+          "model_attempt_id",
+          "provider_attempt_id",
+          "created_at",
+          "updated_at",
+          "state",
+          "state_revision",
+          "provider_exposure_proven",
+          "contributor_count",
+          "omitted_item_count_at_least"
+        ],
+        "title": "MemoryContextExposureAttribution",
+        "type": "object"
+      },
+      "MemoryEvidenceAlias": {
+        "additionalProperties": false,
+        "description": "A domain- and session-scoped HMAC alias for a private durable identity.",
+        "properties": {
+          "algorithm": {
+            "const": "hmac-sha256",
+            "default": "hmac-sha256",
+            "title": "Algorithm",
+            "type": "string"
+          },
+          "digest": {
+            "maxLength": 64,
+            "minLength": 64,
+            "title": "Digest",
+            "type": "string"
+          },
+          "key_id": {
+            "maxLength": 64,
+            "title": "Key Id",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "receipt",
+              "exposure",
+              "item",
+              "interaction"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key_id",
+          "kind",
+          "digest"
+        ],
+        "title": "MemoryEvidenceAlias",
+        "type": "object"
+      },
+      "MemoryExposureItemAttribution": {
+        "additionalProperties": false,
+        "properties": {
+          "admission": {
+            "$ref": "#/components/schemas/RecallItemAdmission"
+          },
+          "item_alias": {
+            "$ref": "#/components/schemas/MemoryEvidenceAlias"
+          },
+          "ordinal": {
+            "exclusiveMaximum": 64.0,
+            "minimum": 0.0,
+            "title": "Ordinal",
+            "type": "integer"
+          },
+          "receipt_alias": {
+            "$ref": "#/components/schemas/MemoryEvidenceAlias"
+          },
+          "receipt_item_ordinal": {
+            "exclusiveMaximum": 64.0,
+            "minimum": 0.0,
+            "title": "Receipt Item Ordinal",
+            "type": "integer"
+          },
+          "selection_reason": {
+            "$ref": "#/components/schemas/RecallItemSelectionReason"
+          }
+        },
+        "required": [
+          "item_alias",
+          "receipt_alias",
+          "ordinal",
+          "receipt_item_ordinal",
+          "admission",
+          "selection_reason"
+        ],
+        "title": "MemoryExposureItemAttribution",
+        "type": "object"
+      },
+      "MemoryExposureTransitionAttribution": {
+        "additionalProperties": false,
+        "properties": {
+          "evidence_kind": {
+            "$ref": "#/components/schemas/ContextExposureEvidenceKind"
+          },
+          "occurred_at": {
+            "format": "date-time",
+            "title": "Occurred At",
+            "type": "string"
+          },
+          "revision": {
+            "exclusiveMaximum": 16.0,
+            "minimum": 0.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ContextExposureState"
+          }
+        },
+        "required": [
+          "revision",
+          "state",
+          "occurred_at",
+          "evidence_kind"
+        ],
+        "title": "MemoryExposureTransitionAttribution",
+        "type": "object"
+      },
+      "MemoryRecallAttribution": {
+        "additionalProperties": false,
+        "description": "Secret-free structural facts from one recall receipt.",
+        "properties": {
+          "admitted_count": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Admitted Count",
+            "type": "integer"
+          },
+          "complete_source_count": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Complete Source Count",
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "eligible_count": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Eligible Count",
+            "type": "integer"
+          },
+          "failed_source_count": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Failed Source Count",
+            "type": "integer"
+          },
+          "inspected_count": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Inspected Count",
+            "type": "integer"
+          },
+          "interaction_alias": {
+            "$ref": "#/components/schemas/MemoryEvidenceAlias"
+          },
+          "items": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryRecallItemAttribution"
+            },
+            "maxItems": 64,
+            "title": "Items",
+            "type": "array"
+          },
+          "items_truncated": {
+            "default": false,
+            "title": "Items Truncated",
+            "type": "boolean"
+          },
+          "model_step_id": {
+            "maxLength": 256,
+            "title": "Model Step Id",
+            "type": "string"
+          },
+          "offered_count": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Offered Count",
+            "type": "integer"
+          },
+          "omitted_count": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Omitted Count",
+            "type": "integer"
+          },
+          "omitted_item_count_at_least": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Omitted Item Count At Least",
+            "type": "integer"
+          },
+          "partial_source_count": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Partial Source Count",
+            "type": "integer"
+          },
+          "projection_ordinal": {
+            "exclusiveMaximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Projection Ordinal",
+            "type": "integer"
+          },
+          "receipt_alias": {
+            "$ref": "#/components/schemas/MemoryEvidenceAlias"
+          },
+          "silent_count": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Silent Count",
+            "type": "integer"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "unavailable_source_count": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Unavailable Source Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "receipt_alias",
+          "interaction_alias",
+          "projection_ordinal",
+          "model_step_id",
+          "created_at",
+          "inspected_count",
+          "eligible_count",
+          "admitted_count",
+          "offered_count",
+          "silent_count",
+          "omitted_count",
+          "complete_source_count",
+          "partial_source_count",
+          "unavailable_source_count",
+          "failed_source_count",
+          "truncated",
+          "omitted_item_count_at_least"
+        ],
+        "title": "MemoryRecallAttribution",
+        "type": "object"
+      },
+      "MemoryRecallItemAttribution": {
+        "additionalProperties": false,
+        "properties": {
+          "admission": {
+            "$ref": "#/components/schemas/RecallItemAdmission"
+          },
+          "item_alias": {
+            "$ref": "#/components/schemas/MemoryEvidenceAlias"
+          },
+          "ordinal": {
+            "exclusiveMaximum": 64.0,
+            "minimum": 0.0,
+            "title": "Ordinal",
+            "type": "integer"
+          },
+          "selection_reason": {
+            "$ref": "#/components/schemas/RecallItemSelectionReason"
+          }
+        },
+        "required": [
+          "item_alias",
+          "ordinal",
+          "admission",
+          "selection_reason"
+        ],
+        "title": "MemoryRecallItemAttribution",
+        "type": "object"
+      },
       "Message": {
         "additionalProperties": false,
         "description": "Frozen transcript message.\n\nMessages and their parts are immutable once constructed: attribute\nassignment is rejected, `content` is a tuple, and every part entering the\nmessage is copied so the message exclusively owns its JSON payloads. The\nfreeze is shallow, though \u2014 nested payload dicts stay mutable \u2014 so sharing\na validated instance is safe only while every holder treats payloads as\nread-only. Hot-path `copy_message` \"copies\" are no-ops under that\ncontract; `detach_message` produces a genuinely isolated copy for\nstorage/trust boundaries, and `copy.deepcopy` isolates as well.",
@@ -13275,7 +14204,7 @@
             "type": "string"
           },
           "schema_version": {
-            "const": 2,
+            "const": 3,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -13355,6 +14284,9 @@
             "title": "Evidence Complete",
             "type": "boolean"
           },
+          "memory_attribution": {
+            "$ref": "#/components/schemas/EvalMemoryAttributionEvidenceV1"
+          },
           "message": {
             "title": "Message",
             "type": "string"
@@ -13409,6 +14341,7 @@
           "evidence_complete",
           "duration_ms",
           "output",
+          "memory_attribution",
           "code",
           "message"
         ],
@@ -13890,6 +14823,26 @@
         ],
         "title": "PublishedUsageSummaryV1",
         "type": "object"
+      },
+      "RecallItemAdmission": {
+        "enum": [
+          "admitted",
+          "offered"
+        ],
+        "title": "RecallItemAdmission",
+        "type": "string"
+      },
+      "RecallItemSelectionReason": {
+        "enum": [
+          "calibrated_strong_match",
+          "calibrated_plausible_match",
+          "duplicate_strong_reference",
+          "strong_match_not_focused",
+          "strong_match_offered_by_mode",
+          "explicit_application_selection"
+        ],
+        "title": "RecallItemSelectionReason",
+        "type": "string"
       },
       "RegistrationProvenance": {
         "additionalProperties": false,

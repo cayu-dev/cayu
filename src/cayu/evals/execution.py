@@ -62,7 +62,7 @@ CORPUS_EXECUTION_MAX_CONCURRENCY = 32
 CORPUS_EXECUTION_MAX_APP_MANIFEST_BYTES = 1 << 20
 CORPUS_EXECUTION_MAX_REQUEST_BASE_BYTES = 64 << 10
 CORPUS_EXECUTION_RESULT_MAX_BYTES = 40 << 20
-CORPUS_EXECUTION_RESULT_SCHEMA_VERSION = 1
+CORPUS_EXECUTION_RESULT_SCHEMA_VERSION = 2
 CORPUS_EXECUTION_MAX_MODEL_JUDGES = 32
 
 
@@ -703,7 +703,7 @@ class CorpusExecutionResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
 
-    schema_version: Literal[1] = CORPUS_EXECUTION_RESULT_SCHEMA_VERSION
+    schema_version: Literal[2] = CORPUS_EXECUTION_RESULT_SCHEMA_VERSION
     revision: StrictStr
     target: EvaluationTargetIdentity
     run: PublishedEvalRun
@@ -712,7 +712,7 @@ class CorpusExecutionResult(BaseModel):
     @classmethod
     def validate_schema_version_type(cls, value: object) -> object:
         if type(value) is not int:
-            raise ValueError("schema_version must be the integer 1.")
+            raise ValueError("schema_version must be the integer 2.")
         return value
 
     @field_validator("revision")

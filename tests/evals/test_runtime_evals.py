@@ -6,6 +6,7 @@ import json
 import os
 from datetime import UTC, datetime
 from decimal import Decimal
+from threading import Event as ThreadEvent
 from types import SimpleNamespace
 
 import pytest
@@ -79,6 +80,7 @@ from cayu import (
     write_eval_run_json,
     write_html_report,
 )
+from cayu._exception_groups import iter_exception_tree
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.artifacts import ArtifactListResult, ArtifactMetadata, ArtifactScope
 from cayu.cli import main
@@ -91,8 +93,35 @@ from cayu.evals import (
     run_eval_case,
     write_trajectory_json,
 )
+from cayu.evals._memory_attribution import (
+    eval_memory_attribution_evidence_from_trajectory,
+)
+from cayu.evals.memory_attribution import (
+    EvalMemoryAttributionEvidenceV1,
+    EvalMemoryAttributionSourceV1,
+    EvalMemoryEvidenceCompleteness,
+    EvalMemoryEvidenceLimitation,
+    EvalMemorySourceReferenceV1,
+    eval_memory_attribution_fingerprint,
+    eval_memory_source_alias,
+    standard_eval_memory_attribution_bounds,
+)
 from cayu.evals.models import WorkspaceFileProbe
 from cayu.evals.runner import _blocked_assertion_results, _build_child_trajectories
+from cayu.memory_attribution import (
+    MemoryAttribution,
+    MemoryAttributionStatus,
+    MemoryAttributionUnavailableReason,
+)
+from cayu.memory_evidence import (
+    ContextExposure,
+    ContextExposureEvidenceKind,
+    ContextExposurePage,
+    ContextExposureState,
+    ContextExposureTransition,
+    KeyedEvidenceFingerprint,
+    KeyedEvidenceFingerprintDomain,
+)
 from cayu.providers import (
     ModelProvider,
     ModelRequest,
@@ -102,8 +131,18 @@ from cayu.providers import (
     ProviderOperationStatus,
 )
 from cayu.runtime import InMemorySessionStore, SessionIdentity
-from cayu.runtime.sessions import Session, SessionStatus
+from cayu.runtime._memory_evidence import memory_evidence_key
+from cayu.runtime.request_footprints import RequestFootprintConfig
+from cayu.runtime.sessions import (
+    Session,
+    SessionLineageNode,
+    SessionLineageOrigin,
+    SessionStatus,
+    TerminalSessionEvidenceError,
+    TerminalSessionEvidenceErrorCode,
+)
 from cayu.runtime.usage import SessionUsageSummary, build_aggregate_usage_metrics
+from cayu.storage.sqlite import SQLiteSessionStore
 
 
 def _session(
@@ -634,8 +673,14 @@ def test_eval_json_html_and_compare(tmp_path):
 
     assert loaded == result
     assert "Cayu Eval Report" in html
+    assert "Memory attribution:" in html
+    assert "Full memory-attribution record inspection is unsupported in HTML" in html
     assert comparison.regressions == ()
-    assert "Cayu Eval Comparison" in render_comparison_html(comparison)
+    assert comparison.memory_attribution_support == "unsupported"
+    assert '"memory_attribution_support": "unsupported"' in comparison_to_json(comparison)
+    comparison_html = render_comparison_html(comparison)
+    assert "Cayu Eval Comparison" in comparison_html
+    assert "Memory-attribution comparison: <code>unsupported</code>" in comparison_html
 
 
 @pytest.mark.parametrize("invalid_text", ["contains\x00nul", "\ud800"], ids=["nul", "surrogate"])
@@ -984,6 +1029,363 @@ class _NeverReturningLoadStore(InMemorySessionStore):
     async def load_terminal_session_evidence(self, session_id: str, *, limits=None):
         await asyncio.Event().wait()
         return None
+
+
+class _BlockedRecallEvidenceStore(InMemorySessionStore):
+    def __init__(
+        self,
+        *,
+        blocked_read: str = "receipt",
+    ) -> None:
+        super().__init__()
+        self.blocked_read = blocked_read
+        self.read_started = asyncio.Event()
+        self.release_read = asyncio.Event()
+        self.read_finished = asyncio.Event()
+        self.read_cancelled = asyncio.Event()
+        self._item_exposure_seeded = False
+        self._item_exposure: ContextExposure | None = None
+
+    async def _block(self):
+        self.read_started.set()
+        try:
+            await self.release_read.wait()
+        except asyncio.CancelledError:
+            self.read_cancelled.set()
+            raise
+        finally:
+            self.read_finished.set()
+
+    async def list_recall_receipts(self, query):
+        if self.blocked_read == "receipt":
+            await self._block()
+        if self.blocked_read == "item" and not self._item_exposure_seeded:
+            self._item_exposure_seeded = True
+            occurred_at = datetime.now(UTC)
+            transition = ContextExposureTransition(
+                transition_id="eval-memory-transition",
+                revision=0,
+                state=ContextExposureState.PLANNED,
+                occurred_at=occurred_at,
+                evidence_kind=ContextExposureEvidenceKind.COMPOSITION_PLANNED,
+                evidence_ref="eval-memory-plan",
+            )
+
+            def fingerprint(domain: KeyedEvidenceFingerprintDomain):
+                return KeyedEvidenceFingerprint(
+                    domain=domain,
+                    key_id="eval-memory-test",
+                    digest="1" * 64,
+                )
+
+            self._item_exposure = ContextExposure(
+                exposure_id="eval-memory-exposure",
+                session_id=query.session_id,
+                interaction_id="eval-memory-interaction",
+                model_step_id=f"mstep_{'1' * 32}",
+                model_attempt_id=f"matt_{'2' * 32}",
+                provider_attempt_id=f"patt_{'3' * 32}",
+                provider_name="scripted",
+                model_name="fake-model",
+                composition_fingerprint=fingerprint(KeyedEvidenceFingerprintDomain.COMPOSITION),
+                execution_profile_fingerprint=fingerprint(
+                    KeyedEvidenceFingerprintDomain.EXECUTION_PROFILE
+                ),
+                context_policy_fingerprint=fingerprint(
+                    KeyedEvidenceFingerprintDomain.CONTEXT_POLICY
+                ),
+                tool_exposure_fingerprint=fingerprint(KeyedEvidenceFingerprintDomain.TOOL_EXPOSURE),
+                request_contract_fingerprint=fingerprint(
+                    KeyedEvidenceFingerprintDomain.REQUEST_CONTRACT
+                ),
+                created_at=occurred_at,
+                updated_at=occurred_at,
+                state=ContextExposureState.PLANNED,
+                state_revision=0,
+                transitions=(transition,),
+            )
+        return await super().list_recall_receipts(query)
+
+    async def list_context_exposures(self, query):
+        if self.blocked_read == "exposure":
+            await self._block()
+        if self.blocked_read == "item":
+            assert self._item_exposure is not None
+            return ContextExposurePage(items=(self._item_exposure,), truncated=False)
+        return await super().list_context_exposures(query)
+
+    async def load_recall_item_exposures(self, session_id, exposure_id):
+        if self.blocked_read == "item":
+            await self._block()
+        return await super().load_recall_item_exposures(session_id, exposure_id)
+
+
+class _ChildCancelledRecallEvidenceStore(InMemorySessionStore):
+    def __init__(self, *, cancel_on_call: int) -> None:
+        super().__init__()
+        self.cancel_on_call = cancel_on_call
+        self.read_count = 0
+
+    async def list_recall_receipts(self, query):
+        self.read_count += 1
+        if self.read_count == self.cancel_on_call:
+            raise asyncio.CancelledError("store-owned cancellation")
+        return await super().list_recall_receipts(query)
+
+
+class _ChangingLineageStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.root_lineage_reads = 0
+
+    async def query_session_lineage(self, query):
+        result = await super().query_session_lineage(query)
+        if query.cursor is not None:
+            return result
+        self.root_lineage_reads += 1
+        if self.root_lineage_reads != 2:
+            return result
+        appeared = SessionLineageNode(
+            id="child-visible-during-revalidation",
+            parent_session_id=query.parent_session_id,
+            created_at=datetime.now(UTC),
+            origin_events=(
+                SessionLineageOrigin(
+                    sequence=1,
+                    event_id="child-origin-visible-during-revalidation",
+                    event_type=EventType.SESSION_STARTED,
+                ),
+            ),
+        )
+        return result.model_copy(update={"children": (*result.children, appeared)})
+
+
+class _FailingRevalidationLineageStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.root_lineage_reads = 0
+
+    async def query_session_lineage(self, query):
+        if query.cursor is None:
+            self.root_lineage_reads += 1
+            if self.root_lineage_reads == 2:
+                raise ConnectionError("PRIVATE_REVALIDATION_LINEAGE_CANARY")
+        return await super().query_session_lineage(query)
+
+
+class _FailingRevalidationTerminalEvidenceStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.terminal_evidence_reads = 0
+
+    async def load_terminal_session_evidence(self, session_id: str, *, limits=None):
+        self.terminal_evidence_reads += 1
+        if self.terminal_evidence_reads == 2:
+            raise ConnectionError("PRIVATE_REVALIDATION_EVIDENCE_CANARY")
+        return await super().load_terminal_session_evidence(session_id, limits=limits)
+
+
+class _ChangedRevalidationTerminalEvidenceStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.terminal_evidence_reads = 0
+
+    async def load_terminal_session_evidence(self, session_id: str, *, limits=None):
+        self.terminal_evidence_reads += 1
+        if self.terminal_evidence_reads == 2:
+            assert limits is not None
+            raise TerminalSessionEvidenceError(
+                TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED,
+                limit=limits.max_events,
+                observed=limits.max_events + 1,
+            )
+        return await super().load_terminal_session_evidence(session_id, limits=limits)
+
+
+class _ContradictoryRevalidationTerminalEvidenceStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.terminal_evidence_reads = 0
+
+    async def load_terminal_session_evidence(self, session_id: str, *, limits=None):
+        evidence = await super().load_terminal_session_evidence(session_id, limits=limits)
+        self.terminal_evidence_reads += 1
+        if self.terminal_evidence_reads != 2:
+            return evidence
+        return evidence.model_copy(
+            update={
+                "session": evidence.session.model_copy(
+                    update={"parent_session_id": "contradictory-parent"}
+                )
+            }
+        )
+
+
+class _ContradictoryInterruptedRevalidationStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.interrupted_evidence_reads = 0
+
+    async def load_runner_owned_interrupted_evidence(
+        self,
+        session_id,
+        *,
+        observed_events=None,
+        expected_parent_session_id=None,
+        limits=None,
+    ):
+        evidence = await super().load_runner_owned_interrupted_evidence(
+            session_id,
+            observed_events=observed_events,
+            expected_parent_session_id=expected_parent_session_id,
+            limits=limits,
+        )
+        self.interrupted_evidence_reads += 1
+        if self.interrupted_evidence_reads != 2:
+            return evidence
+        return evidence.model_copy(
+            update={
+                "session": evidence.session.model_copy(
+                    update={"parent_session_id": "contradictory-parent"}
+                )
+            }
+        )
+
+
+class _BlockedRevalidationLineageStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lineage_reads = 0
+        self.read_started = asyncio.Event()
+        self.release_read = asyncio.Event()
+        self.read_finished = asyncio.Event()
+        self.terminal_evidence_reads = 0
+
+    async def load_terminal_session_evidence(self, session_id: str, *, limits=None):
+        self.terminal_evidence_reads += 1
+        return await super().load_terminal_session_evidence(session_id, limits=limits)
+
+    async def query_session_lineage(self, query):
+        self.lineage_reads += 1
+        if self.lineage_reads == 2:
+            self.read_started.set()
+            try:
+                await self.release_read.wait()
+            finally:
+                self.read_finished.set()
+        return await super().query_session_lineage(query)
+
+
+class _CancellationResistantTerminalEvidenceStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.read_started = asyncio.Event()
+        self.read_cancelled = asyncio.Event()
+        self.release_read = asyncio.Event()
+        self.lineage_read_calls = 0
+        self.recall_read_calls = 0
+
+    async def load_terminal_session_evidence(self, session_id: str, *, limits=None):
+        evidence = await super().load_terminal_session_evidence(session_id, limits=limits)
+        self.read_started.set()
+        try:
+            await self.release_read.wait()
+        except asyncio.CancelledError:
+            self.read_cancelled.set()
+            await self.release_read.wait()
+        return evidence
+
+    async def query_session_lineage(self, query):
+        self.lineage_read_calls += 1
+        return await super().query_session_lineage(query)
+
+    async def list_recall_receipts(self, query):
+        self.recall_read_calls += 1
+        return await super().list_recall_receipts(query)
+
+
+class _ForgedLineagePageStore(InMemorySessionStore):
+    async def query_session_lineage(self, query):
+        result = await super().query_session_lineage(query)
+        return result.model_copy(
+            update={
+                "has_more": False,
+                "next_cursor": "forged-unvalidated-cursor",
+            }
+        )
+
+
+class _ForgedTerminalEvidenceStore(InMemorySessionStore):
+    async def load_terminal_session_evidence(self, session_id: str, *, limits=None):
+        evidence = await super().load_terminal_session_evidence(session_id, limits=limits)
+        boundary = evidence.boundary.model_copy(update={"total_bytes": 1})
+        return evidence.model_copy(update={"boundary": boundary})
+
+
+class _BlockingSQLiteRecallEvidenceStore(SQLiteSessionStore):
+    def __init__(self, path) -> None:
+        super().__init__(path)
+        self.read_started = ThreadEvent()
+        self.release_read = ThreadEvent()
+        self.read_finished = ThreadEvent()
+        self._block_next_physical_read = False
+        self.exposure_read_calls = 0
+
+    async def list_recall_receipts(self, query):
+        self._block_next_physical_read = True
+        return await super().list_recall_receipts(query)
+
+    async def list_context_exposures(self, query):
+        self.exposure_read_calls += 1
+        return await super().list_context_exposures(query)
+
+    async def _run_read(self, query):
+        if not self._block_next_physical_read:
+            return await super()._run_read(query)
+        self._block_next_physical_read = False
+
+        def blocked_query(connection):
+            self.read_started.set()
+            self.release_read.wait()
+            try:
+                return query(connection)
+            finally:
+                self.read_finished.set()
+
+        return await super()._run_read(blocked_query)
+
+
+class _ProcessControlRecallEvidenceStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.read_started = asyncio.Event()
+        self.release_read = asyncio.Event()
+
+    async def list_recall_receipts(self, query):
+        self.read_started.set()
+        await self.release_read.wait()
+        raise SystemExit(17)
+
+
+def _memory_read_app(store: InMemorySessionStore, *, requests: int = 1) -> CayuApp:
+    batch = (
+        ModelStreamEvent.text_delta("done"),
+        ModelStreamEvent.completed({"finish_reason": "stop"}),
+    )
+    app = CayuApp(
+        session_store=store,
+        enable_logging=False,
+        request_footprint=RequestFootprintConfig(
+            fingerprint_key_id="eval-memory-read-key",
+            fingerprint_key="eval-memory-read-secret-material",
+        ),
+    )
+    app.register_provider(
+        ScriptedModelProvider(batch if requests == 1 else tuple(batch for _ in range(requests))),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="agent", model="fake-model"))
+    return app
 
 
 class _OverlapProbeProvider(ModelProvider):
@@ -1564,7 +1966,7 @@ def test_assertion_results_carry_score_and_run_has_schema_version(tmp_path):
     output = tmp_path / "run.json"
     output.write_text(eval_run_to_json(result), encoding="utf-8")
     document = json.loads(output.read_text(encoding="utf-8"))
-    assert EVAL_SCHEMA_VERSION == 7
+    assert EVAL_SCHEMA_VERSION == 8
     assert document["schema_version"] == EVAL_SCHEMA_VERSION
     usage = document["cases"][0]["trials"][0]["usage_summary"]["usage"]
     assert set(usage) == {
@@ -1586,7 +1988,7 @@ def test_assertion_results_carry_score_and_run_has_schema_version(tmp_path):
     assert load_eval_run(output) == result  # round-trips with the new fields
 
 
-@pytest.mark.parametrize("schema_version", [1, 2, 3, 4, 5, 6])
+@pytest.mark.parametrize("schema_version", [1, 2, 3, 4, 5, 6, 7])
 def test_load_eval_run_rejects_prerelease_schema_versions(tmp_path, schema_version):
     run = _run(EvalStatus.PASSED, 1.0, [_case_result("a", EvalStatus.PASSED, 1.0)])
     data = json.loads(eval_run_to_json(run))
@@ -1628,6 +2030,17 @@ def test_load_eval_run_rejects_missing_schema_version(tmp_path):
     path.write_text(json.dumps(data), encoding="utf-8")
 
     with pytest.raises(ValueError, match="has no schema_version.*regenerate"):
+        load_eval_run(path)
+
+
+def test_load_eval_run_rejects_missing_versioned_memory_evidence(tmp_path):
+    run = _run(EvalStatus.PASSED, 1.0, [_case_result("a", EvalStatus.PASSED, 1.0)])
+    data = json.loads(eval_run_to_json(run))
+    del data["cases"][0]["trials"][0]["memory_attribution"]
+    path = tmp_path / "missing-memory-evidence.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="memory_attribution is required"):
         load_eval_run(path)
 
 
@@ -2623,6 +3036,7 @@ def test_case_and_run_revalidate_nested_result_instances():
         completed_at=case.completed_at,
         duration_ms=case.duration_ms,
         trajectory=trajectory,
+        memory_attribution=eval_memory_attribution_evidence_from_trajectory(trajectory),
     )
     retained_case = EvalCaseResult.from_trials(case_id="retained", trials=(retained_trial,))
     retained_run = EvalRun(
@@ -2637,6 +3051,120 @@ def test_case_and_run_revalidate_nested_result_instances():
     restored = retained_run.cases[0].trials[0].trajectory
     assert restored == trajectory
     assert restored is not trajectory
+
+
+def test_trial_binds_memory_receipt_census_to_retained_terminal_events():
+    session_id = "memory-source"
+    attribution = MemoryAttribution(
+        status=MemoryAttributionStatus.COMPLETE,
+        truncated=False,
+        observed_receipt_count=0,
+        observed_exposure_count=0,
+        observed_item_count=0,
+        omitted_receipt_count_at_least=0,
+        omitted_exposure_count_at_least=0,
+        omitted_item_count_at_least=0,
+    )
+    trajectory = _completed_trajectory(session_id).model_copy(
+        update={
+            "events": (
+                Event(type=EventType.AUTOMATIC_RECALL_COMPLETED, session_id=session_id),
+                _terminal_event(session_id),
+            ),
+            "memory_attribution": attribution,
+        }
+    )
+    source = EvalMemoryAttributionSourceV1(
+        source=EvalMemorySourceReferenceV1(role="root", tree_path=()),
+        terminal_status="completed",
+        expected_receipt_count=0,
+        attribution=attribution,
+        attribution_fingerprint=eval_memory_attribution_fingerprint(attribution),
+    )
+    false_empty = EvalMemoryAttributionEvidenceV1.create(
+        effective_bounds=standard_eval_memory_attribution_bounds(),
+        completeness=EvalMemoryEvidenceCompleteness.COMPLETE,
+        limitations=(),
+        total_source_count=1,
+        sources=(source,),
+    )
+    result = _trial_result(EvalStatus.PASSED, 1.0, session_id=session_id)
+    payload = result.model_dump(mode="python")
+    payload.update(
+        {
+            "events_count": len(trajectory.events),
+            "memory_attribution": false_empty,
+            "trajectory": trajectory,
+        }
+    )
+
+    with pytest.raises(ValidationError, match="retained trajectory source evidence"):
+        EvalTrialResult.model_validate(payload)
+
+
+def test_trajectory_projection_binds_exposure_census_to_admitted_model_attempts():
+    session_id = "memory-exposure-source"
+    model_step_id = f"mstep_{'1' * 32}"
+    model_attempt_id = f"matt_{'2' * 32}"
+    attribution = MemoryAttribution(
+        status=MemoryAttributionStatus.COMPLETE,
+        truncated=False,
+        observed_receipt_count=0,
+        observed_exposure_count=0,
+        observed_item_count=0,
+        omitted_receipt_count_at_least=0,
+        omitted_exposure_count_at_least=0,
+        omitted_item_count_at_least=0,
+    )
+    trajectory = _completed_trajectory(session_id).model_copy(
+        update={
+            "events": (
+                Event(
+                    type=EventType.AUTOMATIC_RECALL_ADMITTED,
+                    session_id=session_id,
+                    payload={"model_step_id": model_step_id},
+                ),
+                Event(
+                    type=EventType.AUTOMATIC_RECALL_COMPLETED,
+                    session_id=session_id,
+                ),
+                Event(
+                    type=EventType.MODEL_STARTED,
+                    session_id=session_id,
+                    payload={
+                        "model_step_id": model_step_id,
+                        "model_attempt_id": model_attempt_id,
+                    },
+                ),
+                Event(
+                    type=EventType.MODEL_STARTED,
+                    session_id=session_id,
+                    payload={
+                        "model_step_id": model_step_id,
+                        "model_attempt_id": f"matt_{'3' * 32}",
+                        "purpose": "context_compaction",
+                    },
+                ),
+                _terminal_event(session_id),
+            ),
+            "memory_attribution": attribution,
+        }
+    )
+    trajectory = trajectory.model_copy(
+        update={
+            "events": tuple(
+                Event.model_validate(event.model_dump(mode="json")) for event in trajectory.events
+            )
+        }
+    )
+
+    evidence = eval_memory_attribution_evidence_from_trajectory(trajectory)
+
+    assert evidence.completeness is EvalMemoryEvidenceCompleteness.UNAVAILABLE
+    assert evidence.proves_empty is False
+    assert evidence.sources[0].expected_receipt_count == 1
+    assert evidence.sources[0].expected_exposure_count == 1
+    assert evidence.sources[0].limitations == (EvalMemoryEvidenceLimitation.DELETED,)
 
 
 @pytest.mark.parametrize("duplicate_kind", ["event", "child"])
@@ -3917,6 +4445,822 @@ def test_run_case_records_exception_type_when_loading_session_fails(monkeypatch)
     assert result.error is not None
     assert "Failed to load terminal eval evidence" in result.error
     assert "RuntimeError" in result.error
+
+
+def test_fresh_eval_fails_closed_when_memory_evidence_changes_during_closure(
+    monkeypatch,
+):
+    import cayu.evals.runner as eval_runner
+
+    app = _scored_app()
+    case = EvalCase(
+        id="memory-closure",
+        request=RunRequest(
+            agent_name="agent",
+            messages=[Message.text("user", "go")],
+            max_steps=1,
+        ),
+        assertions=[SessionCompleted()],
+    )
+    complete_empty = MemoryAttribution(
+        status=MemoryAttributionStatus.COMPLETE,
+        truncated=False,
+        observed_receipt_count=0,
+        observed_exposure_count=0,
+        observed_item_count=0,
+        omitted_receipt_count_at_least=0,
+        omitted_exposure_count_at_least=0,
+        omitted_item_count_at_least=0,
+    )
+    changed = MemoryAttribution(
+        status=MemoryAttributionStatus.TRUNCATED,
+        truncated=True,
+        observed_receipt_count=1,
+        observed_exposure_count=0,
+        observed_item_count=0,
+        omitted_receipt_count_at_least=1,
+        omitted_exposure_count_at_least=0,
+        omitted_item_count_at_least=0,
+    )
+    projections = iter((complete_empty, changed))
+
+    async def project(_app, trajectory, *, bounds, before_store_read=None):
+        del _app, bounds, before_store_read
+        return trajectory.model_copy(update={"memory_attribution": next(projections)})
+
+    monkeypatch.setattr(eval_runner, "_promote_memory_attribution", project)
+
+    result = asyncio.run(
+        eval_runner._run_case_once(
+            app,
+            case,
+            trial_number=1,
+            suite_id="suite",
+            retain_trajectory=True,
+        )
+    )
+
+    assert result.status is EvalStatus.ERROR
+    assert result.error is not None
+    assert "Memory attribution changed" in result.error
+    assert result.trajectory is None
+    assert result.memory_attribution.total_source_count == 1
+    assert result.memory_attribution.sources[0].source.tree_path == ()
+    assert result.memory_attribution.sources[0].attribution is None
+    assert result.memory_attribution.sources[0].limitations == (
+        EvalMemoryEvidenceLimitation.CLOSURE_CHANGED,
+    )
+    assert result.memory_attribution.limitations == (EvalMemoryEvidenceLimitation.CLOSURE_CHANGED,)
+
+
+def test_fresh_eval_reuses_trial_memory_bounds_for_portable_evidence(monkeypatch):
+    import cayu.evals.runner as eval_runner
+
+    app = _scored_app()
+    case = EvalCase(
+        id="memory-bounds-handoff",
+        request=RunRequest(
+            agent_name="agent",
+            messages=[Message.text("user", "go")],
+            max_steps=1,
+        ),
+        assertions=[SessionCompleted()],
+    )
+    selected_bounds = standard_eval_memory_attribution_bounds().model_copy(
+        update={
+            "max_source_bytes": 1024,
+            "max_projection_bytes": 1024,
+        }
+    )
+    prepared_memory: list[EvalMemoryAttributionEvidenceV1 | None] = []
+    original_prepare = eval_runner._prepare_portable_evidence
+
+    def capture_prepare(
+        assertions,
+        context,
+        *,
+        runtime_app,
+        memory_attribution_evidence=None,
+    ):
+        prepared_memory.append(memory_attribution_evidence)
+        return original_prepare(
+            assertions,
+            context,
+            runtime_app=runtime_app,
+            memory_attribution_evidence=memory_attribution_evidence,
+        )
+
+    monkeypatch.setattr(eval_runner, "_prepare_portable_evidence", capture_prepare)
+
+    result = asyncio.run(
+        eval_runner._run_case_once(
+            app,
+            case,
+            trial_number=1,
+            suite_id="suite",
+            retain_trajectory=True,
+            memory_attribution_bounds=selected_bounds,
+            memory_attribution_source_limit=1,
+            memory_attribution_max_bytes=4096,
+        )
+    )
+
+    assert result.status is EvalStatus.PASSED
+    assert prepared_memory == [result.memory_attribution]
+    assert result.memory_attribution.effective_bounds.max_source_bytes == 1024
+    assert result.memory_attribution.effective_bounds.max_projection_bytes == 1024
+    assert result.memory_attribution.effective_source_limit == 1
+    assert result.memory_attribution.effective_max_bytes == 4096
+
+
+def test_fresh_eval_timeout_during_memory_read_retains_bounded_source_references(
+    monkeypatch,
+):
+    import cayu.evals.runner as eval_runner
+
+    app = CayuApp(
+        enable_logging=False,
+        request_footprint=RequestFootprintConfig(
+            fingerprint_key_id="eval-memory-timeout-key",
+            fingerprint_key="eval-memory-timeout-secret-material",
+        ),
+    )
+    app.register_provider(
+        ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("ok"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="agent", model="fake-model"))
+    case = EvalCase(
+        id="memory-timeout",
+        request=RunRequest(
+            agent_name="agent",
+            messages=[Message.text("user", "go")],
+            max_steps=1,
+        ),
+        assertions=[SessionCompleted()],
+    )
+
+    async def stalled_projection(
+        _app,
+        _trajectory,
+        *,
+        bounds,
+        before_store_read=None,
+    ):
+        del _app, _trajectory, bounds, before_store_read
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(eval_runner, "_promote_memory_attribution", stalled_projection)
+
+    result = asyncio.run(
+        eval_runner._run_case_once(
+            app,
+            case,
+            trial_number=1,
+            suite_id="suite",
+            retain_trajectory=True,
+            timeout_seconds=1.0,
+        )
+    )
+
+    assert result.status is EvalStatus.ERROR
+    assert result.evidence_complete is True
+    assert result.trajectory is not None
+    assert result.memory_attribution.completeness.value == "unavailable"
+    assert result.memory_attribution.total_source_count == 1
+    assert result.memory_attribution.sources[0].source.tree_path == ()
+    alias_key = memory_evidence_key(app._request_footprint)
+    assert alias_key is not None
+    assert result.session_id is not None
+    assert result.memory_attribution.sources[0].source.session_alias == eval_memory_source_alias(
+        session_id=result.session_id,
+        key_id=alias_key.key_id,
+        key=alias_key.key,
+    )
+    assert result.memory_attribution.sources[0].attribution is None
+    assert result.memory_attribution.sources[0].limitations == (
+        EvalMemoryEvidenceLimitation.DEADLINE_EXPIRED,
+    )
+    assert result.memory_attribution.limitations == (EvalMemoryEvidenceLimitation.DEADLINE_EXPIRED,)
+    encoded = result.memory_attribution.model_dump_json()
+    assert result.session_id not in encoded
+    assert EvalMemoryAttributionEvidenceV1.model_validate_json(encoded) == result.memory_attribution
+
+
+@pytest.mark.parametrize("blocked_read", ["receipt", "exposure", "item"])
+def test_fresh_eval_deadline_abandons_and_observes_opaque_memory_read(blocked_read):
+    async def scenario():
+        store = _BlockedRecallEvidenceStore(blocked_read=blocked_read)
+        app = _memory_read_app(store)
+        loop = asyncio.get_running_loop()
+        loop_errors: list[dict[str, object]] = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+        task = asyncio.create_task(
+            run_eval_suite(
+                app,
+                EvalSuite(id="opaque-memory-read", cases=[_case("deadline")]),
+                case_timeout_seconds=0.5,
+            )
+        )
+        try:
+            result = await asyncio.wait_for(task, timeout=2)
+            assert store.read_started.is_set()
+            assert not store.read_cancelled.is_set()
+            assert not store.read_finished.is_set()
+            assert task.cancelling() == 0
+            assert task.cancelled() is False
+        finally:
+            store.release_read.set()
+            if store.read_started.is_set():
+                await asyncio.wait_for(store.read_finished.wait(), timeout=1)
+            await asyncio.sleep(0)
+            loop.set_exception_handler(previous_handler)
+        return result, loop_errors
+
+    result, loop_errors = asyncio.run(scenario())
+
+    trial = result.cases[0].trials[0]
+    assert trial.status is EvalStatus.ERROR
+    assert trial.memory_attribution.limitations == (EvalMemoryEvidenceLimitation.DEADLINE_EXPIRED,)
+    assert loop_errors == []
+
+
+def test_fresh_eval_retains_cancellation_resistant_read_under_shared_bound():
+    async def scenario():
+        import cayu.evals.runner as eval_runner
+
+        loop = asyncio.get_running_loop()
+        supervisor = eval_runner._FreshMemoryAttributionReadSupervisor(max_operations=1)
+        with eval_runner._FRESH_MEMORY_READ_SUPERVISORS_LOCK:
+            eval_runner._FRESH_MEMORY_READ_SUPERVISORS[loop] = supervisor
+        stalled_store = _BlockedRecallEvidenceStore()
+        try:
+            first = await asyncio.wait_for(
+                run_eval_suite(
+                    _memory_read_app(stalled_store),
+                    EvalSuite(id="resistant-memory-read", cases=[_case("first")]),
+                    case_timeout_seconds=1.0,
+                ),
+                timeout=3,
+            )
+            assert stalled_store.read_started.is_set()
+            assert not stalled_store.read_cancelled.is_set()
+            assert not stalled_store.read_finished.is_set()
+
+            second = await asyncio.wait_for(
+                run_eval_suite(
+                    _memory_read_app(InMemorySessionStore()),
+                    EvalSuite(id="bounded-followup", cases=[_case("second")]),
+                ),
+                timeout=2,
+            )
+
+            stalled_store.release_read.set()
+            await asyncio.wait_for(stalled_store.read_finished.wait(), timeout=1)
+            await asyncio.sleep(0)
+            third = await asyncio.wait_for(
+                run_eval_suite(
+                    _memory_read_app(InMemorySessionStore()),
+                    EvalSuite(id="released-followup", cases=[_case("third")]),
+                ),
+                timeout=2,
+            )
+        finally:
+            stalled_store.release_read.set()
+        return first, second, third
+
+    first, second, third = asyncio.run(scenario())
+
+    assert first.cases[0].trials[0].memory_attribution.limitations == (
+        EvalMemoryEvidenceLimitation.DEADLINE_EXPIRED,
+    )
+    second_source = second.cases[0].trials[0].memory_attribution.sources[0]
+    assert second_source.limitations == (EvalMemoryEvidenceLimitation.EVIDENCE_READ_FAILED,)
+    assert third.cases[0].trials[0].status is EvalStatus.PASSED
+
+
+def test_fresh_eval_retains_sqlite_physical_read_under_shared_bound(tmp_path):
+    async def scenario():
+        import cayu.evals.runner as eval_runner
+
+        loop = asyncio.get_running_loop()
+        supervisor = eval_runner._FreshMemoryAttributionReadSupervisor(max_operations=1)
+        with eval_runner._FRESH_MEMORY_READ_SUPERVISORS_LOCK:
+            eval_runner._FRESH_MEMORY_READ_SUPERVISORS[loop] = supervisor
+        stalled_store = _BlockingSQLiteRecallEvidenceStore(tmp_path / "blocked-read.sqlite")
+        try:
+            first = await asyncio.wait_for(
+                run_eval_suite(
+                    _memory_read_app(stalled_store),
+                    EvalSuite(id="sqlite-memory-read", cases=[_case("first")]),
+                    case_timeout_seconds=1.0,
+                ),
+                timeout=3,
+            )
+            assert stalled_store.read_started.is_set()
+            assert not stalled_store.read_finished.is_set()
+
+            second = await asyncio.wait_for(
+                run_eval_suite(
+                    _memory_read_app(InMemorySessionStore()),
+                    EvalSuite(id="sqlite-bounded-followup", cases=[_case("second")]),
+                ),
+                timeout=2,
+            )
+
+            stalled_store.release_read.set()
+            assert await asyncio.to_thread(stalled_store.read_finished.wait, 1)
+            for _ in range(8):
+                await asyncio.sleep(0)
+            assert stalled_store.exposure_read_calls == 0
+            third = await asyncio.wait_for(
+                run_eval_suite(
+                    _memory_read_app(InMemorySessionStore()),
+                    EvalSuite(id="sqlite-released-followup", cases=[_case("third")]),
+                ),
+                timeout=2,
+            )
+        finally:
+            stalled_store.release_read.set()
+            await stalled_store.close()
+        return first, second, third
+
+    first, second, third = asyncio.run(scenario())
+
+    assert first.cases[0].trials[0].memory_attribution.limitations == (
+        EvalMemoryEvidenceLimitation.DEADLINE_EXPIRED,
+    )
+    second_source = second.cases[0].trials[0].memory_attribution.sources[0]
+    assert second_source.limitations == (EvalMemoryEvidenceLimitation.EVIDENCE_READ_FAILED,)
+    assert third.cases[0].trials[0].status is EvalStatus.PASSED
+
+
+def test_fresh_eval_retains_late_store_process_control_for_next_entrance():
+    async def scenario():
+        store = _ProcessControlRecallEvidenceStore()
+        first = await run_eval_suite(
+            _memory_read_app(store),
+            EvalSuite(id="late-process-control", cases=[_case("late-control")]),
+            case_timeout_seconds=1.0,
+        )
+        assert store.read_started.is_set()
+        store.release_read.set()
+        for _ in range(8):
+            await asyncio.sleep(0)
+        with pytest.raises(SystemExit) as raised:
+            await run_eval_suite(
+                _memory_read_app(InMemorySessionStore()),
+                EvalSuite(id="claim-late-process-control", cases=[_case("claim")]),
+            )
+        third = await run_eval_suite(
+            _memory_read_app(InMemorySessionStore()),
+            EvalSuite(id="retired-late-process-control", cases=[_case("third")]),
+        )
+        return first, raised.value, third
+
+    first, error, third = asyncio.run(scenario())
+
+    assert first.cases[0].trials[0].memory_attribution.limitations == (
+        EvalMemoryEvidenceLimitation.DEADLINE_EXPIRED,
+    )
+    assert error.code == 17
+    assert third.cases[0].trials[0].status is EvalStatus.PASSED
+
+
+def test_fresh_eval_caller_cancellation_abandons_opaque_memory_read_exactly():
+    async def scenario():
+        store = _BlockedRecallEvidenceStore()
+        task = asyncio.create_task(
+            run_eval_suite(
+                _memory_read_app(store),
+                EvalSuite(id="cancel-memory-read", cases=[_case("cancel")]),
+            )
+        )
+        await asyncio.wait_for(store.read_started.wait(), timeout=1)
+        task.cancel("stop fresh eval")
+        try:
+            with pytest.raises(asyncio.CancelledError) as raised:
+                await task
+            assert raised.value.args == ("stop fresh eval",)
+            assert task.cancelling() == 1
+            assert task.cancelled() is True
+            assert not store.read_cancelled.is_set()
+            assert not store.read_finished.is_set()
+        finally:
+            store.release_read.set()
+            await asyncio.wait_for(store.read_finished.wait(), timeout=1)
+        return task
+
+    task = asyncio.run(scenario())
+    assert task.cancelling() == 1
+    assert task.cancelled() is True
+
+
+def test_fresh_eval_revalidates_authoritative_descendant_closure():
+    store = _ChangingLineageStore()
+    result = asyncio.run(
+        run_eval_suite(
+            _memory_read_app(store),
+            EvalSuite(id="changed-descendant-closure", cases=[_case("changed")]),
+        )
+    )
+
+    trial = result.cases[0].trials[0]
+    assert store.root_lineage_reads == 2
+    assert trial.status is EvalStatus.ERROR
+    assert trial.memory_attribution.completeness is EvalMemoryEvidenceCompleteness.UNAVAILABLE
+    assert trial.memory_attribution.limitations == (EvalMemoryEvidenceLimitation.CLOSURE_CHANGED,)
+    assert trial.memory_attribution.proves_empty is False
+
+
+@pytest.mark.parametrize(
+    ("store", "expected_limitation", "canary"),
+    [
+        (
+            _FailingRevalidationLineageStore(),
+            EvalMemoryEvidenceLimitation.EVIDENCE_READ_FAILED,
+            "PRIVATE_REVALIDATION_LINEAGE_CANARY",
+        ),
+        (
+            _FailingRevalidationTerminalEvidenceStore(),
+            EvalMemoryEvidenceLimitation.EVIDENCE_READ_FAILED,
+            "PRIVATE_REVALIDATION_EVIDENCE_CANARY",
+        ),
+        (
+            _ChangedRevalidationTerminalEvidenceStore(),
+            EvalMemoryEvidenceLimitation.CLOSURE_CHANGED,
+            None,
+        ),
+        (
+            _ContradictoryRevalidationTerminalEvidenceStore(),
+            EvalMemoryEvidenceLimitation.CONTRADICTORY_LINEAGE,
+            None,
+        ),
+    ],
+)
+def test_fresh_eval_revalidation_failure_retains_typed_memory_limitation(
+    store,
+    expected_limitation,
+    canary,
+):
+    result = asyncio.run(
+        run_eval_suite(
+            _memory_read_app(store),
+            EvalSuite(id="failed-closure-revalidation", cases=[_case("failed")]),
+        )
+    )
+
+    trial = result.cases[0].trials[0]
+    encoded = result.model_dump_json()
+    assert trial.status is EvalStatus.ERROR
+    assert trial.memory_attribution.completeness is EvalMemoryEvidenceCompleteness.UNAVAILABLE
+    assert trial.memory_attribution.limitations == (expected_limitation,)
+    assert trial.memory_attribution.proves_empty is False
+    if canary is not None:
+        assert canary not in encoded
+
+
+def test_interrupted_fresh_revalidation_preserves_contradictory_lineage():
+    from cayu.evals.trajectory import (
+        SessionTrajectoryBounds,
+        SessionTrajectoryError,
+        SessionTrajectoryErrorCode,
+        _CaptureState,
+        _revalidate_fresh_capture,
+    )
+    from cayu.runtime.sessions import (
+        EventQuery,
+        RunnerObservedEventIdentity,
+        TerminalSessionEvidenceLimits,
+    )
+
+    async def scenario():
+        store = _ContradictoryInterruptedRevalidationStore()
+        session_id = "interrupted-revalidation"
+        interaction_id = "interrupted-revalidation-interaction"
+        message = Message.text("user", "Exercise interrupted evidence revalidation.")
+        await store.create(
+            RunRequest(
+                agent_name="agent",
+                session_id=session_id,
+                messages=[message],
+            ),
+            identity=SessionIdentity(provider_name="scripted", model="fake-model"),
+            interaction_started_event=Event(
+                id="interrupted-revalidation-started",
+                type=EventType.INTERACTION_STARTED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            ),
+            interaction_source_messages=[message],
+        )
+        await store.replace_initial_transcript_messages(
+            session_id,
+            [message],
+            [message],
+            interaction_id=interaction_id,
+        )
+        await store.publish_interaction_transition(
+            session_id,
+            event=Event(
+                id="interrupted-revalidation-interaction-interrupted",
+                type=EventType.INTERACTION_INTERRUPTED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            ),
+            from_statuses={SessionStatus.RUNNING},
+            to_status=SessionStatus.INTERRUPTED,
+        )
+        await store.append_event(
+            session_id,
+            Event(
+                id="interrupted-revalidation-session-interrupted",
+                type=EventType.SESSION_INTERRUPTED,
+                session_id=session_id,
+            ),
+        )
+        records = await store.query_events(EventQuery(session_id=session_id))
+        observed_events = tuple(
+            RunnerObservedEventIdentity(
+                session_id=session_id,
+                sequence=record.sequence,
+                event_type=record.event.type,
+            )
+            for record in records
+        )
+        limits = TerminalSessionEvidenceLimits()
+        evidence = await store.load_runner_owned_interrupted_evidence(
+            session_id,
+            observed_events=observed_events,
+            limits=limits,
+        )
+        state = _CaptureState(bounds=SessionTrajectoryBounds(), strict=True)
+        state.retain(evidence, limits=limits)
+        with pytest.raises(SessionTrajectoryError) as raised:
+            await _revalidate_fresh_capture(
+                CayuApp(session_store=store, enable_logging=False),
+                state,
+                root_session_id=session_id,
+                root_interrupted_observed_events=observed_events,
+            )
+        return raised.value
+
+    error = asyncio.run(scenario())
+    assert error.code is SessionTrajectoryErrorCode.PARENT_CONTRADICTION
+
+
+def test_fresh_eval_deadline_abandons_opaque_closure_revalidation():
+    async def scenario():
+        store = _BlockedRevalidationLineageStore()
+        result = await asyncio.wait_for(
+            run_eval_suite(
+                _memory_read_app(store),
+                EvalSuite(id="blocked-closure-revalidation", cases=[_case("blocked")]),
+                case_timeout_seconds=0.5,
+            ),
+            timeout=2,
+        )
+        try:
+            assert store.lineage_reads == 2
+            assert store.terminal_evidence_reads == 1
+            assert store.read_started.is_set()
+            assert not store.read_finished.is_set()
+        finally:
+            store.release_read.set()
+            await asyncio.wait_for(store.read_finished.wait(), timeout=1)
+            for _ in range(8):
+                await asyncio.sleep(0)
+            assert store.terminal_evidence_reads == 1
+        return result
+
+    result = asyncio.run(scenario())
+
+    trial = result.cases[0].trials[0]
+    assert trial.status is EvalStatus.ERROR
+    assert trial.memory_attribution.limitations == (EvalMemoryEvidenceLimitation.DEADLINE_EXPIRED,)
+
+
+def test_fresh_eval_deadline_starts_no_read_after_resistant_terminal_read():
+    async def scenario():
+        store = _CancellationResistantTerminalEvidenceStore()
+        task = asyncio.create_task(
+            run_eval_suite(
+                _memory_read_app(store),
+                EvalSuite(id="resistant-terminal-read", cases=[_case("deadline")]),
+                case_timeout_seconds=1.0,
+            )
+        )
+        await asyncio.wait_for(store.read_started.wait(), timeout=2)
+        await asyncio.wait_for(store.read_cancelled.wait(), timeout=2)
+        store.release_read.set()
+        return await asyncio.wait_for(task, timeout=1), store
+
+    result, store = asyncio.run(scenario())
+
+    trial = result.cases[0].trials[0]
+    assert trial.status is EvalStatus.ERROR
+    assert trial.memory_attribution.limitations == (EvalMemoryEvidenceLimitation.DEADLINE_EXPIRED,)
+    assert store.lineage_read_calls == 0
+    assert store.recall_read_calls == 0
+
+
+def test_fresh_eval_rejects_validator_bypassed_lineage_page():
+    result = asyncio.run(
+        run_eval_suite(
+            _memory_read_app(_ForgedLineagePageStore()),
+            EvalSuite(id="forged-lineage-page", cases=[_case("forged")]),
+        )
+    )
+
+    trial = result.cases[0].trials[0]
+    assert trial.memory_attribution.completeness is EvalMemoryEvidenceCompleteness.UNAVAILABLE
+    assert trial.memory_attribution.limitations == (
+        EvalMemoryEvidenceLimitation.SOURCE_TREE_INCOMPLETE,
+    )
+    assert trial.memory_attribution.proves_empty is False
+
+
+def test_fresh_eval_rejects_validator_bypassed_terminal_boundary():
+    result = asyncio.run(
+        run_eval_suite(
+            _memory_read_app(_ForgedTerminalEvidenceStore()),
+            EvalSuite(id="forged-terminal-evidence", cases=[_case("forged")]),
+        )
+    )
+
+    trial = result.cases[0].trials[0]
+    assert trial.status is EvalStatus.ERROR
+    assert trial.error is not None
+    assert "Session store returned invalid terminal evidence" in trial.error
+    assert trial.memory_attribution.proves_empty is False
+
+
+def test_fresh_eval_without_authoritative_lineage_cannot_prove_empty():
+    class NoLineageStore(InMemorySessionStore):
+        supports_session_lineage = False
+
+    result = asyncio.run(
+        run_eval_suite(
+            _memory_read_app(NoLineageStore()),
+            EvalSuite(id="unsupported-descendant-closure", cases=[_case("unsupported")]),
+        )
+    )
+
+    trial = result.cases[0].trials[0]
+    assert trial.memory_attribution.completeness is EvalMemoryEvidenceCompleteness.UNAVAILABLE
+    assert trial.memory_attribution.limitations == (
+        EvalMemoryEvidenceLimitation.SOURCE_TREE_INCOMPLETE,
+    )
+    assert trial.memory_attribution.proves_empty is False
+
+
+def test_fresh_eval_cleanup_preserves_repeated_caller_cancellation(monkeypatch):
+    async def scenario():
+        import cayu.evals.runner as eval_runner
+
+        store = _BlockedRecallEvidenceStore()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        original_aclose = eval_runner._FreshMemoryAttributionOperationRegistry.aclose
+
+        async def paused_aclose(registry, *, timeout_s):
+            cleanup_started.set()
+            await release_cleanup.wait()
+            return await original_aclose(registry, timeout_s=timeout_s)
+
+        monkeypatch.setattr(
+            eval_runner._FreshMemoryAttributionOperationRegistry,
+            "aclose",
+            paused_aclose,
+        )
+        task = asyncio.create_task(
+            run_eval_suite(
+                _memory_read_app(store),
+                EvalSuite(id="repeated-cancel-memory-read", cases=[_case("cancel")]),
+            )
+        )
+        await asyncio.wait_for(store.read_started.wait(), timeout=1)
+        task.cancel("stop fresh eval first")
+        try:
+            await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+            task.cancel("stop fresh eval again")
+            release_cleanup.set()
+            with pytest.raises(BaseExceptionGroup) as raised:
+                await task
+        finally:
+            release_cleanup.set()
+            store.release_read.set()
+            await asyncio.wait_for(store.read_finished.wait(), timeout=1)
+        return raised.value, task
+
+    error, task = asyncio.run(scenario())
+    cancellations = [
+        item for item in iter_exception_tree(error) if isinstance(item, asyncio.CancelledError)
+    ]
+    assert [item.args for item in cancellations] == [
+        ("stop fresh eval first",),
+        ("stop fresh eval again",),
+    ]
+    assert task.cancelling() == 2
+    assert task.cancelled() is False
+
+
+def test_fresh_eval_preserves_process_control_concurrent_with_caller_cancellation():
+    async def scenario():
+        store = _ProcessControlRecallEvidenceStore()
+        task = asyncio.create_task(
+            run_eval_suite(
+                _memory_read_app(store),
+                EvalSuite(id="process-control-memory-read", cases=[_case("process-control")]),
+            )
+        )
+        await asyncio.wait_for(store.read_started.wait(), timeout=1)
+        store.release_read.set()
+        task.cancel("stop fresh eval")
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await task
+        return raised.value, task
+
+    error, task = asyncio.run(scenario())
+    tree = tuple(iter_exception_tree(error))
+    cancellations = [item for item in tree if isinstance(item, asyncio.CancelledError)]
+    exits = [item for item in tree if isinstance(item, SystemExit)]
+    assert len(cancellations) == 1
+    assert cancellations[0].args == ("stop fresh eval",)
+    assert len(exits) == 1
+    assert exits[0].code == 17
+    assert task.cancelling() == 1
+    assert task.cancelled() is False
+
+
+@pytest.mark.parametrize("cancel_on_call", [1, 2])
+def test_fresh_eval_store_owned_cancellation_is_typed_read_failure(cancel_on_call):
+    async def scenario():
+        store = _ChildCancelledRecallEvidenceStore(cancel_on_call=cancel_on_call)
+        task = asyncio.create_task(
+            run_eval_suite(
+                _memory_read_app(store),
+                EvalSuite(id="child-cancel-memory-read", cases=[_case("child-cancel")]),
+                retain_trajectory=True,
+            )
+        )
+        result = await task
+        return result, task, store.read_count
+
+    result, task, read_count = asyncio.run(scenario())
+
+    trial = result.cases[0].trials[0]
+    assert trial.status is EvalStatus.PASSED
+    assert trial.trajectory is not None
+    assert trial.trajectory.memory_attribution is not None
+    assert (
+        trial.trajectory.memory_attribution.reason
+        is MemoryAttributionUnavailableReason.EVIDENCE_READ_FAILED
+    )
+    assert trial.memory_attribution.completeness is EvalMemoryEvidenceCompleteness.UNAVAILABLE
+    assert trial.memory_attribution.sources[0].limitations == (
+        EvalMemoryEvidenceLimitation.EVIDENCE_READ_FAILED,
+    )
+    assert read_count == cancel_on_call
+    assert task.cancelling() == 0
+    assert task.cancelled() is False
+
+
+def test_fresh_eval_memory_read_capacity_fails_closed_after_opaque_timeout():
+    async def scenario():
+        store = _BlockedRecallEvidenceStore()
+        cases = [_case("first"), _case("second")]
+        task = asyncio.create_task(
+            run_eval_suite(
+                _memory_read_app(store, requests=2),
+                EvalSuite(id="bounded-memory-reads", cases=cases),
+                max_concurrency=1,
+                case_timeout_seconds=0.5,
+            )
+        )
+        try:
+            result = await asyncio.wait_for(task, timeout=2)
+        finally:
+            store.release_read.set()
+            if store.read_started.is_set():
+                await asyncio.wait_for(store.read_finished.wait(), timeout=1)
+        return result
+
+    result = asyncio.run(scenario())
+
+    first, second = (case.trials[0] for case in result.cases)
+    assert first.memory_attribution.limitations == (EvalMemoryEvidenceLimitation.DEADLINE_EXPIRED,)
+    assert second.status is EvalStatus.PASSED
+    assert second.memory_attribution.completeness is EvalMemoryEvidenceCompleteness.UNAVAILABLE
+    assert second.memory_attribution.sources[0].limitations == (
+        EvalMemoryEvidenceLimitation.EVIDENCE_READ_FAILED,
+    )
 
 
 class _FakeProbeWorkspace:

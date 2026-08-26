@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -34,17 +34,21 @@ from cayu.runtime.sessions import (
     TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES,
     TERMINAL_SESSION_EVIDENCE_HARD_MAX_TOTAL_BYTES,
     TERMINAL_SESSION_EVIDENCE_HARD_MAX_TRANSCRIPT_RECORDS,
+    RunnerObservedEventIdentity,
     Session,
     SessionInputContractEvidence,
     SessionLineageNode,
     SessionLineageOrigin,
     SessionLineageQuery,
+    SessionLineageResult,
     SessionOrder,
     SessionQuery,
+    SessionStatus,
     TerminalSessionEvidence,
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
     TerminalSessionEvidenceLimits,
+    copy_terminal_session_evidence,
     parse_session_input_contract_evidence,
 )
 from cayu.runtime.usage import SessionUsageSummary, session_usage_summary
@@ -422,10 +426,53 @@ async def _load_terminal_evidence(
     session_id: str,
     *,
     limits: TerminalSessionEvidenceLimits | None = None,
+    revalidation_expected: TerminalSessionEvidence | None = None,
 ) -> TerminalSessionEvidence:
     if not app.session_store.supports_terminal_session_evidence:
         raise NotImplementedError
-    return await app.session_store.load_terminal_session_evidence(session_id, limits=limits)
+    evidence = await app.session_store.load_terminal_session_evidence(session_id, limits=limits)
+    if revalidation_expected is not None:
+        _validate_revalidation_evidence_scope(evidence, revalidation_expected)
+    return _validated_terminal_session_evidence(evidence)
+
+
+def _validated_terminal_session_evidence(value: object) -> TerminalSessionEvidence:
+    """Detach and revalidate one extension-owned terminal snapshot."""
+
+    try:
+        if type(value) is not TerminalSessionEvidence:
+            raise TypeError
+        return copy_terminal_session_evidence(value)
+    except Exception:
+        raise RuntimeError("Session store returned invalid terminal evidence.") from None
+
+
+def _validate_revalidation_evidence_scope(
+    value: object,
+    expected: TerminalSessionEvidence,
+) -> None:
+    """Reject a changed typed session scope before defensive copying obscures it."""
+
+    if type(value) is not TerminalSessionEvidence or type(value.session) is not Session:
+        return
+    observed_session_id = value.session.id
+    observed_parent_session_id = value.session.parent_session_id
+    if type(observed_session_id) is not str:
+        return
+    if observed_session_id != expected.session.id:
+        raise SessionTrajectoryError(
+            SessionTrajectoryErrorCode.EVIDENCE_INCONSISTENT,
+            session_id=expected.session.id,
+            parent_session_id=expected.session.parent_session_id,
+        )
+    if observed_parent_session_id is not None and type(observed_parent_session_id) is not str:
+        return
+    if observed_parent_session_id != expected.session.parent_session_id:
+        raise SessionTrajectoryError(
+            SessionTrajectoryErrorCode.PARENT_CONTRADICTION,
+            session_id=expected.session.id,
+            parent_session_id=expected.session.parent_session_id,
+        )
 
 
 def _project_terminal_evidence(
@@ -650,6 +697,7 @@ async def _promote_memory_attribution(
     trajectory: Trajectory,
     *,
     bounds: MemoryAttributionBounds,
+    before_store_read: Callable[[], None] | None = None,
 ) -> Trajectory:
     budget = MemoryAttributionCaptureBudget(bounds)
     key = memory_evidence_key(app._request_footprint)
@@ -663,6 +711,7 @@ async def _promote_memory_attribution(
                 node.session.id,
                 key=key,
                 budget=budget,
+                before_store_read=before_store_read,
             )
         )
         children = tuple([await promote(child) for child in node.children])
@@ -722,15 +771,23 @@ async def _load_strict_terminal_evidence(
     *,
     limits: TerminalSessionEvidenceLimits,
     parent_session_id: str | None = None,
+    revalidation_expected: TerminalSessionEvidence | None = None,
 ) -> TerminalSessionEvidence:
     try:
-        evidence = await _load_terminal_evidence(app, session_id, limits=limits)
+        evidence = await _load_terminal_evidence(
+            app,
+            session_id,
+            limits=limits,
+            revalidation_expected=revalidation_expected,
+        )
     except TerminalSessionEvidenceError as exc:
         raise _terminal_trajectory_error(
             session_id,
             exc,
             parent_session_id=parent_session_id,
         ) from exc
+    except SessionTrajectoryError:
+        raise
     except Exception as exc:
         raise SessionTrajectoryError(
             SessionTrajectoryErrorCode.EVIDENCE_READ_FAILED,
@@ -799,6 +856,7 @@ async def _build_child_trajectories(
     parent_terminal_sequence: int | None = None,
     state: _CaptureState | None = None,
     depth: int = 1,
+    before_store_read: Callable[[], None] | None = None,
 ) -> tuple[Trajectory, ...]:
     """Construct descendants under either best-effort or strict admission policy."""
 
@@ -813,10 +871,14 @@ async def _build_child_trajectories(
             parent_session_id,
             state=capture,
             parent_terminal_sequence=parent_terminal_sequence,
+            before_store_read=before_store_read,
         )
         candidates = candidate_result.values
         admitted: tuple[Session | _ChildOrigin, ...]
-        if capture.strict or (candidates and isinstance(candidates[0], SessionLineageNode)):
+        authoritative_lineage = capture.strict or (
+            parent_terminal_sequence is not None and app.session_store.supports_session_lineage
+        )
+        if authoritative_lineage:
             if parent_terminal_sequence is None:
                 raise SessionTrajectoryError(
                     SessionTrajectoryErrorCode.EVIDENCE_INCONSISTENT,
@@ -837,11 +899,10 @@ async def _build_child_trajectories(
                     key=lambda origin: (origin.origin.sequence, origin.node.id),
                 )
             )
-            if capture.strict:
-                capture.parent_closures[parent_session_id] = (
-                    parent_terminal_sequence,
-                    tuple(origin.fingerprint for origin in admitted_origins),
-                )
+            capture.parent_closures[parent_session_id] = (
+                parent_terminal_sequence,
+                tuple(origin.fingerprint for origin in admitted_origins),
+            )
             admitted = admitted_origins
         else:
             admitted = tuple(
@@ -895,6 +956,7 @@ async def _build_child_trajectories(
                 visited=visited,
                 state=capture,
                 depth=child_depth,
+                before_store_read=before_store_read,
             )
         except SessionTrajectoryError:
             if capture.strict:
@@ -920,6 +982,7 @@ async def _child_candidates(
     *,
     state: _CaptureState,
     parent_terminal_sequence: int | None,
+    before_store_read: Callable[[], None] | None = None,
 ) -> _ChildCandidates:
     if state.strict or (
         parent_terminal_sequence is not None and app.session_store.supports_session_lineage
@@ -929,9 +992,15 @@ async def _child_candidates(
                 app,
                 parent_session_id,
                 state=state,
+                before_store_read=before_store_read,
             )
         )
-    return await _best_effort_child_sessions(app, parent_session_id, state=state)
+    return await _best_effort_child_sessions(
+        app,
+        parent_session_id,
+        state=state,
+        before_store_read=before_store_read,
+    )
 
 
 async def _best_effort_child_sessions(
@@ -939,12 +1008,15 @@ async def _best_effort_child_sessions(
     parent_session_id: str,
     *,
     state: _CaptureState,
+    before_store_read: Callable[[], None] | None = None,
 ) -> _ChildCandidates:
     sessions: list[Session] = []
     seen_ids: set[str] = set()
     cursor: str | None = None
     for _ in range(_CHILD_TRAJECTORY_MAX_PAGES):
         try:
+            if before_store_read is not None:
+                before_store_read()
             result = await app.session_store.list_sessions(
                 SessionQuery(
                     parent_session_id=parent_session_id,
@@ -984,12 +1056,15 @@ async def _strict_child_nodes(
     parent_session_id: str,
     *,
     state: _CaptureState,
+    before_store_read: Callable[[], None] | None = None,
 ) -> tuple[SessionLineageNode, ...]:
     nodes: list[SessionLineageNode] = []
     seen_ids: set[str] = set()
     cursor: str | None = None
     while True:
         try:
+            if before_store_read is not None:
+                before_store_read()
             result = await app.session_store.query_session_lineage(
                 SessionLineageQuery(
                     parent_session_id=parent_session_id,
@@ -997,11 +1072,23 @@ async def _strict_child_nodes(
                     limit=_STRICT_CHILD_PAGE_SIZE,
                 )
             )
-        except Exception as exc:
+        except Exception:
             raise SessionTrajectoryError(
                 SessionTrajectoryErrorCode.DESCENDANT_ENUMERATION_FAILED,
                 session_id=parent_session_id,
-            ) from exc
+            ) from None
+        try:
+            result = _validated_session_lineage_result(
+                result,
+                expected_parent_session_id=parent_session_id,
+            )
+        except SessionTrajectoryError:
+            raise
+        except Exception:
+            raise SessionTrajectoryError(
+                SessionTrajectoryErrorCode.DESCENDANT_ENUMERATION_FAILED,
+                session_id=parent_session_id,
+            ) from None
         if result.parent_session_id != parent_session_id:
             raise SessionTrajectoryError(
                 SessionTrajectoryErrorCode.DESCENDANT_ENUMERATION_FAILED,
@@ -1030,6 +1117,57 @@ async def _strict_child_nodes(
         cursor = result.next_cursor
 
 
+def _validated_session_lineage_result(
+    value: object,
+    *,
+    expected_parent_session_id: str,
+) -> SessionLineageResult:
+    """Detach and revalidate one extension-owned lineage page."""
+
+    contradiction: tuple[str, str] | None = None
+    try:
+        if type(value) is not SessionLineageResult:
+            raise TypeError
+        if type(value.parent_session_id) is not str or type(value.children) is not tuple:
+            raise TypeError
+        for child in value.children:
+            if type(child) is not SessionLineageNode:
+                raise TypeError
+            if type(child.id) is not str or type(child.parent_session_id) is not str:
+                raise TypeError
+            if contradiction is None and child.parent_session_id != expected_parent_session_id:
+                contradiction = (child.id, child.parent_session_id)
+        payload = BaseModel.model_dump(value, mode="python", warnings=False)
+        try:
+            validated = SessionLineageResult.model_validate(payload)
+        except Exception:
+            if contradiction is None:
+                raise
+            children_payload = payload.get("children")
+            if not isinstance(children_payload, list | tuple):
+                raise
+            normalized_children: list[dict[str, Any]] = []
+            for child_payload in children_payload:
+                if type(child_payload) is not dict:
+                    raise TypeError from None
+                normalized_child = dict(child_payload)
+                normalized_child["parent_session_id"] = value.parent_session_id
+                normalized_children.append(normalized_child)
+            normalized_payload = dict(payload)
+            normalized_payload["children"] = normalized_children
+            validated = SessionLineageResult.model_validate(normalized_payload)
+    except Exception:
+        raise RuntimeError("Session store returned invalid lineage evidence.") from None
+    if contradiction is not None:
+        child_id, _ = contradiction
+        raise SessionTrajectoryError(
+            SessionTrajectoryErrorCode.PARENT_CONTRADICTION,
+            session_id=child_id,
+            parent_session_id=expected_parent_session_id,
+        )
+    return validated
+
+
 def _child_origin(node: SessionLineageNode) -> _ChildOrigin:
     origins = node.origin_events
     if len(origins) != 1:
@@ -1050,6 +1188,7 @@ async def _load_child_trajectory(
     visited: set[str],
     state: _CaptureState,
     depth: int,
+    before_store_read: Callable[[], None] | None = None,
 ) -> _ChildTrajectoryLoad:
     session_id = candidate.node.id if isinstance(candidate, _ChildOrigin) else candidate.id
     # A custom store without the minimal lineage capability can reveal the
@@ -1064,6 +1203,8 @@ async def _load_child_trajectory(
         enforce_session_capacity=enforce_session_capacity,
     )
     if state.strict:
+        if before_store_read is not None:
+            before_store_read()
         evidence = await _load_strict_terminal_evidence(
             app,
             session_id,
@@ -1072,6 +1213,8 @@ async def _load_child_trajectory(
         )
     else:
         try:
+            if before_store_read is not None:
+                before_store_read()
             evidence = await _load_terminal_evidence(
                 app,
                 session_id,
@@ -1084,11 +1227,14 @@ async def _load_child_trajectory(
             ):
                 return _ChildTrajectoryLoad()
             try:
+                if before_store_read is not None:
+                    before_store_read()
                 evidence = await app.session_store.load_runner_owned_interrupted_evidence(
                     session_id,
                     expected_parent_session_id=expected_parent_session_id,
                     limits=limits,
                 )
+                evidence = _validated_terminal_session_evidence(evidence)
             except Exception:
                 return _ChildTrajectoryLoad()
         except Exception:
@@ -1134,6 +1280,7 @@ async def _load_child_trajectory(
         parent_terminal_sequence=evidence.boundary.terminal_event_sequence,
         state=state,
         depth=depth,
+        before_store_read=before_store_read,
     )
     return _ChildTrajectoryLoad(
         trajectory=_trajectory_node_from_terminal_evidence(
@@ -1191,6 +1338,151 @@ async def _revalidate_strict_capture(app: CayuApp, state: _CaptureState) -> None
             limits=limits,
             parent_session_id=expected_evidence.session.parent_session_id,
         )
+        if observed_evidence != expected_evidence:
+            raise SessionTrajectoryError(
+                SessionTrajectoryErrorCode.CLOSURE_CHANGED,
+                session_id=session_id,
+                parent_session_id=expected_evidence.session.parent_session_id,
+            )
+
+
+async def _revalidate_fresh_capture(
+    app: CayuApp,
+    state: _CaptureState,
+    *,
+    root_session_id: str,
+    root_interrupted_observed_events: tuple[RunnerObservedEventIdentity, ...],
+    before_store_read: Callable[[], None] | None = None,
+) -> None:
+    """Revalidate one fresh authoritative closure, including interrupted evidence."""
+
+    if not app.session_store.supports_session_lineage:
+        raise SessionTrajectoryError(
+            SessionTrajectoryErrorCode.STORE_UNSUPPORTED,
+            session_id=root_session_id,
+        )
+
+    revalidation_state = _CaptureState(bounds=state.bounds, strict=True)
+    for evidence in state.evidence_by_session_id.values():
+        revalidation_state.ensure_retained_session_capacity(
+            evidence.session.id,
+            parent_session_id=evidence.session.parent_session_id,
+        )
+        revalidation_state.retained_session_ids.add(evidence.session.id)
+
+    for parent_session_id, (terminal_sequence, expected) in state.parent_closures.items():
+        candidates = await _strict_child_nodes(
+            app,
+            parent_session_id,
+            state=revalidation_state,
+            before_store_read=before_store_read,
+        )
+        origins = tuple(_child_origin(node) for node in candidates)
+        observed = tuple(
+            origin.fingerprint
+            for origin in sorted(origins, key=lambda item: (item.origin.sequence, item.node.id))
+            if origin.origin.sequence <= terminal_sequence
+        )
+        if observed != expected:
+            raise SessionTrajectoryError(
+                SessionTrajectoryErrorCode.CLOSURE_CHANGED,
+                session_id=parent_session_id,
+            )
+
+    for session_id, expected_evidence in state.evidence_by_session_id.items():
+        original_limits = state.evidence_limits_by_session_id.get(session_id)
+        if original_limits is None:
+            raise SessionTrajectoryError(
+                SessionTrajectoryErrorCode.EVIDENCE_INCONSISTENT,
+                session_id=session_id,
+                parent_session_id=expected_evidence.session.parent_session_id,
+            )
+        limits = TerminalSessionEvidenceLimits(
+            max_events=expected_evidence.boundary.event_count,
+            max_transcript_records=expected_evidence.boundary.transcript_count,
+            max_record_bytes=original_limits.max_record_bytes,
+            max_total_bytes=original_limits.max_total_bytes,
+        )
+        if expected_evidence.session.status is SessionStatus.INTERRUPTED:
+            if not app.session_store.supports_runner_owned_interrupted_evidence:
+                raise SessionTrajectoryError(
+                    SessionTrajectoryErrorCode.EVIDENCE_READ_FAILED,
+                    session_id=session_id,
+                    parent_session_id=expected_evidence.session.parent_session_id,
+                )
+            try:
+                if session_id == root_session_id:
+                    if before_store_read is not None:
+                        before_store_read()
+                    observed_evidence = (
+                        await app.session_store.load_runner_owned_interrupted_evidence(
+                            session_id,
+                            observed_events=root_interrupted_observed_events,
+                            limits=limits,
+                        )
+                    )
+                    _validate_revalidation_evidence_scope(
+                        observed_evidence,
+                        expected_evidence,
+                    )
+                    observed_evidence = _validated_terminal_session_evidence(observed_evidence)
+                else:
+                    if before_store_read is not None:
+                        before_store_read()
+                    observed_evidence = (
+                        await app.session_store.load_runner_owned_interrupted_evidence(
+                            session_id,
+                            expected_parent_session_id=(
+                                expected_evidence.session.parent_session_id
+                            ),
+                            limits=limits,
+                        )
+                    )
+                    _validate_revalidation_evidence_scope(
+                        observed_evidence,
+                        expected_evidence,
+                    )
+                    observed_evidence = _validated_terminal_session_evidence(observed_evidence)
+                _validate_terminal_origin_lineage(observed_evidence)
+            except TerminalSessionEvidenceError as exc:
+                raise SessionTrajectoryError(
+                    SessionTrajectoryErrorCode.CLOSURE_CHANGED,
+                    session_id=session_id,
+                    parent_session_id=expected_evidence.session.parent_session_id,
+                    terminal_code=exc.code,
+                    limit=exc.limit,
+                    observed=exc.observed,
+                ) from exc
+            except SessionTrajectoryError:
+                raise
+            except Exception as exc:
+                raise SessionTrajectoryError(
+                    SessionTrajectoryErrorCode.EVIDENCE_READ_FAILED,
+                    session_id=session_id,
+                    parent_session_id=expected_evidence.session.parent_session_id,
+                ) from exc
+        else:
+            if before_store_read is not None:
+                before_store_read()
+            try:
+                observed_evidence = await _load_strict_terminal_evidence(
+                    app,
+                    session_id,
+                    limits=limits,
+                    parent_session_id=expected_evidence.session.parent_session_id,
+                    revalidation_expected=expected_evidence,
+                )
+            except SessionTrajectoryError as exc:
+                if exc.code is not SessionTrajectoryErrorCode.TERMINAL_EVIDENCE_REJECTED:
+                    raise
+                raise SessionTrajectoryError(
+                    SessionTrajectoryErrorCode.CLOSURE_CHANGED,
+                    session_id=session_id,
+                    parent_session_id=expected_evidence.session.parent_session_id,
+                    terminal_code=exc.terminal_code,
+                    limit=exc.limit,
+                    observed=exc.observed,
+                ) from exc
         if observed_evidence != expected_evidence:
             raise SessionTrajectoryError(
                 SessionTrajectoryErrorCode.CLOSURE_CHANGED,

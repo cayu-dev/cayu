@@ -361,7 +361,14 @@ Portable assertions consume one immutable `AssertionEvidenceView`, produced by
 `project_assertion_evidence_view(...)` from a validated `Trajectory`. The view
 contains only terminal statuses, bounded redacted final output, requested tool
 names and counts, model-step/token counts, and optional currency-local cost
-totals. It carries no session, event, interaction, provider, model, agent,
+totals. Schema version 2 also carries one versioned
+`EvalMemoryAttributionEvidenceV1` section. That section retains bounded runtime
+receipt/exposure attribution, exact lifecycle states and fingerprints,
+deterministic root/descendant tree paths, optional HMAC session aliases, and
+explicit completeness and limitation codes. It carries no raw recalled text,
+prompt, provider body, embedding, unrestricted event, or arbitrary private
+metadata. The rest of the assertion view carries no session, event,
+interaction, provider, model, agent,
 environment, payload, tool argument/result, or cost line-item identity. Child,
 output, tool, model-step, and usage completeness are explicit; unavailable or
 limit-exceeded evidence is never represented as a complete observation. The
@@ -376,6 +383,35 @@ numeric corpus field exact across Python, browser, and other portable JSON
 boundaries. The serialized evidence view is
 capped at 10 MiB, enough to retain every field at its declared character and
 cardinality ceiling, including four-byte Unicode.
+
+Fresh eval execution captures memory only after the exact terminal root and
+bounded descendant trajectory are available. It uses the same runtime
+projection as historical `trajectory_from_session(...)` promotion and performs
+a second bounded read before closing the trial; a changed closure becomes
+typed `closure_changed` unavailable evidence rather than choosing either read.
+The resulting trial-owned section is also the section consumed by portable
+assertions, so suite-partitioned effective bounds are not replaced by defaults
+during assertion or captured-result preparation.
+The eval policy retains at most 100 source records per trial and partitions
+aggregate 32 MiB source-read and 8 MiB runtime-projection budgets across both
+closure reads before trials dispatch, with per-trial ceilings of 4 MiB and
+512 KiB. It separately partitions at most 10,000 retained source wrappers and
+9 MiB of final serialized memory evidence across the complete run before the
+first trial dispatches. Large suites therefore reduce descendant retention—or
+retain only an explicit projection-limit result—instead of completing provider
+work and then exceeding the published-result ceiling. Runtime truncation remains distinct
+from an eval source or byte limit because the runtime does not expose which of
+its own limits fired. A complete zero-record projection is the only state that
+sets `proves_empty`; missing, read-failed, redacted, truncated, contradictory,
+deleted, legacy, incomplete-tree, deadline, and closure-change evidence cannot
+be interpreted as empty. Deletion is asserted only from positive terminal
+source evidence, never inferred from an unavailable or truncated store read.
+For exposures, that positive census is the set of runtime-authored assistant
+model attempts for model steps that durably admitted automatic recall;
+auxiliary context-compaction attempts are excluded, and repeated count/model
+events for one assistant attempt are deduplicated by runtime attempt identity.
+Selected/planned, prepared, dispatch-started, acknowledged, completed, and
+indeterminate exposure states remain the exact runtime lifecycle values.
 
 When cost evidence is requested, callers inject a trusted local `PriceBook`.
 `pricing_profile_identity(...)` canonicalizes and fingerprints the validated
@@ -421,9 +457,21 @@ credentials.
 
 `publish_eval_run(...)` is the only public result projection for a portable
 corpus run. It matches the complete internal suite result back to the corpus and
-produces a content-addressed schema-version-2 `PublishedEvalRun` containing
+produces a content-addressed schema-version-3 `PublishedEvalRun` containing
 every case, trial, assertion outcome, safe structural detail, duration, and
-identity-free aggregate usage. Every complete trial carries its exact aggregate
+identity-free aggregate usage. Every trial also retains the exact bounded
+memory-attribution section used during evaluation, so JSON, SDK, CLI, HTML, and
+Control Plane readers do not need raw runtime events to distinguish complete,
+truncated, and unavailable evidence. Captured-session scoring embeds the same
+section in `CapturedRunScoreV1`; fresh and captured publications therefore use
+one memory evidence model and revision contract. CLI JSON and Control Plane
+schemas preserve the complete section. HTML reports retain its bounded
+classification, limitation, and lifecycle summary while explicitly directing
+full record inspection to JSON. The current compact generic
+result-comparison projection explicitly reports memory attribution as
+`unsupported` rather than silently dropping or comparing it; repeated-trial
+memory statistics belong to the dedicated comparison contract. Every complete
+trial carries its exact aggregate
 usage, and conclusive
 usage-derived observations cannot exist without that summary. A publishable run
 carries large aggregate counters in the same canonical decimal-string JSON
@@ -455,7 +503,7 @@ messages that distinguish assertion, lifecycle, evidence, and timeout failures
 without copying raw exception text. Raw assertion metadata, raw final output,
 trajectories, concrete session IDs, and provider/model identity are never copied.
 Cost results require
-the corpus pricing-profile fingerprint. The closed schema-v2 graph is bounded to
+the corpus pricing-profile fingerprint. The closed schema-v3 graph is bounded to
 32 MiB and is the reporting, comparison, and CI substrate for portable corpus
 execution; the lossless `EvalRun` does not cross that publishing boundary.
 The publication model defines and enforces this boundary independently of execution.
@@ -1540,14 +1588,14 @@ payloads after each trial result is built. When enabled, every trial retains its
 trajectory. Trajectories are **excluded from saved `EvalRun` JSON** and remain separate,
 opt-in exports.
 
-Saved `EvalRun` baselines use schema version `7`. Version 7 preserves the complete
+Saved `EvalRun` baselines use schema version `8`. Version 8 preserves the complete
 ordered trial graph, explicit outcome/null-score contract, conclusive-evidence
 state, the exact portable assertion revision behind each result, and the optional
 portable execution contract a trusted executor fixes before dispatch. It retains
 identity-free aggregate usage for every complete trial, canonical large counters,
 and durable-JSON validation. A contracted run must retain exactly the requested
 number of trials for every case.
-`load_eval_run(...)` rejects missing versions and versions 1–6;
+`load_eval_run(...)` rejects missing versions and versions 1–7;
 regenerate those baselines with the current Cayu version. No compatibility loader
 or migration is used.
 

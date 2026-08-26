@@ -110,6 +110,7 @@ class CorpusComparisonResultSummary(BaseModel):
     result_revision: StrictStr
     application_release_id: StrictStr = Field(min_length=1, max_length=256)
     app_manifest_fingerprint: StrictStr = Field(min_length=64, max_length=64)
+    memory_attribution_support: Literal["unsupported"] = "unsupported"
     status: PublishedStatus
     score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
 
@@ -313,6 +314,7 @@ def _validated_projection(
         result_revision=projection.result_revision,
         application_release_id=projection.target.application_release_id,
         app_manifest_fingerprint=projection.target.app_manifest_fingerprint,
+        memory_attribution_support=projection.memory_attribution_support,
         status=projection.status,
         score=projection.score,
     )

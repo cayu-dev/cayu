@@ -49,6 +49,12 @@ from cayu import (
     preflight_eval_scenario,
     run_compiled_eval_scenario,
 )
+from cayu.evals.memory_attribution import (
+    EVAL_MEMORY_ATTRIBUTION_MAX_BYTES,
+    eval_memory_attribution_bounds_for_trial_count,
+    eval_memory_attribution_max_bytes_for_trial_count,
+    eval_memory_attribution_source_limit_for_trial_count,
+)
 
 
 class _ApprovalProvider(ModelProvider):
@@ -151,7 +157,12 @@ def _scenario(*, occurrence: int = 1) -> EvalScenarioDocumentV2:
     )
 
 
-def _approval_target(provider: ModelProvider, *, session_store=None) -> CorpusTarget:
+def _approval_target(
+    provider: ModelProvider,
+    *,
+    session_store=None,
+    max_trials: int = 2,
+) -> CorpusTarget:
     app = CayuApp(session_store=session_store, enable_logging=False)
     app.register_provider(provider, default=True)
     app.register_agent(
@@ -169,7 +180,7 @@ def _approval_target(provider: ModelProvider, *, session_store=None) -> CorpusTa
         ),
         bootstrap_messages=(Message.text("system", "Follow policy."),),
         application_release_id="release-current",
-        limits=CorpusExecutionLimits(max_trials=2, max_concurrency=2),
+        limits=CorpusExecutionLimits(max_trials=max_trials, max_concurrency=2),
     )
 
 
@@ -346,6 +357,84 @@ def test_scenario_execution_waits_for_fresh_approval_and_publishes_corpus_result
         assert result.run.status == "passed"
         assert result.run.cases[0].trials[0].output.text == "approved answer"
         assert provider.request_count == 2
+
+    asyncio.run(exercise())
+
+
+def test_scenario_execution_partitions_memory_limits_before_trial_dispatch() -> None:
+    async def exercise() -> None:
+        trial_count = 10
+        provider = _ApprovalProvider(request_approval=False)
+        target = _approval_target(provider, max_trials=trial_count)
+        scenario = _scenario()
+        preflight = await preflight_eval_scenario(
+            scenario,
+            target,
+            ScenarioLaunchSettingsV2(
+                trials=trial_count,
+                max_concurrency=2,
+                timeout_seconds=30,
+            ),
+            actor_authorized=True,
+        )
+        assert preflight.binding is not None
+        binding = preflight.binding
+        corpus = corpus_for_eval_scenario(scenario, binding, target)
+        compiled = compile_corpus_suite(corpus, target, "scenario")
+        store = InMemoryEvalStore()
+        await store.save_scenario(scenario, redact_json=target.app.redact_json)
+        await store.save_corpus(corpus, redact_json=target.app.redact_json)
+        request = EvalRunRequest(
+            run_id="scenario-memory-bounds",
+            idempotency_key="sha256:" + "9" * 64,
+            corpus_revision=corpus.revision,
+            target_key=target.key,
+            suite_id="scenario",
+            suite_revision=compiled.run_contract.suite_revision,
+            max_concurrency=2,
+            invocation=EvalRunInvocation(
+                max_steps=binding.max_steps,
+                limits=binding.operator_run_limits,
+                cost_budget=binding.cost_budget,
+                scenario=EvalScenarioRunInvocation(
+                    scenario_revision=scenario.revision,
+                    binding_revision=binding.revision,
+                    environment_name=binding.environment_name,
+                    trials=binding.trials,
+                    timeout_seconds=binding.timeout_seconds,
+                ),
+            ),
+        )
+        await store.admit_run(request, redact_json=target.app.redact_json)
+        claimed = await store.claim_run(target_key=target.key, lease_seconds=30)
+        assert claimed is not None
+
+        result = await run_compiled_eval_scenario(
+            target,
+            compiled,
+            scenario,
+            binding,
+            store=store,
+            claim=claimed.claim,
+            max_concurrency=2,
+            poll_seconds=0.001,
+        )
+
+        expected_bounds = eval_memory_attribution_bounds_for_trial_count(trial_count)
+        expected_source_limit = eval_memory_attribution_source_limit_for_trial_count(trial_count)
+        expected_max_bytes = eval_memory_attribution_max_bytes_for_trial_count(trial_count)
+        assert expected_max_bytes < EVAL_MEMORY_ATTRIBUTION_MAX_BYTES
+        trials = result.run.cases[0].trials
+        assert len(trials) == trial_count
+        assert provider.request_count == trial_count
+        assert all(trial.memory_attribution.effective_bounds == expected_bounds for trial in trials)
+        assert all(
+            trial.memory_attribution.effective_source_limit == expected_source_limit
+            for trial in trials
+        )
+        assert all(
+            trial.memory_attribution.effective_max_bytes == expected_max_bytes for trial in trials
+        )
 
     asyncio.run(exercise())
 

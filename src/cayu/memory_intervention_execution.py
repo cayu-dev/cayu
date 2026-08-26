@@ -29,6 +29,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictInt,
     StrictStr,
     field_validator,
@@ -48,6 +49,7 @@ from cayu._task_wait import (
 )
 from cayu._validation import (
     canonical_durable_json_bytes,
+    compact_json_utf8_size,
     copy_durable_json_object,
     require_durable_clean_nonblank,
     revalidate_model_input,
@@ -65,12 +67,27 @@ from cayu.agent_snapshots import (
     execution_profile_snapshot_ref,
 )
 from cayu.core.events import event_durable_sequence
-from cayu.evals.models import EvalCaseContractV1, EvalTrialResult
+from cayu.evals._memory_attribution import (
+    eval_memory_attribution_evidence_from_runtime_source,
+)
+from cayu.evals.memory_attribution import (
+    EvalMemoryAttributionEvidenceV1,
+    EvalMemoryEvidenceLimitation,
+    EvalMemorySourceAliasV1,
+    eval_memory_source_alias,
+    standard_eval_memory_attribution_bounds,
+)
+from cayu.evals.models import (
+    EvalCaseContractV1,
+    EvalTrialResult,
+    _memory_source_expected_counts,
+)
 from cayu.memory import AutomaticRecallPolicy
 from cayu.memory_attribution import (
     MemoryAttribution,
     MemoryAttributionBounds,
     MemoryAttributionStatus,
+    MemoryAttributionUnavailableReason,
 )
 from cayu.memory_interventions import (
     MemoryInterventionEffectStatus,
@@ -97,7 +114,10 @@ from cayu.runtime.sessions import (
     SessionStatus,
     TerminalSessionEvidence,
     TerminalSessionEvidenceError,
+    TerminalSessionEvidenceErrorCode,
     copy_run_request,
+    copy_session,
+    copy_terminal_session_evidence,
     run_request_with_runtime_generated_authority,
     run_request_with_runtime_session_create_claim,
     session_has_runtime_create_claim,
@@ -1385,24 +1405,34 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
             factory.execution_profile_fingerprint,
             "factory.execution_profile_fingerprint",
         )
+        requested_bounds = MemoryAttributionBounds.model_validate(
+            (attribution_bounds or MemoryAttributionBounds()).model_dump(mode="python")
+        )
+        policy_bounds = standard_eval_memory_attribution_bounds()
+        self._attribution_bounds = MemoryAttributionBounds(
+            max_receipts=min(requested_bounds.max_receipts, policy_bounds.max_receipts),
+            max_exposures=min(requested_bounds.max_exposures, policy_bounds.max_exposures),
+            max_items=min(requested_bounds.max_items, policy_bounds.max_items),
+            max_source_bytes=min(
+                requested_bounds.max_source_bytes,
+                policy_bounds.max_source_bytes,
+            ),
+            max_projection_bytes=min(
+                requested_bounds.max_projection_bytes,
+                policy_bounds.max_projection_bytes,
+                MEMORY_INTERVENTION_ATTRIBUTION_MAX_PROJECTION_BYTES,
+            ),
+        )
         self.execution_profile_fingerprint = _content_sha256(
             {
                 "kind": "cayu_memory_intervention_runtime",
                 "version": 1,
                 "factory_id": self._factory_id,
                 "factory_fingerprint": self._factory_fingerprint,
+                "attribution_bounds": self._attribution_bounds.model_dump(mode="json"),
             },
             "memory intervention runtime runner",
         )
-        requested_bounds = MemoryAttributionBounds.model_validate(
-            (attribution_bounds or MemoryAttributionBounds()).model_dump(mode="python")
-        )
-        bounded_values = requested_bounds.model_dump(mode="python")
-        bounded_values["max_projection_bytes"] = min(
-            requested_bounds.max_projection_bytes,
-            MEMORY_INTERVENTION_ATTRIBUTION_MAX_PROJECTION_BYTES,
-        )
-        self._attribution_bounds = MemoryAttributionBounds.model_validate(bounded_values)
 
     def required_execution_profile_fingerprint(
         self,
@@ -1477,7 +1507,14 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
         session = await app.session_store.load(execution.session_id)
         if session is None:
             if execution.runtime_timeout_observed:
-                return _runtime_timeout_before_session_result(execution)
+                return _runtime_timeout_before_session_result(
+                    execution,
+                    effective_attribution_bounds=self._attribution_bounds,
+                    source_alias=_memory_intervention_source_alias(
+                        app,
+                        execution.session_id,
+                    ),
+                )
             return await self._execute(
                 app=app,
                 request=request,
@@ -1511,9 +1548,16 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
                     },
                 )
             )
+            session = await app.session_store.load(execution.session_id)
+            if session is None or not _session_matches_intervention_create_claim(
+                session, session_create_claim, request=runtime_request
+            ):
+                raise MemoryInterventionExecutionConflict(
+                    "Canonical runtime session does not match its intervention create claim."
+                )
         return await self._collect_result(
             app=app,
-            session_id=execution.session_id,
+            expected_session=session,
             observed_events=(),
             timeout_expired=execution.runtime_timeout_observed,
             cancellation_observed=execution.runtime_cancellation_observed,
@@ -1658,7 +1702,14 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
         observed: list[RunnerObservedEventIdentity] = []
         remaining_timeout = _remaining_runtime_timeout(request, execution)
         if remaining_timeout <= 0:
-            result = _runtime_timeout_before_session_result(execution)
+            result = _runtime_timeout_before_session_result(
+                execution,
+                effective_attribution_bounds=self._attribution_bounds,
+                source_alias=_memory_intervention_source_alias(
+                    app,
+                    execution.session_id,
+                ),
+            )
             raise _MemoryInterventionRuntimeTimeoutObserved(lambda: asyncio.sleep(0, result=result))
         try:
             async with asyncio.timeout(remaining_timeout):
@@ -1687,17 +1738,15 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
                 )
             ) from None
         session = await app.session_store.load(execution.session_id)
-        if not _session_matches_intervention_create_claim(
-            session,
-            session_create_claim,
-            request=runtime_request,
+        if session is None or not _session_matches_intervention_create_claim(
+            session, session_create_claim, request=runtime_request
         ):
             raise MemoryInterventionExecutionConflict(
                 "Canonical runtime session does not match its intervention create claim."
             )
         return await self._collect_result(
             app=app,
-            session_id=runtime_request.session_id,
+            expected_session=session,
             observed_events=tuple(observed),
             timeout_expired=False,
             cancellation_observed=False,
@@ -1714,7 +1763,14 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
     ) -> MemoryInterventionRuntimeResult:
         session = await app.session_store.load(execution.session_id)
         if session is None:
-            return _runtime_timeout_before_session_result(execution)
+            return _runtime_timeout_before_session_result(
+                execution,
+                effective_attribution_bounds=self._attribution_bounds,
+                source_alias=_memory_intervention_source_alias(
+                    app,
+                    execution.session_id,
+                ),
+            )
         if not _session_matches_intervention_create_claim(
             session,
             session_create_claim,
@@ -1725,7 +1781,7 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
             )
         return await self._collect_result(
             app=app,
-            session_id=execution.session_id,
+            expected_session=session,
             observed_events=observed_events,
             timeout_expired=True,
             cancellation_observed=False,
@@ -1735,44 +1791,70 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
         self,
         *,
         app,
-        session_id: str,
+        expected_session: Session,
         observed_events: tuple[RunnerObservedEventIdentity, ...],
         timeout_expired: bool,
         cancellation_observed: bool,
     ) -> MemoryInterventionRuntimeResult:
-        session = await app.session_store.load(session_id)
-        if session is None:
-            raise MemoryInterventionExecutionConflict(
-                "Canonical runtime did not create the intervention session."
-            )
+        session = copy_session(expected_session)
+        session_id = session.id
         evidence: TerminalSessionEvidence | None = None
+        terminal_evidence_limitation: EvalMemoryEvidenceLimitation | None = None
         try:
             evidence = await app.session_store.load_terminal_session_evidence(session_id)
-        except TerminalSessionEvidenceError:
+        except TerminalSessionEvidenceError as error:
             if session.status is SessionStatus.INTERRUPTED and observed_events:
                 try:
                     evidence = await app.session_store.load_runner_owned_interrupted_evidence(
                         session_id,
                         observed_events=observed_events,
                     )
-                except (NotImplementedError, TerminalSessionEvidenceError):
+                except (NotImplementedError, TerminalSessionEvidenceError) as fallback_error:
                     evidence = None
-            elif session.status not in {SessionStatus.INTERRUPTED}:
-                raise
+                    terminal_evidence_limitation = _terminal_evidence_limitation(fallback_error)
+                except Exception:
+                    evidence = None
+                    terminal_evidence_limitation = EvalMemoryEvidenceLimitation.EVIDENCE_READ_FAILED
+            else:
+                terminal_evidence_limitation = _terminal_evidence_limitation(error)
+        except NotImplementedError as error:
+            terminal_evidence_limitation = _terminal_evidence_limitation(error)
+        except Exception:
+            terminal_evidence_limitation = EvalMemoryEvidenceLimitation.EVIDENCE_READ_FAILED
         if evidence is not None:
+            evidence = _validated_memory_intervention_terminal_evidence(
+                evidence,
+                expected_session=session,
+                observed_events=observed_events,
+            )
+            terminal_evidence_limitation = None
             runtime_material: object = evidence.model_dump(mode="json")
         else:
+            terminal_evidence_limitation = (
+                terminal_evidence_limitation or EvalMemoryEvidenceLimitation.MISSING
+            )
             runtime_material = {
                 "session": session.model_dump(mode="json"),
                 "terminal_evidence": "unavailable",
+                "terminal_evidence_limitation": terminal_evidence_limitation.value,
             }
         usage = await app.get_session_usage(session_id)
-        attribution = await project_memory_attribution(
-            app.session_store,
-            session_id,
-            key=memory_evidence_key(app._request_footprint),
-            budget=MemoryAttributionCaptureBudget(bounds=self._attribution_bounds),
-        )
+        evidence_key = memory_evidence_key(app._request_footprint)
+        source_alias = _memory_intervention_source_alias(app, session_id)
+        if evidence is None:
+            expected_receipt_count = None
+            expected_exposure_count = None
+            attribution = _unavailable_terminal_memory_attribution()
+        else:
+            expected_receipt_count, expected_exposure_count = _memory_source_expected_counts(
+                record.event for record in evidence.events
+            )
+            attribution = await project_memory_attribution(
+                app.session_store,
+                session_id,
+                key=evidence_key,
+                budget=MemoryAttributionCaptureBudget(bounds=self._attribution_bounds),
+            )
         disposition = (
             AgentSnapshotTerminalDisposition.TIMED_OUT
             if timeout_expired
@@ -1791,6 +1873,12 @@ class CayuMemoryInterventionRuntimeRunner(MemoryInterventionRuntimeRunner):
                 runtime_material,
                 "memory intervention runtime evidence",
             ),
+            terminal_evidence_available=evidence is not None,
+            terminal_evidence_limitation=terminal_evidence_limitation,
+            expected_receipt_count=expected_receipt_count,
+            expected_exposure_count=expected_exposure_count,
+            effective_attribution_bounds=self._attribution_bounds,
+            source_alias=source_alias,
             attribution=attribution,
             usage_fingerprint=_content_sha256(
                 usage.model_dump(mode="json"),
@@ -1803,6 +1891,12 @@ class MemoryInterventionRuntimeResult(_ExecutionModel):
     session_id: StrictStr = Field(max_length=512)
     terminal_disposition: AgentSnapshotTerminalDisposition
     runtime_evidence_fingerprint: StrictStr
+    terminal_evidence_available: StrictBool
+    terminal_evidence_limitation: EvalMemoryEvidenceLimitation | None = None
+    expected_receipt_count: StrictInt | None = Field(default=None, ge=0)
+    expected_exposure_count: StrictInt | None = Field(default=None, ge=0)
+    effective_attribution_bounds: MemoryAttributionBounds
+    source_alias: EvalMemorySourceAliasV1 | None = None
     attribution: MemoryAttribution
     usage_fingerprint: StrictStr | None = None
     cost_fingerprint: StrictStr | None = None
@@ -1823,6 +1917,88 @@ class MemoryInterventionRuntimeResult(_ExecutionModel):
     @classmethod
     def copy_attribution(cls, value: object) -> object:
         return revalidate_model_input(value, MemoryAttribution)
+
+    @field_validator("effective_attribution_bounds", mode="before")
+    @classmethod
+    def copy_effective_attribution_bounds(cls, value: object) -> object:
+        return revalidate_model_input(value, MemoryAttributionBounds)
+
+    @field_validator("source_alias", mode="before")
+    @classmethod
+    def copy_source_alias(cls, value: object) -> object:
+        if value is None:
+            return None
+        return revalidate_model_input(value, EvalMemorySourceAliasV1)
+
+    @model_validator(mode="after")
+    def validate_terminal_memory_authority(self) -> Self:
+        if (self.expected_receipt_count is None) is not (self.expected_exposure_count is None):
+            raise ValueError("Terminal memory counts must be present or absent together.")
+        counts_available = self.expected_receipt_count is not None
+        if self.terminal_evidence_available is not counts_available:
+            raise ValueError(
+                "Terminal memory counts must be present exactly when terminal evidence is available."
+            )
+        if self.terminal_evidence_available:
+            if self.terminal_evidence_limitation is not None:
+                raise ValueError("Available terminal evidence cannot carry a limitation.")
+        elif self.terminal_evidence_limitation not in {
+            EvalMemoryEvidenceLimitation.STORE_UNSUPPORTED,
+            EvalMemoryEvidenceLimitation.EVIDENCE_READ_FAILED,
+            EvalMemoryEvidenceLimitation.MISSING,
+            EvalMemoryEvidenceLimitation.CONTRADICTORY_LINEAGE,
+            EvalMemoryEvidenceLimitation.DEADLINE_EXPIRED,
+        }:
+            raise ValueError("Unavailable terminal evidence requires a terminal limitation.")
+        policy_bounds = standard_eval_memory_attribution_bounds()
+        if self.effective_attribution_bounds.max_receipts > policy_bounds.max_receipts:
+            raise ValueError("Effective receipt bound exceeds the eval capture policy.")
+        if self.effective_attribution_bounds.max_exposures > policy_bounds.max_exposures:
+            raise ValueError("Effective exposure bound exceeds the eval capture policy.")
+        if self.effective_attribution_bounds.max_items > policy_bounds.max_items:
+            raise ValueError("Effective item bound exceeds the eval capture policy.")
+        if self.effective_attribution_bounds.max_source_bytes > policy_bounds.max_source_bytes:
+            raise ValueError("Effective source-byte bound exceeds the eval capture policy.")
+        if (
+            self.effective_attribution_bounds.max_projection_bytes
+            > policy_bounds.max_projection_bytes
+        ):
+            raise ValueError("Effective projection-byte bound exceeds the eval capture policy.")
+        return self
+
+
+def _validated_memory_intervention_terminal_evidence(
+    value: object,
+    *,
+    expected_session: Session,
+    observed_events: tuple[RunnerObservedEventIdentity, ...],
+) -> TerminalSessionEvidence:
+    """Detach store authority and bind it to the exact runtime session and live census."""
+
+    try:
+        expected = copy_session(expected_session)
+        if type(value) is not TerminalSessionEvidence:
+            raise TypeError
+        evidence = copy_terminal_session_evidence(value)
+        if evidence.session != expected or evidence.boundary.run_epoch != expected.run_epoch:
+            raise ValueError
+        if observed_events:
+            retained_identities = {
+                (record.event.session_id, record.sequence): record.event.type
+                for record in evidence.events
+            }
+            if any(
+                observed.sequence is not None
+                and retained_identities.get((observed.session_id, observed.sequence))
+                is not observed.event_type
+                for observed in observed_events
+            ):
+                raise ValueError
+        return evidence
+    except (TypeError, ValueError):
+        raise MemoryInterventionExecutionConflict(
+            "Canonical runtime returned invalid or foreign terminal evidence."
+        ) from None
 
 
 def _session_matches_intervention_create_claim(
@@ -1863,6 +2039,9 @@ def _remaining_runtime_timeout(
 
 def _runtime_timeout_before_session_result(
     execution: MemoryInterventionExecutionRecord,
+    *,
+    effective_attribution_bounds: MemoryAttributionBounds,
+    source_alias: EvalMemorySourceAliasV1 | None,
 ) -> MemoryInterventionRuntimeResult:
     return MemoryInterventionRuntimeResult(
         session_id=execution.session_id,
@@ -1882,16 +2061,56 @@ def _runtime_timeout_before_session_result(
             },
             "memory intervention pre-session timeout evidence",
         ),
-        attribution=MemoryAttribution(
-            status=MemoryAttributionStatus.COMPLETE,
-            truncated=False,
-            observed_receipt_count=0,
-            observed_exposure_count=0,
-            observed_item_count=0,
-            omitted_receipt_count_at_least=0,
-            omitted_exposure_count_at_least=0,
-            omitted_item_count_at_least=0,
-        ),
+        terminal_evidence_available=False,
+        terminal_evidence_limitation=EvalMemoryEvidenceLimitation.DEADLINE_EXPIRED,
+        expected_receipt_count=None,
+        expected_exposure_count=None,
+        effective_attribution_bounds=effective_attribution_bounds,
+        source_alias=source_alias,
+        attribution=_unavailable_terminal_memory_attribution(),
+    )
+
+
+def _terminal_evidence_limitation(
+    error: NotImplementedError | TerminalSessionEvidenceError,
+) -> EvalMemoryEvidenceLimitation:
+    if isinstance(error, NotImplementedError):
+        return EvalMemoryEvidenceLimitation.STORE_UNSUPPORTED
+    if error.code is TerminalSessionEvidenceErrorCode.SESSION_NOT_FOUND:
+        return EvalMemoryEvidenceLimitation.MISSING
+    if error.code in {
+        TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_CONFLICT,
+        TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_DUPLICATE,
+        TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_INVALID,
+        TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_CONFLICT,
+        TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT,
+    }:
+        return EvalMemoryEvidenceLimitation.CONTRADICTORY_LINEAGE
+    return EvalMemoryEvidenceLimitation.EVIDENCE_READ_FAILED
+
+
+def _memory_intervention_source_alias(app, session_id: str) -> EvalMemorySourceAliasV1 | None:
+    key = memory_evidence_key(app._request_footprint)
+    if key is None:
+        return None
+    return eval_memory_source_alias(
+        session_id=session_id,
+        key_id=key.key_id,
+        key=key.key,
+    )
+
+
+def _unavailable_terminal_memory_attribution() -> MemoryAttribution:
+    return MemoryAttribution(
+        status=MemoryAttributionStatus.UNAVAILABLE,
+        truncated=False,
+        reason=MemoryAttributionUnavailableReason.EVIDENCE_READ_FAILED,
+        observed_receipt_count=0,
+        observed_exposure_count=0,
+        observed_item_count=0,
+        omitted_receipt_count_at_least=0,
+        omitted_exposure_count_at_least=0,
+        omitted_item_count_at_least=0,
     )
 
 
@@ -1911,6 +2130,22 @@ def _runtime_result_with_compact_attribution(
     )
     return MemoryInterventionRuntimeResult.model_validate(
         result.model_copy(update={"attribution": compact}).model_dump(mode="json")
+    )
+
+
+def _runtime_result_exceeds_effective_attribution_bounds(
+    result: MemoryInterventionRuntimeResult,
+) -> bool:
+    bounds = result.effective_attribution_bounds
+    retained_records = (*result.attribution.receipts, *result.attribution.exposures)
+    return (
+        len(result.attribution.receipts) > bounds.max_receipts
+        or len(result.attribution.exposures) > bounds.max_exposures
+        or sum(len(record.items) for record in retained_records) > bounds.max_items
+        or sum(
+            compact_json_utf8_size(record.model_dump(mode="json")) for record in retained_records
+        )
+        > bounds.max_projection_bytes
     )
 
 
@@ -2296,6 +2531,9 @@ class MemoryInterventionExecutor:
             trial=trial,
             result=snapshot_result,
             attribution=runtime.attribution,
+            terminal_evidence_available=runtime.terminal_evidence_available,
+            expected_receipt_count=runtime.expected_receipt_count,
+            expected_exposure_count=runtime.expected_exposure_count,
         )
         final_status = MemoryInterventionExecutionStatus(runtime.terminal_disposition.value)
         failure_code = (
@@ -2331,6 +2569,9 @@ class MemoryInterventionExecutor:
                     trial=trial,
                     result=snapshot_result,
                     attribution=runtime.attribution,
+                    terminal_evidence_available=runtime.terminal_evidence_available,
+                    expected_receipt_count=runtime.expected_receipt_count,
+                    expected_exposure_count=runtime.expected_exposure_count,
                 )
         if (
             record.status is not final_status
@@ -2898,6 +3139,8 @@ class MemoryInterventionExecutor:
             raise MemoryInterventionExecutionConflict(
                 "Runtime result belongs to another intervention session."
             )
+        if _runtime_result_exceeds_effective_attribution_bounds(result):
+            result = _runtime_result_with_compact_attribution(result)
         if result.terminal_disposition is AgentSnapshotTerminalDisposition.TIMED_OUT:
             current = await self._record_runtime_timeout(current)
         return result, current
@@ -2925,7 +3168,42 @@ class MemoryInterventionExecutor:
             raise MemoryInterventionExecutionConflict(
                 "Evaluator result belongs to another intervention session."
             )
-        return result
+        terminal_status: Literal["completed", "failed", "interrupted"]
+        if runtime.terminal_disposition is AgentSnapshotTerminalDisposition.COMPLETED:
+            terminal_status = "completed"
+        elif runtime.terminal_disposition is AgentSnapshotTerminalDisposition.FAILED:
+            terminal_status = "failed"
+        else:
+            terminal_status = "interrupted"
+        expected_attribution = eval_memory_attribution_evidence_from_runtime_source(
+            terminal_status=terminal_status,
+            attribution=runtime.attribution,
+            terminal_evidence_available=runtime.terminal_evidence_available,
+            terminal_evidence_limitation=runtime.terminal_evidence_limitation,
+            expected_receipt_count=runtime.expected_receipt_count,
+            expected_exposure_count=runtime.expected_exposure_count,
+            effective_bounds=runtime.effective_attribution_bounds,
+            source_alias=runtime.source_alias,
+        )
+        default_attribution = EvalMemoryAttributionEvidenceV1.unavailable(
+            EvalMemoryEvidenceLimitation.MISSING
+        )
+        supplied_attribution = result.memory_attribution
+        if supplied_attribution != default_attribution:
+            supplied_fingerprints = tuple(
+                source.attribution_fingerprint for source in supplied_attribution.sources
+            )
+            expected_fingerprints = tuple(
+                source.attribution_fingerprint for source in expected_attribution.sources
+            )
+            if supplied_fingerprints != expected_fingerprints:
+                raise MemoryInterventionExecutionConflict(
+                    "Evaluator result conflicts with runtime-owned memory attribution."
+                )
+        result_payload = result.model_dump(mode="python")
+        result_payload["trajectory"] = result.trajectory
+        result_payload["memory_attribution"] = expected_attribution
+        return EvalTrialResult.model_validate(result_payload)
 
     def _validate_live_owners(self) -> None:
         if (

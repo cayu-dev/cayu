@@ -9420,12 +9420,21 @@ preflight cannot create or dispatch a session under another profile. The exact
 registered environment and context-policy objects are likewise pinned through
 actual admission, and an `Environment` knowledge-store binding is read-only
 after registration, so a store swap cannot redirect an admitted trial into
-production knowledge. The runner
-drains the ordinary runtime stream, loads exact terminal or fresh interrupted
-evidence, projects the
-ordinary memory attribution and usage evidence, and recovers an undispatched or
-incomplete runtime-owned session without creating another session identity.
-Concrete attribution capture is capped at 512 KiB. The execution journal keeps
+production knowledge. The runner drains the ordinary runtime stream, loads
+exact terminal or fresh interrupted evidence, derives the terminal
+receipt/exposure census, and only then projects ordinary memory attribution and
+usage evidence. If exact terminal evidence is unavailable, the result retains
+a typed missing, unsupported, read-failed, contradictory, or deadline
+limitation rather than treating an empty store projection as proof. When the
+configured fingerprint key is available, the runner also retains the same
+domain-separated HMAC session alias used by ordinary eval publication; the raw
+session identity never enters the portable memory section. The runner recovers
+an undispatched or incomplete runtime-owned session
+without creating another session identity. Before any store read, concrete
+attribution capture caps every requested bound to the eval policy, including
+the 4 MiB source and 512 KiB projection ceilings. The exact effective bounds
+and terminal census are bound into runner identity and the durable runtime
+result. The execution journal keeps
 its independent 1 MiB record bound and, if a custom runner still returns a
 larger valid attribution, persists a truthful `truncated` projection with the
 observed and omitted-at-least counts instead of stranding the session-bound
@@ -9447,10 +9456,63 @@ or otherwise change production knowledge.
 `AgentSnapshotTrialBinding`, `AgentSnapshotResultBinding`, and
 `MemoryAttribution` records. Its canonical attribution fingerprint must equal
 `AgentSnapshotResultBinding.memory_evidence_fingerprint`. The
-`proves_no_memory_exposure` property is true only for complete attribution with
-zero observed receipts, exposures, and items. That observation remains
+`proves_no_memory_exposure` property is true only for available exact terminal
+evidence proving zero expected receipts/exposures and complete attribution with
+zero observed receipts, exposures, and items. Missing terminal authority or a
+terminal census larger than the retained store projection also makes memory
+intervention comparability fail closed. That observation remains
 distinct from a recall-off spec, a no-match receipt, and `truncated`,
 `unavailable`, `redacted`, or `contradictory` attribution.
+
+Runtime-native Evals carry that attribution across both fresh and captured
+publication. `AssertionEvidenceView.schema_version == 2`,
+`EvalRun.schema_version == 8`, `PublishedEvalRun.schema_version == 3`, and
+`CorpusExecutionResult.schema_version == 2` each require the same nested
+`EvalMemoryAttributionEvidenceV1`. The nested section is independently
+versioned and content-addressed. It binds a fixed capture-policy revision,
+effective runtime, retained-source, and serialized-document bounds, deterministic
+root/descendant source references,
+optional domain-separated HMAC session aliases, exact runtime attribution
+fingerprints, exposure lifecycle states, completeness, omitted-at-least counts,
+and typed limitations. It has no raw recall content, prompt, provider body,
+embedding, unrestricted event, or arbitrary private metadata field.
+
+The fresh eval runner waits for exact terminal session evidence and the bounded
+child tree before reading memory evidence. It reuses the historical trajectory
+promotion projector and a single aggregate capture budget, then repeats the
+read before trial closure. If the two bounded attribution snapshots disagree,
+the trial records `closure_changed` unavailable evidence and does not select a
+preferred snapshot. Deadline expiry never starts another store read. Aggregate
+source/projection budgets are partitioned before suite or case dispatch;
+retained source records are capped at 100 per trial and 10,000 across a run,
+and final memory documents share a 9 MiB run-wide budget. A runtime-owned truncation is
+reported as `runtime_attribution_truncated`, not guessed to be one particular
+eval bound. The aggregate byte budgets include both closure reads rather than
+accounting only for the retained second projection.
+Portable assertion preparation receives that exact trial-owned projection and
+its effective bounds; it must not reconstruct the same trajectory under wider
+default bounds.
+
+`proves_empty` is true only when every retained terminal source has a complete
+zero-receipt, zero-exposure, zero-item runtime projection and no source was
+omitted. Missing, unreadable, redacted, truncated, contradictory, deleted,
+legacy, incomplete-tree, deadline, or changed-closure evidence is unavailable
+or truncated and cannot prove empty. `deleted` requires positive retained
+terminal evidence for a record that an authoritative complete store census no
+longer contains; absence during an unavailable or truncated read is not deletion
+proof. Planned, prepared, dispatch-started, acknowledged, completed, and
+indeterminate exposure states remain distinct. Acknowledgement proves only the
+recorded provider lifecycle state, not attention or use.
+
+`PublishedEvalTrialResult` and `CapturedRunScoreV1` retain the complete bounded
+section, and their containing case/run/result revisions transitively bind it.
+JSON and EvalStore round-trips therefore preserve the same meaning for fresh
+and captured evidence across memory, SQLite, and PostgreSQL implementations.
+CLI JSON and Control Plane schemas preserve the complete section. HTML reports
+retain its bounded classification, limitation, and lifecycle summary while
+explicitly directing full record inspection to JSON. The compact generic result-comparison
+projection currently declares `memory_attribution_support="unsupported"`;
+it must not present a missing memory comparison as an empty or passing one.
 
 `MemoryInterventionComparability` compares only the memory-specific boundary.
 Its closed mismatch reasons cover starting memory state, intervention identity,

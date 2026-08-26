@@ -430,6 +430,9 @@ def _binding(
         trial=trial,
         result=result,
         attribution=attribution,
+        terminal_evidence_available=True,
+        expected_receipt_count=attribution.observed_receipt_count,
+        expected_exposure_count=attribution.observed_exposure_count,
     )
 
 
@@ -647,6 +650,9 @@ def test_trial_binding_reuses_result_memory_fingerprint_and_attribution_status()
             trial=binding.trial,
             result=mismatched_result,
             attribution=binding.attribution,
+            terminal_evidence_available=binding.terminal_evidence_available,
+            expected_receipt_count=binding.expected_receipt_count,
+            expected_exposure_count=binding.expected_exposure_count,
         )
 
 
@@ -690,6 +696,45 @@ def test_memory_comparability_is_closed_and_requires_isolated_overlays() -> None
     assert comparison.mismatch_reasons == (MemoryInterventionMismatchReason.INTERVENTION_IDENTITY,)
 
 
+def test_memory_comparability_requires_terminal_census_and_rejects_deleted_evidence() -> None:
+    baseline = _binding(_spec(MemoryInterventionKind.AS_DECLARED), "terminal-baseline")
+    intervention = _binding(
+        _spec(MemoryInterventionKind.AUTOMATIC_RECALL_OFF),
+        "terminal-intervention",
+    )
+    unavailable = MemoryInterventionTrialBinding.create(
+        spec=intervention.spec,
+        operation=intervention.operation,
+        receipt=intervention.receipt,
+        trial=intervention.trial,
+        result=intervention.result,
+        attribution=intervention.attribution,
+    )
+    deleted = MemoryInterventionTrialBinding.create(
+        spec=intervention.spec,
+        operation=intervention.operation,
+        receipt=intervention.receipt,
+        trial=intervention.trial,
+        result=intervention.result,
+        attribution=intervention.attribution,
+        terminal_evidence_available=True,
+        expected_receipt_count=1,
+        expected_exposure_count=0,
+    )
+
+    assert unavailable.proves_no_memory_exposure is False
+    assert deleted.proves_no_memory_exposure is False
+    for candidate in (unavailable, deleted):
+        comparison = MemoryInterventionComparability.create(
+            baseline=baseline,
+            intervention=candidate,
+        )
+        assert comparison.status is MemoryInterventionComparabilityStatus.INCOMPARABLE
+        assert comparison.mismatch_reasons == (
+            MemoryInterventionMismatchReason.REQUIRED_ATTRIBUTION_AVAILABILITY,
+        )
+
+
 def test_memory_comparability_rejects_partial_item_application() -> None:
     baseline = _binding(_spec(MemoryInterventionKind.AS_DECLARED), "partial-baseline")
     fully_applied = _binding(_omit_spec(item_count=2), "partial-intervention")
@@ -720,6 +765,9 @@ def test_memory_comparability_rejects_partial_item_application() -> None:
         trial=fully_applied.trial,
         result=fully_applied.result,
         attribution=fully_applied.attribution,
+        terminal_evidence_available=fully_applied.terminal_evidence_available,
+        expected_receipt_count=fully_applied.expected_receipt_count,
+        expected_exposure_count=fully_applied.expected_exposure_count,
     )
 
     comparison = MemoryInterventionComparability.create(
@@ -748,6 +796,9 @@ def test_memory_comparability_keeps_matched_no_items_distinct() -> None:
         trial=applied.trial,
         result=applied.result,
         attribution=applied.attribution,
+        terminal_evidence_available=applied.terminal_evidence_available,
+        expected_receipt_count=applied.expected_receipt_count,
+        expected_exposure_count=applied.expected_exposure_count,
     )
 
     comparison = MemoryInterventionComparability.create(
@@ -937,6 +988,9 @@ def test_trial_binding_rejects_foreign_trial_lineage(
             trial=trial,
             result=result,
             attribution=valid.attribution,
+            terminal_evidence_available=valid.terminal_evidence_available,
+            expected_receipt_count=valid.expected_receipt_count,
+            expected_exposure_count=valid.expected_exposure_count,
         )
 
 
@@ -967,6 +1021,9 @@ def test_comparability_rejects_uncertain_application_evidence(
         trial=applied.trial,
         result=applied.result,
         attribution=applied.attribution,
+        terminal_evidence_available=applied.terminal_evidence_available,
+        expected_receipt_count=applied.expected_receipt_count,
+        expected_exposure_count=applied.expected_exposure_count,
     )
 
     with pytest.raises(ValueError, match="determinate intervention effects"):

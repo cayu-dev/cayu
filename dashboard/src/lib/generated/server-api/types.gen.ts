@@ -2254,7 +2254,7 @@ export type AssertionCostEvidenceV1 = {
 /**
  * AssertionEvidenceView
  *
- * The bounded, alias-free data consumed by every portable assertion.
+ * The bounded, content-minimized data consumed by every portable assertion.
  */
 export type AssertionEvidenceView = {
     /**
@@ -2277,6 +2277,7 @@ export type AssertionEvidenceView = {
      * Final Output State
      */
     final_output_state: 'complete' | 'unavailable' | 'limit_exceeded';
+    memory_attribution: EvalMemoryAttributionEvidenceV1;
     /**
      * Model Step Evidence State
      */
@@ -2312,7 +2313,7 @@ export type AssertionEvidenceView = {
     /**
      * Schema Version
      */
-    schema_version?: 1;
+    schema_version?: 2;
     /**
      * Started Tool Names
      */
@@ -2807,6 +2808,7 @@ export type CapturedRunScoreV1 = {
      * Evidence Revision
      */
     evidence_revision: string;
+    memory_attribution: EvalMemoryAttributionEvidenceV1;
     /**
      * Pricing Profile Fingerprint
      */
@@ -3121,6 +3123,16 @@ export type CompactSessionBody = {
 };
 
 /**
+ * ContextExposureEvidenceKind
+ */
+export type ContextExposureEvidenceKind = 'composition_planned' | 'request_prepared' | 'dispatch_intent_committed' | 'provider_acknowledgement' | 'recovery_acknowledgement' | 'provider_completion' | 'recovery_completion' | 'conclusive_failure' | 'conclusive_cancellation' | 'ambiguous_transport' | 'recovery_indeterminate';
+
+/**
+ * ContextExposureState
+ */
+export type ContextExposureState = 'planned' | 'prepared' | 'dispatch_started' | 'acknowledged' | 'completed' | 'failed' | 'cancelled' | 'indeterminate';
+
+/**
  * ContextualPricingRequirement
  *
  * Commercial constraints every contextual price for one provider must declare.
@@ -3270,6 +3282,10 @@ export type CorpusComparisonResultSummary = {
      */
     application_release_id: string;
     /**
+     * Memory Attribution Support
+     */
+    memory_attribution_support?: 'unsupported';
+    /**
      * Result Revision
      */
     result_revision: string;
@@ -3354,7 +3370,7 @@ export type CorpusExecutionResult = {
     /**
      * Schema Version
      */
-    schema_version?: 1;
+    schema_version?: 2;
     target: EvaluationTargetIdentity;
 };
 
@@ -4067,6 +4083,180 @@ export type EvalCorpusDocument = {
      * Target Key
      */
     target_key: string;
+};
+
+/**
+ * EvalMemoryAttributionCapturePolicyV1
+ *
+ * One fixed eval-owned projection contract.
+ */
+export type EvalMemoryAttributionCapturePolicyV1 = {
+    /**
+     * Max Document Bytes
+     */
+    max_document_bytes?: 1048576;
+    /**
+     * Max Exposures
+     */
+    max_exposures?: 100;
+    /**
+     * Max Items
+     */
+    max_items?: 1000;
+    /**
+     * Max Projection Bytes
+     */
+    max_projection_bytes?: 524288;
+    /**
+     * Max Receipts
+     */
+    max_receipts?: 100;
+    /**
+     * Max Source Bytes
+     */
+    max_source_bytes?: 4194304;
+    /**
+     * Max Sources
+     */
+    max_sources?: 100;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Runtime Projection
+     */
+    runtime_projection?: 'cayu.memory_attribution.v1';
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+};
+
+/**
+ * EvalMemoryAttributionEvidenceV1
+ *
+ * Complete portable memory evidence for one eval trial's session tree.
+ */
+export type EvalMemoryAttributionEvidenceV1 = {
+    completeness: EvalMemoryEvidenceCompleteness;
+    effective_bounds: MemoryAttributionBounds;
+    /**
+     * Effective Max Bytes
+     */
+    effective_max_bytes: number;
+    /**
+     * Effective Source Limit
+     */
+    effective_source_limit: number;
+    /**
+     * Has Indeterminate Exposure
+     */
+    has_indeterminate_exposure: boolean;
+    /**
+     * Limitations
+     */
+    limitations?: Array<EvalMemoryEvidenceLimitation>;
+    /**
+     * Omitted Source Count At Least
+     */
+    omitted_source_count_at_least: number;
+    policy: EvalMemoryAttributionCapturePolicyV1;
+    /**
+     * Proves Empty
+     */
+    proves_empty: boolean;
+    /**
+     * Retained Source Count
+     */
+    retained_source_count: number;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Sources
+     */
+    sources?: Array<EvalMemoryAttributionSourceV1>;
+    /**
+     * Total Source Count
+     */
+    total_source_count: number;
+};
+
+/**
+ * EvalMemoryAttributionSourceV1
+ */
+export type EvalMemoryAttributionSourceV1 = {
+    attribution?: MemoryAttribution | null;
+    /**
+     * Attribution Fingerprint
+     */
+    attribution_fingerprint?: string | null;
+    /**
+     * Expected Exposure Count
+     */
+    expected_exposure_count?: number | null;
+    /**
+     * Expected Receipt Count
+     */
+    expected_receipt_count?: number | null;
+    /**
+     * Limitations
+     */
+    limitations?: Array<EvalMemoryEvidenceLimitation>;
+    source: EvalMemorySourceReferenceV1;
+    /**
+     * Terminal Status
+     */
+    terminal_status: 'completed' | 'failed' | 'interrupted';
+};
+
+/**
+ * EvalMemoryEvidenceCompleteness
+ */
+export type EvalMemoryEvidenceCompleteness = 'complete' | 'truncated' | 'unavailable';
+
+/**
+ * EvalMemoryEvidenceLimitation
+ */
+export type EvalMemoryEvidenceLimitation = 'source_limit' | 'source_bytes_limit' | 'projection_bytes_limit' | 'runtime_attribution_truncated' | 'store_unsupported' | 'evidence_read_failed' | 'alias_key_unavailable' | 'missing' | 'deleted' | 'legacy' | 'contradictory_lineage' | 'source_tree_incomplete' | 'closure_changed' | 'deadline_expired';
+
+/**
+ * EvalMemorySourceAliasV1
+ */
+export type EvalMemorySourceAliasV1 = {
+    /**
+     * Algorithm
+     */
+    algorithm?: 'hmac-sha256';
+    /**
+     * Digest
+     */
+    digest: string;
+    /**
+     * Key Id
+     */
+    key_id: string;
+};
+
+/**
+ * EvalMemorySourceReferenceV1
+ */
+export type EvalMemorySourceReferenceV1 = {
+    /**
+     * Role
+     */
+    role: 'root' | 'descendant';
+    session_alias?: EvalMemorySourceAliasV1 | null;
+    /**
+     * Tree Path
+     */
+    tree_path: Array<number>;
 };
 
 /**
@@ -5943,6 +6133,314 @@ export type MaxTotalTokensAssertionSpec = {
 };
 
 /**
+ * MemoryAttribution
+ *
+ * Versioned bounded projection of one session's durable memory-use truth.
+ */
+export type MemoryAttribution = {
+    /**
+     * Exposures
+     */
+    exposures?: Array<MemoryContextExposureAttribution>;
+    /**
+     * Observed Exposure Count
+     */
+    observed_exposure_count: number;
+    /**
+     * Observed Item Count
+     */
+    observed_item_count: number;
+    /**
+     * Observed Receipt Count
+     */
+    observed_receipt_count: number;
+    /**
+     * Omitted Exposure Count At Least
+     */
+    omitted_exposure_count_at_least: number;
+    /**
+     * Omitted Item Count At Least
+     */
+    omitted_item_count_at_least: number;
+    /**
+     * Omitted Receipt Count At Least
+     */
+    omitted_receipt_count_at_least: number;
+    reason?: MemoryAttributionUnavailableReason | null;
+    /**
+     * Receipts
+     */
+    receipts?: Array<MemoryRecallAttribution>;
+    /**
+     * Schema Version
+     */
+    schema_version?: 'cayu.memory_attribution.v1';
+    status: MemoryAttributionStatus;
+    /**
+     * Truncated
+     */
+    truncated: boolean;
+};
+
+/**
+ * MemoryAttributionBounds
+ *
+ * Global bounds shared by every session in one evidence capture.
+ */
+export type MemoryAttributionBounds = {
+    /**
+     * Max Exposures
+     */
+    max_exposures?: number;
+    /**
+     * Max Items
+     */
+    max_items?: number;
+    /**
+     * Max Projection Bytes
+     */
+    max_projection_bytes?: number;
+    /**
+     * Max Receipts
+     */
+    max_receipts?: number;
+    /**
+     * Max Source Bytes
+     */
+    max_source_bytes?: number;
+};
+
+/**
+ * MemoryAttributionStatus
+ *
+ * Trust state of one session's projected memory evidence.
+ */
+export type MemoryAttributionStatus = 'complete' | 'truncated' | 'unavailable' | 'redacted' | 'contradictory';
+
+/**
+ * MemoryAttributionUnavailableReason
+ *
+ * Stable reason memory attribution could not be represented.
+ */
+export type MemoryAttributionUnavailableReason = 'store_unsupported' | 'evidence_read_failed' | 'alias_key_unavailable' | 'contradictory_evidence';
+
+/**
+ * MemoryContextExposureAttribution
+ *
+ * Secret-free structural and lifecycle facts from one context exposure.
+ */
+export type MemoryContextExposureAttribution = {
+    /**
+     * Contributor Count
+     */
+    contributor_count: number;
+    /**
+     * Created At
+     */
+    created_at: string;
+    exposure_alias: MemoryEvidenceAlias;
+    interaction_alias: MemoryEvidenceAlias;
+    /**
+     * Items
+     */
+    items?: Array<MemoryExposureItemAttribution>;
+    /**
+     * Items Truncated
+     */
+    items_truncated?: boolean;
+    /**
+     * Model Attempt Id
+     */
+    model_attempt_id: string;
+    /**
+     * Model Step Id
+     */
+    model_step_id: string;
+    /**
+     * Omitted Item Count At Least
+     */
+    omitted_item_count_at_least: number;
+    /**
+     * Projection Ordinal
+     */
+    projection_ordinal: number;
+    /**
+     * Provider Attempt Id
+     */
+    provider_attempt_id: string;
+    /**
+     * Provider Exposure Proven
+     */
+    provider_exposure_proven: boolean;
+    /**
+     * Receipt Aliases
+     */
+    receipt_aliases?: Array<MemoryEvidenceAlias>;
+    state: ContextExposureState;
+    /**
+     * State Revision
+     */
+    state_revision: number;
+    /**
+     * Transitions
+     */
+    transitions?: Array<MemoryExposureTransitionAttribution>;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+};
+
+/**
+ * MemoryEvidenceAlias
+ *
+ * A domain- and session-scoped HMAC alias for a private durable identity.
+ */
+export type MemoryEvidenceAlias = {
+    /**
+     * Algorithm
+     */
+    algorithm?: 'hmac-sha256';
+    /**
+     * Digest
+     */
+    digest: string;
+    /**
+     * Key Id
+     */
+    key_id: string;
+    /**
+     * Kind
+     */
+    kind: 'receipt' | 'exposure' | 'item' | 'interaction';
+};
+
+/**
+ * MemoryExposureItemAttribution
+ */
+export type MemoryExposureItemAttribution = {
+    admission: RecallItemAdmission;
+    item_alias: MemoryEvidenceAlias;
+    /**
+     * Ordinal
+     */
+    ordinal: number;
+    receipt_alias: MemoryEvidenceAlias;
+    /**
+     * Receipt Item Ordinal
+     */
+    receipt_item_ordinal: number;
+    selection_reason: RecallItemSelectionReason;
+};
+
+/**
+ * MemoryExposureTransitionAttribution
+ */
+export type MemoryExposureTransitionAttribution = {
+    evidence_kind: ContextExposureEvidenceKind;
+    /**
+     * Occurred At
+     */
+    occurred_at: string;
+    /**
+     * Revision
+     */
+    revision: number;
+    state: ContextExposureState;
+};
+
+/**
+ * MemoryRecallAttribution
+ *
+ * Secret-free structural facts from one recall receipt.
+ */
+export type MemoryRecallAttribution = {
+    /**
+     * Admitted Count
+     */
+    admitted_count: number;
+    /**
+     * Complete Source Count
+     */
+    complete_source_count: number;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Eligible Count
+     */
+    eligible_count: number;
+    /**
+     * Failed Source Count
+     */
+    failed_source_count: number;
+    /**
+     * Inspected Count
+     */
+    inspected_count: number;
+    interaction_alias: MemoryEvidenceAlias;
+    /**
+     * Items
+     */
+    items?: Array<MemoryRecallItemAttribution>;
+    /**
+     * Items Truncated
+     */
+    items_truncated?: boolean;
+    /**
+     * Model Step Id
+     */
+    model_step_id: string;
+    /**
+     * Offered Count
+     */
+    offered_count: number;
+    /**
+     * Omitted Count
+     */
+    omitted_count: number;
+    /**
+     * Omitted Item Count At Least
+     */
+    omitted_item_count_at_least: number;
+    /**
+     * Partial Source Count
+     */
+    partial_source_count: number;
+    /**
+     * Projection Ordinal
+     */
+    projection_ordinal: number;
+    receipt_alias: MemoryEvidenceAlias;
+    /**
+     * Silent Count
+     */
+    silent_count: number;
+    /**
+     * Truncated
+     */
+    truncated: boolean;
+    /**
+     * Unavailable Source Count
+     */
+    unavailable_source_count: number;
+};
+
+/**
+ * MemoryRecallItemAttribution
+ */
+export type MemoryRecallItemAttribution = {
+    admission: RecallItemAdmission;
+    item_alias: MemoryEvidenceAlias;
+    /**
+     * Ordinal
+     */
+    ordinal: number;
+    selection_reason: RecallItemSelectionReason;
+};
+
+/**
  * Message
  *
  * Frozen transcript message.
@@ -6807,7 +7305,7 @@ export type PublishedEvalRun = {
     /**
      * Schema Version
      */
-    schema_version: 2;
+    schema_version: 3;
     /**
      * Score
      */
@@ -6847,6 +7345,7 @@ export type PublishedEvalTrialResult = {
      * Evidence Complete
      */
     evidence_complete: boolean;
+    memory_attribution: EvalMemoryAttributionEvidenceV1;
     /**
      * Message
      */
@@ -7120,6 +7619,16 @@ export type PublishedUsageSummaryV1 = {
      */
     total_tokens: string;
 };
+
+/**
+ * RecallItemAdmission
+ */
+export type RecallItemAdmission = 'admitted' | 'offered';
+
+/**
+ * RecallItemSelectionReason
+ */
+export type RecallItemSelectionReason = 'calibrated_strong_match' | 'calibrated_plausible_match' | 'duplicate_strong_reference' | 'strong_match_not_focused' | 'strong_match_offered_by_mode' | 'explicit_application_selection';
 
 /**
  * RegistrationProvenance

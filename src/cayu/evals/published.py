@@ -15,7 +15,11 @@ from pydantic import (
     model_validator,
 )
 
-from cayu._validation import MAX_DURABLE_JSON_INTEGER, json_utf8_size_within_limit
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    compact_json_utf8_size,
+    json_utf8_size_within_limit,
+)
 from cayu.evals.corpus import (
     _CURRENCY_PATTERN,
     _MODEL_JUDGE_RESOLVED_IMPLEMENTATION_REVISION_METADATA_KEY,
@@ -58,6 +62,10 @@ from cayu.evals.corpus import (
     eval_run_contract_for_corpus,
 )
 from cayu.evals.evidence import _canonical_decimal
+from cayu.evals.memory_attribution import (
+    EVAL_MEMORY_ATTRIBUTION_RESULT_BUDGET_BYTES,
+    EvalMemoryAttributionEvidenceV1,
+)
 from cayu.evals.models import (
     EvalAssertionResult,
     EvalRun,
@@ -71,7 +79,7 @@ from cayu.evals.result_contract import (
 )
 from cayu.runtime.usage import AggregateCount, aggregate_usage_metrics_from_durable_payload
 
-PUBLISHED_EVAL_SCHEMA_VERSION = 2
+PUBLISHED_EVAL_SCHEMA_VERSION = 3
 PUBLISHED_EVAL_MAX_BYTES = 32 << 20
 PUBLISHED_EVAL_MAX_DURATION_MS = 2**63 - 1
 
@@ -445,6 +453,7 @@ class PublishedEvalTrialResult(_PortableModel):
     duration_ms: StrictInt = Field(ge=0, le=PUBLISHED_EVAL_MAX_DURATION_MS)
     usage: PublishedUsageSummaryV1 | None = None
     output: EvalTrialOutputPreviewV1
+    memory_attribution: EvalMemoryAttributionEvidenceV1
     code: EvalTrialDiagnosticCode
     message: StrictStr
 
@@ -460,6 +469,17 @@ class PublishedEvalTrialResult(_PortableModel):
             return EvalTrialOutputPreviewV1.model_validate(value.model_dump(mode="python"))
         if isinstance(value, BaseModel):
             raise TypeError("output must be an exact EvalTrialOutputPreviewV1 or JSON object.")
+        return value
+
+    @field_validator("memory_attribution", mode="before")
+    @classmethod
+    def copy_memory_attribution(cls, value: object) -> object:
+        if type(value) is EvalMemoryAttributionEvidenceV1:
+            return EvalMemoryAttributionEvidenceV1.model_validate(value.model_dump(mode="python"))
+        if isinstance(value, BaseModel):
+            raise TypeError(
+                "memory_attribution must be exact eval memory evidence or a JSON object."
+            )
         return value
 
     @model_validator(mode="after")
@@ -536,7 +556,7 @@ class PublishedEvalCaseResult(_PortableModel):
 
 
 class PublishedEvalRun(_PortableModel):
-    schema_version: Literal[2]
+    schema_version: Literal[3]
     revision: StrictStr
     corpus_revision: StrictStr
     target_key: StrictStr
@@ -724,6 +744,16 @@ class PublishedEvalRun(_PortableModel):
             raise ValueError(
                 "Published eval run exceeds its aggregate output-preview limit of "
                 f"{PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES} UTF-8 bytes."
+            )
+        memory_attribution_bytes = sum(
+            compact_json_utf8_size(trial.memory_attribution.model_dump(mode="json"))
+            for case in self.cases
+            for trial in case.trials
+        )
+        if memory_attribution_bytes > EVAL_MEMORY_ATTRIBUTION_RESULT_BUDGET_BYTES:
+            raise ValueError(
+                "Published eval run exceeds its aggregate memory-attribution limit of "
+                f"{EVAL_MEMORY_ATTRIBUTION_RESULT_BUDGET_BYTES} UTF-8 bytes."
             )
         has_cost_assertion = any(
             assertion.detail.kind == "max_estimated_cost"
@@ -1350,6 +1380,7 @@ def _published_case(
                 duration_ms=trial.duration_ms,
                 usage=_published_usage(trial.usage_summary),
                 output=public_data.output,
+                memory_attribution=trial.memory_attribution,
                 code=public_data.diagnostic_code,
                 message=_TRIAL_MESSAGE[public_data.diagnostic_code],
             )

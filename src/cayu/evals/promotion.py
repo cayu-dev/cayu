@@ -47,6 +47,7 @@ from cayu.evals.corpus import (
     pricing_profile_identity,
 )
 from cayu.evals.evidence import AssertionEvidenceView, project_assertion_evidence_view
+from cayu.evals.memory_attribution import EvalMemoryAttributionEvidenceV1
 from cayu.evals.models import (
     Trajectory,
     _model_instance_python_input,
@@ -593,6 +594,7 @@ class CapturedRunScoreV1(_SchemaV1PortableModel):
     evidence_revision: StrictStr
     evidence_policy_revision: StrictStr
     pricing_profile_fingerprint: StrictStr | None = None
+    memory_attribution: EvalMemoryAttributionEvidenceV1
     status: PublishedStatus
     score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
     assertions: tuple[PublishedAssertionResult, ...] = Field(
@@ -708,6 +710,7 @@ class CapturedRunScoreV1(_SchemaV1PortableModel):
             "evidence_revision": validated_evidence.revision,
             "evidence_policy_revision": validated_evidence.policy_revision,
             "pricing_profile_fingerprint": validated_evidence.pricing_profile_fingerprint,
+            "memory_attribution": validated_evidence.memory_attribution.model_dump(mode="json"),
             "status": status,
             "score": score,
             "assertions": [assertion.model_dump(mode="json") for assertion in validated_assertions],
@@ -721,6 +724,7 @@ class CapturedRunScoreV1(_SchemaV1PortableModel):
             evidence_revision=validated_evidence.revision,
             evidence_policy_revision=validated_evidence.policy_revision,
             pricing_profile_fingerprint=validated_evidence.pricing_profile_fingerprint,
+            memory_attribution=validated_evidence.memory_attribution,
             status=status,
             score=score,
             assertions=validated_assertions,

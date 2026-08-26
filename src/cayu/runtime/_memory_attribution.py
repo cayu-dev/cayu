@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -106,6 +107,7 @@ async def project_memory_attribution(
     *,
     key: MemoryEvidenceKey | None,
     budget: MemoryAttributionCaptureBudget,
+    before_store_read: Callable[[], None] | None = None,
 ) -> MemoryAttribution:
     """Project one session without running or mutating application behavior."""
 
@@ -117,6 +119,8 @@ async def project_memory_attribution(
         raise TypeError("key must be a MemoryEvidenceKey or None.")
     if type(budget) is not MemoryAttributionCaptureBudget:
         raise TypeError("budget must be a MemoryAttributionCaptureBudget.")
+    if before_store_read is not None and not callable(before_store_read):
+        raise TypeError("before_store_read must be callable or None.")
     if not store.supports_recall_evidence:
         return _empty_attribution(
             status=MemoryAttributionStatus.UNAVAILABLE,
@@ -124,7 +128,12 @@ async def project_memory_attribution(
         )
 
     try:
-        source = await _capture_source(store, session_id, budget)
+        source = await _capture_source(
+            store,
+            session_id,
+            budget,
+            before_store_read=before_store_read,
+        )
     except Exception:
         return _empty_attribution(
             status=MemoryAttributionStatus.UNAVAILABLE,
@@ -237,6 +246,8 @@ async def project_memory_attribution(
             items_complete = False
         else:
             try:
+                if before_store_read is not None:
+                    before_store_read()
                 item_exposures = await store.load_recall_item_exposures(
                     session_id,
                     exposure.exposure_id,
@@ -348,16 +359,20 @@ async def _capture_source(
     store: SessionStore,
     session_id: str,
     budget: MemoryAttributionCaptureBudget,
+    *,
+    before_store_read: Callable[[], None] | None,
 ) -> _SourceCapture:
     receipts, receipts_complete, receipt_more = await _capture_receipts(
         store,
         session_id,
         budget,
+        before_store_read=before_store_read,
     )
     exposures, exposures_complete, exposure_more = await _capture_exposures(
         store,
         session_id,
         budget,
+        before_store_read=before_store_read,
     )
     return _SourceCapture(
         receipts=receipts,
@@ -373,6 +388,8 @@ async def _capture_receipts(
     store: SessionStore,
     session_id: str,
     budget: MemoryAttributionCaptureBudget,
+    *,
+    before_store_read: Callable[[], None] | None,
 ) -> tuple[tuple[RecallReceipt, ...], bool, int]:
     retained: list[RecallReceipt] = []
     cursor: str | None = None
@@ -387,6 +404,8 @@ async def _capture_receipts(
             max_bytes=min(MAX_MEMORY_EVIDENCE_PAGE_BYTES, budget.remaining_source_bytes),
             cursor=cursor,
         )
+        if before_store_read is not None:
+            before_store_read()
         page = await store.list_recall_receipts(query)
         if type(page) is not RecallReceiptPage:
             raise TypeError("Recall receipt page has an invalid store shape.")
@@ -413,6 +432,8 @@ async def _capture_exposures(
     store: SessionStore,
     session_id: str,
     budget: MemoryAttributionCaptureBudget,
+    *,
+    before_store_read: Callable[[], None] | None,
 ) -> tuple[tuple[ContextExposure, ...], bool, int]:
     retained: list[ContextExposure] = []
     cursor: str | None = None
@@ -427,6 +448,8 @@ async def _capture_exposures(
             max_bytes=min(MAX_MEMORY_EVIDENCE_PAGE_BYTES, budget.remaining_source_bytes),
             cursor=cursor,
         )
+        if before_store_read is not None:
+            before_store_read()
         page = await store.list_context_exposures(query)
         if type(page) is not ContextExposurePage:
             raise TypeError("Context exposure page has an invalid store shape.")

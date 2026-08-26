@@ -17,6 +17,7 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_durable_text,
 )
+from cayu.evals.memory_attribution import eval_memory_attribution_summary
 from cayu.evals.models import (
     EVAL_SCHEMA_VERSION,
     TRAJECTORY_SCHEMA_VERSION,
@@ -86,6 +87,7 @@ class EvalRunComparison(BaseModel):
     current_status: EvalStatus
     baseline_score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
     current_score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
+    memory_attribution_support: Literal["unsupported"] = "unsupported"
     regressions: tuple[str, ...] = Field(default_factory=tuple)
     cases: tuple[EvalCaseComparison, ...] = Field(default_factory=tuple)
 
@@ -479,6 +481,7 @@ def render_comparison_html(comparison: EvalRunComparison) -> str:
     <h1>Cayu Eval Comparison</h1>
     <p>Baseline <code>{_escape(comparison.baseline_run_id)}</code> vs current <code>{_escape(comparison.current_run_id)}</code></p>
     <p>Score: {_format_score(comparison.baseline_score)} -&gt; {_format_score(comparison.current_score)}</p>
+    <p>Memory-attribution comparison: <code>{_escape(comparison.memory_attribution_support)}</code> in this compact report.</p>
     <h2>Regressions</h2>
     <div class="regressions">{_escape("; ".join(comparison.regressions) or "No regressions detected.")}</div>
     <h2>Cases</h2>
@@ -562,13 +565,21 @@ def _trial_section(trial: Any) -> str:
         if trial.usage_summary is not None
         else ""
     )
+    memory = trial.memory_attribution
+    memory_summary = eval_memory_attribution_summary(memory)
     return (
         '<div class="case">'
         f"<h4>Trial {trial.trial_number} · {_status_badge(trial.status)}</h4>"
         f"<p>Session <code>{_escape(trial.session_id or 'not created')}</code> · "
         f"score {_format_score(trial.score)} · {trial.duration_ms} ms · "
         f"evidence {'complete' if trial.evidence_complete else 'incomplete'}</p>"
-        f"{diagnostic_html}{final_output}{usage}<h5>Assertions</h5>{assertions}</div>"
+        f"{diagnostic_html}{final_output}{usage}"
+        f"<p>Memory attribution: {_escape(memory_summary)} · revision "
+        f"<code>{_escape(memory.revision)}</code></p>"
+        "<p>Full memory-attribution record inspection is unsupported in HTML; "
+        "use the JSON result for aliases, fingerprints, source references, and complete "
+        "lifecycle transitions.</p>"
+        f"<h5>Assertions</h5>{assertions}</div>"
     )
 
 

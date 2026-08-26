@@ -6867,6 +6867,81 @@ class TerminalSessionEvidence(BaseModel):
         )
 
 
+def copy_terminal_session_evidence(
+    evidence: TerminalSessionEvidence,
+) -> TerminalSessionEvidence:
+    """Detach and fully revalidate one typed terminal-evidence snapshot.
+
+    Event authority is in-process provenance carried outside the serialized
+    model fields. Rebuilding the snapshot through ``model_dump`` would erase
+    that authority and make an authentic store result indistinguishable from a
+    caller-reconstructed document. Reconstruct each durable model explicitly
+    instead: ``EventRecord`` delegates to ``copy_event``, which validates the
+    public event fields while retaining authority already present on the exact
+    typed event. Serialized evidence cannot manufacture that provenance.
+    """
+
+    if type(evidence) is not TerminalSessionEvidence:
+        raise TypeError("Terminal evidence copy requires TerminalSessionEvidence.")
+    if type(evidence.session) is not Session:
+        raise TypeError("Terminal evidence session must be a Session.")
+
+    events: list[EventRecord] = []
+    for record in evidence.events:
+        if type(record) is not EventRecord or type(record.event) is not Event:
+            raise TypeError("Terminal evidence events must be EventRecord values.")
+        events.append(EventRecord(sequence=record.sequence, event=record.event))
+
+    transcript: list[TranscriptRecord] = []
+    for record in evidence.transcript:
+        if type(record) is not TranscriptRecord or type(record.message) is not Message:
+            raise TypeError("Terminal evidence transcript must contain TranscriptRecord values.")
+        transcript.append(
+            TranscriptRecord(
+                index=record.index,
+                interaction_id=record.interaction_id,
+                message=record.message,
+            )
+        )
+
+    marker = evidence.terminal_publication_marker
+    if marker is not None:
+        if type(marker) is not TerminalPublicationMarker:
+            raise TypeError(
+                "Terminal evidence publication marker must be a TerminalPublicationMarker."
+            )
+        marker = TerminalPublicationMarker(
+            operation_id=marker.operation_id,
+            run_epoch=marker.run_epoch,
+        )
+
+    boundary = evidence.boundary
+    if type(boundary) is not TerminalSessionEvidenceBoundary:
+        raise TypeError("Terminal evidence boundary must be a TerminalSessionEvidenceBoundary.")
+    copied_boundary = TerminalSessionEvidenceBoundary(
+        first_event_sequence=boundary.first_event_sequence,
+        terminal_event_sequence=boundary.terminal_event_sequence,
+        transcript_end_index_exclusive=boundary.transcript_end_index_exclusive,
+        run_epoch=boundary.run_epoch,
+        event_count=boundary.event_count,
+        transcript_count=boundary.transcript_count,
+        session_bytes=boundary.session_bytes,
+        event_bytes=boundary.event_bytes,
+        transcript_bytes=boundary.transcript_bytes,
+        terminal_publication_marker_bytes=boundary.terminal_publication_marker_bytes,
+        largest_record_bytes=boundary.largest_record_bytes,
+        total_bytes=boundary.total_bytes,
+        lifecycle_event_sequences=boundary.lifecycle_event_sequences,
+    )
+    return TerminalSessionEvidence(
+        session=evidence.session,
+        events=tuple(events),
+        transcript=tuple(transcript),
+        terminal_publication_marker=marker,
+        boundary=copied_boundary,
+    )
+
+
 class DeferredInteractionInput(BaseModel):
     """Source messages durably admitted but not yet visible in the transcript."""
 

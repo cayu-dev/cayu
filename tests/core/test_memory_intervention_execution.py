@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import multiprocessing
 import sqlite3
 from dataclasses import replace
@@ -47,6 +48,11 @@ from cayu.core.agents import AgentSpec
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.core.messages import Message
 from cayu.environments import Environment, EnvironmentSpec
+from cayu.evals.memory_attribution import (
+    EvalMemoryEvidenceCompleteness,
+    EvalMemoryEvidenceLimitation,
+    standard_eval_memory_attribution_bounds,
+)
 from cayu.evals.models import (
     EvalAssertionResult,
     EvalCaseContractV1,
@@ -58,6 +64,7 @@ from cayu.evals.testing import ScriptedModelProvider
 from cayu.memory import AutomaticRecallMode, AutomaticRecallPolicy
 from cayu.memory_attribution import (
     MemoryAttribution,
+    MemoryAttributionBounds,
     MemoryAttributionStatus,
     MemoryContextExposureAttribution,
     MemoryEvidenceAlias,
@@ -68,6 +75,7 @@ from cayu.memory_attribution import (
 from cayu.memory_evidence import (
     ContextExposureEvidenceKind,
     ContextExposureState,
+    RecallEvidenceQuery,
     RecallItemAdmission,
     RecallItemSelectionReason,
 )
@@ -127,7 +135,11 @@ from cayu.runtime.request_footprints import RequestFootprintConfig
 from cayu.runtime.sessions import (
     InterruptSessionRequest,
     RunRequest,
+    SessionStatus,
     SessionStore,
+    TerminalSessionEvidence,
+    TerminalSessionEvidenceError,
+    TerminalSessionEvidenceErrorCode,
     run_request_with_runtime_invocation,
 )
 from cayu.runtime.usage import SessionUsageSummary
@@ -1102,6 +1114,96 @@ class _BlockOnceTerminalEvidenceSQLiteSessionStore(SQLiteSessionStore):
         return await super().load_terminal_session_evidence(session_id, limits=limits)
 
 
+class _SubstitutingTerminalEvidenceSQLiteSessionStore(SQLiteSessionStore):
+    def __init__(self, path) -> None:
+        super().__init__(path)
+        self.foreign_evidence: TerminalSessionEvidence | None = None
+        self.forge_empty_events = False
+
+    async def load_terminal_session_evidence(self, session_id: str, *, limits=None):
+        evidence = await super().load_terminal_session_evidence(session_id, limits=limits)
+        if self.foreign_evidence is not None:
+            return self.foreign_evidence
+        if self.forge_empty_events:
+            return evidence.model_copy(update={"events": ()})
+        return evidence
+
+
+class _AdvancedTerminalSessionSQLiteSessionStore(SQLiteSessionStore):
+    async def load(self, session_id: str):
+        session = await super().load(session_id)
+        if session is None or session.status not in {
+            SessionStatus.COMPLETED,
+            SessionStatus.FAILED,
+            SessionStatus.INTERRUPTED,
+        }:
+            return session
+        return session.model_copy(update={"run_epoch": session.run_epoch + 1})
+
+
+class _CoherentlyAdvancedTerminalEvidenceSQLiteSessionStore(SQLiteSessionStore):
+    def __init__(self, path) -> None:
+        super().__init__(path)
+        self.terminal_session_loads = 0
+
+    async def load(self, session_id: str):
+        session = await super().load(session_id)
+        if session is None or session.status not in {
+            SessionStatus.COMPLETED,
+            SessionStatus.FAILED,
+            SessionStatus.INTERRUPTED,
+        }:
+            return session
+        self.terminal_session_loads += 1
+        if self.terminal_session_loads == 1:
+            return session
+        return session.model_copy(update={"run_epoch": session.run_epoch + 1})
+
+    async def load_terminal_session_evidence(self, session_id: str, *, limits=None):
+        evidence = await super().load_terminal_session_evidence(session_id, limits=limits)
+        return evidence.model_copy(
+            update={
+                "session": evidence.session.model_copy(
+                    update={"run_epoch": evidence.session.run_epoch + 1}
+                ),
+                "boundary": evidence.boundary.model_copy(
+                    update={"run_epoch": evidence.boundary.run_epoch + 1}
+                ),
+            }
+        )
+
+
+class _UnavailableTerminalEvidenceSQLiteSessionStore(SQLiteSessionStore):
+    def __init__(self, path, *, failure: str) -> None:
+        super().__init__(path)
+        self.failure = failure
+
+    async def load_terminal_session_evidence(self, session_id: str, *, limits=None):
+        await super().load_terminal_session_evidence(session_id, limits=limits)
+        if self.failure == "unsupported":
+            raise NotImplementedError("terminal evidence is unsupported")
+        if self.failure == "typed":
+            raise TerminalSessionEvidenceError(
+                TerminalSessionEvidenceErrorCode.TOTAL_BYTES_EXCEEDED
+            )
+        raise OSError("terminal evidence read failed")
+
+
+class _RecordingAttributionBoundsSQLiteSessionStore(SQLiteSessionStore):
+    def __init__(self, path) -> None:
+        super().__init__(path)
+        self.recall_queries: list[RecallEvidenceQuery] = []
+        self.exposure_queries: list[RecallEvidenceQuery] = []
+
+    async def list_recall_receipts(self, query: RecallEvidenceQuery):
+        self.recall_queries.append(RecallEvidenceQuery.model_validate(query.model_dump()))
+        return await super().list_recall_receipts(query)
+
+    async def list_context_exposures(self, query: RecallEvidenceQuery):
+        self.exposure_queries.append(RecallEvidenceQuery.model_validate(query.model_dump()))
+        return await super().list_context_exposures(query)
+
+
 class _RecallOverlayProvider(_OverlayProvider):
     _REPLACEMENT_TEXT = _REPLACEMENT_FIXTURE_TEXT
     _NEGATIVE_CONTROL_TEXT = _NEGATIVE_CONTROL_FIXTURE_TEXT
@@ -1274,6 +1376,7 @@ async def _canonical_execution_harness(
     suffix: str,
     timeout_seconds: int = 300,
     sessions: SessionStore | None = None,
+    attribution_bounds: MemoryAttributionBounds | None = None,
     factory_type: type[_CanonicalRuntimeApplicationFactory] = (_CanonicalRuntimeApplicationFactory),
 ) -> tuple[
     MemoryInterventionExecutor,
@@ -1310,7 +1413,10 @@ async def _canonical_execution_harness(
             {},
             entry_text="Atlas is released Friday.",
         ),
-        runtime_runner=CayuMemoryInterventionRuntimeRunner(factory),
+        runtime_runner=CayuMemoryInterventionRuntimeRunner(
+            factory,
+            attribution_bounds=attribution_bounds,
+        ),
         evaluator=_Evaluator({}),
         request_keys={
             "test-key": MemoryInterventionRequestFingerprintKey(
@@ -1344,6 +1450,13 @@ class _RuntimeRunner(MemoryInterventionRuntimeRunner):
         self.results = results
         self.terminal_disposition = terminal_disposition
         self.attribution = _empty_attribution()
+        self.terminal_evidence_available = True
+        self.terminal_evidence_limitation: EvalMemoryEvidenceLimitation | None = None
+        self.expected_receipt_count: int | None = None
+        self.expected_exposure_count: int | None = None
+        self.effective_attribution_bounds = standard_eval_memory_attribution_bounds()
+        self.source_alias = None
+        self.result_override: MemoryInterventionRuntimeResult | None = None
         self.raise_child_cancellation = False
         self.run_calls = 0
         self.recover_calls = 0
@@ -1361,6 +1474,8 @@ class _RuntimeRunner(MemoryInterventionRuntimeRunner):
         self.run_calls += 1
         if self.raise_child_cancellation:
             raise asyncio.CancelledError("runtime child cancelled itself")
+        if self.result_override is not None:
+            return self.result_override
         existing = self.results.get(operation.operation_id)
         if existing is not None:
             return existing
@@ -1368,6 +1483,24 @@ class _RuntimeRunner(MemoryInterventionRuntimeRunner):
             session_id=execution.session_id,
             terminal_disposition=self.terminal_disposition,
             runtime_evidence_fingerprint=_digest(f"runtime:{operation.operation_id}"),
+            terminal_evidence_available=self.terminal_evidence_available,
+            terminal_evidence_limitation=(
+                None
+                if self.terminal_evidence_available
+                else self.terminal_evidence_limitation or EvalMemoryEvidenceLimitation.MISSING
+            ),
+            expected_receipt_count=(
+                self.attribution.observed_receipt_count
+                if self.terminal_evidence_available and self.expected_receipt_count is None
+                else self.expected_receipt_count
+            ),
+            expected_exposure_count=(
+                self.attribution.observed_exposure_count
+                if self.terminal_evidence_available and self.expected_exposure_count is None
+                else self.expected_exposure_count
+            ),
+            effective_attribution_bounds=self.effective_attribution_bounds,
+            source_alias=self.source_alias,
             attribution=self.attribution,
             usage_fingerprint=_digest(f"usage:{operation.operation_id}"),
             cost_fingerprint=_digest(f"cost:{operation.operation_id}"),
@@ -2048,15 +2181,26 @@ async def test_timeout_authority_survives_terminal_evidence_failure_without_redi
         sessions=sessions,
     )
 
-    with pytest.raises(ConnectionError, match="terminal evidence read failed"):
-        await executor.execute_trial(request)
+    initial = await executor.execute_trial(request)
 
     interrupted = await executions.load(request.execution_id)
     assert interrupted is not None
-    assert interrupted.phase is MemoryInterventionExecutionPhase.SESSION_BOUND
-    assert interrupted.status is MemoryInterventionExecutionStatus.ACTIVE
+    assert interrupted.phase is MemoryInterventionExecutionPhase.FINALIZED
+    assert interrupted.status is MemoryInterventionExecutionStatus.TIMED_OUT
     assert interrupted.runtime_timeout_observed is True
-    assert interrupted.runtime_result_payload is None
+    assert interrupted.runtime_result_payload is not None
+    assert (
+        interrupted.runtime_result_payload["terminal_evidence_limitation"]
+        == EvalMemoryEvidenceLimitation.EVIDENCE_READ_FAILED.value
+    )
+    assert initial.eval_result is not None
+    assert initial.eval_result.memory_attribution.completeness is (
+        EvalMemoryEvidenceCompleteness.UNAVAILABLE
+    )
+    assert initial.eval_result.memory_attribution.limitations == ()
+    assert initial.eval_result.memory_attribution.sources[0].limitations == (
+        EvalMemoryEvidenceLimitation.EVIDENCE_READ_FAILED,
+    )
 
     restarted_provider = _BlockingRuntimeProvider()
     restarted_factory = _CanonicalRuntimeApplicationFactory(
@@ -2098,6 +2242,7 @@ async def test_timeout_authority_survives_terminal_evidence_failure_without_redi
     assert recovered.execution.phase is MemoryInterventionExecutionPhase.FINALIZED
     assert recovered.execution.status is MemoryInterventionExecutionStatus.TIMED_OUT
     assert recovered.execution.runtime_timeout_observed is True
+    assert recovered.eval_result == initial.eval_result
 
 
 @_async_test
@@ -2516,6 +2661,16 @@ async def test_concrete_runner_preserves_real_cancellation_and_recovers_without_
     assert (
         recovered.snapshot_result.terminal_disposition is AgentSnapshotTerminalDisposition.CANCELLED
     )
+    assert recovered.eval_result is not None
+    assert (
+        recovered.eval_result.memory_attribution.completeness
+        is EvalMemoryEvidenceCompleteness.UNAVAILABLE
+    )
+    assert recovered.eval_result.memory_attribution.proves_empty is False
+    assert recovered.binding is not None
+    assert recovered.binding.terminal_evidence_available is False
+    assert recovered.binding.attribution.status is MemoryAttributionStatus.UNAVAILABLE
+    assert recovered.binding.proves_no_memory_exposure is False
 
 
 @_async_test
@@ -2964,6 +3119,361 @@ async def test_indeterminate_exposure_survives_execution_persistence_and_replay(
     assert replay.binding.attribution.exposures[0].state is ContextExposureState.INDETERMINATE
     assert restarted_runner.run_calls == 0
     assert restarted_runner.recover_calls == 0
+
+
+@_async_test
+async def test_terminal_memory_census_survives_journal_recovery_and_fails_closed_on_deletion(
+    tmp_path,
+) -> None:
+    snapshot = _snapshot()
+    snapshot_path = tmp_path / "terminal-census-snapshots.db"
+    execution_path = tmp_path / "terminal-census-executions.db"
+    runtime_results: dict[str, MemoryInterventionRuntimeResult] = {}
+    eval_results: dict[str, EvalTrialResult] = {}
+    first, _, runner, _ = await _executor(
+        snapshot,
+        snapshot_store=SQLiteAgentSnapshotStore(snapshot_path),
+        execution_store=SQLiteMemoryInterventionExecutionStore(execution_path),
+        materializations={},
+        views={},
+        runtime_results=runtime_results,
+        eval_results=eval_results,
+    )
+    runner.expected_receipt_count = 1
+    runner.expected_exposure_count = 0
+    runner.effective_attribution_bounds = MemoryAttributionBounds(
+        max_receipts=1,
+        max_exposures=2,
+        max_items=3,
+        max_source_bytes=1_024,
+        max_projection_bytes=2_048,
+    )
+    request = _request(_spec(snapshot), trial_id="terminal-census-deletion")
+
+    outcome = await first.execute_trial(request)
+    persisted = await SQLiteMemoryInterventionExecutionStore(execution_path).load(
+        request.execution_id
+    )
+
+    assert outcome.eval_result is not None
+    evidence = outcome.eval_result.memory_attribution
+    assert evidence.effective_bounds == runner.effective_attribution_bounds
+    assert evidence.completeness is EvalMemoryEvidenceCompleteness.UNAVAILABLE
+    assert evidence.sources[0].limitations == (EvalMemoryEvidenceLimitation.DELETED,)
+    assert outcome.binding is not None
+    assert outcome.binding.terminal_evidence_available is True
+    assert outcome.binding.expected_receipt_count == 1
+    assert outcome.binding.proves_no_memory_exposure is False
+    assert persisted is not None
+    assert persisted.runtime_result_payload is not None
+    assert persisted.runtime_result_payload["expected_receipt_count"] == 1
+    assert persisted.runtime_result_payload[
+        "effective_attribution_bounds"
+    ] == runner.effective_attribution_bounds.model_dump(mode="json")
+
+    restarted, _, restarted_runner, _ = await _executor(
+        snapshot,
+        snapshot_store=SQLiteAgentSnapshotStore(snapshot_path),
+        execution_store=SQLiteMemoryInterventionExecutionStore(execution_path),
+        materializations={},
+        views={},
+        runtime_results=runtime_results,
+        eval_results=eval_results,
+    )
+    replay = await restarted.execute_trial(request)
+
+    assert replay == outcome
+    assert restarted_runner.run_calls == 0
+    assert restarted_runner.recover_calls == 0
+
+
+@_async_test
+async def test_missing_terminal_evidence_cannot_prove_empty_or_remain_comparable() -> None:
+    snapshot = _snapshot()
+    executor, _, runner, _ = await _executor(
+        snapshot,
+        snapshot_store=AgentSnapshotCoordinator(_providers(snapshot, {})).store,
+        execution_store=InMemoryMemoryInterventionExecutionStore(),
+        materializations={},
+        views={},
+        runtime_results={},
+        eval_results={},
+    )
+    runner.terminal_evidence_available = False
+    request = _request(_spec(snapshot), trial_id="terminal-evidence-unavailable")
+
+    outcome = await executor.execute_trial(request)
+
+    assert outcome.eval_result is not None
+    assert (
+        outcome.eval_result.memory_attribution.completeness
+        is EvalMemoryEvidenceCompleteness.UNAVAILABLE
+    )
+    assert outcome.eval_result.memory_attribution.proves_empty is False
+    assert outcome.binding is not None
+    assert outcome.binding.terminal_evidence_available is False
+    assert outcome.binding.proves_no_memory_exposure is False
+
+
+@pytest.mark.parametrize("foreign", (False, True))
+@_async_test
+async def test_concrete_runner_rejects_forged_or_foreign_terminal_evidence(
+    tmp_path,
+    foreign: bool,
+) -> None:
+    sessions = _SubstitutingTerminalEvidenceSQLiteSessionStore(
+        tmp_path / f"terminal-evidence-{'foreign' if foreign else 'forged'}.db"
+    )
+    provider = _BlockingRuntimeProvider()
+    provider.release.set()
+    executor, _, request, _ = await _canonical_execution_harness(
+        tmp_path,
+        provider=provider,
+        suffix=f"terminal-evidence-{'foreign' if foreign else 'forged'}",
+        sessions=sessions,
+    )
+    if foreign:
+        first = await executor.execute_trial(request)
+        sessions.foreign_evidence = await SQLiteSessionStore.load_terminal_session_evidence(
+            sessions,
+            first.execution.session_id,
+        )
+        request = _request(
+            request.spec,
+            trial_id="foreign-terminal-evidence-target",
+            prompt="When is Atlas released?",
+        )
+    else:
+        sessions.forge_empty_events = True
+
+    with pytest.raises(
+        MemoryInterventionExecutionConflict,
+        match="invalid or foreign terminal evidence",
+    ):
+        await executor.execute_trial(request)
+
+
+@_async_test
+async def test_concrete_runner_rejects_stale_evidence_for_the_same_session_epoch(
+    tmp_path,
+) -> None:
+    sessions = _AdvancedTerminalSessionSQLiteSessionStore(
+        tmp_path / "terminal-evidence-stale-epoch.db"
+    )
+    provider = _BlockingRuntimeProvider()
+    provider.release.set()
+    executor, _, request, _ = await _canonical_execution_harness(
+        tmp_path,
+        provider=provider,
+        suffix="terminal-evidence-stale-epoch",
+        sessions=sessions,
+    )
+
+    with pytest.raises(
+        MemoryInterventionExecutionConflict,
+        match="invalid or foreign terminal evidence",
+    ):
+        await executor.execute_trial(request)
+
+
+@_async_test
+async def test_concrete_runner_binds_evidence_to_the_authenticated_terminal_snapshot(
+    tmp_path,
+) -> None:
+    sessions = _CoherentlyAdvancedTerminalEvidenceSQLiteSessionStore(
+        tmp_path / "terminal-evidence-coherent-later-epoch.db"
+    )
+    provider = _BlockingRuntimeProvider()
+    provider.release.set()
+    executor, _, request, _ = await _canonical_execution_harness(
+        tmp_path,
+        provider=provider,
+        suffix="terminal-evidence-coherent-later-epoch",
+        sessions=sessions,
+    )
+
+    with pytest.raises(
+        MemoryInterventionExecutionConflict,
+        match="invalid or foreign terminal evidence",
+    ):
+        await executor.execute_trial(request)
+
+    assert sessions.terminal_session_loads == 1
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_limitation"),
+    (
+        ("unsupported", EvalMemoryEvidenceLimitation.STORE_UNSUPPORTED),
+        ("typed", EvalMemoryEvidenceLimitation.EVIDENCE_READ_FAILED),
+        ("read", EvalMemoryEvidenceLimitation.EVIDENCE_READ_FAILED),
+    ),
+)
+@_async_test
+async def test_concrete_runner_publishes_unavailable_terminal_evidence_and_replays_it(
+    tmp_path,
+    failure: str,
+    expected_limitation: EvalMemoryEvidenceLimitation,
+) -> None:
+    sessions = _UnavailableTerminalEvidenceSQLiteSessionStore(
+        tmp_path / f"terminal-evidence-unavailable-{failure}.db",
+        failure=failure,
+    )
+    provider = _BlockingRuntimeProvider()
+    provider.release.set()
+    executor, executions, request, _ = await _canonical_execution_harness(
+        tmp_path,
+        provider=provider,
+        suffix=f"terminal-evidence-unavailable-{failure}",
+        sessions=sessions,
+    )
+
+    outcome = await executor.execute_trial(request)
+    persisted = await executions.load(request.execution_id)
+
+    assert outcome.eval_result is not None
+    evidence = outcome.eval_result.memory_attribution
+    assert evidence.completeness is EvalMemoryEvidenceCompleteness.UNAVAILABLE
+    assert evidence.proves_empty is False
+    assert evidence.sources[0].limitations == (expected_limitation,)
+    assert outcome.binding is not None
+    assert outcome.binding.terminal_evidence_available is False
+    assert outcome.binding.proves_no_memory_exposure is False
+    assert persisted is not None
+    assert persisted.runtime_result_payload is not None
+    assert persisted.runtime_result_payload["terminal_evidence_limitation"] == str(
+        expected_limitation
+    )
+    assert await executor.execute_trial(request) == outcome
+
+
+@_async_test
+async def test_concrete_runner_applies_persists_and_recovers_effective_eval_bounds(
+    tmp_path,
+) -> None:
+    policy_bounds = standard_eval_memory_attribution_bounds()
+    above_policy = MemoryAttributionBounds(
+        max_receipts=101,
+        max_exposures=101,
+        max_items=1_001,
+        max_source_bytes=8 * 1024 * 1024,
+        max_projection_bytes=1024 * 1024,
+    )
+    above_store = _RecordingAttributionBoundsSQLiteSessionStore(
+        tmp_path / "runner-bounds-above-sessions.db"
+    )
+    above_provider = _BlockingRuntimeProvider()
+    above_provider.release.set()
+    above_executor, above_executions, above_request, _ = await _canonical_execution_harness(
+        tmp_path,
+        provider=above_provider,
+        suffix="runner-bounds-above",
+        sessions=above_store,
+        attribution_bounds=above_policy,
+    )
+
+    above_outcome = await above_executor.execute_trial(above_request)
+    above_persisted = await above_executions.load(above_request.execution_id)
+    read_count = len(above_store.recall_queries) + len(above_store.exposure_queries)
+
+    assert above_store.recall_queries[0].max_bytes == policy_bounds.max_source_bytes
+    assert above_outcome.eval_result is not None
+    assert above_outcome.eval_result.memory_attribution.effective_bounds == policy_bounds
+    above_source = above_outcome.eval_result.memory_attribution.sources[0]
+    assert above_source.source.session_alias is not None
+    assert above_source.source.session_alias.key_id == "memory-intervention-test"
+    assert above_outcome.execution.session_id not in json.dumps(
+        above_outcome.eval_result.memory_attribution.model_dump(mode="json")
+    )
+    assert above_persisted is not None
+    assert above_persisted.runtime_result_payload is not None
+    assert above_persisted.runtime_result_payload[
+        "effective_attribution_bounds"
+    ] == policy_bounds.model_dump(mode="json")
+    assert above_persisted.runtime_result_payload[
+        "source_alias"
+    ] == above_source.source.session_alias.model_dump(mode="json")
+    assert await above_executor.execute_trial(above_request) == above_outcome
+    assert len(above_store.recall_queries) + len(above_store.exposure_queries) == read_count
+
+    lower_bounds = MemoryAttributionBounds(
+        max_receipts=1,
+        max_exposures=1,
+        max_items=3,
+        max_source_bytes=2 * 1024 * 1024,
+        max_projection_bytes=256 * 1024,
+    )
+    lower_store = _RecordingAttributionBoundsSQLiteSessionStore(
+        tmp_path / "runner-bounds-lower-sessions.db"
+    )
+    lower_provider = _BlockingRuntimeProvider()
+    lower_provider.release.set()
+    lower_executor, lower_executions, lower_request, _ = await _canonical_execution_harness(
+        tmp_path,
+        provider=lower_provider,
+        suffix="runner-bounds-lower",
+        sessions=lower_store,
+        attribution_bounds=lower_bounds,
+    )
+
+    lower_outcome = await lower_executor.execute_trial(lower_request)
+    lower_persisted = await lower_executions.load(lower_request.execution_id)
+
+    assert lower_store.recall_queries[0].max_bytes == lower_bounds.max_source_bytes
+    assert lower_outcome.eval_result is not None
+    assert lower_outcome.eval_result.memory_attribution.effective_bounds == lower_bounds
+    assert lower_persisted is not None
+    assert lower_persisted.runtime_result_payload is not None
+    assert lower_persisted.runtime_result_payload[
+        "effective_attribution_bounds"
+    ] == lower_bounds.model_dump(mode="json")
+
+
+@_async_test
+async def test_executor_rejects_above_policy_runtime_bounds_before_persistence() -> None:
+    snapshot = _snapshot()
+    execution_store = InMemoryMemoryInterventionExecutionStore()
+    executor, _, runner, evaluator = await _executor(
+        snapshot,
+        snapshot_store=AgentSnapshotCoordinator(_providers(snapshot, {})).store,
+        execution_store=execution_store,
+        materializations={},
+        views={},
+        runtime_results={},
+        eval_results={},
+    )
+    request = _request(_spec(snapshot), trial_id="invalid-runtime-bounds-policy")
+    valid = MemoryInterventionRuntimeResult(
+        session_id=request.session_id,
+        terminal_disposition=AgentSnapshotTerminalDisposition.COMPLETED,
+        runtime_evidence_fingerprint=_digest("runtime-bounds:policy"),
+        terminal_evidence_available=True,
+        expected_receipt_count=0,
+        expected_exposure_count=0,
+        effective_attribution_bounds=standard_eval_memory_attribution_bounds(),
+        attribution=_empty_attribution(),
+    )
+    policy = standard_eval_memory_attribution_bounds()
+    invalid = valid.model_copy(
+        update={
+            "effective_attribution_bounds": policy.model_copy(
+                update={"max_receipts": policy.max_receipts + 1}
+            )
+        }
+    )
+    runner.result_override = invalid
+
+    with pytest.raises(
+        ValueError,
+        match="Effective receipt bound exceeds the eval capture policy",
+    ):
+        await executor.execute_trial(request)
+
+    persisted = await execution_store.load(request.execution_id)
+    assert persisted is not None
+    assert persisted.phase is MemoryInterventionExecutionPhase.SESSION_BOUND
+    assert persisted.runtime_result_payload is None
+    assert evaluator.evaluate_calls == 0
 
 
 @_async_test

@@ -9,16 +9,33 @@ from collections import Counter
 from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from threading import Lock
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+from weakref import WeakKeyDictionary
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from cayu._exception_groups import exception_tree_contains
+from cayu._task_wait import capture_awaitable_outcome
 from cayu._validation import copy_durable_json_object, require_durable_clean_nonblank
 from cayu.artifacts import ArtifactMetadata, ArtifactScope
 from cayu.core.events import Event, EventType, event_durable_sequence
 from cayu.core.messages import Message
+from cayu.evals._memory_attribution import (
+    eval_memory_attribution_evidence_from_trajectory,
+)
 from cayu.evals.assertions import EvalAssertion
+from cayu.evals.memory_attribution import (
+    EVAL_MEMORY_ATTRIBUTION_MAX_BYTES,
+    EVAL_MEMORY_ATTRIBUTION_MAX_SOURCES,
+    EvalMemoryAttributionEvidenceV1,
+    EvalMemoryEvidenceLimitation,
+    eval_memory_attribution_bounds_for_trial_count,
+    eval_memory_attribution_max_bytes_for_trial_count,
+    eval_memory_attribution_source_limit_for_trial_count,
+    standard_eval_memory_attribution_bounds,
+)
 from cayu.evals.models import (
     WORKSPACE_PROBE_MAX_BYTES,
     EvalAssertionResult,
@@ -45,14 +62,27 @@ from cayu.evals.result_contract import (
 )
 from cayu.evals.trajectory import (
     SessionTrajectoryBounds,
+    SessionTrajectoryError,
+    SessionTrajectoryErrorCode,
     _build_child_trajectories,
     _CaptureState,
     _IncompleteFlag,
     _load_terminal_evidence,
+    _memory_attribution_snapshot,
     _project_terminal_evidence,
+    _promote_memory_attribution,
+    _revalidate_fresh_capture,
     _trajectory_from_terminal_evidence,
+    _validated_terminal_session_evidence,
     final_output_text,
 )
+from cayu.memory_attribution import (
+    MemoryAttribution,
+    MemoryAttributionBounds,
+    MemoryAttributionStatus,
+    MemoryAttributionUnavailableReason,
+)
+from cayu.runtime._memory_evidence import memory_evidence_key
 from cayu.runtime.app import CayuApp
 from cayu.runtime.sessions import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
@@ -63,11 +93,19 @@ from cayu.runtime.sessions import (
     TerminalSessionEvidence,
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
+    TerminalSessionEvidenceLimits,
     copy_run_request,
 )
 from cayu.runtime.usage import (
     SessionUsageSummary,
     session_usage_summary_payload,
+)
+from cayu.tools._operation_boundary import (
+    BoundedInvocationOperationRegistry,
+    InvocationOperationCapacityError,
+    _RetainedInvocationOperationProbe,
+    await_invocation_operation,
+    retained_invocation_operation_outcome_if_done,
 )
 
 if TYPE_CHECKING:
@@ -78,6 +116,387 @@ if TYPE_CHECKING:
 
 class _FreshInterruptedEvidenceUnavailable(RuntimeError):
     """The runner-owned interrupted session could not be reconciled exactly."""
+
+
+class _FreshMemoryAttributionReadFailed(RuntimeError):
+    """One fresh-eval attribution projection could not be read authoritatively."""
+
+
+class _FreshMemoryAttributionReadStopped(BaseException):
+    """A retained composite read reached its first post-abandonment dispatch seam."""
+
+
+class _FreshEvalDeadlineExpired(BaseException):
+    """The fresh-eval deadline expired before another evidence read was admitted."""
+
+
+class _FreshMemoryAttributionReadStop:
+    """Per-operation cooperative authority that forbids reads after abandonment."""
+
+    __slots__ = ("_stopped",)
+
+    def __init__(self) -> None:
+        self._stopped = False
+
+    def stop(self) -> None:
+        self._stopped = True
+
+    def require_read_allowed(self) -> None:
+        if self._stopped:
+            raise _FreshMemoryAttributionReadStopped
+
+
+_CONTRADICTORY_FRESH_CAPTURE_CODES = frozenset(
+    {
+        SessionTrajectoryErrorCode.ORIGIN_EVIDENCE_REJECTED,
+        SessionTrajectoryErrorCode.PARENT_CONTRADICTION,
+        SessionTrajectoryErrorCode.CYCLE_DETECTED,
+        SessionTrajectoryErrorCode.EVIDENCE_INCONSISTENT,
+    }
+)
+_INCOMPLETE_FRESH_CAPTURE_CODES = frozenset(
+    {
+        SessionTrajectoryErrorCode.SESSION_LIMIT_EXCEEDED,
+        SessionTrajectoryErrorCode.DEPTH_LIMIT_EXCEEDED,
+    }
+)
+
+
+def _fresh_capture_revalidation_limitation(
+    error: SessionTrajectoryError,
+) -> EvalMemoryEvidenceLimitation:
+    """Map exact-capture failures onto the portable memory-evidence vocabulary."""
+
+    if error.code is SessionTrajectoryErrorCode.CLOSURE_CHANGED:
+        return EvalMemoryEvidenceLimitation.CLOSURE_CHANGED
+    if error.code is SessionTrajectoryErrorCode.STORE_UNSUPPORTED:
+        return EvalMemoryEvidenceLimitation.STORE_UNSUPPORTED
+    if error.code in _CONTRADICTORY_FRESH_CAPTURE_CODES:
+        return EvalMemoryEvidenceLimitation.CONTRADICTORY_LINEAGE
+    if error.code in _INCOMPLETE_FRESH_CAPTURE_CODES:
+        return EvalMemoryEvidenceLimitation.SOURCE_TREE_INCOMPLETE
+    return EvalMemoryEvidenceLimitation.EVIDENCE_READ_FAILED
+
+
+_MAX_RETAINED_FRESH_MEMORY_ATTRIBUTION_READS = 1_024
+
+
+class _FreshMemoryAttributionReadSupervisor:
+    """Retain bounded abandoned reads and deliver exact late control once."""
+
+    def __init__(
+        self,
+        *,
+        max_operations: int = _MAX_RETAINED_FRESH_MEMORY_ATTRIBUTION_READS,
+    ) -> None:
+        self.operation_registry = BoundedInvocationOperationRegistry(max_operations=max_operations)
+        self._retained: list[_RetainedInvocationOperationProbe] = []
+
+    def retain(self, retained: _RetainedInvocationOperationProbe) -> None:
+        if type(retained) is not _RetainedInvocationOperationProbe:
+            raise TypeError("retained must be a runtime-owned invocation-operation probe.")
+        self._retained.append(retained)
+
+    def claim_terminal_controls(self) -> tuple[BaseException, ...]:
+        pending: list[_RetainedInvocationOperationProbe] = []
+        controls: list[BaseException] = []
+        for retained in self._retained:
+            outcome = retained_invocation_operation_outcome_if_done(retained)
+            if outcome is None:
+                pending.append(retained)
+                continue
+            error = outcome.error
+            if error is not None and exception_tree_contains(
+                error,
+                (GeneratorExit, KeyboardInterrupt, SystemExit),
+            ):
+                controls.append(error)
+        self._retained = pending
+        return tuple(_ordered_unique_failures(controls))
+
+
+_FRESH_MEMORY_READ_SUPERVISORS: WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    _FreshMemoryAttributionReadSupervisor,
+] = WeakKeyDictionary()
+_FRESH_MEMORY_READ_SUPERVISORS_LOCK = Lock()
+
+
+def _shared_fresh_memory_attribution_read_supervisor() -> _FreshMemoryAttributionReadSupervisor:
+    """Return one loop-owned supervisor shared by sequential and overlapping runs."""
+
+    loop = asyncio.get_running_loop()
+    with _FRESH_MEMORY_READ_SUPERVISORS_LOCK:
+        supervisor = _FRESH_MEMORY_READ_SUPERVISORS.get(loop)
+        if supervisor is None:
+            supervisor = _FreshMemoryAttributionReadSupervisor()
+            _FRESH_MEMORY_READ_SUPERVISORS[loop] = supervisor
+        return supervisor
+
+
+class _FreshMemoryAttributionOperationRegistry:
+    """Compose one eval-run limit with the loop-wide retained-read bound."""
+
+    def __init__(
+        self,
+        *,
+        max_operations: int,
+        supervisor: _FreshMemoryAttributionReadSupervisor,
+    ) -> None:
+        self._local = BoundedInvocationOperationRegistry(max_operations=max_operations)
+        self._shared = supervisor.operation_registry
+
+    def reserve(self) -> bool:
+        if not self._local.reserve():
+            return False
+        if self._shared.reserve():
+            return True
+        self._local.release_reservation()
+        return False
+
+    def track(self, operation: asyncio.Future[Any]) -> None:
+        self._local.track(operation)
+        self._shared.track(operation)
+
+    def release_reservation(self) -> None:
+        self._local.release_reservation()
+        self._shared.release_reservation()
+
+    def release(self, operation: asyncio.Future[Any]) -> None:
+        self._local.release(operation)
+        self._shared.release(operation)
+
+    async def aclose(self, *, timeout_s: float) -> bool:
+        del timeout_s
+        self._local.seal()
+        # The same wrapper task remains owned by the shared registry. Cancelling
+        # it here can let a store such as SQLite detach physical off-thread work
+        # and make the shared capacity slot appear settled too early.
+        return len(self._local) == 0
+
+
+def _ordered_unique_failures(failures: Iterable[BaseException]) -> list[BaseException]:
+    ordered: list[BaseException] = []
+    for failure in failures:
+        if all(failure is not retained for retained in ordered):
+            ordered.append(failure)
+    return ordered
+
+
+class _FreshMemoryAttributionReadLifecycle:
+    """Own fresh-read capacity, bounded stop, and exact terminal control outcomes."""
+
+    def __init__(self, *, max_operations: int) -> None:
+        self._supervisor = _shared_fresh_memory_attribution_read_supervisor()
+        self.operation_registry = _FreshMemoryAttributionOperationRegistry(
+            max_operations=max_operations,
+            supervisor=self._supervisor,
+        )
+
+    def retain_abandoned(self, retained: _RetainedInvocationOperationProbe) -> None:
+        self._supervisor.retain(retained)
+
+    async def _close(self) -> tuple[BaseException, ...]:
+        await self.operation_registry.aclose(timeout_s=0.0)
+        return self._supervisor.claim_terminal_controls()
+
+    async def __aenter__(self) -> _FreshMemoryAttributionReadLifecycle:
+        controls = self._supervisor.claim_terminal_controls()
+        if len(controls) == 1:
+            raise controls[0]
+        if controls:
+            raise BaseExceptionGroup(
+                "Fresh eval memory attribution retained process control.",
+                list(controls),
+            ) from None
+        return self
+
+    async def __aexit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        primary: BaseException | None,
+        _traceback: object,
+    ) -> bool:
+        close_task = asyncio.create_task(capture_awaitable_outcome(self._close))
+        concurrent: list[BaseException] = []
+        while not close_task.done():
+            try:
+                await asyncio.shield(close_task)
+            except BaseException as error:
+                concurrent.append(error)
+        try:
+            await asyncio.sleep(0)
+        except BaseException as error:
+            concurrent.append(error)
+        captured = close_task.result()
+        if captured.error is not None:
+            concurrent.append(captured.error)
+        elif type(captured.result) is tuple:
+            concurrent.extend(captured.result)
+        else:
+            concurrent.append(
+                RuntimeError("Fresh eval memory-read cleanup returned invalid state.")
+            )
+        failures = _ordered_unique_failures(([primary] if primary is not None else []) + concurrent)
+        if not concurrent:
+            return False
+        if len(failures) == 1:
+            raise failures[0]
+        raise BaseExceptionGroup(
+            "Fresh eval memory attribution cleanup received concurrent control.",
+            failures,
+        ) from None
+
+
+async def _owned_fresh_memory_attribution_projection(
+    app: CayuApp,
+    trajectory: Trajectory,
+    *,
+    bounds: MemoryAttributionBounds,
+    lifecycle: _FreshMemoryAttributionReadLifecycle,
+) -> Trajectory:
+    """Read one projection without letting an opaque store defeat caller cancellation."""
+
+    stop = _FreshMemoryAttributionReadStop()
+
+    def retain_abandoned(retained: _RetainedInvocationOperationProbe) -> None:
+        stop.stop()
+        lifecycle.retain_abandoned(retained)
+
+    outcome = await await_invocation_operation(
+        lambda: _promote_memory_attribution(
+            app,
+            trajectory,
+            bounds=bounds,
+            before_store_read=stop.require_read_allowed,
+        ),
+        request_child_cancellation=False,
+        abandon_on_caller_cancellation=True,
+        operation_registry=lifecycle.operation_registry,
+        on_abandoned_caller_operation=retain_abandoned,
+        on_unsettled_supervisory_exit=retain_abandoned,
+    )
+    error = outcome.error
+    if outcome.cancellation is not None:
+        if error is not None and exception_tree_contains(
+            error,
+            (GeneratorExit, KeyboardInterrupt, SystemExit),
+        ):
+            raise BaseExceptionGroup(
+                "Fresh eval memory attribution received concurrent process control and "
+                "caller cancellation.",
+                [outcome.cancellation, error],
+            ) from None
+        raise outcome.cancellation from None
+    if error is not None and exception_tree_contains(
+        error,
+        (GeneratorExit, KeyboardInterrupt, SystemExit),
+    ):
+        raise error
+    if (
+        isinstance(error, (asyncio.CancelledError, BaseExceptionGroup))
+        or type(error) is InvocationOperationCapacityError
+    ):
+        raise _FreshMemoryAttributionReadFailed(
+            "Fresh eval memory attribution could not be read."
+        ) from None
+    if error is not None:
+        raise error
+    if type(outcome.result) is not Trajectory:
+        raise _FreshMemoryAttributionReadFailed(
+            "Fresh eval memory attribution returned an invalid projection."
+        )
+    return outcome.result
+
+
+async def _owned_fresh_capture_revalidation(
+    app: CayuApp,
+    capture_state: _CaptureState,
+    *,
+    root_session_id: str,
+    root_interrupted_observed_events: tuple[RunnerObservedEventIdentity, ...],
+    lifecycle: _FreshMemoryAttributionReadLifecycle,
+) -> None:
+    """Revalidate one closure without letting opaque store reads defeat cancellation."""
+
+    stop = _FreshMemoryAttributionReadStop()
+
+    def retain_abandoned(retained: _RetainedInvocationOperationProbe) -> None:
+        stop.stop()
+        lifecycle.retain_abandoned(retained)
+
+    outcome = await await_invocation_operation(
+        lambda: _revalidate_fresh_capture(
+            app,
+            capture_state,
+            root_session_id=root_session_id,
+            root_interrupted_observed_events=root_interrupted_observed_events,
+            before_store_read=stop.require_read_allowed,
+        ),
+        request_child_cancellation=False,
+        abandon_on_caller_cancellation=True,
+        operation_registry=lifecycle.operation_registry,
+        on_abandoned_caller_operation=retain_abandoned,
+        on_unsettled_supervisory_exit=retain_abandoned,
+    )
+    error = outcome.error
+    if outcome.cancellation is not None:
+        if error is not None and exception_tree_contains(
+            error,
+            (GeneratorExit, KeyboardInterrupt, SystemExit),
+        ):
+            raise BaseExceptionGroup(
+                "Fresh eval closure revalidation received concurrent process control and "
+                "caller cancellation.",
+                [outcome.cancellation, error],
+            ) from None
+        raise outcome.cancellation from None
+    if error is not None and exception_tree_contains(
+        error,
+        (GeneratorExit, KeyboardInterrupt, SystemExit),
+    ):
+        raise error
+    if (
+        isinstance(error, (asyncio.CancelledError, BaseExceptionGroup))
+        or type(error) is InvocationOperationCapacityError
+    ):
+        raise _FreshMemoryAttributionReadFailed(
+            "Fresh eval closure revalidation could not be read."
+        ) from None
+    if error is not None:
+        raise error
+    if outcome.result is not None:
+        raise _FreshMemoryAttributionReadFailed(
+            "Fresh eval closure revalidation returned an invalid result."
+        )
+
+
+def _memory_attribution_read_failed_trajectory(trajectory: Trajectory) -> Trajectory:
+    """Fail closed for the complete retained tree after an untrusted read outcome."""
+
+    attribution = (
+        None
+        if trajectory.session is None
+        else MemoryAttribution(
+            status=MemoryAttributionStatus.UNAVAILABLE,
+            truncated=False,
+            reason=MemoryAttributionUnavailableReason.EVIDENCE_READ_FAILED,
+            observed_receipt_count=0,
+            observed_exposure_count=0,
+            observed_item_count=0,
+            omitted_receipt_count_at_least=0,
+            omitted_exposure_count_at_least=0,
+            omitted_item_count_at_least=0,
+        )
+    )
+    return trajectory.model_copy(
+        update={
+            "memory_attribution": attribution,
+            "children": tuple(
+                _memory_attribution_read_failed_trajectory(child) for child in trajectory.children
+            ),
+        }
+    )
 
 
 def _format_exception_summary(exc: BaseException) -> str:
@@ -347,16 +766,30 @@ async def _run_eval_suite(
     _validate_timeout_seconds(case_timeout_seconds, "run_eval_suite case_timeout_seconds")
     run_id = str(uuid4())
     started_at = datetime.now(UTC)
-    results, public_data_by_case = await _run_suite_cases(
-        app,
-        suite,
-        retain_trajectory=retain_trajectory,
-        retain_final_output=retain_final_output,
-        max_concurrency=max_concurrency,
-        case_timeout_seconds=case_timeout_seconds,
-        trials=trials,
-        public_output_preview_bytes=public_output_preview_bytes,
+    trial_count = len(suite.cases) * trials
+    memory_attribution_bounds = eval_memory_attribution_bounds_for_trial_count(trial_count)
+    memory_attribution_source_limit = eval_memory_attribution_source_limit_for_trial_count(
+        trial_count
     )
+    memory_attribution_max_bytes = eval_memory_attribution_max_bytes_for_trial_count(trial_count)
+    memory_attribution_read_lifecycle = _FreshMemoryAttributionReadLifecycle(
+        max_operations=max_concurrency
+    )
+    async with memory_attribution_read_lifecycle:
+        results, public_data_by_case = await _run_suite_cases(
+            app,
+            suite,
+            retain_trajectory=retain_trajectory,
+            retain_final_output=retain_final_output,
+            max_concurrency=max_concurrency,
+            case_timeout_seconds=case_timeout_seconds,
+            trials=trials,
+            public_output_preview_bytes=public_output_preview_bytes,
+            memory_attribution_bounds=memory_attribution_bounds,
+            memory_attribution_source_limit=memory_attribution_source_limit,
+            memory_attribution_max_bytes=memory_attribution_max_bytes,
+            memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
+        )
     completed_at = datetime.now(UTC)
     status = aggregate_eval_status(result.status for result in results)
     score = aggregate_eval_score(result.score for result in results)
@@ -431,6 +864,10 @@ async def _run_suite_cases(
     case_timeout_seconds: float | None,
     trials: int,
     public_output_preview_bytes: int | None,
+    memory_attribution_bounds: MemoryAttributionBounds,
+    memory_attribution_source_limit: int,
+    memory_attribution_max_bytes: int,
+    memory_attribution_read_lifecycle: _FreshMemoryAttributionReadLifecycle,
 ) -> tuple[
     list[EvalCaseResult],
     dict[str, tuple[_EvalTrialPublicData, ...]] | None,
@@ -446,6 +883,10 @@ async def _run_suite_cases(
                 timeout_seconds=case_timeout_seconds,
                 trials=trials,
                 public_output_preview_bytes=public_output_preview_bytes,
+                memory_attribution_bounds=memory_attribution_bounds,
+                memory_attribution_source_limit=memory_attribution_source_limit,
+                memory_attribution_max_bytes=memory_attribution_max_bytes,
+                memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
             )
             for case in suite.cases
         ]
@@ -478,6 +919,10 @@ async def _run_suite_cases(
                 timeout_seconds=case_timeout_seconds,
                 trials=trials,
                 public_output_preview_bytes=public_output_preview_bytes,
+                memory_attribution_bounds=memory_attribution_bounds,
+                memory_attribution_source_limit=memory_attribution_source_limit,
+                memory_attribution_max_bytes=memory_attribution_max_bytes,
+                memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
             )
 
     async with asyncio.TaskGroup() as group:
@@ -517,16 +962,24 @@ async def run_eval_case(
     if type(case) is not EvalCase:
         raise TypeError("run_eval_case requires an EvalCase.")
     case = _detach_eval_case(case)
-    result, _ = await _run_eval_case(
-        app,
-        case,
-        suite_id=suite_id,
-        retain_trajectory=retain_trajectory,
-        retain_final_output=retain_final_output,
-        timeout_seconds=timeout_seconds,
-        trials=trials,
-        public_output_preview_bytes=None,
-    )
+    memory_attribution_read_lifecycle = _FreshMemoryAttributionReadLifecycle(max_operations=1)
+    async with memory_attribution_read_lifecycle:
+        result, _ = await _run_eval_case(
+            app,
+            case,
+            suite_id=suite_id,
+            retain_trajectory=retain_trajectory,
+            retain_final_output=retain_final_output,
+            timeout_seconds=timeout_seconds,
+            trials=trials,
+            public_output_preview_bytes=None,
+            memory_attribution_bounds=eval_memory_attribution_bounds_for_trial_count(trials),
+            memory_attribution_source_limit=eval_memory_attribution_source_limit_for_trial_count(
+                trials
+            ),
+            memory_attribution_max_bytes=eval_memory_attribution_max_bytes_for_trial_count(trials),
+            memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
+        )
     return result
 
 
@@ -540,6 +993,10 @@ async def _run_eval_case(
     timeout_seconds: float | None,
     trials: int,
     public_output_preview_bytes: int | None,
+    memory_attribution_bounds: MemoryAttributionBounds,
+    memory_attribution_source_limit: int,
+    memory_attribution_max_bytes: int,
+    memory_attribution_read_lifecycle: _FreshMemoryAttributionReadLifecycle,
 ) -> tuple[EvalCaseResult, tuple[_EvalTrialPublicData, ...] | None]:
     if type(retain_final_output) is not bool:
         raise TypeError("run_eval_case retain_final_output must be a bool.")
@@ -564,6 +1021,10 @@ async def _run_eval_case(
             retain_final_output=retain_final_output,
             timeout_seconds=timeout_seconds,
             public_output_preview_bytes=public_output_preview_bytes,
+            memory_attribution_bounds=memory_attribution_bounds,
+            memory_attribution_source_limit=memory_attribution_source_limit,
+            memory_attribution_max_bytes=memory_attribution_max_bytes,
+            memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
         )
         for trial_number in range(1, trials + 1)
     ]
@@ -597,17 +1058,36 @@ async def _run_case_once(
     retain_trajectory: bool = False,
     retain_final_output: bool = True,
     timeout_seconds: float | None = None,
+    memory_attribution_bounds: MemoryAttributionBounds | None = None,
+    memory_attribution_source_limit: int | None = None,
+    memory_attribution_max_bytes: int | None = None,
 ) -> EvalTrialResult:
-    result, _ = await _run_case_once_with_public_projection(
-        app,
-        case,
-        trial_number=trial_number,
-        suite_id=suite_id,
-        retain_trajectory=retain_trajectory,
-        retain_final_output=retain_final_output,
-        timeout_seconds=timeout_seconds,
-        public_output_preview_bytes=None,
-    )
+    memory_attribution_read_lifecycle = _FreshMemoryAttributionReadLifecycle(max_operations=1)
+    async with memory_attribution_read_lifecycle:
+        result, _ = await _run_case_once_with_public_projection(
+            app,
+            case,
+            trial_number=trial_number,
+            suite_id=suite_id,
+            retain_trajectory=retain_trajectory,
+            retain_final_output=retain_final_output,
+            timeout_seconds=timeout_seconds,
+            public_output_preview_bytes=None,
+            memory_attribution_bounds=(
+                memory_attribution_bounds or standard_eval_memory_attribution_bounds()
+            ),
+            memory_attribution_source_limit=(
+                EVAL_MEMORY_ATTRIBUTION_MAX_SOURCES
+                if memory_attribution_source_limit is None
+                else memory_attribution_source_limit
+            ),
+            memory_attribution_max_bytes=(
+                EVAL_MEMORY_ATTRIBUTION_MAX_BYTES
+                if memory_attribution_max_bytes is None
+                else memory_attribution_max_bytes
+            ),
+            memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
+        )
     return result
 
 
@@ -622,6 +1102,10 @@ async def _run_case_once_with_public_projection(
     timeout_seconds: float | None = None,
     public_output_preview_bytes: int | None = None,
     run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None = None,
+    memory_attribution_bounds: MemoryAttributionBounds | None = None,
+    memory_attribution_source_limit: int | None = None,
+    memory_attribution_max_bytes: int | None = None,
+    memory_attribution_read_lifecycle: _FreshMemoryAttributionReadLifecycle,
 ) -> tuple[EvalTrialResult, _EvalTrialPublicData | None]:
     started_at = datetime.now(UTC)
     trial_request = _isolated_trial_request(case.request)
@@ -640,10 +1124,38 @@ async def _run_case_once_with_public_projection(
     final_output = ""
     trajectory: Trajectory | None = None
     terminal_evidence: TerminalSessionEvidence | None = None
+    capture_state = _CaptureState(bounds=SessionTrajectoryBounds(), strict=False)
+    root_terminal_limits: TerminalSessionEvidenceLimits | None = None
     assertion_results: list[EvalAssertionResult] = []
     public_output = EvalTrialOutputPreviewV1.unavailable()
     diagnostic_code: EvalTrialDiagnosticCode | None = None
+    selected_memory_bounds = MemoryAttributionBounds.model_validate(
+        (memory_attribution_bounds or standard_eval_memory_attribution_bounds()).model_dump(
+            mode="python"
+        )
+    )
+    selected_memory_source_limit = (
+        EVAL_MEMORY_ATTRIBUTION_MAX_SOURCES
+        if memory_attribution_source_limit is None
+        else memory_attribution_source_limit
+    )
+    selected_memory_max_bytes = (
+        EVAL_MEMORY_ATTRIBUTION_MAX_BYTES
+        if memory_attribution_max_bytes is None
+        else memory_attribution_max_bytes
+    )
+    memory_alias_key = memory_evidence_key(app._request_footprint)
+    memory_attribution = EvalMemoryAttributionEvidenceV1.unavailable(
+        EvalMemoryEvidenceLimitation.MISSING,
+        effective_bounds=selected_memory_bounds,
+        effective_source_limit=selected_memory_source_limit,
+        effective_max_bytes=selected_memory_max_bytes,
+    )
     deadline: asyncio.Timeout | None = None
+
+    def require_evidence_read_allowed() -> None:
+        if deadline is not None and deadline.expired():
+            raise _FreshEvalDeadlineExpired
 
     # asyncio.timeout(None) never expires, so the unbounded default shares the path.
     # Keep the deadline around the full case lifecycle: runtime execution, state/probe
@@ -668,6 +1180,7 @@ async def _run_case_once_with_public_projection(
                         else:
                             emitted_root_events_truncated = True
                 run_drained = True
+                require_evidence_read_allowed()
             except TimeoutError as exc:
                 # A provider-originated TimeoutError is an eval run error, not the case
                 # deadline. Deadline expiry arrives as cancellation and is handled below.
@@ -680,7 +1193,16 @@ async def _run_case_once_with_public_projection(
             candidate_session_id = observed_session_id or trial_request.session_id
             if candidate_session_id is not None:
                 try:
-                    terminal_evidence = await _load_terminal_evidence(app, candidate_session_id)
+                    root_terminal_limits = capture_state.remaining_terminal_limits(
+                        candidate_session_id
+                    )
+                    require_evidence_read_allowed()
+                    terminal_evidence = await _load_terminal_evidence(
+                        app,
+                        candidate_session_id,
+                        limits=root_terminal_limits,
+                    )
+                    require_evidence_read_allowed()
                     session_id = candidate_session_id
                     session, events, transcript, usage_summary = _project_terminal_evidence(
                         terminal_evidence
@@ -694,12 +1216,19 @@ async def _run_case_once_with_public_projection(
                         and exc.code == TerminalSessionEvidenceErrorCode.SESSION_INTERRUPTED
                     ):
                         try:
+                            if root_terminal_limits is None:
+                                raise RuntimeError(
+                                    "Exact root evidence limits were lost before interrupted recovery."
+                                )
                             terminal_evidence = await _load_fresh_interrupted_evidence(
                                 app,
                                 candidate_session_id,
                                 tuple(emitted_root_events),
                                 emitted_events_truncated=emitted_root_events_truncated,
+                                limits=root_terminal_limits,
+                                before_store_read=require_evidence_read_allowed,
                             )
+                            require_evidence_read_allowed()
                             session, events, transcript, usage_summary = _project_terminal_evidence(
                                 terminal_evidence
                             )
@@ -761,14 +1290,21 @@ async def _run_case_once_with_public_projection(
                     final_output = final_output_text(transcript)
                     probe_requirements = _collect_probe_requirements(case.assertions)
                     probes = await _capture_probes(app, session, probe_requirements)
+                    require_evidence_read_allowed()
                     children_incomplete = _IncompleteFlag()
                     if terminal_evidence is None:
                         raise RuntimeError("Exact root evidence was lost before child capture.")
-                    capture_state = _CaptureState(
-                        bounds=SessionTrajectoryBounds(),
-                        strict=False,
-                    )
-                    capture_state.retain(terminal_evidence)
+                    if root_terminal_limits is None:
+                        raise RuntimeError(
+                            "Exact root evidence limits were lost before child capture."
+                        )
+                    if session_id is None:
+                        raise RuntimeError(
+                            "Exact root session identity was lost before child capture."
+                        )
+                    capture_state.retain(terminal_evidence, limits=root_terminal_limits)
+                    if not app.session_store.supports_session_lineage:
+                        children_incomplete.value = True
                     children = await _build_child_trajectories(
                         app,
                         session_id,
@@ -778,7 +1314,9 @@ async def _run_case_once_with_public_projection(
                             terminal_evidence.boundary.terminal_event_sequence
                         ),
                         state=capture_state,
+                        before_store_read=require_evidence_read_allowed,
                     )
+                    require_evidence_read_allowed()
                     trajectory = _trajectory_from_terminal_evidence(
                         terminal_evidence,
                         probes=probes,
@@ -786,6 +1324,105 @@ async def _run_case_once_with_public_projection(
                         children_incomplete=children_incomplete.value,
                         metadata=case.metadata,
                     )
+                    try:
+                        first_memory_projection = await _owned_fresh_memory_attribution_projection(
+                            app,
+                            trajectory,
+                            bounds=selected_memory_bounds,
+                            lifecycle=memory_attribution_read_lifecycle,
+                        )
+                        require_evidence_read_allowed()
+                        if app.session_store.supports_session_lineage:
+                            try:
+                                await _owned_fresh_capture_revalidation(
+                                    app,
+                                    capture_state,
+                                    root_session_id=session_id,
+                                    root_interrupted_observed_events=tuple(emitted_root_events),
+                                    lifecycle=memory_attribution_read_lifecycle,
+                                )
+                            except SessionTrajectoryError as exc:
+                                limitation = _fresh_capture_revalidation_limitation(exc)
+                                memory_attribution = (
+                                    eval_memory_attribution_evidence_from_trajectory(
+                                        trajectory,
+                                        effective_bounds=selected_memory_bounds,
+                                        effective_source_limit=selected_memory_source_limit,
+                                        effective_max_bytes=selected_memory_max_bytes,
+                                        source_alias_key_id=(
+                                            None
+                                            if memory_alias_key is None
+                                            else memory_alias_key.key_id
+                                        ),
+                                        source_alias_key=(
+                                            None
+                                            if memory_alias_key is None
+                                            else memory_alias_key.key
+                                        ),
+                                        unavailable_reason=limitation,
+                                    )
+                                )
+                                raise RuntimeError(
+                                    "Fresh eval evidence changed or became unavailable while "
+                                    "its durable closure was being revalidated."
+                                ) from None
+                        require_evidence_read_allowed()
+                        revalidated_memory_projection = (
+                            await _owned_fresh_memory_attribution_projection(
+                                app,
+                                trajectory,
+                                bounds=selected_memory_bounds,
+                                lifecycle=memory_attribution_read_lifecycle,
+                            )
+                        )
+                        require_evidence_read_allowed()
+                    except _FreshMemoryAttributionReadFailed:
+                        trajectory = _memory_attribution_read_failed_trajectory(trajectory)
+                        memory_attribution = eval_memory_attribution_evidence_from_trajectory(
+                            trajectory,
+                            effective_bounds=selected_memory_bounds,
+                            effective_source_limit=selected_memory_source_limit,
+                            effective_max_bytes=selected_memory_max_bytes,
+                            source_alias_key_id=(
+                                None if memory_alias_key is None else memory_alias_key.key_id
+                            ),
+                            source_alias_key=(
+                                None if memory_alias_key is None else memory_alias_key.key
+                            ),
+                        )
+                    else:
+                        if _memory_attribution_snapshot(
+                            first_memory_projection
+                        ) != _memory_attribution_snapshot(revalidated_memory_projection):
+                            memory_attribution = eval_memory_attribution_evidence_from_trajectory(
+                                trajectory,
+                                effective_bounds=selected_memory_bounds,
+                                effective_source_limit=selected_memory_source_limit,
+                                effective_max_bytes=selected_memory_max_bytes,
+                                source_alias_key_id=(
+                                    None if memory_alias_key is None else memory_alias_key.key_id
+                                ),
+                                source_alias_key=(
+                                    None if memory_alias_key is None else memory_alias_key.key
+                                ),
+                                unavailable_reason=EvalMemoryEvidenceLimitation.CLOSURE_CHANGED,
+                            )
+                            raise RuntimeError(
+                                "Memory attribution changed while fresh eval evidence was closing."
+                            )
+                        trajectory = revalidated_memory_projection
+                        memory_attribution = eval_memory_attribution_evidence_from_trajectory(
+                            trajectory,
+                            effective_bounds=selected_memory_bounds,
+                            effective_source_limit=selected_memory_source_limit,
+                            effective_max_bytes=selected_memory_max_bytes,
+                            source_alias_key_id=(
+                                None if memory_alias_key is None else memory_alias_key.key_id
+                            ),
+                            source_alias_key=(
+                                None if memory_alias_key is None else memory_alias_key.key
+                            ),
+                        )
                     if children_incomplete.value:
                         evidence_complete = False
                         if run_error is None:
@@ -823,6 +1460,7 @@ async def _run_case_once_with_public_projection(
                     case.assertions,
                     prepared_context,
                     runtime_app=app,
+                    memory_attribution_evidence=memory_attribution,
                 )
                 if (
                     public_output_preview_bytes is not None
@@ -883,8 +1521,10 @@ async def _run_case_once_with_public_projection(
                 elif assertion_unavailable is not None:
                     unavailable_reason = assertion_unavailable
                     diagnostic_code = EvalTrialDiagnosticCode.ASSERTION_EVIDENCE_UNAVAILABLE
-    except TimeoutError as exc:
-        if deadline is not None and deadline.expired():
+    except (TimeoutError, _FreshEvalDeadlineExpired) as exc:
+        if isinstance(exc, _FreshEvalDeadlineExpired) or (
+            deadline is not None and deadline.expired()
+        ):
             run_error = f"Eval case timed out after {timeout_seconds} seconds."
             diagnostic_code = EvalTrialDiagnosticCode.CASE_TIMEOUT
         else:
@@ -901,6 +1541,30 @@ async def _run_case_once_with_public_projection(
         assertion_results = list(
             _blocked_assertion_results(case.assertions, EvalOutcome.ERROR, run_error)
         )
+        if (
+            memory_attribution.completeness.value == "unavailable"
+            and not memory_attribution.sources
+        ):
+            memory_attribution = (
+                EvalMemoryAttributionEvidenceV1.unavailable(
+                    EvalMemoryEvidenceLimitation.DEADLINE_EXPIRED,
+                    effective_bounds=selected_memory_bounds,
+                    effective_source_limit=selected_memory_source_limit,
+                    effective_max_bytes=selected_memory_max_bytes,
+                )
+                if trajectory is None
+                else eval_memory_attribution_evidence_from_trajectory(
+                    trajectory,
+                    effective_bounds=selected_memory_bounds,
+                    effective_source_limit=selected_memory_source_limit,
+                    effective_max_bytes=selected_memory_max_bytes,
+                    source_alias_key_id=(
+                        None if memory_alias_key is None else memory_alias_key.key_id
+                    ),
+                    source_alias_key=(None if memory_alias_key is None else memory_alias_key.key),
+                    unavailable_reason=EvalMemoryEvidenceLimitation.DEADLINE_EXPIRED,
+                )
+            )
 
     # A yielded runtime event proves the session was created before a deadline interrupted
     # evidence capture. Do not perform any store I/O after the deadline; without an event, the
@@ -940,6 +1604,7 @@ async def _run_case_once_with_public_projection(
             usage_summary=session_usage_summary_payload(usage_summary)
             if usage_summary is not None
             else None,
+            memory_attribution=memory_attribution,
             started_at=started_at,
             completed_at=completed_at,
             duration_ms=_duration_ms(started_at, completed_at),
@@ -957,6 +1622,8 @@ async def _load_fresh_interrupted_evidence(
     emitted_events: tuple[RunnerObservedEventIdentity, ...],
     *,
     emitted_events_truncated: bool,
+    limits: TerminalSessionEvidenceLimits,
+    before_store_read: Callable[[], None] | None = None,
 ) -> TerminalSessionEvidence:
     """Reconcile one runner-owned, fully drained interruption with durable state.
 
@@ -978,10 +1645,14 @@ async def _load_fresh_interrupted_evidence(
             "the configured session store does not support exact runner-owned interruptions."
         )
     try:
+        if before_store_read is not None:
+            before_store_read()
         evidence = await app.session_store.load_runner_owned_interrupted_evidence(
             session_id,
             observed_events=emitted_events,
+            limits=limits,
         )
+        evidence = _validated_terminal_session_evidence(evidence)
     except (NotImplementedError, TerminalSessionEvidenceError) as exc:
         detail = (
             exc.code.value
@@ -1061,6 +1732,7 @@ def _prepare_portable_evidence(
     context: EvalContext,
     *,
     runtime_app: CayuApp | None,
+    memory_attribution_evidence: EvalMemoryAttributionEvidenceV1 | None = None,
 ) -> tuple[AssertionEvidenceView | None, Exception | None]:
     # Import lazily to keep the public assertion base independent of the
     # optional portable-corpus adapter.
@@ -1072,6 +1744,7 @@ def _prepare_portable_evidence(
                 assertions,
                 context,
                 runtime_app=runtime_app,
+                memory_attribution_evidence=memory_attribution_evidence,
             ),
             None,
         )
