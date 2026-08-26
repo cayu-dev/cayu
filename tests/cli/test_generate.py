@@ -11,12 +11,35 @@ import pytest
 from cayu.cli import main
 from cayu.cli.generate import (
     GeneratorApplyError,
+    GeneratorPlan,
+    ServiceContextMigrationPlan,
     apply_slice_plan,
     plan_service_context,
     plan_slice,
     plan_tool,
 )
 from cayu.runtime import APP_MANIFEST_SCHEMA_VERSION
+
+
+def test_generator_plan_models_round_trip_the_current_schema_version() -> None:
+    plan = GeneratorPlan(
+        status="ready",
+        slice_name="reviewer",
+        tool_name="review",
+        effect="none",
+        edits=(),
+        verification_commands=(),
+    )
+    migration = ServiceContextMigrationPlan(
+        status="already_present",
+        edits=(),
+        verification_commands=(),
+    )
+
+    assert plan.schema_version == APP_MANIFEST_SCHEMA_VERSION
+    assert migration.schema_version == APP_MANIFEST_SCHEMA_VERSION
+    assert GeneratorPlan.model_validate_json(plan.model_dump_json()) == plan
+    assert ServiceContextMigrationPlan.model_validate_json(migration.model_dump_json()) == migration
 
 
 def _files(root: Path) -> dict[str, bytes]:

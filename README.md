@@ -306,6 +306,7 @@ boundary should contain it:
 | Surface | Execution location | Boundary |
 | --- | --- | --- |
 | Native Python `Tool` | Cayu application process | Trusted application code; policy controls invocation, not host-process access |
+| Process-isolated host `Tool` | Disposable POSIX child process session | Hard wall-clock liveness and owned process-group cleanup for an explicitly reconstructable trusted adapter; not a security sandbox |
 | Runner-backed operation (`ctx.runner`) | Selected runner for that operation; the enclosing `Tool.run()` stays in the Cayu application process | Isolation, environment, network, and filesystem guarantees for the operation come from the admitted runner and environment |
 | MCP tool | Configured MCP process or server | Separate integration boundary whose process, transport, credentials, and isolation remain deployment choices |
 | Virtual egress | Selected runner plus a trusted broker outside it | A conforming adapter can keep the real credential out of the workload; code isolation still depends on the runner |
@@ -526,6 +527,7 @@ Start with the document that matches the job:
 | Choose how work starts | [Triggering runs](https://github.com/cayu-dev/cayu/blob/main/docs/triggering-runs.md) |
 | Create per-session workspaces and runners | [Environment factories](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md) |
 | Implement a runner for your platform | [Build a runner](https://github.com/cayu-dev/cayu/blob/main/docs/build-a-runner.md) |
+| Contain a non-cooperative trusted host dependency behind a hard deadline | [Process-isolated host tools](https://github.com/cayu-tech/cayu/blob/main/docs/process-isolated-tools.md) |
 | Configure network and credential boundaries | [Virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/virtual-egress.md) |
 | Let an agent search and read bounded public web evidence | [Web fetch and hosted search](https://github.com/cayu-dev/cayu/blob/main/docs/web-fetch.md) |
 | Run GitHub CLI without giving the runner a real token | [GitHub CLI through virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/github-cli-virtual-egress.md) |

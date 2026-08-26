@@ -137,6 +137,10 @@ The `*Spec` types (`AgentSpec`, `EnvironmentSpec`, …) are the portable, serial
 - `Workspace`: active filesystem an agent can work with, such as a target repo or working directory.
 - `ArtifactStore`: uploaded/generated durable file references scoped to a session or environment.
 - `Runner`: executes explicit `ExecCommand` values in a workspace or sandbox.
+- `ProcessIsolatedTool`: reconstructs one explicitly declared trusted adapter in
+  a disposable POSIX process session when hard wall-clock liveness is required.
+  This is a process lifecycle boundary, not a filesystem, network, credential,
+  privilege, or hostile-code sandbox.
 - `Sandbox`: isolated workspace plus runner plus lifecycle and limits.
 
 Workspaces and artifacts are separate on purpose:

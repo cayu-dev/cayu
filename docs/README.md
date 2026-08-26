@@ -20,6 +20,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [OpenAI subscription](openai-subscription.md)
 - [Project server](project-server.md)
 - [Project workers](project-workers.md)
+- [Process-isolated host tools](process-isolated-tools.md)
 - [Server configuration](server-configuration.md)
 - [Session inspection](session-inspection.md)
 - [Session-store targets](session-store-targets.md)

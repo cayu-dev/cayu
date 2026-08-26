@@ -37,11 +37,13 @@ from cayu.core.tools import ToolEffect, ToolResult
 from cayu.runtime.tool_catalogue import (
     TOOL_CATALOGUE_MAX_BYTES,
     TOOL_CATALOGUE_MAX_TOOLS,
+    ToolExecutionContract,
+    copy_tool_execution_contract,
     validate_tool_catalogue_revision,
 )
 
 TOOL_EXPOSURE_SCHEMA_VERSION = 2
-REGISTERED_TOOL_CAPABILITY_SCHEMA_VERSION = 1
+REGISTERED_TOOL_CAPABILITY_SCHEMA_VERSION = 2
 TOOL_CAPABILITY_CEILING_SCHEMA_VERSION = 1
 TOOL_EXPOSURE_PROFILE_ID_MAX_CHARS = 256
 TOOL_EXPOSURE_MAX_REGISTERED_TOOLS = TOOL_CATALOGUE_MAX_TOOLS
@@ -127,6 +129,7 @@ class RegisteredToolCapability(BaseModel):
     effect: ToolEffect = ToolEffect.EXTERNAL
     publishes_arguments: StrictBool = True
     workspace_mutation: StrictBool = False
+    execution_contract: ToolExecutionContract = Field(default_factory=ToolExecutionContract)
     schema_fingerprint: str = ""
     definition_fingerprint: str = ""
 
@@ -177,6 +180,7 @@ class RegisteredToolCapability(BaseModel):
                 "effect": self.effect.value,
                 "publishes_arguments": self.publishes_arguments,
                 "workspace_mutation": self.workspace_mutation,
+                "execution_contract": self.execution_contract.model_dump(mode="json"),
             },
             "registered_tool_capability",
         )
@@ -203,6 +207,7 @@ class RegisteredToolCapability(BaseModel):
                     "effect": self.effect.value,
                     "publishes_arguments": self.publishes_arguments,
                     "workspace_mutation": self.workspace_mutation,
+                    "execution_contract": self.execution_contract.model_dump(mode="json"),
                     "schema_fingerprint": self.schema_fingerprint,
                     "definition_fingerprint": self.definition_fingerprint,
                 },
@@ -224,6 +229,7 @@ def _revalidate_registered_tool_capability(
         effect=value.effect,
         publishes_arguments=value.publishes_arguments,
         workspace_mutation=value.workspace_mutation,
+        execution_contract=copy_tool_execution_contract(value.execution_contract),
         schema_fingerprint=value.schema_fingerprint,
         definition_fingerprint=value.definition_fingerprint,
     )

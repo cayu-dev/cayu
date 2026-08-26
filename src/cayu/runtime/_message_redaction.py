@@ -94,12 +94,16 @@ _TERMINAL_RESULT_STRUCTURE_KEYS = frozenset(
     {
         "durable_value_error_code",
         "durable_value_error_path",
+        "isolated_tool_cleanup_failure_code",
+        "isolated_tool_failure_code",
         "manual_reconciliation_required",
         "outcome_unknown",
         "portable_result_evidence",
         "portable_result_evidence_incomplete",
         "terminal_outcome",
         "tool_effect",
+        "tool_execution_boundary",
+        "tool_timeout_strength",
     }
 )
 _TOOL_POLICY_DENIAL_RESULT_STRUCTURE_KEYS = frozenset({"decision", "metadata", "reason"})
@@ -612,6 +616,9 @@ def _recognized_runtime_terminal_controls(
     """Return only positively validated runtime-owned terminal controls."""
 
     try:
-        return tool_results.runtime_terminal_controls(structured)
+        controls: dict[str, object] = tool_results.runtime_terminal_controls(structured)
+        if controls:
+            controls.update(tool_results.runtime_tool_execution_boundary_controls(structured))
+        return controls
     except (TypeError, ValueError):
         return {}

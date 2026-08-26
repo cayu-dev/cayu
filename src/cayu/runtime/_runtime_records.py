@@ -102,6 +102,7 @@ class RegisteredTool:
     effect: ToolEffect
     publish_arguments: bool
     workspace_mutation: bool
+    execution_contract: dict[str, Any]
     execution_profile_identity: ExecutionProfileBehaviorIdentity | None
     command_policy_execution_profile_identity: ExecutionProfileBehaviorIdentity | None
     tool: Tool

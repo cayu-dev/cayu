@@ -94,6 +94,26 @@ def test_readme_surfaces_reviewed_knowledge_and_links_runtime_contracts() -> Non
     assert "/docs/runtime-contracts.md" in readme
 
 
+def test_process_isolated_tool_documentation_preserves_boundary_claims() -> None:
+    guide = (_REPO_ROOT / "docs" / "process-isolated-tools.md").read_text(encoding="utf-8")
+    contracts = (_REPO_ROOT / "docs" / "runtime-contracts.md").read_text(encoding="utf-8")
+    documented = " ".join(f"{guide}\n{contracts}".split())
+
+    for required in (
+        "cooperative_in_process",
+        "hard_process_deadline",
+        "sandboxed=false",
+        "process group",
+        "TERM",
+        "KILL",
+        "outcome_unknown",
+        "does not replay",
+        "POSIX",
+        "Abrupt Cayu parent death",
+    ):
+        assert required in documented
+
+
 def test_release_facing_metadata_uses_public_urls() -> None:
     readme = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
     private_repository_url = "https://github.com/" + "vertex" + "kg/cayu"

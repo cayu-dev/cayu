@@ -4252,8 +4252,8 @@
             "$ref": "#/components/schemas/RuntimeManifest"
           },
           "schema_version": {
-            "const": "12",
-            "default": "12",
+            "const": "13",
+            "default": "13",
             "title": "Schema Version",
             "type": "string"
           },
@@ -18568,6 +18568,30 @@
       "ToolManifest": {
         "additionalProperties": false,
         "properties": {
+          "adapter_configuration_sha256": {
+            "anyOf": [
+              {
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter Configuration Sha256"
+          },
+          "adapter_identity": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Adapter Identity"
+          },
           "command_policy": {
             "anyOf": [
               {
@@ -18586,6 +18610,28 @@
           "effect": {
             "title": "Effect",
             "type": "string"
+          },
+          "execution_boundary": {
+            "default": "in_process",
+            "enum": [
+              "in_process",
+              "posix_process"
+            ],
+            "title": "Execution Boundary",
+            "type": "string"
+          },
+          "hard_deadline_seconds": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 86400.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hard Deadline Seconds"
           },
           "implementation_provenance": {
             "$ref": "#/components/schemas/RegistrationProvenance"
@@ -18616,6 +18662,21 @@
           },
           "registration_provenance": {
             "$ref": "#/components/schemas/RegistrationProvenance"
+          },
+          "sandboxed": {
+            "default": false,
+            "title": "Sandboxed",
+            "type": "boolean"
+          },
+          "timeout_strength": {
+            "default": "none",
+            "enum": [
+              "none",
+              "cooperative_in_process",
+              "hard_process_deadline"
+            ],
+            "title": "Timeout Strength",
+            "type": "string"
           },
           "workspace_mutation": {
             "default": false,

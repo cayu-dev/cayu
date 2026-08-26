@@ -115,6 +115,10 @@ from cayu.runtime._interruption_coordinator import (
     _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY,
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
 )
+from cayu.runtime._isolated_tool_process import (
+    isolated_tool_dispatch_record_matches,
+    isolated_tool_dispatch_storage_key,
+)
 from cayu.runtime._memory_evidence import (
     close_context_exposure_without_provider_effect,
     close_unrecoverable_context_exposure,
@@ -9284,10 +9288,17 @@ class RecoveryCoordinator:
             events=lifecycle_events,
             pending_round=pending_round,
         )
+        isolated_dispatched_ids = await self._isolated_tool_dispatch_ids(
+            session=request.session,
+            pending_round=pending_round,
+            registered_agent=request.registered_agent,
+        )
         interrupted_results = _interrupted_tool_round_results(
             tool_calls=pending_tool_calls,
             completed_outcomes=list(recorded_outcomes.values()),
             tool_round_identity=tool_round_identity,
+            registered_agent=request.registered_agent,
+            isolated_dispatched_ids=isolated_dispatched_ids,
             cancellation_artifacts=request.cancellation_artifacts,
             cancellation_artifacts_by_id=request.cancellation_artifacts_by_id,
         )
@@ -9300,7 +9311,7 @@ class RecoveryCoordinator:
         )
         cancellation_redactors = request.cancellation_redactors_by_id or {}
         interrupted_results = [
-            tool_results.redact_tool_call_outcomes(
+            tool_results.redact_runtime_owned_tool_call_outcomes(
                 [outcome],
                 cancellation_redactors.get(outcome.call.id, self._secret_redactor),
             )[0]
@@ -9417,6 +9428,69 @@ class RecoveryCoordinator:
                 "Round-scoped lifecycle lookup returned evidence for a different tool round."
             )
         return lifecycle_events
+
+    async def _isolated_tool_dispatch_ids(
+        self,
+        *,
+        session: Session,
+        pending_round: tool_round_recovery.PendingToolRound,
+        registered_agent: runtime_records.RegisteredAgentState,
+    ) -> set[str]:
+        """Load exact runtime-owned evidence that an isolated child was admitted."""
+
+        identity = tool_round_recovery.pending_tool_round_identity(pending_round)
+        dispatched_ids: set[str] = set()
+        for call in pending_round.tool_calls:
+            registered_tool = registered_agent.executable_tool(call.tool_name)
+            if registered_tool is None:
+                continue
+            contract = registered_tool.execution_contract
+            if type(contract) is not dict:
+                raise RuntimeError("Registered tool execution contract is malformed.")
+            if contract.get("boundary") != "posix_process":
+                continue
+            idempotency_key = tool_execution.tool_idempotency_key(
+                session_id=session.id,
+                tool_round_id=identity.tool_round_id,
+                tool_call_id=call.tool_call_id,
+            )
+            storage_key = isolated_tool_dispatch_storage_key(
+                session_id=session.id,
+                model_step_id=identity.model_step_id,
+                model_attempt_id=identity.model_attempt_id,
+                tool_round_id=identity.tool_round_id,
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                idempotency_key=idempotency_key,
+            )
+            record = await self._session_store.load_session_operation(
+                session.id,
+                storage_key,
+            )
+            if record is None:
+                continue
+            if (
+                pending_round.source_run_epoch is None
+                or pending_round.execution_profile_fingerprint is None
+                or not isolated_tool_dispatch_record_matches(
+                    record,
+                    session_id=session.id,
+                    parent_task_id=pending_round.task_id,
+                    parent_run_epoch=pending_round.source_run_epoch,
+                    model_step_id=identity.model_step_id,
+                    model_attempt_id=identity.model_attempt_id,
+                    tool_round_id=identity.tool_round_id,
+                    tool_call_id=call.tool_call_id,
+                    tool_name=call.tool_name,
+                    idempotency_key=idempotency_key,
+                    execution_profile_fingerprint=(pending_round.execution_profile_fingerprint),
+                )
+            ):
+                raise RuntimeError(
+                    "Isolated tool dispatch evidence conflicts with its pending round."
+                )
+            dispatched_ids.add(call.tool_call_id)
+        return dispatched_ids
 
     async def _complete_recovery_assistant_publication(
         self,
@@ -14914,6 +14988,8 @@ def _interrupted_tool_round_results(
     tool_calls: list[runtime_records.ToolCallRequest],
     completed_outcomes: list[runtime_records.ToolCallOutcome],
     tool_round_identity: ToolRoundIdentity,
+    registered_agent: runtime_records.RegisteredAgentState | None = None,
+    isolated_dispatched_ids: set[str] | None = None,
     cancellation_artifacts: list[dict[str, Any]] | None = None,
     cancellation_artifacts_by_id: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[runtime_records.ToolCallOutcome]:
@@ -14934,6 +15010,14 @@ def _interrupted_tool_round_results(
             _interrupted_tool_call_outcome(
                 tool_call=tool_call,
                 tool_round_identity=tool_round_identity,
+                registered_tool=(
+                    None
+                    if registered_agent is None
+                    else registered_agent.executable_tool(tool_call.name)
+                ),
+                execution_started=(
+                    isolated_dispatched_ids is not None and tool_call.id in isolated_dispatched_ids
+                ),
                 artifacts=result_artifacts,
             )
         )

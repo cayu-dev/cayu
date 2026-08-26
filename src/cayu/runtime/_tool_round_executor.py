@@ -174,7 +174,11 @@ from cayu.runtime.structured_output import (
     StructuredOutputSpec,
     copy_structured_output_spec,
 )
-from cayu.runtime.tool_catalogue import CALL_TOOL_NAME, SEARCH_TOOLS_NAME
+from cayu.runtime.tool_catalogue import (
+    CALL_TOOL_NAME,
+    SEARCH_TOOLS_NAME,
+    ToolExecutionContract,
+)
 from cayu.runtime.tool_discovery import (
     TOOL_DISCOVERY_REFERENCE_PREFIX,
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
@@ -4179,6 +4183,8 @@ class ToolRoundExecutor:
             interrupted_outcome = _interrupted_tool_call_outcome(
                 tool_call=tool_call,
                 tool_round_identity=tool_round_identity,
+                registered_tool=registered_agent.executable_tool(tool_call.name),
+                execution_started=True,
                 artifacts=artifacts,
             )
             interrupted_event = _interrupted_tool_call_event(
@@ -4231,6 +4237,8 @@ class ToolRoundExecutor:
                 ctx=tool_context,
                 arguments=effective_tool_call.arguments,
                 redactor=lambda: invocation_secret_scope.redactor,
+                registered_schema=registered_tool.schema,
+                registered_execution_contract=registered_tool.execution_contract,
                 finalize_publication=invocation_secret_scope.seal_for_publication,
                 timeout_seconds=self._tool_timeout_seconds,
             )
@@ -7496,6 +7504,8 @@ def _interrupted_tool_call_outcome(
     *,
     tool_call: runtime_records.ToolCallRequest,
     tool_round_identity: ToolRoundIdentity,
+    registered_tool: runtime_records.RegisteredTool | None,
+    execution_started: bool,
     artifacts: list[dict[str, Any]] | None = None,
 ) -> runtime_records.ToolCallOutcome:
     """Build the canonical bounded result for one interrupted tool call."""
@@ -7506,6 +7516,26 @@ def _interrupted_tool_call_outcome(
         "tool_name": tool_call.name,
         **copy_tool_round_identity(tool_round_identity).payload(),
     }
+    if execution_started and registered_tool is not None:
+        try:
+            execution_contract = ToolExecutionContract.model_validate(
+                registered_tool.execution_contract
+            )
+        except (TypeError, ValueError):
+            execution_contract = None
+        if execution_contract is not None and execution_contract.boundary == "posix_process":
+            process_controls = {
+                "terminal_outcome": "tool_execution_error",
+                "tool_effect": registered_tool.effect.value,
+                "outcome_unknown": registered_tool.effect is not ToolEffect.NONE,
+                "manual_reconciliation_required": (registered_tool.effect is ToolEffect.EXTERNAL),
+                "isolated_tool_failure_code": "process_interrupted",
+                "tool_execution_boundary": "posix_process",
+                "tool_timeout_strength": "hard_process_deadline",
+            }
+            tool_results.runtime_terminal_controls(process_controls)
+            tool_results.runtime_tool_execution_boundary_controls(process_controls)
+            structured.update(process_controls)
     return runtime_records.ToolCallOutcome(
         call=tool_call,
         result=ToolResult(
@@ -7527,6 +7557,9 @@ def _interrupted_tool_call_event(
 ) -> Event:
     """Build the terminal event paired with the canonical interrupted result."""
 
+    structured = dict(tool_call_outcome.result.structured or {})
+    terminal_controls = tool_results.runtime_terminal_controls(structured)
+    terminal_controls.update(tool_results.runtime_tool_execution_boundary_controls(structured))
     return Event(
         type=(
             EventType.TOOL_CALL_FAILED
@@ -7546,6 +7579,7 @@ def _interrupted_tool_call_event(
             ),
             "interrupted": True,
             "result": tool_call_outcome.result.model_dump(),
+            **terminal_controls,
             **copy_tool_round_identity(tool_round_identity).payload(),
         },
     )

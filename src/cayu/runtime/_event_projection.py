@@ -295,6 +295,10 @@ _TERMINAL_CONTROL_KEYS = frozenset(
         "manual_reconciliation_required",
         "durable_value_error_code",
         "durable_value_error_path",
+        "isolated_tool_failure_code",
+        "isolated_tool_cleanup_failure_code",
+        "tool_execution_boundary",
+        "tool_timeout_strength",
     }
 )
 _WORKSPACE_MUTATION_CAPTURE_CONTROLS = frozenset(
@@ -1317,6 +1321,10 @@ _TOOL_RESULT_NESTED_PATHS = frozenset(
         ("result", "structured", "manual_reconciliation_required"),
         ("result", "structured", "durable_value_error_code"),
         ("result", "structured", "durable_value_error_path"),
+        ("result", "structured", "isolated_tool_failure_code"),
+        ("result", "structured", "isolated_tool_cleanup_failure_code"),
+        ("result", "structured", "tool_execution_boundary"),
+        ("result", "structured", "tool_timeout_strength"),
     }
 )
 _TOOL_RESULT_PROJECTION_RECORD_FIELDS = frozenset(
@@ -2282,12 +2290,16 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     tool_terminal = tool_common | {
         "durable_value_error_code",
         "durable_value_error_path",
+        "isolated_tool_failure_code",
+        "isolated_tool_cleanup_failure_code",
         "manual_reconciliation_required",
         "manual_recovery",
         "outcome_unknown",
         "registration_state",
         "terminal_outcome",
         "tool_effect",
+        "tool_execution_boundary",
+        "tool_timeout_strength",
         WEB_ACCESS_RESULT_AUTHORITY_FIELD,
     }
     tool_actor_paths = _resolution_actor_nested_paths("resolved_by")

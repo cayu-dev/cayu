@@ -56,6 +56,7 @@ from cayu.core.execution_identity import (
     ExecutionProfileBehaviorIdentity,
     copy_execution_profile_behavior_identity,
 )
+from cayu.core.isolated_tools import ProcessIsolatedTool
 from cayu.core.messages import (
     FilePart,
     Message,
@@ -126,6 +127,10 @@ from cayu.runtime._execution_profile_identity_validation import (
 )
 from cayu.runtime._interruption_coordinator import (
     BackgroundInterruptionCoordinator,
+)
+from cayu.runtime._isolated_tool_process import (
+    isolated_tool_execution_contract,
+    validate_process_isolated_tool_registration,
 )
 from cayu.runtime._model_step_executor import (
     ModelCompletionPublicationRequest,
@@ -410,6 +415,7 @@ from cayu.runtime.tool_catalogue import (
     ToolCatalogSnapshot,
     ToolDescriptor,
     ToolDescriptorProvenance,
+    ToolExecutionContract,
     build_tool_catalog_snapshot,
     build_tool_descriptor,
     mcp_source_tool_fingerprint,
@@ -2012,6 +2018,7 @@ class CayuApp:
             registered_tool = _validate_registered_tool(
                 tool,
                 redactor=self._secret_redactor,
+                timeout_seconds=self._tool_timeout_seconds,
             )
             if registered_tool.name in tools_by_name:
                 raise ValueError(f"Duplicate tool registered for agent: {registered_tool.name}")
@@ -2023,6 +2030,7 @@ class CayuApp:
                 SearchToolsTool(),
                 redactor=self._secret_redactor,
                 framework_owned=True,
+                timeout_seconds=self._tool_timeout_seconds,
             )
             runtime_tools_by_name[search_tool.name] = search_tool
 
@@ -7210,6 +7218,10 @@ def _copy_registered_tool(tool: runtime_records.RegisteredTool) -> runtime_recor
         effect=tool.effect,
         publish_arguments=tool.publish_arguments,
         workspace_mutation=tool.workspace_mutation,
+        execution_contract=copy_json_value(
+            tool.execution_contract,
+            "registered_tool.execution_contract",
+        ),
         execution_profile_identity=copy_execution_profile_behavior_identity(
             tool.execution_profile_identity
         ),
@@ -7354,6 +7366,7 @@ def _validate_registered_tool(
     *,
     redactor: SecretRedactor,
     framework_owned: bool = False,
+    timeout_seconds: float | None,
 ) -> runtime_records.RegisteredTool:
     spec = getattr(tool, "spec", None)
     if type(spec) is not ToolSpec:
@@ -7384,6 +7397,20 @@ def _validate_registered_tool(
         workspace_mutation=spec.workspace_mutation,
     )
     command_policy = getattr(tool, "command_policy", None)
+    if isinstance(tool, ProcessIsolatedTool):
+        if validated_spec.workspace_mutation:
+            raise ValueError(
+                "Process-isolated tools cannot request Cayu workspace mutation authority."
+            )
+        validate_process_isolated_tool_registration(tool, redactor=redactor)
+        execution_contract = isolated_tool_execution_contract(
+            tool,
+            runtime_timeout_seconds=timeout_seconds,
+        )
+    else:
+        execution_contract = ToolExecutionContract(
+            timeout_strength=("cooperative_in_process" if timeout_seconds is not None else "none")
+        ).model_dump(mode="json")
     return runtime_records.RegisteredTool(
         name=validated_spec.name,
         description=validated_spec.description,
@@ -7392,6 +7419,7 @@ def _validate_registered_tool(
         effect=validated_spec.effect,
         publish_arguments=publish_arguments,
         workspace_mutation=validated_spec.workspace_mutation,
+        execution_contract=execution_contract,
         execution_profile_identity=copy_secret_free_execution_profile_behavior_identity(
             tool.execution_profile_identity,
             redactor=redactor,
@@ -7438,6 +7466,7 @@ def _registered_tool_descriptor(
         effect=tool.effect,
         publishes_arguments=tool.publish_arguments,
         workspace_mutation=tool.workspace_mutation,
+        execution_contract=ToolExecutionContract.model_validate(tool.execution_contract),
         provenance=provenance,
     )
 

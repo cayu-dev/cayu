@@ -10,15 +10,25 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Annotated, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, PlainValidator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    PlainValidator,
+    field_validator,
+    model_validator,
+)
 
 from cayu._validation import collision_safe_json_object, copy_json_value
 from cayu.core.agents import AgentAuthoringState
+from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.environments import ExecutionRequirements
 from cayu.runtime.request_footprints import (
     REQUEST_FOOTPRINT_CANONICALIZATION_VERSION,
     REQUEST_FOOTPRINT_SCHEMA_VERSION,
 )
+from cayu.runtime.tool_catalogue import ToolExecutionContract
 from cayu.runtime.tool_policy import (
     AllowAllToolPolicy,
     AlwaysRequireApprovalToolPolicy,
@@ -42,7 +52,7 @@ if TYPE_CHECKING:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime.app import CayuApp
 
-APP_MANIFEST_SCHEMA_VERSION = "12"
+APP_MANIFEST_SCHEMA_VERSION = "13"
 _ABSOLUTE_PATH_PLACEHOLDER = "[ABSOLUTE_PATH]"
 _MEMORY_ADDRESS_PLACEHOLDER = "[MEMORY_ADDRESS]"
 _OBJECT_REPRESENTATION_PLACEHOLDER = "[OBJECT_REPRESENTATION]"
@@ -161,11 +171,55 @@ class ToolManifest(_ManifestModel):
     effect: str
     parallel_safe: bool
     workspace_mutation: bool = False
+    execution_boundary: Literal["in_process", "posix_process"] = "in_process"
+    timeout_strength: Literal[
+        "none",
+        "cooperative_in_process",
+        "hard_process_deadline",
+    ] = "none"
+    sandboxed: bool = False
+    adapter_identity: FrozenJsonObject | None = None
+    adapter_configuration_sha256: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+    )
+    hard_deadline_seconds: float | None = Field(default=None, gt=0, le=24 * 60 * 60)
     input_schema: FrozenJsonObject = Field(default_factory=lambda: MappingProxyType({}))
     policy_coverage: Literal["allowed", "denied", "approval_required", "conditional", "unknown"]
     command_policy: str | None = None
     registration_provenance: RegistrationProvenance
     implementation_provenance: RegistrationProvenance
+
+    @field_validator("adapter_identity", mode="before")
+    @classmethod
+    def validate_adapter_identity(cls, value: object) -> object:
+        if value is None:
+            return None
+        try:
+            identity = ExecutionProfileBehaviorIdentity.model_validate(value)
+        except Exception:
+            raise ValueError("Process adapter identity is invalid.") from None
+        return identity.model_dump(mode="json")
+
+    @model_validator(mode="after")
+    def validate_execution_boundary(self) -> ToolManifest:
+        adapter_fields = (
+            self.adapter_identity,
+            self.adapter_configuration_sha256,
+            self.hard_deadline_seconds,
+        )
+        if self.sandboxed:
+            raise ValueError("Host-tool execution cannot claim sandboxing.")
+        if self.execution_boundary == "in_process":
+            if self.timeout_strength not in {"none", "cooperative_in_process"} or any(
+                value is not None for value in adapter_fields
+            ):
+                raise ValueError("In-process tool manifest evidence is inconsistent.")
+        elif self.timeout_strength != "hard_process_deadline" or any(
+            value is None for value in adapter_fields
+        ):
+            raise ValueError("Process-isolated tool manifest evidence is incomplete.")
+        return self
 
 
 class HostedToolManifest(_ManifestModel):
@@ -289,7 +343,7 @@ class RuntimeManifest(_ManifestModel):
 
 
 class AppManifest(_ManifestModel):
-    schema_version: Literal["12"] = APP_MANIFEST_SCHEMA_VERSION
+    schema_version: Literal["13"] = APP_MANIFEST_SCHEMA_VERSION
     fingerprint: str
     agents: tuple[AgentManifest, ...]
     providers: tuple[ProviderManifest, ...]
@@ -512,17 +566,13 @@ def _describe_agent(
             registration.execution_requirements.model_dump(mode="python")
         ),
         tools=tuple(
-            ToolManifest(
-                name=tool_name,
-                description=tool.description,
-                effect=tool.effect.value,
-                parallel_safe=tool.parallel_safe,
-                workspace_mutation=tool.workspace_mutation,
-                input_schema=app.redact_json(tool.schema),
-                policy_coverage=_tool_policy_coverage(registration.tool_policy, tool_name),
-                command_policy=_command_policy_name(tool.tool),
+            _describe_tool(
+                app,
+                tool_name=tool_name,
+                tool=tool,
+                tool_policy=registration.tool_policy,
                 registration_provenance=registration_provenance,
-                implementation_provenance=_provenance(tool.tool, project_root),
+                project_root=project_root,
             )
             for tool_name, tool in sorted(registration.tools.items())
         ),
@@ -542,6 +592,40 @@ def _describe_agent(
         loop_policies=tuple(_type_name(item) for item in registration.loop_policies),
         registration_provenance=registration_provenance,
         implementation_provenance=_provenance(spec, project_root),
+    )
+
+
+def _describe_tool(
+    app: CayuApp,
+    *,
+    tool_name: str,
+    tool: runtime_records.RegisteredTool,
+    tool_policy: ToolPolicy,
+    registration_provenance: RegistrationProvenance,
+    project_root: Path | None,
+) -> ToolManifest:
+    execution_contract = ToolExecutionContract.model_validate(tool.execution_contract)
+    return ToolManifest(
+        name=tool_name,
+        description=tool.description,
+        effect=tool.effect.value,
+        parallel_safe=tool.parallel_safe,
+        workspace_mutation=tool.workspace_mutation,
+        execution_boundary=execution_contract.boundary,
+        timeout_strength=execution_contract.timeout_strength,
+        sandboxed=execution_contract.sandboxed,
+        adapter_identity=(
+            None
+            if execution_contract.adapter_identity is None
+            else execution_contract.adapter_identity.model_dump(mode="json")
+        ),
+        adapter_configuration_sha256=execution_contract.adapter_configuration_sha256,
+        hard_deadline_seconds=execution_contract.hard_deadline_seconds,
+        input_schema=app.redact_json(tool.schema),
+        policy_coverage=_tool_policy_coverage(tool_policy, tool_name),
+        command_policy=_command_policy_name(tool.tool),
+        registration_provenance=registration_provenance,
+        implementation_provenance=_provenance(tool.tool, project_root),
     )
 
 

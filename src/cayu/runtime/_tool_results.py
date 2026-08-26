@@ -79,6 +79,10 @@ _RUNTIME_TERMINAL_CONTROL_FIELDS = frozenset(
         "manual_reconciliation_required",
         "durable_value_error_code",
         "durable_value_error_path",
+        "isolated_tool_failure_code",
+        "isolated_tool_cleanup_failure_code",
+        "tool_execution_boundary",
+        "tool_timeout_strength",
     }
 )
 _RUNTIME_TOOL_EVENT_LINKAGE_FIELDS = frozenset(
@@ -173,6 +177,7 @@ def redact_tool_result_event(
     if not isinstance(redactor, SecretRedactor):
         raise TypeError("redactor must be a SecretRedactor.")
     terminal_controls = runtime_terminal_controls(event.payload)
+    terminal_controls.update(runtime_tool_execution_boundary_controls(event.payload))
     if not redactor.has_values:
         return web_access_results.restore_attested_tool_result(
             event,
@@ -339,6 +344,49 @@ def runtime_terminal_controls(payload: dict[str, Any]) -> dict[str, Any]:
     return controls
 
 
+def runtime_tool_execution_boundary_controls(payload: dict[str, Any]) -> dict[str, str]:
+    """Validate execution-boundary controls from a runtime-owned event payload."""
+
+    fields = {
+        key: payload[key]
+        for key in (
+            "isolated_tool_failure_code",
+            "isolated_tool_cleanup_failure_code",
+            "tool_execution_boundary",
+            "tool_timeout_strength",
+        )
+        if key in payload
+    }
+    if not fields:
+        return {}
+    if fields.get("tool_execution_boundary") == "in_process":
+        if fields != {
+            "tool_execution_boundary": "in_process",
+            "tool_timeout_strength": "cooperative_in_process",
+        }:
+            raise ValueError("Runtime in-process tool controls are inconsistent.")
+        return {key: str(value) for key, value in fields.items()}
+    if (
+        fields.get("tool_execution_boundary") != "posix_process"
+        or fields.get("tool_timeout_strength") != "hard_process_deadline"
+        or "isolated_tool_failure_code" not in fields
+    ):
+        raise ValueError("Runtime isolated-tool controls are incomplete.")
+    for key in ("isolated_tool_failure_code", "isolated_tool_cleanup_failure_code"):
+        if key not in fields:
+            continue
+        value = fields[key]
+        if (
+            type(value) is not str
+            or not value
+            or len(value) > 128
+            or value[0] not in "abcdefghijklmnopqrstuvwxyz"
+            or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in value)
+        ):
+            raise ValueError(f"Invalid runtime {key} control.")
+    return {key: str(value) for key, value in fields.items()}
+
+
 def runtime_tool_event_boundary_controls(
     payload: dict[str, Any],
     *,
@@ -354,6 +402,7 @@ def runtime_tool_event_boundary_controls(
     projection_references: dict[int, dict[str, Any]] = {}
     if include_terminal_controls:
         controls.update(runtime_terminal_controls(payload))
+        controls.update(runtime_tool_execution_boundary_controls(payload))
     evidence = _runtime_tool_result_projection(payload)
     if evidence is not None:
         projection, projection_references = evidence
@@ -480,6 +529,51 @@ def redact_tool_call_outcomes(
         )
         for outcome in outcomes
     ]
+
+
+def redact_runtime_owned_tool_call_outcomes(
+    outcomes: list[runtime_records.ToolCallOutcome],
+    redactor: SecretRedactor,
+) -> list[runtime_records.ToolCallOutcome]:
+    """Redact trusted runtime outcomes without rewriting validated controls.
+
+    This entrance is deliberately separate from ``redact_tool_call_outcomes``:
+    a value merely shaped like a runtime control is not authority to bypass
+    workload-secret redaction.
+    """
+
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+    redacted_outcomes: list[runtime_records.ToolCallOutcome] = []
+    for outcome in outcomes:
+        structured = dict(outcome.result.structured or {})
+        controls: dict[str, Any] = runtime_terminal_controls(structured)
+        controls.update(runtime_tool_execution_boundary_controls(structured))
+        if not controls:
+            redacted_result = redact_tool_result(outcome.result, redactor)
+        else:
+            redacted_result = _redact_terminal_result(
+                _tool_result_without_terminal_controls(
+                    outcome.result,
+                    terminal_controls=controls,
+                ),
+                redactor,
+            )
+            redacted_structured = dict(redacted_result.structured or {})
+            redacted_structured.update(controls)
+            redacted_result = ToolResult(
+                content=redacted_result.content,
+                structured=redacted_structured,
+                artifacts=redacted_result.artifacts,
+                is_error=redacted_result.is_error,
+            )
+        redacted_outcomes.append(
+            runtime_records.ToolCallOutcome(
+                call=outcome.call,
+                result=redacted_result,
+            )
+        )
+    return redacted_outcomes
 
 
 def tool_result_from_payload(payload: dict[str, Any]) -> ToolResult:

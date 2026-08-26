@@ -2108,7 +2108,7 @@ export type AppManifest = {
     /**
      * Schema Version
      */
-    schema_version?: '12';
+    schema_version?: '13';
     stores: StoreManifest;
 };
 
@@ -9649,6 +9649,16 @@ export type ToolCalledAssertionSpec = {
  */
 export type ToolManifest = {
     /**
+     * Adapter Configuration Sha256
+     */
+    adapter_configuration_sha256?: string | null;
+    /**
+     * Adapter Identity
+     */
+    adapter_identity?: {
+        [key: string]: unknown;
+    } | null;
+    /**
      * Command Policy
      */
     command_policy?: string | null;
@@ -9660,6 +9670,14 @@ export type ToolManifest = {
      * Effect
      */
     effect: string;
+    /**
+     * Execution Boundary
+     */
+    execution_boundary?: 'in_process' | 'posix_process';
+    /**
+     * Hard Deadline Seconds
+     */
+    hard_deadline_seconds?: number | null;
     implementation_provenance: RegistrationProvenance;
     /**
      * Input Schema
@@ -9680,6 +9698,14 @@ export type ToolManifest = {
      */
     policy_coverage: 'allowed' | 'denied' | 'approval_required' | 'conditional' | 'unknown';
     registration_provenance: RegistrationProvenance;
+    /**
+     * Sandboxed
+     */
+    sandboxed?: boolean;
+    /**
+     * Timeout Strength
+     */
+    timeout_strength?: 'none' | 'cooperative_in_process' | 'hard_process_deadline';
     /**
      * Workspace Mutation
      */

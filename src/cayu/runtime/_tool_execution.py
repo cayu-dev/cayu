@@ -5,7 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
-from cayu._exception_groups import exception_tree_contains
+from cayu._exception_groups import exception_cause, exception_tree_contains
 from cayu._task_wait import restore_task_cancellation_requests
 from cayu._validation import (
     FrozenJsonDict,
@@ -14,6 +14,7 @@ from cayu._validation import (
     freeze_json_value,
     thaw_json_value,
 )
+from cayu.core.isolated_tools import ProcessIsolatedTool
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult
 from cayu.runners import RunnerExecutionError, RunnerUnavailableError
 from cayu.runtime import _tool_results as tool_results
@@ -21,6 +22,16 @@ from cayu.runtime._durable_subagents import (
     durable_subagent_committed_cancellation_outcome,
     durable_subagent_unsettled_cancellation_outcome,
     is_durable_subagent_submission_unsettled,
+)
+from cayu.runtime._isolated_tool_process import (
+    IsolatedToolCleanupUnproven,
+    IsolatedToolDeadlineExceeded,
+    IsolatedToolFailure,
+    IsolatedToolInvalidOutput,
+    IsolatedToolPreDispatchFailure,
+    IsolatedToolSettlementFailure,
+    execute_process_isolated_tool,
+    isolated_tool_execution_contract,
 )
 from cayu.runtime._tool_identity import tool_idempotency_key as tool_idempotency_key
 from cayu.runtime.tool_policy import ToolPolicyResult
@@ -155,6 +166,28 @@ def _caller_cancellation_after_tool_timeout(
     return asyncio.CancelledError("Tool execution was cancelled during timeout settlement.")
 
 
+def _isolated_cancellation_cause(
+    tool: Tool,
+    cancellation: asyncio.CancelledError,
+) -> IsolatedToolFailure | IsolatedToolDeadlineExceeded | None:
+    """Copy only fixed runtime-owned process evidence onto caller cancellation."""
+
+    if type(tool) is not ProcessIsolatedTool:
+        return None
+    cause = exception_cause(cancellation)
+    if type(cause) is IsolatedToolCleanupUnproven:
+        return IsolatedToolCleanupUnproven(cause.code)
+    if type(cause) is IsolatedToolInvalidOutput:
+        return IsolatedToolInvalidOutput(cause.code)
+    if type(cause) is IsolatedToolPreDispatchFailure:
+        return IsolatedToolPreDispatchFailure(cause.code)
+    if type(cause) is IsolatedToolFailure:
+        return IsolatedToolFailure(cause.code)
+    if type(cause) is IsolatedToolDeadlineExceeded:
+        return IsolatedToolDeadlineExceeded()
+    return None
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class ToolExecutionOutcome:
     """Runtime-owned result plus terminal controls a tool cannot supply.
@@ -220,6 +253,82 @@ def _execution_outcome(
     )
 
 
+def _isolated_failure_outcome(
+    *,
+    terminal_outcome: str,
+    effect: ToolEffect,
+    message: str,
+    failure_code: str,
+    redactor: SecretRedactor,
+    cleanup_failure_code: str | None = None,
+) -> ToolExecutionOutcome:
+    result, controls = tool_results.terminal_failure_result(
+        terminal_outcome=terminal_outcome,
+        effect=effect,
+        message=message,
+        redactor=redactor,
+    )
+    structured = dict(result.structured or {})
+    isolated_controls = {
+        "isolated_tool_failure_code": failure_code,
+        "tool_execution_boundary": "posix_process",
+        "tool_timeout_strength": "hard_process_deadline",
+    }
+    if cleanup_failure_code is not None:
+        isolated_controls["isolated_tool_cleanup_failure_code"] = cleanup_failure_code
+    structured.update(isolated_controls)
+    controls.update(isolated_controls)
+    return _execution_outcome(
+        ToolResult(
+            content=result.content,
+            structured=structured,
+            artifacts=result.artifacts,
+            is_error=True,
+        ),
+        controls,
+    )
+
+
+def _tool_timeout_outcome(
+    *,
+    tool: Tool,
+    effect: ToolEffect,
+    timeout_seconds: float | None,
+    redactor: SecretRedactor,
+) -> ToolExecutionOutcome:
+    message = f"Tool call timed out after {timeout_seconds} seconds."
+    if type(tool) is ProcessIsolatedTool:
+        return _isolated_failure_outcome(
+            terminal_outcome="tool_execution_timeout",
+            effect=effect,
+            message=message,
+            failure_code="hard_process_deadline_exceeded",
+            redactor=redactor,
+        )
+    result, controls = tool_results.terminal_failure_result(
+        terminal_outcome="tool_execution_timeout",
+        effect=effect,
+        message=message,
+        redactor=redactor,
+    )
+    timeout_controls = {
+        "tool_execution_boundary": "in_process",
+        "tool_timeout_strength": "cooperative_in_process",
+    }
+    structured = dict(result.structured or {})
+    structured.update(timeout_controls)
+    controls.update(timeout_controls)
+    return _execution_outcome(
+        ToolResult(
+            content=result.content,
+            structured=structured,
+            artifacts=result.artifacts,
+            is_error=True,
+        ),
+        controls,
+    )
+
+
 async def run_tool(
     *,
     tool: Tool,
@@ -227,6 +336,8 @@ async def run_tool(
     ctx: ToolContext,
     arguments: dict[str, Any],
     redactor: Callable[[], SecretRedactor],
+    registered_schema: dict[str, Any] | None = None,
+    registered_execution_contract: dict[str, Any] | None = None,
     finalize_publication: Callable[[], InvocationPublicationSnapshot] | None = None,
     timeout_seconds: float | None = None,
 ) -> ToolExecutionOutcome:
@@ -241,6 +352,8 @@ async def run_tool(
             ctx=ctx,
             arguments=arguments,
             redactor=redactor,
+            registered_schema=registered_schema,
+            registered_execution_contract=registered_execution_contract,
             timeout_seconds=timeout_seconds,
         )
     except BaseException:
@@ -272,6 +385,8 @@ async def _run_tool(
     ctx: ToolContext,
     arguments: dict[str, Any],
     redactor: Callable[[], SecretRedactor],
+    registered_schema: dict[str, Any] | None,
+    registered_execution_contract: dict[str, Any] | None,
     timeout_seconds: float | None,
 ) -> ToolExecutionOutcome:
     timer: _ToolTimeoutOwner | None = None
@@ -283,12 +398,34 @@ async def _run_tool(
     if not callable(redactor):
         raise TypeError("redactor must be a callable returning SecretRedactor.")
     try:
+
+        async def invoke_registered_tool() -> ToolResult:
+            if type(tool) is not ProcessIsolatedTool:
+                return await tool.run(ctx, arguments)
+            if registered_schema is None:
+                raise IsolatedToolPreDispatchFailure("registered_schema_missing")
+            if registered_execution_contract is None:
+                raise IsolatedToolPreDispatchFailure("registered_execution_contract_missing")
+            current_execution_contract = isolated_tool_execution_contract(
+                tool,
+                runtime_timeout_seconds=timeout_seconds,
+            )
+            if current_execution_contract != registered_execution_contract:
+                raise IsolatedToolPreDispatchFailure("registered_execution_contract_mismatch")
+            return await execute_process_isolated_tool(
+                tool=tool,
+                context=ctx,
+                arguments=arguments,
+                registered_schema=registered_schema,
+                redactor=_active_redactor(redactor),
+            )
+
         if timeout_seconds is None:
-            raw_result = await tool.run(ctx, arguments)
+            raw_result = await invoke_registered_tool()
         else:
 
             async def invoke_tool() -> ToolResult:
-                return await tool.run(ctx, arguments)
+                return await invoke_registered_tool()
 
             operation_task = asyncio.create_task(
                 invoke_tool(),
@@ -308,7 +445,7 @@ async def _run_tool(
         if timer is None:
             raise
         if timer.external_request_count() > 0:
-            raise timer.caller_cancellation(exc) from None
+            raise timer.caller_cancellation(exc) from _isolated_cancellation_cause(tool, exc)
         if not timer.cancellation_request_count():
             raise
         # A runner boundary may replace the delivered cancellation while
@@ -316,24 +453,121 @@ async def _run_tool(
         # the replacement exception's arguments, remains authoritative when
         # no separate caller request exists.
         ctx._discard_policy_denials_for(tool)
-        result, controls = tool_results.terminal_failure_result(
-            terminal_outcome="tool_execution_timeout",
+        cleanup_failure = exception_cause(exc)
+        if type(tool) is ProcessIsolatedTool and isinstance(
+            cleanup_failure,
+            IsolatedToolCleanupUnproven,
+        ):
+            return _isolated_failure_outcome(
+                terminal_outcome="tool_execution_timeout",
+                effect=effect,
+                message="Isolated tool process cleanup could not be proven.",
+                failure_code="process_cleanup_unproven",
+                cleanup_failure_code=cleanup_failure.code,
+                redactor=_active_redactor(redactor),
+            )
+        if type(tool) is ProcessIsolatedTool and isinstance(
+            cleanup_failure,
+            IsolatedToolFailure,
+        ):
+            return _isolated_failure_outcome(
+                terminal_outcome="tool_execution_timeout",
+                effect=effect,
+                message="Isolated tool timed out and reported a secondary process failure.",
+                failure_code="hard_process_deadline_exceeded",
+                cleanup_failure_code=cleanup_failure.code,
+                redactor=_active_redactor(redactor),
+            )
+        return _tool_timeout_outcome(
+            tool=tool,
             effect=effect,
-            message=f"Tool call timed out after {timeout_seconds} seconds.",
+            redactor=_active_redactor(redactor),
+            timeout_seconds=timeout_seconds,
+        )
+    except IsolatedToolPreDispatchFailure as exc:
+        ctx._discard_policy_denials_for(tool)
+        error_kind = (
+            "invalid_arguments"
+            if exc.code.startswith("argument") or exc.code.startswith("request_invalid")
+            else "tool_unavailable"
+        )
+        isolated_controls = {
+            "isolated_tool_failure_code": exc.code,
+            "tool_execution_boundary": "posix_process",
+            "tool_timeout_strength": "hard_process_deadline",
+        }
+        return _execution_outcome(
+            ToolResult(
+                content="Isolated tool execution was rejected before child dispatch.",
+                structured={
+                    "error": error_kind,
+                    **isolated_controls,
+                },
+                is_error=True,
+            ),
+            isolated_controls,
+        )
+    except IsolatedToolSettlementFailure as exc:
+        ctx._discard_policy_denials_for(tool)
+        terminal_outcome = {
+            "timeout": "tool_execution_timeout",
+            "invalid_output": "invalid_tool_output",
+            "execution_error": "tool_execution_error",
+        }[exc.primary_kind]
+        return _isolated_failure_outcome(
+            terminal_outcome=terminal_outcome,
+            effect=effect,
+            message="Isolated tool process cleanup could not be proven.",
+            failure_code=exc.code,
+            cleanup_failure_code=exc.cleanup_code,
             redactor=_active_redactor(redactor),
         )
-        return _execution_outcome(result, controls)
+    except IsolatedToolCleanupUnproven as exc:
+        ctx._discard_policy_denials_for(tool)
+        return _isolated_failure_outcome(
+            terminal_outcome="tool_execution_error",
+            effect=effect,
+            message="Isolated tool process cleanup could not be proven.",
+            failure_code="process_cleanup_unproven",
+            cleanup_failure_code=exc.code,
+            redactor=_active_redactor(redactor),
+        )
+    except IsolatedToolDeadlineExceeded:
+        ctx._discard_policy_denials_for(tool)
+        return _isolated_failure_outcome(
+            terminal_outcome="tool_execution_timeout",
+            effect=effect,
+            message="Isolated tool exceeded its hard process deadline.",
+            failure_code="hard_process_deadline_exceeded",
+            redactor=_active_redactor(redactor),
+        )
+    except IsolatedToolInvalidOutput as exc:
+        ctx._discard_policy_denials_for(tool)
+        return _isolated_failure_outcome(
+            terminal_outcome="invalid_tool_output",
+            effect=effect,
+            message="Isolated tool returned an invalid bounded result.",
+            failure_code=exc.code,
+            redactor=_active_redactor(redactor),
+        )
+    except IsolatedToolFailure as exc:
+        ctx._discard_policy_denials_for(tool)
+        return _isolated_failure_outcome(
+            terminal_outcome="tool_execution_error",
+            effect=effect,
+            message="Isolated tool process execution failed.",
+            failure_code=exc.code,
+            redactor=_active_redactor(redactor),
+        )
     except TimeoutError as exc:
         ctx._discard_policy_denials_for(tool)
         if timer is not None and timer.expired():
-            active_redactor = _active_redactor(redactor)
-            result, controls = tool_results.terminal_failure_result(
-                terminal_outcome="tool_execution_timeout",
+            return _tool_timeout_outcome(
+                tool=tool,
                 effect=effect,
-                message=f"Tool call timed out after {timeout_seconds} seconds.",
-                redactor=active_redactor,
+                redactor=_active_redactor(redactor),
+                timeout_seconds=timeout_seconds,
             )
-            return _execution_outcome(result, controls)
         active_redactor = _active_redactor(redactor)
         diagnostic = tool_results.exception_diagnostic(
             exc,
@@ -360,13 +594,12 @@ async def _run_tool(
                     caller_cancelled=True,
                 )
             else:
-                result, controls = tool_results.terminal_failure_result(
-                    terminal_outcome="tool_execution_timeout",
+                return _tool_timeout_outcome(
+                    tool=tool,
                     effect=effect,
-                    message=f"Tool call timed out after {timeout_seconds} seconds.",
                     redactor=_active_redactor(redactor),
+                    timeout_seconds=timeout_seconds,
                 )
-                return _execution_outcome(result, controls)
         elif isinstance(exc, Exception):
             active_redactor = _active_redactor(redactor)
             result, controls = tool_results.terminal_failure_result(

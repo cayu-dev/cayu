@@ -89,6 +89,25 @@ guard.
 
 ## Unreleased
 
+### Trusted host tools can opt into a hard POSIX process deadline
+
+`ProcessIsolatedTool` adds an explicit reconstructable JSON-only adapter for
+trusted synchronous or native dependencies that may not cooperate with
+`asyncio` cancellation or may hold the Python interpreter lock. The parent
+owns a versioned bounded protocol, a wall deadline, a fresh process session,
+bounded TERM-to-KILL process-group cleanup, result validation, and existing
+effect uncertainty. Ordinary tools remain in process, and
+`tool_timeout_seconds` remains a cooperative cancellation request for them.
+
+Application manifest schema 13 and tool descriptor/capability schema 2 expose
+the configured execution boundary, timeout strength, isolated adapter identity
+and configuration digest, deadline, and the explicit `sandboxed=false` claim.
+Configuration, environment values, arguments, context, and secrets are not
+published. The initial hard boundary requires POSIX process-group support and
+does not claim hostile-code, filesystem, network, credential, privilege,
+kernel, or abrupt-parent-death containment. See
+[Process-isolated host tools](process-isolated-tools.md).
+
 ### Agents can discover large registered tool catalogues through a stable core
 
 Agents may opt into provider-neutral discovery with

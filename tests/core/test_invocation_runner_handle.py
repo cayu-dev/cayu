@@ -2815,6 +2815,8 @@ def test_tool_timeout_classifies_grouped_runner_cleanup_as_timeout() -> None:
         "tool_effect": "none",
         "outcome_unknown": False,
         "manual_reconciliation_required": False,
+        "tool_execution_boundary": "in_process",
+        "tool_timeout_strength": "cooperative_in_process",
     }
     assert "workload-secret" not in repr(outcome)
     assert runner.cancelled is True
@@ -2931,6 +2933,8 @@ def test_clean_runner_cancellation_remains_compatible_with_asyncio_timeout(
         "tool_effect": "none",
         "outcome_unknown": False,
         "manual_reconciliation_required": False,
+        "tool_execution_boundary": "in_process",
+        "tool_timeout_strength": "cooperative_in_process",
     }
     assert cancelling == 0
     assert runner.cancelled is True
@@ -2978,6 +2982,8 @@ def test_legacy_runner_cancellation_remains_compatible_with_asyncio_timeout() ->
         "tool_effect": "none",
         "outcome_unknown": False,
         "manual_reconciliation_required": False,
+        "tool_execution_boundary": "in_process",
+        "tool_timeout_strength": "cooperative_in_process",
     }
     assert runner.cancelled is True
 

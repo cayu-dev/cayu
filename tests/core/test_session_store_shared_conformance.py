@@ -16204,7 +16204,10 @@ def test_session_store_conformance_persisted_event_side_effect_claim_fencing(
             event = Event(type=EventType.SESSION_STARTED, session_id=session.id)
             await store.append_event(session.id, event)
 
-            stale = await store.claim_persisted_event_side_effect(lease_seconds=0.05)
+            # Keep the initial lease comfortably live across a loaded PostgreSQL
+            # round trip; the old 50ms window made this immediate fencing check
+            # depend on CI scheduler latency rather than store behavior.
+            stale = await store.claim_persisted_event_side_effect(lease_seconds=0.5)
             assert stale is not None
             pending = Event(type="custom.pending", session_id=session.id)
             await store.append_event(session.id, pending)
@@ -16213,7 +16216,7 @@ def test_session_store_conformance_persisted_event_side_effect_claim_fencing(
                 limit=1,
             )
             assert [delivery.event_id for delivery in claimable] == [pending.id]
-            await asyncio.sleep(0.06)
+            await asyncio.sleep(0.6)
             replacement = await store.claim_persisted_event_side_effect()
             assert replacement is not None
             assert replacement.event.id == event.id

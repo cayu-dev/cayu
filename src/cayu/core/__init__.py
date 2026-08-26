@@ -3,6 +3,15 @@
 from cayu.core.agents import Agent, AgentAuthoringState, AgentSpec
 from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
+from cayu.core.isolated_tools import (
+    ProcessIsolatedTool,
+    ProcessIsolatedToolContext,
+    ProcessIsolatedToolContextProjection,
+    ProcessIsolatedToolFactoryRef,
+    ProcessIsolatedToolLimits,
+    ToolExecutionBoundary,
+    ToolTimeoutStrength,
+)
 from cayu.core.messages import (
     CitationPart,
     CitationProvenance,
@@ -36,6 +45,11 @@ __all__ = [
     "HostedToolCallPart",
     "Message",
     "MessageRole",
+    "ProcessIsolatedTool",
+    "ProcessIsolatedToolContext",
+    "ProcessIsolatedToolContextProjection",
+    "ProcessIsolatedToolFactoryRef",
+    "ProcessIsolatedToolLimits",
     "ProviderStatePart",
     "TextPart",
     "ThinkingConfig",
@@ -44,9 +58,11 @@ __all__ = [
     "ToolCallPart",
     "ToolContext",
     "ToolEffect",
+    "ToolExecutionBoundary",
     "ToolResult",
     "ToolResultPart",
     "ToolSpec",
+    "ToolTimeoutStrength",
     "WebSearchAction",
     "WebSearchSource",
     "Workflow",

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from itertools import islice
@@ -119,6 +120,8 @@ _DURABLE_ERROR_MESSAGES = {
     ),
     "circular_reference": "must not contain circular references.",
     "nesting_too_deep": (f"must not exceed {MAX_DURABLE_JSON_NESTING} levels of JSON nesting."),
+    "too_many_json_nodes": "must not exceed the configured JSON node limit.",
+    "json_value_too_large": "must not exceed the configured encoded JSON byte limit.",
 }
 _DURABLE_ERROR_PATH_RE = re.compile(
     r"\$(?:/(?:[0-9]+|#[0-9]+)(?:/key)?)*",
@@ -707,6 +710,227 @@ class JsonUtf8SizeCounter:
             return True
         self.encountered_unsupported_value = True
         return False
+
+
+@dataclass(slots=True)
+class _BoundedDurableJsonFrame:
+    value_id: int
+    items: Iterator[Any]
+    is_object: bool
+    path: str
+    item_count: int = 0
+
+
+def inspect_bounded_durable_json(
+    value: Any,
+    field_name: str,
+    *,
+    max_bytes: int,
+    max_nodes: int,
+    max_nesting: int = MAX_DURABLE_JSON_NESTING,
+) -> None:
+    """Validate and size one durable JSON value without recursively copying it.
+
+    The iterative walk is used before process-boundary serialization so deeply
+    nested or oversized caller data cannot first allocate a complete defensive
+    copy or exhaust Python's recursion limit.
+    """
+
+    if type(max_bytes) is not int or max_bytes < 0:
+        raise ValueError("max_bytes must be a non-negative integer.")
+    if type(max_nodes) is not int or max_nodes <= 0:
+        raise ValueError("max_nodes must be a positive integer.")
+    if type(max_nesting) is not int or not 0 < max_nesting <= MAX_DURABLE_JSON_NESTING:
+        raise ValueError(f"max_nesting must be between 1 and {MAX_DURABLE_JSON_NESTING}.")
+
+    remaining = max_bytes
+    node_count = 0
+    active_container_ids: set[int] = set()
+    frames: list[_BoundedDurableJsonFrame] = []
+    current = value
+    current_path = "$"
+    value = None
+
+    def consume(count: int, path: str) -> None:
+        nonlocal remaining
+        remaining -= count
+        if remaining < 0:
+            raise DurableValueError("json_value_too_large", field_name, path=path)
+
+    def consume_string(text: str, path: str) -> None:
+        _require_durable_text(text, field_name, path=path)
+        consume(2, path)
+        for character in text:
+            codepoint = ord(character)
+            if character in {'"', "\\"} or character in "\b\f\n\r\t":
+                count = 2
+            elif codepoint < 0x20:
+                count = 6
+            elif codepoint < 0x80:
+                count = 1
+            elif codepoint < 0x800:
+                count = 2
+            elif codepoint < 0x10000:
+                count = 3
+            else:
+                count = 4
+            consume(count, path)
+
+    try:
+        while True:
+            node_count += 1
+            if node_count > max_nodes:
+                raise DurableValueError(
+                    "too_many_json_nodes",
+                    field_name,
+                    path=current_path,
+                )
+
+            if current is None:
+                consume(4, current_path)
+            elif type(current) is bool:
+                consume(4 if current else 5, current_path)
+            elif type(current) is str:
+                consume_string(current, current_path)
+            elif type(current) is int:
+                if not MIN_DURABLE_JSON_INTEGER <= current <= MAX_DURABLE_JSON_INTEGER:
+                    raise DurableValueError(
+                        "integer_out_of_range",
+                        field_name,
+                        path=current_path,
+                    )
+                consume(len(str(current)), current_path)
+            elif type(current) is float:
+                if not isfinite(current):
+                    raise DurableValueError(
+                        "non_finite_number",
+                        field_name,
+                        path=current_path,
+                    )
+                if current.is_integer() and not (
+                    MIN_DURABLE_JSON_INTEGER <= current <= MAX_DURABLE_JSON_INTEGER
+                ):
+                    raise DurableValueError(
+                        "integral_float_out_of_range",
+                        field_name,
+                        path=current_path,
+                    )
+                rendered = _canonical_durable_json_text(
+                    int(current) if current.is_integer() else current
+                )
+                consume(len(rendered), current_path)
+            elif type(current) in {dict, FrozenJsonDict, list, FrozenJsonList}:
+                if len(frames) >= max_nesting:
+                    raise DurableValueError(
+                        "nesting_too_deep",
+                        field_name,
+                        path=current_path,
+                    )
+                value_id = id(current)
+                if value_id in active_container_ids:
+                    raise DurableValueError(
+                        "circular_reference",
+                        field_name,
+                        path=current_path,
+                    )
+                consume(2, current_path)
+                is_object = type(current) in {dict, FrozenJsonDict}
+                active_container_ids.add(value_id)
+                frames.append(
+                    _BoundedDurableJsonFrame(
+                        value_id=value_id,
+                        items=(iter(current.items()) if is_object else iter(current)),
+                        is_object=is_object,
+                        path=current_path,
+                    )
+                )
+            else:
+                raise DurableValueError(
+                    "invalid_json_type",
+                    field_name,
+                    path=current_path,
+                )
+
+            while frames:
+                frame = frames[-1]
+                try:
+                    entry = next(frame.items)
+                except StopIteration:
+                    active_container_ids.remove(frame.value_id)
+                    frames.pop()
+                    continue
+                if frame.item_count:
+                    consume(1, frame.path)
+                item_index = frame.item_count
+                frame.item_count += 1
+                child_path = _durable_child_path(
+                    frame.path,
+                    item_index,
+                    object_value=frame.is_object,
+                )
+                if frame.is_object:
+                    key, current = entry
+                    if type(key) is not str:
+                        raise DurableValueError(
+                            "invalid_json_key",
+                            field_name,
+                            path=f"{child_path}/key",
+                        )
+                    consume_string(key, f"{child_path}/key")
+                    consume(1, child_path)
+                else:
+                    current = entry
+                current_path = child_path
+                break
+            else:
+                break
+    finally:
+        current = None
+        frames.clear()
+        active_container_ids.clear()
+
+
+def copy_bounded_durable_json_value(
+    value: Any,
+    field_name: str,
+    *,
+    max_bytes: int,
+    max_nodes: int,
+    max_nesting: int = MAX_DURABLE_JSON_NESTING,
+) -> Any:
+    """Preflight, validate, and defensively copy one bounded durable JSON value."""
+
+    inspect_bounded_durable_json(
+        value,
+        field_name,
+        max_bytes=max_bytes,
+        max_nodes=max_nodes,
+        max_nesting=max_nesting,
+    )
+    return copy_durable_json_value(value, field_name)
+
+
+def canonical_bounded_durable_json_bytes(
+    value: Any,
+    field_name: str,
+    *,
+    max_bytes: int,
+    max_nodes: int,
+    max_nesting: int = MAX_DURABLE_JSON_NESTING,
+) -> bytes:
+    """Return canonical bytes only after iterative size and nesting preflight."""
+
+    inspect_bounded_durable_json(
+        value,
+        field_name,
+        max_bytes=max_bytes,
+        max_nodes=max_nodes,
+        max_nesting=max_nesting,
+    )
+    encoded = canonical_durable_json_bytes(value, field_name)
+    if len(encoded) > max_bytes:  # pragma: no cover - counter/encoder invariant
+        raise AssertionError("Bounded durable JSON counter underestimated canonical encoding.")
+    return encoded
 
 
 def json_utf8_size_within_limit(

@@ -28,9 +28,14 @@ from cayu._validation import (
     require_durable_text,
     thaw_json_value,
 )
+from cayu.core.execution_identity import (
+    ExecutionProfileBehaviorIdentity,
+    copy_execution_profile_behavior_identity,
+)
+from cayu.core.isolated_tools import ISOLATED_TOOL_PROTOCOL_NAME
 from cayu.core.tools import ToolEffect
 
-TOOL_DESCRIPTOR_SCHEMA_VERSION = 1
+TOOL_DESCRIPTOR_SCHEMA_VERSION = 2
 TOOL_CATALOGUE_SCHEMA_VERSION = 1
 TOOL_CATALOGUE_MAX_TOOLS = 10_000
 TOOL_CATALOGUE_MAX_BYTES = 32 * 1024 * 1024
@@ -248,6 +253,93 @@ def mcp_source_tool_fingerprint(source_tool_name: str) -> str:
     )
 
 
+class ToolExecutionContract(BaseModel):
+    """Callable-free evidence for the boundary that executes one tool."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    boundary: Literal["in_process", "posix_process"] = "in_process"
+    timeout_strength: Literal[
+        "none",
+        "cooperative_in_process",
+        "hard_process_deadline",
+    ] = "none"
+    sandboxed: StrictBool = False
+    adapter_identity: ExecutionProfileBehaviorIdentity | None = None
+    adapter_configuration_sha256: str | None = Field(
+        default=None,
+        pattern=_SHA256_IDENTIFIER_PATTERN,
+    )
+    hard_deadline_seconds: float | None = None
+    protocol: str | None = None
+    protocol_version: StrictInt | None = None
+
+    @field_validator("adapter_identity", mode="before")
+    @classmethod
+    def copy_adapter_identity(cls, value: object) -> object:
+        if isinstance(value, ExecutionProfileBehaviorIdentity):
+            copied = copy_execution_profile_behavior_identity(value)
+            if copied is None:  # pragma: no cover - narrowed by isinstance
+                raise AssertionError("Adapter identity copy unexpectedly returned None.")
+            return copied.model_dump(mode="python")
+        return value
+
+    @field_validator("protocol")
+    @classmethod
+    def validate_optional_protocol(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _validate_bounded_text(value, "protocol")
+
+    @field_validator("hard_deadline_seconds", mode="before")
+    @classmethod
+    def validate_optional_deadline(cls, value: object) -> object:
+        if value is None:
+            return None
+        if type(value) not in {int, float}:
+            raise TypeError("hard_deadline_seconds must be numeric or None.")
+        normalized = float(cast("int | float", value))
+        if not 0 < normalized <= 24 * 60 * 60:
+            raise ValueError("hard_deadline_seconds must be positive and at most 24 hours.")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> ToolExecutionContract:
+        if self.sandboxed:
+            raise ValueError("The host process boundary cannot claim sandboxing.")
+        adapter_fields = (
+            self.adapter_identity,
+            self.adapter_configuration_sha256,
+            self.hard_deadline_seconds,
+            self.protocol,
+            self.protocol_version,
+        )
+        if self.boundary == "in_process":
+            if self.timeout_strength not in {"none", "cooperative_in_process"} or any(
+                value is not None for value in adapter_fields
+            ):
+                raise ValueError("In-process tools cannot claim process-adapter authority.")
+        elif (
+            self.timeout_strength != "hard_process_deadline"
+            or any(value is None for value in adapter_fields)
+            or self.protocol != ISOLATED_TOOL_PROTOCOL_NAME
+            or self.protocol_version != 1
+        ):
+            raise ValueError("POSIX process tools require complete hard-deadline evidence.")
+        return self
+
+
+def copy_tool_execution_contract(contract: ToolExecutionContract) -> ToolExecutionContract:
+    if type(contract) is not ToolExecutionContract:
+        raise TypeError("execution_contract must be a ToolExecutionContract.")
+    return ToolExecutionContract.model_validate(contract.model_dump(mode="python"))
+
+
 class ToolDescriptor(BaseModel):
     """Immutable canonical contract for one runtime-admitted tool."""
 
@@ -258,7 +350,7 @@ class ToolDescriptor(BaseModel):
         revalidate_instances="always",
     )
 
-    schema_version: Literal[1] = TOOL_DESCRIPTOR_SCHEMA_VERSION
+    schema_version: Literal[2] = TOOL_DESCRIPTOR_SCHEMA_VERSION
     tool_id: str = ""
     name: str
     description: str = ""
@@ -267,6 +359,7 @@ class ToolDescriptor(BaseModel):
     effect: ToolEffect = ToolEffect.EXTERNAL
     publishes_arguments: StrictBool = True
     workspace_mutation: StrictBool = False
+    execution_contract: ToolExecutionContract = Field(default_factory=ToolExecutionContract)
     provenance: ToolDescriptorProvenance = Field(default_factory=ToolDescriptorProvenance)
     schema_fingerprint: str = Field(default="", pattern=r"^(?:|sha256:[0-9a-f]{64})$")
     version: str = Field(default="", pattern=r"^(?:|sha256:[0-9a-f]{64})$")
@@ -275,7 +368,7 @@ class ToolDescriptor(BaseModel):
     @classmethod
     def validate_schema_version(cls, value: object) -> object:
         if type(value) is not int or value != TOOL_DESCRIPTOR_SCHEMA_VERSION:
-            raise ValueError("Tool descriptor schema_version must be the integer 1.")
+            raise ValueError("Tool descriptor schema_version must be the integer 2.")
         return value
 
     @field_validator("name")
@@ -336,6 +429,7 @@ class ToolDescriptor(BaseModel):
                 "effect": self.effect.value,
                 "publishes_arguments": self.publishes_arguments,
                 "workspace_mutation": self.workspace_mutation,
+                "execution_contract": self.execution_contract.model_dump(mode="json"),
                 "provenance": self.provenance.model_dump(mode="json"),
             },
             "tool_descriptor",
@@ -363,6 +457,7 @@ class ToolDescriptor(BaseModel):
             "effect": self.effect,
             "publishes_arguments": self.publishes_arguments,
             "workspace_mutation": self.workspace_mutation,
+            "execution_contract": self.execution_contract.model_dump(mode="json"),
         }
 
     def execution_profile_material(self) -> dict[str, Any]:
@@ -383,6 +478,7 @@ def build_tool_descriptor(
     effect: ToolEffect,
     publishes_arguments: bool,
     workspace_mutation: bool,
+    execution_contract: ToolExecutionContract | None = None,
     provenance: ToolDescriptorProvenance | None = None,
 ) -> ToolDescriptor:
     """Build one descriptor from copied runtime-admitted registration state."""
@@ -395,6 +491,11 @@ def build_tool_descriptor(
         effect=effect,
         publishes_arguments=publishes_arguments,
         workspace_mutation=workspace_mutation,
+        execution_contract=(
+            ToolExecutionContract()
+            if execution_contract is None
+            else copy_tool_execution_contract(execution_contract)
+        ),
         provenance=(ToolDescriptorProvenance() if provenance is None else provenance),
     )
 

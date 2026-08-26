@@ -9660,3 +9660,80 @@ Compound CandidateMutationApplier          -> Cayu downstream intervention execu
 Cayu MemoryInterventionReceipt              -> Compound CandidateApplicationReceipt
 Cayu trial attribution/result               -> Compound CanonicalTrialEvaluator / TrialEvidence
 ```
+
+## Hard process boundary for non-cooperative host tools
+
+`ProcessIsolatedTool` is the only hard host-tool process entrance. Ordinary
+`Tool` instances execute in the Cayu worker, and `tool_timeout_seconds` is a
+cooperative cancellation deadline for those tools. Cayu never infers hard
+containment from an ordinary tool, thread, executor future, or timeout value.
+A hard process deadline and a security sandbox are separate claims;
+`ProcessIsolatedTool` always records `sandboxed=false`.
+
+Registration accepts only an exact `ProcessIsolatedTool` carrying a stable
+module/qualified factory reference, application-declared behavior identity,
+bounded JSON factory configuration, explicit JSON context projection, literal
+string environment, and finite process/transport limits. `__main__`, closures,
+interpreter/dynamic-loader environment controls, workspace mutation authority,
+non-JSON values, and registered workload secrets fail closed. The trusted
+parent completes lookup, schema validation, policy, approval, effect,
+execution-profile, environment-allocation, and idempotency preparation before
+spawn. The child cannot reevaluate or widen those decisions.
+
+The parent-to-child request is one canonical protocol-version-1 JSON document.
+Its digest binds the factory and identity, limits, factory configuration,
+validated arguments, projected context, declared environment, session, parent
+task/run epoch, model step/attempt, tool round/call, idempotency key, effective
+argument digest, execution-profile fingerprint, and environment-allocation
+fingerprint. Byte, node, type, number, text, and nesting limits are checked
+iteratively before a defensive copy or serialization. The child starts under
+the current Python executable with isolated interpreter mode, a fresh session,
+an empty temporary working directory, closed inherited descriptors, fixed
+locale/UTF-8 values, and only explicitly declared environment entries. It
+receives stdin/stdout/stderr plus one private result descriptor; no parent
+store, runner, workspace, provider, policy, approval, event loop, socket, or
+ambient environment is authority.
+
+Immediately before child-process creation, the parent publishes one exact
+durable isolated-dispatch-admission record bound to the session,
+task/run epoch, model step/attempt, tool round/call, idempotency key, request
+digest, arguments digest, execution profile, and one unique dispatch owner.
+Recovery treats only that record as positive isolated-child admission evidence;
+the generic `tool.call.started` event is not proof that policy, hooks, or child
+admission completed.
+
+The child imports exactly the recorded module/qualified factory and requires
+the loaded callable's declared `execution_profile_identity` to equal the
+registered factory identity. It then constructs the handler from the copied
+configuration and calls `run(projected_context, arguments)`.
+It emits one bounded, length-framed canonical envelope containing an exact
+`ToolResult` or a fixed error code, closes the result descriptor, and remains
+owned until parent settlement. Completing the frame lets settlement start even
+when a forked descendant retained the descriptor; the parent continues draining
+through group settlement so trailing or multiple output still fails closed. The
+parent rejects missing, oversized, invalid UTF-8/JSON,
+non-canonical, trailing, multiple, wrong-version, wrong-request, or malformed
+terminal evidence. Peer strings, exception objects, stdout, and stderr never
+become public diagnostics. A successful decoded result traverses the same
+normalization, redaction, artifact projection, hooks, transcript, and event
+publication as an in-process result.
+
+The hard deadline begins before spawn. Every success, failure, timeout,
+cancellation, signal, pipe failure, or child exit converges on one lifecycle
+owner. That owner closes pipes, sends TERM to the child process group, waits the
+declared grace, escalates to KILL, waits for the direct child, and proves the
+group absent. Unproven cleanup remains attached to a retained lifecycle owner
+and is not reported as a clean terminal result or made replayable. A pending
+retained owner fences every later isolated child dispatch in that process
+before spawn, without fencing ordinary in-process tools; successful retained
+settlement removes the fence. Caller task cancellation is restored only after
+this settlement. Platforms without
+complete POSIX process-group support reject hard registration.
+
+Process termination proves local quiescence only. The registered `ToolEffect`
+and runtime tool-execution identity remain unchanged. Abnormal termination of
+a mutating tool keeps `outcome_unknown`; external effects require manual
+reconciliation and are never replayed solely because the child was reaped.
+Normal durable receipt and recovery rules own duplicate delivery. Abrupt Cayu
+parent death, distributed execution, and hostile-code isolation are outside
+this adapter's authority.

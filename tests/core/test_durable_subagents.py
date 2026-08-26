@@ -4914,6 +4914,7 @@ def test_tool_timeout_preserves_unsettled_submission_for_exact_recovery() -> Non
             session_store=sessions,
             task_store=tasks,
             dispatcher=restarted_dispatcher,
+            tool_timeout_seconds=0.01,
             enable_logging=False,
         )
         restarted_app.register_provider(provider, default=True)
