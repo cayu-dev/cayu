@@ -1,4 +1,5 @@
 import type { CapturedEvaluationLaunch, EvalRun, EvalStatus } from "./api.ts"
+import { formatCurrencyWithCode } from "./format.ts"
 import type {
   CorpusComparisonReason,
   PublishedAssertionResult,
@@ -241,19 +242,31 @@ export function capturedEvalLaunchRequestIdentity(
   ])
 }
 
-export function evalTrialCostSummary(assertions: Array<PublishedAssertionResult>): string {
+export type EvalTrialCostSummary = Readonly<{
+  display: string
+  exact: string
+}>
+
+export function evalTrialCostSummary(
+  assertions: Array<PublishedAssertionResult>,
+  locales?: Intl.LocalesArgument,
+): EvalTrialCostSummary {
   for (const assertion of assertions) {
     const detail = assertion.detail
     if (detail.kind !== "max_estimated_cost") continue
     if (detail.estimated_cost !== null && detail.estimated_cost !== undefined) {
-      return `${detail.estimated_cost} ${detail.currency}`
+      return {
+        display: formatCurrencyWithCode(detail.estimated_cost, detail.currency, locales),
+        exact: `${detail.estimated_cost} ${detail.currency}`,
+      }
     }
     if (detail.unpriced_model_steps) {
-      return `unavailable · ${detail.unpriced_model_steps} unpriced model steps`
+      const unavailable = `unavailable · ${detail.unpriced_model_steps} unpriced model steps`
+      return { display: unavailable, exact: unavailable }
     }
-    return "unavailable"
+    return { display: "unavailable", exact: "unavailable" }
   }
-  return "not evaluated"
+  return { display: "not evaluated", exact: "not evaluated" }
 }
 
 const COMPARISON_REASON_TEXT: Record<CorpusComparisonReason, string> = {

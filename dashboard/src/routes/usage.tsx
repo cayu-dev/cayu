@@ -29,7 +29,7 @@ import { retryAggregateRequest } from "../lib/aggregate-query"
 import { fetchUsageRollup, type UsageRollup } from "../lib/api"
 import { billingCostRows, billingIdentityBreakdownState } from "../lib/billing-breakdown"
 import { dashboardConfig } from "../lib/config"
-import { formatCount, formatDateTime, formatDecimal } from "../lib/format"
+import { formatCount, formatCurrency, formatCurrencyWithCode, formatDateTime } from "../lib/format"
 import type {
   AggregateAccuracy,
   UsageAggregateBreakdown,
@@ -501,7 +501,10 @@ function CostSummary({ cost }: { cost: UsageCostRollup | null }) {
     return (
       <DataCard title="Estimated Cost" description="No dashboard price book is configured.">
         <StateMessage>
-          Usage remains available, but cost is unavailable rather than displayed as zero.
+          Usage remains available, but cost is unavailable rather than displayed as zero. Embedded
+          apps can pass <code>{'dashboard_config={"priceBook": default_price_book()}'}</code> to{" "}
+          <code>mount_cayu</code>; use a complete application-owned PriceBook for private or
+          negotiated rates.
         </StateMessage>
       </DataCard>
     )
@@ -554,7 +557,9 @@ function CostSummary({ cost }: { cost: UsageCostRollup | null }) {
               <TableCell>{currency.currency}</TableCell>
               <TableCell className="text-right">{formatCount(currency.model_steps)}</TableCell>
               <TableCell className="text-right font-medium">
-                {formatDecimal(currency.total_cost)}
+                <span title={`Exact estimate: ${currency.total_cost} ${currency.currency}`}>
+                  {formatCurrency(currency.total_cost, currency.currency)}
+                </span>
               </TableCell>
             </TableRow>
           ))}
@@ -708,7 +713,13 @@ function BillingIdentityBreakdown({ cost }: { cost: UsageCostRollup | null }) {
                       {formatCount(row.priced)} / {formatCount(row.unpriced)}
                     </TableCell>
                     <TableCell className="text-right">
-                      {row.currency ? `${formatDecimal(row.totalCost)} ${row.currency}` : "—"}
+                      {row.currency ? (
+                        <span title={`Exact estimate: ${row.totalCost} ${row.currency}`}>
+                          {formatCurrencyWithCode(row.totalCost, row.currency)}
+                        </span>
+                      ) : (
+                        "—"
+                      )}
                     </TableCell>
                   </TableRow>
                 ))}

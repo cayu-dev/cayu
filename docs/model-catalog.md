@@ -34,6 +34,31 @@ budget APIs. `ModelPrice` contains no routing capabilities. Cost, budget, server
 dashboard, and evaluation paths accept one complete `PriceBook` through `pricing=`.
 There is no implicit model-catalog projection, overlay, or precedence merge.
 
+## Embedded dashboard pricing
+
+The dashboard never selects a price snapshot on an application's behalf. An embedded
+control plane must deliberately publish either Cayu's bundled, dated public snapshot or
+one complete application-owned book:
+
+```python
+from cayu import default_price_book
+from cayu.server import AuthenticatedAccess, mount_cayu
+
+mount_cayu(
+    server,
+    cayu_app,
+    access=AuthenticatedAccess(dependency=require_operator),
+    dashboard_config={"priceBook": default_price_book()},
+)
+```
+
+Without `priceBook`, usage remains available and the dashboard reports cost as
+unavailable rather than zero. The bundled book is a convenient public-rate snapshot,
+not a universal default: private gateways, negotiated rates, historical reconstruction,
+and identities outside its reviewed subset require a complete application-owned
+`PriceBook`. Cayu does not merge that book with the bundled snapshot or silently price
+unknown rows.
+
 ## Coverage and provider keys
 
 The bundled resources cover a reviewed subset of current tool-capable offerings under

@@ -119,6 +119,7 @@ WORKFLOW_BUDGET_ID = "dashboard-workflow-budget"
 WORKFLOW_ENVIRONMENT = "dashboard-workflow-production"
 WORKFLOW_PROVIDER_NAME = "dashboard-workflow-provider"
 WORKFLOW_MODEL_NAME = "dashboard-workflow-model"
+WORKFLOW_SECONDARY_MODEL_NAME = "dashboard-workflow-secondary-model"
 WORKFLOW_PARENT_TASK_ID = "dashboard-workflow-task-parent"
 WORKFLOW_BLOCKED_TASK_ID = "dashboard-workflow-task-blocked"
 WORKFLOW_LINKED_TASK_PREFIX = "dashboard-workflow-linked-task"
@@ -809,6 +810,7 @@ async def _seed_app() -> tuple[
         parent_session_id: str | None,
         status: SessionStatus,
         usage: tuple[int, int] | None = None,
+        model: str = WORKFLOW_MODEL_NAME,
     ) -> None:
         await store.create(
             RunRequest(
@@ -822,7 +824,7 @@ async def _seed_app() -> tuple[
             ),
             identity=SessionIdentity(
                 provider_name=WORKFLOW_PROVIDER_NAME,
-                model=WORKFLOW_MODEL_NAME,
+                model=model,
             ),
         )
         events: list[Event] = []
@@ -838,8 +840,8 @@ async def _seed_app() -> tuple[
                     payload={
                         "usage_metrics": {
                             "provider_name": WORKFLOW_PROVIDER_NAME,
-                            "requested_model": WORKFLOW_MODEL_NAME,
-                            "model": WORKFLOW_MODEL_NAME,
+                            "requested_model": model,
+                            "model": model,
                             "input_tokens": input_tokens,
                             "output_tokens": output_tokens,
                             "total_tokens": input_tokens + output_tokens,
@@ -888,6 +890,7 @@ async def _seed_app() -> tuple[
         parent_session_id=WORKFLOW_FOCUS_SESSION_ID,
         status=SessionStatus.FAILED,
         usage=(20, 5),
+        model=WORKFLOW_SECONDARY_MODEL_NAME,
     )
     await seed_workflow_session(
         WORKFLOW_INTERRUPTED_SESSION_ID,
@@ -990,8 +993,16 @@ def _dashboard_price_book() -> PriceBook:
                 provider_name=WORKFLOW_PROVIDER_NAME,
                 model=WORKFLOW_MODEL_NAME,
                 match="exact",
-                input_per_million=Decimal("2"),
-                output_per_million=Decimal("4"),
+                input_per_million=Decimal("0.002"),
+                output_per_million=Decimal("0.002"),
+            ),
+            ModelPrice.fixed(
+                provider_name=WORKFLOW_PROVIDER_NAME,
+                model=WORKFLOW_SECONDARY_MODEL_NAME,
+                match="exact",
+                input_per_million=Decimal("0.004"),
+                output_per_million=Decimal("0.004"),
+                currency="CAD",
             ),
         ),
     )
@@ -1058,6 +1069,7 @@ async def _run_browser_contract(
         context = await browser.new_context(
             viewport={"width": 1440, "height": 1000},
             http_credentials={"username": AUTH_USERNAME, "password": AUTH_PASSWORD},
+            locale="en-US",
         )
         await context.grant_permissions(["clipboard-read", "clipboard-write"], origin=base_url)
         await context.tracing.start(screenshots=True, snapshots=True)
@@ -1610,7 +1622,7 @@ async def _exercise_captured_evaluation(
     async def launch_saved_suite() -> str:
         await page.get_by_role(
             "button",
-            name=f"Run suite {suite_name} ({suite_id})",
+            name=f"Run suite {suite_name} ({suite_id}) on current app",
             exact=True,
         ).click()
         await expect(page).to_have_url(re.compile(r"[?&]tab=runs(?:&|$)"))
@@ -2061,7 +2073,8 @@ async def _exercise_workflow(
         ).to_be_visible()
         await expect(page.get_by_text("Causal-budget usage", exact=True)).to_be_visible()
         await expect(page.get_by_text("75", exact=True)).to_be_visible()
-        await expect(page.get_by_text("0.00018 USD", exact=True)).to_be_visible()
+        await expect(page.get_by_text("<USD\u00a00.0001", exact=True).first).to_be_visible()
+        await expect(page.get_by_text("<CAD\u00a00.0001", exact=True).first).to_be_visible()
         await expect(
             page.get_by_text(
                 "2 returned session groups are outside the loaded topology and are not mapped to rows here.",
@@ -2480,9 +2493,16 @@ async def _exercise_workflow(
             await expect(
                 page.get_by_text(
                     "No dashboard price book is configured. Usage remains available; cost is unavailable rather than zero.",
+                    exact=False,
+                )
+            ).to_be_visible()
+            await expect(
+                page.get_by_text(
+                    'dashboard_config={"priceBook": default_price_book()}',
                     exact=True,
                 )
             ).to_be_visible()
+            await expect(page.get_by_text("mount_cayu", exact=True)).to_be_visible()
             require(
                 usage_without_pricing,
                 "a no-pricing Workflow must still issue its bounded usage request",
@@ -2776,8 +2796,17 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
         await expect(
             page.get_by_text(
                 "Usage remains available, but cost is unavailable rather than displayed as zero.",
+                exact=False,
+            )
+        ).to_be_visible()
+        await expect(
+            page.get_by_text(
+                'dashboard_config={"priceBook": default_price_book()}',
                 exact=True,
             )
+        ).to_be_visible()
+        await expect(
+            page.get_by_text("complete application-owned PriceBook", exact=False)
         ).to_be_visible()
         require(
             usage_request_without_pricing,

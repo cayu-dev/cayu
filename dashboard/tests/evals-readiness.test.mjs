@@ -22,6 +22,10 @@ test("Evals readiness exposes every operation in a stable product order", () => 
       "reports",
     ],
   )
+  assert.equal(
+    EVALS_READINESS_OPERATIONS.find(([operation]) => operation === "fresh_launch")?.[1],
+    "Current-app trials",
+  )
 })
 
 test("Evals readiness copy distinguishes ready, deployment-gated, and unavailable operations", () => {
@@ -42,7 +46,14 @@ test("Evals readiness copy distinguishes ready, deployment-gated, and unavailabl
       state: "gated",
       reason_code: "eval_store_not_configured",
     }),
-    "Durable Evals storage is not available in this deployment.",
+    "For mount_cayu, pass access=AuthenticatedAccess(...) and complete durable Evals wiring through evals=EvalsConfig(target=target, store=eval_store), where eval_store is a SQLiteEvalStore or PostgresEvalStore.",
+  )
+  assert.equal(
+    evalsReadinessReasonText({
+      state: "gated",
+      reason_code: "eval_target_not_configured",
+    }),
+    "For mount_cayu, pass access=AuthenticatedAccess(...) and complete durable Evals wiring through evals=EvalsConfig(target=target, store=eval_store), where target is a CorpusTarget for the exact mounted CayuApp.",
   )
   assert.equal(
     evalsReadinessStateLabel({

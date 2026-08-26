@@ -318,7 +318,7 @@ export function EvalsPage() {
     <Page>
       <PageHeader
         title="Evals"
-        description="Manage portable regression corpora and durable fresh evaluation runs."
+        description="Manage portable regression corpora and durable current-app evaluation runs."
         actions={
           <>
             <EvalTargetSelector
@@ -525,12 +525,13 @@ function EvalTargetSelector({
 }) {
   return (
     <label className="flex items-center gap-2 text-xs text-muted-foreground">
-      Target
+      Current app target
       <select
         value={selectedTargetKey ?? ""}
         disabled={loading || targets.length === 0}
         className="h-9 max-w-72 rounded-md border border-input bg-background px-2 text-sm text-foreground"
-        aria-label="Eval target"
+        aria-label="Current application eval target"
+        title="Server-published target for the mounted app, including its current provider, tools, environment, approvals, and policy."
         onChange={(event) => void selectTarget(event.target.value)}
       >
         {loading && <option value="">Loading...</option>}
@@ -548,7 +549,7 @@ function EvalsReadinessOverview({ readiness }: { readiness: EvalsReadiness }) {
   return (
     <DataCard
       title="Readiness"
-      description="Server-published operation availability. Underlying routes still enforce authentication and runtime policy."
+      description="Embedded mounts need AuthenticatedAccess and EvalsConfig(target=..., store=...); cayu serve --dev assembles trusted local wiring. Routes still enforce runtime policy."
       contentClassName="p-4"
     >
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
@@ -1049,7 +1050,7 @@ function CatalogView({
                         <Button
                           type="button"
                           size="sm"
-                          aria-label={`Run suite ${suite.name} (${suite.id})`}
+                          aria-label={`Run suite ${suite.name} (${suite.id}) on current app`}
                           disabled={!mutateEnabled || !concurrencyIsValid || pendingAction !== null}
                           onClick={() => launchSuite(suite.id)}
                         >
@@ -1058,7 +1059,7 @@ function CatalogView({
                           ) : (
                             <Play />
                           )}
-                          Run suite
+                          Run on current app
                         </Button>
                       </TableCell>
                     </TableRow>
@@ -1297,7 +1298,7 @@ function ResultsView({
                 </TableCell>
                 <TableCell>
                   <Badge variant="outline">
-                    {result.origin === "captured_session" ? "Captured" : "Fresh"}
+                    {result.origin === "captured_session" ? "Captured" : "Current app"}
                   </Badge>
                   <div className="mt-1 max-w-40 truncate text-xs text-muted-foreground">
                     {result.target.application_release_id}
@@ -1432,7 +1433,7 @@ function CapturedResultInspector({
             {selectedAsBaseline && <Badge variant="secondary">Baseline</Badge>}
           </span>
         }
-        description={`${detail.record.origin === "captured_session" ? "Captured session" : "Fresh execution"} · release ${detail.record.target.application_release_id}`}
+        description={`${detail.record.origin === "captured_session" ? "Captured session" : "Current-app execution"} · release ${detail.record.target.application_release_id}`}
         actions={
           <>
             <Button
@@ -2006,6 +2007,7 @@ function ResultInspector({
     ? Math.min(currentSelection.trialIndex, selectedCase.trials.length - 1)
     : 0
   const selectedTrial = selectedCase?.trials[trialIndex]
+  const selectedTrialCost = selectedTrial ? evalTrialCostSummary(selectedTrial.assertions) : null
 
   return (
     <DataCard
@@ -2128,7 +2130,8 @@ function ResultInspector({
             />
             <RunFact
               label="Estimated cost"
-              value={evalTrialCostSummary(selectedTrial.assertions)}
+              value={selectedTrialCost?.display ?? "not evaluated"}
+              title={selectedTrialCost?.exact}
             />
           </div>
 
@@ -2265,7 +2268,8 @@ function ComparisonPanel({
           <datalist id="eval-baseline-candidates">
             {candidates.map((result) => (
               <option key={result.revision} value={result.revision}>
-                {result.suite_id} · {result.origin === "captured_session" ? "captured" : "fresh"} ·{" "}
+                {result.suite_id} ·{" "}
+                {result.origin === "captured_session" ? "captured" : "current app"} ·{" "}
                 {result.status}
               </option>
             ))}
@@ -2415,7 +2419,9 @@ function ComparisonResultSummary({
         <RunFact label="Result" value={shortEvalIdentity(record.revision)} />
         <RunFact
           label="Origin"
-          value={record.origin === "captured_session" ? "Captured session" : "Fresh execution"}
+          value={
+            record.origin === "captured_session" ? "Captured session" : "Current-app execution"
+          }
         />
         <RunFact label="Suite" value={record.suite_id} />
         <RunFact label="Release" value={result.application_release_id} />
@@ -2444,11 +2450,11 @@ function EvalStatusBadge({ run }: { run: EvalRun }) {
   return <Badge variant={variant}>{status}</Badge>
 }
 
-function RunFact({ label, value }: { label: string; value: string }) {
+function RunFact({ label, value, title }: { label: string; value: string; title?: string }) {
   return (
     <div className="min-w-0">
       <div className="text-xs font-medium text-muted-foreground">{label}</div>
-      <div className="mt-1 truncate" title={value}>
+      <div className="mt-1 truncate" title={title ?? value}>
         {value}
       </div>
     </div>

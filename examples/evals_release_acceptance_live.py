@@ -199,7 +199,7 @@ async def _run_browser_journey(base_url: str, project_root: Path) -> dict[str, o
 
             await sheet.get_by_test_id("promotion-launch").click()
             await expect(
-                sheet.get_by_text(re.compile(r"Started fresh eval run .+\."))
+                sheet.get_by_text(re.compile(r"Started current-app eval run .+\."))
             ).to_be_visible(timeout=20_000)
             await sheet.get_by_role("button", name="Approve baseline", exact=True).click()
             await expect(sheet.get_by_text("Baseline approved", exact=True)).to_be_visible()

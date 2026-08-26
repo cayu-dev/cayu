@@ -31,7 +31,7 @@ import { retryAggregateRequest } from "../lib/aggregate-query.ts"
 import { fetchSessionTopology, fetchUsageRollup, type UsageRollup } from "../lib/api.ts"
 import { dashboardConfig } from "../lib/config.ts"
 import { dashboardCapabilityUnavailableText } from "../lib/dashboard-capabilities.ts"
-import { formatCount, formatDateTime, formatDecimal } from "../lib/format.ts"
+import { formatCount, formatCurrencyWithCode, formatDateTime } from "../lib/format.ts"
 import type {
   AggregateAccuracy,
   ApiSessionTopologyNode,
@@ -1203,7 +1203,7 @@ function costText(cost: UsageSessionCostSummary | undefined): string {
   if (cost.currencies.length === 0) return "No priced cost"
   const currencies = cost.currencies.slice(0, 3)
   const value = currencies
-    .map((item) => `${formatDecimal(item.total_cost)} ${item.currency}`)
+    .map((item) => formatCurrencyWithCode(item.total_cost, item.currency))
     .join(" · ")
   const omitted = cost.currencies.length - currencies.length
   return omitted > 0 ? `${value} · ${formatCount(omitted)} more currencies` : value
@@ -1230,9 +1230,15 @@ function workflowAccuracyExplanation(accuracy: AggregateAccuracy, fallback: stri
 
 function SessionCostCell({ cost }: { cost: UsageSessionCostSummary | undefined }) {
   if (cost === undefined) return <span className="text-muted-foreground">Unavailable</span>
+  const exactEstimate = cost.currencies
+    .slice(0, 3)
+    .map((item) => `${item.total_cost} ${item.currency}`)
+    .join(" · ")
   return (
     <div className="space-y-1">
-      <div>{costText(cost)}</div>
+      <div title={exactEstimate ? `Exact estimate: ${exactEstimate}` : undefined}>
+        {costText(cost)}
+      </div>
       <div className="flex flex-wrap justify-end gap-1 text-xs text-muted-foreground">
         <WorkflowAccuracyBadge label="cost" accuracy={cost.accuracy} />
         <span>{formatCount(cost.priced_model_steps)} priced</span>
@@ -1313,7 +1319,10 @@ function WorkflowUsageSummary({
         {data.cost === null ? (
           <p className="mt-2 text-sm text-muted-foreground">
             No dashboard price book is configured. Usage remains available; cost is unavailable
-            rather than zero.
+            rather than zero. Embedded apps can pass{" "}
+            <code>{'dashboard_config={"priceBook": default_price_book()}'}</code> to{" "}
+            <code>mount_cayu</code>; use a complete application-owned PriceBook for private or
+            negotiated rates.
           </p>
         ) : (
           <div className="mt-2 space-y-2 text-sm">
@@ -1328,8 +1337,12 @@ function WorkflowUsageSummary({
                 </span>
               ) : displayedCurrencies.length > 0 ? (
                 displayedCurrencies.map((currency) => (
-                  <Badge key={currency.currency} variant="outline">
-                    {formatDecimal(currency.total_cost)} {currency.currency}
+                  <Badge
+                    key={currency.currency}
+                    variant="outline"
+                    title={`Exact estimate: ${currency.total_cost} ${currency.currency}`}
+                  >
+                    {formatCurrencyWithCode(currency.total_cost, currency.currency)}
                   </Badge>
                 ))
               ) : (

@@ -96,6 +96,12 @@ outside a configured Cayu project. Targets may be synchronous or awaitable; the
 application `factory` is not used as an eval target because it does not identify
 an `EvalSuite`.
 
+This CLI target is hermetic test-program authority. `[tool.cayu].eval_target` builds the
+app, fixtures, request base, and suites selected by `cayu eval run`; it is not the target
+shown in the Control Plane. Control Plane trials instead use the current target published
+by the running server, including that mounted app's current provider, tools, environment,
+approval policy, and runtime policy.
+
 Example:
 
 ```bash
@@ -612,7 +618,9 @@ The same suite/assertion surface supports several modes:
 - **Production replay** — promote a completed or failed durable session tree with
   `trajectory_from_session(...)`, then score or export the resulting `Trajectory` without running
   the application again. The Control Plane can persist this captured result and, for a simple
-  safely reconstructable invocation, launch a bounded fresh trial. Scenario-v2 extends that path
+  safely reconstructable invocation, launch a bounded current-app trial. This uses the mounted
+  application's current provider, tools, environment, approvals, and policy; it is distinct from
+  the hermetic target configured through `[tool.cayu].eval_target`. Scenario-v2 extends that path
   to ordered queued input, explicit session resumes, `ask_user` answers, files, portable JSON, and
   fresh approval checkpoints when current launch authority passes readiness preflight.
 
@@ -866,24 +874,24 @@ approval-checkpoint, and file-backed stimuli. Neither conversion controls
 captured scoring or persistence: when exact source material is missing, the
 captured evaluation remains usable and only the affected conversion reports why.
 
-When that conversion is available, the same review sheet exposes **Run fresh
-trial**. The default is one trial at concurrency one. Operators can contract the
+When that conversion is available, the same review sheet exposes **Run on current
+app**. The default is one trial at concurrency one. Operators can contract the
 published target's trial timeout and model-step ceiling, add run-scoped token,
 tool-call, or elapsed-time limits, and—when the server owns a compatible
 `PriceBook`—set an estimated-cost ceiling. The browser never supplies tools,
 environments, credentials, pricing schedules, approval rules, or other execution
 authority. It submits the reviewed expectation contract and bounded settings;
 the server reconstructs runnable input from its current target baseline, scores
-and saves the captured result, then admits the fresh run through the ordinary
+and saves the captured result, then admits the current-app run through the ordinary
 durable worker.
 
-Runtime and estimated-cost ceilings apply independently to each fresh trial;
+Runtime and estimated-cost ceilings apply independently to each current-app trial;
 they are not aggregate ceilings across the eval run. Trial count and concurrency
 bound the run's aggregate scale. Generated project targets permit only one trial,
 while an application-owned target that permits multiple trials must account for
 that multiplication when choosing per-trial limits.
 
-The fresh session uses the target's normal provider, tools, environment,
+The current-app session uses the target's normal provider, tools, environment,
 approval, and operator policy. Authenticated HTTP provenance and every requested
 contraction are persisted with run admission, so a worker restart cannot silently
 turn an operator launch into unattributed SDK work or recover with broader
@@ -1313,6 +1321,31 @@ server = create_server(
 )
 ```
 
+For a host-owned FastAPI application, pass the same complete wiring directly to the
+mount. The `CorpusTarget.app` must be the exact `CayuApp` being mounted:
+
+```python
+from cayu import SQLiteEvalStore
+from cayu.server import AuthenticatedAccess, EvalsConfig, mount_cayu
+from cayu.storage.migrations import SchemaMode
+
+eval_store = SQLiteEvalStore("cayu.db", schema_mode=SchemaMode.MIGRATE)
+mount_cayu(
+    server,
+    target.app,
+    access=AuthenticatedAccess(dependency=require_operator),
+    evals=EvalsConfig(target=target, store=eval_store),
+)
+```
+
+An embedded mount must supply `access`; `OpenAccess` with Evals and an incomplete
+`EvalsConfig` both fail construction. When `evals` is omitted, the dashboard keeps Evals
+visible but marks execution and catalog operations not ready and names the missing target
+or durable store wiring. An arbitrary embedded mount does not infer executable authority
+from registered agents. `cayu serve --dev` is different: project assembly creates trusted
+loopback access, a project-local durable store when needed, and server-published targets
+for registered agents.
+
 The target must reference the exact `CayuApp` attached to the server. Open
 access, a disabled API, an in-memory store, incomplete wiring, or an unavailable
 target identity rejects during construction and mounts no Evals execution
@@ -1412,11 +1445,12 @@ status, and comparison identities remain in bounded URL state. Superseded reads
 are cancelled and a changed corpus never reuses another corpus's suite or case
 projection.
 
-The session-side **Run fresh trial** action uses the same retry registry and run
-worker. Its request identity includes the captured candidate revision and every
-execution setting, so changing a bound creates a new admission identity while an
-ambiguous retry of unchanged work remains idempotent. Successful launch opens the
-ordinary Evals run view; there is no dashboard-only execution engine.
+The session-side **Run on current app** action uses the same retry registry and run
+worker. It executes through the current server-published application target, not the
+hermetic `[tool.cayu].eval_target`. Its request identity includes the captured candidate
+revision and every execution setting, so changing a bound creates a new admission
+identity while an ambiguous retry of unchanged work remains idempotent. Successful
+launch opens the ordinary Evals run view; there is no dashboard-only execution engine.
 
 A completed run exposes the complete safe published graph. The result view
 shows target release/AppManifest identity, run/case/trial status and score,
@@ -1466,13 +1500,13 @@ the downloaded dashboard result.
 
 The focused real-application check starts from a freshly generated project and
 an actual OpenAI or Anthropic model. It runs `cayu serve --dev`, creates a
-session in Control Plane, adds an output-content assertion, launches one fresh
-trial, approves the captured result as baseline, compares captured to fresh,
+session in Control Plane, adds an output-content assertion, launches one current-app
+trial, approves the captured result as baseline, compares captured to the current-app result,
 downloads both result origins and their reports, and proves the stable CLI
 comparison exit. The generated project contains no Evals-specific changes:
 
 ```bash
-# Two agent executions: source capture and one bounded fresh trial.
+# Two agent executions: source capture and one bounded current-app trial.
 CAYU_PROVIDER=openai OPENAI_API_KEY=... \
   uv run python examples/evals_release_acceptance_live.py
 

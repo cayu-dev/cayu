@@ -8,7 +8,7 @@ export const EVALS_READINESS_OPERATIONS = [
   ["catalog_write", "Import and save"],
   ["captured_result_persistence", "Captured results"],
   ["scenario_conversion", "Production scenarios"],
-  ["fresh_launch", "Fresh trials"],
+  ["fresh_launch", "Current-app trials"],
   ["cancellation", "Cancellation"],
   ["comparison", "Comparison"],
   ["reports", "Reports"],
@@ -21,8 +21,10 @@ const REASON_TEXT: Record<EvalsReadinessReasonCode, string> = {
     "The session store cannot provide the terminal evidence required for captured evaluation.",
   session_lineage_not_supported:
     "The session store cannot provide the session lineage required for captured evaluation.",
-  eval_store_not_configured: "Durable Evals storage is not available in this deployment.",
-  eval_target_not_configured: "No server-owned eval target is available in this deployment.",
+  eval_store_not_configured:
+    "For mount_cayu, pass access=AuthenticatedAccess(...) and complete durable Evals wiring through evals=EvalsConfig(target=target, store=eval_store), where eval_store is a SQLiteEvalStore or PostgresEvalStore.",
+  eval_target_not_configured:
+    "For mount_cayu, pass access=AuthenticatedAccess(...) and complete durable Evals wiring through evals=EvalsConfig(target=target, store=eval_store), where target is a CorpusTarget for the exact mounted CayuApp.",
   captured_result_persistence_not_available:
     "The configured eval store cannot persist captured results.",
   scenario_v2_not_available: "Scenario-v2 conversion is unavailable in this deployment.",

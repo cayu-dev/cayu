@@ -466,8 +466,8 @@ export function EvaluationPromotionAction({
             <SheetTitle>Evaluate captured session</SheetTitle>
             <SheetDescription>
               Review retained evidence, define expectations, then save or export the exact previewed
-              evaluation. Preview is evidence-only; Run fresh trial explicitly starts new
-              application work.
+              evaluation. Preview is evidence-only; Run on current app explicitly starts new work
+              through the mounted application target.
             </SheetDescription>
           </SheetHeader>
 
@@ -545,7 +545,7 @@ export function EvaluationPromotionAction({
               >
                 {launchedRunId === null
                   ? `Saved result ${shortEvalIdentity(savedRevision)} to Evals. `
-                  : `Started fresh eval run ${shortEvalIdentity(launchedRunId)}. `}
+                  : `Started current-app eval run ${shortEvalIdentity(launchedRunId)}. `}
                 <Link
                   to="/evals"
                   search={{
@@ -648,7 +648,7 @@ export function EvaluationPromotionAction({
               onClick={() => void launchFreshTrial()}
             >
               {launching ? <LoaderCircle className="animate-spin" /> : <Play />}
-              {launching ? "Starting..." : "Run fresh trial"}
+              {launching ? "Starting..." : "Run on current app"}
             </Button>
           </SheetFooter>
         </SheetContent>
@@ -704,8 +704,8 @@ function PromotionEvidenceSummary({
       )}
       <div className="mx-3 mt-3 rounded-lg border border-border bg-muted/20 p-2.5 text-xs text-muted-foreground">
         {preview.runnable_conversion.available
-          ? "This captured session can also be converted into runnable input for a fresh evaluation."
-          : `Captured scoring and saving are available. Fresh execution needs authored runnable input${preview.runnable_conversion.reason_code ? ` (${preview.runnable_conversion.reason_code.replaceAll("_", " ")})` : ""}.`}
+          ? "This captured session can also be converted into runnable input for a current-app evaluation."
+          : `Captured scoring and saving are available. Current-app execution needs authored runnable input${preview.runnable_conversion.reason_code ? ` (${preview.runnable_conversion.reason_code.replaceAll("_", " ")})` : ""}.`}
       </div>
       <div
         className="mx-3 mt-3 rounded-lg border border-border bg-muted/20 p-2.5 text-xs text-muted-foreground"
@@ -781,7 +781,7 @@ function FreshExecutionEditor({
   return (
     <Card size="sm" data-testid="promotion-fresh-execution">
       <CardHeader>
-        <CardTitle>Fresh execution</CardTitle>
+        <CardTitle>Current-app execution</CardTitle>
         <p className="mt-1 text-xs text-muted-foreground">
           Starts new application work with the target&apos;s existing tools, environment, approvals,
           and operator policy. {targetSummary}
@@ -983,7 +983,7 @@ function validateFreshExecution(
   } catch (error) {
     return {
       ok: false,
-      error: error instanceof Error ? error.message : "Fresh execution settings are invalid.",
+      error: error instanceof Error ? error.message : "Current-app execution settings are invalid.",
     }
   }
 }

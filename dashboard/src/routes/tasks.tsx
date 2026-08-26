@@ -35,7 +35,7 @@ import {
   type TaskListQuery,
 } from "../lib/api"
 import { dashboardCapabilityUnavailableText } from "../lib/dashboard-capabilities"
-import { formatDateTime } from "../lib/format"
+import { formatCurrencyWithCode, formatDateTime } from "../lib/format"
 import { currentQueryParam, dashboardPath, replaceDashboardLocation } from "../lib/links"
 import { taskAvailabilityDescriptor } from "../lib/task-availability"
 import { cn } from "../lib/utils"
@@ -614,9 +614,13 @@ export function TasksPage() {
                       {selectedTask.retry_series.estimated_cost_remaining != null && (
                         <div className="flex justify-between gap-3">
                           <span className="text-muted-foreground">Cost remaining</span>
-                          <span>
-                            {selectedTask.retry_series.estimated_cost_remaining}{" "}
-                            {selectedTask.retry_series.policy.cost_currency}
+                          <span
+                            title={`Exact remaining cost: ${selectedTask.retry_series.estimated_cost_remaining} ${selectedTask.retry_series.policy.cost_currency}`}
+                          >
+                            {formatCurrencyWithCode(
+                              selectedTask.retry_series.estimated_cost_remaining,
+                              selectedTask.retry_series.policy.cost_currency,
+                            )}
                           </span>
                         </div>
                       )}

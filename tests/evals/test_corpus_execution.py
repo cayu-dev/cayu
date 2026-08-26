@@ -13,9 +13,11 @@ import cayu.evals.execution as execution_module
 import cayu.evals.runner as runner_module
 from cayu import (
     AgentSpec,
+    AlwaysRequireApprovalToolPolicy,
     ContextExposurePage,
     Environment,
     EnvironmentSpec,
+    EvalTrialDiagnosticCode,
     InMemorySessionStore,
     LocalWorkspace,
     Message,
@@ -23,6 +25,7 @@ from cayu import (
     ModelStreamEvent,
     RunRequest,
     ScriptedModelProvider,
+    SQLiteSessionStore,
     StructuredOutputSpec,
     Tool,
     ToolContext,
@@ -42,6 +45,7 @@ from cayu.evals.corpus import (
     ModelJudgeAssertionSpec,
     RootStatusAssertionSpec,
     RunInputSpec,
+    ToolCalledAssertionSpec,
     TrialRequestSpec,
     _content_revision,
     pricing_profile_identity,
@@ -315,6 +319,42 @@ class _DangerousJudgeTool(Tool):
         return ToolResult(content="executed")
 
 
+class _NamedRecordingTool(Tool):
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            ToolSpec(
+                name=name,
+                description=f"Record {name}.",
+                input_schema={"type": "object", "properties": {}},
+            )
+        )
+        self.calls = 0
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del ctx, args
+        self.calls += 1
+        return ToolResult(content="ok")
+
+
+class _AskModeReorderProvider(ModelProvider):
+    name = "ask-mode-reorder"
+
+    def __init__(self) -> None:
+        self.request_count = 0
+
+    async def stream(self, request):
+        del request
+        calls = (
+            ("get_customer", "call-customer"),
+            ("create_recommendation", "call-recommendation"),
+            ("send_email", "call-email"),
+        )
+        tool_name, call_id = calls[self.request_count]
+        self.request_count += 1
+        yield ModelStreamEvent.tool_call(id=call_id, name=tool_name, arguments={})
+        yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+
+
 def _model_judge_corpus(
     judge: ModelJudgeTarget,
     *,
@@ -501,6 +541,84 @@ def test_missing_runtime_exposure_evidence_fails_closed_at_publication() -> None
         == evidence
     )
     assert captured_result_for_corpus(corpus, result).score.memory_attribution == evidence
+
+
+def test_run_corpus_suite_scores_completed_tools_when_ask_mode_interrupts_on_sqlite(
+    tmp_path,
+):
+    store = SQLiteSessionStore(tmp_path / "ask-mode-eval.sqlite")
+    provider = _AskModeReorderProvider()
+    get_customer = _NamedRecordingTool("get_customer")
+    create_recommendation = _NamedRecordingTool("create_recommendation")
+    send_email = _NamedRecordingTool("send_email")
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="reorder-agent", model="fixture-model"),
+        tools=[get_customer, create_recommendation, send_email],
+        tool_policy=AlwaysRequireApprovalToolPolicy(tools={"send_email"}),
+    )
+    target = CorpusTarget(
+        key="reorder-agent",
+        app=app,
+        request_base=RunRequest(agent_name="reorder-agent", messages=[], max_steps=4),
+        application_release_id="release-ask-mode",
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+    )
+    suite = EvalSuiteSpec.create(
+        id="reorder-campaign",
+        name="Reorder campaign",
+        trial_request=TrialRequestSpec(trials=1, timeout_seconds=30),
+    )
+    corpus = EvalCorpusDocument.create(
+        target_key=target.key,
+        evidence_policy=target.evidence_policy,
+        suites=(suite,),
+        cases=(
+            EvalCaseSpec.create(
+                id="approval-gate",
+                suite_id=suite.id,
+                name="Approval-gated email",
+                source=_source(),
+                input=RunInputSpec(
+                    messages=(CorpusUserMessageSpec(text="Prepare and send the reorder email."),)
+                ),
+                assertions=(
+                    RootStatusAssertionSpec(id="completed", expected="completed"),
+                    ToolCalledAssertionSpec(
+                        id="customer-loaded",
+                        tool_name="get_customer",
+                        min_count=1,
+                        max_count=1,
+                    ),
+                    ToolCalledAssertionSpec(
+                        id="recommendation-created",
+                        tool_name="create_recommendation",
+                        min_count=1,
+                        max_count=1,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    try:
+        result = asyncio.run(run_corpus_suite(target, corpus, suite.id))
+    finally:
+        asyncio.run(store.close())
+
+    trial = result.run.cases[0].trials[0]
+    assertions = {assertion.assertion_id: assertion for assertion in trial.assertions}
+    assert provider.request_count == 3
+    assert (get_customer.calls, create_recommendation.calls, send_email.calls) == (1, 1, 0)
+    assert trial.evidence_complete is True
+    assert trial.status == "failed"
+    assert trial.code is EvalTrialDiagnosticCode.ASSERTION_FAILED
+    assert trial.score == pytest.approx(2 / 3)
+    assert assertions["completed"].outcome == "failed"
+    assert assertions["completed"].detail.actual == "interrupted"
+    assert assertions["customer-loaded"].outcome == "passed"
+    assert assertions["recommendation-created"].outcome == "passed"
 
 
 def test_run_corpus_suite_resolves_trusted_model_judge_and_publishes_its_contract():

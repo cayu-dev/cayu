@@ -321,20 +321,39 @@ test("eval launch retry state never silently evicts an unresolved request", () =
 })
 
 test("eval trial cost summary distinguishes observed, unavailable, and absent pricing", () => {
-  assert.equal(
-    evalTrialCostSummary([
-      {
-        detail: {
-          kind: "max_estimated_cost",
-          estimated_cost: "0.0125",
-          currency: "USD",
-          maximum: "0.02",
+  assert.deepEqual(
+    evalTrialCostSummary(
+      [
+        {
+          detail: {
+            kind: "max_estimated_cost",
+            estimated_cost: "0.0125",
+            currency: "USD",
+            maximum: "0.02",
+          },
         },
-      },
-    ]),
-    "0.0125 USD",
+      ],
+      "en-US",
+    ),
+    { display: "USD\u00a00.01", exact: "0.0125 USD" },
   )
-  assert.equal(
+  assert.deepEqual(
+    evalTrialCostSummary(
+      [
+        {
+          detail: {
+            kind: "max_estimated_cost",
+            estimated_cost: "1E-7",
+            currency: "USD",
+            maximum: "0.02",
+          },
+        },
+      ],
+      "en-US",
+    ),
+    { display: "<USD\u00a00.0001", exact: "1E-7 USD" },
+  )
+  assert.deepEqual(
     evalTrialCostSummary([
       {
         detail: {
@@ -346,9 +365,15 @@ test("eval trial cost summary distinguishes observed, unavailable, and absent pr
         },
       },
     ]),
-    "unavailable · 2 unpriced model steps",
+    {
+      display: "unavailable · 2 unpriced model steps",
+      exact: "unavailable · 2 unpriced model steps",
+    },
   )
-  assert.equal(evalTrialCostSummary([]), "not evaluated")
+  assert.deepEqual(evalTrialCostSummary([]), {
+    display: "not evaluated",
+    exact: "not evaluated",
+  })
 })
 
 test("eval comparison reasons remain specific and operator-readable", () => {

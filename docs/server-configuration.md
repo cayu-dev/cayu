@@ -167,7 +167,8 @@ This adapter is independent of the control plane's current **Evaluate** action.
 Configured projects started with `cayu serve` automatically publish their
 registered agents as eval targets and use durable project storage, so operators
 can evaluate a terminal session, save it, approve it as a baseline, launch a
-fresh trial, compare results, and download reports without adding Evals-specific
+current-app trial using the mounted application's provider, tools, environment,
+approvals, and policy, compare results, and download reports without adding Evals-specific
 Python configuration.
 
 ## Durable Evals execution
