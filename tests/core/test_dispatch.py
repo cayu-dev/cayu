@@ -4292,6 +4292,71 @@ def test_run_worker_drains_queue_until_stopped() -> None:
     asyncio.run(scenario())
 
 
+def test_concurrent_terminal_reconciliation_is_single_flight() -> None:
+    h = _build([_batch("first answer")])
+
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        call_count = 0
+
+        async def reconcile_owned(runtime) -> bool:
+            nonlocal call_count
+            del runtime
+            call_count += 1
+            started.set()
+            await release.wait()
+            return True
+
+        h.dispatcher._reconcile_terminal_acknowledgements_owned = reconcile_owned
+        first = asyncio.create_task(h.dispatcher._reconcile_terminal_acknowledgements(h.app))
+        await started.wait()
+        waiters = [
+            asyncio.create_task(h.dispatcher._reconcile_terminal_acknowledgements(h.app))
+            for _ in range(99)
+        ]
+        await asyncio.sleep(0)
+        release.set()
+
+        results = await asyncio.gather(first, *waiters)
+
+        assert results == [True] * 100
+        assert call_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_new_terminal_reconciliation_generation_gets_follow_up_sweep() -> None:
+    h = _build([_batch("first answer")])
+
+    async def scenario() -> None:
+        first_sweep_started = asyncio.Event()
+        release_first_sweep = asyncio.Event()
+        swept_generations: list[int] = []
+
+        async def reconcile_owned(runtime) -> bool:
+            del runtime
+            swept_generations.append(h.dispatcher._terminal_receipt_reconciliation_generation)
+            if len(swept_generations) == 1:
+                first_sweep_started.set()
+                await release_first_sweep.wait()
+            return True
+
+        h.dispatcher._reconcile_terminal_acknowledgements_owned = reconcile_owned
+        first = asyncio.create_task(h.dispatcher.process_next(h.app, worker_id="first"))
+        await first_sweep_started.wait()
+        h.dispatcher._arm_terminal_receipt_reconciliation()
+        late = asyncio.create_task(h.dispatcher.process_next(h.app, worker_id="late"))
+        await asyncio.sleep(0)
+        release_first_sweep.set()
+
+        assert await asyncio.gather(first, late) == [None, None]
+        assert swept_generations == [0, 1]
+        assert h.dispatcher._startup_terminal_receipt_reconciliation_pending is False
+
+    asyncio.run(scenario())
+
+
 def test_lease_seconds_must_be_positive() -> None:
     with pytest.raises(ValueError, match="lease_seconds must be a positive integer"):
         TaskStoreDispatcher(InMemoryTaskStore(), lease_seconds=0)

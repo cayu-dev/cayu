@@ -547,6 +547,7 @@ class TaskStoreDispatcher(Dispatcher):
         self._terminal_receipt_reconciliation_cursor: tuple[str, str] | None = None
         self._terminal_receipt_reconciliation_cycle_settled = True
         self._terminal_receipt_reconciliation_task: asyncio.Task[bool] | None = None
+        self._terminal_receipt_reconciliation_task_generation: int | None = None
         self._terminal_receipt_reconciliation_generation = 0
         self._startup_terminal_receipt_reconciliation_pending = True
 
@@ -1621,28 +1622,41 @@ class TaskStoreDispatcher(Dispatcher):
     ) -> bool:
         """Serialize bounded cross-store acknowledgement-loss discovery."""
 
+        requested_generation = self._terminal_receipt_reconciliation_generation
         while self._terminal_receipt_reconciliation_task is not None:
             active_reconciliation = self._terminal_receipt_reconciliation_task
+            active_generation = self._terminal_receipt_reconciliation_task_generation
+            if active_generation is None:
+                raise RuntimeError("Active terminal receipt reconciliation has no generation.")
             if active_reconciliation.get_loop() is not asyncio.get_running_loop():
                 if active_reconciliation.done():
                     self._terminal_receipt_reconciliation_task = None
+                    self._terminal_receipt_reconciliation_task_generation = None
                     continue
                 raise RuntimeError(
                     "TaskStoreDispatcher cannot reconcile terminal receipts from "
                     "multiple event loops concurrently."
                 )
-            await asyncio.shield(active_reconciliation)
+            reconciliation_complete = await asyncio.shield(active_reconciliation)
+            if not reconciliation_complete or active_generation >= requested_generation:
+                return reconciliation_complete
+            if self._terminal_receipt_reconciliation_task is active_reconciliation:
+                self._terminal_receipt_reconciliation_task = None
+                self._terminal_receipt_reconciliation_task_generation = None
 
+        reconciliation_generation = self._terminal_receipt_reconciliation_generation
         reconciliation = asyncio.create_task(
             self._reconcile_terminal_acknowledgements_owned(runtime)
         )
         self._terminal_receipt_reconciliation_task = reconciliation
+        self._terminal_receipt_reconciliation_task_generation = reconciliation_generation
 
         def reconciliation_done(completed: asyncio.Task[bool]) -> None:
             with contextlib.suppress(asyncio.CancelledError):
                 completed.exception()
             if self._terminal_receipt_reconciliation_task is completed:
                 self._terminal_receipt_reconciliation_task = None
+                self._terminal_receipt_reconciliation_task_generation = None
 
         reconciliation.add_done_callback(reconciliation_done)
         return await asyncio.shield(reconciliation)
