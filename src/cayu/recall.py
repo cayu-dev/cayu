@@ -58,12 +58,17 @@ from cayu.runtime.sessions import (
 )
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_NAMESPACE,
+    MAX_KNOWLEDGE_RELATION_BYTES,
     KnowledgeAccessScope,
     KnowledgeHit,
     KnowledgeIndexCoverage,
+    KnowledgeLineageQuery,
+    KnowledgeLineageResult,
     KnowledgeQuery,
+    KnowledgeRevisionRef,
     KnowledgeSearchMode,
     KnowledgeSearchResult,
+    KnowledgeStatus,
     KnowledgeStore,
     copy_knowledge_access_scope,
 )
@@ -79,6 +84,9 @@ RECALL_MAX_QUERY_BYTES = 8_192
 RECALL_MAX_RESULT_BYTES = 1_000_000
 RECALL_MAX_CONTINUATIONS = 100
 RECALL_MAX_CONTINUATION_BYTES = 4_096
+RECALL_MAX_LINEAGE_LINKS_PER_RECORD = 100
+RECALL_MAX_LINEAGE_CANDIDATES = 100
+RECALL_MAX_LINEAGE_BYTES_PER_RECORD = 64_000
 _RECALL_MAX_SOURCES = 32
 _RECALL_MAX_CHANNELS = 100
 _RECALL_MAX_NAME_BYTES = 256
@@ -371,6 +379,10 @@ class RecallRecord(BaseModel):
     text_complete: bool
     content_hash: str
     locator: Mapping[str, Any]
+    lineage: KnowledgeLineageResult | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @field_validator("identity", mode="before")
     @classmethod
@@ -423,6 +435,40 @@ class RecallRecord(BaseModel):
         if type(thawed) is not dict:  # pragma: no cover - defensive invariant
             raise AssertionError("Recall locator did not thaw as an object.")
         return thawed
+
+    @field_validator("lineage", mode="before")
+    @classmethod
+    def copy_lineage(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, KnowledgeLineageResult):
+            value = value.model_dump(mode="python")
+        return KnowledgeLineageResult.model_validate(value)
+
+    @model_validator(mode="after")
+    def validate_lineage_locator(self) -> RecallRecord:
+        if self.lineage is None:
+            return self
+        if self.identity.record_type not in {"knowledge_entry", "knowledge_chunk"}:
+            raise ValueError("Only an exact knowledge recall record can carry lineage.")
+        entry_id = self.locator.get("entry_id")
+        entry_revision = self.locator.get("entry_revision")
+        if (
+            type(entry_id) is not str
+            or type(entry_revision) is not int
+            or entry_id != self.lineage.query.reference.entry_id
+            or entry_revision != self.lineage.query.reference.revision
+            or self.identity.revision != str(self.lineage.query.reference.revision)
+        ):
+            raise ValueError("Recall lineage conflicts with the exact knowledge locator.")
+        if self.identity.record_type == "knowledge_entry" and self.identity.record_id != entry_id:
+            raise ValueError("Knowledge-entry lineage conflicts with recall identity.")
+        if (
+            self.identity.record_type == "knowledge_chunk"
+            and self.identity.record_id != self.locator.get("chunk_id")
+        ):
+            raise ValueError("Knowledge-chunk lineage conflicts with recall identity.")
+        return self
 
 
 class RecallSourceResult(BaseModel):
@@ -1324,6 +1370,9 @@ class KnowledgeRecallSource(RecallSource):
         max_bytes: int = 64_000,
         max_record_bytes: int = 8_000,
         semantic_timeout_seconds: float = 1.0,
+        lineage_limit: int = 0,
+        lineage_candidate_limit: int = 10,
+        lineage_max_bytes: int = MAX_KNOWLEDGE_RELATION_BYTES,
     ) -> None:
         if not isinstance(store, KnowledgeStore):
             raise TypeError("store must be a KnowledgeStore.")
@@ -1342,10 +1391,43 @@ class KnowledgeRecallSource(RecallSource):
         )
         if not 0 < semantic_timeout_seconds <= 60:
             raise ValueError("semantic_timeout_seconds must be greater than 0 and at most 60.")
+        if (
+            type(lineage_limit) is not int
+            or not 0 <= lineage_limit <= RECALL_MAX_LINEAGE_LINKS_PER_RECORD
+        ):
+            raise ValueError(
+                f"lineage_limit must be between 0 and {RECALL_MAX_LINEAGE_LINKS_PER_RECORD}."
+            )
+        if (
+            type(lineage_candidate_limit) is not int
+            or not 1 <= lineage_candidate_limit <= RECALL_MAX_LINEAGE_CANDIDATES
+        ):
+            raise ValueError(
+                f"lineage_candidate_limit must be between 1 and {RECALL_MAX_LINEAGE_CANDIDATES}."
+            )
+        if (
+            type(lineage_max_bytes) is not int
+            or not MAX_KNOWLEDGE_RELATION_BYTES
+            <= lineage_max_bytes
+            <= RECALL_MAX_LINEAGE_BYTES_PER_RECORD
+        ):
+            raise ValueError(
+                "lineage_max_bytes must be between "
+                f"{MAX_KNOWLEDGE_RELATION_BYTES} and "
+                f"{RECALL_MAX_LINEAGE_BYTES_PER_RECORD}."
+            )
+        if lineage_candidate_limit * lineage_max_bytes > RECALL_MAX_RESULT_BYTES:
+            raise ValueError(
+                "The lineage candidate and per-record byte bounds cannot reserve more than "
+                f"{RECALL_MAX_RESULT_BYTES} bytes."
+            )
         self._store = store
         self._max_bytes = max_bytes
         self._max_record_bytes = max_record_bytes
         self._semantic_timeout_seconds = semantic_timeout_seconds
+        self._lineage_limit = lineage_limit
+        self._lineage_candidate_limit = lineage_candidate_limit
+        self._lineage_max_bytes = lineage_max_bytes
 
     async def retrieve(self, situation: RecallSituation) -> RecallSourceResult:
         if situation.knowledge_access_scope is None:
@@ -1435,6 +1517,11 @@ class KnowledgeRecallSource(RecallSource):
                 partial_reasons.append("semantic_index_partial")
             if semantic.truncated:
                 partial_reasons.append("semantic_truncated")
+        await self._attach_lineage(
+            records,
+            channels=(lexical_channel, semantic_channel),
+            access_scope=situation.knowledge_access_scope,
+        )
         return RecallSourceResult(
             source=self.name,
             channels=(lexical_channel, semantic_channel),
@@ -1478,6 +1565,94 @@ class KnowledgeRecallSource(RecallSource):
             hits=tuple(ranked),
             truncated=result.truncated or not coverage_complete,
         )
+
+    async def _attach_lineage(
+        self,
+        records: dict[tuple[str, str, str], RecallRecord],
+        *,
+        channels: tuple[RankedRetrievalChannel, ...],
+        access_scope: KnowledgeAccessScope,
+    ) -> None:
+        if self._lineage_limit == 0 or not records:
+            return
+        ranked_records: dict[
+            tuple[str, str, str],
+            tuple[tuple[int, str, tuple[str, str, str]], tuple[str, int]],
+        ] = {}
+        for channel in channels:
+            for hit in channel.hits:
+                identity_key = hit.identity.sort_key()
+                record = records[identity_key]
+                entry_id = record.locator.get("entry_id")
+                entry_revision = record.locator.get("entry_revision")
+                if type(entry_id) is not str or type(entry_revision) is not int:
+                    raise RuntimeError("Knowledge recall produced an invalid exact locator.")
+                reference_key = (entry_id, entry_revision)
+                rank_key = (hit.rank, channel.channel, identity_key)
+                existing = ranked_records.get(identity_key)
+                if existing is None or rank_key < existing[0]:
+                    ranked_records[identity_key] = (rank_key, reference_key)
+        selected_records = [
+            (identity_key, ranked[1])
+            for identity_key, ranked in sorted(
+                ranked_records.items(),
+                key=lambda item: item[1][0],
+            )[: self._lineage_candidate_limit]
+        ]
+        selected_references = list(dict.fromkeys(reference for _, reference in selected_records))
+
+        async def inspect(reference: tuple[str, int]) -> KnowledgeLineageResult:
+            requested_query = KnowledgeLineageQuery(
+                reference=KnowledgeRevisionRef(
+                    entry_id=reference[0],
+                    revision=reference[1],
+                ),
+                limit=self._lineage_limit,
+                max_bytes=self._lineage_max_bytes,
+            )
+            raw_result = await self._store.inspect_lineage(
+                requested_query,
+                access_scope=access_scope,
+            )
+            if raw_result is None:
+                raise RuntimeError("Knowledge lineage authority changed during recall.")
+            if type(raw_result) is not KnowledgeLineageResult:
+                raise TypeError(
+                    "KnowledgeStore.inspect_lineage() must return a KnowledgeLineageResult or None."
+                )
+            result = KnowledgeLineageResult.model_validate(raw_result.model_dump(mode="python"))
+            if result.query != requested_query:
+                raise RuntimeError("Knowledge lineage store altered the bounded recall query.")
+            if (
+                result.reference_current != requested_query.reference
+                or result.reference_status is not KnowledgeStatus.ACTIVE
+            ):
+                raise RuntimeError("Knowledge lineage authority changed during recall.")
+            return result
+
+        inspection_tasks = [
+            asyncio.create_task(
+                inspect(reference),
+                name=f"cayu-knowledge-lineage-{index}",
+            )
+            for index, reference in enumerate(selected_references)
+        ]
+        try:
+            inspections = await asyncio.gather(*inspection_tasks)
+        except BaseException:
+            for task in inspection_tasks:
+                task.cancel()
+            await asyncio.gather(*inspection_tasks, return_exceptions=True)
+            raise
+        by_reference = dict(zip(selected_references, inspections, strict=True))
+        for identity_key, reference in selected_records:
+            record = records[identity_key]
+            records[identity_key] = RecallRecord.model_validate(
+                {
+                    **record.model_dump(mode="python"),
+                    "lineage": by_reference[reference],
+                }
+            )
 
 
 class TranscriptRecallSource(RecallSource):

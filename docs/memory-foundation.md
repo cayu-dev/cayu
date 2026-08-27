@@ -60,6 +60,27 @@ temporarily omitted optional lanes are not described as complete. A required
 source failure fails the recall request; an optional source can be represented
 as unavailable without inventing empty complete coverage.
 
+`KnowledgeRecallSource(..., lineage_limit=N)` can additionally attach a
+`KnowledgeLineageResult` to the highest-ranked bounded set of exact knowledge
+records. `lineage_limit=0` is the default, so applications that do not request
+lineage pay no inspection cost. Enrichment never changes a lexical or semantic
+rank. It exposes typed exact-revision references: `supersedes`,
+`superseded_by`, `derived_from`, `derivation_source_for`, or `contradicts`.
+An unresolved current contradiction identifies the other active revision as an
+explicit alternative; it never labels either side as the winner. Archived
+predecessor text is not recalled or copied into the lineage projection.
+Before attachment, the recall adapter revalidates the store page against the
+exact bounded query and requires the recalled revision to remain current and
+active in the lineage snapshot. An intervening advance fails the source closed
+instead of returning a candidate and explanation from conflicting lifecycle
+snapshots.
+Recall caps enrichment at 100 records, 100 links per record, 64,000 bytes per
+lineage page, and a 1 MB configured aggregate reservation. Repeated chunk
+records for the same exact revision share one store inspection but each consume a record
+slot and only selected records receive the projection. Lower constructor bounds
+are recommended for interactive paths; the defaults select at most 10 records
+and reserve 8,192 bytes per selected record.
+
 Every fusion implementation has an immutable strategy identity which must match
 the caller's versioned fusion configuration and the returned diagnostics. A
 custom strategy may rank differently, but cannot claim the built-in WRRF
@@ -466,10 +487,42 @@ relations whose exact endpoints no longer exist, while immutable publication
 receipts and already-published metadata-only changes remain reconciliation
 evidence and never recreate the relation on replay.
 
+`inspect_lineage(...)` is the safer read surface for recall and operator
+explanations. It projects only relation identity, semantic role, the exact and
+current counterpart references, lifecycle status, current/stale state, the
+unresolved-contradiction marker, and creation time. It never returns knowledge
+text, relation metadata, actor identity, policy payload, or evidence locators.
+Every relation, currentness, counterpart-lifecycle, and unresolved filter is
+bound into the stable cursor with the access scope.
+
+Reviewed archival is special only at this reference boundary. An active exact
+predecessor may be named after its logical current revision becomes `archived`,
+which lets a selected replacement explain what it superseded. Ordinary entry,
+chunk, evidence, and raw relation reads remain subject to their existing exact
+plus current authorization and therefore do not release archived content. A
+deleted, expired, relabeled, foreign-source, or foreign-namespace endpoint is
+not widened. The in-memory, SQLite, and PostgreSQL implementations evaluate the
+projection in one bounded store snapshot.
+
+```python
+from cayu import KnowledgeLineageQuery, KnowledgeRevisionRef
+
+lineage = await store.inspect_lineage(
+    KnowledgeLineageQuery(
+        reference=KnowledgeRevisionRef(entry_id="refund-policy-new", revision=2),
+        limit=20,
+    )
+)
+for link in lineage.links if lineage is not None else ():
+    print(link.role, link.counterpart, link.currentness)
+```
+
 A relation is not truth, similarity, approval, current-state activation,
 ranking weight, or context-placement authority. This slice performs no graph
-traversal and does not automatically archive a predecessor. Reviewed atomic
-supersession and relation-aware recall are separate later policies.
+traversal. Lineage-aware recall reports reviewed relations but cannot create,
+approve, activate, archive, rerank, or place knowledge. `ContextExposure`
+continues to attribute actual provider-facing use from the unchanged exact
+recall locator; a lineage reference is not exposure evidence.
 
 Breaking storage revision 60 installs this final prerelease relation contract.
 Fresh databases and completely empty earlier knowledge schemas initialize
@@ -483,8 +536,9 @@ The hermetic relation performance checker makes no provider calls:
 PYTHONPATH=src python scripts/run_knowledge_relation_performance.py --check
 ```
 
-Its checked report returns 50 matching relations from a store containing 5,000
-additional unrelated relations, so endpoint lookup must remain index-bound. The
+Its checked report returns 50 matching relations and safe lineage links from a
+store containing 5,000 additional unrelated relations, so both endpoint lookups
+must remain index-bound. The
 result is recorded in
 [`benchmarks/memory/knowledge-relation-performance-v1.json`](../benchmarks/memory/knowledge-relation-performance-v1.json).
 The zero-relation lane is a current-runtime control with the same canonical

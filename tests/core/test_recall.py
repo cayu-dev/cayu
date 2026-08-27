@@ -48,7 +48,12 @@ from cayu.storage.memory import (
     InMemoryKnowledgeStore,
     KnowledgeAccessScope,
     KnowledgeEntry,
+    KnowledgeLineageRole,
+    KnowledgeRelation,
+    KnowledgeRelationKind,
+    KnowledgeRevisionRef,
     KnowledgeSearchMode,
+    KnowledgeStatus,
 )
 from cayu.storage.sqlite import SQLiteSessionStore
 
@@ -913,6 +918,353 @@ def test_built_in_sources_fuse_exact_current_knowledge_and_transcript_evidence()
     ]
     assert result.sources[0].failure_code == "semantic_unsupported"
     assert result.truncated is True
+
+
+def test_knowledge_recall_can_explain_supersession_and_unresolved_alternatives() -> None:
+    async def run() -> RecallResult:
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = InMemoryKnowledgeStore(access_scope=scope)
+        replacement = await knowledge.create_entry(
+            KnowledgeEntry(
+                id="release-current",
+                text="Atlas release date is Friday",
+                namespace="project:cayu",
+            )
+        )
+        predecessor = await knowledge.create_entry(
+            KnowledgeEntry(
+                id="release-obsolete",
+                text="Atlas release date was Thursday",
+                namespace="project:cayu",
+            )
+        )
+        alternative = await knowledge.create_entry(
+            KnowledgeEntry(
+                id="release-alternative",
+                text="Atlas release date may be Monday",
+                namespace="project:cayu",
+            )
+        )
+        await knowledge.publish_relations(
+            [
+                KnowledgeRelation(
+                    id="release-supersession",
+                    subject=KnowledgeRevisionRef(
+                        entry_id=replacement.id,
+                        revision=replacement.revision,
+                    ),
+                    object=KnowledgeRevisionRef(
+                        entry_id=predecessor.id,
+                        revision=predecessor.revision,
+                    ),
+                    kind=KnowledgeRelationKind.SUPERSEDES,
+                    metadata={"private_review": "not recall material"},
+                ),
+                KnowledgeRelation(
+                    id="release-contradiction",
+                    subject=KnowledgeRevisionRef(
+                        entry_id=replacement.id,
+                        revision=replacement.revision,
+                    ),
+                    object=KnowledgeRevisionRef(
+                        entry_id=alternative.id,
+                        revision=alternative.revision,
+                    ),
+                    kind=KnowledgeRelationKind.CONTRADICTS,
+                ),
+            ],
+            operation_id="release-lineage",
+        )
+        await knowledge.append_entry_revision(
+            predecessor.model_copy(
+                update={
+                    "revision": 2,
+                    "status": KnowledgeStatus.ARCHIVED,
+                    "updated_at": predecessor.updated_at + timedelta(microseconds=1),
+                }
+            ),
+            expected_revision=1,
+        )
+        return await RecallEngine(
+            (KnowledgeRecallSource(knowledge, lineage_limit=10),),
+            fusion_config=_fusion_config(
+                KNOWLEDGE_LEXICAL_CHANNEL,
+                KNOWLEDGE_SEMANTIC_CHANNEL,
+            ),
+        ).recall(
+            _situation(
+                knowledge_access_scope=scope,
+                knowledge_namespace="project:cayu",
+            )
+        )
+
+    result = asyncio.run(run())
+
+    by_entry = {candidate.record.locator["entry_id"]: candidate for candidate in result.candidates}
+    assert set(by_entry) == {"release-current", "release-alternative"}
+    current_lineage = by_entry["release-current"].record.lineage
+    alternative_lineage = by_entry["release-alternative"].record.lineage
+    assert current_lineage is not None
+    assert alternative_lineage is not None
+    assert {
+        (link.role, link.counterpart.entry_id, link.unresolved_contradiction)
+        for link in current_lineage.links
+    } == {
+        (KnowledgeLineageRole.SUPERSEDES, "release-obsolete", False),
+        (KnowledgeLineageRole.CONTRADICTS, "release-alternative", True),
+    }
+    assert alternative_lineage.links[0].role is KnowledgeLineageRole.CONTRADICTS
+    assert alternative_lineage.links[0].counterpart.entry_id == "release-current"
+    assert alternative_lineage.links[0].unresolved_contradiction is True
+    assert "private_review" not in result.model_dump_json()
+
+
+def test_knowledge_recall_lineage_has_zero_record_overhead() -> None:
+    class CountingLineageStore(InMemoryKnowledgeStore):
+        lineage_calls = 0
+
+        async def inspect_lineage(self, query, *, access_scope=None):
+            self.lineage_calls += 1
+            return await super().inspect_lineage(query, access_scope=access_scope)
+
+    async def run() -> int:
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = CountingLineageStore(access_scope=scope)
+        result = await KnowledgeRecallSource(
+            knowledge,
+            lineage_limit=5,
+        ).retrieve(
+            _situation(
+                knowledge_access_scope=scope,
+                knowledge_namespace="project:cayu",
+            )
+        )
+        assert result.records == ()
+        return knowledge.lineage_calls
+
+    assert asyncio.run(run()) == 0
+    assert "lineage" not in _record("knowledge_entry", "plain", "plain").model_dump(mode="json")
+
+
+def test_knowledge_recall_lineage_candidate_limit_counts_chunk_records() -> None:
+    class CountingLineageStore(InMemoryKnowledgeStore):
+        lineage_calls = 0
+
+        async def inspect_lineage(self, query, *, access_scope=None):
+            self.lineage_calls += 1
+            return await super().inspect_lineage(query, access_scope=access_scope)
+
+    async def run() -> tuple[dict[tuple[str, str, str], RecallRecord], int]:
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = CountingLineageStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="chunked-entry",
+                text="Atlas canonical guidance",
+                namespace="project:cayu",
+            )
+        )
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="source-entry",
+                text="Atlas source guidance",
+                namespace="project:cayu",
+            )
+        )
+        await knowledge.publish_relations(
+            [
+                KnowledgeRelation(
+                    id="chunked-lineage",
+                    subject=KnowledgeRevisionRef(entry_id="chunked-entry", revision=1),
+                    object=KnowledgeRevisionRef(entry_id="source-entry", revision=1),
+                    kind=KnowledgeRelationKind.DERIVED_FROM,
+                )
+            ],
+            operation_id="chunked-lineage",
+        )
+        records: dict[tuple[str, str, str], RecallRecord] = {}
+        hits = []
+        for rank, chunk_id in enumerate(("chunk-a", "chunk-b"), start=1):
+            text = f"Atlas {chunk_id}"
+            record = RecallRecord(
+                identity=RetrievalCandidateIdentity(
+                    record_type="knowledge_chunk",
+                    record_id=chunk_id,
+                    revision="1",
+                ),
+                representation="chunk_text",
+                text=text,
+                text_complete=True,
+                content_hash=sha256(text.encode()).hexdigest(),
+                locator={
+                    "entry_id": "chunked-entry",
+                    "entry_revision": 1,
+                    "chunk_id": chunk_id,
+                    "chunk_index": rank - 1,
+                },
+            )
+            records[record.identity.sort_key()] = record
+            hits.append(
+                RankedRetrievalHit(
+                    identity=record.identity,
+                    rank=rank,
+                    representation=record.representation,
+                    content_hash=record.content_hash,
+                )
+            )
+        source = KnowledgeRecallSource(
+            knowledge,
+            lineage_limit=5,
+            lineage_candidate_limit=1,
+        )
+        await source._attach_lineage(
+            records,
+            channels=(
+                RankedRetrievalChannel(
+                    channel=KNOWLEDGE_LEXICAL_CHANNEL,
+                    index_version="test-v1",
+                    candidate_limit=2,
+                    hits=tuple(hits),
+                ),
+            ),
+            access_scope=scope,
+        )
+        return records, knowledge.lineage_calls
+
+    records, lineage_calls = asyncio.run(run())
+
+    assert lineage_calls == 1
+    assert sum(record.lineage is not None for record in records.values()) == 1
+    enriched = records[("knowledge_chunk", "chunk-a", "1")]
+    assert enriched.lineage is not None
+    assert records[("knowledge_chunk", "chunk-b", "1")].lineage is None
+    invalid = enriched.model_dump(mode="python")
+    invalid["locator"]["chunk_id"] = "different-chunk"
+    with pytest.raises(ValueError, match="Knowledge-chunk lineage"):
+        RecallRecord.model_validate(invalid)
+
+
+@pytest.mark.parametrize(
+    "successor_status",
+    (KnowledgeStatus.ACTIVE, KnowledgeStatus.ARCHIVED),
+)
+def test_knowledge_recall_rejects_a_candidate_that_advances_before_lineage(
+    successor_status: KnowledgeStatus,
+) -> None:
+    class AdvancingLineageStore(InMemoryKnowledgeStore):
+        candidate: KnowledgeEntry | None = None
+
+        async def inspect_lineage(self, query, *, access_scope=None):
+            if self.candidate is not None:
+                candidate = self.candidate
+                self.candidate = None
+                await self.append_entry_revision(
+                    candidate.model_copy(
+                        update={
+                            "revision": candidate.revision + 1,
+                            "status": successor_status,
+                            "updated_at": candidate.updated_at + timedelta(microseconds=1),
+                        }
+                    ),
+                    expected_revision=candidate.revision,
+                    access_scope=KnowledgeAccessScope.privileged(),
+                )
+            return await super().inspect_lineage(query, access_scope=access_scope)
+
+    async def run() -> None:
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = AdvancingLineageStore()
+        knowledge.candidate = await knowledge.create_entry(
+            KnowledgeEntry(
+                id="advancing-candidate",
+                text="Atlas answer before advancement",
+                namespace="project:cayu",
+            ),
+            access_scope=KnowledgeAccessScope.privileged(),
+        )
+        with pytest.raises(RuntimeError, match="authority changed"):
+            await KnowledgeRecallSource(knowledge, lineage_limit=5).retrieve(
+                _situation(
+                    knowledge_access_scope=scope,
+                    knowledge_namespace="project:cayu",
+                )
+            )
+
+    asyncio.run(run())
+
+
+def test_knowledge_recall_rejects_a_store_that_expands_the_lineage_query() -> None:
+    class ExpandingLineageStore(InMemoryKnowledgeStore):
+        expanded_link_count = 0
+
+        async def inspect_lineage(self, query, *, access_scope=None):
+            expanded = query.model_copy(update={"limit": 100, "max_bytes": 64_000})
+            result = await super().inspect_lineage(expanded, access_scope=access_scope)
+            assert result is not None
+            self.expanded_link_count = len(result.links)
+            return result
+
+    async def run() -> int:
+        scope = KnowledgeAccessScope.for_namespace("project:cayu")
+        knowledge = ExpandingLineageStore(access_scope=scope)
+        await knowledge.create_entry(
+            KnowledgeEntry(
+                id="bounded-anchor",
+                text="Atlas bounded anchor",
+                namespace="project:cayu",
+            )
+        )
+        for entry_id in ("bounded-source-a", "bounded-source-b"):
+            await knowledge.create_entry(
+                KnowledgeEntry(
+                    id=entry_id,
+                    text=f"Source material for {entry_id}",
+                    namespace="project:cayu",
+                )
+            )
+        await knowledge.publish_relations(
+            [
+                KnowledgeRelation(
+                    id=f"bounded-relation-{index}",
+                    subject=KnowledgeRevisionRef(entry_id="bounded-anchor", revision=1),
+                    object=KnowledgeRevisionRef(entry_id=entry_id, revision=1),
+                    kind=KnowledgeRelationKind.DERIVED_FROM,
+                )
+                for index, entry_id in enumerate(
+                    ("bounded-source-a", "bounded-source-b"),
+                    start=1,
+                )
+            ],
+            operation_id="bounded-lineage",
+        )
+        with pytest.raises(RuntimeError, match="altered the bounded recall query"):
+            await KnowledgeRecallSource(knowledge, lineage_limit=1).retrieve(
+                _situation(
+                    knowledge_access_scope=scope,
+                    knowledge_namespace="project:cayu",
+                )
+            )
+        return knowledge.expanded_link_count
+
+    assert asyncio.run(run()) == 2
+
+
+@pytest.mark.parametrize(
+    "configuration",
+    (
+        {"lineage_limit": 101},
+        {"lineage_candidate_limit": 101},
+        {"lineage_max_bytes": 64_001},
+        {"lineage_candidate_limit": 100, "lineage_max_bytes": 20_000},
+    ),
+)
+def test_knowledge_recall_rejects_unbounded_lineage_configuration(configuration) -> None:
+    scope = KnowledgeAccessScope.for_namespace("project:cayu")
+    with pytest.raises(ValueError):
+        KnowledgeRecallSource(
+            InMemoryKnowledgeStore(access_scope=scope),
+            **configuration,
+        )
 
 
 @pytest.mark.parametrize(
