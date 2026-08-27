@@ -214,7 +214,10 @@ def test_suite_preview_reports_an_unpublished_target_without_execution(tmp_path)
         asyncio.run(store.close())
 
 
-def test_authored_suite_full_and_subset_launch_use_existing_durable_runners(tmp_path) -> None:
+def test_authored_suite_full_and_subset_launch_use_existing_durable_runners(
+    tmp_path,
+    monkeypatch,
+) -> None:
     provider = ScriptedModelProvider(
         [
             (
@@ -289,13 +292,12 @@ def test_authored_suite_full_and_subset_launch_use_existing_durable_runners(tmp_
             assert subset.status_code == 200
             assert subset.json()["ready"] is True
             assert subset.json()["selection"]["mode"] == "subset"
-            assert subset.json()["launches"] == [
-                {
-                    "kind": "simple_input",
-                    "case_ids": ["refund-request"],
-                    "scenario_revision": None,
-                }
-            ]
+            assert len(subset.json()["launches"]) == 1
+            subset_launch = subset.json()["launches"][0]
+            assert subset_launch["kind"] == "simple_input"
+            assert subset_launch["case_ids"] == ["refund-request"]
+            assert subset_launch["scenario_revision"] is None
+            assert subset_launch["execution_profile_revision"].startswith("sha256:")
 
             full = client.post(
                 f"/api/evals/suites/{suite.revision}/runs/preview",
@@ -309,11 +311,20 @@ def test_authored_suite_full_and_subset_launch_use_existing_durable_runners(tmp_
                 "simple_input",
                 "scenario",
             ]
+            launch_body = {
+                "expected_execution_profiles": [
+                    {
+                        "case_ids": item["case_ids"],
+                        "execution_profile_revision": item["execution_profile_revision"],
+                    }
+                    for item in full.json()["launches"]
+                ]
+            }
 
             launched = client.post(
                 f"/api/evals/suites/{suite.revision}/runs",
                 headers={**_AUTH_HEADERS, "Idempotency-Key": "authored-suite-full-1"},
-                json={},
+                json=launch_body,
             )
             assert launched.status_code == 202
             body = launched.json()
@@ -336,7 +347,7 @@ def test_authored_suite_full_and_subset_launch_use_existing_durable_runners(tmp_
             replayed = client.post(
                 f"/api/evals/suites/{suite.revision}/runs",
                 headers={**_AUTH_HEADERS, "Idempotency-Key": "authored-suite-full-1"},
-                json={},
+                json=launch_body,
             )
             assert replayed.status_code == 202
             assert [item["run"]["spec"]["run_id"] for item in replayed.json()["runs"]] == [
@@ -345,7 +356,17 @@ def test_authored_suite_full_and_subset_launch_use_existing_durable_runners(tmp_
             changed_selection = client.post(
                 f"/api/evals/suites/{suite.revision}/runs",
                 headers={**_AUTH_HEADERS, "Idempotency-Key": "authored-suite-full-1"},
-                json={"case_ids": ["refund-request"]},
+                json={
+                    "case_ids": ["refund-request"],
+                    "expected_execution_profiles": [
+                        {
+                            "case_ids": subset_launch["case_ids"],
+                            "execution_profile_revision": subset_launch[
+                                "execution_profile_revision"
+                            ],
+                        }
+                    ],
+                },
             )
             assert changed_selection.status_code == 409
             assert changed_selection.json() == {
@@ -398,6 +419,9 @@ def test_authored_suite_full_and_subset_launch_use_existing_durable_runners(tmp_
                 json={
                     "corpus_revision": first_spec["corpus_revision"],
                     "suite_id": first_spec["suite_id"],
+                    "expected_execution_profile_revision": full.json()["launches"][0][
+                        "execution_profile_revision"
+                    ],
                     "max_concurrency": 1,
                 },
             )
@@ -405,5 +429,20 @@ def test_authored_suite_full_and_subset_launch_use_existing_durable_runners(tmp_
             assert independent.json()["spec"]["run_id"] not in {
                 item["run"]["spec"]["run_id"] for item in body["runs"]
             }
+
+            def unavailable_profile(*, model: str) -> None:
+                del model
+                raise RuntimeError("provider temporarily unavailable")
+
+            monkeypatch.setattr(provider, "preflight_model_target", unavailable_profile)
+            replayed_while_unavailable = client.post(
+                f"/api/evals/suites/{suite.revision}/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "authored-suite-full-1"},
+                json=launch_body,
+            )
+            assert replayed_while_unavailable.status_code == 202
+            assert [
+                item["run"]["spec"]["run_id"] for item in replayed_while_unavailable.json()["runs"]
+            ] == [item["run"]["spec"]["run_id"] for item in body["runs"]]
     finally:
         asyncio.run(store.close())

@@ -936,6 +936,10 @@ async def assert_eval_store_conformance(
         redact_json=_NO_SECRETS.redact_json,
     )
     assert admitted.spec.invocation == invocation
+    assert await store.load_run_by_idempotency_key(cancel_request.idempotency_key) == admitted
+    assert await store.load_run_by_idempotency_key("sha256:" + "0" * 64) is None
+    with pytest.raises(ValueError, match="lowercase sha256 content revision"):
+        await store.load_run_by_idempotency_key("not-a-revision")
     assert (
         await store.admit_run(
             cancel_request.model_copy(update={"run_id": "conformance-a-retry"}),

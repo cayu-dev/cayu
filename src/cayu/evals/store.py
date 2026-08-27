@@ -51,6 +51,7 @@ from cayu.evals.execution import (
     CORPUS_EXECUTION_RESULT_MAX_BYTES,
     CorpusExecutionResult,
 )
+from cayu.evals.execution_profiles import EvalExecutionProfileBindingV1
 from cayu.evals.published import _validate_published_eval_run_for_corpus
 from cayu.evals.results import (
     CAPTURED_EVALUATION_RESULT_MAX_BYTES,
@@ -1150,6 +1151,7 @@ class EvalScenarioTrialPhase(StrEnum):
 
 class EvalScenarioTrialFailureCode(StrEnum):
     EXECUTION_FAILED = "execution_failed"
+    EXECUTION_PROFILE_CHANGED = "execution_profile_changed"
     UNEXPECTED_SESSION_STATE = "unexpected_session_state"
     EXPECTED_APPROVAL_UNAVAILABLE = "expected_approval_unavailable"
     EXPECTED_USER_INPUT_UNAVAILABLE = "expected_user_input_unavailable"
@@ -1449,6 +1451,17 @@ class EvalRunInvocation(_EvalStoreModel):
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
     limits: RunLimits | None = None
     cost_budget: EvalRunCostBudget | None = None
+    execution_profile: EvalExecutionProfileBindingV1 | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    admission_request_revision: StrictStr | None = Field(
+        default=None,
+        description=(
+            "Secret-safe identity of the exact authenticated request that admitted this run."
+        ),
+        exclude_if=lambda value: value is None,
+    )
     authored_suite_revision: StrictStr | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
@@ -1496,6 +1509,13 @@ class EvalRunInvocation(_EvalStoreModel):
             return EvalRunCostBudget.model_validate(value.model_dump(mode="python"))
         return value
 
+    @field_validator("execution_profile", mode="before")
+    @classmethod
+    def copy_execution_profile(cls, value: object) -> object:
+        if type(value) is EvalExecutionProfileBindingV1:
+            return value.model_dump(mode="python")
+        return value
+
     @field_validator("scenario", mode="before")
     @classmethod
     def copy_scenario(cls, value: object) -> object:
@@ -1506,11 +1526,12 @@ class EvalRunInvocation(_EvalStoreModel):
         return value
 
     @field_validator(
+        "admission_request_revision",
         "authored_suite_revision",
         "authored_suite_selection_revision",
     )
     @classmethod
-    def validate_authored_revisions(cls, value: str | None, info) -> str | None:
+    def validate_content_revisions(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
         return _sha256_revision(value, info.field_name)
@@ -2704,6 +2725,13 @@ class EvalStore(ABC):
         """Atomically admit or replay one logical run request."""
 
     @abstractmethod
+    async def load_run_by_idempotency_key(
+        self,
+        idempotency_key: str,
+    ) -> EvalRunRecord | None:
+        """Load a previously admitted run by its server-scoped idempotency digest."""
+
+    @abstractmethod
     async def load_run(self, run_id: str) -> EvalRunRecord | None:
         """Load one run's public lifecycle projection."""
 
@@ -3280,6 +3308,15 @@ class InMemoryEvalStore(EvalStore):
             self._runs[request.run_id] = state
             self._run_ids_by_idempotency_key[request.idempotency_key] = request.run_id
             return self._record(state)
+
+    async def load_run_by_idempotency_key(
+        self,
+        idempotency_key: str,
+    ) -> EvalRunRecord | None:
+        idempotency_key = _idempotency_key(idempotency_key, "idempotency_key")
+        async with self._lock:
+            run_id = self._run_ids_by_idempotency_key.get(idempotency_key)
+            return None if run_id is None else self._record(self._runs[run_id])
 
     async def load_run(self, run_id: str) -> EvalRunRecord | None:
         run_id = _store_identifier(run_id, "run_id")

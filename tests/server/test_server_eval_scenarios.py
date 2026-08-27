@@ -23,6 +23,7 @@ from cayu import (
     EnvironmentSpec,
     EvalScenarioDocumentV2,
     EvalScenarioDraftV2,
+    EvalScenarioTrialPhase,
     EventType,
     ExecutionProfileBehaviorIdentity,
     LocalArtifactStore,
@@ -176,6 +177,33 @@ def _scenario(
     )
 
 
+def _approval_scenario(target_key: str) -> EvalScenarioDocumentV2:
+    return EvalScenarioDocumentV2.create(
+        id="approve-fresh-action",
+        target_key=target_key,
+        name="Approve fresh action",
+        events=(
+            ScenarioInitialInputEventV2(
+                sequence=0,
+                id="initial",
+                input=ScenarioInputV2.create(
+                    (
+                        ScenarioUserMessageV2.create(
+                            (ScenarioTextPartV2(text="Review this action."),)
+                        ),
+                    )
+                ),
+            ),
+            ScenarioApprovalCheckpointEventV2(
+                sequence=1,
+                id="review-approval",
+                tool_name="review_action",
+                occurrence=1,
+            ),
+        ),
+    )
+
+
 def test_scenario_editor_preview_save_catalog_and_download_are_target_scoped(
     tmp_path,
 ) -> None:
@@ -253,6 +281,7 @@ def test_scenario_editor_preview_save_catalog_and_download_are_target_scoped(
 
 def test_saved_scenario_launches_without_python_eval_configuration_and_exports_result(
     tmp_path,
+    monkeypatch,
 ) -> None:
     provider = ScriptedModelProvider(
         [
@@ -278,12 +307,14 @@ def test_saved_scenario_launches_without_python_eval_configuration_and_exports_r
             )
             assert saved.status_code == 201
             binding_revision = saved.json()["preflight"]["binding"]["revision"]
+            execution_profile_revision = saved.json()["execution_profile_revision"]
 
             stale = client.post(
                 f"/api/evals/scenarios/{scenario.revision}/runs",
                 headers={**_AUTH_HEADERS, "Idempotency-Key": "stale-scenario-launch"},
                 json={
                     "expected_binding_revision": "sha256:" + "0" * 64,
+                    "expected_execution_profile_revision": execution_profile_revision,
                     "settings": {"timeout_seconds": 30},
                 },
             )
@@ -294,6 +325,7 @@ def test_saved_scenario_launches_without_python_eval_configuration_and_exports_r
                 headers={**_AUTH_HEADERS, "Idempotency-Key": "scenario-launch"},
                 json={
                     "expected_binding_revision": binding_revision,
+                    "expected_execution_profile_revision": execution_profile_revision,
                     "settings": {"timeout_seconds": 30},
                 },
             )
@@ -304,6 +336,7 @@ def test_saved_scenario_launches_without_python_eval_configuration_and_exports_r
                 headers={**_AUTH_HEADERS, "Idempotency-Key": "scenario-launch"},
                 json={
                     "expected_binding_revision": binding_revision,
+                    "expected_execution_profile_revision": execution_profile_revision,
                     "settings": {"timeout_seconds": 30},
                 },
             )
@@ -334,6 +367,98 @@ def test_saved_scenario_launches_without_python_eval_configuration_and_exports_r
             )
             assert report.status_code == 200
             assert b"current scenario result" in report.content
+
+            def unavailable_profile(*, model: str) -> None:
+                del model
+                raise RuntimeError("provider temporarily unavailable")
+
+            monkeypatch.setattr(provider, "preflight_model_target", unavailable_profile)
+            replayed_while_unavailable = client.post(
+                f"/api/evals/scenarios/{scenario.revision}/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "scenario-launch"},
+                json={
+                    "expected_binding_revision": binding_revision,
+                    "expected_execution_profile_revision": execution_profile_revision,
+                    "settings": {"timeout_seconds": 30},
+                },
+            )
+            assert replayed_while_unavailable.status_code == 202
+            assert replayed_while_unavailable.json()["spec"]["run_id"] == run_id
+    finally:
+        asyncio.run(store.close())
+
+
+def test_scenario_selected_environment_is_profiled_and_used_for_execution(tmp_path) -> None:
+    provider = ScriptedModelProvider(
+        [
+            (
+                ModelStreamEvent.text_delta("alternate environment result"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            )
+        ]
+    )
+    target, _, _ = _target(tmp_path, provider)
+    target.app.register_environment(
+        Environment(
+            EnvironmentSpec(name="alternate"),
+            artifact_store=LocalArtifactStore(
+                tmp_path / "alternate-artifacts",
+                store_id="alternate-scenario-artifacts",
+            ),
+        )
+    )
+    target = target.model_copy(
+        update={"request_base": target.request_base.model_copy(update={"environment_name": None})}
+    )
+    store = SQLiteEvalStore(tmp_path / "scenario-environment.db")
+    scenario = _scenario()
+    settings = {"environment_name": "alternate", "timeout_seconds": 30}
+    try:
+        with TestClient(_server(target, store)) as client:
+            catalog = client.get("/api/evals/targets", headers=_AUTH_HEADERS)
+            assert catalog.status_code == 200
+            base_profile_revision = catalog.json()["items"][0]["execution_profile"]["revision"]
+            saved = client.post(
+                "/api/evals/scenarios",
+                headers=_AUTH_HEADERS,
+                json={
+                    "expected_scenario_revision": scenario.revision,
+                    "scenario": scenario.model_dump(mode="json"),
+                    "settings": settings,
+                },
+            )
+            assert saved.status_code == 201
+            saved_body = saved.json()
+            binding = saved_body["preflight"]["binding"]
+            assert binding["environment_name"] == "alternate"
+            assert saved_body["execution_profile_revision"] != base_profile_revision
+
+            launched = client.post(
+                f"/api/evals/scenarios/{scenario.revision}/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "alternate-environment"},
+                json={
+                    "expected_binding_revision": binding["revision"],
+                    "expected_execution_profile_revision": saved_body["execution_profile_revision"],
+                    "settings": settings,
+                },
+            )
+            assert launched.status_code == 202
+            run_id = launched.json()["spec"]["run_id"]
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                terminal = client.get(f"/api/evals/runs/{run_id}", headers=_AUTH_HEADERS)
+                assert terminal.status_code == 200
+                if terminal.json()["status"] in {"completed", "failed", "cancelled"}:
+                    break
+                time.sleep(0.01)
+            else:
+                raise AssertionError("Environment-selected scenario did not terminalize.")
+            terminal_body = terminal.json()
+            assert terminal_body["status"] == "completed"
+            session_id = terminal_body["scenario_progress"]["trials"][0]["session_id"]
+            session = asyncio.run(target.app.session_store.load(session_id))
+            assert session is not None
+            assert session.environment_name == "alternate"
     finally:
         asyncio.run(store.close())
 
@@ -392,11 +517,13 @@ def test_scenario_cancellation_terminalizes_while_awaiting_approval(tmp_path) ->
             )
             assert saved.status_code == 201
             binding_revision = saved.json()["preflight"]["binding"]["revision"]
+            execution_profile_revision = saved.json()["execution_profile_revision"]
             launched = client.post(
                 f"/api/evals/scenarios/{scenario.revision}/runs",
                 headers={**_AUTH_HEADERS, "Idempotency-Key": "cancel-scenario-approval"},
                 json={
                     "expected_binding_revision": binding_revision,
+                    "expected_execution_profile_revision": execution_profile_revision,
                     "settings": {"timeout_seconds": 30},
                 },
             )
@@ -458,30 +585,7 @@ def test_scenario_approval_route_is_fresh_fenced_and_actor_attributed(tmp_path) 
         request_base=RunRequest(agent_name="assistant", messages=[], max_steps=8),
         application_release_id="release-current",
     )
-    scenario = EvalScenarioDocumentV2.create(
-        id="approve-fresh-action",
-        target_key=target.key,
-        name="Approve fresh action",
-        events=(
-            ScenarioInitialInputEventV2(
-                sequence=0,
-                id="initial",
-                input=ScenarioInputV2.create(
-                    (
-                        ScenarioUserMessageV2.create(
-                            (ScenarioTextPartV2(text="Review this action."),)
-                        ),
-                    )
-                ),
-            ),
-            ScenarioApprovalCheckpointEventV2(
-                sequence=1,
-                id="review-approval",
-                tool_name="review_action",
-                occurrence=1,
-            ),
-        ),
-    )
+    scenario = _approval_scenario(target.key)
     store = SQLiteEvalStore(tmp_path / "scenario-approval.db")
     try:
         with TestClient(_server(target, store)) as client:
@@ -496,11 +600,13 @@ def test_scenario_approval_route_is_fresh_fenced_and_actor_attributed(tmp_path) 
             )
             assert saved.status_code == 201
             binding_revision = saved.json()["preflight"]["binding"]["revision"]
+            execution_profile_revision = saved.json()["execution_profile_revision"]
             launched = client.post(
                 f"/api/evals/scenarios/{scenario.revision}/runs",
                 headers={**_AUTH_HEADERS, "Idempotency-Key": "approve-scenario-action"},
                 json={
                     "expected_binding_revision": binding_revision,
+                    "expected_execution_profile_revision": execution_profile_revision,
                     "settings": {"timeout_seconds": 30},
                 },
             )
@@ -572,6 +678,210 @@ def test_scenario_approval_route_is_fresh_fenced_and_actor_attributed(tmp_path) 
             "source": "http_auth",
             "tenant": None,
         }
+    finally:
+        asyncio.run(store.close())
+
+
+def test_scenario_rejects_profile_drift_before_approved_tool_dispatch(tmp_path) -> None:
+    provider = _ApprovalProvider()
+    tool = _ReviewTool()
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="scenario-model"),
+        tools=[tool],
+        tool_policy=AlwaysRequireApprovalToolPolicy(),
+    )
+    target = CorpusTarget(
+        key="assistant.default",
+        app=app,
+        request_base=RunRequest(agent_name="assistant", messages=[], max_steps=8),
+        application_release_id="release-current",
+    )
+    scenario = _approval_scenario(target.key)
+    store = SQLiteEvalStore(tmp_path / "scenario-profile-drift.db")
+    try:
+        with TestClient(_server(target, store)) as client:
+            saved = client.post(
+                "/api/evals/scenarios",
+                headers=_AUTH_HEADERS,
+                json={
+                    "expected_scenario_revision": scenario.revision,
+                    "scenario": scenario.model_dump(mode="json"),
+                    "settings": {"timeout_seconds": 30},
+                },
+            )
+            assert saved.status_code == 201
+            launched = client.post(
+                f"/api/evals/scenarios/{scenario.revision}/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "profile-drift-scenario"},
+                json={
+                    "expected_binding_revision": saved.json()["preflight"]["binding"]["revision"],
+                    "expected_execution_profile_revision": saved.json()[
+                        "execution_profile_revision"
+                    ],
+                    "settings": {"timeout_seconds": 30},
+                },
+            )
+            assert launched.status_code == 202
+            run_id = launched.json()["spec"]["run_id"]
+
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                current = client.get(f"/api/evals/runs/{run_id}", headers=_AUTH_HEADERS)
+                progress = current.json().get("scenario_progress")
+                if progress is not None and progress["trials"][0]["phase"] == "awaiting_approval":
+                    break
+                time.sleep(0.01)
+            else:
+                raise AssertionError("Scenario did not pause for approval.")
+
+            app.register_agent(AgentSpec(name="late-agent", model="scenario-model"))
+            approved = client.post(
+                f"/api/evals/runs/{run_id}/scenario-approval",
+                headers=_AUTH_HEADERS,
+                json={
+                    "expected_progress_revision": progress["revision"],
+                    "trial_number": 1,
+                    "event_id": "review-approval",
+                    "decision": "approve",
+                },
+            )
+            assert approved.status_code == 200
+
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                terminal_response = client.get(f"/api/evals/runs/{run_id}", headers=_AUTH_HEADERS)
+                assert terminal_response.status_code == 200
+                terminal = terminal_response.json()
+                if terminal["status"] in {"completed", "failed", "cancelled"}:
+                    break
+                time.sleep(0.01)
+            else:
+                raise AssertionError("Profile-drift scenario did not terminalize.")
+            trial = terminal["scenario_progress"]["trials"][0]
+            assert terminal["status"] == "failed"
+            assert terminal["failure_code"] == "target_unavailable"
+            assert trial["phase"] == "error"
+            assert trial["failure_code"] == "execution_profile_changed"
+            assert provider.request_count == 1
+            assert tool.run_count == 0
+    finally:
+        asyncio.run(store.close())
+
+
+@pytest.mark.parametrize(
+    ("drift_running_update", "expected_provider_requests"),
+    ((1, 0), (2, 1)),
+    ids=("initial-dispatch", "approval-continuation"),
+)
+def test_scenario_rechecks_profile_after_running_progress_write(
+    tmp_path,
+    monkeypatch,
+    drift_running_update,
+    expected_provider_requests,
+) -> None:
+    provider = _ApprovalProvider()
+    tool = _ReviewTool()
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="scenario-model"),
+        tools=[tool],
+        tool_policy=AlwaysRequireApprovalToolPolicy(),
+    )
+    target = CorpusTarget(
+        key="assistant.default",
+        app=app,
+        request_base=RunRequest(agent_name="assistant", messages=[], max_steps=8),
+        application_release_id="release-current",
+    )
+    scenario = _approval_scenario(target.key)
+    store = SQLiteEvalStore(tmp_path / "scenario-progress-write-drift.db")
+    original_update = store.update_scenario_trial
+    running_updates = 0
+
+    async def drift_during_second_running_update(claim, trial):
+        nonlocal running_updates
+        updated = await original_update(claim, trial)
+        if trial.phase is EvalScenarioTrialPhase.RUNNING:
+            running_updates += 1
+            if running_updates == drift_running_update:
+                app.register_agent(AgentSpec(name="late-agent", model="scenario-model"))
+        return updated
+
+    monkeypatch.setattr(store, "update_scenario_trial", drift_during_second_running_update)
+    try:
+        with TestClient(_server(target, store)) as client:
+            saved = client.post(
+                "/api/evals/scenarios",
+                headers=_AUTH_HEADERS,
+                json={
+                    "expected_scenario_revision": scenario.revision,
+                    "scenario": scenario.model_dump(mode="json"),
+                    "settings": {"timeout_seconds": 30},
+                },
+            )
+            assert saved.status_code == 201
+            launched = client.post(
+                f"/api/evals/scenarios/{scenario.revision}/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "progress-write-profile-drift"},
+                json={
+                    "expected_binding_revision": saved.json()["preflight"]["binding"]["revision"],
+                    "expected_execution_profile_revision": saved.json()[
+                        "execution_profile_revision"
+                    ],
+                    "settings": {"timeout_seconds": 30},
+                },
+            )
+            assert launched.status_code == 202
+            run_id = launched.json()["spec"]["run_id"]
+
+            if drift_running_update == 2:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    current = client.get(f"/api/evals/runs/{run_id}", headers=_AUTH_HEADERS)
+                    progress = current.json().get("scenario_progress")
+                    if (
+                        progress is not None
+                        and progress["trials"][0]["phase"] == "awaiting_approval"
+                    ):
+                        break
+                    time.sleep(0.01)
+                else:
+                    raise AssertionError("Scenario did not pause for approval.")
+
+                approved = client.post(
+                    f"/api/evals/runs/{run_id}/scenario-approval",
+                    headers=_AUTH_HEADERS,
+                    json={
+                        "expected_progress_revision": progress["revision"],
+                        "trial_number": 1,
+                        "event_id": "review-approval",
+                        "decision": "approve",
+                    },
+                )
+                assert approved.status_code == 200
+
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                terminal_response = client.get(f"/api/evals/runs/{run_id}", headers=_AUTH_HEADERS)
+                assert terminal_response.status_code == 200
+                terminal = terminal_response.json()
+                if terminal["status"] in {"completed", "failed", "cancelled"}:
+                    break
+                time.sleep(0.01)
+            else:
+                raise AssertionError("Profile-drift scenario did not terminalize.")
+
+            trial = terminal["scenario_progress"]["trials"][0]
+            assert running_updates == drift_running_update
+            assert terminal["status"] == "failed"
+            assert terminal["failure_code"] == "target_unavailable"
+            assert trial["phase"] == "error"
+            assert trial["failure_code"] == "execution_profile_changed"
+            assert provider.request_count == expected_provider_requests
+            assert tool.run_count == 0
     finally:
         asyncio.run(store.close())
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -10,10 +11,16 @@ from pathlib import Path
 from types import MappingProxyType
 
 from cayu._validation import require_durable_clean_nonblank, require_unicode_scalar_text
+from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals.execution import (
     CorpusExecutionLimits,
     CorpusTarget,
     evaluation_target_identity,
+)
+from cayu.evals.execution_profiles import (
+    EvalExecutionProfilePolicyV1,
+    PreparedEvalExecutionProfile,
+    prepare_eval_execution_profile,
 )
 from cayu.evals.store import EvalRunInvocation, EvalStore
 from cayu.runtime.app import CayuApp
@@ -35,6 +42,7 @@ from cayu.server.config import (
 from cayu.server.contracts import (
     MAX_EVAL_TARGET_COMPONENT_CHARS,
     MAX_EVAL_TARGETS,
+    EvalExecutionProfileDiagnostic,
     EvalTargetCatalogEntry,
     EvalTargetCatalogResponse,
 )
@@ -42,6 +50,7 @@ from cayu.server.contracts import (
 DEFAULT_EVAL_PROFILE_ID = "default"
 _EXPLICIT_EVAL_PROFILE_ID = "explicit"
 _TARGET_KEY_DOMAIN = b"cayu-generated-eval-target-v1\0"
+_EVAL_PROFILE_RESOLUTION_CONCURRENCY = 16
 
 
 def _narrow_optional_limit(current: int | None, requested: int | None) -> int | None:
@@ -140,6 +149,15 @@ def target_for_eval_invocation(
         and request.invocation_origin is not None
     ):
         raise ValueError("HTTP eval execution cannot inherit a host-asserted SDK origin.")
+    scenario_environment = (
+        None if invocation.scenario is None else invocation.scenario.environment_name
+    )
+    if (
+        scenario_environment is not None
+        and request.environment_name is not None
+        and scenario_environment != request.environment_name
+    ):
+        raise ValueError("Eval scenario environment conflicts with the published target.")
     budget_limits = request.budget_limits
     if invocation.cost_budget is not None:
         if target.price_book is None:
@@ -163,6 +181,7 @@ def target_for_eval_invocation(
         )
     request = request.model_copy(
         update={
+            "environment_name": scenario_environment or request.environment_name,
             "max_steps": (
                 request.max_steps
                 if invocation.max_steps is None
@@ -228,6 +247,7 @@ class EvalTargetRegistration:
 
     catalog_entry: EvalTargetCatalogEntry
     target: CorpusTarget
+    execution_profile_policy: EvalExecutionProfilePolicyV1
     manifest_project_root: Path | None = None
 
     def __post_init__(self) -> None:
@@ -235,17 +255,56 @@ class EvalTargetRegistration:
             raise TypeError("catalog_entry must be an exact EvalTargetCatalogEntry.")
         if type(self.target) is not CorpusTarget:
             raise TypeError("target must be an exact CorpusTarget.")
+        if type(self.execution_profile_policy) is not EvalExecutionProfilePolicyV1:
+            raise TypeError(
+                "execution_profile_policy must be an exact EvalExecutionProfilePolicyV1."
+            )
         if self.catalog_entry.target_key != self.target.key:
             raise ValueError("Eval target catalog key does not match its runtime target.")
         if self.catalog_entry.agent_name != self.target.request_base.agent_name:
             raise ValueError("Eval target catalog agent does not match its request authority.")
         if self.catalog_entry.application_release_id != self.target.application_release_id:
             raise ValueError("Eval target catalog release does not match its runtime target.")
+        policy = self.execution_profile_policy
+        if (
+            policy.max_trials > self.target.limits.max_trials
+            or policy.max_concurrency > self.target.limits.max_concurrency
+        ):
+            raise ValueError("Eval execution profile exceeds its runtime target authority.")
+        if (
+            self.catalog_entry.max_trials != policy.max_trials
+            or self.catalog_entry.max_concurrency != policy.max_concurrency
+            or self.catalog_entry.max_timeout_seconds != self.target.limits.max_timeout_seconds
+            or self.catalog_entry.max_steps != self.target.request_base.max_steps
+        ):
+            raise ValueError("Eval target catalog limits do not match its execution authority.")
         if self.manifest_project_root is not None and (
             not isinstance(self.manifest_project_root, Path)
             or not self.manifest_project_root.is_absolute()
         ):
             raise TypeError("manifest_project_root must be an absolute Path or None.")
+
+    def execution_target(self) -> CorpusTarget:
+        """Return this target narrowed to its published Evals execution policy."""
+
+        policy = self.execution_profile_policy
+        limits = self.target.limits.model_copy(
+            update={
+                "max_trials": policy.max_trials,
+                "max_concurrency": policy.max_concurrency,
+            }
+        )
+        return CorpusTarget(
+            key=self.target.key,
+            app=self.target.app,
+            request_base=self.target.request_base,
+            bootstrap_messages=self.target.bootstrap_messages,
+            application_release_id=self.target.application_release_id,
+            evidence_policy=self.target.evidence_policy,
+            price_book=self.target.price_book,
+            model_judges=self.target.model_judges,
+            limits=limits,
+        )
 
 
 class EvalTargetRegistry:
@@ -325,7 +384,120 @@ class EvalTargetRegistry:
         return self._catalog.default_target_key
 
     def catalog(self) -> EvalTargetCatalogResponse:
+        """Return the immutable registry projection without runtime preparation."""
+
         return self._catalog.model_copy(deep=True)
+
+    async def resolved_catalog(self) -> EvalTargetCatalogResponse:
+        """Resolve current profile identity for every bounded published target."""
+
+        resolution_limit = asyncio.Semaphore(_EVAL_PROFILE_RESOLUTION_CONCURRENCY)
+
+        async def resolve(registration: EvalTargetRegistration) -> EvalTargetCatalogEntry:
+            async with resolution_limit:
+                try:
+                    prepared = await self.prepare_execution_profile(registration.target.key)
+                except asyncio.CancelledError:
+                    raise
+                except EvalExecutionProfileChangedError:
+                    diagnostic = EvalExecutionProfileDiagnostic.for_code(
+                        "application_identity_changed"
+                    )
+                except Exception:
+                    diagnostic = EvalExecutionProfileDiagnostic.for_code(
+                        "runtime_authority_unavailable"
+                    )
+                else:
+                    return registration.catalog_entry.model_copy(
+                        update={
+                            "execution_profile_ready": True,
+                            "execution_profile": prepared.snapshot,
+                            "execution_profile_diagnostics": (),
+                        },
+                        deep=True,
+                    )
+                return registration.catalog_entry.model_copy(
+                    update={
+                        "execution_profile_ready": False,
+                        "execution_profile": None,
+                        "execution_profile_diagnostics": (diagnostic,),
+                    },
+                    deep=True,
+                )
+
+        entries = await asyncio.gather(
+            *(resolve(registration) for registration in self._registrations.values())
+        )
+        return EvalTargetCatalogResponse(
+            items=tuple(entries),
+            default_target_key=self.default_target_key,
+        )
+
+    async def prepare_execution_profile(
+        self,
+        target_key: str,
+        *,
+        effective_target: CorpusTarget | None = None,
+    ) -> PreparedEvalExecutionProfile:
+        """Resolve one exact current profile without admitting runtime state."""
+
+        registration = self.registration(target_key)
+        if registration is None:
+            raise KeyError(f"Eval target not found: {target_key}")
+        target = registration.execution_target() if effective_target is None else effective_target
+        if (
+            type(target) is not CorpusTarget
+            or target.key != target_key
+            or target.app is not registration.target.app
+        ):
+            raise ValueError("Effective eval target does not match its published registration.")
+        target = CorpusTarget(
+            key=target.key,
+            app=target.app,
+            request_base=target.request_base,
+            bootstrap_messages=target.bootstrap_messages,
+            application_release_id=target.application_release_id,
+            evidence_policy=target.evidence_policy,
+            price_book=target.price_book,
+            model_judges=target.model_judges,
+            limits=target.limits.model_copy(
+                update={
+                    "max_trials": registration.execution_profile_policy.max_trials,
+                    "max_concurrency": registration.execution_profile_policy.max_concurrency,
+                }
+            ),
+        )
+        identity = evaluation_target_identity(
+            target,
+            project_root=registration.manifest_project_root,
+        )
+        if identity.app_manifest_fingerprint != registration.catalog_entry.app_manifest_fingerprint:
+            raise EvalExecutionProfileChangedError(
+                "Current eval target manifest does not match its published registration."
+            )
+        prepared = await prepare_eval_execution_profile(
+            target,
+            profile_id=registration.catalog_entry.profile_id,
+            label=registration.catalog_entry.label,
+            source=registration.catalog_entry.source,
+            app_manifest_fingerprint=registration.catalog_entry.app_manifest_fingerprint,
+            policy=registration.execution_profile_policy,
+        )
+        durable_binding = EvalRunInvocation(execution_profile=prepared.binding).execution_profile
+        if durable_binding != prepared.binding:
+            raise RuntimeError("Eval execution profile binding did not round-trip durably.")
+        identity_after = evaluation_target_identity(
+            target,
+            project_root=registration.manifest_project_root,
+        )
+        if (
+            identity_after.app_manifest_fingerprint
+            != registration.catalog_entry.app_manifest_fingerprint
+        ):
+            raise EvalExecutionProfileChangedError(
+                "Current eval target manifest changed during profile preparation."
+            )
+        return prepared
 
     def get(self, target_key: str) -> CorpusTarget | None:
         registration = self._registrations.get(target_key)
@@ -403,6 +575,7 @@ def generated_eval_target_registry(
     if len(agent_names) > MAX_EVAL_TARGETS:
         raise ValueError(f"Automatic Evals supports at most {MAX_EVAL_TARGETS} registered agents.")
 
+    policy = EvalExecutionProfilePolicyV1.safe_default()
     registrations: list[EvalTargetRegistration] = []
     for agent_name in agent_names:
         agent_name = _target_identity_component(agent_name, "agent_name")
@@ -435,23 +608,36 @@ def generated_eval_target_registry(
             max_steps=target.request_base.max_steps,
             cost_budget_available=bool(cost_budget_currencies),
             cost_budget_currencies=cost_budget_currencies,
+            execution_profile_ready=False,
+            execution_profile=None,
+            execution_profile_diagnostics=(
+                EvalExecutionProfileDiagnostic.for_code("not_resolved"),
+            ),
         )
         _require_public_catalog_entry(app, entry)
         registrations.append(
             EvalTargetRegistration(
                 catalog_entry=entry,
                 target=target,
+                execution_profile_policy=policy,
                 manifest_project_root=app_manifest_project_root,
             )
         )
     return EvalTargetRegistry(registrations)
 
 
-def explicit_eval_target_registry(target: CorpusTarget) -> EvalTargetRegistry:
+def explicit_eval_target_registry(
+    target: CorpusTarget,
+    *,
+    policy: EvalExecutionProfilePolicyV1 | None = None,
+) -> EvalTargetRegistry:
     """Adapt the V1 singleton target into the common registry contract."""
 
     if type(target) is not CorpusTarget:
         raise TypeError("target must be an exact CorpusTarget.")
+    policy = EvalExecutionProfilePolicyV1.safe_default() if policy is None else policy
+    if type(policy) is not EvalExecutionProfilePolicyV1:
+        raise TypeError("policy must be an exact EvalExecutionProfilePolicyV1 or None.")
     identity = evaluation_target_identity(target)
     agent_name = _target_identity_component(target.request_base.agent_name, "agent_name")
     cost_budget_currencies = cost_budget_currencies_for_target(target)
@@ -464,15 +650,26 @@ def explicit_eval_target_registry(target: CorpusTarget) -> EvalTargetRegistry:
         source="explicit",
         application_release_id=identity.application_release_id,
         app_manifest_fingerprint=identity.app_manifest.fingerprint,
-        max_trials=target.limits.max_trials,
-        max_concurrency=target.limits.max_concurrency,
+        max_trials=policy.max_trials,
+        max_concurrency=policy.max_concurrency,
         max_timeout_seconds=target.limits.max_timeout_seconds,
         max_steps=target.request_base.max_steps,
         cost_budget_available=bool(cost_budget_currencies),
         cost_budget_currencies=cost_budget_currencies,
+        execution_profile_ready=False,
+        execution_profile=None,
+        execution_profile_diagnostics=(EvalExecutionProfileDiagnostic.for_code("not_resolved"),),
     )
     _require_public_catalog_entry(target.app, entry)
-    return EvalTargetRegistry((EvalTargetRegistration(catalog_entry=entry, target=target),))
+    return EvalTargetRegistry(
+        (
+            EvalTargetRegistration(
+                catalog_entry=entry,
+                target=target,
+                execution_profile_policy=policy,
+            ),
+        )
+    )
 
 
 def resolved_evals_runtime(
@@ -487,7 +684,10 @@ def resolved_evals_runtime(
         if type(explicit) is not EvalsConfig:
             raise TypeError("explicit must be an exact EvalsConfig or None.")
         return ResolvedEvalsRuntime(
-            registry=explicit_eval_target_registry(explicit.target),
+            registry=explicit_eval_target_registry(
+                explicit.target,
+                policy=explicit.execution_profile_policy,
+            ),
             store=explicit.store,
             lease_seconds=explicit.lease_seconds,
             poll_interval_seconds=explicit.poll_interval_seconds,

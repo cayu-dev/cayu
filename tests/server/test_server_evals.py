@@ -26,7 +26,17 @@ from tests.evals.test_corpus_execution import (
 import cayu.evals.execution as execution_module
 import cayu.server.evals_worker as evals_worker_module
 import cayu.storage.evals_sqlite as evals_sqlite_module
-from cayu import AgentSpec, CayuApp, ModelJudgeTarget, ModelProvider, ModelRequest, ModelStreamEvent
+from cayu import (
+    AgentSpec,
+    CayuApp,
+    CorpusTarget,
+    EvalExecutionProfilePolicyV1,
+    Message,
+    ModelJudgeTarget,
+    ModelProvider,
+    ModelRequest,
+    ModelStreamEvent,
+)
 from cayu.evals.corpus import EvalCaseSpec, EvalCorpusDocument
 from cayu.evals.execution import run_corpus_suite
 from cayu.evals.store import (
@@ -62,6 +72,7 @@ from cayu.server.contracts import (
     EvalResultResponse,
     EvalRunCreateRequest,
 )
+from cayu.server.evals_registry import explicit_eval_target_registry, target_for_eval_invocation
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 from cayu.storage.migrations import SchemaMode
 
@@ -85,15 +96,64 @@ def _evals_config(target, store, **updates) -> EvalsConfig:
     )
 
 
-def _server(target, store):
+def _repeatable_execution_policy(target) -> EvalExecutionProfilePolicyV1:
+    return EvalExecutionProfilePolicyV1(
+        fixture_strategy="application_managed",
+        reset_strategy="application_managed",
+        effect_posture="isolated_application_authority",
+        isolation_revision="sha256:" + "1" * 64,
+        max_trials=target.limits.max_trials,
+        max_concurrency=target.limits.max_concurrency,
+    )
+
+
+async def _bound_eval_invocation(
+    target,
+    invocation: EvalRunInvocation | None = None,
+) -> EvalRunInvocation:
+    invocation = EvalRunInvocation() if invocation is None else invocation
+    registry = explicit_eval_target_registry(target)
+    effective_target = target_for_eval_invocation(target, invocation)
+    prepared = await registry.prepare_execution_profile(
+        target.key,
+        effective_target=effective_target,
+    )
+    return invocation.model_copy(update={"execution_profile": prepared.binding}, deep=True)
+
+
+def _server(target, store, *, execution_profile_policy=None):
     return create_server(
         target.app,
         config=ServerConfig.protected(
             _authenticate,
             dashboard=DashboardConfig(enabled=False),
-            evals=_evals_config(target, store),
+            evals=_evals_config(
+                target,
+                store,
+                **(
+                    {}
+                    if execution_profile_policy is None
+                    else {"execution_profile_policy": execution_profile_policy}
+                ),
+            ),
         ),
     )
+
+
+def _execution_profile_revision(
+    client: TestClient,
+    target_key: str | None = None,
+    *,
+    path_prefix: str = "/api",
+) -> str:
+    response = client.get(f"{path_prefix}/evals/targets", headers=_AUTH_HEADERS)
+    assert response.status_code == 200
+    catalog = response.json()
+    selected_key = target_key or catalog["default_target_key"]
+    target = next(item for item in catalog["items"] if item["target_key"] == selected_key)
+    assert target["execution_profile_ready"] is True
+    assert target["execution_profile_diagnostics"] == []
+    return target["execution_profile"]["revision"]
 
 
 def _wait_for_terminal(
@@ -329,6 +389,10 @@ def test_mounted_evals_routes_run_under_the_host_lifespan(tmp_path) -> None:
                 json={
                     "corpus_revision": corpus.revision,
                     "suite_id": corpus.suites[0].id,
+                    "expected_execution_profile_revision": _execution_profile_revision(
+                        client,
+                        path_prefix="/cayu/api",
+                    ),
                 },
             )
             assert admitted.status_code == 202
@@ -452,12 +516,22 @@ def test_evals_replays_a_body_consumed_by_auth_and_bounds_auth_reads(tmp_path) -
         asyncio.run(store.close())
 
 
-def test_evals_api_imports_executes_compares_and_exports_deterministically(tmp_path) -> None:
-    target = _target(_provider(trials=2))
+def test_evals_api_imports_executes_compares_and_exports_deterministically(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    provider = _provider(trials=2)
+    target = _target(provider)
     corpus = _corpus(trials=2)
     store = SQLiteEvalStore(tmp_path / "evals.db")
     try:
-        with TestClient(_server(target, store)) as client:
+        with TestClient(
+            _server(
+                target,
+                store,
+                execution_profile_policy=_repeatable_execution_policy(target),
+            )
+        ) as client:
             imported = client.post(
                 "/api/evals/corpora",
                 headers=_AUTH_HEADERS,
@@ -485,6 +559,7 @@ def test_evals_api_imports_executes_compares_and_exports_deterministically(tmp_p
             request = {
                 "corpus_revision": corpus.revision,
                 "suite_id": corpus.suites[0].id,
+                "expected_execution_profile_revision": _execution_profile_revision(client),
                 "max_concurrency": 1,
                 "max_steps": 1,
                 "limits": {"max_total_tokens": 100, "scope": "run"},
@@ -495,7 +570,10 @@ def test_evals_api_imports_executes_compares_and_exports_deterministically(tmp_p
                 json=request,
             )
             assert admitted.status_code == 202
-            assert admitted.json()["spec"]["invocation"] == {
+            invocation = admitted.json()["spec"]["invocation"]
+            execution_profile = invocation.pop("execution_profile")
+            admission_request_revision = invocation.pop("admission_request_revision")
+            assert invocation == {
                 "schema_version": 1,
                 "source": "http_run",
                 "origin": {
@@ -514,6 +592,10 @@ def test_evals_api_imports_executes_compares_and_exports_deterministically(tmp_p
                 },
                 "cost_budget": None,
             }
+            assert execution_profile["schema_version"] == 1
+            assert execution_profile["profile_revision"].startswith("sha256:")
+            assert execution_profile["runtime_execution_profile"]["fingerprint"]
+            assert admission_request_revision.startswith("sha256:")
             run_id = admitted.json()["spec"]["run_id"]
             replayed = client.post(
                 "/api/evals/runs",
@@ -526,6 +608,28 @@ def test_evals_api_imports_executes_compares_and_exports_deterministically(tmp_p
             terminal = _wait_for_terminal(client, run_id)
             assert terminal["status"] == "completed"
             assert terminal["result"]["status"] == "passed"
+
+            def unavailable_profile(*, model: str) -> None:
+                del model
+                raise RuntimeError("provider temporarily unavailable")
+
+            monkeypatch.setattr(provider, "preflight_model_target", unavailable_profile)
+            replayed_while_unavailable = client.post(
+                "/api/evals/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "eval-run-one"},
+                json=request,
+            )
+            assert replayed_while_unavailable.status_code == 202
+            assert replayed_while_unavailable.json()["spec"]["run_id"] == run_id
+            conflicting_retry = client.post(
+                "/api/evals/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "eval-run-one"},
+                json={**request, "max_concurrency": 2},
+            )
+            assert conflicting_retry.status_code == 409
+            assert conflicting_retry.json() == {
+                "detail": "Idempotency-Key is already bound to another eval run request."
+            }
             sessions = asyncio.run(target.app.session_store.list_sessions()).sessions
             assert len(sessions) == 2
             assert all(
@@ -622,6 +726,7 @@ def test_evals_api_compares_compatible_releases_and_returns_typed_regressions(tm
             application_release_id="baseline-release",
         )
         with TestClient(_server(baseline_target, baseline_store)) as client:
+            request["expected_execution_profile_revision"] = _execution_profile_revision(client)
             assert (
                 client.post(
                     "/api/evals/corpora",
@@ -649,6 +754,7 @@ def test_evals_api_compares_compatible_releases_and_returns_typed_regressions(tm
             application_release_id="current-release",
         )
         with TestClient(_server(current_target, current_store)) as client:
+            request["expected_execution_profile_revision"] = _execution_profile_revision(client)
             current_admission = client.post(
                 "/api/evals/runs",
                 headers={**_AUTH_HEADERS, "Idempotency-Key": "current-run"},
@@ -705,6 +811,7 @@ def test_eval_result_refreshes_run_after_concurrent_publication(tmp_path, monkey
             suite_id=corpus.suites[0].id,
             suite_revision=corpus.suites[0].revision,
             max_concurrency=1,
+            invocation=await _bound_eval_invocation(target),
         )
         await store.admit_run(request, redact_json=target.app.redact_json)
         lease = await store.claim_run(target_key=target.key, lease_seconds=300)
@@ -766,6 +873,112 @@ def test_evals_rejects_incompatible_import_before_provider_dispatch(tmp_path) ->
             }
             assert provider.requests == []
             assert client.get("/api/evals/corpora", headers=_AUTH_HEADERS).json()["items"] == []
+    finally:
+        asyncio.run(store.close())
+
+
+def test_evals_rejects_stale_profile_and_undeclared_repetition_before_admission(
+    tmp_path,
+) -> None:
+    provider = _provider(trials=2)
+    target = _target(provider)
+    corpus = _corpus(trials=2)
+    store = SQLiteEvalStore(tmp_path / "evals.db")
+    try:
+        with TestClient(_server(target, store)) as client:
+            imported = client.post(
+                "/api/evals/corpora",
+                headers=_AUTH_HEADERS,
+                json=corpus.model_dump(mode="json"),
+            )
+            assert imported.status_code == 201
+
+            stale = client.post(
+                "/api/evals/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "stale-profile"},
+                json={
+                    "corpus_revision": corpus.revision,
+                    "suite_id": corpus.suites[0].id,
+                    "expected_execution_profile_revision": "sha256:" + "0" * 64,
+                },
+            )
+            assert stale.status_code == 400
+            assert stale.json() == {
+                "detail": "Eval run exceeds the published execution-profile trial limit."
+            }
+
+            single_trial = _corpus(trials=1)
+            assert (
+                client.post(
+                    "/api/evals/corpora",
+                    headers=_AUTH_HEADERS,
+                    json=single_trial.model_dump(mode="json"),
+                ).status_code
+                == 201
+            )
+            stale = client.post(
+                "/api/evals/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "stale-profile"},
+                json={
+                    "corpus_revision": single_trial.revision,
+                    "suite_id": single_trial.suites[0].id,
+                    "expected_execution_profile_revision": "sha256:" + "0" * 64,
+                },
+            )
+            assert stale.status_code == 409
+            assert stale.json() == {
+                "detail": (
+                    "The selected eval execution profile changed after it was reviewed. "
+                    "Refresh readiness before launching."
+                )
+            }
+            assert client.get("/api/evals/runs", headers=_AUTH_HEADERS).json()["items"] == []
+            assert provider.requests == []
+    finally:
+        asyncio.run(store.close())
+
+
+def test_evals_reports_published_application_identity_drift_before_admission(tmp_path) -> None:
+    target = _target(_provider(trials=1))
+    corpus = _corpus(trials=1)
+    store = SQLiteEvalStore(tmp_path / "evals.db")
+    try:
+        with TestClient(_server(target, store)) as client:
+            profile_revision = _execution_profile_revision(client)
+            assert (
+                client.post(
+                    "/api/evals/corpora",
+                    headers=_AUTH_HEADERS,
+                    json=corpus.model_dump(mode="json"),
+                ).status_code
+                == 201
+            )
+            target.app.register_agent(AgentSpec(name="late-agent", model="fixture-model"))
+
+            catalog = client.get("/api/evals/targets", headers=_AUTH_HEADERS)
+            assert catalog.status_code == 200
+            target_entry = catalog.json()["items"][0]
+            assert target_entry["execution_profile_ready"] is False
+            assert target_entry["execution_profile_diagnostics"][0]["code"] == (
+                "application_identity_changed"
+            )
+            launched = client.post(
+                "/api/evals/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "changed-application"},
+                json={
+                    "corpus_revision": corpus.revision,
+                    "suite_id": corpus.suites[0].id,
+                    "expected_execution_profile_revision": profile_revision,
+                },
+            )
+            assert launched.status_code == 409
+            assert launched.json() == {
+                "detail": (
+                    "The application identity for this eval execution profile changed after "
+                    "the target was published. Refresh the deployment before launching."
+                )
+            }
+            assert client.get("/api/evals/runs", headers=_AUTH_HEADERS).json()["items"] == []
     finally:
         asyncio.run(store.close())
 
@@ -891,6 +1104,7 @@ def test_eval_provider_failure_is_contained_without_publishing_exception_text(tm
                 json={
                     "corpus_revision": corpus.revision,
                     "suite_id": corpus.suites[0].id,
+                    "expected_execution_profile_revision": _execution_profile_revision(client),
                 },
             )
             assert admitted.status_code == 202
@@ -929,6 +1143,7 @@ def test_running_eval_cancellation_stops_execution_before_terminalizing(tmp_path
                 json={
                     "corpus_revision": corpus.revision,
                     "suite_id": corpus.suites[0].id,
+                    "expected_execution_profile_revision": _execution_profile_revision(client),
                     "max_concurrency": 1,
                 },
             )
@@ -975,6 +1190,7 @@ def test_attached_worker_runs_the_same_trusted_model_judge_contract(tmp_path) ->
                 json={
                     "corpus_revision": corpus.revision,
                     "suite_id": corpus.suites[0].id,
+                    "expected_execution_profile_revision": _execution_profile_revision(client),
                 },
             )
             assert admitted.status_code == 202
@@ -1034,6 +1250,7 @@ def test_attached_worker_recovers_interrupted_model_judge_under_a_new_fence(tmp_
                 json={
                     "corpus_revision": corpus.revision,
                     "suite_id": corpus.suites[0].id,
+                    "expected_execution_profile_revision": _execution_profile_revision(client),
                 },
             )
             assert admitted.status_code == 202
@@ -1131,6 +1348,7 @@ def test_complex_corpus_import_cannot_starve_an_active_eval_lease(
                 json={
                     "corpus_revision": active_corpus.revision,
                     "suite_id": active_corpus.suites[0].id,
+                    "expected_execution_profile_revision": _execution_profile_revision(client),
                 },
             )
             assert admitted.status_code == 202
@@ -1192,6 +1410,7 @@ def test_sqlite_eval_heartbeats_have_capacity_when_default_executor_is_saturated
             suite_id=corpus.suites[0].id,
             suite_revision=corpus.suites[0].revision,
             max_concurrency=1,
+            invocation=await _bound_eval_invocation(target),
         )
         await store.admit_run(request, redact_json=target.app.redact_json)
 
@@ -1311,6 +1530,7 @@ def test_result_publication_heartbeats_until_the_terminal_commit(
                 json={
                     "corpus_revision": corpus.revision,
                     "suite_id": corpus.suites[0].id,
+                    "expected_execution_profile_revision": _execution_profile_revision(client),
                 },
             )
             assert admitted.status_code == 202
@@ -1384,6 +1604,7 @@ def test_result_projection_cannot_expire_a_completed_provider_lease(
                 json={
                     "corpus_revision": corpus.revision,
                     "suite_id": corpus.suites[0].id,
+                    "expected_execution_profile_revision": _execution_profile_revision(client),
                 },
             )
             assert admitted.status_code == 202
@@ -1415,7 +1636,9 @@ def test_eval_preflight_heartbeats_ownership_before_provider_dispatch(
     provider = _provider(trials=1)
     target = _target(provider)
     corpus = _corpus(trials=1)
-    store = SQLiteEvalStore(tmp_path / "evals.db")
+    database = tmp_path / "evals.db"
+    store = SQLiteEvalStore(database)
+    competing_store = SQLiteEvalStore(database, schema_mode=SchemaMode.VALIDATE)
     compile_started = threading.Event()
     release_compile = threading.Event()
     original_compile = evals_worker_module.compile_corpus_suite
@@ -1453,13 +1676,16 @@ def test_eval_preflight_heartbeats_ownership_before_provider_dispatch(
                 json={
                     "corpus_revision": corpus.revision,
                     "suite_id": corpus.suites[0].id,
+                    "expected_execution_profile_revision": _execution_profile_revision(client),
                 },
             )
             run_id = admitted.json()["spec"]["run_id"]
             assert compile_started.wait(timeout=2)
 
             time.sleep(1.1)
-            competing_lease = asyncio.run(store.claim_run(target_key=target.key, lease_seconds=5))
+            competing_lease = asyncio.run(
+                competing_store.claim_run(target_key=target.key, lease_seconds=5)
+            )
             assert competing_lease is None
             assert provider.requests == []
 
@@ -1469,6 +1695,7 @@ def test_eval_preflight_heartbeats_ownership_before_provider_dispatch(
             assert len(provider.requests) == 1
     finally:
         release_compile.set()
+        asyncio.run(competing_store.close())
         asyncio.run(store.close())
 
 
@@ -1479,7 +1706,9 @@ def test_eval_preflight_rechecks_ownership_before_provider_dispatch(
     provider = _provider(trials=1)
     target = _target(provider)
     corpus = _corpus(trials=1)
-    store = SQLiteEvalStore(tmp_path / "evals.db")
+    database = tmp_path / "evals.db"
+    store = SQLiteEvalStore(database)
+    competing_store = SQLiteEvalStore(database, schema_mode=SchemaMode.VALIDATE)
     compile_started = threading.Event()
     release_compile = threading.Event()
     refresh_attempted = threading.Event()
@@ -1535,13 +1764,16 @@ def test_eval_preflight_rechecks_ownership_before_provider_dispatch(
                 json={
                     "corpus_revision": corpus.revision,
                     "suite_id": corpus.suites[0].id,
+                    "expected_execution_profile_revision": _execution_profile_revision(client),
                 },
             )
             assert admitted.status_code == 202
             assert compile_started.wait(timeout=2)
 
             time.sleep(1.1)
-            competing_lease = asyncio.run(store.claim_run(target_key=target.key, lease_seconds=5))
+            competing_lease = asyncio.run(
+                competing_store.claim_run(target_key=target.key, lease_seconds=5)
+            )
             assert competing_lease is not None
             assert competing_lease.claim.epoch == 2
 
@@ -1552,7 +1784,8 @@ def test_eval_preflight_rechecks_ownership_before_provider_dispatch(
     finally:
         release_compile.set()
         if competing_lease is not None:
-            asyncio.run(store.release_run(competing_lease.claim))
+            asyncio.run(competing_store.release_run(competing_lease.claim))
+        asyncio.run(competing_store.close())
         asyncio.run(store.close())
 
 
@@ -1578,6 +1811,7 @@ def test_shutdown_releases_owned_eval_for_restart_recovery(tmp_path) -> None:
                 json={
                     "corpus_revision": corpus.revision,
                     "suite_id": corpus.suites[0].id,
+                    "expected_execution_profile_revision": _execution_profile_revision(client),
                 },
             )
             run_id = admitted.json()["spec"]["run_id"]
@@ -1601,6 +1835,17 @@ def test_restarted_worker_recreates_persisted_http_provenance_and_run_bounds(tmp
 
     async def exercise() -> None:
         first = SQLiteEvalStore(database)
+        invocation = EvalRunInvocation(
+            source=SessionExecutionSource.HTTP_RUN,
+            origin=InvocationOrigin(
+                trust=InvocationOriginTrust.SERVER_VERIFIED,
+                subject="restart-operator",
+                tenant="restart-tenant",
+            ),
+            max_steps=1,
+            limits=RunLimits(max_total_tokens=100, scope="run"),
+        )
+        invocation = await _bound_eval_invocation(target, invocation)
         request = EvalRunRequest(
             run_id="eval-restart-provenance",
             idempotency_key="sha256:" + "9" * 64,
@@ -1609,16 +1854,7 @@ def test_restarted_worker_recreates_persisted_http_provenance_and_run_bounds(tmp
             suite_id=corpus.suites[0].id,
             suite_revision=corpus.suites[0].revision,
             max_concurrency=1,
-            invocation=EvalRunInvocation(
-                source=SessionExecutionSource.HTTP_RUN,
-                origin=InvocationOrigin(
-                    trust=InvocationOriginTrust.SERVER_VERIFIED,
-                    subject="restart-operator",
-                    tenant="restart-tenant",
-                ),
-                max_steps=1,
-                limits=RunLimits(max_total_tokens=100, scope="run"),
-            ),
+            invocation=invocation,
         )
         await first.save_corpus(corpus, redact_json=target.app.redact_json)
         await first.admit_run(request, redact_json=target.app.redact_json)
@@ -1656,6 +1892,221 @@ def test_restarted_worker_recreates_persisted_http_provenance_and_run_bounds(tmp
     asyncio.run(exercise())
 
 
+def test_restarted_worker_rejects_changed_execution_profile_before_provider_dispatch(
+    tmp_path,
+) -> None:
+    provider = _provider(trials=1)
+    target = _target(provider)
+    corpus = _corpus(trials=1)
+    store = SQLiteEvalStore(tmp_path / "profile-drift.db")
+
+    async def exercise() -> None:
+        invocation = await _bound_eval_invocation(target)
+        request = EvalRunRequest(
+            run_id="eval-profile-drift",
+            idempotency_key="sha256:" + "4" * 64,
+            corpus_revision=corpus.revision,
+            target_key=target.key,
+            suite_id=corpus.suites[0].id,
+            suite_revision=corpus.suites[0].revision,
+            max_concurrency=1,
+            invocation=invocation,
+        )
+        await store.save_corpus(corpus, redact_json=target.app.redact_json)
+        await store.admit_run(request, redact_json=target.app.redact_json)
+
+        target.app.register_agent(AgentSpec(name="late-agent", model="fixture-model"))
+        coordinator = evals_worker_module.EvalRunCoordinator(_evals_config(target, store))
+        coordinator.start()
+        try:
+            deadline = asyncio.get_running_loop().time() + 5
+            while asyncio.get_running_loop().time() < deadline:
+                record = await store.load_run(request.run_id)
+                assert record is not None
+                if record.status in {
+                    EvalRunStatus.COMPLETED,
+                    EvalRunStatus.FAILED,
+                    EvalRunStatus.CANCELLED,
+                }:
+                    break
+                await asyncio.sleep(0.01)
+            assert record.status is EvalRunStatus.FAILED
+            assert record.failure_code == "target_unavailable"
+            assert provider.requests == []
+        finally:
+            await coordinator.stop()
+            await store.close()
+
+    asyncio.run(exercise())
+
+
+def test_restarted_worker_rejects_changed_target_bootstrap_before_provider_dispatch(
+    tmp_path,
+) -> None:
+    provider = _provider(trials=1)
+    target = _target(provider)
+    corpus = _corpus(trials=1)
+    store = SQLiteEvalStore(tmp_path / "target-material-drift.db")
+    changed_target = CorpusTarget(
+        key=target.key,
+        app=target.app,
+        request_base=target.request_base,
+        bootstrap_messages=(Message.text("system", "A changed candidate bootstrap."),),
+        application_release_id=target.application_release_id,
+        evidence_policy=target.evidence_policy,
+        price_book=target.price_book,
+        model_judges=target.model_judges,
+        limits=target.limits,
+    )
+
+    async def exercise() -> None:
+        invocation = await _bound_eval_invocation(target)
+        request = EvalRunRequest(
+            run_id="eval-target-material-drift",
+            idempotency_key="sha256:" + "7" * 64,
+            corpus_revision=corpus.revision,
+            target_key=target.key,
+            suite_id=corpus.suites[0].id,
+            suite_revision=corpus.suites[0].revision,
+            max_concurrency=1,
+            invocation=invocation,
+        )
+        await store.save_corpus(corpus, redact_json=target.app.redact_json)
+        await store.admit_run(request, redact_json=target.app.redact_json)
+
+        coordinator = evals_worker_module.EvalRunCoordinator(_evals_config(changed_target, store))
+        coordinator.start()
+        try:
+            deadline = asyncio.get_running_loop().time() + 5
+            while asyncio.get_running_loop().time() < deadline:
+                record = await store.load_run(request.run_id)
+                assert record is not None
+                if record.status in {
+                    EvalRunStatus.COMPLETED,
+                    EvalRunStatus.FAILED,
+                    EvalRunStatus.CANCELLED,
+                }:
+                    break
+                await asyncio.sleep(0.01)
+            assert record.status is EvalRunStatus.FAILED
+            assert record.failure_code == "target_unavailable"
+            assert provider.requests == []
+        finally:
+            await coordinator.stop()
+            await store.close()
+
+    asyncio.run(exercise())
+
+
+def test_worker_classifies_manifest_drift_after_preflight_as_target_unavailable(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    provider = _provider(trials=1)
+    target = _target(provider)
+    corpus = _corpus(trials=1)
+    store = SQLiteEvalStore(tmp_path / "manifest-drift-after-preflight.db")
+    original_preflight = evals_worker_module.EvalRunCoordinator._preflight_lease
+
+    async def drift_after_preflight(coordinator, lease, registration):
+        prepared = await original_preflight(coordinator, lease, registration)
+        if isinstance(prepared, evals_worker_module._PreparedEvalRun):
+            target.app.register_agent(AgentSpec(name="late-agent", model="fixture-model"))
+        return prepared
+
+    monkeypatch.setattr(
+        evals_worker_module.EvalRunCoordinator,
+        "_preflight_lease",
+        drift_after_preflight,
+    )
+
+    async def exercise() -> None:
+        invocation = await _bound_eval_invocation(target)
+        request = EvalRunRequest(
+            run_id="eval-manifest-drift-after-preflight",
+            idempotency_key="sha256:" + "5" * 64,
+            corpus_revision=corpus.revision,
+            target_key=target.key,
+            suite_id=corpus.suites[0].id,
+            suite_revision=corpus.suites[0].revision,
+            max_concurrency=1,
+            invocation=invocation,
+        )
+        await store.save_corpus(corpus, redact_json=target.app.redact_json)
+        await store.admit_run(request, redact_json=target.app.redact_json)
+
+        coordinator = evals_worker_module.EvalRunCoordinator(_evals_config(target, store))
+        coordinator.start()
+        try:
+            deadline = asyncio.get_running_loop().time() + 5
+            while asyncio.get_running_loop().time() < deadline:
+                record = await store.load_run(request.run_id)
+                assert record is not None
+                if record.status in {
+                    EvalRunStatus.COMPLETED,
+                    EvalRunStatus.FAILED,
+                    EvalRunStatus.CANCELLED,
+                }:
+                    break
+                await asyncio.sleep(0.01)
+            assert record.status is EvalRunStatus.FAILED
+            assert record.failure_code == "target_unavailable"
+            assert provider.requests == []
+        finally:
+            await coordinator.stop()
+            await store.close()
+
+    asyncio.run(exercise())
+
+
+def test_worker_rechecks_manifest_before_each_fresh_trial(tmp_path, monkeypatch) -> None:
+    provider = _provider(trials=2)
+    target = _target(provider)
+    corpus = _corpus(trials=2)
+    store = SQLiteEvalStore(tmp_path / "manifest-drift-between-trials.db")
+    original_stream = provider.stream
+
+    async def drift_after_first_trial(request):
+        async for event in original_stream(request):
+            yield event
+        if len(provider.requests) == 1:
+            target.app.register_agent(AgentSpec(name="late-agent", model="fixture-model"))
+
+    monkeypatch.setattr(provider, "stream", drift_after_first_trial)
+    try:
+        with TestClient(
+            _server(
+                target,
+                store,
+                execution_profile_policy=_repeatable_execution_policy(target),
+            )
+        ) as client:
+            imported = client.post(
+                "/api/evals/corpora",
+                headers=_AUTH_HEADERS,
+                json=corpus.model_dump(mode="json"),
+            )
+            assert imported.status_code == 201
+            admitted = client.post(
+                "/api/evals/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "manifest-drift-between-trials"},
+                json={
+                    "corpus_revision": corpus.revision,
+                    "suite_id": corpus.suites[0].id,
+                    "expected_execution_profile_revision": _execution_profile_revision(client),
+                    "max_concurrency": 1,
+                },
+            )
+            assert admitted.status_code == 202
+
+            terminal = _wait_for_terminal(client, admitted.json()["spec"]["run_id"])
+            assert terminal["status"] == "failed"
+            assert terminal["failure_code"] == "target_unavailable"
+            assert len(provider.requests) == 1
+    finally:
+        asyncio.run(store.close())
+
+
 def test_shutdown_grace_bounds_a_stalled_durable_release(tmp_path, monkeypatch) -> None:
     provider = _BlockingProvider()
     target = _target(provider)
@@ -1674,6 +2125,7 @@ def test_shutdown_grace_bounds_a_stalled_durable_release(tmp_path, monkeypatch) 
             suite_id=corpus.suites[0].id,
             suite_revision=corpus.suites[0].revision,
             max_concurrency=1,
+            invocation=await _bound_eval_invocation(target),
         )
         await store.admit_run(request, redact_json=target.app.redact_json)
         release_started = asyncio.Event()

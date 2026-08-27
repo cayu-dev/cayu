@@ -34,6 +34,7 @@ from cayu._validation import (
 )
 from cayu.evals.corpus import EvaluationEvidencePolicySpec
 from cayu.evals.execution import CorpusTarget
+from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
 from cayu.evals.store import EVAL_STORE_MAX_LEASE_SECONDS, EvalStore
 from cayu.runtime.sessions import IncompleteSessionsRecoveryRequest, SessionStatus
 from cayu.server.contracts import SERVER_API_PREFIX, validate_usage_rollup_price_book
@@ -352,6 +353,9 @@ class EvalsConfig(BaseModel):
 
     target: CorpusTarget = Field(exclude=True, repr=False)
     store: EvalStore = Field(exclude=True, repr=False)
+    execution_profile_policy: EvalExecutionProfilePolicyV1 = Field(
+        default_factory=EvalExecutionProfilePolicyV1.safe_default
+    )
     lease_seconds: StrictInt = Field(
         default=DEFAULT_EVAL_LEASE_SECONDS,
         ge=1,
@@ -387,6 +391,12 @@ class EvalsConfig(BaseModel):
         elif not config.store.durable:
             message = "store must be durable."
             location = "store"
+        elif config.execution_profile_policy.max_trials > config.target.limits.max_trials:
+            message = "execution profile trial ceiling exceeds target authority."
+            location = "execution_profile_policy"
+        elif config.execution_profile_policy.max_concurrency > config.target.limits.max_concurrency:
+            message = "execution profile concurrency ceiling exceeds target authority."
+            location = "execution_profile_policy"
         else:
             return config
         _raise_redacted_config_error(

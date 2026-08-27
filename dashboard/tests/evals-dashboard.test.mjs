@@ -7,6 +7,8 @@ import {
   capturedEvalLaunchRequestIdentity,
   createEvalIdempotencyKey,
   EVAL_RESULT_QUERY_RETENTION,
+  EVAL_TARGET_QUERY_KEY,
+  EVAL_TARGET_STALE_TIME_MS,
   EvalLaunchIdempotencyRegistry,
   evalCancellationNotice,
   evalComparisonReasonText,
@@ -16,6 +18,7 @@ import {
   evalRunCanCancel,
   evalRunHasResult,
   evalRunIsActive,
+  evalTargetCatalogMayBeStale,
   evalTrialCostSummary,
   MAX_EVAL_CORPUS_FILE_BYTES,
   preflightEvalCorpusFile,
@@ -164,30 +167,52 @@ test("eval launch idempotency keys use secure browser UUIDs", () => {
 
 test("eval launch retries reuse their key across page reloads until reconciled", () => {
   const storage = new MemoryStorage()
-  const identity = evalLaunchRequestIdentity("sha256:corpus", "suite-1", 4)
+  const identity = evalLaunchRequestIdentity("sha256:corpus", "suite-1", 4, "sha256:profile")
   const originalKey = new EvalLaunchIdempotencyRegistry(storage, "/api").keyFor(identity)
 
   assert.equal(new EvalLaunchIdempotencyRegistry(storage, "/api").keyFor(identity), originalKey)
+  assert.notEqual(
+    identity,
+    evalLaunchRequestIdentity("sha256:corpus", "suite-1", 4, "sha256:new-profile"),
+  )
 
   new EvalLaunchIdempotencyRegistry(storage, "/api").resolve(identity)
   assert.notEqual(new EvalLaunchIdempotencyRegistry(storage, "/api").keyFor(identity), originalKey)
 })
 
-test("scenario launch retry identity binds the immutable scenario and reviewed binding", () => {
-  const identity = scenarioEvalLaunchRequestIdentity("sha256:scenario", "sha256:binding")
-  assert.equal(identity, '["scenario-v2","sha256:scenario","sha256:binding"]')
+test("scenario launch retry identity binds the scenario, binding, and execution profile", () => {
+  const identity = scenarioEvalLaunchRequestIdentity(
+    "sha256:scenario",
+    "sha256:binding",
+    "sha256:profile",
+  )
+  assert.equal(identity, '["scenario-v2","sha256:scenario","sha256:binding","sha256:profile"]')
   assert.notEqual(
     identity,
-    scenarioEvalLaunchRequestIdentity("sha256:scenario", "sha256:new-binding"),
+    scenarioEvalLaunchRequestIdentity("sha256:scenario", "sha256:new-binding", "sha256:profile"),
+  )
+  assert.notEqual(
+    identity,
+    scenarioEvalLaunchRequestIdentity("sha256:scenario", "sha256:binding", "sha256:new-profile"),
   )
 })
 
-test("authored suite retry identity binds the immutable suite and exact selection", () => {
-  const identity = authoredSuiteEvalLaunchRequestIdentity("sha256:suite", "sha256:selection")
-  assert.equal(identity, '["authored-suite-v1","sha256:suite","sha256:selection"]')
+test("authored suite retry identity binds the suite, selection, and execution profiles", () => {
+  const profiles = [{ case_ids: ["case-a"], execution_profile_revision: "sha256:profile-a" }]
+  const identity = authoredSuiteEvalLaunchRequestIdentity(
+    "sha256:suite",
+    "sha256:selection",
+    profiles,
+  )
   assert.notEqual(
     identity,
-    authoredSuiteEvalLaunchRequestIdentity("sha256:suite", "sha256:other-selection"),
+    authoredSuiteEvalLaunchRequestIdentity("sha256:suite", "sha256:other-selection", profiles),
+  )
+  assert.notEqual(
+    identity,
+    authoredSuiteEvalLaunchRequestIdentity("sha256:suite", "sha256:selection", [
+      { case_ids: ["case-a"], execution_profile_revision: "sha256:new-profile" },
+    ]),
   )
 })
 
@@ -227,7 +252,7 @@ test("captured eval retry identities include every execution contraction", () =>
 
 test("eval launch retries are isolated between API mounts on one origin", () => {
   const storage = new MemoryStorage()
-  const identity = evalLaunchRequestIdentity("sha256:corpus", "suite-1", 4)
+  const identity = evalLaunchRequestIdentity("sha256:corpus", "suite-1", 4, "sha256:profile")
   const first = new EvalLaunchIdempotencyRegistry(storage, "/app-a/api")
   const second = new EvalLaunchIdempotencyRegistry(storage, "/app-b/api")
   const firstKey = first.keyFor(identity)
@@ -237,6 +262,14 @@ test("eval launch retries are isolated between API mounts on one origin", () => 
   second.resolve(identity)
   assert.equal(first.keyFor(identity), firstKey)
   assert.notEqual(second.keyFor(identity), secondKey)
+})
+
+test("dynamic eval targets have bounded freshness and profile conflicts invalidate them", () => {
+  assert.deepEqual(EVAL_TARGET_QUERY_KEY, ["evals", "targets"])
+  assert.equal(EVAL_TARGET_STALE_TIME_MS, 15_000)
+  assert.equal(evalTargetCatalogMayBeStale({ status: 409 }), true)
+  assert.equal(evalTargetCatalogMayBeStale({ status: 400 }), false)
+  assert.equal(evalTargetCatalogMayBeStale(new Error("offline")), false)
 })
 
 test("eval launch retry keys clear only after definitive API responses", () => {

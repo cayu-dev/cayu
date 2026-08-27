@@ -48,9 +48,11 @@ import {
 } from "@/lib/eval-suite-authoring"
 import {
   authoredSuiteEvalLaunchRequestIdentity,
+  EVAL_TARGET_QUERY_KEY,
   EvalLaunchIdempotencyRegistry,
   evalErrorMessage,
   evalLaunchFailureIsDefinitive,
+  evalTargetCatalogMayBeStale,
   shortEvalIdentity,
 } from "@/lib/evals-dashboard"
 import type { PromotionAssertion } from "@/lib/evaluation-promotion"
@@ -411,9 +413,21 @@ export function EvalSuiteAuthoringAction({
     ) {
       return
     }
+    const expectedExecutionProfiles = runPreview.launches.flatMap((item) =>
+      item.execution_profile_revision
+        ? [
+            {
+              case_ids: item.case_ids,
+              execution_profile_revision: item.execution_profile_revision,
+            },
+          ]
+        : [],
+    )
+    if (expectedExecutionProfiles.length !== runPreview.launches.length) return
     const requestIdentity = authoredSuiteEvalLaunchRequestIdentity(
       savedRevision,
       runPreview.selection.revision,
+      expectedExecutionProfiles,
     )
     void run("launch", async (signal) => {
       const registry =
@@ -425,11 +439,17 @@ export function EvalSuiteAuthoringAction({
       try {
         launched = await launchEvalAuthoredSuiteRun(
           savedRevision,
-          launchSelection,
+          {
+            ...launchSelection,
+            expected_execution_profiles: expectedExecutionProfiles,
+          },
           idempotencyKey,
           signal,
         )
       } catch (launchError) {
+        if (evalTargetCatalogMayBeStale(launchError)) {
+          await queryClient.invalidateQueries({ queryKey: EVAL_TARGET_QUERY_KEY })
+        }
         if (
           launchError instanceof ApiClientError &&
           evalLaunchFailureIsDefinitive(launchError.status)

@@ -40,6 +40,7 @@ from cayu.evals.execution import (
     CorpusExecutionResult,
 )
 from cayu.evals.execution_comparison import CorpusExecutionComparison
+from cayu.evals.execution_profiles import EvalExecutionProfileV1
 from cayu.evals.promotion import (
     CAPTURED_EVALUATION_CANDIDATE_MAX_BYTES,
     PROMOTION_CANDIDATE_MAX_BYTES,
@@ -963,6 +964,51 @@ EvalServerIdentifier = Annotated[
     ),
 ]
 
+_EVAL_EXECUTION_PROFILE_DIAGNOSTIC_COPY = {
+    "not_resolved": (
+        "The runtime execution profile has not been resolved.",
+        "Refresh the target catalog to resolve current execution authority.",
+    ),
+    "application_identity_changed": (
+        "The current application identity no longer matches this published eval target.",
+        "Restart or republish the application before launching this target.",
+    ),
+    "runtime_authority_unavailable": (
+        "The current runtime execution profile is unavailable.",
+        "Restore the target's provider, model, environment, and runtime authority, then refresh.",
+    ),
+}
+
+
+class EvalExecutionProfileDiagnostic(ApiBaseModel):
+    """Stable public reason that an eval target cannot publish a current profile."""
+
+    code: Literal[
+        "not_resolved",
+        "application_identity_changed",
+        "runtime_authority_unavailable",
+    ]
+    message: StrictStr = Field(min_length=1, max_length=512)
+    remediation: StrictStr = Field(min_length=1, max_length=512)
+
+    @model_validator(mode="after")
+    def validate_copy(self) -> EvalExecutionProfileDiagnostic:
+        if (self.message, self.remediation) != _EVAL_EXECUTION_PROFILE_DIAGNOSTIC_COPY[self.code]:
+            raise ValueError("Eval execution-profile diagnostic copy does not match its code.")
+        return self
+
+    @classmethod
+    def for_code(
+        cls,
+        code: Literal[
+            "not_resolved",
+            "application_identity_changed",
+            "runtime_authority_unavailable",
+        ],
+    ) -> EvalExecutionProfileDiagnostic:
+        message, remediation = _EVAL_EXECUTION_PROFILE_DIAGNOSTIC_COPY[code]
+        return cls(code=code, message=message, remediation=remediation)
+
 
 class EvalTargetCatalogEntry(ApiBaseModel):
     """Bounded public identity for one server-owned eval execution target."""
@@ -991,6 +1037,9 @@ class EvalTargetCatalogEntry(ApiBaseModel):
     max_steps: StrictInt = Field(ge=1, le=256)
     cost_budget_available: StrictBool
     cost_budget_currencies: tuple[StrictStr, ...] = Field(max_length=32)
+    execution_profile_ready: StrictBool
+    execution_profile: EvalExecutionProfileV1 | None
+    execution_profile_diagnostics: tuple[EvalExecutionProfileDiagnostic, ...] = Field(max_length=4)
 
     @field_validator(
         "project_id",
@@ -1040,6 +1089,27 @@ class EvalTargetCatalogEntry(ApiBaseModel):
             raise ValueError("Explicit eval targets do not claim generated project identity.")
         return self
 
+    @model_validator(mode="after")
+    def validate_execution_profile_readiness(self) -> EvalTargetCatalogEntry:
+        if self.execution_profile_ready != (self.execution_profile is not None):
+            raise ValueError("Eval execution-profile readiness contradicts its snapshot.")
+        if self.execution_profile_ready == bool(self.execution_profile_diagnostics):
+            raise ValueError("Eval execution-profile readiness contradicts its diagnostics.")
+        if self.execution_profile is not None and (
+            self.execution_profile.profile_id != self.profile_id
+            or self.execution_profile.target_key != self.target_key
+            or self.execution_profile.application_release_id != self.application_release_id
+            or self.execution_profile.app_manifest_fingerprint != self.app_manifest_fingerprint
+            or self.execution_profile.ceilings.max_trials != self.max_trials
+            or self.execution_profile.ceilings.max_concurrency != self.max_concurrency
+            or self.execution_profile.ceilings.max_timeout_seconds != self.max_timeout_seconds
+            or self.execution_profile.ceilings.max_steps != self.max_steps
+        ):
+            raise ValueError(
+                "Eval execution-profile snapshot contradicts its target catalog entry."
+            )
+        return self
+
 
 class EvalTargetCatalogResponse(ApiBaseModel):
     """Complete bounded registry projection for target selection."""
@@ -1065,6 +1135,7 @@ class EvalRunCreateRequest(ApiBaseModel):
 
     corpus_revision: EvalRevision
     suite_id: PromotionPortableId
+    expected_execution_profile_revision: EvalRevision
     max_concurrency: StrictInt = Field(default=1, ge=1, le=CORPUS_EXECUTION_MAX_CONCURRENCY)
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
     limits: RunLimits | None = None
@@ -1337,6 +1408,7 @@ class CapturedEvaluationLaunchRequest(CapturedEvaluationSaveRequest):
     """Reviewed captured contract plus bounded fresh-execution settings."""
 
     trial_request: TrialRequestSpec = Field(default_factory=TrialRequestSpec)
+    expected_execution_profile_revision: EvalRevision
     max_concurrency: StrictInt = Field(default=1, ge=1, le=CORPUS_EXECUTION_MAX_CONCURRENCY)
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
     limits: RunLimits | None = None
@@ -1377,6 +1449,13 @@ class EvalScenarioPreviewRequest(ApiBaseModel):
 class EvalScenarioPreviewResponse(ApiBaseModel):
     scenario: EvalScenarioDocumentV2
     preflight: ScenarioLaunchPreflightResultV2
+    execution_profile_revision: EvalRevision | None = None
+
+    @model_validator(mode="after")
+    def validate_profile_readiness(self) -> EvalScenarioPreviewResponse:
+        if self.preflight.ready != (self.execution_profile_revision is not None):
+            raise ValueError("Scenario readiness contradicts its execution-profile revision.")
+        return self
 
 
 class EvalScenarioSaveRequest(ApiBaseModel):
@@ -1396,6 +1475,13 @@ class EvalScenarioSaveResponse(ApiBaseModel):
     entry: EvalScenarioCatalogEntry
     scenario: EvalScenarioDocumentV2
     preflight: ScenarioLaunchPreflightResultV2
+    execution_profile_revision: EvalRevision | None = None
+
+    @model_validator(mode="after")
+    def validate_profile_readiness(self) -> EvalScenarioSaveResponse:
+        if self.preflight.ready != (self.execution_profile_revision is not None):
+            raise ValueError("Saved scenario readiness contradicts its execution profile.")
+        return self
 
 
 class EvalSuiteAuthoringDiagnostic(ApiBaseModel):
@@ -1462,6 +1548,8 @@ class EvalAuthoredSuiteRunSelectionRequest(ApiBaseModel):
 class EvalAuthoredSuiteLaunchDiagnostic(ApiBaseModel):
     code: Literal[
         "one_trial_required",
+        "execution_profile_unavailable",
+        "execution_profile_changed",
         "simple_launch_not_ready",
         "scenario_execution_unavailable",
         "scenario_launch_not_ready",
@@ -1477,6 +1565,7 @@ class EvalAuthoredSuiteLaunchPlanItem(ApiBaseModel):
         max_length=EVAL_CORPUS_MAX_CASES,
     )
     scenario_revision: EvalRevision | None = None
+    execution_profile_revision: EvalRevision | None = None
 
     @model_validator(mode="after")
     def validate_plan_item(self) -> EvalAuthoredSuiteLaunchPlanItem:
@@ -1509,6 +1598,47 @@ class EvalAuthoredSuiteRunPreviewResponse(ApiBaseModel):
         selected = tuple(item.id for item in self.selection.cases)
         if tuple(sorted(planned)) != selected or len(planned) != len(set(planned)):
             raise ValueError("Authored suite launch plan does not match its immutable selection.")
+        if self.ready != all(item.execution_profile_revision is not None for item in self.launches):
+            raise ValueError(
+                "Authored suite launch readiness contradicts execution-profile bindings."
+            )
+        return self
+
+
+class EvalAuthoredSuiteExecutionProfileExpectation(ApiBaseModel):
+    """Browser-held CAS identity for one previewed authored-suite launch item."""
+
+    case_ids: tuple[PromotionPortableId, ...] = Field(
+        min_length=1,
+        max_length=EVAL_CORPUS_MAX_CASES,
+    )
+    execution_profile_revision: EvalRevision
+
+    @field_validator("case_ids")
+    @classmethod
+    def validate_case_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if value != tuple(sorted(set(value))):
+            raise ValueError("Execution-profile expectation case IDs must be unique and sorted.")
+        return value
+
+
+class EvalAuthoredSuiteRunLaunchRequest(EvalAuthoredSuiteRunSelectionRequest):
+    """Exact reviewed selection and per-launch execution-profile expectations."""
+
+    expected_execution_profiles: tuple[EvalAuthoredSuiteExecutionProfileExpectation, ...] = Field(
+        min_length=1,
+        max_length=EVAL_CORPUS_MAX_CASES,
+    )
+
+    @model_validator(mode="after")
+    def validate_profile_expectations(self) -> EvalAuthoredSuiteRunLaunchRequest:
+        case_ids = tuple(
+            case_id
+            for expectation in self.expected_execution_profiles
+            for case_id in expectation.case_ids
+        )
+        if len(case_ids) != len(set(case_ids)):
+            raise ValueError("Execution-profile expectations must not overlap case IDs.")
         return self
 
 
@@ -1561,12 +1691,20 @@ class EvalScenarioArtifactMaterializationRequest(ApiBaseModel):
 class EvalScenarioArtifactMaterializationResponse(ApiBaseModel):
     materialization: ScenarioArtifactMaterializationV2
     preflight: ScenarioLaunchPreflightResultV2
+    execution_profile_revision: EvalRevision | None = None
+
+    @model_validator(mode="after")
+    def validate_profile_readiness(self) -> EvalScenarioArtifactMaterializationResponse:
+        if self.preflight.ready != (self.execution_profile_revision is not None):
+            raise ValueError("Materialized scenario readiness contradicts its execution profile.")
+        return self
 
 
 class EvalScenarioRunCreateRequest(ApiBaseModel):
     """Launch one stored scenario only from the exact reviewed current binding."""
 
     expected_binding_revision: EvalRevision
+    expected_execution_profile_revision: EvalRevision
     settings: ScenarioLaunchSettingsV2 = Field(default_factory=ScenarioLaunchSettingsV2)
 
 

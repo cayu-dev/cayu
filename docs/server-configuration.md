@@ -177,6 +177,11 @@ Configured projects started with `cayu serve` do not construct Evals objects.
 Cayu derives the eval store from the project's declared SQLite or PostgreSQL
 storage, generates one bounded target for each registered agent, and uses the
 normal application provider, tools, environment, approvals, and runtime policy.
+Each catalog request prepares and publishes the current candidate execution
+profile. Generated targets require no Evals-specific Python configuration and
+default to one fresh trial at concurrency one. Browser launches are pinned to
+the published profile revision, while admission and workers fail closed if the
+runtime identity changes before execution.
 `cayu serve --dev` grants only trusted loopback product access; an authenticated
 production control plane uses the same automatic assembly. Missing durable
 storage or ordinary runtime authority remains visible as an operation-level
@@ -191,6 +196,13 @@ application, provider, PriceBook, database handle, or executable target from
 environment text. Explicit target and store objects are excluded from model
 serialization and safe summaries. See [runtime-native evals](evals.md#server-attached-durable-execution)
 for the complete automatic and embedded contracts.
+
+An explicit `EvalsConfig` uses the same conservative one-trial profile unless
+the application supplies `execution_profile_policy`. Repeated or concurrent
+execution requires a stable application-managed reset/isolation revision and
+cannot exceed the `CorpusTarget` authority. This is trusted runtime wiring, not
+an environment or browser setting; see the execution-profile example in the
+Evals guide.
 
 The resolved model is immutable, owns nested runtime JSON, and is evaluated
 once when the server is created. A non-secret effective summary is available

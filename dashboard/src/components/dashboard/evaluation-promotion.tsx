@@ -46,8 +46,11 @@ import {
 import { dashboardConfig } from "@/lib/config"
 import {
   capturedEvalLaunchRequestIdentity,
+  EVAL_TARGET_QUERY_KEY,
+  EVAL_TARGET_STALE_TIME_MS,
   EvalLaunchIdempotencyRegistry,
   evalLaunchFailureIsDefinitive,
+  evalTargetCatalogMayBeStale,
   shortEvalIdentity,
 } from "@/lib/evals-dashboard"
 import { evalsReadinessReasonText } from "@/lib/evals-readiness"
@@ -129,10 +132,10 @@ export function EvaluationPromotionAction({
   const generationRef = useRef(0)
   const launchRegistryRef = useRef<EvalLaunchIdempotencyRegistry | null>(null)
   const targets = useQuery({
-    queryKey: ["evals", "targets"],
+    queryKey: EVAL_TARGET_QUERY_KEY,
     queryFn: ({ signal }) => fetchEvalTargets(signal),
     enabled: open && freshReadiness.state === "ready",
-    staleTime: Number.POSITIVE_INFINITY,
+    staleTime: EVAL_TARGET_STALE_TIME_MS,
   })
 
   const cancelRequests = useCallback(() => {
@@ -352,7 +355,9 @@ export function EvaluationPromotionAction({
       preview === null ||
       !preview.runnable_conversion.available ||
       freshReadiness.state !== "ready" ||
-      !freshLaunch.ok
+      !freshLaunch.ok ||
+      selectedTarget?.execution_profile === null ||
+      selectedTarget?.execution_profile === undefined
     ) {
       return
     }
@@ -362,12 +367,13 @@ export function EvaluationPromotionAction({
     const request: CapturedEvaluationLaunch = {
       candidate: preview.candidate,
       expected_candidate_revision: preview.candidate.revision,
+      expected_execution_profile_revision: selectedTarget.execution_profile.revision,
       ...freshLaunch.request,
     }
     const requestIdentity = capturedEvalLaunchRequestIdentity(
       sessionId,
       preview.candidate.revision,
-      freshLaunch.request,
+      request,
     )
     setLaunching(true)
     setSavedRevision(null)
@@ -388,6 +394,9 @@ export function EvaluationPromotionAction({
           controller.signal,
         )
       } catch (launchError) {
+        if (evalTargetCatalogMayBeStale(launchError)) {
+          await queryClient.invalidateQueries({ queryKey: EVAL_TARGET_QUERY_KEY })
+        }
         if (
           launchError instanceof ApiClientError &&
           evalLaunchFailureIsDefinitive(launchError.status)
@@ -753,7 +762,7 @@ function EvidenceFact({ label, value }: { label: string; value: string }) {
 
 type FreshLaunchRequest = Omit<
   CapturedEvaluationLaunch,
-  "candidate" | "expected_candidate_revision"
+  "candidate" | "expected_candidate_revision" | "expected_execution_profile_revision"
 >
 type FreshLaunchValidation =
   | { ok: true; request: FreshLaunchRequest }
@@ -917,6 +926,14 @@ function validateFreshExecution(
 ): FreshLaunchValidation {
   if (target === undefined) {
     return { ok: false, error: "Execution target details have not loaded." }
+  }
+  if (!target.execution_profile_ready || target.execution_profile == null) {
+    return {
+      ok: false,
+      error:
+        target.execution_profile_diagnostics?.[0]?.message ??
+        "The current execution profile is unavailable.",
+    }
   }
   try {
     const trials = freshExecutionInteger(draft.trials, "Trials", target.max_trials)

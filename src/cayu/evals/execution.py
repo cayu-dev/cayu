@@ -17,6 +17,7 @@ from pydantic import (
 
 from cayu._validation import json_utf8_size_within_limit
 from cayu.core.messages import Message, MessageRole, TextPart, detach_message
+from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_CASES,
     EVAL_CORPUS_MAX_MESSAGE_CHARS,
@@ -52,6 +53,7 @@ from cayu.evals.result_contract import (
 from cayu.evals.runner import EvalCase, EvalSuite, _run_eval_suite_with_public_projection
 from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import PriceBook, copy_price_book
+from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.runtime.manifest import AppManifest, _app_manifest_fingerprint
 from cayu.runtime.sessions import RunRequest, copy_run_request
 
@@ -817,6 +819,7 @@ async def _run_compiled_corpus_suite(
     max_concurrency: int,
     manifest_project_root: Path | None = None,
     expected_app_manifest_fingerprint: str | None = None,
+    expected_execution_profile: ExecutionProfileIdentity | None = None,
 ) -> CorpusExecutionResult:
     """Execute one internally compiled suite without repeating corpus compilation."""
 
@@ -827,6 +830,13 @@ async def _run_compiled_corpus_suite(
         raise ValueError("Compiled corpus target key does not match the trusted target.")
     if compiled.corpus.evidence_policy != validated_target.evidence_policy:
         raise ValueError("Compiled corpus evidence policy does not match the trusted target.")
+    if (
+        expected_execution_profile is not None
+        and type(expected_execution_profile) is not ExecutionProfileIdentity
+    ):
+        raise TypeError(
+            "expected_execution_profile must be an exact ExecutionProfileIdentity or None."
+        )
     _validate_corpus_concurrency(validated_target, max_concurrency)
 
     target_before = _evaluation_target_identity_from_validated_target(
@@ -837,7 +847,7 @@ async def _run_compiled_corpus_suite(
         expected_app_manifest_fingerprint is not None
         and target_before.app_manifest_fingerprint != expected_app_manifest_fingerprint
     ):
-        raise RuntimeError(
+        raise EvalExecutionProfileChangedError(
             "CorpusTarget application manifest does not match its registered identity."
         )
     trial_count = len(compiled.suite.cases) * compiled.trials
@@ -845,6 +855,22 @@ async def _run_compiled_corpus_suite(
         EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES,
         PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES // trial_count,
     )
+
+    def run_stream(request: RunRequest):
+        if expected_app_manifest_fingerprint is not None:
+            current_target = _evaluation_target_identity_from_validated_target(
+                validated_target,
+                project_root=manifest_project_root,
+            )
+            if current_target.app_manifest_fingerprint != expected_app_manifest_fingerprint:
+                raise EvalExecutionProfileChangedError(
+                    "CorpusTarget application manifest changed before fresh eval execution."
+                )
+        return validated_target.app._run_private(
+            request,
+            expected_execution_profile=expected_execution_profile,
+        )
+
     internal_run, trial_public_data_by_case = await _run_eval_suite_with_public_projection(
         validated_target.app,
         compiled.suite,
@@ -852,6 +878,12 @@ async def _run_compiled_corpus_suite(
         case_timeout_seconds=compiled.timeout_seconds,
         trials=compiled.trials,
         output_preview_bytes=output_preview_bytes,
+        run_stream=(
+            run_stream
+            if expected_app_manifest_fingerprint is not None
+            or expected_execution_profile is not None
+            else None
+        ),
     )
     return await asyncio.to_thread(
         _finalize_compiled_corpus_result,
@@ -883,7 +915,9 @@ def _finalize_compiled_corpus_result(
         or target_after.application_release_id != target_before.application_release_id
         or target_after.app_manifest_fingerprint != target_before.app_manifest_fingerprint
     ):
-        raise RuntimeError("CorpusTarget application manifest changed during eval execution.")
+        raise EvalExecutionProfileChangedError(
+            "CorpusTarget application manifest changed during eval execution."
+        )
     run_document: dict[str, Any] = _model_instance_python_input(internal_run)
     run_document["run_contract"] = compiled.run_contract
     bound_run = EvalRun.model_validate(run_document)

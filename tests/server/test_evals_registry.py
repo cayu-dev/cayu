@@ -1,13 +1,27 @@
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from tests.evals.test_corpus_execution import _price_book, _provider, _target
 
-from cayu import AgentSpec, CayuApp, EvalRunCostBudget, EvalRunInvocation, default_price_book
+import cayu.server.evals_registry as evals_registry_module
+from cayu import (
+    AgentSpec,
+    CayuApp,
+    CorpusExecutionLimits,
+    CorpusTarget,
+    EvalRunCostBudget,
+    EvalRunInvocation,
+    EvalScenarioRunInvocation,
+    Message,
+    SecretRedactor,
+    default_price_book,
+)
 from cayu.evals.execution import evaluation_target_identity
+from cayu.evals.execution_profiles import EvalExecutionProfilePolicyV1
 from cayu.runtime.invocation import (
     InvocationOrigin,
     InvocationOriginClaim,
@@ -38,6 +52,33 @@ def _generated_registry(*, release_id: str = "release-one") -> EvalTargetRegistr
     )
     assert registry is not None
     return registry
+
+
+def _copy_target(
+    target: CorpusTarget,
+    *,
+    request_base=None,
+    bootstrap_messages=None,
+    limits: CorpusExecutionLimits | None = None,
+) -> CorpusTarget:
+    return CorpusTarget(
+        key=target.key,
+        app=target.app,
+        request_base=target.request_base if request_base is None else request_base,
+        bootstrap_messages=(
+            target.bootstrap_messages if bootstrap_messages is None else bootstrap_messages
+        ),
+        application_release_id=target.application_release_id,
+        evidence_policy=target.evidence_policy,
+        price_book=target.price_book,
+        model_judges=target.model_judges,
+        limits=target.limits if limits is None else limits,
+    )
+
+
+def _prepared_profile(target: CorpusTarget):
+    registry = explicit_eval_target_registry(target)
+    return asyncio.run(registry.prepare_execution_profile(target.key))
 
 
 def test_generated_target_keys_are_stable_unambiguous_and_release_independent() -> None:
@@ -118,6 +159,199 @@ def test_generated_registry_maps_each_agent_to_normal_authority_without_serializ
         assert runtime_target.application_release_id == "release-one"
 
 
+def test_resolved_catalog_publishes_deterministic_safe_execution_profiles() -> None:
+    registry = _generated_registry()
+
+    first = asyncio.run(registry.resolved_catalog())
+    second = asyncio.run(registry.resolved_catalog())
+
+    assert tuple(item.execution_profile_ready for item in first.items) == (True, True)
+    assert tuple(item.execution_profile_diagnostics for item in first.items) == ((), ())
+    assert tuple(item.execution_profile for item in first.items) == tuple(
+        item.execution_profile for item in second.items
+    )
+    for item in first.items:
+        profile = item.execution_profile
+        assert profile is not None
+        assert profile.target_key == item.target_key
+        assert profile.candidate.agent_name == item.agent_name
+        assert profile.candidate.provider_name == "scripted"
+        assert profile.candidate.model == "fixture-model"
+        assert len(profile.candidate.runtime_execution_profile_fingerprint) == 64
+        assert profile.fixture_strategy == "none"
+        assert profile.reset_strategy == "fresh_session_only"
+        assert profile.effect_posture == "ordinary_application_authority"
+        assert profile.isolation_revision is None
+        runtime_target = registry.get(item.target_key)
+        assert runtime_target is not None
+        assert profile.evidence_policy == runtime_target.evidence_policy
+        assert profile.target_material.kind == "structural_sha256"
+        assert profile.target_material.process_scope is None
+        assert profile.ceilings.max_cases == runtime_target.limits.max_cases
+        assert profile.ceilings.max_trials == 1
+        assert profile.ceilings.max_concurrency == 1
+        assert (
+            profile.ceilings.max_bootstrap_messages == runtime_target.limits.max_bootstrap_messages
+        )
+        assert profile.ceilings.max_total_input_chars == runtime_target.limits.max_total_input_chars
+        assert (
+            profile.ceilings.max_compiled_input_chars
+            == runtime_target.limits.max_compiled_input_chars
+        )
+        assert profile.revision.startswith("sha256:")
+        changed = profile.model_dump(mode="json")
+        changed_candidate = changed["candidate"]
+        assert isinstance(changed_candidate, dict)
+        changed_candidate["model"] = "different-model"
+        with pytest.raises(ValueError, match="revision does not match"):
+            type(profile).model_validate(changed)
+
+
+def test_execution_profile_binds_complete_target_inputs_and_limits() -> None:
+    target = _target(_provider())
+    baseline = _prepared_profile(target)
+    changed_request = target.request_base.model_copy(
+        update={
+            "labels": {"eval-mode": "changed"},
+            "metadata": {"candidate-variant": "changed"},
+        }
+    )
+    variants = (
+        _copy_target(
+            target,
+            bootstrap_messages=(Message.text("system", "A different candidate bootstrap."),),
+        ),
+        _copy_target(target, request_base=changed_request),
+        *(
+            _copy_target(
+                target,
+                limits=CorpusExecutionLimits.model_validate(
+                    {**target.limits.model_dump(mode="python"), field_name: value}
+                ),
+            )
+            for field_name, value in (
+                ("max_cases", 1),
+                ("max_bootstrap_messages", 1),
+                ("max_total_input_chars", 128),
+                ("max_compiled_input_chars", 128),
+            )
+        ),
+    )
+
+    for variant in variants:
+        prepared = _prepared_profile(variant)
+        assert prepared.snapshot.revision != baseline.snapshot.revision
+        assert prepared.binding != baseline.binding
+
+    serialized = baseline.snapshot.model_dump_json()
+    assert "Follow the refund policy." not in serialized
+    assert '"max_cases":1000' in serialized
+
+
+def test_private_target_material_uses_process_local_hmac_without_leaking_values() -> None:
+    secret = "private-bootstrap-token"
+    target = _target(_provider(), secret_redactor=SecretRedactor(secret))
+    first = _copy_target(
+        target,
+        bootstrap_messages=(Message.text("system", f"Use {secret} for fixture A."),),
+    )
+    second = _copy_target(
+        target,
+        bootstrap_messages=(Message.text("system", f"Use {secret} for fixture B."),),
+    )
+
+    first_profile = _prepared_profile(first)
+    replayed_profile = _prepared_profile(first)
+    second_profile = _prepared_profile(second)
+    restarted_base = _target(_provider(), secret_redactor=SecretRedactor(secret))
+    restarted = _copy_target(
+        restarted_base,
+        bootstrap_messages=(Message.text("system", f"Use {secret} for fixture A."),),
+    )
+    restarted_profile = _prepared_profile(restarted)
+
+    assert first_profile.snapshot.target_material.kind == "process_local_hmac_sha256"
+    assert first_profile.snapshot.target_material.process_scope is not None
+    assert first_profile.snapshot == replayed_profile.snapshot
+    assert first_profile.snapshot.revision != second_profile.snapshot.revision
+    assert (
+        first_profile.snapshot.target_material.process_scope
+        != restarted_profile.snapshot.target_material.process_scope
+    )
+    assert (
+        first_profile.snapshot.target_material.fingerprint
+        != restarted_profile.snapshot.target_material.fingerprint
+    )
+    assert secret not in first_profile.snapshot.model_dump_json()
+
+
+def test_resolved_catalog_reports_application_identity_drift_without_fallback() -> None:
+    registry = _generated_registry()
+    target = registry.get(registry.default_target_key)
+    assert target is not None
+    target.app.register_agent(AgentSpec(name="late-agent", model="fixture-model"))
+
+    catalog = asyncio.run(registry.resolved_catalog())
+
+    assert all(not item.execution_profile_ready for item in catalog.items)
+    assert all(item.execution_profile is None for item in catalog.items)
+    assert {
+        diagnostic.code
+        for item in catalog.items
+        for diagnostic in item.execution_profile_diagnostics
+    } == {"application_identity_changed"}
+
+
+def test_profile_preparation_rejects_application_drift_during_resolution(monkeypatch) -> None:
+    target = _target(_provider())
+    registry = explicit_eval_target_registry(target)
+    original = evals_registry_module.prepare_eval_execution_profile
+
+    async def mutate_after_preparation(*args, **kwargs):
+        prepared = await original(*args, **kwargs)
+        target.app.register_agent(AgentSpec(name="late-agent", model="fixture-model"))
+        return prepared
+
+    monkeypatch.setattr(
+        evals_registry_module,
+        "prepare_eval_execution_profile",
+        mutate_after_preparation,
+    )
+
+    catalog = asyncio.run(registry.resolved_catalog())
+
+    assert all(not item.execution_profile_ready for item in catalog.items)
+    assert {
+        diagnostic.code
+        for item in catalog.items
+        for diagnostic in item.execution_profile_diagnostics
+    } == {"application_identity_changed"}
+
+
+def test_repeated_execution_requires_an_application_isolation_contract() -> None:
+    target = _target(_provider())
+
+    with pytest.raises(ValueError, match="application-managed reset"):
+        EvalExecutionProfilePolicyV1(max_trials=2)
+
+    policy = EvalExecutionProfilePolicyV1(
+        fixture_strategy="application_managed",
+        reset_strategy="application_managed",
+        effect_posture="isolated_application_authority",
+        isolation_revision="sha256:" + "a" * 64,
+        max_trials=2,
+        max_concurrency=2,
+    )
+    registry = explicit_eval_target_registry(target, policy=policy)
+    profile = asyncio.run(registry.resolved_catalog()).items[0].execution_profile
+
+    assert registry.get(target.key) is target
+    assert profile is not None
+    assert profile.ceilings.max_trials == 2
+    assert profile.ceilings.max_concurrency == 2
+    assert profile.isolation_revision == policy.isolation_revision
+
+
 def test_generated_registry_exposes_only_server_owned_pricing_availability() -> None:
     target = _target(_provider())
     pricing = _price_book()
@@ -164,6 +398,21 @@ def test_generated_registry_does_not_advertise_unpriced_target_models() -> None:
         )
 
 
+def test_explicit_registry_rejects_execution_policy_beyond_target_authority() -> None:
+    target = _target(_provider())
+    target = target.model_copy(
+        update={"limits": target.limits.model_copy(update={"max_trials": 1, "max_concurrency": 1})}
+    )
+    policy = EvalExecutionProfilePolicyV1(
+        reset_strategy="application_managed",
+        isolation_revision="sha256:" + "1" * 64,
+        max_trials=2,
+    )
+
+    with pytest.raises(ValueError, match="exceeds its runtime target authority"):
+        explicit_eval_target_registry(target, policy=policy)
+
+
 def test_generated_registry_does_not_crash_when_priced_target_has_no_provider() -> None:
     app = CayuApp()
     app.register_agent(AgentSpec(name="agent", model="gpt-5"))
@@ -181,6 +430,15 @@ def test_generated_registry_does_not_crash_when_priced_target_has_no_provider() 
     entry = registry.catalog().items[0]
     assert entry.cost_budget_available is False
     assert entry.cost_budget_currencies == ()
+    resolved = asyncio.run(registry.resolved_catalog()).items[0]
+    assert resolved.execution_profile_ready is False
+    assert resolved.execution_profile is None
+    assert [item.code for item in resolved.execution_profile_diagnostics] == [
+        "runtime_authority_unavailable"
+    ]
+    assert resolved.execution_profile_diagnostics[0].message == (
+        "The current runtime execution profile is unavailable."
+    )
     runtime_target = registry.get(entry.target_key)
     assert runtime_target is not None
     with pytest.raises(ValueError, match="target model"):
@@ -247,6 +505,50 @@ def test_eval_invocation_can_only_contract_target_authority() -> None:
     )
     with pytest.raises(ValueError, match="cannot inherit a host-asserted SDK origin"):
         target_for_eval_invocation(host_asserted_target, invocation)
+
+
+def test_execution_profile_preserves_valid_session_scoped_target_limits() -> None:
+    target = _target(_provider())
+    target = target.model_copy(
+        update={
+            "request_base": target.request_base.model_copy(
+                update={"limits": RunLimits(max_total_tokens=50, scope="session")}
+            )
+        }
+    )
+    registry = explicit_eval_target_registry(target)
+
+    profile = asyncio.run(registry.prepare_execution_profile(target.key)).snapshot
+
+    assert profile.ceilings.run_limits.max_total_tokens == 50
+    assert profile.ceilings.run_limits.scope == "session"
+
+
+def test_eval_scenario_invocation_selects_only_compatible_published_environment() -> None:
+    target = _target(_provider())
+    assert target.request_base.environment_name is None
+    invocation = EvalRunInvocation(
+        scenario=EvalScenarioRunInvocation(
+            scenario_revision="sha256:" + "1" * 64,
+            binding_revision="sha256:" + "2" * 64,
+            environment_name="eval-environment",
+            trials=1,
+            timeout_seconds=30,
+        )
+    )
+
+    effective = target_for_eval_invocation(target, invocation)
+
+    assert effective.request_base.environment_name == "eval-environment"
+    pinned = target.model_copy(
+        update={
+            "request_base": target.request_base.model_copy(
+                update={"environment_name": "production"}
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="environment conflicts"):
+        target_for_eval_invocation(pinned, invocation)
 
 
 def test_generated_registry_preserves_project_root_manifest_provenance() -> None:

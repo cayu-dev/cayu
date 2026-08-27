@@ -8,6 +8,8 @@ import logging
 from dataclasses import dataclass
 from enum import StrEnum
 
+from cayu._exception_groups import iter_exception_tree
+from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals.corpus import EvalCorpusDocument
 from cayu.evals.execution import (
     CompiledCorpusSuite,
@@ -18,6 +20,7 @@ from cayu.evals.execution import (
 )
 from cayu.evals.scenario import EvalScenarioDocumentV2
 from cayu.evals.scenario_execution import (
+    ScenarioExecutionError,
     corpus_for_eval_scenario,
     run_compiled_eval_scenario,
     scenario_launch_settings_from_invocation,
@@ -30,9 +33,14 @@ from cayu.evals.store import (
     EvalRunLease,
     EvalRunStateConflict,
     EvalRunStatus,
+    EvalScenarioTrialFailureCode,
 )
 from cayu.evals.suite_authoring import EvalSuiteDocumentV1
 from cayu.evals.suite_execution import corpus_for_authored_scenario_case
+from cayu.runtime.execution_profiles import (
+    ExecutionProfileIdentity,
+    ExecutionProfileMismatchError,
+)
 from cayu.server.config import EvalsConfig
 from cayu.server.evals_registry import (
     EvalTargetRegistration,
@@ -44,10 +52,22 @@ from cayu.server.evals_registry import (
 logger = logging.getLogger(__name__)
 
 
+def _is_execution_profile_failure(error: BaseException) -> bool:
+    return any(
+        isinstance(candidate, EvalExecutionProfileChangedError | ExecutionProfileMismatchError)
+        or (
+            isinstance(candidate, ScenarioExecutionError)
+            and candidate.code is EvalScenarioTrialFailureCode.EXECUTION_PROFILE_CHANGED
+        )
+        for candidate in iter_exception_tree(error)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _PreparedEvalRun:
     target: CorpusTarget
     compiled: CompiledCorpusSuite
+    execution_profile: ExecutionProfileIdentity
     scenario: EvalScenarioDocumentV2 | None = None
     scenario_binding: ScenarioLaunchBindingV2 | None = None
 
@@ -239,6 +259,25 @@ class EvalRunCoordinator:
         if corpus is None:
             return EvalRunFailureCode.CORPUS_UNAVAILABLE
 
+        try:
+            target = target_for_eval_invocation(
+                registration.execution_target(),
+                lease.run.spec.invocation,
+            )
+            expected_profile = lease.run.spec.invocation.execution_profile
+            if expected_profile is None:
+                return EvalRunFailureCode.TARGET_UNAVAILABLE
+            prepared_profile = await self._config.registry.prepare_execution_profile(
+                target.key,
+                effective_target=target,
+            )
+            if prepared_profile.binding != expected_profile:
+                return EvalRunFailureCode.TARGET_UNAVAILABLE
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return EvalRunFailureCode.TARGET_UNAVAILABLE
+
         scenario_invocation = lease.run.spec.invocation.scenario
         if scenario_invocation is not None:
             try:
@@ -273,7 +312,7 @@ class EvalRunCoordinator:
                 )
                 preflight = await preflight_eval_scenario(
                     scenario,
-                    registration.target,
+                    registration.execution_target(),
                     settings,
                     actor_authorized=True,
                     project_root=registration.manifest_project_root,
@@ -297,6 +336,8 @@ class EvalRunCoordinator:
                 authored_suite,
                 lease,
                 registration,
+                target,
+                prepared_profile.binding.runtime_execution_profile,
             )
             return prepared
 
@@ -305,6 +346,8 @@ class EvalRunCoordinator:
             corpus,
             lease,
             registration,
+            target,
+            prepared_profile.binding.runtime_execution_profile,
         )
 
     def _compile_loaded_corpus(
@@ -312,14 +355,9 @@ class EvalRunCoordinator:
         corpus: EvalCorpusDocument,
         lease: EvalRunLease,
         registration: EvalTargetRegistration,
+        target: CorpusTarget,
+        execution_profile: ExecutionProfileIdentity,
     ) -> _PreparedEvalRun | EvalRunFailureCode:
-        try:
-            target = target_for_eval_invocation(
-                registration.target,
-                lease.run.spec.invocation,
-            )
-        except Exception:
-            return EvalRunFailureCode.TARGET_UNAVAILABLE
         try:
             identity = evaluation_target_identity(
                 target,
@@ -343,7 +381,11 @@ class EvalRunCoordinator:
                 raise ValueError("Persisted eval run does not match its compiled suite.")
         except Exception:
             return EvalRunFailureCode.CORPUS_UNAVAILABLE
-        return _PreparedEvalRun(target=target, compiled=compiled)
+        return _PreparedEvalRun(
+            target=target,
+            compiled=compiled,
+            execution_profile=execution_profile,
+        )
 
     def _compile_loaded_scenario(
         self,
@@ -353,12 +395,10 @@ class EvalRunCoordinator:
         authored_suite: EvalSuiteDocumentV1 | None,
         lease: EvalRunLease,
         registration: EvalTargetRegistration,
+        target: CorpusTarget,
+        execution_profile: ExecutionProfileIdentity,
     ) -> _PreparedEvalRun | EvalRunFailureCode:
         try:
-            target = target_for_eval_invocation(
-                registration.target,
-                lease.run.spec.invocation,
-            )
             scenario_invocation = lease.run.spec.invocation.scenario
             if scenario_invocation is None:
                 return EvalRunFailureCode.CORPUS_UNAVAILABLE
@@ -405,6 +445,7 @@ class EvalRunCoordinator:
         return _PreparedEvalRun(
             target=target,
             compiled=compiled,
+            execution_profile=execution_profile,
             scenario=scenario,
             scenario_binding=binding,
         )
@@ -426,6 +467,7 @@ class EvalRunCoordinator:
                 expected_app_manifest_fingerprint=(
                     registration.catalog_entry.app_manifest_fingerprint
                 ),
+                expected_execution_profile=prepared.execution_profile,
             )
         else:
             if prepared.scenario_binding is None:
@@ -443,6 +485,7 @@ class EvalRunCoordinator:
                 expected_app_manifest_fingerprint=(
                     registration.catalog_entry.app_manifest_fingerprint
                 ),
+                expected_execution_profile=prepared.execution_profile,
             )
         execution = asyncio.create_task(
             execution_coro,
@@ -487,10 +530,15 @@ class EvalRunCoordinator:
                 refresh=False,
             )
             return
-        if execution.exception() is not None:
+        failure = execution.exception()
+        if failure is not None:
             await self._finalize_failure(
                 claim,
-                EvalRunFailureCode.EXECUTION_FAILED,
+                (
+                    EvalRunFailureCode.TARGET_UNAVAILABLE
+                    if _is_execution_profile_failure(failure)
+                    else EvalRunFailureCode.EXECUTION_FAILED
+                ),
                 refresh=False,
             )
             return

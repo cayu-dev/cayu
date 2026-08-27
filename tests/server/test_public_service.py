@@ -2440,6 +2440,13 @@ def test_maintained_service_uses_the_same_generated_eval_target_registry(tmp_pat
             assert response.status_code == 200
             body = response.json()
             assert body["default_target_key"] == body["items"][0]["target_key"]
+            execution_profile = body["items"][0]["execution_profile"]
+            assert execution_profile is not None
+            assert execution_profile["candidate"]["agent_name"] == "assistant"
+            assert execution_profile["candidate"]["provider_name"] == "scripted"
+            assert execution_profile["candidate"]["model"] == "scripted-model"
+            assert execution_profile["ceilings"]["max_trials"] == 1
+            assert execution_profile["ceilings"]["max_concurrency"] == 1
             assert body["items"] == [
                 {
                     "target_key": body["default_target_key"],
@@ -2456,6 +2463,9 @@ def test_maintained_service_uses_the_same_generated_eval_target_registry(tmp_pat
                     "max_steps": 16,
                     "cost_budget_available": False,
                     "cost_budget_currencies": [],
+                    "execution_profile_ready": True,
+                    "execution_profile": execution_profile,
+                    "execution_profile_diagnostics": [],
                 }
             ]
     finally:

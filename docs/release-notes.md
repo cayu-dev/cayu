@@ -89,6 +89,21 @@ guard.
 
 ## Unreleased
 
+### Evals launches are pinned to server-published execution profiles
+
+The Evals target catalog now resolves a public, secret-free snapshot of the
+current candidate, runtime execution identity, fixture/reset/effect posture,
+evidence policy, complete resource ceilings, and an opaque commitment to the
+request base, bootstrap messages, and compilation limits. Public-safe target
+material uses a structural digest; private material uses a process-keyed HMAC
+so raw values never cross the API and old work fails closed after restart.
+Generated projects receive a safe one-trial, concurrency-one profile without
+Evals-specific application code. Every control-plane launch carries the exact
+profile revision, and durable admission plus worker restart validation rejects
+runtime, target-input, and limit drift before provider dispatch. Explicit
+applications may publish greater trial or concurrency limits only with an
+application-managed reset contract and stable isolation revision.
+
 ### Local attempts retain complete-tree cleanup ownership across worker loss
 
 `LocalExecutionAttemptCoordinator` adds a task-backed Linux containment boundary

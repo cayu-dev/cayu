@@ -12,6 +12,7 @@ pytest.importorskip("fastapi")
 pytest.importorskip("sse_starlette")
 
 from fastapi.testclient import TestClient
+from tests.server.test_server_evals import _execution_profile_revision
 from tests.server.test_server_evaluation_promotion import (
     _AUTH_HEADERS,
     _SESSION_ID,
@@ -360,6 +361,10 @@ def test_click_to_evaluate_saves_catalogs_baselines_and_exports_without_runnable
             json={
                 "corpus_revision": corpus_revision,
                 "suite_id": saved["record"]["suite_id"],
+                "expected_execution_profile_revision": _execution_profile_revision(
+                    client,
+                    target_key,
+                ),
                 "max_concurrency": 1,
             },
         )
@@ -471,6 +476,7 @@ def test_baseline_rejects_an_authenticated_actor_that_cannot_be_published(tmp_pa
 
 def test_reviewed_simple_session_launches_one_fresh_trial_with_http_operator_provenance(
     tmp_path,
+    monkeypatch,
 ) -> None:
     app = asyncio.run(_seed_app())
     store = SQLiteEvalStore(tmp_path / "cayu.db")
@@ -503,6 +509,10 @@ def test_reviewed_simple_session_launches_one_fresh_trial_with_http_operator_pro
         request = {
             "expected_candidate_revision": candidate["revision"],
             "candidate": candidate,
+            "expected_execution_profile_revision": _execution_profile_revision(
+                client,
+                candidate["target_key"],
+            ),
             "trial_request": {"trials": 1, "timeout_seconds": 30},
             "max_concurrency": 1,
             "max_steps": 3,
@@ -526,6 +536,8 @@ def test_reviewed_simple_session_launches_one_fresh_trial_with_http_operator_pro
         )
         assert body["captured"]["result"]["score"]["candidate_revision"] != candidate["revision"]
         invocation = body["run"]["spec"]["invocation"]
+        execution_profile = invocation.pop("execution_profile")
+        admission_request_revision = invocation.pop("admission_request_revision")
         assert invocation == {
             "schema_version": 1,
             "source": "http_run",
@@ -545,6 +557,8 @@ def test_reviewed_simple_session_launches_one_fresh_trial_with_http_operator_pro
             },
             "cost_budget": None,
         }
+        assert execution_profile["profile_revision"].startswith("sha256:")
+        assert admission_request_revision.startswith("sha256:")
         captured_result_revision = body["captured"]["record"]["revision"]
         selected_baseline = client.post(
             f"/api/evals/results/{captured_result_revision}/baseline",
@@ -626,7 +640,7 @@ def test_reviewed_simple_session_launches_one_fresh_trial_with_http_operator_pro
             },
         )
         assert too_many_trials.status_code == 400
-        assert "target or bounds" in too_many_trials.json()["detail"]
+        assert "execution-profile trial limit" in too_many_trials.json()["detail"]
 
         missing_server_pricing = client.post(
             launch_url,
@@ -638,6 +652,22 @@ def test_reviewed_simple_session_launches_one_fresh_trial_with_http_operator_pro
         )
         assert missing_server_pricing.status_code == 400
         assert "target or bounds" in missing_server_pricing.json()["detail"]
+
+        def unavailable_profile(*, model: str) -> None:
+            del model
+            raise RuntimeError("provider temporarily unavailable")
+
+        monkeypatch.setattr(app.get_provider(), "preflight_model_target", unavailable_profile)
+        replayed_while_unavailable = client.post(
+            launch_url,
+            headers={**_AUTH_HEADERS, "Idempotency-Key": "fresh-trial-one"},
+            json=request,
+        )
+        assert replayed_while_unavailable.status_code == 202
+        assert (
+            replayed_while_unavailable.json()["run"]["spec"]["run_id"]
+            == body["run"]["spec"]["run_id"]
+        )
 
     asyncio.run(context.close())
 
@@ -708,6 +738,7 @@ def test_fresh_launch_rejects_incompatible_cost_budget_before_writing(
             json={
                 "expected_candidate_revision": candidate["revision"],
                 "candidate": candidate,
+                "expected_execution_profile_revision": target["execution_profile"]["revision"],
                 "cost_budget": {
                     "max_estimated_cost": "1.00",
                     "currency": requested_currency,

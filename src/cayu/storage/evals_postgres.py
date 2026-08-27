@@ -87,6 +87,7 @@ from cayu.evals.store import (
     _claim_target_keys,
     _copy_query,
     _exact_model,
+    _idempotency_key,
     _lease_seconds,
     _prepare_authored_suite_for_store,
     _prepare_baseline_update_for_store,
@@ -878,6 +879,16 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
             except BaseException:
                 await conn.rollback()
                 raise
+
+    async def load_run_by_idempotency_key(
+        self,
+        idempotency_key: str,
+    ) -> EvalRunRecord | None:
+        idempotency_key = _idempotency_key(idempotency_key, "idempotency_key")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            row = await self._load_run_by_idempotency_key(cur, idempotency_key)
+            return None if row is None else _run_record_from_row(row)
 
     async def load_run(self, run_id: str) -> EvalRunRecord | None:
         run_id = _store_identifier(run_id, "run_id")

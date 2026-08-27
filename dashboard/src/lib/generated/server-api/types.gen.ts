@@ -2608,6 +2608,10 @@ export type CapturedEvaluationLaunchRequest = {
      * Expected Candidate Revision
      */
     expected_candidate_revision: string;
+    /**
+     * Expected Execution Profile Revision
+     */
+    expected_execution_profile_revision: string;
     limits?: RunLimits | null;
     /**
      * Max Concurrency
@@ -3535,6 +3539,142 @@ export type CostLineItem = {
 };
 
 /**
+ * EgressAuthorityBindingIdentity
+ *
+ * One destination/credential class bound to a named policy.
+ */
+export type EgressAuthorityBindingIdentity = {
+    /**
+     * Credential Authority Fingerprint
+     */
+    credential_authority_fingerprint: string;
+    /**
+     * Credential Kind
+     */
+    credential_kind: string;
+    /**
+     * Destination
+     */
+    destination: string;
+    /**
+     * Policy Name
+     */
+    policy_name: string;
+};
+
+/**
+ * EgressAuthorityCutoverStrategy
+ *
+ * How an adapter can replace one admitted egress generation.
+ */
+export type EgressAuthorityCutoverStrategy = 'verified_in_place' | 'fresh_authority_path' | 'allocation_replacement' | 'unsupported';
+
+/**
+ * EgressAuthorityIdentity
+ *
+ * Versioned, bounded, secret-free identity for one admitted egress generation.
+ */
+export type EgressAuthorityIdentity = {
+    /**
+     * Authority Scope
+     */
+    authority_scope: string;
+    /**
+     * Authority Source
+     */
+    authority_source: string;
+    /**
+     * Bindings
+     */
+    bindings: Array<EgressAuthorityBindingIdentity>;
+    /**
+     * Comparison Available
+     */
+    comparison_available: boolean;
+    cutover_strategy: EgressAuthorityCutoverStrategy;
+    /**
+     * Fingerprint
+     */
+    fingerprint: string;
+    /**
+     * Generation
+     */
+    generation: number;
+    /**
+     * Policies
+     */
+    policies: Array<EgressAuthorityPolicyIdentity>;
+    /**
+     * Policy Version
+     */
+    policy_version: string;
+    /**
+     * Record Type
+     */
+    record_type?: 'cayu.egress-authority';
+    /**
+     * Runner Kind
+     */
+    runner_kind: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+};
+
+/**
+ * EgressAuthorityOperation
+ *
+ * One bounded HTTP operation admitted by a built-in policy.
+ */
+export type EgressAuthorityOperation = {
+    /**
+     * Match
+     */
+    match?: 'exact' | 'prefix';
+    /**
+     * Method
+     */
+    method: string;
+    /**
+     * Path
+     */
+    path: string;
+};
+
+/**
+ * EgressAuthorityPolicyIdentity
+ *
+ * Secret-free canonical projection of one policy's operation semantics.
+ */
+export type EgressAuthorityPolicyIdentity = {
+    /**
+     * Allowed Destinations
+     */
+    allowed_destinations?: Array<string>;
+    /**
+     * Comparison Available
+     */
+    comparison_available?: boolean;
+    /**
+     * Denied Path Prefixes
+     */
+    denied_path_prefixes?: Array<string>;
+    /**
+     * Kind
+     */
+    kind: 'http' | 'browser' | 'opaque';
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Operations
+     */
+    operations?: Array<EgressAuthorityOperation>;
+};
+
+/**
  * EnqueueSessionMessageBody
  */
 export type EnqueueSessionMessageBody = {
@@ -3725,6 +3865,22 @@ export type EvalAuthoredSuiteCatalogPage = {
 };
 
 /**
+ * EvalAuthoredSuiteExecutionProfileExpectation
+ *
+ * Browser-held CAS identity for one previewed authored-suite launch item.
+ */
+export type EvalAuthoredSuiteExecutionProfileExpectation = {
+    /**
+     * Case Ids
+     */
+    case_ids: Array<string>;
+    /**
+     * Execution Profile Revision
+     */
+    execution_profile_revision: string;
+};
+
+/**
  * EvalAuthoredSuiteLaunchDiagnostic
  */
 export type EvalAuthoredSuiteLaunchDiagnostic = {
@@ -3735,7 +3891,7 @@ export type EvalAuthoredSuiteLaunchDiagnostic = {
     /**
      * Code
      */
-    code: 'one_trial_required' | 'simple_launch_not_ready' | 'scenario_execution_unavailable' | 'scenario_launch_not_ready';
+    code: 'one_trial_required' | 'execution_profile_unavailable' | 'execution_profile_changed' | 'simple_launch_not_ready' | 'scenario_execution_unavailable' | 'scenario_launch_not_ready';
     /**
      * Message
      */
@@ -3751,6 +3907,10 @@ export type EvalAuthoredSuiteLaunchPlanItem = {
      */
     case_ids: Array<string>;
     /**
+     * Execution Profile Revision
+     */
+    execution_profile_revision?: string | null;
+    /**
      * Kind
      */
     kind: 'simple_input' | 'scenario';
@@ -3758,6 +3918,22 @@ export type EvalAuthoredSuiteLaunchPlanItem = {
      * Scenario Revision
      */
     scenario_revision?: string | null;
+};
+
+/**
+ * EvalAuthoredSuiteRunLaunchRequest
+ *
+ * Exact reviewed selection and per-launch execution-profile expectations.
+ */
+export type EvalAuthoredSuiteRunLaunchRequest = {
+    /**
+     * Case Ids
+     */
+    case_ids?: Array<string> | null;
+    /**
+     * Expected Execution Profiles
+     */
+    expected_execution_profiles: Array<EvalAuthoredSuiteExecutionProfileExpectation>;
 };
 
 /**
@@ -4179,6 +4355,211 @@ export type EvalCorpusDocument = {
 };
 
 /**
+ * EvalExecutionCandidateIdentityV1
+ *
+ * Safe current candidate identity selected by runtime preparation.
+ */
+export type EvalExecutionCandidateIdentityV1 = {
+    /**
+     * Agent Name
+     */
+    agent_name: string;
+    /**
+     * Environment Name
+     */
+    environment_name?: string | null;
+    /**
+     * Model
+     */
+    model: string;
+    /**
+     * Provider Name
+     */
+    provider_name: string;
+    /**
+     * Runtime Execution Profile Fingerprint
+     */
+    runtime_execution_profile_fingerprint: string;
+    /**
+     * Runtime Execution Profile Schema Version
+     */
+    runtime_execution_profile_schema_version: number;
+};
+
+/**
+ * EvalExecutionProfileBindingV1
+ *
+ * Durable server-prepared runtime identity for one admitted eval run.
+ */
+export type EvalExecutionProfileBindingV1 = {
+    /**
+     * Profile Revision
+     */
+    profile_revision: string;
+    runtime_execution_profile: ExecutionProfileIdentity;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+};
+
+/**
+ * EvalExecutionProfileDiagnostic
+ *
+ * Stable public reason that an eval target cannot publish a current profile.
+ */
+export type EvalExecutionProfileDiagnostic = {
+    /**
+     * Code
+     */
+    code: 'not_resolved' | 'application_identity_changed' | 'runtime_authority_unavailable';
+    /**
+     * Message
+     */
+    message: string;
+    /**
+     * Remediation
+     */
+    remediation: string;
+};
+
+/**
+ * EvalExecutionProfileV1
+ *
+ * Bounded public snapshot of one currently executable server profile.
+ */
+export type EvalExecutionProfileV1 = {
+    /**
+     * App Manifest Fingerprint
+     */
+    app_manifest_fingerprint: string;
+    /**
+     * Application Release Id
+     */
+    application_release_id: string;
+    candidate: EvalExecutionCandidateIdentityV1;
+    ceilings: EvalExecutionResourceCeilingsV1;
+    /**
+     * Effect Posture
+     */
+    effect_posture: 'ordinary_application_authority' | 'isolated_application_authority';
+    evidence_policy: EvaluationEvidencePolicySpec;
+    /**
+     * Fixture Strategy
+     */
+    fixture_strategy: 'none' | 'application_managed';
+    /**
+     * Isolation Revision
+     */
+    isolation_revision?: string | null;
+    /**
+     * Label
+     */
+    label: string;
+    /**
+     * Profile Id
+     */
+    profile_id: string;
+    /**
+     * Reset Strategy
+     */
+    reset_strategy: 'fresh_session_only' | 'application_managed';
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Source
+     */
+    source: 'generated' | 'explicit';
+    /**
+     * Target Key
+     */
+    target_key: string;
+    target_material: EvalExecutionTargetMaterialIdentityV1;
+};
+
+/**
+ * EvalExecutionResourceCeilingsV1
+ *
+ * Complete server-owned limits that HTTP may only narrow.
+ */
+export type EvalExecutionResourceCeilingsV1 = {
+    /**
+     * Max Bootstrap Messages
+     */
+    max_bootstrap_messages: number;
+    /**
+     * Max Cases
+     */
+    max_cases: number;
+    /**
+     * Max Compiled Input Chars
+     */
+    max_compiled_input_chars: number;
+    /**
+     * Max Concurrency
+     */
+    max_concurrency: number;
+    /**
+     * Max Steps
+     */
+    max_steps: number;
+    /**
+     * Max Timeout Seconds
+     */
+    max_timeout_seconds: number;
+    /**
+     * Max Total Input Chars
+     */
+    max_total_input_chars: number;
+    /**
+     * Max Trials
+     */
+    max_trials: number;
+    run_limits: RunLimits;
+};
+
+/**
+ * EvalExecutionTargetMaterialIdentityV1
+ *
+ * Opaque commitment to candidate inputs owned by one trusted target.
+ *
+ * Runtime execution authority is represented separately by
+ * ``ExecutionProfileIdentity``. This identity covers the remaining target
+ * material consumed while compiling each fresh request: the request base,
+ * bootstrap messages, and complete corpus-execution limit object.
+ *
+ * Public-safe material has a restart-portable structural digest. Material
+ * crossing the application's workload-secret boundary uses a process-keyed
+ * HMAC instead, so it remains exact within the serving process without
+ * exposing an offline digest of private values. A restart then changes the
+ * process scope and safely rejects previously admitted work.
+ */
+export type EvalExecutionTargetMaterialIdentityV1 = {
+    /**
+     * Fingerprint
+     */
+    fingerprint: string;
+    /**
+     * Kind
+     */
+    kind: 'structural_sha256' | 'process_local_hmac_sha256';
+    /**
+     * Process Scope
+     */
+    process_scope?: string | null;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+};
+
+/**
  * EvalMemoryAttributionCapturePolicyV1
  *
  * One fixed eval-owned projection contract.
@@ -4530,6 +4911,12 @@ export type EvalRunFailureCode = 'target_unavailable' | 'corpus_unavailable' | '
  */
 export type EvalRunInvocation = {
     /**
+     * Admission Request Revision
+     *
+     * Secret-safe identity of the exact authenticated request that admitted this run.
+     */
+    admission_request_revision?: string | null;
+    /**
      * Authored Suite Revision
      */
     authored_suite_revision?: string | null;
@@ -4538,6 +4925,7 @@ export type EvalRunInvocation = {
      */
     authored_suite_selection_revision?: string | null;
     cost_budget?: EvalRunCostBudgetOutput | null;
+    execution_profile?: EvalExecutionProfileBindingV1 | null;
     limits?: RunLimits | null;
     /**
      * Max Steps
@@ -4746,6 +5134,10 @@ export type EvalScenarioArtifactMaterializationRequest = {
  * EvalScenarioArtifactMaterializationResponse
  */
 export type EvalScenarioArtifactMaterializationResponse = {
+    /**
+     * Execution Profile Revision
+     */
+    execution_profile_revision?: string | null;
     materialization: ScenarioArtifactMaterializationV2;
     preflight: ScenarioLaunchPreflightResultV2;
 };
@@ -4947,6 +5339,10 @@ export type EvalScenarioPreviewRequest = {
  * EvalScenarioPreviewResponse
  */
 export type EvalScenarioPreviewResponse = {
+    /**
+     * Execution Profile Revision
+     */
+    execution_profile_revision?: string | null;
     preflight: ScenarioLaunchPreflightResultV2;
     scenario: EvalScenarioDocumentV2;
 };
@@ -4961,6 +5357,10 @@ export type EvalScenarioRunCreateRequest = {
      * Expected Binding Revision
      */
     expected_binding_revision: string;
+    /**
+     * Expected Execution Profile Revision
+     */
+    expected_execution_profile_revision: string;
     settings?: ScenarioLaunchSettingsV2;
 };
 
@@ -5057,6 +5457,10 @@ export type EvalScenarioSaveRequest = {
  */
 export type EvalScenarioSaveResponse = {
     entry: EvalScenarioCatalogEntry;
+    /**
+     * Execution Profile Revision
+     */
+    execution_profile_revision?: string | null;
     preflight: ScenarioLaunchPreflightResultV2;
     scenario: EvalScenarioDocumentV2;
 };
@@ -5084,7 +5488,7 @@ export type EvalScenarioStimulusV1 = {
 /**
  * EvalScenarioTrialFailureCode
  */
-export type EvalScenarioTrialFailureCode = 'execution_failed' | 'unexpected_session_state' | 'expected_approval_unavailable' | 'expected_user_input_unavailable';
+export type EvalScenarioTrialFailureCode = 'execution_failed' | 'execution_profile_changed' | 'unexpected_session_state' | 'expected_approval_unavailable' | 'expected_user_input_unavailable';
 
 /**
  * EvalScenarioTrialPhase
@@ -5421,6 +5825,15 @@ export type EvalTargetCatalogEntry = {
      * Cost Budget Currencies
      */
     cost_budget_currencies: Array<string>;
+    execution_profile: EvalExecutionProfileV1 | null;
+    /**
+     * Execution Profile Diagnostics
+     */
+    execution_profile_diagnostics: Array<EvalExecutionProfileDiagnostic>;
+    /**
+     * Execution Profile Ready
+     */
+    execution_profile_ready: boolean;
     /**
      * Label
      */
@@ -5789,6 +6202,63 @@ export type ExecutionProfileAdoptionBody = {
     reason: string;
     requested_by?: ResolutionActor | null;
 };
+
+/**
+ * ExecutionProfileComponentClass
+ *
+ * Stable classes of execution authority represented by a profile.
+ */
+export type ExecutionProfileComponentClass = 'runtime' | 'provider_target' | 'durable_system_projection' | 'direct_tools' | 'tool_implementations' | 'tool_view_grants' | 'execution_policies' | 'invocation_policies' | 'runtime_hooks' | 'execution_environment' | 'effect_authority' | 'egress_authority' | 'context_selection' | 'automatic_recall' | 'context_compaction' | 'live_state_projection' | 'provider_adapter' | 'provider_request_policy' | 'application_budget_policy' | 'invocation_budget_policy' | 'structured_output' | 'finalization';
+
+/**
+ * ExecutionProfileComponentIdentity
+ *
+ * Redacted identity for one typed execution-profile component.
+ */
+export type ExecutionProfileComponentIdentity = {
+    availability: ExecutionProfileIdentityAvailability;
+    component_class: ExecutionProfileComponentClass;
+    /**
+     * Fingerprint
+     */
+    fingerprint: string | null;
+    strength: ExecutionProfileIdentityStrength;
+};
+
+/**
+ * ExecutionProfileIdentity
+ *
+ * Versioned, redacted identity frozen before a session can execute.
+ */
+export type ExecutionProfileIdentity = {
+    /**
+     * Components
+     */
+    components: Array<ExecutionProfileComponentIdentity>;
+    egress_authority?: EgressAuthorityIdentity | null;
+    /**
+     * Fingerprint
+     */
+    fingerprint: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1 | 2 | 4 | 5;
+};
+
+/**
+ * ExecutionProfileIdentityAvailability
+ *
+ * Whether a component can be compared at the admission boundary.
+ */
+export type ExecutionProfileIdentityAvailability = 'available' | 'unavailable';
+
+/**
+ * ExecutionProfileIdentityStrength
+ *
+ * How strongly one component is identified.
+ */
+export type ExecutionProfileIdentityStrength = 'application_versioned' | 'structural' | 'process_local' | 'unavailable';
 
 /**
  * ExecutionRequirements
@@ -12077,6 +12547,10 @@ export type CreateEvalRunApiEvalsRunsPostData = {
              */
             max_estimated_cost: number | string;
         } | null;
+        /**
+         * Expected Execution Profile Revision
+         */
+        expected_execution_profile_revision: string;
         limits?: {
             /**
              * Max Elapsed Seconds
@@ -13142,7 +13616,7 @@ export type DownloadEvalAuthoredSuiteApiEvalsSuitesSuiteRevisionDownloadGetRespo
 };
 
 export type LaunchEvalAuthoredSuiteRunApiEvalsSuitesSuiteRevisionRunsPostData = {
-    body: EvalAuthoredSuiteRunSelectionRequest;
+    body: EvalAuthoredSuiteRunLaunchRequest;
     headers: {
         /**
          * Idempotency-Key

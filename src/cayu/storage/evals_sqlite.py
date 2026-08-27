@@ -90,6 +90,7 @@ from cayu.evals.store import (
     _claim_target_keys,
     _copy_query,
     _exact_model,
+    _idempotency_key,
     _lease_seconds,
     _prepare_authored_suite_for_store,
     _prepare_baseline_update_for_store,
@@ -916,6 +917,21 @@ class SQLiteEvalStore(EvalStore):
             except BaseException:
                 connection.rollback()
                 raise
+
+        return await self._run(operation)
+
+    async def load_run_by_idempotency_key(
+        self,
+        idempotency_key: str,
+    ) -> EvalRunRecord | None:
+        idempotency_key = _idempotency_key(idempotency_key, "idempotency_key")
+
+        def operation(connection: sqlite3.Connection) -> EvalRunRecord | None:
+            row = connection.execute(
+                f"SELECT {_RUN_COLUMNS} FROM cayu_eval_runs WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            return None if row is None else _run_record_from_row(row)
 
         return await self._run(operation)
 

@@ -22,6 +22,7 @@ from cayu._validation import copy_durable_json_object, require_durable_clean_non
 from cayu.artifacts import ArtifactMetadata, ArtifactScope
 from cayu.core.events import Event, EventType, event_durable_sequence
 from cayu.core.messages import Message
+from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals._memory_attribution import (
     eval_memory_attribution_evidence_from_trajectory,
 )
@@ -84,6 +85,7 @@ from cayu.memory_attribution import (
 )
 from cayu.runtime._memory_evidence import memory_evidence_key
 from cayu.runtime.app import CayuApp
+from cayu.runtime.execution_profiles import ExecutionProfileMismatchError
 from cayu.runtime.sessions import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
     RunnerObservedEventIdentity,
@@ -714,6 +716,7 @@ async def _run_eval_suite_with_public_projection(
     case_timeout_seconds: float | None,
     trials: int,
     output_preview_bytes: int,
+    run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None = None,
 ) -> tuple[EvalRun, dict[str, tuple[_EvalTrialPublicData, ...]]]:
     """Run a corpus suite and return its separate runner-owned public sidecar."""
 
@@ -726,6 +729,7 @@ async def _run_eval_suite_with_public_projection(
         case_timeout_seconds=case_timeout_seconds,
         trials=trials,
         public_output_preview_bytes=output_preview_bytes,
+        run_stream=run_stream,
     )
     if public_data is None:
         raise RuntimeError("Corpus execution lost its runner-owned public projection.")
@@ -742,6 +746,7 @@ async def _run_eval_suite(
     case_timeout_seconds: float | None,
     trials: int,
     public_output_preview_bytes: int | None,
+    run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None = None,
 ) -> tuple[EvalRun, dict[str, tuple[_EvalTrialPublicData, ...]] | None]:
     if not isinstance(app, CayuApp):
         raise TypeError("run_eval_suite requires a CayuApp.")
@@ -789,6 +794,7 @@ async def _run_eval_suite(
             memory_attribution_source_limit=memory_attribution_source_limit,
             memory_attribution_max_bytes=memory_attribution_max_bytes,
             memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
+            run_stream=run_stream,
         )
     completed_at = datetime.now(UTC)
     status = aggregate_eval_status(result.status for result in results)
@@ -868,6 +874,7 @@ async def _run_suite_cases(
     memory_attribution_source_limit: int,
     memory_attribution_max_bytes: int,
     memory_attribution_read_lifecycle: _FreshMemoryAttributionReadLifecycle,
+    run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None,
 ) -> tuple[
     list[EvalCaseResult],
     dict[str, tuple[_EvalTrialPublicData, ...]] | None,
@@ -887,6 +894,7 @@ async def _run_suite_cases(
                 memory_attribution_source_limit=memory_attribution_source_limit,
                 memory_attribution_max_bytes=memory_attribution_max_bytes,
                 memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
+                run_stream=run_stream,
             )
             for case in suite.cases
         ]
@@ -923,6 +931,7 @@ async def _run_suite_cases(
                 memory_attribution_source_limit=memory_attribution_source_limit,
                 memory_attribution_max_bytes=memory_attribution_max_bytes,
                 memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
+                run_stream=run_stream,
             )
 
     async with asyncio.TaskGroup() as group:
@@ -997,6 +1006,7 @@ async def _run_eval_case(
     memory_attribution_source_limit: int,
     memory_attribution_max_bytes: int,
     memory_attribution_read_lifecycle: _FreshMemoryAttributionReadLifecycle,
+    run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None = None,
 ) -> tuple[EvalCaseResult, tuple[_EvalTrialPublicData, ...] | None]:
     if type(retain_final_output) is not bool:
         raise TypeError("run_eval_case retain_final_output must be a bool.")
@@ -1025,6 +1035,7 @@ async def _run_eval_case(
             memory_attribution_source_limit=memory_attribution_source_limit,
             memory_attribution_max_bytes=memory_attribution_max_bytes,
             memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
+            run_stream=run_stream,
         )
         for trial_number in range(1, trials + 1)
     ]
@@ -1187,6 +1198,11 @@ async def _run_case_once_with_public_projection(
                 run_error = _format_exception(exc)
                 diagnostic_code = EvalTrialDiagnosticCode.EXECUTION_FAILED
             except Exception as exc:
+                if exception_tree_contains(
+                    exc,
+                    (EvalExecutionProfileChangedError, ExecutionProfileMismatchError),
+                ):
+                    raise
                 run_error = _format_exception(exc)
                 diagnostic_code = EvalTrialDiagnosticCode.EXECUTION_FAILED
 

@@ -40,6 +40,7 @@ from cayu._exception_groups import exception_tree_contains
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     JsonUtf8SizeCounter,
+    canonical_durable_json_bytes,
     compact_json_utf8_size,
     copy_durable_json_object,
     copy_json_value,
@@ -66,6 +67,7 @@ from cayu.core.events import (
 )
 from cayu.core.messages import Message, MessageRole
 from cayu.core.thinking import ThinkingConfig
+from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals.corpus import EvalCaseSpec, EvalCorpusDocument, EvalSuiteSpec, eval_corpus_to_json
 from cayu.evals.execution import (
     CompiledCorpusSuite,
@@ -374,6 +376,7 @@ from cayu.server.contracts import (
     EvalAuthoredSuiteAdmittedRun,
     EvalAuthoredSuiteLaunchDiagnostic,
     EvalAuthoredSuiteLaunchPlanItem,
+    EvalAuthoredSuiteRunLaunchRequest,
     EvalAuthoredSuiteRunLaunchResponse,
     EvalAuthoredSuiteRunPreviewResponse,
     EvalAuthoredSuiteRunSelectionRequest,
@@ -1017,6 +1020,7 @@ ArtifactIdPath = Annotated[str, StringConstraints(min_length=1)]
 # tool-approval bodies all cap at 256) so a request cannot ask for an unbounded run.
 _DEFAULT_RUN_MAX_STEPS = 20
 _MAX_RUN_STEPS = 256
+_EVAL_ADMISSION_REQUEST_REVISION_DOMAIN = b"cayu-eval-admission-request-v1\0"
 _EVENT_PAGE_LIMIT_MAX = 1000
 _TRANSCRIPT_PAGE_LIMIT_MAX = 1000
 _ARTIFACT_PAGE_LIMIT_MAX = 500
@@ -4060,6 +4064,7 @@ def create_router(
             evals = EvalsConfig(
                 target=evals.target,
                 store=evals.store,
+                execution_profile_policy=evals.execution_profile_policy,
                 lease_seconds=evals.lease_seconds,
                 poll_interval_seconds=evals.poll_interval_seconds,
                 shutdown_grace_seconds=evals.shutdown_grace_seconds,
@@ -4741,7 +4746,7 @@ def create_router(
             dependencies=protected,
         )
         async def list_eval_targets() -> EvalTargetCatalogResponse:
-            return eval_registry.catalog()
+            return await eval_registry.resolved_catalog()
 
         captured_eval_store = None if eval_runtime is None else eval_runtime.store
 
@@ -5346,6 +5351,45 @@ def create_router(
                     detail="Eval execution bounds or authenticated provenance are invalid.",
                 ) from exc
 
+        def _bind_eval_admission_request(
+            invocation: EvalRunInvocation,
+            *,
+            kind: Literal["authored_suite", "captured", "corpus", "scenario"],
+            target_key: str,
+            resource_identity: Mapping[str, object],
+            body: BaseModel,
+        ) -> EvalRunInvocation:
+            material = {
+                "kind": kind,
+                "target_key": target_key,
+                "resource_identity": copy_json_value(
+                    dict(resource_identity),
+                    "eval admission resource identity",
+                ),
+                "request": body.model_dump(mode="json"),
+                "invocation_provenance": {
+                    "source": invocation.source.value,
+                    "origin": (
+                        None
+                        if invocation.origin is None
+                        else invocation.origin.model_dump(mode="json")
+                    ),
+                },
+            }
+            revision = (
+                "sha256:"
+                + hashlib.sha256(
+                    _EVAL_ADMISSION_REQUEST_REVISION_DOMAIN
+                    + canonical_durable_json_bytes(material, "eval admission request")
+                ).hexdigest()
+            )
+            return EvalRunInvocation.model_validate(
+                {
+                    **invocation.model_dump(mode="python"),
+                    "admission_request_revision": revision,
+                }
+            )
+
         def _eval_idempotency_digest(
             target_key: str,
             idempotency_key: str,
@@ -5376,6 +5420,31 @@ def create_router(
                 ).hexdigest()
             )
 
+        async def _replay_eval_run(
+            *,
+            target_key: str,
+            idempotency_key: str,
+            admission_request_revision: str,
+            idempotency_namespace: str | None = None,
+        ) -> EvalRunRecord | None:
+            digest = _eval_idempotency_digest(
+                target_key,
+                idempotency_key,
+                namespace=idempotency_namespace,
+            )
+            existing = await eval_store.load_run_by_idempotency_key(digest)
+            if existing is None:
+                return None
+            if (
+                existing.spec.target_key != target_key
+                or existing.spec.invocation.admission_request_revision != admission_request_revision
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency-Key is already bound to another eval run request.",
+                )
+            return existing
+
         async def _admit_eval_run(
             *,
             corpus: EvalCorpusDocument,
@@ -5388,6 +5457,10 @@ def create_router(
         ) -> EvalRunRecord:
             if eval_target.key != corpus.target_key:
                 raise RuntimeError("Prepared eval target does not match its corpus.")
+            if invocation.execution_profile is None:
+                raise RuntimeError("Server-admitted eval run lost its execution-profile binding.")
+            if invocation.admission_request_revision is None:
+                raise RuntimeError("Server-admitted eval run lost its admission request revision.")
             run_request = EvalRunRequest(
                 run_id=f"eval-{uuid4().hex}",
                 corpus_revision=corpus.revision,
@@ -5424,8 +5497,25 @@ def create_router(
             suite_id: str,
             max_concurrency: int,
             invocation: EvalRunInvocation,
-        ) -> tuple[CorpusTarget, CompiledCorpusSuite]:
+            expected_execution_profile_revision: str | None = None,
+            expect_exact_execution_profile: bool = False,
+        ) -> tuple[CorpusTarget, CompiledCorpusSuite, EvalRunInvocation]:
             eval_target = _eval_target(corpus.target_key)
+            registration = active_eval_registry.registration(eval_target.key)
+            if registration is None:
+                raise HTTPException(status_code=404, detail="Eval target not found.")
+            suite = next((item for item in corpus.suites if item.id == suite_id), None)
+            policy = registration.execution_profile_policy
+            if suite is not None and suite.trial_request.trials > policy.max_trials:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Eval run exceeds the published execution-profile trial limit.",
+                )
+            if max_concurrency > policy.max_concurrency:
+                raise HTTPException(
+                    status_code=400,
+                    detail=("Eval run exceeds the published execution-profile concurrency limit."),
+                )
             if any(case.suite_id == suite_id and case.input is None for case in corpus.cases):
                 raise HTTPException(
                     status_code=409,
@@ -5435,7 +5525,98 @@ def create_router(
                     ),
                 )
             try:
-                effective_target = target_for_eval_invocation(eval_target, invocation)
+                published_profile_revision = None
+                if (
+                    expected_execution_profile_revision is not None
+                    and not expect_exact_execution_profile
+                ):
+                    published_profile = await active_eval_registry.prepare_execution_profile(
+                        eval_target.key
+                    )
+                    published_profile_revision = published_profile.snapshot.revision
+                    if published_profile.snapshot.revision != expected_execution_profile_revision:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "The selected eval execution profile changed after it was "
+                                "reviewed. Refresh readiness before launching."
+                            ),
+                        )
+            except HTTPException:
+                raise
+            except EvalExecutionProfileChangedError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "The application identity for this eval execution profile changed after "
+                        "the target was published. Refresh the deployment before launching."
+                    ),
+                ) from exc
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The current eval execution profile is unavailable.",
+                ) from exc
+            try:
+                effective_target = target_for_eval_invocation(
+                    registration.execution_target(),
+                    invocation,
+                )
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Eval run is incompatible with the attached target or bounds.",
+                ) from exc
+            try:
+                prepared_profile = await active_eval_registry.prepare_execution_profile(
+                    eval_target.key,
+                    effective_target=effective_target,
+                )
+                effective_target = prepared_profile.target
+                if (
+                    expected_execution_profile_revision is not None
+                    and expect_exact_execution_profile
+                    and prepared_profile.snapshot.revision != expected_execution_profile_revision
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "The exact eval execution profile changed after readiness. "
+                            "Check launch readiness again."
+                        ),
+                    )
+                invocation = invocation.model_copy(
+                    update={"execution_profile": prepared_profile.binding},
+                    deep=True,
+                )
+                if published_profile_revision is not None:
+                    current_published_profile = (
+                        await active_eval_registry.prepare_execution_profile(eval_target.key)
+                    )
+                    if current_published_profile.snapshot.revision != published_profile_revision:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "The selected eval execution profile changed during launch "
+                                "preparation. Refresh readiness before launching."
+                            ),
+                        )
+            except HTTPException:
+                raise
+            except EvalExecutionProfileChangedError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "The application identity for this eval execution profile changed after "
+                        "the target was published. Refresh the deployment before launching."
+                    ),
+                ) from exc
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The exact current eval execution profile is unavailable.",
+                ) from exc
+            try:
                 compiled = await asyncio.to_thread(
                     compile_corpus_suite,
                     corpus,
@@ -5445,14 +5626,9 @@ def create_router(
             except (TypeError, ValueError) as exc:
                 raise HTTPException(
                     status_code=400,
-                    detail="Eval run is incompatible with the attached target or bounds.",
+                    detail="Eval corpus is incompatible with the attached target or bounds.",
                 ) from exc
-            if max_concurrency > eval_target.limits.max_concurrency:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Eval run exceeds the attached target concurrency limit.",
-                )
-            return eval_target, compiled
+            return effective_target, compiled, invocation
 
         async def _load_eval_corpus(corpus_revision: str) -> EvalCorpusDocument:
             try:
@@ -5502,9 +5678,10 @@ def create_router(
                     detail="Eval scenario is incompatible with the attached targets.",
                 )
             try:
+                execution_target = registration.execution_target()
                 result = await preflight_eval_scenario(
                     scenario,
-                    registration.target,
+                    execution_target,
                     settings,
                     actor_authorized=True,
                     project_root=registration.manifest_project_root,
@@ -5520,6 +5697,40 @@ def create_router(
                     detail="Attached eval target is unavailable for scenario preflight.",
                 ) from exc
             return registration, result
+
+        async def _scenario_execution_profile(
+            registration: EvalTargetRegistration,
+            scenario: EvalScenarioDocumentV2,
+            binding: ScenarioLaunchBindingV2,
+        ):
+            scenario_invocation = EvalScenarioRunInvocation(
+                scenario_revision=scenario.revision,
+                binding_revision=binding.revision,
+                environment_name=binding.environment_name,
+                trials=binding.trials,
+                timeout_seconds=binding.timeout_seconds,
+                artifact_references=tuple(
+                    EvalScenarioArtifactReference(
+                        requirement_id=item.requirement_id,
+                        artifact_id=item.artifact_id,
+                    )
+                    for item in binding.artifacts
+                ),
+            )
+            invocation = EvalRunInvocation(
+                max_steps=binding.max_steps,
+                limits=binding.operator_run_limits,
+                cost_budget=binding.cost_budget,
+                scenario=scenario_invocation,
+            )
+            effective_target = target_for_eval_invocation(
+                registration.execution_target(),
+                invocation,
+            )
+            return await active_eval_registry.prepare_execution_profile(
+                registration.target.key,
+                effective_target=effective_target,
+            )
 
         async def _load_eval_run(run_id: str):
             try:
@@ -5645,11 +5856,35 @@ def create_router(
                 limits=body.limits,
                 cost_budget=body.cost_budget,
             )
-            eval_target, compiled = await _prepare_eval_run(
+            invocation = _bind_eval_admission_request(
+                invocation,
+                kind="captured",
+                target_key=target.key,
+                resource_identity={"session_id": session_id},
+                body=body,
+            )
+            admission_request_revision = invocation.admission_request_revision
+            if admission_request_revision is None:
+                raise RuntimeError("Captured eval launch lost its admission request revision.")
+            replayed = await _replay_eval_run(
+                target_key=target.key,
+                idempotency_key=idempotency_key,
+                admission_request_revision=admission_request_revision,
+            )
+            if replayed is not None:
+                record = await eval_store.load_result_record(result.revision)
+                if record is None:
+                    raise RuntimeError("Replayed captured eval result is unavailable.")
+                return CapturedEvaluationLaunchResponse(
+                    captured=CapturedEvaluationSaveResponse(record=record, result=result),
+                    run=replayed,
+                )
+            eval_target, compiled, invocation = await _prepare_eval_run(
                 corpus=corpus,
                 suite_id=runnable_candidate.suite.id,
                 max_concurrency=body.max_concurrency,
                 invocation=invocation,
+                expected_execution_profile_revision=(body.expected_execution_profile_revision),
             )
             try:
                 record = await eval_store.save_captured_result(
@@ -5836,6 +6071,7 @@ def create_router(
             registration = active_eval_registry.registration(suite.target_key)
             if registration is None:
                 raise HTTPException(status_code=404, detail="Authored eval suite not found.")
+            execution_target = registration.execution_target()
             if simple_cases and not diagnostics:
                 try:
                     simple_selection = eval_suite_selection(
@@ -5846,13 +6082,13 @@ def create_router(
                         corpus_for_authored_simple_selection,
                         suite,
                         simple_selection,
-                        registration.target,
+                        execution_target,
                         project_root=registration.manifest_project_root,
                     )
                     await asyncio.to_thread(
                         compile_corpus_suite,
                         corpus,
-                        registration.target,
+                        execution_target,
                         suite.suite.id,
                     )
                 except (TypeError, ValueError):
@@ -5865,6 +6101,28 @@ def create_router(
                             ),
                         )
                     )
+                else:
+                    try:
+                        prepared_profile = await active_eval_registry.prepare_execution_profile(
+                            suite.target_key,
+                            effective_target=execution_target,
+                        )
+                    except Exception:
+                        diagnostics.append(
+                            EvalAuthoredSuiteLaunchDiagnostic(
+                                code="execution_profile_unavailable",
+                                message=(
+                                    "The selected simple cases have no currently executable "
+                                    "server-published profile."
+                                ),
+                            )
+                        )
+                    else:
+                        launches[0] = launches[0].model_copy(
+                            update={
+                                "execution_profile_revision": prepared_profile.snapshot.revision
+                            }
+                        )
             prepared_scenarios: dict[
                 str,
                 tuple[EvalScenarioDocumentV2, ScenarioLaunchBindingV2],
@@ -5890,7 +6148,7 @@ def create_router(
                                 raise ValueError("scenario unavailable")
                             preflight = await preflight_eval_scenario(
                                 scenario,
-                                registration.target,
+                                execution_target,
                                 settings,
                                 actor_authorized=True,
                                 project_root=registration.manifest_project_root,
@@ -5901,26 +6159,65 @@ def create_router(
                                     if preflight.diagnostics
                                     else "Current scenario launch requirements are not ready."
                                 )
-                                return case.id, None, detail
+                                return case.id, None, None, detail
+                            scenario_invocation = EvalScenarioRunInvocation(
+                                scenario_revision=scenario.revision,
+                                binding_revision=preflight.binding.revision,
+                                authored_suite_revision=suite.revision,
+                                authored_case_revision=case.revision,
+                                environment_name=preflight.binding.environment_name,
+                                trials=1,
+                                timeout_seconds=preflight.binding.timeout_seconds,
+                                artifact_references=tuple(
+                                    EvalScenarioArtifactReference(
+                                        requirement_id=item.requirement_id,
+                                        artifact_id=item.artifact_id,
+                                    )
+                                    for item in preflight.binding.artifacts
+                                ),
+                            )
+                            profile_invocation = _eval_run_invocation(
+                                None,
+                                max_steps=preflight.binding.max_steps,
+                                limits=preflight.binding.operator_run_limits,
+                                cost_budget=preflight.binding.cost_budget,
+                                scenario=scenario_invocation,
+                                authored_suite_revision=suite.revision,
+                                authored_suite_selection_revision=selection.revision,
+                            )
+                            effective_target = target_for_eval_invocation(
+                                execution_target,
+                                profile_invocation,
+                            )
+                            prepared_profile = await active_eval_registry.prepare_execution_profile(
+                                suite.target_key,
+                                effective_target=effective_target,
+                            )
                             corpus = await asyncio.to_thread(
                                 corpus_for_authored_scenario_case,
                                 suite,
                                 case.id,
                                 scenario,
                                 preflight.binding,
-                                registration.target,
+                                execution_target,
                                 project_root=registration.manifest_project_root,
                             )
                             await asyncio.to_thread(
                                 compile_corpus_suite,
                                 corpus,
-                                registration.target,
+                                execution_target,
                                 suite.suite.id,
                             )
-                            return case.id, (scenario, preflight.binding), None
+                            return (
+                                case.id,
+                                (scenario, preflight.binding),
+                                prepared_profile.snapshot.revision,
+                                None,
+                            )
                         except Exception:
                             return (
                                 case.id,
+                                None,
                                 None,
                                 "The exact scenario is unavailable or incompatible with current authority.",
                             )
@@ -5928,7 +6225,7 @@ def create_router(
                 prepared = await asyncio.gather(
                     *(prepare_scenario(case) for case in scenario_cases)
                 )
-                for case_id, material, message in prepared:
+                for case_id, material, profile_revision, message in prepared:
                     if material is None:
                         diagnostics.append(
                             EvalAuthoredSuiteLaunchDiagnostic(
@@ -5939,6 +6236,14 @@ def create_router(
                         )
                     else:
                         prepared_scenarios[case_id] = material
+                        launch_index = next(
+                            index
+                            for index, launch in enumerate(launches)
+                            if launch.case_ids == (case_id,)
+                        )
+                        launches[launch_index] = launches[launch_index].model_copy(
+                            update={"execution_profile_revision": profile_revision}
+                        )
             return (
                 EvalAuthoredSuiteRunPreviewResponse(
                     selection=selection,
@@ -6142,7 +6447,7 @@ def create_router(
         )
         async def launch_eval_authored_suite_run(
             suite_revision: str,
-            body: EvalAuthoredSuiteRunSelectionRequest,
+            body: EvalAuthoredSuiteRunLaunchRequest,
             idempotency_key: Annotated[
                 str,
                 Header(alias="Idempotency-Key", min_length=1, max_length=512),
@@ -6150,18 +6455,110 @@ def create_router(
             auth_context: AuthContext | None = optional_auth_context,
         ) -> EvalAuthoredSuiteRunLaunchResponse:
             suite = await _load_authored_suite(suite_revision)
+            replay_probe = _bind_eval_admission_request(
+                _eval_run_invocation(
+                    auth_context,
+                    max_steps=None,
+                    limits=None,
+                    cost_budget=None,
+                ),
+                kind="authored_suite",
+                target_key=suite.target_key,
+                resource_identity={"suite_revision": suite.revision},
+                body=body,
+            )
+            admission_request_revision = replay_probe.admission_request_revision
+            if admission_request_revision is None:
+                raise RuntimeError("Authored eval launch lost its admission request revision.")
+            replayed_first_part = await _replay_eval_run(
+                target_key=suite.target_key,
+                idempotency_key=idempotency_key,
+                idempotency_namespace="authored-suite-part-1",
+                admission_request_revision=admission_request_revision,
+            )
+            if replayed_first_part is None:
+                replayed_parts: tuple[EvalRunRecord | None, ...] = (None,) * len(
+                    body.expected_execution_profiles
+                )
+            else:
+                replayed_parts_list: list[EvalRunRecord | None] = [replayed_first_part]
+                for index in range(1, len(body.expected_execution_profiles)):
+                    replayed_parts_list.append(
+                        await _replay_eval_run(
+                            target_key=suite.target_key,
+                            idempotency_key=idempotency_key,
+                            idempotency_namespace=f"authored-suite-part-{index + 1}",
+                            admission_request_revision=admission_request_revision,
+                        )
+                    )
+                replayed_parts = tuple(replayed_parts_list)
+            if all(part is not None for part in replayed_parts):
+                selection = eval_suite_selection(suite, body.case_ids)
+                cases_by_id = {case.id: case for case in suite.cases}
+                replayed_runs = []
+                for expectation, part in zip(
+                    body.expected_execution_profiles,
+                    replayed_parts,
+                    strict=True,
+                ):
+                    if part is None:
+                        raise RuntimeError("Complete authored eval replay lost an admitted part.")
+                    first_case = cases_by_id[expectation.case_ids[0]]
+                    kind: Literal["simple_input", "scenario"] = (
+                        "scenario"
+                        if type(first_case.stimulus) is EvalScenarioStimulusV1
+                        else "simple_input"
+                    )
+                    replayed_runs.append(
+                        EvalAuthoredSuiteAdmittedRun(
+                            kind=kind,
+                            case_ids=expectation.case_ids,
+                            run=part,
+                        )
+                    )
+                return EvalAuthoredSuiteRunLaunchResponse(
+                    selection=selection,
+                    runs=tuple(replayed_runs),
+                )
+            partial_replay = any(part is not None for part in replayed_parts)
             preview, prepared_scenarios = await _preview_authored_suite_launch(
                 suite,
                 body.case_ids,
             )
             if not preview.ready:
                 raise HTTPException(
-                    status_code=409,
-                    detail="Authored eval suite launch requirements are not currently ready.",
+                    status_code=503 if partial_replay else 409,
+                    detail=(
+                        "An earlier authored eval launch attempt admitted only part of this "
+                        "request. Restore current launch readiness and retry with the same "
+                        "Idempotency-Key."
+                        if partial_replay
+                        else "Authored eval suite launch requirements are not currently ready."
+                    ),
+                )
+            expected_profiles = tuple(
+                (expectation.case_ids, expectation.execution_profile_revision)
+                for expectation in body.expected_execution_profiles
+            )
+            current_profiles = tuple(
+                (plan.case_ids, plan.execution_profile_revision) for plan in preview.launches
+            )
+            if expected_profiles != current_profiles:
+                raise HTTPException(
+                    status_code=503 if partial_replay else 409,
+                    detail=(
+                        "An earlier authored eval launch attempt admitted only part of this "
+                        "request. Restore the reviewed execution profiles and retry with the "
+                        "same Idempotency-Key."
+                        if partial_replay
+                        else "The authored-suite execution profile changed after readiness. "
+                        "Check launch readiness again."
+                    ),
                 )
             registration = active_eval_registry.registration(suite.target_key)
             if registration is None:
                 raise HTTPException(status_code=404, detail="Authored eval suite not found.")
+            execution_target = registration.execution_target()
             cases_by_id = {case.id: case for case in suite.cases}
             prepared_runs = []
             for plan in preview.launches:
@@ -6176,7 +6573,7 @@ def create_router(
                         authored_suite_selection_revision=preview.selection.revision,
                     )
                     effective_target = target_for_eval_invocation(
-                        registration.target,
+                        execution_target,
                         invocation,
                     )
                     corpus = await asyncio.to_thread(
@@ -6216,7 +6613,7 @@ def create_router(
                         authored_suite_selection_revision=preview.selection.revision,
                     )
                     effective_target = target_for_eval_invocation(
-                        registration.target,
+                        execution_target,
                         invocation,
                     )
                     corpus = await asyncio.to_thread(
@@ -6228,12 +6625,35 @@ def create_router(
                         effective_target,
                         project_root=registration.manifest_project_root,
                     )
-                eval_target, compiled = await _prepare_eval_run(
-                    corpus=corpus,
-                    suite_id=suite.suite.id,
-                    max_concurrency=1,
-                    invocation=invocation,
+                if plan.execution_profile_revision is None:
+                    raise RuntimeError("Ready authored-suite launch lost its profile revision.")
+                invocation = _bind_eval_admission_request(
+                    invocation,
+                    kind="authored_suite",
+                    target_key=suite.target_key,
+                    resource_identity={"suite_revision": suite.revision},
+                    body=body,
                 )
+                try:
+                    eval_target, compiled, invocation = await _prepare_eval_run(
+                        corpus=corpus,
+                        suite_id=suite.suite.id,
+                        max_concurrency=1,
+                        invocation=invocation,
+                        expected_execution_profile_revision=(plan.execution_profile_revision),
+                        expect_exact_execution_profile=True,
+                    )
+                except HTTPException as exc:
+                    if partial_replay and exc.status_code == 409:
+                        raise HTTPException(
+                            status_code=503,
+                            detail=(
+                                "An earlier authored eval launch attempt admitted only part of "
+                                "this request. Restore current launch readiness and retry with "
+                                "the same Idempotency-Key."
+                            ),
+                        ) from exc
+                    raise
                 prepared_runs.append((plan, corpus, invocation, eval_target, compiled))
 
             for _, corpus, _, eval_target, _ in prepared_runs:
@@ -6299,10 +6719,25 @@ def create_router(
                     status_code=400,
                     detail="Eval scenario draft is invalid.",
                 ) from exc
-            _, preflight = await _preflight_scenario(scenario, body.settings)
+            registration, preflight = await _preflight_scenario(scenario, body.settings)
+            profile_revision = None
+            if preflight.ready and preflight.binding is not None:
+                try:
+                    prepared_profile = await _scenario_execution_profile(
+                        registration,
+                        scenario,
+                        preflight.binding,
+                    )
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="The current scenario execution profile is unavailable.",
+                    ) from exc
+                profile_revision = prepared_profile.snapshot.revision
             return EvalScenarioPreviewResponse(
                 scenario=scenario,
                 preflight=preflight,
+                execution_profile_revision=profile_revision,
             )
 
         @bounded_evals_router.post(
@@ -6331,6 +6766,20 @@ def create_router(
                     detail="Eval scenario changed after the reviewed revision.",
                 ) from exc
             registration, preflight = await _preflight_scenario(scenario, body.settings)
+            profile_revision = None
+            if preflight.ready and preflight.binding is not None:
+                try:
+                    prepared_profile = await _scenario_execution_profile(
+                        registration,
+                        scenario,
+                        preflight.binding,
+                    )
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="The current scenario execution profile is unavailable.",
+                    ) from exc
+                profile_revision = prepared_profile.snapshot.revision
             try:
                 entry = await eval_store.save_scenario(
                     scenario,
@@ -6355,6 +6804,7 @@ def create_router(
                 entry=entry,
                 scenario=scenario,
                 preflight=preflight,
+                execution_profile_revision=profile_revision,
             )
 
         @bounded_evals_router.post(
@@ -6386,7 +6836,7 @@ def create_router(
             try:
                 materialization = await materialize_eval_scenario_artifact_fixture(
                     scenario,
-                    registration.target,
+                    registration.execution_target(),
                     requirement_id,
                     environment_name=body.settings.environment_name,
                     source_artifact_id=body.settings.artifact_references.get(requirement_id),
@@ -6412,13 +6862,28 @@ def create_router(
                     "artifact_references": references,
                 }
             )
-            _, preflight = await _preflight_scenario(
+            registration, preflight = await _preflight_scenario(
                 materialization.scenario,
                 settings,
             )
+            profile_revision = None
+            if preflight.ready and preflight.binding is not None:
+                try:
+                    prepared_profile = await _scenario_execution_profile(
+                        registration,
+                        materialization.scenario,
+                        preflight.binding,
+                    )
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="The current scenario execution profile is unavailable.",
+                    ) from exc
+                profile_revision = prepared_profile.snapshot.revision
             return EvalScenarioArtifactMaterializationResponse(
                 materialization=materialization,
                 preflight=preflight,
+                execution_profile_revision=profile_revision,
             )
 
         @bounded_evals_router.get(
@@ -6526,6 +6991,28 @@ def create_router(
                     detail="Durable scenario execution is not available.",
                 )
             scenario = await _load_eval_scenario(scenario_revision)
+            replay_probe = _bind_eval_admission_request(
+                _eval_run_invocation(
+                    auth_context,
+                    max_steps=None,
+                    limits=None,
+                    cost_budget=None,
+                ),
+                kind="scenario",
+                target_key=scenario.target_key,
+                resource_identity={"scenario_revision": scenario.revision},
+                body=body,
+            )
+            admission_request_revision = replay_probe.admission_request_revision
+            if admission_request_revision is None:
+                raise RuntimeError("Scenario eval launch lost its admission request revision.")
+            replayed = await _replay_eval_run(
+                target_key=scenario.target_key,
+                idempotency_key=idempotency_key,
+                admission_request_revision=admission_request_revision,
+            )
+            if replayed is not None:
+                return replayed
             registration, preflight = await _preflight_scenario(scenario, body.settings)
             binding = preflight.binding
             if not preflight.ready or binding is None:
@@ -6559,8 +7046,18 @@ def create_router(
                 cost_budget=binding.cost_budget,
                 scenario=scenario_invocation,
             )
+            invocation = _bind_eval_admission_request(
+                invocation,
+                kind="scenario",
+                target_key=scenario.target_key,
+                resource_identity={"scenario_revision": scenario.revision},
+                body=body,
+            )
             try:
-                effective_target = target_for_eval_invocation(registration.target, invocation)
+                effective_target = target_for_eval_invocation(
+                    registration.execution_target(),
+                    invocation,
+                )
                 corpus = await asyncio.to_thread(
                     corpus_for_eval_scenario,
                     scenario,
@@ -6573,11 +7070,13 @@ def create_router(
                     status_code=409,
                     detail="Eval scenario no longer matches its current target binding.",
                 ) from exc
-            eval_target, compiled = await _prepare_eval_run(
+            eval_target, compiled, invocation = await _prepare_eval_run(
                 corpus=corpus,
                 suite_id="scenario",
                 max_concurrency=binding.max_concurrency,
                 invocation=invocation,
+                expected_execution_profile_revision=(body.expected_execution_profile_revision),
+                expect_exact_execution_profile=True,
             )
             try:
                 await eval_store.save_corpus(
@@ -6842,11 +7341,29 @@ def create_router(
                 limits=body.limits,
                 cost_budget=body.cost_budget,
             )
-            eval_target, compiled = await _prepare_eval_run(
+            invocation = _bind_eval_admission_request(
+                invocation,
+                kind="corpus",
+                target_key=corpus.target_key,
+                resource_identity={"corpus_revision": corpus.revision},
+                body=body,
+            )
+            admission_request_revision = invocation.admission_request_revision
+            if admission_request_revision is None:
+                raise RuntimeError("Corpus eval launch lost its admission request revision.")
+            replayed = await _replay_eval_run(
+                target_key=corpus.target_key,
+                idempotency_key=idempotency_key,
+                admission_request_revision=admission_request_revision,
+            )
+            if replayed is not None:
+                return replayed
+            eval_target, compiled, invocation = await _prepare_eval_run(
                 corpus=corpus,
                 suite_id=body.suite_id,
                 max_concurrency=body.max_concurrency,
                 invocation=invocation,
+                expected_execution_profile_revision=(body.expected_execution_profile_revision),
             )
             return await _admit_eval_run(
                 corpus=corpus,

@@ -34,10 +34,13 @@ import {
 import { dashboardConfig } from "@/lib/config"
 import { scenarioArtifactBindingsRequireMaterialization } from "@/lib/eval-suite-authoring"
 import {
+  EVAL_TARGET_QUERY_KEY,
+  EVAL_TARGET_STALE_TIME_MS,
   EvalLaunchIdempotencyRegistry,
   evalErrorMessage,
   evalLaunchFailureIsDefinitive,
   evalLaunchNotice,
+  evalTargetCatalogMayBeStale,
   scenarioEvalLaunchRequestIdentity,
   shortEvalIdentity,
 } from "@/lib/evals-dashboard"
@@ -293,9 +296,9 @@ export function ScenarioAuthoring({
     enabled: showLaunchSettings,
   })
   const targets = useQuery({
-    queryKey: ["evals", "targets"],
+    queryKey: EVAL_TARGET_QUERY_KEY,
     queryFn: ({ signal }) => fetchEvalTargets(signal),
-    staleTime: Number.POSITIVE_INFINITY,
+    staleTime: EVAL_TARGET_STALE_TIME_MS,
   })
   const selectedTarget = targets.data?.items.find(
     (target) => target.target_key === draft.target_key,
@@ -414,7 +417,11 @@ export function ScenarioAuthoring({
       const normalizedDraft = draftFromScenario(saved.scenario)
       const normalizedIdentity = JSON.stringify([normalizedDraft, settings])
       setDraft(normalizedDraft)
-      setPreview({ scenario: saved.scenario, preflight: saved.preflight })
+      setPreview({
+        scenario: saved.scenario,
+        preflight: saved.preflight,
+        execution_profile_revision: saved.execution_profile_revision,
+      })
       setPreviewIdentity(normalizedIdentity)
       setSavedRevision(saved.scenario.revision)
       setSavedDraftIdentity(JSON.stringify(normalizedDraft))
@@ -430,6 +437,8 @@ export function ScenarioAuthoring({
       !previewCurrent ||
       preview === null ||
       !preview.preflight.ready ||
+      preview.execution_profile_revision === null ||
+      preview.execution_profile_revision === undefined ||
       binding === null ||
       binding === undefined ||
       settingsValue === null ||
@@ -437,9 +446,11 @@ export function ScenarioAuthoring({
     ) {
       return
     }
+    const executionProfileRevision = preview.execution_profile_revision
     const requestIdentity = scenarioEvalLaunchRequestIdentity(
       preview.scenario.revision,
       binding.revision,
+      executionProfileRevision,
     )
     void run("launch", async (signal) => {
       const registry =
@@ -453,12 +464,16 @@ export function ScenarioAuthoring({
           preview.scenario.revision,
           {
             expected_binding_revision: binding.revision,
+            expected_execution_profile_revision: executionProfileRevision,
             settings: settingsValue,
           },
           idempotencyKey,
           signal,
         )
       } catch (launchError) {
+        if (evalTargetCatalogMayBeStale(launchError)) {
+          await queryClient.invalidateQueries({ queryKey: EVAL_TARGET_QUERY_KEY })
+        }
         if (
           launchError instanceof ApiClientError &&
           evalLaunchFailureIsDefinitive(launchError.status)

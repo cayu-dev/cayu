@@ -30,6 +30,7 @@ import type {
   CreateEvalRunApiEvalsRunsPostData,
   EnvironmentsResponse,
   EvalAuthoredSuiteCatalogPage,
+  EvalAuthoredSuiteRunLaunchRequest,
   EvalAuthoredSuiteRunLaunchResponse,
   EvalAuthoredSuiteRunPreviewResponse,
   EvalAuthoredSuiteRunSelectionRequest,
@@ -260,6 +261,7 @@ export type EvalAuthoredSuiteSave = EvalSuiteSaveRequest
 export type EvalAuthoredSuiteSaved = EvalSuiteSaveResponse
 export type EvalAuthoredSuitesPage = EvalAuthoredSuiteCatalogPage
 export type EvalAuthoredSuiteRunSelection = EvalAuthoredSuiteRunSelectionRequest
+export type EvalAuthoredSuiteRunLaunch = EvalAuthoredSuiteRunLaunchRequest
 export type EvalAuthoredSuiteRunPreview = EvalAuthoredSuiteRunPreviewResponse
 export type EvalAuthoredSuiteRunLaunched = EvalAuthoredSuiteRunLaunchResponse
 export type EvalCorporaQuery = NonNullable<ListEvalCorporaApiEvalsCorporaGetData["query"]>
@@ -697,7 +699,7 @@ export async function previewEvalAuthoredSuiteRun(
 
 export async function launchEvalAuthoredSuiteRun(
   suiteRevision: string,
-  body: EvalAuthoredSuiteRunSelection,
+  body: EvalAuthoredSuiteRunLaunch,
   idempotencyKey: string,
   signal?: AbortSignal,
 ): Promise<EvalAuthoredSuiteRunLaunched> {

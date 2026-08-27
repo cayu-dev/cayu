@@ -95,6 +95,13 @@ def test_project_context_generates_multi_agent_targets_and_keeps_all_work_target
         assert {item["app_manifest_fingerprint"] for item in target_catalog["items"]} == {
             rooted_manifest.fingerprint
         }
+        assert {item["execution_profile_ready"] for item in target_catalog["items"]} == {True}
+        assert {
+            item["execution_profile"]["fixture_strategy"] for item in target_catalog["items"]
+        } == {"none"}
+        assert {
+            item["execution_profile"]["reset_strategy"] for item in target_catalog["items"]
+        } == {"fresh_session_only"}
         catalog_by_agent = {item["agent_name"]: item for item in target_catalog["items"]}
         target_keys = {item["agent_name"]: item["target_key"] for item in target_catalog["items"]}
 
@@ -141,6 +148,9 @@ def test_project_context_generates_multi_agent_targets_and_keeps_all_work_target
                 json={
                     "corpus_revision": corpus.revision,
                     "suite_id": corpus.suites[0].id,
+                    "expected_execution_profile_revision": catalog_by_agent[agent_name][
+                        "execution_profile"
+                    ]["revision"],
                     "max_concurrency": 1,
                 },
             )
@@ -259,14 +269,14 @@ def test_generated_eval_worker_rejects_manifest_drift_after_catalog_publication(
             json={
                 "corpus_revision": corpus.revision,
                 "suite_id": corpus.suites[0].id,
+                "expected_execution_profile_revision": catalog["items"][0]["execution_profile"][
+                    "revision"
+                ],
                 "max_concurrency": 1,
             },
         )
-        assert admitted.status_code == 202
-        terminal = _wait_for_terminal(client, admitted.json()["spec"]["run_id"])
-
-        assert terminal["status"] == "failed"
-        assert terminal["failure_code"] == "target_unavailable"
+        assert admitted.status_code == 409
+        assert "execution profile" in admitted.json()["detail"]
         assert provider.requests == []
     asyncio.run(context.close())
 
@@ -289,23 +299,20 @@ def test_explicit_v1_configuration_publishes_one_compatible_target(tmp_path) -> 
             assert response.status_code == 200
             body = response.json()
             assert body["default_target_key"] == target.key
-            assert body["items"] == [
-                {
-                    "target_key": target.key,
-                    "project_id": None,
-                    "agent_name": target.request_base.agent_name,
-                    "profile_id": "explicit",
-                    "label": f"{target.request_base.agent_name} · Explicit",
-                    "source": "explicit",
-                    "application_release_id": target.application_release_id,
-                    "app_manifest_fingerprint": body["items"][0]["app_manifest_fingerprint"],
-                    "max_trials": target.limits.max_trials,
-                    "max_concurrency": target.limits.max_concurrency,
-                    "max_timeout_seconds": target.limits.max_timeout_seconds,
-                    "max_steps": target.request_base.max_steps,
-                    "cost_budget_available": target.price_book is not None,
-                    "cost_budget_currencies": [],
-                }
-            ]
+            assert len(body["items"]) == 1
+            entry = body["items"][0]
+            assert entry["target_key"] == target.key
+            assert entry["project_id"] is None
+            assert entry["agent_name"] == target.request_base.agent_name
+            assert entry["profile_id"] == "explicit"
+            assert entry["source"] == "explicit"
+            assert entry["max_trials"] == 1
+            assert entry["max_concurrency"] == 1
+            assert entry["execution_profile_ready"] is True
+            assert entry["execution_profile"]["candidate"]["agent_name"] == (
+                target.request_base.agent_name
+            )
+            assert entry["execution_profile"]["ceilings"]["max_trials"] == 1
+            assert entry["execution_profile_diagnostics"] == []
     finally:
         asyncio.run(store.close())

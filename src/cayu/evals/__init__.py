@@ -118,6 +118,14 @@ from cayu.evals.execution_comparison import (
     corpus_execution_compatibility,
     eval_result_compatibility,
 )
+from cayu.evals.execution_profiles import (
+    EvalExecutionCandidateIdentityV1,
+    EvalExecutionProfileBindingV1,
+    EvalExecutionProfilePolicyV1,
+    EvalExecutionProfileV1,
+    EvalExecutionResourceCeilingsV1,
+    EvalExecutionTargetMaterialIdentityV1,
+)
 from cayu.evals.execution_reporting import (
     CORPUS_EXECUTION_COMPARISON_MAX_HTML_BYTES,
     CORPUS_EXECUTION_COMPARISON_MAX_JSON_BYTES,
@@ -621,6 +629,12 @@ __all__ = [
     "EvalCorpusDocument",
     "EvalCorpusInspectionV1",
     "EvalCorpusSuiteInspectionV1",
+    "EvalExecutionCandidateIdentityV1",
+    "EvalExecutionProfileBindingV1",
+    "EvalExecutionProfilePolicyV1",
+    "EvalExecutionProfileV1",
+    "EvalExecutionResourceCeilingsV1",
+    "EvalExecutionTargetMaterialIdentityV1",
     "EvalMemoryAttributionCapturePolicyV1",
     "EvalMemoryAttributionEvidenceV1",
     "EvalMemoryAttributionSourceV1",

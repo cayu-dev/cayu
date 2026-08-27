@@ -79,6 +79,8 @@ import { dashboardConfig } from "@/lib/config"
 import { dashboardCapabilityUnavailableText } from "@/lib/dashboard-capabilities"
 import {
   EVAL_RESULT_QUERY_RETENTION,
+  EVAL_TARGET_QUERY_KEY,
+  EVAL_TARGET_STALE_TIME_MS,
   EvalLaunchIdempotencyRegistry,
   evalCancellationNotice,
   evalComparisonReasonText,
@@ -89,6 +91,7 @@ import {
   evalRunCanCancel,
   evalRunHasResult,
   evalRunIsActive,
+  evalTargetCatalogMayBeStale,
   evalTrialCostSummary,
   preflightEvalCorpusFile,
   retryEvalQuery,
@@ -114,16 +117,19 @@ export function EvalsPage() {
   const catalogReady = readiness.catalog_read.state === "ready"
   const resultsReady = readiness.captured_result_persistence.state === "ready"
   const targets = useQuery({
-    queryKey: ["evals", "targets"],
+    queryKey: EVAL_TARGET_QUERY_KEY,
     queryFn: ({ signal }) => fetchEvalTargets(signal),
     enabled: catalogReady,
-    staleTime: Number.POSITIVE_INFINITY,
+    staleTime: EVAL_TARGET_STALE_TIME_MS,
   })
   const selectedTargetKey = targets.data?.items.some(
     (target) => target.target_key === search.target,
   )
     ? search.target
     : targets.data?.default_target_key
+  const selectedTarget = targets.data?.items.find(
+    (target) => target.target_key === selectedTargetKey,
+  )
   const mutateCapability = useDashboardCapability({
     kind: "surface",
     surface: "evals",
@@ -379,6 +385,14 @@ export function EvalsPage() {
 
       <EvalsReadinessOverview readiness={readiness} />
 
+      {selectedTarget && (
+        <EvalExecutionProfileSummary
+          target={selectedTarget}
+          refreshing={targets.isFetching}
+          refresh={() => void targets.refetch()}
+        />
+      )}
+
       <div
         className="flex gap-2 border-b border-border"
         role="tablist"
@@ -478,7 +492,7 @@ export function EvalsPage() {
                 />
                 <CatalogView
                   search={search}
-                  targetKey={selectedTargetKey}
+                  target={selectedTarget}
                   updateSearch={updateSearch}
                   pendingAction={pendingAction}
                   runAction={runAction}
@@ -571,6 +585,101 @@ function EvalTargetSelector({
       </select>
     </label>
   )
+}
+
+function EvalExecutionProfileSummary({
+  target,
+  refreshing,
+  refresh,
+}: {
+  target: EvalTarget
+  refreshing: boolean
+  refresh: () => void
+}) {
+  const profile = target.execution_profile
+  return (
+    <DataCard
+      title="Current execution profile"
+      description="Server-published candidate identity and authority that fresh Evals will freeze at launch."
+      actions={
+        <Button type="button" size="sm" variant="outline" disabled={refreshing} onClick={refresh}>
+          <RotateCcw className={refreshing ? "animate-spin" : undefined} />
+          Refresh profile
+        </Button>
+      }
+      contentClassName="p-4"
+    >
+      {profile ? (
+        <div className="grid gap-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
+          <ProfileFact label="Candidate" value={profile.candidate.agent_name} />
+          <ProfileFact
+            label="Provider / model"
+            value={`${profile.candidate.provider_name} / ${profile.candidate.model}`}
+          />
+          <ProfileFact
+            label="Environment"
+            value={profile.candidate.environment_name ?? "Application default"}
+          />
+          <ProfileFact
+            label="Fixture / reset"
+            value={`${executionProfileLabel(profile.fixture_strategy)} / ${executionProfileLabel(profile.reset_strategy)}`}
+          />
+          <ProfileFact label="Effects" value={executionProfileLabel(profile.effect_posture)} />
+          <ProfileFact
+            label="Maximum scale"
+            value={`${profile.ceilings.max_cases} case${profile.ceilings.max_cases === 1 ? "" : "s"}, ${profile.ceilings.max_trials} trial${profile.ceilings.max_trials === 1 ? "" : "s"}, concurrency ${profile.ceilings.max_concurrency}`}
+          />
+          <ProfileFact
+            label="Execution ceilings"
+            value={`${profile.ceilings.max_timeout_seconds}s timeout · ${profile.ceilings.max_steps} steps · ${profile.ceilings.max_compiled_input_chars.toLocaleString()} compiled chars`}
+          />
+          <ProfileFact
+            label="Evidence"
+            value={`Public runtime projection · output up to ${(profile.evidence_policy.max_final_output_chars ?? 65_536).toLocaleString()} chars`}
+          />
+          <ProfileFact
+            label="Runtime identity"
+            value={profile.candidate.runtime_execution_profile_fingerprint.slice(0, 12)}
+            mono
+          />
+          <ProfileFact
+            label="Target material"
+            value={`${profile.target_material.fingerprint.slice(0, 12)} · ${profile.target_material.kind === "structural_sha256" ? "structural" : "process-local"}`}
+            mono
+          />
+          <ProfileFact label="Profile revision" value={shortEvalIdentity(profile.revision)} mono />
+        </div>
+      ) : (
+        <div className="text-sm text-amber-700 dark:text-amber-300">
+          {target.execution_profile_diagnostics?.[0]?.message ??
+            "The current runtime execution profile is unavailable."}
+        </div>
+      )}
+    </DataCard>
+  )
+}
+
+function ProfileFact({
+  label,
+  value,
+  mono = false,
+}: {
+  label: string
+  value: string
+  mono?: boolean
+}) {
+  return (
+    <div className="min-w-0 rounded-md border border-border bg-muted/20 p-3">
+      <div className="text-muted-foreground">{label}</div>
+      <div className={`mt-1 truncate text-foreground ${mono ? "font-mono" : "font-medium"}`}>
+        {value}
+      </div>
+    </div>
+  )
+}
+
+function executionProfileLabel(value: string): string {
+  return value.replaceAll("_", " ")
 }
 
 function EvalsReadinessOverview({ readiness }: { readiness: EvalsReadiness }) {
@@ -768,14 +877,14 @@ function ScenarioCatalog({
 
 function CatalogView({
   search,
-  targetKey,
+  target,
   updateSearch,
   pendingAction,
   runAction,
   mutateEnabled,
 }: {
   search: EvalsSearch
-  targetKey: string
+  target: EvalTarget | undefined
   updateSearch: UpdateEvalsSearch
   pendingAction: string | null
   runAction: (
@@ -784,6 +893,7 @@ function CatalogView({
   ) => Promise<void>
   mutateEnabled: boolean
 }) {
+  const targetKey = target?.target_key ?? ""
   const queryClient = useQueryClient()
   const [maxConcurrency, setMaxConcurrency] = useState("1")
   const launchRegistryRef = useRef<EvalLaunchIdempotencyRegistry | null>(null)
@@ -794,6 +904,7 @@ function CatalogView({
         { target_key: targetKey, limit: PAGE_LIMIT, cursor: search.corpora_cursor },
         signal,
       ),
+    enabled: target !== undefined,
   })
   const suites = useQuery({
     queryKey: ["evals", "suites", search.corpus, search.suites_cursor],
@@ -817,6 +928,10 @@ function CatalogView({
     enabled: search.corpus !== undefined && search.suite !== undefined,
   })
 
+  if (target === undefined) {
+    return <StateMessage>The selected eval target is unavailable.</StateMessage>
+  }
+
   const selectCorpus = (corpus: EvalCorpusEntry) => {
     updateSearch((current) => ({
       ...evalsSearchWithout(current, "suite", "suites_cursor", "cases_cursor"),
@@ -827,7 +942,9 @@ function CatalogView({
   const selectedCorpus = corpora.data?.items.find((item) => item.revision === search.corpus)
   const parsedConcurrency = Number(maxConcurrency)
   const concurrencyIsValid =
-    Number.isInteger(parsedConcurrency) && parsedConcurrency >= 1 && parsedConcurrency <= 32
+    Number.isInteger(parsedConcurrency) &&
+    parsedConcurrency >= 1 &&
+    parsedConcurrency <= target.max_concurrency
 
   const downloadCorpus = () => {
     if (!search.corpus || pendingAction !== null) return
@@ -840,10 +957,23 @@ function CatalogView({
   }
 
   const launchSuite = (suiteId: string) => {
-    if (!search.corpus || pendingAction !== null || !mutateEnabled || !concurrencyIsValid) {
+    if (
+      !search.corpus ||
+      pendingAction !== null ||
+      !mutateEnabled ||
+      !concurrencyIsValid ||
+      !target.execution_profile_ready ||
+      target.execution_profile == null
+    ) {
       return
     }
-    const requestIdentity = evalLaunchRequestIdentity(search.corpus, suiteId, parsedConcurrency)
+    const executionProfile = target.execution_profile
+    const requestIdentity = evalLaunchRequestIdentity(
+      search.corpus,
+      suiteId,
+      parsedConcurrency,
+      executionProfile.revision,
+    )
     void runAction(`launch:${suiteId}`, async (signal) => {
       const registry =
         launchRegistryRef.current ??
@@ -856,12 +986,16 @@ function CatalogView({
           {
             corpus_revision: search.corpus ?? "",
             suite_id: suiteId,
+            expected_execution_profile_revision: executionProfile.revision,
             max_concurrency: parsedConcurrency,
           },
           idempotencyKey,
           signal,
         )
       } catch (error) {
+        if (evalTargetCatalogMayBeStale(error)) {
+          await queryClient.invalidateQueries({ queryKey: EVAL_TARGET_QUERY_KEY })
+        }
         if (error instanceof ApiClientError && evalLaunchFailureIsDefinitive(error.status)) {
           registry.resolve(requestIdentity)
         }
@@ -1007,7 +1141,7 @@ function CatalogView({
                     <input
                       type="number"
                       min={1}
-                      max={32}
+                      max={target.max_concurrency}
                       step={1}
                       value={maxConcurrency}
                       className="h-8 w-16 rounded-md border border-input bg-background px-2 text-sm"
@@ -1079,7 +1213,18 @@ function CatalogView({
                           type="button"
                           size="sm"
                           aria-label={`Run suite ${suite.name} (${suite.id}) on current app`}
-                          disabled={!mutateEnabled || !concurrencyIsValid || pendingAction !== null}
+                          disabled={
+                            !mutateEnabled ||
+                            !concurrencyIsValid ||
+                            !target.execution_profile_ready ||
+                            pendingAction !== null
+                          }
+                          title={
+                            target.execution_profile_ready
+                              ? undefined
+                              : (target.execution_profile_diagnostics?.[0]?.message ??
+                                "The current execution profile is unavailable.")
+                          }
                           onClick={() => launchSuite(suite.id)}
                         >
                           {pendingAction === `launch:${suite.id}` ? (

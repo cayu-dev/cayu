@@ -977,6 +977,36 @@ the complete effective request and enforces target ceilings again during
 compilation and execution. Tool-effect metadata neither grants nor denies
 authority.
 
+Every fresh launch also carries the execution-profile revision shown by its
+server preflight. HTTP can select that exact revision and narrow its published
+ceilings; it cannot submit or alter provider, model, environment, fixture,
+reset, effect, evidence, target request, bootstrap, or runtime identity.
+Admission resolves the profile again and fails on a changed revision. The
+durable run stores the full server-prepared runtime profile binding, and a
+worker re-resolves and compares it before compilation or provider dispatch. A
+deployment, registration, model route, environment, request base, bootstrap,
+execution ceiling, evidence policy, or isolation change therefore produces a
+visible readiness/compatibility conflict instead of silently running against a
+different candidate. The operator refreshes the preview or catalog and makes a
+new launch decision. Controlled scenarios repeat the same manifest and runtime
+profile check before an approval, user-input, or manual-resume continuation can
+dispatch more provider or tool work.
+
+The profile carries an opaque target-material identity over the complete
+request base, bootstrap messages, and `CorpusExecutionLimits` object used by
+compilation. Public-safe material receives a restart-portable structural
+SHA-256 identity. If any of that material crosses the application's configured
+workload-secret boundary, Cayu publishes only a process-keyed HMAC and public
+process-scope commitment. Raw target material is never returned. The same
+private material remains stable within the serving process, while a restart
+changes its scope and safely prevents old admitted work from running against an
+unverifiable private configuration.
+
+A scenario-selected registered environment is part of its exact profile. The
+same environment is retained in durable launch identity, reconstructed by a
+worker after restart, and used for the fresh session; it is never reduced to a
+preflight-only label or replaced by the application's default.
+
 Generated project targets deliberately permit only one trial at concurrency one.
 Increasing repetition or parallelism, substituting fixtures, bypassing normal
 approvals, or selecting different tool/environment authority requires an
@@ -1351,12 +1381,27 @@ worker claims resolve persisted target identity back through the registry, so
 work for an unknown or foreign target is neither exposed nor claimed.
 
 The generated profile id is currently `default`. It preserves normal agent
-provider, tool, environment, approval, and policy selection. The profile
-dimension is part of stable identity now so later server-published profiles can
-represent deliberate fixture, isolation, or authority changes without changing
-existing keys. Generated targets default to one trial and concurrency one; their
-catalog entries publish the server-enforced trial, concurrency, timeout, and
-model-step ceilings plus the target-compatible cost currencies, if any. A
+provider, tool, environment, approval, and policy selection. Before publishing
+the target catalog, Cayu resolves that runtime authority into a public execution
+profile. The profile identifies the candidate agent, provider/model route,
+environment, application release and manifest, evidence policy, runtime
+execution fingerprint, exact target-material commitment, fixture/reset/effect
+posture, and complete case, trial, concurrency, timeout, bootstrap, input,
+compiled-input, model-step, and run-limit ceilings. It contains no credentials,
+callback handles, raw bootstrap content, or private runtime objects. If current
+runtime preparation fails, the target remains visible with an exact not-ready
+state and cannot be launched. Catalog diagnostics use stable
+`not_resolved`, `application_identity_changed`, or
+`runtime_authority_unavailable` codes with bounded remediation copy, so clients
+do not need to parse error prose.
+
+Generated targets use the conservative profile automatically: no managed
+fixture, a fresh Cayu session for each trial, ordinary application authority,
+one trial, and concurrency one. The profile dimension is part of stable target
+identity so applications can later publish deliberate fixture, isolation, or
+authority changes without changing existing target keys. Catalog entries also
+publish the server-enforced timeout and model-step ceilings plus the
+target-compatible cost currencies, if any. A
 non-empty currency list is the only condition that marks cost budgets available;
 the browser cannot invent another currency and admission repeats compatibility
 preflight against current pricing. An
@@ -1395,6 +1440,37 @@ server = create_server(
     ),
 )
 ```
+
+The default explicit profile is also conservative and needs no additional
+configuration. An application may enable repeated or concurrent trials only
+when it owns a real reset boundary and publishes that promise explicitly:
+
+```python
+from cayu import EvalExecutionProfilePolicyV1
+from cayu.server import EvalsConfig
+
+evals = EvalsConfig(
+    target=target,
+    store=eval_store,
+    execution_profile_policy=EvalExecutionProfilePolicyV1(
+        fixture_strategy="application_managed",
+        reset_strategy="application_managed",
+        effect_posture="isolated_application_authority",
+        # Change this content revision whenever the fixture/reset boundary changes.
+        isolation_revision="sha256:" + resolved_isolation_digest,
+        max_trials=5,
+        max_concurrency=2,
+    ),
+)
+```
+
+`isolation_revision` is an application-supplied SHA-256 content identity, not a
+secret and not a callback. Declaring application-managed behavior is a truthful
+operational contract: Cayu does not create, reset, or validate an external test
+tenant on the application's behalf. Any managed fixture, reset, or isolated
+effect claim requires that revision. Repetition or concurrency additionally
+requires an application-managed reset strategy, and the configured scale can
+only narrow the attached target's own limits.
 
 For a host-owned FastAPI application, pass the same complete wiring directly to the
 mount. The `CorpusTarget.app` must be the exact `CayuApp` being mounted:

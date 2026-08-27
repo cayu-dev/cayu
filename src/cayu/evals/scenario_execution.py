@@ -18,6 +18,7 @@ from cayu.artifacts import (
 )
 from cayu.core.events import Event, EventType
 from cayu.core.messages import FilePart, Message, MessageRole, TextPart
+from cayu.evals._execution_profile_errors import EvalExecutionProfileChangedError
 from cayu.evals.corpus import (
     CorpusUserMessageSpec,
     EvalCaseSpec,
@@ -85,6 +86,10 @@ from cayu.runtime.approvals import (
     ToolApprovalDecision,
     ToolApprovalRequest,
 )
+from cayu.runtime.execution_profiles import (
+    ExecutionProfileIdentity,
+    ExecutionProfileMismatchError,
+)
 from cayu.runtime.sessions import (
     EnqueueSessionMessageRequest,
     PendingActionKind,
@@ -94,6 +99,7 @@ from cayu.runtime.sessions import (
     RunRequest,
     SessionMessageDeliveryMode,
     SessionStatus,
+    copy_run_request,
 )
 from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.user_input import UserInputResponse
@@ -347,6 +353,9 @@ class _ScenarioTrialDriver:
         trial_number: int,
         initial_progress: EvalScenarioTrialProgress,
         poll_seconds: float,
+        manifest_project_root: Path | None,
+        expected_app_manifest_fingerprint: str | None,
+        expected_execution_profile: ExecutionProfileIdentity | None,
     ) -> None:
         self.target = target
         self.scenario = scenario
@@ -355,6 +364,9 @@ class _ScenarioTrialDriver:
         self.claim = claim
         self.trial_number = trial_number
         self.poll_seconds = poll_seconds
+        self.manifest_project_root = manifest_project_root
+        self.expected_app_manifest_fingerprint = expected_app_manifest_fingerprint
+        self.expected_execution_profile = expected_execution_profile
         self.initial_progress = initial_progress.model_copy(deep=True)
         session_id = (
             initial_progress.session_id
@@ -369,6 +381,29 @@ class _ScenarioTrialDriver:
             raise ValueError("A resumable scenario checkpoint requires its durable session id.")
         self.session_id: str = session_id
         self.next_sequence = initial_progress.next_event_sequence
+
+    async def _require_expected_execution_profile(self) -> None:
+        """Reject profile drift before a scenario continuation can do governed work."""
+
+        if self.expected_app_manifest_fingerprint is not None:
+            current_target = evaluation_target_identity(
+                self.target,
+                project_root=self.manifest_project_root,
+            )
+            if current_target.app_manifest_fingerprint != self.expected_app_manifest_fingerprint:
+                raise EvalExecutionProfileChangedError(
+                    "Scenario application identity changed after eval admission.",
+                )
+        if self.expected_execution_profile is None:
+            return
+        prepared = await self.target.app._session_engine._prepare_initial_run(
+            copy_run_request(self.target.request_base),
+            admit_session=False,
+        )
+        if prepared is None or prepared.execution_profile != self.expected_execution_profile:
+            raise EvalExecutionProfileChangedError(
+                "Scenario runtime execution profile changed after eval admission.",
+            )
 
     async def _update(
         self,
@@ -394,6 +429,13 @@ class _ScenarioTrialDriver:
                 failure_code=failure_code,
             ),
         )
+
+    async def _enter_running_phase(self) -> None:
+        """Fence the durable progress write immediately before runtime dispatch."""
+
+        await self._require_expected_execution_profile()
+        await self._update(EvalScenarioTrialPhase.RUNNING)
+        await self._require_expected_execution_profile()
 
     async def _enqueue_ready_steps(self) -> None:
         events = self.scenario.events
@@ -501,7 +543,7 @@ class _ScenarioTrialDriver:
                 EvalScenarioTrialFailureCode.EXPECTED_APPROVAL_UNAVAILABLE,
                 "Current approval linkage no longer matches the scenario checkpoint.",
             )
-        await self._update(EvalScenarioTrialPhase.RUNNING)
+        await self._enter_running_phase()
         return self.target.app.resolve_tool_approval(
             ToolApprovalRequest(
                 session_id=self.session_id,
@@ -556,7 +598,7 @@ class _ScenarioTrialDriver:
             for part in message.content
             if type(part) is FilePart
         ]
-        await self._update(EvalScenarioTrialPhase.RUNNING)
+        await self._enter_running_phase()
         return self.target.app.resolve_user_input(
             UserInputResponse(
                 session_id=self.session_id,
@@ -592,7 +634,7 @@ class _ScenarioTrialDriver:
             )
         messages = _scenario_messages(event.input, self.scenario, self.binding)
         request = self.target.request_base
-        await self._update(EvalScenarioTrialPhase.RUNNING)
+        await self._enter_running_phase()
         return self.target.app.resume(
             ResumeRequest(
                 session_id=self.session_id,
@@ -678,9 +720,12 @@ class _ScenarioTrialDriver:
                     },
                     deep=True,
                 )
-                await self._update(EvalScenarioTrialPhase.RUNNING)
+                await self._enter_running_phase()
                 self.next_sequence = 1
-                stream = self.target.app.run(request)
+                stream = self.target.app._run_private(
+                    request,
+                    expected_execution_profile=self.expected_execution_profile,
+                )
             while True:
                 async for emitted in self._drain(stream):
                     yield emitted
@@ -713,7 +758,14 @@ class _ScenarioTrialDriver:
             code = (
                 exc.code
                 if isinstance(exc, ScenarioExecutionError)
-                else EvalScenarioTrialFailureCode.EXECUTION_FAILED
+                else (
+                    EvalScenarioTrialFailureCode.EXECUTION_PROFILE_CHANGED
+                    if isinstance(
+                        exc,
+                        EvalExecutionProfileChangedError | ExecutionProfileMismatchError,
+                    )
+                    else EvalScenarioTrialFailureCode.EXECUTION_FAILED
+                )
             )
             with contextlib.suppress(EvalRunClaimLost, EvalRunStateConflict):
                 await self._update(EvalScenarioTrialPhase.ERROR, failure_code=code)
@@ -732,17 +784,27 @@ async def run_compiled_eval_scenario(
     poll_seconds: float,
     manifest_project_root: Path | None = None,
     expected_app_manifest_fingerprint: str | None = None,
+    expected_execution_profile: ExecutionProfileIdentity | None = None,
 ) -> CorpusExecutionResult:
     """Execute all scenario trials and return the ordinary corpus result shape."""
 
     if len(compiled.suite.cases) != 1 or compiled.trials != binding.trials:
         raise ValueError("Controlled scenario execution requires its derived one-case corpus.")
+    if (
+        expected_execution_profile is not None
+        and type(expected_execution_profile) is not ExecutionProfileIdentity
+    ):
+        raise TypeError(
+            "expected_execution_profile must be an exact ExecutionProfileIdentity or None."
+        )
     target_before = evaluation_target_identity(target, project_root=manifest_project_root)
     if (
         expected_app_manifest_fingerprint is not None
         and target_before.app_manifest_fingerprint != expected_app_manifest_fingerprint
     ):
-        raise RuntimeError("Scenario target manifest does not match its registered identity.")
+        raise EvalExecutionProfileChangedError(
+            "Scenario target manifest does not match its registered identity."
+        )
     current = await store.load_run(claim.run_id)
     if (
         current is None
@@ -798,6 +860,9 @@ async def run_compiled_eval_scenario(
             trial_number=trial_number,
             initial_progress=progress.trials[trial_number - 1],
             poll_seconds=poll_seconds,
+            manifest_project_root=manifest_project_root,
+            expected_app_manifest_fingerprint=expected_app_manifest_fingerprint,
+            expected_execution_profile=expected_execution_profile,
         )
         async with semaphore:
             execution = await _run_case_once_with_public_projection(

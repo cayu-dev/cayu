@@ -5284,6 +5284,13 @@
             "title": "Expected Candidate Revision",
             "type": "string"
           },
+          "expected_execution_profile_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Expected Execution Profile Revision",
+            "type": "string"
+          },
           "limits": {
             "anyOf": [
               {
@@ -5320,7 +5327,8 @@
         },
         "required": [
           "expected_candidate_revision",
-          "candidate"
+          "candidate",
+          "expected_execution_profile_revision"
         ],
         "title": "CapturedEvaluationLaunchRequest",
         "type": "object"
@@ -7079,6 +7087,218 @@
         "title": "CostLineItem",
         "type": "object"
       },
+      "EgressAuthorityBindingIdentity": {
+        "additionalProperties": false,
+        "description": "One destination/credential class bound to a named policy.",
+        "properties": {
+          "credential_authority_fingerprint": {
+            "title": "Credential Authority Fingerprint",
+            "type": "string"
+          },
+          "credential_kind": {
+            "maxLength": 256,
+            "title": "Credential Kind",
+            "type": "string"
+          },
+          "destination": {
+            "maxLength": 253,
+            "title": "Destination",
+            "type": "string"
+          },
+          "policy_name": {
+            "maxLength": 256,
+            "title": "Policy Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "destination",
+          "policy_name",
+          "credential_kind",
+          "credential_authority_fingerprint"
+        ],
+        "title": "EgressAuthorityBindingIdentity",
+        "type": "object"
+      },
+      "EgressAuthorityCutoverStrategy": {
+        "description": "How an adapter can replace one admitted egress generation.",
+        "enum": [
+          "verified_in_place",
+          "fresh_authority_path",
+          "allocation_replacement",
+          "unsupported"
+        ],
+        "title": "EgressAuthorityCutoverStrategy",
+        "type": "string"
+      },
+      "EgressAuthorityIdentity": {
+        "additionalProperties": false,
+        "description": "Versioned, bounded, secret-free identity for one admitted egress generation.",
+        "properties": {
+          "authority_scope": {
+            "maxLength": 256,
+            "title": "Authority Scope",
+            "type": "string"
+          },
+          "authority_source": {
+            "maxLength": 256,
+            "title": "Authority Source",
+            "type": "string"
+          },
+          "bindings": {
+            "items": {
+              "$ref": "#/components/schemas/EgressAuthorityBindingIdentity"
+            },
+            "title": "Bindings",
+            "type": "array"
+          },
+          "comparison_available": {
+            "title": "Comparison Available",
+            "type": "boolean"
+          },
+          "cutover_strategy": {
+            "$ref": "#/components/schemas/EgressAuthorityCutoverStrategy"
+          },
+          "fingerprint": {
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "generation": {
+            "minimum": 1.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "policies": {
+            "items": {
+              "$ref": "#/components/schemas/EgressAuthorityPolicyIdentity"
+            },
+            "title": "Policies",
+            "type": "array"
+          },
+          "policy_version": {
+            "maxLength": 256,
+            "title": "Policy Version",
+            "type": "string"
+          },
+          "record_type": {
+            "const": "cayu.egress-authority",
+            "default": "cayu.egress-authority",
+            "title": "Record Type",
+            "type": "string"
+          },
+          "runner_kind": {
+            "maxLength": 256,
+            "title": "Runner Kind",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "generation",
+          "authority_source",
+          "authority_scope",
+          "policy_version",
+          "runner_kind",
+          "cutover_strategy",
+          "policies",
+          "bindings",
+          "comparison_available",
+          "fingerprint"
+        ],
+        "title": "EgressAuthorityIdentity",
+        "type": "object"
+      },
+      "EgressAuthorityOperation": {
+        "additionalProperties": false,
+        "description": "One bounded HTTP operation admitted by a built-in policy.",
+        "properties": {
+          "match": {
+            "default": "exact",
+            "enum": [
+              "exact",
+              "prefix"
+            ],
+            "title": "Match",
+            "type": "string"
+          },
+          "method": {
+            "maxLength": 32,
+            "title": "Method",
+            "type": "string"
+          },
+          "path": {
+            "maxLength": 2048,
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "method",
+          "path"
+        ],
+        "title": "EgressAuthorityOperation",
+        "type": "object"
+      },
+      "EgressAuthorityPolicyIdentity": {
+        "additionalProperties": false,
+        "description": "Secret-free canonical projection of one policy's operation semantics.",
+        "properties": {
+          "allowed_destinations": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Allowed Destinations",
+            "type": "array"
+          },
+          "comparison_available": {
+            "default": true,
+            "title": "Comparison Available",
+            "type": "boolean"
+          },
+          "denied_path_prefixes": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Denied Path Prefixes",
+            "type": "array"
+          },
+          "kind": {
+            "enum": [
+              "http",
+              "browser",
+              "opaque"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 256,
+            "title": "Name",
+            "type": "string"
+          },
+          "operations": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EgressAuthorityOperation"
+            },
+            "title": "Operations",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "kind"
+        ],
+        "title": "EgressAuthorityPolicyIdentity",
+        "type": "object"
+      },
       "EnqueueSessionMessageBody": {
         "additionalProperties": false,
         "properties": {
@@ -7454,6 +7674,37 @@
         "title": "EvalAuthoredSuiteCatalogPage",
         "type": "object"
       },
+      "EvalAuthoredSuiteExecutionProfileExpectation": {
+        "additionalProperties": false,
+        "description": "Browser-held CAS identity for one previewed authored-suite launch item.",
+        "properties": {
+          "case_ids": {
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+              "type": "string"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Case Ids",
+            "type": "array"
+          },
+          "execution_profile_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Execution Profile Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "case_ids",
+          "execution_profile_revision"
+        ],
+        "title": "EvalAuthoredSuiteExecutionProfileExpectation",
+        "type": "object"
+      },
       "EvalAuthoredSuiteLaunchDiagnostic": {
         "additionalProperties": false,
         "properties": {
@@ -7474,6 +7725,8 @@
           "code": {
             "enum": [
               "one_trial_required",
+              "execution_profile_unavailable",
+              "execution_profile_changed",
               "simple_launch_not_ready",
               "scenario_execution_unavailable",
               "scenario_launch_not_ready"
@@ -7510,6 +7763,20 @@
             "title": "Case Ids",
             "type": "array"
           },
+          "execution_profile_revision": {
+            "anyOf": [
+              {
+                "maxLength": 71,
+                "minLength": 71,
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Profile Revision"
+          },
           "kind": {
             "enum": [
               "simple_input",
@@ -7538,6 +7805,45 @@
           "case_ids"
         ],
         "title": "EvalAuthoredSuiteLaunchPlanItem",
+        "type": "object"
+      },
+      "EvalAuthoredSuiteRunLaunchRequest": {
+        "additionalProperties": false,
+        "description": "Exact reviewed selection and per-launch execution-profile expectations.",
+        "properties": {
+          "case_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "maxLength": 128,
+                  "minLength": 1,
+                  "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+                  "type": "string"
+                },
+                "maxItems": 1000,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Case Ids"
+          },
+          "expected_execution_profiles": {
+            "items": {
+              "$ref": "#/components/schemas/EvalAuthoredSuiteExecutionProfileExpectation"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Expected Execution Profiles",
+            "type": "array"
+          }
+        },
+        "required": [
+          "expected_execution_profiles"
+        ],
+        "title": "EvalAuthoredSuiteRunLaunchRequest",
         "type": "object"
       },
       "EvalAuthoredSuiteRunLaunchResponse": {
@@ -8454,6 +8760,362 @@
         "title": "EvalCorpusDocument",
         "type": "object"
       },
+      "EvalExecutionCandidateIdentityV1": {
+        "additionalProperties": false,
+        "description": "Safe current candidate identity selected by runtime preparation.",
+        "properties": {
+          "agent_name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Agent Name",
+            "type": "string"
+          },
+          "environment_name": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Environment Name"
+          },
+          "model": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Model",
+            "type": "string"
+          },
+          "provider_name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Provider Name",
+            "type": "string"
+          },
+          "runtime_execution_profile_fingerprint": {
+            "maxLength": 64,
+            "minLength": 64,
+            "title": "Runtime Execution Profile Fingerprint",
+            "type": "string"
+          },
+          "runtime_execution_profile_schema_version": {
+            "maximum": 64.0,
+            "minimum": 1.0,
+            "title": "Runtime Execution Profile Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "agent_name",
+          "provider_name",
+          "model",
+          "runtime_execution_profile_schema_version",
+          "runtime_execution_profile_fingerprint"
+        ],
+        "title": "EvalExecutionCandidateIdentityV1",
+        "type": "object"
+      },
+      "EvalExecutionProfileBindingV1": {
+        "additionalProperties": false,
+        "description": "Durable server-prepared runtime identity for one admitted eval run.",
+        "properties": {
+          "profile_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "title": "Profile Revision",
+            "type": "string"
+          },
+          "runtime_execution_profile": {
+            "$ref": "#/components/schemas/ExecutionProfileIdentity"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "profile_revision",
+          "runtime_execution_profile"
+        ],
+        "title": "EvalExecutionProfileBindingV1",
+        "type": "object"
+      },
+      "EvalExecutionProfileDiagnostic": {
+        "additionalProperties": false,
+        "description": "Stable public reason that an eval target cannot publish a current profile.",
+        "properties": {
+          "code": {
+            "enum": [
+              "not_resolved",
+              "application_identity_changed",
+              "runtime_authority_unavailable"
+            ],
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          },
+          "remediation": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Remediation",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "remediation"
+        ],
+        "title": "EvalExecutionProfileDiagnostic",
+        "type": "object"
+      },
+      "EvalExecutionProfileV1": {
+        "additionalProperties": false,
+        "description": "Bounded public snapshot of one currently executable server profile.",
+        "properties": {
+          "app_manifest_fingerprint": {
+            "maxLength": 64,
+            "minLength": 64,
+            "title": "App Manifest Fingerprint",
+            "type": "string"
+          },
+          "application_release_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Application Release Id",
+            "type": "string"
+          },
+          "candidate": {
+            "$ref": "#/components/schemas/EvalExecutionCandidateIdentityV1"
+          },
+          "ceilings": {
+            "$ref": "#/components/schemas/EvalExecutionResourceCeilingsV1"
+          },
+          "effect_posture": {
+            "enum": [
+              "ordinary_application_authority",
+              "isolated_application_authority"
+            ],
+            "title": "Effect Posture",
+            "type": "string"
+          },
+          "evidence_policy": {
+            "$ref": "#/components/schemas/EvaluationEvidencePolicySpec"
+          },
+          "fixture_strategy": {
+            "enum": [
+              "none",
+              "application_managed"
+            ],
+            "title": "Fixture Strategy",
+            "type": "string"
+          },
+          "isolation_revision": {
+            "anyOf": [
+              {
+                "maxLength": 71,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Isolation Revision"
+          },
+          "label": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Label",
+            "type": "string"
+          },
+          "profile_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Profile Id",
+            "type": "string"
+          },
+          "reset_strategy": {
+            "enum": [
+              "fresh_session_only",
+              "application_managed"
+            ],
+            "title": "Reset Strategy",
+            "type": "string"
+          },
+          "revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "source": {
+            "enum": [
+              "generated",
+              "explicit"
+            ],
+            "title": "Source",
+            "type": "string"
+          },
+          "target_key": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Target Key",
+            "type": "string"
+          },
+          "target_material": {
+            "$ref": "#/components/schemas/EvalExecutionTargetMaterialIdentityV1"
+          }
+        },
+        "required": [
+          "revision",
+          "profile_id",
+          "label",
+          "source",
+          "target_key",
+          "application_release_id",
+          "app_manifest_fingerprint",
+          "candidate",
+          "target_material",
+          "fixture_strategy",
+          "reset_strategy",
+          "effect_posture",
+          "evidence_policy",
+          "ceilings"
+        ],
+        "title": "EvalExecutionProfileV1",
+        "type": "object"
+      },
+      "EvalExecutionResourceCeilingsV1": {
+        "additionalProperties": false,
+        "description": "Complete server-owned limits that HTTP may only narrow.",
+        "properties": {
+          "max_bootstrap_messages": {
+            "maximum": 16.0,
+            "minimum": 0.0,
+            "title": "Max Bootstrap Messages",
+            "type": "integer"
+          },
+          "max_cases": {
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Max Cases",
+            "type": "integer"
+          },
+          "max_compiled_input_chars": {
+            "maximum": 8388608.0,
+            "minimum": 1.0,
+            "title": "Max Compiled Input Chars",
+            "type": "integer"
+          },
+          "max_concurrency": {
+            "maximum": 32.0,
+            "minimum": 1.0,
+            "title": "Max Concurrency",
+            "type": "integer"
+          },
+          "max_steps": {
+            "maximum": 256.0,
+            "minimum": 1.0,
+            "title": "Max Steps",
+            "type": "integer"
+          },
+          "max_timeout_seconds": {
+            "maximum": 3600.0,
+            "minimum": 1.0,
+            "title": "Max Timeout Seconds",
+            "type": "integer"
+          },
+          "max_total_input_chars": {
+            "maximum": 524288.0,
+            "minimum": 1.0,
+            "title": "Max Total Input Chars",
+            "type": "integer"
+          },
+          "max_trials": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Max Trials",
+            "type": "integer"
+          },
+          "run_limits": {
+            "$ref": "#/components/schemas/RunLimits"
+          }
+        },
+        "required": [
+          "max_cases",
+          "max_trials",
+          "max_concurrency",
+          "max_timeout_seconds",
+          "max_bootstrap_messages",
+          "max_total_input_chars",
+          "max_compiled_input_chars",
+          "max_steps",
+          "run_limits"
+        ],
+        "title": "EvalExecutionResourceCeilingsV1",
+        "type": "object"
+      },
+      "EvalExecutionTargetMaterialIdentityV1": {
+        "additionalProperties": false,
+        "description": "Opaque commitment to candidate inputs owned by one trusted target.\n\nRuntime execution authority is represented separately by\n``ExecutionProfileIdentity``. This identity covers the remaining target\nmaterial consumed while compiling each fresh request: the request base,\nbootstrap messages, and complete corpus-execution limit object.\n\nPublic-safe material has a restart-portable structural digest. Material\ncrossing the application's workload-secret boundary uses a process-keyed\nHMAC instead, so it remains exact within the serving process without\nexposing an offline digest of private values. A restart then changes the\nprocess scope and safely rejects previously admitted work.",
+        "properties": {
+          "fingerprint": {
+            "maxLength": 64,
+            "minLength": 64,
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "structural_sha256",
+              "process_local_hmac_sha256"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "process_scope": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Process Scope"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "fingerprint"
+        ],
+        "title": "EvalExecutionTargetMaterialIdentityV1",
+        "type": "object"
+      },
       "EvalMemoryAttributionCapturePolicyV1": {
         "additionalProperties": false,
         "description": "One fixed eval-owned projection contract.",
@@ -9097,6 +9759,18 @@
         "additionalProperties": false,
         "description": "Durable, authority-free execution contractions and trusted caller provenance.\n\nThe HTTP API constructs this value after authentication. It retains only the\nbounded subject/tenant projection needed to mint ordinary runtime invocation\nprovenance after a worker restart; authentication claims never enter EvalStore.\n``None`` bounds inherit the server-owned target request base.",
         "properties": {
+          "admission_request_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Secret-safe identity of the exact authenticated request that admitted this run.",
+            "title": "Admission Request Revision"
+          },
           "authored_suite_revision": {
             "anyOf": [
               {
@@ -9123,6 +9797,16 @@
             "anyOf": [
               {
                 "$ref": "#/components/schemas/EvalRunCostBudget-Output"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "execution_profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalExecutionProfileBindingV1"
               },
               {
                 "type": "null"
@@ -9580,6 +10264,20 @@
       "EvalScenarioArtifactMaterializationResponse": {
         "additionalProperties": false,
         "properties": {
+          "execution_profile_revision": {
+            "anyOf": [
+              {
+                "maxLength": 71,
+                "minLength": 71,
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Profile Revision"
+          },
           "materialization": {
             "$ref": "#/components/schemas/ScenarioArtifactMaterializationV2"
           },
@@ -9969,6 +10667,20 @@
       "EvalScenarioPreviewResponse": {
         "additionalProperties": false,
         "properties": {
+          "execution_profile_revision": {
+            "anyOf": [
+              {
+                "maxLength": 71,
+                "minLength": 71,
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Profile Revision"
+          },
           "preflight": {
             "$ref": "#/components/schemas/ScenarioLaunchPreflightResultV2"
           },
@@ -9994,12 +10706,20 @@
             "title": "Expected Binding Revision",
             "type": "string"
           },
+          "expected_execution_profile_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Expected Execution Profile Revision",
+            "type": "string"
+          },
           "settings": {
             "$ref": "#/components/schemas/ScenarioLaunchSettingsV2"
           }
         },
         "required": [
-          "expected_binding_revision"
+          "expected_binding_revision",
+          "expected_execution_profile_revision"
         ],
         "title": "EvalScenarioRunCreateRequest",
         "type": "object"
@@ -10163,6 +10883,20 @@
           "entry": {
             "$ref": "#/components/schemas/EvalScenarioCatalogEntry"
           },
+          "execution_profile_revision": {
+            "anyOf": [
+              {
+                "maxLength": 71,
+                "minLength": 71,
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Profile Revision"
+          },
           "preflight": {
             "$ref": "#/components/schemas/ScenarioLaunchPreflightResultV2"
           },
@@ -10207,6 +10941,7 @@
       "EvalScenarioTrialFailureCode": {
         "enum": [
           "execution_failed",
+          "execution_profile_changed",
           "unexpected_session_state",
           "expected_approval_unavailable",
           "expected_user_input_unavailable"
@@ -10816,6 +11551,28 @@
             "title": "Cost Budget Currencies",
             "type": "array"
           },
+          "execution_profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalExecutionProfileV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "execution_profile_diagnostics": {
+            "items": {
+              "$ref": "#/components/schemas/EvalExecutionProfileDiagnostic"
+            },
+            "maxItems": 4,
+            "title": "Execution Profile Diagnostics",
+            "type": "array"
+          },
+          "execution_profile_ready": {
+            "title": "Execution Profile Ready",
+            "type": "boolean"
+          },
           "label": {
             "maxLength": 512,
             "minLength": 1,
@@ -10895,7 +11652,10 @@
           "max_timeout_seconds",
           "max_steps",
           "cost_budget_available",
-          "cost_budget_currencies"
+          "cost_budget_currencies",
+          "execution_profile_ready",
+          "execution_profile",
+          "execution_profile_diagnostics"
         ],
         "title": "EvalTargetCatalogEntry",
         "type": "object"
@@ -11554,6 +12314,133 @@
         ],
         "title": "ExecutionProfileAdoptionBody",
         "type": "object"
+      },
+      "ExecutionProfileComponentClass": {
+        "description": "Stable classes of execution authority represented by a profile.",
+        "enum": [
+          "runtime",
+          "provider_target",
+          "durable_system_projection",
+          "direct_tools",
+          "tool_implementations",
+          "tool_view_grants",
+          "execution_policies",
+          "invocation_policies",
+          "runtime_hooks",
+          "execution_environment",
+          "effect_authority",
+          "egress_authority",
+          "context_selection",
+          "automatic_recall",
+          "context_compaction",
+          "live_state_projection",
+          "provider_adapter",
+          "provider_request_policy",
+          "application_budget_policy",
+          "invocation_budget_policy",
+          "structured_output",
+          "finalization"
+        ],
+        "title": "ExecutionProfileComponentClass",
+        "type": "string"
+      },
+      "ExecutionProfileComponentIdentity": {
+        "additionalProperties": false,
+        "description": "Redacted identity for one typed execution-profile component.",
+        "properties": {
+          "availability": {
+            "$ref": "#/components/schemas/ExecutionProfileIdentityAvailability"
+          },
+          "component_class": {
+            "$ref": "#/components/schemas/ExecutionProfileComponentClass"
+          },
+          "fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fingerprint"
+          },
+          "strength": {
+            "$ref": "#/components/schemas/ExecutionProfileIdentityStrength"
+          }
+        },
+        "required": [
+          "component_class",
+          "strength",
+          "availability",
+          "fingerprint"
+        ],
+        "title": "ExecutionProfileComponentIdentity",
+        "type": "object"
+      },
+      "ExecutionProfileIdentity": {
+        "additionalProperties": false,
+        "description": "Versioned, redacted identity frozen before a session can execute.",
+        "properties": {
+          "components": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionProfileComponentIdentity"
+            },
+            "title": "Components",
+            "type": "array"
+          },
+          "egress_authority": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EgressAuthorityIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "fingerprint": {
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "schema_version": {
+            "default": 5,
+            "enum": [
+              1,
+              2,
+              4,
+              5
+            ],
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "fingerprint",
+          "components"
+        ],
+        "title": "ExecutionProfileIdentity",
+        "type": "object"
+      },
+      "ExecutionProfileIdentityAvailability": {
+        "description": "Whether a component can be compared at the admission boundary.",
+        "enum": [
+          "available",
+          "unavailable"
+        ],
+        "title": "ExecutionProfileIdentityAvailability",
+        "type": "string"
+      },
+      "ExecutionProfileIdentityStrength": {
+        "description": "How strongly one component is identified.",
+        "enum": [
+          "application_versioned",
+          "structural",
+          "process_local",
+          "unavailable"
+        ],
+        "title": "ExecutionProfileIdentityStrength",
+        "type": "string"
       },
       "ExecutionRequirements": {
         "additionalProperties": false,
@@ -16710,7 +17597,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "29",
+            "default": "30",
             "title": "Contract Version",
             "type": "string"
           },
@@ -20769,7 +21656,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "29",
+            "default": "30",
             "title": "Contract Version",
             "type": "string"
           }
@@ -22783,6 +23670,13 @@
                       }
                     ]
                   },
+                  "expected_execution_profile_revision": {
+                    "maxLength": 71,
+                    "minLength": 71,
+                    "pattern": "^sha256:[0-9a-f]{64}$",
+                    "title": "Expected Execution Profile Revision",
+                    "type": "string"
+                  },
                   "limits": {
                     "anyOf": [
                       {
@@ -22902,7 +23796,8 @@
                 },
                 "required": [
                   "corpus_revision",
-                  "suite_id"
+                  "suite_id",
+                  "expected_execution_profile_revision"
                 ],
                 "title": "EvalRunCreateRequest",
                 "type": "object"
@@ -24119,7 +25014,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/EvalAuthoredSuiteRunSelectionRequest"
+                "$ref": "#/components/schemas/EvalAuthoredSuiteRunLaunchRequest"
               }
             }
           },

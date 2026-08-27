@@ -6,6 +6,8 @@ import type {
 } from "./generated/server-api/index.ts"
 
 export const MAX_EVAL_CORPUS_FILE_BYTES = 8 * 1024 * 1024
+export const EVAL_TARGET_QUERY_KEY = ["evals", "targets"] as const
+export const EVAL_TARGET_STALE_TIME_MS = 15_000
 const EVAL_LAUNCH_REGISTRY_KEY_PREFIX = "cayu.eval-launch-idempotency.v1:"
 const EVAL_LAUNCH_REGISTRY_MAX_ENTRIES = 32
 const EVAL_LAUNCH_IDENTITY_MAX_CHARS = 1_024
@@ -69,6 +71,10 @@ export function evalLaunchFailureIsDefinitive(status: number): boolean {
     (status >= 400 && status < 500 && !AMBIGUOUS_EVAL_LAUNCH_FAILURE_STATUSES.has(status)) ||
     status === 501
   )
+}
+
+export function evalTargetCatalogMayBeStale(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "status" in error && error.status === 409
 }
 
 export function retryEvalQuery(failureCount: number, error: Error): boolean {
@@ -207,22 +213,39 @@ export function evalLaunchRequestIdentity(
   corpusRevision: string,
   suiteId: string,
   maxConcurrency: number,
+  executionProfileRevision: string,
 ): string {
-  return JSON.stringify([corpusRevision, suiteId, maxConcurrency])
+  return JSON.stringify([
+    "corpus-v1",
+    corpusRevision,
+    suiteId,
+    maxConcurrency,
+    executionProfileRevision,
+  ])
 }
 
 export function scenarioEvalLaunchRequestIdentity(
   scenarioRevision: string,
   bindingRevision: string,
+  executionProfileRevision: string,
 ): string {
-  return JSON.stringify(["scenario-v2", scenarioRevision, bindingRevision])
+  return JSON.stringify([
+    "scenario-v2",
+    scenarioRevision,
+    bindingRevision,
+    executionProfileRevision,
+  ])
 }
 
 export function authoredSuiteEvalLaunchRequestIdentity(
   suiteRevision: string,
   selectionRevision: string,
+  executionProfiles: ReadonlyArray<{
+    case_ids: ReadonlyArray<string>
+    execution_profile_revision: string
+  }>,
 ): string {
-  return JSON.stringify(["authored-suite-v1", suiteRevision, selectionRevision])
+  return JSON.stringify(["authored-suite-v1", suiteRevision, selectionRevision, executionProfiles])
 }
 
 export function capturedEvalLaunchRequestIdentity(
@@ -234,6 +257,7 @@ export function capturedEvalLaunchRequestIdentity(
     "captured-v1",
     sessionId,
     candidateRevision,
+    request.expected_execution_profile_revision,
     request.trial_request?.trials ?? 1,
     request.trial_request?.timeout_seconds ?? 300,
     request.max_concurrency ?? 1,
