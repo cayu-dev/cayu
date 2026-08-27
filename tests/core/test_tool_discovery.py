@@ -16,21 +16,31 @@ from cayu.core.tools import (
     ToolSpec,
 )
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.providers.base import (
+    OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
+    OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
+)
 from cayu.runtime import (
     CayuApp,
     ForkSessionRequest,
     InMemorySessionStore,
+    MessageWindowContextPolicy,
     ResumeRequest,
     RunRequest,
+    StaticToolExposurePolicy,
+    TargetedToolGrant,
 )
 from cayu.runtime.hooks import BeforeToolCallHookContext, RuntimeHook, ToolCallHookContext
 from cayu.runtime.tool_catalogue import build_tool_catalog_snapshot, build_tool_descriptor
 from cayu.runtime.tool_discovery import (
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+    ToolDiscoveryMode,
+    ToolDiscoveryProjectionKind,
     ToolDiscoveryViewInspection,
     ToolDiscoveryViewState,
     current_tool_discovery_view,
     initial_tool_discovery_operation_records,
+    resolve_tool_discovery_projection,
     search_tool_descriptors,
     search_tools_spec,
 )
@@ -43,6 +53,7 @@ from cayu.runtime.tool_policy import (
     ToolPolicyResult,
 )
 from cayu.storage.sqlite import SQLiteSessionStore
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
 class _RememberKnowledgeTool(Tool):
@@ -206,12 +217,341 @@ class _DiscoveryProvider(ModelProvider):
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
+class _NativeDiscoveryProvider(ModelProvider):
+    name = "native-discovery-test"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:tool-discovery:native-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
+        return model == "fake-model" and protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        projection = request.tool_discovery_projection
+        assert projection is not None
+        if len(self.requests) == 1:
+            assert projection.loaded_tool_names == ()
+            yield ModelStreamEvent.tool_call(
+                id="native-search",
+                name="search_tools",
+                arguments={"query": "remember durable knowledge", "limit": 3},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        if len(self.requests) == 2:
+            assert projection.loaded_tool_names == ("remember_knowledge",)
+            yield ModelStreamEvent.tool_call(
+                id="native-tool-call",
+                name="remember_knowledge",
+                arguments={"fact": "Native discovery keeps durable authority."},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        if len(self.requests) == 4:
+            assert projection.loaded_tool_names == ()
+            yield ModelStreamEvent.tool_call(
+                id="child-guessed-tool-call",
+                name="remember_knowledge",
+                arguments={"fact": "A child must not inherit or guess this capability."},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        if len(self.requests) == 5:
+            assert projection.loaded_tool_names == ()
+            rejected_results = [
+                part
+                for message in request.messages
+                if message.role == "tool"
+                for part in message.content
+                if part.type == "tool_result" and part.tool_name == "remember_knowledge"
+            ]
+            assert rejected_results[-1].is_error is True
+            yield ModelStreamEvent.text_delta("child guess rejected")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+            return
+        if len(self.requests) == 6:
+            assert projection.loaded_tool_names == ("remember_knowledge",)
+            yield ModelStreamEvent.tool_call(
+                id="native-resumed-tool-call",
+                name="remember_knowledge",
+                arguments={"fact": "Native discovery survives ordinary resume."},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        assert len(self.requests) in {3, 7}
+        results = [
+            part
+            for message in request.messages
+            if message.role == "tool"
+            for part in message.content
+            if part.type == "tool_result" and part.tool_name == "remember_knowledge"
+        ]
+        expected_result = (
+            "remembered: Native discovery keeps durable authority."
+            if len(self.requests) == 3
+            else "remembered: Native discovery survives ordinary resume."
+        )
+        assert results[-1].content == expected_result
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _SecretBearingDiscoveryTool(Tool):
+    def __init__(self, secret: str, *, secret_schema_key: bool = False) -> None:
+        property_name = secret if secret_schema_key else "note"
+        super().__init__(
+            ToolSpec(
+                name="remember_private_note",
+                description=f"Save a private note without exposing {secret}.",
+                input_schema={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        property_name: {
+                            "type": "string",
+                            "description": f"A note whose protected default is {secret}.",
+                            "default": secret,
+                        }
+                    },
+                },
+            )
+        )
+
+    async def run(self, ctx: ToolContext, args: dict[str, object]) -> ToolResult:
+        del ctx, args
+        return ToolResult(content="unused")
+
+
+class _NativeDiscoveryRedactionProvider(ModelProvider):
+    name = "native-discovery-redaction-test"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:tool-discovery:native-redaction-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
+        return model == "fake-model" and protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        projection = request.tool_discovery_projection
+        assert projection is not None
+        if len(self.requests) == 1:
+            assert projection.loaded_tool_names == ()
+            yield ModelStreamEvent.tool_call(
+                id="redaction-search",
+                name="search_tools",
+                arguments={"query": "remember private note", "limit": 1},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        assert len(self.requests) == 2
+        assert projection.loaded_tool_names == ("remember_private_note",)
+        yield ModelStreamEvent.text_delta("loaded safely")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _NativeDiscoveryTrimProvider(ModelProvider):
+    name = "native-discovery-trim-test"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:tool-discovery:native-trim-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
+        return model == "fake-model" and protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        projection = request.tool_discovery_projection
+        assert projection is not None
+        request_number = len(self.requests)
+        if request_number == 1:
+            assert projection.loaded_tool_names == ()
+            yield ModelStreamEvent.tool_call(
+                id="trim-search",
+                name="search_tools",
+                arguments={"query": "remember durable knowledge", "limit": 1},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        if request_number == 2:
+            assert projection.loaded_tool_names == ("remember_knowledge",)
+            yield ModelStreamEvent.text_delta("loaded")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+            return
+        if request_number == 3:
+            assert projection.loaded_tool_names == ()
+            yield ModelStreamEvent.tool_call(
+                id="trimmed-guessed-call",
+                name="remember_knowledge",
+                arguments={"fact": "A trimmed schema must not retain call authority."},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        assert request_number == 4
+        assert projection.loaded_tool_names == ()
+        rejected_results = [
+            part
+            for message in request.messages
+            if message.role == "tool"
+            for part in message.content
+            if part.type == "tool_result" and part.tool_name == "remember_knowledge"
+        ]
+        assert rejected_results[-1].is_error is True
+        yield ModelStreamEvent.text_delta("trimmed guess rejected")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _NativeDiscoveryAndTargetedProvider(ModelProvider):
+    name = "native-discovery-and-targeted-test"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:tool-discovery:native-and-targeted-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    def supports_targeted_tool_projection(self, *, model: str, protocol: str) -> bool:
+        return model == "fake-model" and protocol == OPENAI_ADDITIONAL_TOOLS_PROTOCOL
+
+    def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
+        return model == "fake-model" and protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        assert request.targeted_tool_projection is not None
+        assert [tool["name"] for tool in request.targeted_tool_projection.tools] == [
+            "remember_knowledge"
+        ]
+        discovery = request.tool_discovery_projection
+        assert discovery is not None
+        assert discovery.loaded_tool_names == ()
+        if len(self.requests) == 1:
+            yield ModelStreamEvent.tool_call(
+                id="overlap-search",
+                name="search_tools",
+                arguments={"query": "remember durable knowledge", "limit": 1},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        if len(self.requests) == 2:
+            search_results = [
+                part
+                for message in request.messages
+                if message.role == "tool"
+                for part in message.content
+                if part.type == "tool_result" and part.tool_name == "search_tools"
+            ]
+            assert search_results[-1].structured is not None
+            assert [match["name"] for match in search_results[-1].structured["matches"]] == [
+                "remember_knowledge"
+            ]
+            yield ModelStreamEvent.tool_call(
+                id="overlap-native-call",
+                name="remember_knowledge",
+                arguments={"fact": "Targeted authority wins an overlapping native name."},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        assert len(self.requests) == 3
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _NativeDirectExposureProvider(ModelProvider):
+    name = "native-direct-exposure-test"
+
+    @property
+    def execution_profile_identity(self) -> ExecutionProfileBehaviorIdentity:
+        return ExecutionProfileBehaviorIdentity(
+            name="tests:tool-discovery:native-direct-exposure-provider",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
+        return model == "fake-model" and protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        projection = request.tool_discovery_projection
+        assert projection is not None
+        assert projection.loaded_tool_names == ()
+        if len(self.requests) == 1:
+            assert [tool["name"] for tool in request.tools] == [
+                "search_tools",
+                "call_tool",
+                "remember_knowledge",
+            ]
+            yield ModelStreamEvent.tool_call(
+                id="direct-exposure-search",
+                name="search_tools",
+                arguments={"query": "remember knowledge", "limit": 1},
+            )
+            yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+            return
+        assert len(self.requests) == 2
+        search_results = [
+            part
+            for message in request.messages
+            if message.role == "tool"
+            for part in message.content
+            if part.type == "tool_result" and part.tool_name == "search_tools"
+        ]
+        assert search_results[-1].structured is not None
+        assert search_results[-1].structured["matches"] == []
+        yield ModelStreamEvent.text_delta("direct tool omitted from discovery")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
 class _RecordingPolicy(ToolPolicy):
     def __init__(self) -> None:
         self.requests: list[ToolPolicyRequest] = []
 
     async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
         self.requests.append(request)
+        return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
+
+
+class _RequireRememberApprovalPolicy(ToolPolicy):
+    async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+        if request.tool_name == "remember_knowledge":
+            return ToolPolicyResult(
+                decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+                reason="Remembering knowledge requires review.",
+            )
         return ToolPolicyResult(decision=ToolPolicyDecision.ALLOW)
 
 
@@ -497,6 +837,370 @@ def test_search_tools_vertical_keeps_catalogue_hidden_and_routes_effective_tool(
             "remember_knowledge",
             "remember_knowledge",
         ]
+
+    asyncio.run(run())
+
+
+def test_native_discovery_routes_loaded_name_through_the_same_grant_and_hooks() -> None:
+    async def run() -> None:
+        provider = _NativeDiscoveryProvider()
+        remembered = _RememberKnowledgeTool()
+        policy = _RecordingPolicy()
+        hook = _RecordingHook()
+        app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(remembered,),
+            tool_discovery_mode="openai_tool_search_client",
+            tool_policy=policy,
+            runtime_hooks=(hook,),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="native-discovery-session",
+                    messages=[Message.text("user", "Find and save the lesson.")],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert remembered.calls == [{"fact": "Native discovery keeps durable authority."}]
+        assert [
+            request.tool_discovery_projection.loaded_tool_names for request in provider.requests
+        ] == [
+            (),
+            ("remember_knowledge",),
+            ("remember_knowledge",),
+        ]
+        assert [request.tool_name for request in policy.requests] == [
+            "search_tools",
+            "remember_knowledge",
+        ]
+        assert hook.before == ["search_tools", "remember_knowledge"]
+        assert hook.after == ["search_tools", "remember_knowledge"]
+
+        forked = [
+            event
+            async for event in app.fork_session(
+                ForkSessionRequest(
+                    source_session_id="native-discovery-session",
+                    session_id="native-discovery-child",
+                )
+            )
+        ]
+        assert forked[0].type is EventType.SESSION_FORKED
+        child_events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id="native-discovery-child",
+                    messages=[Message.text("user", "Continue independently.")],
+                )
+            )
+        ]
+        assert child_events[-1].type is EventType.SESSION_COMPLETED
+        assert provider.requests[-1].tool_discovery_projection is not None
+        assert provider.requests[-1].tool_discovery_projection.loaded_tool_names == ()
+        assert remembered.calls == [{"fact": "Native discovery keeps durable authority."}]
+        child_blocked = next(
+            event for event in child_events if event.type is EventType.TOOL_CALL_BLOCKED
+        )
+        assert child_blocked.payload["reason"] == "not_exposed_in_request"
+
+        resumed_events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id="native-discovery-session",
+                    messages=[Message.text("user", "Save one more lesson.")],
+                )
+            )
+        ]
+        assert resumed_events[-1].type is EventType.SESSION_COMPLETED
+        assert remembered.calls == [
+            {"fact": "Native discovery keeps durable authority."},
+            {"fact": "Native discovery survives ordinary resume."},
+        ]
+        assert [
+            request.tool_discovery_projection.loaded_tool_names
+            for request in provider.requests[-2:]
+        ] == [
+            ("remember_knowledge",),
+            ("remember_knowledge",),
+        ]
+        assert [request.tool_name for request in policy.requests] == [
+            "search_tools",
+            "remember_knowledge",
+            "remember_knowledge",
+        ]
+        assert hook.before == [
+            "search_tools",
+            "remember_knowledge",
+            "remember_knowledge",
+        ]
+        assert hook.after == [
+            "search_tools",
+            "remember_knowledge",
+            "remember_knowledge",
+        ]
+
+    asyncio.run(run())
+
+
+def test_native_discovery_redacts_loaded_definitions_before_provider_dispatch() -> None:
+    async def run() -> None:
+        secret = "native-discovery-secret-canary"
+        provider = _NativeDiscoveryRedactionProvider()
+        app = CayuApp(
+            session_store=InMemorySessionStore(),
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(_SecretBearingDiscoveryTool(secret),),
+            tool_discovery_mode="openai_tool_search_client",
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="native-discovery-redaction",
+                    messages=[Message.text("user", "Find the private-note capability.")],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert len(provider.requests) == 2
+        projection = provider.requests[-1].tool_discovery_projection
+        assert projection is not None
+        [loaded_tool] = projection.loaded_tools
+        rendered_tool = json.dumps(loaded_tool, sort_keys=True)
+        rendered_request = provider.requests[-1].model_dump_json()
+        assert secret not in rendered_tool
+        assert secret not in rendered_request
+        assert REDACTED_SECRET in rendered_tool
+        assert loaded_tool["name"] == "remember_private_note"
+
+    asyncio.run(run())
+
+
+def test_native_discovery_rejects_secret_bearing_schema_keys_before_dispatch() -> None:
+    async def run() -> None:
+        secret = "native-discovery-secret-schema-key"
+        provider = _NativeDiscoveryRedactionProvider()
+        app = CayuApp(
+            session_store=InMemorySessionStore(),
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(_SecretBearingDiscoveryTool(secret, secret_schema_key=True),),
+            tool_discovery_mode="openai_tool_search_client",
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            _ = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="native-discovery-secret-schema-key",
+                        messages=[Message.text("user", "Find the private-note capability.")],
+                    )
+                )
+            ]
+
+        assert provider.requests == []
+        assert secret not in repr((str(exc_info.value), vars(exc_info.value)))
+
+    asyncio.run(run())
+
+
+def test_targeted_native_grant_takes_precedence_over_same_name_discovery_grant() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = _NativeDiscoveryAndTargetedProvider()
+        remembered = _RememberKnowledgeTool()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(remembered,),
+            targeted_tool_mode="openai_additional_tools",
+            tool_discovery_mode="openai_tool_search_client",
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="native-discovery-targeted-overlap",
+                    messages=[Message.text("user", "Find and save the lesson.")],
+                    tool_grants=(
+                        TargetedToolGrant(
+                            request_id="targeted-overlap",
+                            tool_id="cayu:remember_knowledge",
+                            max_calls=1,
+                            lifetime_seconds=60,
+                        ),
+                    ),
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert remembered.calls == [{"fact": "Targeted authority wins an overlapping native name."}]
+        [targeted_record] = await store.list_targeted_tool_grants(
+            "native-discovery-targeted-overlap"
+        )
+        started = next(
+            event
+            for event in events
+            if event.type is EventType.TOOL_CALL_STARTED and event.tool_name == "remember_knowledge"
+        )
+        assert started.payload["dispatch_kind"] == "native"
+        assert started.payload["grant_id"] == targeted_record.grant_id
+        discovery_view = await app.inspect_tool_discovery_view("native-discovery-targeted-overlap")
+        assert discovery_view.grant_count == 1
+        assert [grant.tool_name for grant in discovery_view.grants] == ["remember_knowledge"]
+        assert [
+            request.tool_discovery_projection.loaded_tool_names
+            for request in provider.requests
+            if request.tool_discovery_projection is not None
+        ] == [(), (), ()]
+
+    asyncio.run(run())
+
+
+def test_native_discovery_uses_the_ordinary_tool_approval_boundary() -> None:
+    async def run() -> None:
+        provider = _NativeDiscoveryProvider()
+        remembered = _RememberKnowledgeTool()
+        app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(remembered,),
+            tool_discovery_mode="openai_tool_search_client",
+            tool_policy=_RequireRememberApprovalPolicy(),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="native-discovery-approval",
+                    messages=[Message.text("user", "Find and save the lesson.")],
+                )
+            )
+        ]
+
+        approval = next(
+            event for event in events if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
+        )
+        assert approval.tool_name == "remember_knowledge"
+        assert events[-1].type is EventType.SESSION_INTERRUPTED
+        assert events[-1].payload["interruption_type"] == "tool_approval_required"
+        assert remembered.calls == []
+        assert [
+            request.tool_discovery_projection.loaded_tool_names for request in provider.requests
+        ] == [(), ("remember_knowledge",)]
+
+    asyncio.run(run())
+
+
+def test_native_discovery_unloads_a_grant_when_context_drops_its_schema_evidence() -> None:
+    async def run() -> None:
+        provider = _NativeDiscoveryTrimProvider()
+        remembered = _RememberKnowledgeTool()
+        app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(remembered,),
+            tool_discovery_mode="openai_tool_search_client",
+            context_policy=MessageWindowContextPolicy(max_messages=2),
+        )
+
+        initial_events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="native-discovery-trim",
+                    messages=[Message.text("user", "Find the memory tool.")],
+                )
+            )
+        ]
+        assert initial_events[-1].type is EventType.SESSION_COMPLETED
+
+        resumed_events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id="native-discovery-trim",
+                    messages=[Message.text("user", "Try the remembered tool name.")],
+                )
+            )
+        ]
+
+        assert resumed_events[-1].type is EventType.SESSION_COMPLETED
+        blocked = next(
+            event for event in resumed_events if event.type is EventType.TOOL_CALL_BLOCKED
+        )
+        assert blocked.payload["reason"] == "not_exposed_in_request"
+        assert remembered.calls == []
+        assert [
+            request.tool_discovery_projection.loaded_tool_names for request in provider.requests
+        ] == [(), ("remember_knowledge",), (), ()]
+
+    asyncio.run(run())
+
+
+def test_native_discovery_omits_the_current_direct_exposure_from_search_results() -> None:
+    async def run() -> None:
+        provider = _NativeDirectExposureProvider()
+        remembered = _RememberKnowledgeTool()
+        app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(remembered,),
+            tool_discovery_mode="openai_tool_search_client",
+            tool_exposure_policy=StaticToolExposurePolicy(
+                profile_id="direct-memory",
+                tools=("remember_knowledge",),
+            ),
+        )
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="native-discovery-direct-exposure",
+                    messages=[Message.text("user", "Search for the visible memory tool.")],
+                )
+            )
+        ]
+
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert remembered.calls == []
+        assert len(provider.requests) == 2
 
     asyncio.run(run())
 
@@ -803,3 +1507,69 @@ def test_registration_rejects_invalid_discovery_modes() -> None:
             AgentSpec(name="assistant", model="model"),
             tool_discovery_mode=True,  # type: ignore[arg-type]
         )
+
+
+def test_discovery_projection_resolution_is_explicit_and_fallback_is_portable() -> None:
+    portable_provider = _DiscoveryProvider()
+    native_provider = _NativeDiscoveryProvider()
+
+    assert (
+        resolve_tool_discovery_projection(
+            ToolDiscoveryMode.SEARCH_TOOLS,
+            provider=portable_provider,
+            model="fake-model",
+        )
+        is ToolDiscoveryProjectionKind.SEARCH_TOOLS
+    )
+    assert (
+        resolve_tool_discovery_projection(
+            ToolDiscoveryMode.OPENAI_TOOL_SEARCH_CLIENT_OR_SEARCH_TOOLS,
+            provider=portable_provider,
+            model="fake-model",
+        )
+        is ToolDiscoveryProjectionKind.SEARCH_TOOLS
+    )
+    assert (
+        resolve_tool_discovery_projection(
+            ToolDiscoveryMode.OPENAI_TOOL_SEARCH_CLIENT,
+            provider=native_provider,
+            model="fake-model",
+        )
+        is ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT
+    )
+    with pytest.raises(ValueError, match="not established"):
+        resolve_tool_discovery_projection(
+            ToolDiscoveryMode.OPENAI_TOOL_SEARCH_CLIENT,
+            provider=portable_provider,
+            model="fake-model",
+        )
+
+
+def test_required_native_discovery_rejects_before_session_creation() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        provider = _DiscoveryProvider()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=(_RememberKnowledgeTool(),),
+            tool_discovery_mode="openai_tool_search_client",
+        )
+
+        with pytest.raises(ValueError, match="not established"):
+            _ = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="unsupported-native-discovery",
+                        messages=[Message.text("user", "Find a tool.")],
+                    )
+                )
+            ]
+
+        assert await store.load("unsupported-native-discovery") is None
+        assert provider.requests == []
+
+    asyncio.run(run())

@@ -3846,6 +3846,7 @@ class PromptCacheCompactor(ContextCompactor):
             messages=compaction_messages,
             tools=tools,
             targeted_tool_projection=cached_request.targeted_tool_projection,
+            tool_discovery_projection=cached_request.tool_discovery_projection,
             options=options,
         )
 
@@ -4208,6 +4209,7 @@ def _detach_compaction_model_request(request: ModelRequest) -> ModelRequest:
         tools=request.tools,
         hosted_tools=request.hosted_tools,
         targeted_tool_projection=request.targeted_tool_projection,
+        tool_discovery_projection=request.tool_discovery_projection,
         options=request.options,
     )
 

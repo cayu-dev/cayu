@@ -606,7 +606,6 @@ from cayu.runtime.tasks import (
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
 from cayu.runtime.tool_discovery import (
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
-    ToolDiscoveryMode,
     current_tool_discovery_view,
     initial_tool_discovery_operation_records,
     tool_discovery_generation_id,
@@ -2926,7 +2925,7 @@ def _tool_discovery_operation_initializer(
 ) -> SessionOperationInitializer | None:
     """Freeze one pure initializer for a discovery-enabled session branch."""
 
-    if registered_agent.tool_discovery_mode is not ToolDiscoveryMode.SEARCH_TOOLS:
+    if registered_agent.tool_discovery_mode is None:
         return None
     catalogue = registered_agent.tool_catalogue
     agent_name = registered_agent.spec.name
@@ -2955,7 +2954,7 @@ async def _require_tool_discovery_view(
 ) -> None:
     """Validate exact persisted discovery authority after a lifecycle boundary."""
 
-    if registered_agent.tool_discovery_mode is not ToolDiscoveryMode.SEARCH_TOOLS:
+    if registered_agent.tool_discovery_mode is None:
         return
     state = current_tool_discovery_view(
         await store.load_session_operation(
@@ -7363,7 +7362,7 @@ class SessionEngine:
         if registered_agent.spec.name != request.agent_name:
             raise ValueError("Initial-run agent override conflicts with the request agent.")
         if (
-            registered_agent.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS
+            registered_agent.tool_discovery_mode is not None
             and not self.session_store.supports_atomic_session_operation_initialization
         ):
             raise RuntimeError("Tool discovery requires atomic session operation initialization.")
@@ -14098,7 +14097,7 @@ class SessionEngine:
         tool_capability_ceiling_narrowed = (
             effective_tool_capability_ceiling != stored_tool_capability_ceiling
         )
-        if registered_agent.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS:
+        if registered_agent.tool_discovery_mode is not None:
             if not self.session_store.supports_atomic_session_operation_initialization:
                 raise RuntimeError(
                     "Tool discovery requires atomic session operation initialization."
@@ -15593,7 +15592,7 @@ class SessionEngine:
         source_tool_capability_ceiling = tool_capability_ceiling_from_session_metadata(
             source_session.metadata,
         )
-        if source_registered_agent.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS:
+        if source_registered_agent.tool_discovery_mode is not None:
             if not self.session_store.supports_atomic_session_operation_initialization:
                 raise RuntimeError(
                     "Tool discovery requires atomic session operation initialization."
@@ -15608,7 +15607,7 @@ class SessionEngine:
         agent_name = request.agent_name or source_session.agent_name
         registered_agent = self._get_registered_agent(agent_name)
         if (
-            registered_agent.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS
+            registered_agent.tool_discovery_mode is not None
             and not self.session_store.supports_atomic_session_operation_initialization
         ):
             raise RuntimeError("Tool discovery requires atomic session operation initialization.")

@@ -27,6 +27,7 @@ from cayu import (
     RequestVariant,
     StructuredOutputSpec,
     TargetedToolGrantFootprint,
+    ToolDiscoveryProjectionRequest,
     ToolDiscoveryViewFootprint,
     ToolExposure,
     build_prompt_contribution_manifest,
@@ -317,6 +318,147 @@ def test_discovery_core_does_not_count_as_direct_application_exposure() -> None:
     assert footprint.tool_exposure.registered_count == 100
     assert footprint.tool_exposure.exposed_count == 0
     assert footprint.tools.count == 2
+
+
+def test_native_discovery_accounts_for_loaded_schema_and_omitted_gateway() -> None:
+    execution_profile_fingerprint = "a" * 64
+    fingerprint_config = RequestFootprintConfig(
+        fingerprint_key_id="native-discovery-test-key",
+        fingerprint_key=SecretStr("n" * 32),
+    )
+    exposure = ToolExposure(
+        execution_profile_fingerprint=execution_profile_fingerprint,
+        profile_id=TOOL_DISCOVERY_ONLY_PROFILE_ID,
+        catalogue_revision=_CATALOGUE_REVISION,
+        exposure_fingerprint="b" * 64,
+        registered_count=1,
+        ceiling_count=1,
+        exposed_count=0,
+        profile_changed=False,
+        step=1,
+        provider_name="provider-a",
+        model="model-a",
+        model_step_id="mstep_00000000000000000000000000000001",
+    )
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"fact": {"type": "string", "description": "Reviewed fact."}},
+        "required": ["fact"],
+    }
+    messages = [
+        Message.text("user", "Find a memory tool."),
+        Message(
+            role="assistant",
+            content=[
+                ToolCallPart(
+                    tool_call_id="search-1",
+                    tool_name="search_tools",
+                    arguments={"query": "memory", "limit": 1},
+                )
+            ],
+        ),
+        Message.tool_result(
+            tool_call_id="search-1",
+            tool_name="search_tools",
+            content="one match",
+            structured={
+                "schema_version": 1,
+                "query": "memory",
+                "matches": [
+                    {
+                        "tool_ref": f"cayu_tool_v1_{'a' * 64}",
+                        "tool_id": "tool:remember_knowledge",
+                        "name": "remember_knowledge",
+                        "description": "Save durable knowledge.",
+                        "input_schema": schema,
+                        "descriptor_version": f"sha256:{'b' * 64}",
+                        "schema_fingerprint": f"sha256:{'c' * 64}",
+                        "readiness": "registered",
+                    }
+                ],
+                "view_revision": 1,
+                "truncated": False,
+            },
+        ),
+    ]
+    portable_request = ModelRequest(
+        model="model-a",
+        messages=messages,
+        tools=[search_tools_spec(), call_tool_spec()],
+    )
+    native_request = portable_request.model_copy(
+        update={
+            "tool_discovery_projection": ToolDiscoveryProjectionRequest(
+                loaded_tools=(
+                    {
+                        "name": "remember_knowledge",
+                        "description": "Save durable knowledge.",
+                        "input_schema": schema,
+                    },
+                )
+            )
+        }
+    )
+
+    def footprint(request: ModelRequest, observation_id: str) -> RequestFootprint:
+        return build_request_footprint(
+            request,
+            provider_name="provider-a",
+            step=1,
+            attempt=1,
+            max_attempts=1,
+            request_variant=RequestVariant.INITIAL,
+            observation_id=observation_id,
+            model_step_id=exposure.model_step_id,
+            model_attempt_id="matt_00000000000000000000000000000001",
+            execution_profile_fingerprint=execution_profile_fingerprint,
+            tool_exposure=exposure,
+            config=fingerprint_config,
+        )
+
+    portable = footprint(portable_request, "portable-discovery-footprint")
+    native_unloaded = footprint(
+        portable_request.model_copy(
+            update={"tool_discovery_projection": ToolDiscoveryProjectionRequest()}
+        ),
+        "native-unloaded-discovery-footprint",
+    )
+    native = footprint(native_request, "native-discovery-footprint")
+    anchored_native = footprint(
+        native_request.model_copy(
+            update={"options": {TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION: CALL_TOOL_NAME}}
+        ),
+        "anchored-native-discovery-footprint",
+    )
+
+    assert portable.tools.count == 2
+    assert native.tools.count == 1
+    assert anchored_native.tools.count == 2
+    assert native.messages.size.canonical_json_bytes > portable.messages.size.canonical_json_bytes
+    assert (
+        native.component_tokens.tool_schema_input_tokens
+        > native_unloaded.component_tokens.tool_schema_input_tokens
+    )
+    assert (
+        native.fingerprints.tool_manifest.value == native_unloaded.fingerprints.tool_manifest.value
+    )
+    assert (
+        native.fingerprints.provider_neutral_request.value
+        != native_unloaded.fingerprints.provider_neutral_request.value
+    )
+
+
+def test_native_discovery_footprint_does_not_subtract_an_absent_gateway() -> None:
+    request = ModelRequest(
+        model="model-a",
+        messages=[Message.text("user", "Find a tool.")],
+        tool_discovery_projection=ToolDiscoveryProjectionRequest(),
+    )
+
+    footprint = _build(request)
+
+    assert footprint.tools.count == 0
 
 
 def test_request_footprint_v5_adds_bounded_targeted_grants_without_tool_prefix_drift() -> None:

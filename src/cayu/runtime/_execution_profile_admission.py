@@ -35,7 +35,11 @@ from cayu.runtime.targeted_tool_projection import (
     TargetedToolProjectionKind,
     resolve_targeted_tool_projection,
 )
-from cayu.runtime.tool_discovery import tool_discovery_execution_profile_material
+from cayu.runtime.tool_discovery import (
+    ToolDiscoveryProjectionKind,
+    resolve_tool_discovery_projection,
+    tool_discovery_execution_profile_material,
+)
 from cayu.runtime.tool_gateway import call_tool_gateway_execution_profile_material
 from cayu.runtime.user_input import pending_user_input_from_checkpoint
 from cayu.vaults import SecretRedactor
@@ -513,6 +517,15 @@ def resolve_execution_profile_identity(
             model=model,
         )
     )
+    tool_discovery_projection = (
+        None
+        if registered_agent.tool_discovery_mode is None or registered_provider is None
+        else resolve_tool_discovery_projection(
+            registered_agent.tool_discovery_mode,
+            provider=registered_provider.provider,
+            model=model,
+        )
+    )
     targeted_tool_delivery_material = (
         None
         if registered_agent.targeted_tool_mode is None
@@ -529,7 +542,7 @@ def resolve_execution_profile_identity(
                         **call_tool_gateway_execution_profile_material(),
                         "callable": (
                             targeted_tool_projection is TargetedToolProjectionKind.CALL_TOOL
-                            or registered_agent.tool_discovery_mode is not None
+                            or tool_discovery_projection is ToolDiscoveryProjectionKind.SEARCH_TOOLS
                         ),
                     }
                 }
@@ -544,9 +557,12 @@ def resolve_execution_profile_identity(
         else {
             **tool_discovery_execution_profile_material(),
             "configured_mode": registered_agent.tool_discovery_mode.value,
+            "resolved_projection": (
+                None if tool_discovery_projection is None else tool_discovery_projection.value
+            ),
             "call_tool_core": {
                 **call_tool_gateway_execution_profile_material(),
-                "callable": True,
+                "callable": (tool_discovery_projection is ToolDiscoveryProjectionKind.SEARCH_TOOLS),
             },
         }
     )
@@ -1688,12 +1704,13 @@ def _cayu_provider_material(provider: object) -> dict[str, Any] | None:
             return None
         return {
             "adapter": "openai-responses",
-            "version": 3,
+            "version": 4,
             "base_url": provider.base_url,
             "default_route": provider.base_url == DEFAULT_OPENAI_BASE_URL,
             "reasoning_state": provider.reasoning_state,
             "background": provider.background,
             "additional_tools_models": sorted(provider.additional_tools_models),
+            "client_tool_search_models": sorted(provider.client_tool_search_models),
             "timeout_s": provider.timeout_s,
             "stream_idle_timeout_s": provider.stream_idle_timeout_s,
         }

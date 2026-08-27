@@ -1749,16 +1749,23 @@ tool execution for that call. The compact frozen authority follows the pending
 tool round through ordinary recovery, approval, and user-input interruption so
 continuation cannot reinterpret the call against a wider request.
 
-### Provider-neutral tool discovery
+### Durable tool discovery
 
-`tool_discovery_mode="search_tools"` installs two Cayu-owned definitions as a
-stable prefix on every model request: `search_tools(query, limit)` and
-`call_tool(tool_ref, arguments)`. Application tools remain in the canonical
-catalogue and durable capability ceiling, but the default discovery exposure
-profile sends none of their schemas. Registering 10, 100, or 1,000 application
-tools therefore does not enlarge this two-schema core. An explicit
-`ToolExposurePolicy` may add a small direct subset after the core; discovery
-omits those already visible names from its results.
+Tool discovery keeps application tools in the canonical catalogue and durable
+capability ceiling while exposing only a stable search surface initially. An
+explicit `ToolExposurePolicy` may still add a small direct subset; discovery
+omits those already visible names from its results. Delivery is an explicit
+agent policy:
+
+| Mode | Selection |
+| --- | --- |
+| `"search_tools"` | Always use the provider-independent `search_tools(query, limit)` plus `call_tool(tool_ref, arguments)` gateway. |
+| `"openai_tool_search_client"` | Require verified OpenAI Responses client Tool Search support and fail before dispatch otherwise. |
+| `"openai_tool_search_client_or_search_tools"` | Select client Tool Search only when the registered provider reports the exact verified capability; otherwise freeze the portable gateway before dispatch. |
+
+The portable mode installs the two Cayu-owned definitions as a stable prefix on
+every request. Registering 10, 100, or 1,000 application tools therefore does
+not enlarge that two-schema core.
 
 Search is local, deterministic, and model-free. It case-folds and ranks name
 and description word matches plus input-property names in canonical tie order.
@@ -1795,12 +1802,49 @@ references and schemas stay in the private model transcript. Generic public
 tool-completion events retain only the discovery result count, view revision,
 and truncation flag. A discovery request footprint adds the current generation,
 view revision, catalogue revision, capability-ceiling fingerprint, and grant
-count. It contains no query, schema, grant id, or tool reference. Those view
-facts are observation metadata, not part of the provider request: discovered
-schemas continue to stay out of the top-level tool array, while the keyed tool
-manifest and cache-breakpoint fingerprints remain stable as the view changes.
-OpenAI Responses, Anthropic, Chat Completions, Bedrock, and Vertex preserve the
-same `search_tools`, `call_tool` prefix before any small direct exposure.
+count. It contains no query, schema, grant id, or tool reference. In portable
+mode those view facts are observation metadata rather than provider-request
+shape: discovered schemas stay out of the top-level tool array, while the keyed
+tool-manifest and cache-breakpoint fingerprints remain stable as the view
+changes. OpenAI Responses, Anthropic, Chat Completions, Bedrock, and Vertex
+preserve the same `search_tools`, `call_tool` prefix before any small direct
+exposure.
+
+OpenAI client Tool Search projects the same canonical `search_tools` definition
+as `{"type":"tool_search","execution":"client",...}`. Cayu executes the
+returned `tool_search_call` locally through the ordinary discovery tool path,
+then replies with a `tool_search_output` containing only matching registered
+function definitions authorized by the current branch view. The model invokes
+those functions directly by name; Cayu binds each call back to its exact durable
+grant before the ordinary policy, approval, hook, and execution path. Native-only
+discovery omits `call_tool`, so registering a large catalogue still sends no
+application schemas until a search loads a bounded match. If a targeted gateway
+grant is simultaneously active, the stable `call_tool` definition remains
+callable for that separate authority path. If an OpenAI native targeted grant and
+a discovery grant name the same function, the targeted interaction grant is the
+only provider-visible binding for that name; the discovery grant remains durable
+but is not projected ambiguously into that request.
+
+OpenAI support is an application assertion on one concrete provider
+registration. List exact model ids in
+`OpenAIProvider.client_tool_search_models`; Cayu does not infer support from a
+model prefix or marketing family. This projection is established only for the
+official OpenAI Responses endpoint; compatible endpoints use portable fallback
+or fail preflight. Capability selection is frozen before dispatch and a provider
+error never changes projections after an ambiguous request. The exact provider
+allow-list and selected delivery protocol are part of execution-profile
+identity; the current loaded-definition projection is part of keyed request
+identity. Inline replay accepts a loaded definition only when its search output
+exactly matches the current canonical catalogue descriptor and branch grant;
+the trusted definition, rather than mutable transcript fields, is rendered to
+OpenAI. Server-retained response references record the exact loaded-name
+ownership and are rebuilt neutrally if the current branch lacks any retained
+tool. A fork therefore keeps the cacheable prefix before its divergence without
+inheriting the parent's callable discovery grants. A loaded name is projected
+only while its canonical search-output schema remains in the exact model
+context. If trimming or compaction removes that evidence, Cayu unloads the name
+and the model must search for it again; a guessed post-compaction call does not
+regain the durable grant.
 
 `CayuApp.inspect_tool_discovery_view(session_id, limit=...)` returns a bounded
 typed current-view projection. It includes canonical tool identity, descriptor
@@ -1822,16 +1866,25 @@ agent, and durable authority inconsistency return a content-minimized conflict
 without exposing a view.
 
 ```python
+verified_model = "the-exact-model-id-verified-for-this-endpoint"
+app.register_provider(
+    OpenAIProvider(
+        api_key=openai_key,
+        client_tool_search_models=(verified_model,),
+    ),
+    default=True,
+)
 app.register_agent(
-    AgentSpec(name="assistant", model="provider-model"),
+    AgentSpec(name="assistant", model=verified_model),
     tools=(search_docs, remember_knowledge, publish_report),
-    tool_discovery_mode="search_tools",
+    tool_discovery_mode="openai_tool_search_client_or_search_tools",
 )
 ```
 
-The model first calls `search_tools` for the capability it needs, then calls
-the stable `call_tool` gateway with a returned reference. Applications define
-and register ordinary `Tool` implementations; there is no separate dynamic-tool
+The model first searches for the capability it needs, then either calls the
+loaded function directly under OpenAI client Tool Search or calls the stable
+`call_tool` gateway with the returned reference. Applications define and
+register ordinary `Tool` implementations; there is no separate dynamic-tool
 implementation type and no second executor.
 
 The credential-free
@@ -1841,6 +1894,12 @@ reports bounded ranking, search, invalid-argument, model-step, token/cache,
 latency, effect, approval, quality, and fixture-cost evidence. Its local timing
 and synthetic usage/prices are measurement examples, not provider benchmarks or
 universal savings claims.
+
+The credential-free
+[`openai_client_tool_search`](../examples/openai_client_tool_search/) fixture
+runs the native three-request search, loaded-function call, and result replay
+through the real OpenAI adapter without contacting the API. It proves adapter
+composition, not support for any production model id.
 
 ### Targeted tool grants and scoped references
 
@@ -2020,11 +2079,13 @@ but cannot re-enable the anchor or name an unavailable function. This fixed
 one-schema core is the cache-stable prefix; registering many targeted tools
 does not add their schemas to it.
 
-When provider-neutral tool discovery is also enabled, the stable core contains
+When portable tool discovery is enabled, the stable core contains
 `search_tools` followed by `call_tool`, and both functions are callable.
 OpenAI's runtime-owned `allowed_tools` projection then contains those two core
-functions plus any directly exposed or active native targeted function. The
-gateway still resolves every reference against Cayu's durable targeted or
+functions plus any directly exposed or active native targeted function. Under
+client Tool Search, the search surface and loaded discovery functions are
+callable instead; `call_tool` remains only when a simultaneous targeted gateway
+grant needs it. Both paths resolve against Cayu's durable targeted or
 branch-local discovery authority before target policy or execution.
 
 The fallback mode resolves once, before the logical model request exists. A

@@ -82,7 +82,6 @@ from cayu.runtime.sessions import (
 from cayu.runtime.tasks import TaskStatus, TaskStore
 from cayu.runtime.tool_discovery import (
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
-    ToolDiscoveryMode,
     current_tool_discovery_view,
     initial_tool_discovery_operation_records,
     tool_discovery_generation_id,
@@ -884,7 +883,7 @@ class DurableSubagentCoordinator:
 
         registered_child = self._get_registered_agent(intent.agent_name)
         discovery_initializer = None
-        if registered_child.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS:
+        if registered_child.tool_discovery_mode is not None:
             if not self.session_store.supports_atomic_session_operation_initialization:
                 raise RuntimeError(
                     "Tool discovery requires atomic session operation initialization."
@@ -965,7 +964,7 @@ class DurableSubagentCoordinator:
             raise RuntimeError(
                 "Existing durable subagent child has no tool capability ceiling."
             ) from exc
-        if registered_child.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS:
+        if registered_child.tool_discovery_mode is not None:
             current_tool_discovery_view(
                 await self.session_store.load_session_operation(
                     child.id,

@@ -4330,10 +4330,17 @@ async def test_runtime_retries_openai_stream_server_error_then_completes() -> No
             ],
         ]
     )
-    provider = OpenAIProvider(api_key="test-key", transport=transport)
+    provider = OpenAIProvider(
+        api_key="test-key",
+        client_tool_search_models=("gpt-test",),
+        transport=transport,
+    )
     app = CayuApp()
     app.register_provider(provider, default=True)
-    app.register_agent(AgentSpec(name="assistant", model="gpt-test"))
+    app.register_agent(
+        AgentSpec(name="assistant", model="gpt-test"),
+        tool_discovery_mode="openai_tool_search_client",
+    )
 
     events = [
         event
@@ -4348,6 +4355,8 @@ async def test_runtime_retries_openai_stream_server_error_then_completes() -> No
     ]
 
     assert len(transport.calls) == 2
+    assert transport.calls[0]["payload"] == transport.calls[1]["payload"]
+    assert transport.calls[0]["payload"]["tools"][0]["type"] == "tool_search"
     retry = next(event for event in events if event.type == EventType.MODEL_RETRY)
     assert retry.payload["status_code"] == 500
     assert retry.payload["reason"] == "http_status"

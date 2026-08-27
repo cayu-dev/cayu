@@ -43,6 +43,7 @@ from cayu.providers.base import (
     ModelContextPressureProfile,
     ModelProvider,
     ModelRequest,
+    call_tool_core_callable,
     copy_model_context_pressure_profile,
     targeted_tool_native_cache_anchor_name,
 )
@@ -1116,6 +1117,11 @@ def build_request_footprint(
     message_payloads = _provider_neutral_message_payloads(
         model_request.messages,
         resolved_attachments=resolved_attachments,
+        loaded_discovery_names=(
+            frozenset()
+            if model_request.tool_discovery_projection is None
+            else frozenset(model_request.tool_discovery_projection.loaded_tool_names)
+        ),
     )
     system_payloads = [
         payload
@@ -1160,8 +1166,21 @@ def build_request_footprint(
         if model_request.targeted_tool_projection is None
         else len(model_request.targeted_tool_projection.tools)
     )
+    omitted_discovery_gateways = (
+        sum(tool.get("name") == CALL_TOOL_NAME for tool in model_request.tools)
+        if model_request.tool_discovery_projection is not None
+        and model_request.targeted_tool_projection is None
+        and targeted_tool_native_cache_anchor_name(model_request.options) is None
+        and not call_tool_core_callable(model_request.options)
+        else 0
+    )
     tools = RequestComponentFootprint(
-        count=len(model_request.tools) + len(hosted_tool_payloads) + projected_tool_count,
+        count=(
+            len(model_request.tools)
+            + len(hosted_tool_payloads)
+            + projected_tool_count
+            - omitted_discovery_gateways
+        ),
         size=_request_size(tool_manifest),
     )
     attachments = _attachment_footprint(attachment_occurrences)
@@ -1276,6 +1295,10 @@ def build_request_footprint(
         measured_request_shape["targeted_tool_projection"] = (
             model_request.targeted_tool_projection.model_dump(mode="json")
         )
+    if model_request.tool_discovery_projection is not None:
+        measured_request_shape["tool_discovery_projection"] = (
+            model_request.tool_discovery_projection.model_dump(mode="json")
+        )
     if hosted_tool_payloads:
         measured_request_shape["hosted_tools"] = hosted_tool_payloads
     fingerprint_request_shape = {
@@ -1300,6 +1323,44 @@ def build_request_footprint(
         profile=profile,
         estimator=estimator,
     )
+    discovery_projected_tools = _provider_visible_discovery_tool_specs(
+        model_request.messages,
+        loaded_names=(
+            frozenset()
+            if model_request.tool_discovery_projection is None
+            else frozenset(model_request.tool_discovery_projection.loaded_tool_names)
+        ),
+    )
+    if discovery_projected_tools:
+        discovery_schema_tokens = estimator.estimate_tool_schema_tokens(
+            discovery_projected_tools,
+            chars_per_token=profile.tool_schema_chars_per_token,
+        )
+        context_pressure = context_pressure.model_copy(
+            update={
+                "estimated_tool_schema_input_tokens": (
+                    context_pressure.estimated_tool_schema_input_tokens + discovery_schema_tokens
+                ),
+                "estimated_request_overhead_input_tokens": (
+                    context_pressure.estimated_request_overhead_input_tokens
+                    + discovery_schema_tokens
+                ),
+                "estimated_request_overhead_delta_tokens": (
+                    context_pressure.estimated_request_overhead_delta_tokens
+                    + discovery_schema_tokens
+                ),
+                "estimated_delta_input_tokens": (
+                    context_pressure.estimated_delta_input_tokens + discovery_schema_tokens
+                ),
+                "estimated_context_input_tokens": (
+                    context_pressure.estimated_context_input_tokens + discovery_schema_tokens
+                ),
+                "estimated_context_window_tokens": (
+                    context_pressure.estimated_context_window_tokens + discovery_schema_tokens
+                ),
+            },
+            deep=True,
+        )
     structured_output_tokens = _structured_output_tokens(
         estimator=estimator,
         native_structured_output_option=structured_output_option,
@@ -1626,6 +1687,7 @@ def _provider_neutral_message_payloads(
     messages: list[Message],
     *,
     resolved_attachments: dict[str, dict[str, Any]],
+    loaded_discovery_names: frozenset[str],
 ) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
     for message in messages:
@@ -1651,7 +1713,15 @@ def _provider_neutral_message_payloads(
                     ResolvedFileAttachment.model_validate(resolved)
                 )
             elif type(part) is ToolResultPart:
-                part_payload.pop("structured", None)
+                if part.tool_name == SEARCH_TOOLS_NAME and loaded_discovery_names:
+                    part_payload["structured"] = {
+                        "loaded_tools": _provider_visible_discovery_tool_specs_from_result(
+                            part,
+                            loaded_names=loaded_discovery_names,
+                        )
+                    }
+                else:
+                    part_payload.pop("structured", None)
                 artifacts: list[dict[str, Any]] = []
                 for artifact in part.artifacts:
                     reference = file_attachment_from_payload(artifact)
@@ -1673,6 +1743,70 @@ def _provider_neutral_message_payloads(
                 part_payload["artifacts"] = artifacts
         payloads.append(message_payload)
     return payloads
+
+
+def _provider_visible_discovery_tool_specs(
+    messages: list[Message],
+    *,
+    loaded_names: frozenset[str],
+) -> list[dict[str, Any]]:
+    if not loaded_names:
+        return []
+    projected: list[dict[str, Any]] = []
+    for message in messages:
+        for part in message.content:
+            if type(part) is ToolResultPart and part.tool_name == SEARCH_TOOLS_NAME:
+                projected.extend(
+                    _provider_visible_discovery_tool_specs_from_result(
+                        part,
+                        loaded_names=loaded_names,
+                    )
+                )
+    return projected
+
+
+def _provider_visible_discovery_tool_specs_from_result(
+    part: ToolResultPart,
+    *,
+    loaded_names: frozenset[str],
+) -> list[dict[str, Any]]:
+    """Project only native provider-visible schemas from one private search result."""
+
+    if part.is_error:
+        return []
+    structured = part.structured
+    if type(structured) is not dict:
+        raise ValueError("A native search_tools result requires structured discovery evidence.")
+    matches = structured.get("matches")
+    if type(matches) is not list or len(matches) > 8:
+        raise ValueError("A native search_tools result requires bounded matches.")
+    projected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for match in matches:
+        if type(match) is not dict:
+            raise ValueError("A native search_tools match must be an object.")
+        name = match.get("name")
+        description = match.get("description")
+        input_schema = match.get("input_schema")
+        if (
+            type(name) is not str
+            or type(description) is not str
+            or type(input_schema) is not dict
+            or match.get("readiness") != "registered"
+            or name in seen
+        ):
+            raise ValueError("A native search_tools match is malformed.")
+        seen.add(name)
+        if name not in loaded_names:
+            continue
+        projected.append(
+            {
+                "name": name,
+                "description": description,
+                "input_schema": copy_json_value(input_schema, "discovery input_schema"),
+            }
+        )
+    return projected
 
 
 def _native_structured_output_projection(options: dict[str, Any]) -> dict[str, Any] | None:
@@ -1768,12 +1902,20 @@ def _estimate_projected_context_pressure(
     profile: ModelContextPressureProfile,
     estimator: ObservedDeltaContextEstimator,
 ) -> ContextPressureEstimate:
+    projected_tools = model_request.tools
+    if (
+        model_request.tool_discovery_projection is not None
+        and targeted_tool_native_cache_anchor_name(model_request.options) is None
+        and not call_tool_core_callable(model_request.options)
+    ):
+        projected_tools = [tool for tool in projected_tools if tool.get("name") != CALL_TOOL_NAME]
     measured_request = ModelRequest(
         model=model_request.model,
         messages=messages,
-        tools=model_request.tools,
+        tools=projected_tools,
         hosted_tools=model_request.hosted_tools,
         targeted_tool_projection=model_request.targeted_tool_projection,
+        tool_discovery_projection=model_request.tool_discovery_projection,
         options=measured_options,
     )
     pressure = estimate_model_request_context_pressure(
@@ -2011,7 +2153,8 @@ def _request_tool_manifest(
     targeted_projection = (
         model_request.targeted_tool_projection if include_targeted_projection else None
     )
-    if not hosted_tools and targeted_projection is None:
+    discovery_projection = model_request.tool_discovery_projection
+    if not hosted_tools and targeted_projection is None and discovery_projection is None:
         return model_request.tools, hosted_tools
     manifest: dict[str, Any] = {
         "function_tools": model_request.tools,
@@ -2020,6 +2163,10 @@ def _request_tool_manifest(
         manifest["hosted_tools"] = hosted_tools
     if targeted_projection is not None:
         manifest["targeted_tool_projection"] = targeted_projection.model_dump(mode="json")
+    if discovery_projection is not None:
+        manifest["tool_discovery_projection"] = {
+            "protocol": discovery_projection.protocol,
+        }
     return manifest, hosted_tools
 
 

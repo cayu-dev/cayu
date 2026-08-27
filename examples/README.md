@@ -80,6 +80,9 @@ corresponding credentials or service.
 - [`tool_discovery_validation/`](tool_discovery_validation/) — credential-free
   discovery, resume, fork reset, copied-reference rejection, ranking, and bounded economics
   evidence through the real `search_tools` / `call_tool` path.
+- [`openai_client_tool_search/`](openai_client_tool_search/) — credential-free
+  native `tool_search_call` / `tool_search_output` projection through the real
+  OpenAI adapter and ordinary Cayu tool executor.
 - [`real_spend_budget_live.py`](real_spend_budget_live.py) — live causal budget enforcement.
 - [`context_counting_live.py`](context_counting_live.py) and
   [`context_pressure_calibration_live.py`](context_pressure_calibration_live.py) — context limits and calibration.

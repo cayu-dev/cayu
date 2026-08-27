@@ -183,7 +183,6 @@ from cayu.runtime.tool_catalogue import (
 from cayu.runtime.tool_discovery import (
     TOOL_DISCOVERY_REFERENCE_PREFIX,
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
-    ToolDiscoveryMode,
     _bind_runtime_tool_discovery_authority,
     current_tool_discovery_view,
     discovered_tool_rejection_event,
@@ -1007,7 +1006,7 @@ class ToolRoundExecutor:
         list[runtime_records.ToolCallRequest],
         tuple[Event, ...],
     ]:
-        """Resolve and durably bind targeted calls before any policy evaluation."""
+        """Resolve and durably bind dynamic-tool calls before policy evaluation."""
 
         source_calls = tool_round_recovery.pending_round_tool_calls(pending_round)
         if not any(
@@ -1020,14 +1019,14 @@ class ToolRoundExecutor:
             return pending_round, source_calls, ()
         interaction_id = pending_round.interaction_id
         if interaction_id is None:
-            raise RuntimeError("A pending targeted-tool round has no interaction identity.")
+            raise RuntimeError("A pending dynamic-tool round has no interaction identity.")
         if pending_round.policy_state != "unplanned" and any(
             (call.name == CALL_TOOL_NAME or call.targeted_tool_grant_id is not None)
             and call.targeted_tool_invocation is None
             and call.targeted_tool_rejection is None
             for call in source_calls
         ):
-            raise RuntimeError("An unresolved targeted-tool call cannot carry a policy plan.")
+            raise RuntimeError("An unresolved dynamic-tool call cannot carry a policy plan.")
 
         records = (
             ()
@@ -1048,7 +1047,7 @@ class ToolRoundExecutor:
         capability_ceiling = tool_capability_ceiling_from_session_metadata(session.metadata)
         ceiling_names = frozenset(capability_ceiling.tool_names)
         discovery_view = None
-        if registered_agent.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS:
+        if registered_agent.tool_discovery_mode is not None:
             raw_discovery_view = await self._session_store.load_session_operation(
                 session.id,
                 TOOL_DISCOVERY_VIEW_OPERATION_KEY,
@@ -1069,6 +1068,13 @@ class ToolRoundExecutor:
             if discovery_view is None
             else {grant.tool_ref: grant for grant in discovery_view.grants}
         )
+        discovery_records_by_id = (
+            {}
+            if discovery_view is None
+            else {grant.grant_id: grant for grant in discovery_view.grants}
+        )
+        if len(discovery_records_by_id) != len(discovery_records_by_ref):
+            raise RuntimeError("Tool discovery view contains duplicate grant identities.")
 
         async def publish_persisted(event: Event) -> None:
             delivered = await self._event_writer.fan_out_persisted([event])
@@ -1137,9 +1143,9 @@ class ToolRoundExecutor:
                     else records_by_id.get(invocation.grant_id)
                 )
                 discovered_record = (
-                    None
-                    if invocation.dispatch_kind != "gateway" or invocation.tool_ref is None
-                    else discovery_records_by_ref.get(invocation.tool_ref)
+                    discovery_records_by_ref.get(invocation.tool_ref)
+                    if invocation.dispatch_kind == "gateway" and invocation.tool_ref is not None
+                    else discovery_records_by_id.get(invocation.grant_id)
                 )
                 if record is None and discovered_record is not None:
                     try:
@@ -1166,6 +1172,13 @@ class ToolRoundExecutor:
                         or invocation.model_step_id != identity.model_step_id
                         or invocation.outer_tool_call_id != call.id
                         or invocation.model_tool_name != call.model_tool_name
+                        or (
+                            invocation.dispatch_kind == "native"
+                            and (
+                                invocation.tool_ref is not None
+                                or call.model_tool_name != discovered_record.tool_name
+                            )
+                        )
                         or targeted_arguments_sha256(call.arguments) != invocation.arguments_sha256
                     ):
                         raise RuntimeError(
@@ -1297,11 +1310,17 @@ class ToolRoundExecutor:
                 dispatch_kind = "native"
                 selected_grant_id = call.targeted_tool_grant_id
                 if selected_grant_id is None:  # pragma: no cover - branch condition invariant
-                    raise AssertionError("Native targeted call lost its grant selection.")
+                    raise AssertionError("Native dynamic-tool call lost its grant selection.")
                 record = records_by_id.get(selected_grant_id)
-                if record is None or record.tool_name != call.name:
+                if record is None:
+                    discovered_record = discovery_records_by_id.get(selected_grant_id)
+                if record is not None and record.tool_name != call.name:
                     raise RuntimeError(
                         "Runtime-selected native tool conflicts with durable grant state."
+                    )
+                if discovered_record is not None and discovered_record.tool_name != call.name:
+                    raise RuntimeError(
+                        "Runtime-selected native discovery tool conflicts with durable view state."
                     )
                 tool_ref = None
                 effective_arguments = copy_durable_json_value(call.arguments, "arguments")
@@ -1348,6 +1367,8 @@ class ToolRoundExecutor:
                             call,
                             reason=rejection_reason,
                             event=event,
+                            dispatch_kind=dispatch_kind,
+                            model_tool_name=model_tool_name,
                         )
                     )
                     continue
@@ -1365,14 +1386,16 @@ class ToolRoundExecutor:
                             outer_tool_call_id=call.id,
                             arguments_sha256=arguments_digest,
                             invocation_id=invocation_id,
+                            dispatch_kind=dispatch_kind,
+                            model_tool_name=model_tool_name,
                         ),
                     )
                 )
                 continue
             if record is None:
                 if dispatch_kind != "gateway" or tool_ref is None:
-                    raise RuntimeError("Native targeted projection lost its durable grant.")
-                if registered_agent.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS and (
+                    raise RuntimeError("Native dynamic-tool projection lost its durable grant.")
+                if registered_agent.tool_discovery_mode is not None and (
                     registered_agent.targeted_tool_mode is None
                     or tool_ref.startswith(TOOL_DISCOVERY_REFERENCE_PREFIX)
                 ):
@@ -1636,10 +1659,7 @@ class ToolRoundExecutor:
         ):
             raise RuntimeError("Paused targeted invocation conflicts with its binding.")
         tool_ref = invocation.tool_ref
-        if (
-            tool_ref is not None
-            and registered_agent.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS
-        ):
+        if registered_agent.tool_discovery_mode is not None:
             ceiling = tool_capability_ceiling_from_session_metadata(session.metadata)
             discovery_view = current_tool_discovery_view(
                 await self._session_store.load_session_operation(
@@ -1655,7 +1675,18 @@ class ToolRoundExecutor:
                 catalogue=registered_agent.tool_catalogue,
                 ceiling=ceiling,
             )
-            discovery_record = discovery_view.record_for_reference(tool_ref)
+            discovery_record = (
+                discovery_view.record_for_reference(tool_ref)
+                if tool_ref is not None
+                else next(
+                    (
+                        record
+                        for record in discovery_view.grants
+                        if record.grant_id == invocation.grant_id
+                    ),
+                    None,
+                )
+            )
             if discovery_record is not None:
                 try:
                     descriptor = registered_agent.tool_catalogue.descriptor_for_id(
@@ -1676,15 +1707,25 @@ class ToolRoundExecutor:
                         descriptor,
                     )
                     or descriptor.name not in ceiling.tool_names
+                    or (
+                        invocation.dispatch_kind == "gateway"
+                        and tool_ref != discovery_record.tool_ref
+                    )
+                    or (
+                        invocation.dispatch_kind == "native"
+                        and (
+                            tool_ref is not None
+                            or invocation.model_tool_name != discovery_record.tool_name
+                        )
+                    )
                 ):
                     raise RuntimeError(
                         "Paused discovered-tool invocation conflicts with its durable view."
                     )
                 return ()
             if (
-                tool_ref.startswith(TOOL_DISCOVERY_REFERENCE_PREFIX)
-                or registered_agent.targeted_tool_mode is None
-            ):
+                tool_ref is not None and tool_ref.startswith(TOOL_DISCOVERY_REFERENCE_PREFIX)
+            ) or registered_agent.targeted_tool_mode is None:
                 raise RuntimeError("Paused discovered-tool invocation lost its durable view grant.")
         if tool_ref is None:
             records = await self._session_store.list_targeted_tool_grants(
@@ -3544,7 +3585,7 @@ class ToolRoundExecutor:
             artifact_store=raw_artifact_store,
         )
         if effective_tool_call.name == SEARCH_TOOLS_NAME:
-            if registered_agent.tool_discovery_mode is not ToolDiscoveryMode.SEARCH_TOOLS:
+            if registered_agent.tool_discovery_mode is None:
                 raise RuntimeError("search_tools execution requires enabled tool discovery.")
             _bind_runtime_tool_discovery_authority(
                 tool_context,

@@ -13,7 +13,7 @@ import asyncio
 import contextlib
 import logging
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextvars import Context
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -133,6 +133,7 @@ from cayu.providers.base import (
     CALL_TOOL_CORE_CALLABLE_OPTION,
     TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
     TargetedToolProjectionRequest,
+    ToolDiscoveryProjectionRequest,
     copy_model_completion,
 )
 from cayu.runtime import _runtime_records as runtime_records
@@ -332,13 +333,24 @@ from cayu.runtime.targeted_tool_projection import (
     openai_targeted_tool_projection,
     resolve_targeted_tool_projection,
 )
-from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
+from cayu.runtime.tool_catalogue import (
+    CALL_TOOL_NAME,
+    SEARCH_TOOLS_NAME,
+    ToolCatalogSnapshot,
+    ToolDescriptor,
+)
 from cayu.runtime.tool_discovery import (
     TOOL_DISCOVERY_VIEW_OPERATION_KEY,
     ToolDiscoveryMode,
+    ToolDiscoveryProjectionKind,
+    ToolDiscoverySearchMatch,
+    _tool_discovery_definition_for_descriptor,
     current_tool_discovery_view,
+    resolve_tool_discovery_projection,
     search_tools_spec,
     tool_discovery_generation_id,
+    tool_discovery_record_matches_descriptor,
+    tool_discovery_search_match_matches_descriptor,
 )
 from cayu.runtime.tool_exposure import (
     ALL_REGISTERED_TOOLS_PROFILE_ID,
@@ -873,7 +885,7 @@ def _durable_assistant_step_result(
     *,
     redactor: SecretRedactor,
     targeted_tool_reference_grant_ids: Mapping[str, str] | None = None,
-    targeted_tool_name_grant_ids: Mapping[str, str] | None = None,
+    native_tool_name_grant_ids: Mapping[str, str] | None = None,
 ) -> AssistantStepResult:
     """Project one assistant result across the durable publication boundary."""
 
@@ -893,9 +905,7 @@ def _durable_assistant_step_result(
     reference_grant_ids = (
         {} if targeted_tool_reference_grant_ids is None else dict(targeted_tool_reference_grant_ids)
     )
-    name_grant_ids = (
-        {} if targeted_tool_name_grant_ids is None else dict(targeted_tool_name_grant_ids)
-    )
+    name_grant_ids = {} if native_tool_name_grant_ids is None else dict(native_tool_name_grant_ids)
     tool_calls: list[runtime_records.ToolCallRequest] = []
     for call in copied.tool_calls:
         projected_arguments = redactor.redact_json_values(call.arguments)
@@ -907,7 +917,9 @@ def _durable_assistant_step_result(
         )
         native_grant_id = name_grant_ids.get(call.name)
         if targeted_tool_grant_id is not None and native_grant_id is not None:
-            raise ValueError("A model tool call matched two targeted-tool projections.")
+            raise ValueError(
+                "A model tool call matched both reference and native dynamic-tool authority."
+            )
         if native_grant_id is not None:
             targeted_tool_grant_id = native_grant_id
         if targeted_tool_grant_id is not None and tool_ref is not None:
@@ -4322,6 +4334,8 @@ class ModelStepExecutor:
         targeted_tool_projection_kind: TargetedToolProjectionKind | None = None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None = None,
         targeted_tool_native: TargetedToolProjectionRequest | None = None,
+        tool_discovery_projection_kind: ToolDiscoveryProjectionKind | None = None,
+        tool_discovery_native_tool_names: Iterable[str] | None = None,
     ) -> ModelRequest:
         resolved_tool_exposure = (
             _all_registered_tool_exposure(registered_agent)
@@ -4346,10 +4360,39 @@ class ModelStepExecutor:
             )
         if targeted_tool_gateway is not None and targeted_tool_native is not None:
             raise RuntimeError("A model request cannot carry two targeted-tool projections.")
+        if registered_agent.tool_discovery_mode is None:
+            if tool_discovery_projection_kind is not None:
+                raise RuntimeError("A discovery projection requires configured tool discovery.")
+        elif tool_discovery_projection_kind is None:
+            raise RuntimeError("Configured tool discovery requires a resolved projection.")
+        discovery_native_tool_names = tuple(
+            () if tool_discovery_native_tool_names is None else tool_discovery_native_tool_names
+        )
+        if any(type(name) is not str for name in discovery_native_tool_names):
+            raise TypeError("Native discovery tool names must be strings.")
+        if len(discovery_native_tool_names) != len(set(discovery_native_tool_names)):
+            raise ValueError("Native discovery tool names must be unique.")
+        if (
+            tool_discovery_projection_kind
+            is not ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT
+            and discovery_native_tool_names
+        ):
+            raise RuntimeError("Native discovery tools require the OpenAI projection.")
         model_messages = _model_request_messages(
             messages=context_messages,
             structured_output=structured_output,
         )
+        discovery_native_tools: tuple[dict[str, Any], ...] = ()
+        if tool_discovery_projection_kind is ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT:
+            discovery_native_tools = _redacted_native_discovery_tools_with_schema_evidence(
+                model_messages,
+                authorized_names=discovery_native_tool_names,
+                catalogue=registered_agent.tool_catalogue,
+                redactor=self._secret_redactor,
+            )
+            discovery_native_tool_names = tuple(
+                cast("str", tool["name"]) for tool in discovery_native_tools
+            )
 
         resolved_attachments, unresolvable_prompt_ids = await _resolved_file_attachments(
             messages=model_messages,
@@ -4401,8 +4444,15 @@ class ModelStepExecutor:
             request_options["thinking"] = thinking_payload
         if targeted_tool_projection_kind is TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS:
             request_options[TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION] = CALL_TOOL_NAME
-            if registered_agent.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS:
-                request_options[CALL_TOOL_CORE_CALLABLE_OPTION] = True
+        if (
+            targeted_tool_native is not None
+            and tool_discovery_projection_kind is ToolDiscoveryProjectionKind.SEARCH_TOOLS
+        ) or (
+            targeted_tool_gateway is not None
+            and tool_discovery_projection_kind
+            is ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT
+        ):
+            request_options[CALL_TOOL_CORE_CALLABLE_OPTION] = True
         redacted_messages = [
             redact_runtime_message_for_boundary(
                 message,
@@ -4421,73 +4471,18 @@ class ModelStepExecutor:
             raise ValueError(
                 "Model identity contains a workload secret and cannot be sent to a provider."
             )
-        for index, tool in enumerate(model_tools):
-            tool_name = tool.get("name")
-            if type(tool_name) is str and self._secret_redactor.redact_text(tool_name) != tool_name:
-                raise ValueError(
-                    f"model_tools[{index}].name contains a workload secret and cannot "
-                    "be sent as provider execution authority."
-                )
-            self._secret_redactor.require_no_secret_keys(
-                {
-                    "name": tool.get("name"),
-                    "description": tool.get("description"),
-                    "input_schema": None,
-                },
-                field_name=f"model_tools[{index}]",
-                preserve_keys={"name", "description", "input_schema"},
-                match_short_substrings=True,
-            )
-            input_schema = tool.get("input_schema")
-            if type(input_schema) is not dict:
-                raise AssertionError("A model tool input_schema must be an object.")
-            require_secret_free_json_schema_keys(
-                input_schema,
-                redactor=self._secret_redactor,
-                field_name=f"model_tools[{index}].input_schema",
-            )
-        redacted_tools = [
-            self._secret_redactor.redact_json_values(
-                tool,
-                preserve_string_fields={"name"},
-            )
-            for tool in model_tools
-        ]
+        redacted_tools = _redacted_provider_tool_definitions(
+            model_tools,
+            redactor=self._secret_redactor,
+            field_name="model_tools",
+        )
         redacted_targeted_tool_projection = None
         if targeted_tool_native is not None:
-            for index, tool in enumerate(targeted_tool_native.tools):
-                tool_name = tool.get("name")
-                if type(tool_name) is not str:
-                    raise AssertionError("A targeted model tool name must be a string.")
-                if self._secret_redactor.redact_text(tool_name) != tool_name:
-                    raise ValueError(
-                        f"targeted_tools[{index}].name contains a workload secret and "
-                        "cannot be sent as provider execution authority."
-                    )
-                self._secret_redactor.require_no_secret_keys(
-                    {
-                        "name": tool_name,
-                        "description": tool.get("description"),
-                        "input_schema": None,
-                    },
-                    field_name=f"targeted_tools[{index}]",
-                    preserve_keys={"name", "description", "input_schema"},
-                    match_short_substrings=True,
-                )
-                input_schema = tool.get("input_schema")
-                if type(input_schema) is not dict:
-                    raise AssertionError("A targeted model tool input_schema must be an object.")
-                require_secret_free_json_schema_keys(
-                    input_schema,
-                    redactor=self._secret_redactor,
-                    field_name=f"targeted_tools[{index}].input_schema",
-                )
-            projected_targeted_tools = self._secret_redactor.redact_json_values(
-                list(targeted_tool_native.tools),
-                preserve_string_fields={"name"},
+            projected_targeted_tools = _redacted_provider_tool_definitions(
+                targeted_tool_native.tools,
+                redactor=self._secret_redactor,
+                field_name="targeted_tools",
             )
-            if type(projected_targeted_tools) is not list:
-                raise AssertionError("Targeted tool redaction returned a non-list.")
             redacted_targeted_tool_projection = TargetedToolProjectionRequest(
                 protocol=targeted_tool_native.protocol,
                 marker_id=targeted_tool_native.marker_id,
@@ -4552,6 +4547,12 @@ class ModelStepExecutor:
             tools=redacted_tools,
             hosted_tools=registered_agent.hosted_tools,
             targeted_tool_projection=redacted_targeted_tool_projection,
+            tool_discovery_projection=(
+                ToolDiscoveryProjectionRequest(loaded_tools=discovery_native_tools)
+                if tool_discovery_projection_kind
+                is ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT
+                else None
+            ),
             options=redacted_options,
         )
 
@@ -4591,7 +4592,7 @@ class ModelStepExecutor:
         tool_exposure_evidence: ToolExposure | None = None,
         targeted_tool_grants: TargetedToolGrantFootprint | None = None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None = None,
-        targeted_tool_native_grant_ids: Mapping[str, str] | None = None,
+        native_tool_grant_ids: Mapping[str, str] | None = None,
         memory_evidence_reference: MemoryEvidenceReference | None = None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         retry_policy = copy_retry_policy(retry_policy)
@@ -4616,14 +4617,12 @@ class ModelStepExecutor:
             raise TypeError(
                 "targeted_tool_gateway must be a TargetedToolGatewayProjection or None."
             )
-        native_grant_ids = (
-            {} if targeted_tool_native_grant_ids is None else dict(targeted_tool_native_grant_ids)
-        )
+        native_grant_ids = {} if native_tool_grant_ids is None else dict(native_tool_grant_ids)
         if any(
             type(name) is not str or type(grant_id) is not str
             for name, grant_id in native_grant_ids.items()
         ):
-            raise TypeError("targeted_tool_native_grant_ids must map strings to strings.")
+            raise TypeError("native_tool_grant_ids must map strings to strings.")
         if tool_exposure_evidence is not None:
             if type(tool_exposure_evidence) is not ToolExposure:
                 raise TypeError("tool_exposure_evidence must be a ToolExposure or None.")
@@ -4648,10 +4647,7 @@ class ModelStepExecutor:
                     "Tool exposure evidence does not match the frozen model request authority."
                 )
         discovery_view_footprint: ToolDiscoveryViewFootprint | None = None
-        if (
-            self._request_footprint.enabled
-            and registered_agent.tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS
-        ):
+        if self._request_footprint.enabled and registered_agent.tool_discovery_mode is not None:
             capability_ceiling = tool_capability_ceiling_from_session_metadata(session.metadata)
             discovery_view = current_tool_discovery_view(
                 await self._session_store.load_session_operation(
@@ -4888,7 +4884,7 @@ class ModelStepExecutor:
                 execution_profile=execution_profile,
                 tool_exposure=resolved_tool_exposure,
                 targeted_tool_gateway=targeted_tool_gateway,
-                targeted_tool_native_grant_ids=native_grant_ids,
+                native_tool_grant_ids=native_grant_ids,
                 memory_evidence_reference=memory_evidence_reference,
                 prepared_model_completion_dispatch=pre_count_completion_dispatch,
             )
@@ -5320,7 +5316,7 @@ class ModelStepExecutor:
         execution_profile: ExecutionProfileIdentity | None,
         tool_exposure: ResolvedToolExposure | None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None,
-        targeted_tool_native_grant_ids: Mapping[str, str],
+        native_tool_grant_ids: Mapping[str, str],
         memory_evidence_reference: MemoryEvidenceReference | None,
         prepared_model_completion_dispatch: ModelCompletionDispatch | None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
@@ -5328,7 +5324,7 @@ class ModelStepExecutor:
         targeted_tool_reference_grant_ids = (
             None if targeted_tool_gateway is None else targeted_tool_gateway.reference_grant_ids()
         )
-        targeted_tool_name_grant_ids = dict(targeted_tool_native_grant_ids)
+        native_tool_name_grant_ids = dict(native_tool_grant_ids)
         if retry_policy.max_attempts != max_attempts:
             raise ValueError("Retry policy does not match the model-attempt ceiling.")
         assistant_parts: list[transcript_helpers.AssistantContentPart] = []
@@ -6892,11 +6888,11 @@ class ModelStepExecutor:
                         step_result,
                         redactor=self._secret_redactor,
                         targeted_tool_reference_grant_ids=targeted_tool_reference_grant_ids,
-                        targeted_tool_name_grant_ids=targeted_tool_name_grant_ids,
+                        native_tool_name_grant_ids=native_tool_name_grant_ids,
                     )
                     candidate_live_continuation = (
                         None
-                        if targeted_tool_gateway is None and not targeted_tool_name_grant_ids
+                        if targeted_tool_gateway is None and not native_tool_name_grant_ids
                         else _assistant_step_result_with_published_targeted_authority(
                             step_result,
                             candidate_step_result,
@@ -7193,6 +7189,11 @@ class ModelStepRun:
             provider=provider,
             model=session.model,
         )
+        self._tool_discovery_projection_kind = resolve_tool_discovery_projection(
+            registered_agent.tool_discovery_mode,
+            provider=provider,
+            model=session.model,
+        )
         if (
             targeted_tool_grants is not None
             and targeted_tool_grants.projection is not self._targeted_tool_projection_kind
@@ -7337,6 +7338,45 @@ class ModelStepRun:
             return None, projection, grant_ids_by_name
         raise RuntimeError("Targeted grants have no resolved provider projection.")
 
+    async def _native_tool_discovery_grant_ids(
+        self,
+        *,
+        tool_exposure: ResolvedToolExposure,
+    ) -> dict[str, str]:
+        """Load callable native names from the branch's current durable discovery view."""
+
+        if (
+            self._tool_discovery_projection_kind
+            is not ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT
+        ):
+            return {}
+        view = current_tool_discovery_view(
+            await self._executor._session_store.load_session_operation(
+                self._session.id,
+                TOOL_DISCOVERY_VIEW_OPERATION_KEY,
+            ),
+            session_id=self._session.id,
+            generation_id=tool_discovery_generation_id(
+                session_id=self._session.id,
+                root_invocation_id=self._session.invocation.root_invocation_id,
+            ),
+            agent_name=self._registered_agent.spec.name,
+            catalogue=self._registered_agent.tool_catalogue,
+            ceiling=self._tool_capability_ceiling,
+        )
+        directly_exposed = frozenset(tool_exposure.tool_names)
+        grants: dict[str, str] = {}
+        for record in view.grants:
+            descriptor = self._registered_agent.tool_catalogue.descriptor_for_id(record.tool_id)
+            if not tool_discovery_record_matches_descriptor(record, descriptor):
+                raise RuntimeError("Native discovery grant has stale descriptor authority.")
+            if record.tool_name in directly_exposed:
+                continue
+            if record.tool_name in grants:
+                raise RuntimeError("Native discovery view repeats a tool name.")
+            grants[record.tool_name] = record.grant_id
+        return grants
+
     async def _abandon_pre_dispatch_model_stage(
         self,
         stage: ModelCompletionStage,
@@ -7479,6 +7519,22 @@ class ModelStepRun:
             targeted_tool_native,
             targeted_tool_native_grant_ids,
         ) = await self._targeted_tool_projections()
+        discovery_native_grant_ids = await self._native_tool_discovery_grant_ids(
+            tool_exposure=tool_exposure,
+        )
+        # One provider-visible function name can bind to only one frozen grant.
+        # A deliberately issued targeted grant takes precedence for its interaction;
+        # keep any same-name discovery grant durable but out of this request.
+        discovery_native_grant_ids = {
+            name: grant_id
+            for name, grant_id in discovery_native_grant_ids.items()
+            if name not in targeted_tool_native_grant_ids
+        }
+        native_grant_ids = {
+            **targeted_tool_native_grant_ids,
+            **discovery_native_grant_ids,
+        }
+        discovery_native_tool_names = tuple(sorted(discovery_native_grant_ids))
         if targeted_tool_native is not None:
             exposed_names = frozenset(tool_exposure.tool_names)
             overlap = sorted(
@@ -7594,6 +7650,8 @@ class ModelStepRun:
                     targeted_tool_projection_kind=self._targeted_tool_projection_kind,
                     targeted_tool_gateway=targeted_tool_gateway,
                     targeted_tool_native=targeted_tool_native,
+                    tool_discovery_projection_kind=self._tool_discovery_projection_kind,
+                    tool_discovery_native_tool_names=discovery_native_tool_names,
                 ),
                 count_input_tokens=self._context_input_token_counter(
                     step=step,
@@ -7601,6 +7659,7 @@ class ModelStepRun:
                     targeted_tool_projection_kind=self._targeted_tool_projection_kind,
                     targeted_tool_gateway=targeted_tool_gateway,
                     targeted_tool_native=targeted_tool_native,
+                    tool_discovery_native_tool_names=discovery_native_tool_names,
                 ),
                 build_cache_prefix_request=self._cache_prefix_request_builder(
                     step=step,
@@ -7608,6 +7667,7 @@ class ModelStepRun:
                     targeted_tool_projection_kind=self._targeted_tool_projection_kind,
                     targeted_tool_gateway=targeted_tool_gateway,
                     targeted_tool_native=targeted_tool_native,
+                    tool_discovery_native_tool_names=discovery_native_tool_names,
                 ),
                 secret_redactor=self._executor._secret_redactor,
                 run_compaction=run_automatic_compaction,
@@ -7736,6 +7796,8 @@ class ModelStepRun:
             targeted_tool_projection_kind=self._targeted_tool_projection_kind,
             targeted_tool_gateway=targeted_tool_gateway,
             targeted_tool_native=targeted_tool_native,
+            tool_discovery_projection_kind=self._tool_discovery_projection_kind,
+            tool_discovery_native_tool_names=discovery_native_tool_names,
         )
         if self._execution_profile is None:
             raise RuntimeError("Tool exposure evidence requires an execution profile.")
@@ -7773,7 +7835,7 @@ class ModelStepRun:
             memory_evidence_reference=memory_evidence_reference,
             memory_evidence_key=evidence_key,
             targeted_tool_gateway=targeted_tool_gateway,
-            targeted_tool_native_grant_ids=targeted_tool_native_grant_ids,
+            native_tool_grant_ids=native_grant_ids,
         )
         try:
             async for event, outcome in request_events:
@@ -7795,12 +7857,10 @@ class ModelStepRun:
         memory_evidence_reference: MemoryEvidenceReference | None = None,
         memory_evidence_key: MemoryEvidenceKey | None = None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None = None,
-        targeted_tool_native_grant_ids: Mapping[str, str] | None = None,
+        native_tool_grant_ids: Mapping[str, str] | None = None,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
-        native_grant_ids = (
-            {} if targeted_tool_native_grant_ids is None else dict(targeted_tool_native_grant_ids)
-        )
+        native_grant_ids = {} if native_tool_grant_ids is None else dict(native_tool_grant_ids)
         if memory_evidence_reference is not None and self._model_completion_publisher is None:
             raise RuntimeError(
                 "Automatic recall dispatch requires durable model-completion publication."
@@ -8297,7 +8357,7 @@ class ModelStepRun:
             memory_evidence_reference=memory_evidence_reference,
             memory_evidence_key=memory_evidence_key,
             targeted_tool_gateway=targeted_tool_gateway,
-            targeted_tool_native_grant_ids=native_grant_ids,
+            native_tool_grant_ids=native_grant_ids,
         )
         guarded_events = controller.model_step_events_with_heartbeat(
             model_step_events,
@@ -8487,7 +8547,7 @@ class ModelStepRun:
         memory_evidence_reference: MemoryEvidenceReference | None,
         memory_evidence_key: MemoryEvidenceKey | None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None,
-        targeted_tool_native_grant_ids: Mapping[str, str],
+        native_tool_grant_ids: Mapping[str, str],
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
         request_variant = RequestVariant(request_variant)
@@ -8526,6 +8586,10 @@ class ModelStepRun:
             initial_identity: ModelAttemptIdentity | None = None,
             attempt_variant: RequestVariant,
         ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
+            request_native_grant_ids = _native_tool_grant_ids_for_request(
+                request,
+                available=native_tool_grant_ids,
+            )
             return self._executor.run_with_retries(
                 provider=provider,
                 model_request=request,
@@ -8553,7 +8617,7 @@ class ModelStepRun:
                 tool_exposure_evidence=tool_exposure_evidence,
                 targeted_tool_grants=self._targeted_tool_grants,
                 targeted_tool_gateway=targeted_tool_gateway,
-                targeted_tool_native_grant_ids=targeted_tool_native_grant_ids,
+                native_tool_grant_ids=request_native_grant_ids,
                 memory_evidence_reference=evidence_reference,
             )
 
@@ -8683,6 +8747,12 @@ class ModelStepRun:
                     targeted_tool_projection_kind=self._targeted_tool_projection_kind,
                     targeted_tool_gateway=targeted_tool_gateway,
                     targeted_tool_native=model_request.targeted_tool_projection,
+                    tool_discovery_projection_kind=self._tool_discovery_projection_kind,
+                    tool_discovery_native_tool_names=(
+                        ()
+                        if model_request.tool_discovery_projection is None
+                        else model_request.tool_discovery_projection.loaded_tool_names
+                    ),
                 ),
                 count_input_tokens=self._context_input_token_counter(
                     step=step,
@@ -8690,6 +8760,11 @@ class ModelStepRun:
                     targeted_tool_projection_kind=self._targeted_tool_projection_kind,
                     targeted_tool_gateway=targeted_tool_gateway,
                     targeted_tool_native=model_request.targeted_tool_projection,
+                    tool_discovery_native_tool_names=(
+                        ()
+                        if model_request.tool_discovery_projection is None
+                        else model_request.tool_discovery_projection.loaded_tool_names
+                    ),
                 ),
                 build_cache_prefix_request=self._cache_prefix_request_builder(
                     step=step,
@@ -8697,6 +8772,11 @@ class ModelStepRun:
                     targeted_tool_projection_kind=self._targeted_tool_projection_kind,
                     targeted_tool_gateway=targeted_tool_gateway,
                     targeted_tool_native=model_request.targeted_tool_projection,
+                    tool_discovery_native_tool_names=(
+                        ()
+                        if model_request.tool_discovery_projection is None
+                        else model_request.tool_discovery_projection.loaded_tool_names
+                    ),
                 ),
                 secret_redactor=self._executor._secret_redactor,
                 run_compaction=run_automatic_compaction,
@@ -8863,6 +8943,12 @@ class ModelStepRun:
             targeted_tool_projection_kind=self._targeted_tool_projection_kind,
             targeted_tool_gateway=targeted_tool_gateway,
             targeted_tool_native=model_request.targeted_tool_projection,
+            tool_discovery_projection_kind=self._tool_discovery_projection_kind,
+            tool_discovery_native_tool_names=(
+                ()
+                if model_request.tool_discovery_projection is None
+                else model_request.tool_discovery_projection.loaded_tool_names
+            ),
         )
         yield (
             await self._executor._event_writer.emit(
@@ -10013,6 +10099,7 @@ class ModelStepRun:
         targeted_tool_projection_kind: TargetedToolProjectionKind | None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None,
         targeted_tool_native: TargetedToolProjectionRequest | None,
+        tool_discovery_native_tool_names: tuple[str, ...],
     ) -> Callable[[list[Message]], Awaitable[int | None]]:
         async def count_input_tokens(context_messages: list[Message]) -> int | None:
             request = await self._executor.build_request(
@@ -10027,6 +10114,8 @@ class ModelStepRun:
                 targeted_tool_projection_kind=targeted_tool_projection_kind,
                 targeted_tool_gateway=targeted_tool_gateway,
                 targeted_tool_native=targeted_tool_native,
+                tool_discovery_projection_kind=self._tool_discovery_projection_kind,
+                tool_discovery_native_tool_names=tool_discovery_native_tool_names,
             )
             # Context-policy execution can await arbitrary application code.
             # Reject changed provider semantics at the final remote count seam.
@@ -10047,6 +10136,7 @@ class ModelStepRun:
         targeted_tool_projection_kind: TargetedToolProjectionKind | None,
         targeted_tool_gateway: TargetedToolGatewayProjection | None,
         targeted_tool_native: TargetedToolProjectionRequest | None,
+        tool_discovery_native_tool_names: tuple[str, ...],
     ) -> Callable[[list[Message]], Awaitable[ModelRequest]]:
         async def build_cache_prefix_request(context_messages: list[Message]) -> ModelRequest:
             return await self._executor.build_request(
@@ -10061,6 +10151,8 @@ class ModelStepRun:
                 targeted_tool_projection_kind=targeted_tool_projection_kind,
                 targeted_tool_gateway=targeted_tool_gateway,
                 targeted_tool_native=targeted_tool_native,
+                tool_discovery_projection_kind=self._tool_discovery_projection_kind,
+                tool_discovery_native_tool_names=tool_discovery_native_tool_names,
             )
 
         return build_cache_prefix_request
@@ -10477,7 +10569,7 @@ def _model_request_tools(
         raise TypeError("tool_discovery_mode must be a ToolDiscoveryMode or None.")
 
     tools: list[dict[str, Any]] = []
-    if tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS:
+    if tool_discovery_mode is not None:
         tools.extend((search_tools_spec(), call_tool_spec()))
     tools.extend(
         [
@@ -10500,6 +10592,148 @@ def _model_request_tools(
     } and not any(tool.get("name") == CALL_TOOL_NAME for tool in tools):
         tools.append(call_tool_spec())
     return tools
+
+
+def _redacted_native_discovery_tools_with_schema_evidence(
+    messages: Iterable[Message],
+    *,
+    authorized_names: Iterable[str],
+    catalogue: ToolCatalogSnapshot,
+    redactor: SecretRedactor,
+) -> tuple[dict[str, Any], ...]:
+    """Keep exact current definitions whose loading result remains in context."""
+
+    authorized = frozenset(authorized_names)
+    evidenced: dict[str, dict[str, Any]] = {}
+    trusted_definitions: dict[str, tuple[ToolDescriptor, dict[str, Any], dict[str, Any]]] = {}
+    for message in messages:
+        for part in message.content:
+            if (
+                type(part) is not ToolResultPart
+                or part.tool_name != SEARCH_TOOLS_NAME
+                or part.is_error
+                or type(part.structured) is not dict
+            ):
+                continue
+            matches = part.structured.get("matches")
+            if type(matches) is not list:
+                continue
+            for match in matches:
+                if type(match) is not dict:
+                    continue
+                name = match.get("name")
+                if type(name) is not str or name not in authorized:
+                    continue
+                try:
+                    trusted = trusted_definitions.get(name)
+                    if trusted is None:
+                        descriptor = catalogue.descriptor_for_name(name)
+                        raw_definition = _tool_discovery_definition_for_descriptor(descriptor)
+                        [provider_definition] = _redacted_provider_tool_definitions(
+                            (raw_definition,),
+                            redactor=redactor,
+                            field_name="discovery_tools",
+                        )
+                        trusted = (descriptor, raw_definition, provider_definition)
+                        trusted_definitions[name] = trusted
+                    descriptor, raw_definition, provider_definition = trusted
+                    if (
+                        match.get("description") != provider_definition["description"]
+                        or match.get("input_schema") != provider_definition["input_schema"]
+                    ):
+                        raise ValueError("Provider-visible discovery definition changed.")
+                    validated = ToolDiscoverySearchMatch.model_validate(
+                        {
+                            **match,
+                            "description": raw_definition["description"],
+                            "input_schema": raw_definition["input_schema"],
+                        }
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "Native discovery search evidence is malformed or stale."
+                    ) from exc
+                if not tool_discovery_search_match_matches_descriptor(validated, descriptor):
+                    raise RuntimeError(
+                        "Native discovery search evidence conflicts with the current catalogue."
+                    )
+                previous = evidenced.setdefault(name, provider_definition)
+                if previous != provider_definition:
+                    raise RuntimeError("Native discovery search evidence is inconsistent.")
+    return tuple(evidenced[name] for name in sorted(evidenced))
+
+
+def _redacted_provider_tool_definitions(
+    tools: Iterable[Mapping[str, Any]],
+    *,
+    redactor: SecretRedactor,
+    field_name: str,
+) -> list[dict[str, Any]]:
+    """Validate executable tool authority and redact its provider-visible values."""
+
+    copied = copy_json_value(list(tools), field_name)
+    if type(copied) is not list or any(type(tool) is not dict for tool in copied):
+        raise AssertionError("Provider tool definitions must be a list of objects.")
+    copied_tools = cast("list[dict[str, Any]]", copied)
+    for index, tool in enumerate(copied_tools):
+        tool_name = tool.get("name")
+        if type(tool_name) is not str:
+            raise AssertionError("A provider tool name must be a string.")
+        if redactor.redact_text(tool_name) != tool_name:
+            raise ValueError(
+                f"{field_name}[{index}].name contains a workload secret and cannot "
+                "be sent as provider execution authority."
+            )
+        redactor.require_no_secret_keys(
+            {
+                "name": tool_name,
+                "description": tool.get("description"),
+                "input_schema": None,
+            },
+            field_name=f"{field_name}[{index}]",
+            preserve_keys={"name", "description", "input_schema"},
+            match_short_substrings=True,
+        )
+        input_schema = tool.get("input_schema")
+        if type(input_schema) is not dict:
+            raise AssertionError("A provider tool input_schema must be an object.")
+        require_secret_free_json_schema_keys(
+            input_schema,
+            redactor=redactor,
+            field_name=f"{field_name}[{index}].input_schema",
+        )
+    redacted = redactor.redact_json_values(
+        copied_tools,
+        preserve_string_fields={"name"},
+    )
+    if type(redacted) is not list or any(type(tool) is not dict for tool in redacted):
+        raise AssertionError("Provider tool redaction returned a non-list of objects.")
+    return redacted
+
+
+def _native_tool_grant_ids_for_request(
+    request: ModelRequest,
+    *,
+    available: Mapping[str, str],
+) -> dict[str, str]:
+    """Select only native grant identities actually projected in one request."""
+
+    projected_names = {
+        tool["name"]
+        for tool in (
+            ()
+            if request.targeted_tool_projection is None
+            else request.targeted_tool_projection.tools
+        )
+    }
+    if request.tool_discovery_projection is not None:
+        projected_names.update(request.tool_discovery_projection.loaded_tool_names)
+    missing = sorted(projected_names.difference(available))
+    if missing:
+        raise RuntimeError(
+            "A native tool projection has no matching durable grant: " + ", ".join(missing)
+        )
+    return {name: available[name] for name in sorted(projected_names)}
 
 
 def _require_frozen_tool_exposure(
@@ -10598,6 +10832,8 @@ def _context_pressure_overhead(
     targeted_tool_projection_kind: TargetedToolProjectionKind | None = None,
     targeted_tool_gateway: TargetedToolGatewayProjection | None = None,
     targeted_tool_native: TargetedToolProjectionRequest | None = None,
+    tool_discovery_projection_kind: ToolDiscoveryProjectionKind | None = None,
+    tool_discovery_native_tool_names: Iterable[str] = (),
 ) -> ContextPressureOverhead:
     profile = copy_model_context_pressure_profile(
         registered_provider.provider.context_pressure_profile
@@ -10610,6 +10846,31 @@ def _context_pressure_overhead(
     )
     if targeted_tool_native is not None:
         tools.extend(copy_json_value(list(targeted_tool_native.tools), "targeted tools"))
+    if tool_discovery_projection_kind is ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT:
+        discovery_names = tuple(sorted(tool_discovery_native_tool_names))
+        if len(discovery_names) != len(set(discovery_names)):
+            raise ValueError("Native discovery tool names must be unique.")
+        if (
+            targeted_tool_projection_kind is not TargetedToolProjectionKind.OPENAI_ADDITIONAL_TOOLS
+            and targeted_tool_gateway is None
+        ):
+            tools = [tool for tool in tools if tool.get("name") != CALL_TOOL_NAME]
+        existing_names = {tool.get("name") for tool in tools}
+        for name in discovery_names:
+            if name in existing_names:
+                raise RuntimeError(
+                    "A native discovery tool cannot also be directly or dynamically exposed: "
+                    f"{name}"
+                )
+            descriptor = registered_agent.tool_catalogue.descriptor_for_name(name)
+            tools.append(
+                {
+                    "name": descriptor.name,
+                    "description": descriptor.description,
+                    "input_schema": descriptor.input_schema_copy(),
+                }
+            )
+            existing_names.add(name)
     structured_output_instruction: str | None = None
     if (
         structured_output is not None
@@ -11435,6 +11696,7 @@ def _detach_model_request(request: ModelRequest) -> ModelRequest:
         tools=request.tools,
         hosted_tools=request.hosted_tools,
         targeted_tool_projection=request.targeted_tool_projection,
+        tool_discovery_projection=request.tool_discovery_projection,
         options=request.options,
     )
 

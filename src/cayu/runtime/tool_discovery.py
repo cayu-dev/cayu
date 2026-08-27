@@ -42,6 +42,7 @@ from cayu.core.tools import (
     ToolSpec,
     _runtime_tool_invocation_authority,
 )
+from cayu.providers.base import OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL, ModelProvider
 from cayu.runtime.tool_catalogue import (
     SEARCH_TOOLS_NAME,
     ToolCatalogSnapshot,
@@ -82,9 +83,18 @@ _WORD_PATTERN = re.compile(r"[^\W_]+", re.UNICODE)
 
 
 class ToolDiscoveryMode(StrEnum):
-    """Application-selected provider-neutral tool discovery mode."""
+    """Application-selected tool-discovery delivery policy."""
 
     SEARCH_TOOLS = SEARCH_TOOLS_NAME
+    OPENAI_TOOL_SEARCH_CLIENT = "openai_tool_search_client"
+    OPENAI_TOOL_SEARCH_CLIENT_OR_SEARCH_TOOLS = "openai_tool_search_client_or_search_tools"
+
+
+class ToolDiscoveryProjectionKind(StrEnum):
+    """One concrete provider projection selected for an invocation."""
+
+    SEARCH_TOOLS = SEARCH_TOOLS_NAME
+    OPENAI_TOOL_SEARCH_CLIENT = "openai_tool_search_client"
 
 
 class ToolDiscoveryViewInconsistentError(RuntimeError):
@@ -110,6 +120,37 @@ def copy_tool_discovery_mode(
     except ValueError:
         supported = ", ".join(mode.value for mode in ToolDiscoveryMode)
         raise ValueError(f"{field_name} must be one of: {supported}.") from None
+
+
+def resolve_tool_discovery_projection(
+    mode: ToolDiscoveryMode | None,
+    *,
+    provider: ModelProvider,
+    model: str,
+) -> ToolDiscoveryProjectionKind | None:
+    """Resolve one explicit discovery policy without model-name inference."""
+
+    if mode is None:
+        return None
+    mode = copy_tool_discovery_mode(mode)
+    model = require_durable_clean_nonblank(model, "model")
+    if mode is ToolDiscoveryMode.SEARCH_TOOLS:
+        return ToolDiscoveryProjectionKind.SEARCH_TOOLS
+    supported = provider.supports_tool_discovery_projection(
+        model=model,
+        protocol=OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
+    )
+    if type(supported) is not bool:
+        raise TypeError("Provider tool-discovery capability checks must return a bool.")
+    if supported:
+        return ToolDiscoveryProjectionKind.OPENAI_TOOL_SEARCH_CLIENT
+    if mode is ToolDiscoveryMode.OPENAI_TOOL_SEARCH_CLIENT_OR_SEARCH_TOOLS:
+        return ToolDiscoveryProjectionKind.SEARCH_TOOLS
+    provider.preflight_tool_discovery_projection(
+        model=model,
+        protocol=OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
+    )
+    raise RuntimeError("Provider tool-discovery preflight returned without establishing support.")
 
 
 def search_tools_spec() -> dict[str, Any]:
@@ -148,12 +189,16 @@ def search_tools_spec() -> dict[str, Any]:
 
 
 def tool_discovery_execution_profile_material() -> dict[str, Any]:
-    """Bind the portable search protocol and stable tool schema into a profile."""
+    """Bind discovery semantics and supported delivery projections into a profile."""
 
     return {
-        "kind": "cayu:portable-tool-discovery",
-        "schema_version": TOOL_DISCOVERY_SCHEMA_VERSION,
-        "mode": ToolDiscoveryMode.SEARCH_TOOLS.value,
+        "kind": "cayu:tool-discovery",
+        "schema_version": 2,
+        "result_schema_version": TOOL_DISCOVERY_SCHEMA_VERSION,
+        "projections": {
+            "portable": ToolDiscoveryProjectionKind.SEARCH_TOOLS.value,
+            "openai_client": OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
+        },
         "view_operation_key": TOOL_DISCOVERY_VIEW_OPERATION_KEY,
         "max_results": TOOL_DISCOVERY_MAX_RESULTS,
         "max_grants": TOOL_DISCOVERY_MAX_GRANTS,
@@ -710,11 +755,20 @@ def resolved_discovered_tool_invocation(
     outer_tool_call_id: str,
     arguments_sha256: str,
     invocation_id: str,
+    dispatch_kind: Literal["gateway", "native"] = "gateway",
+    model_tool_name: str = "call_tool",
 ) -> ResolvedTargetedToolInvocation:
     """Project persistent discovery authority into existing dual-identity evidence."""
 
     if type(record) is not ToolDiscoveryGrantRecord:
         raise TypeError("record must be a ToolDiscoveryGrantRecord.")
+    if dispatch_kind not in {"gateway", "native"}:
+        raise ValueError("dispatch_kind must be gateway or native.")
+    model_tool_name = require_durable_clean_nonblank(model_tool_name, "model_tool_name")
+    if dispatch_kind == "gateway" and model_tool_name != "call_tool":
+        raise ValueError("Gateway discovery invocations must use call_tool.")
+    if dispatch_kind == "native" and model_tool_name != record.tool_name:
+        raise ValueError("Native discovery invocations must use the effective tool name.")
     use_id = tool_reference_use_id(
         grant_id=record.grant_id,
         session_id=session_id,
@@ -725,9 +779,9 @@ def resolved_discovered_tool_invocation(
         invocation_id=invocation_id,
     )
     return ResolvedTargetedToolInvocation(
-        dispatch_kind="gateway",
-        model_tool_name="call_tool",
-        tool_ref=record.tool_ref,
+        dispatch_kind=dispatch_kind,
+        model_tool_name=model_tool_name,
+        tool_ref=record.tool_ref if dispatch_kind == "gateway" else None,
         grant_id=record.grant_id,
         use_id=use_id,
         session_id=session_id,
@@ -945,6 +999,40 @@ class ToolDiscoverySearchResult(BaseModel):
                 f"Tool discovery result cannot exceed {TOOL_DISCOVERY_MAX_RESULT_BYTES} bytes."
             )
         return self
+
+
+def tool_discovery_search_match_matches_descriptor(
+    match: ToolDiscoverySearchMatch,
+    descriptor: ToolDescriptor,
+) -> bool:
+    """Return whether model-visible search evidence is the exact current definition."""
+
+    if type(match) is not ToolDiscoverySearchMatch or type(descriptor) is not ToolDescriptor:
+        return False
+    definition = _tool_discovery_definition_for_descriptor(descriptor)
+    return (
+        match.tool_id == descriptor.tool_id
+        and match.name == descriptor.name
+        and match.description == definition["description"]
+        and thaw_json_value(match.input_schema) == definition["input_schema"]
+        and match.descriptor_version == descriptor.version
+        and match.schema_fingerprint == descriptor.schema_fingerprint
+        and match.readiness == "registered"
+    )
+
+
+def _tool_discovery_definition_for_descriptor(
+    descriptor: ToolDescriptor,
+) -> dict[str, Any]:
+    """Return the canonical bounded function definition emitted by discovery."""
+
+    if type(descriptor) is not ToolDescriptor:
+        raise TypeError("descriptor must be a ToolDescriptor.")
+    return {
+        "name": descriptor.name,
+        "description": _bounded_description(descriptor.description),
+        "input_schema": descriptor.input_schema_copy(),
+    }
 
 
 def minimized_tool_discovery_result(result: ToolResult) -> ToolResult:
@@ -1201,7 +1289,8 @@ def _tool_discovery_search_transition(
     for descriptor in ranked:
         if len(matches) >= limit:
             break
-        descriptor_schema = descriptor.input_schema_copy()
+        descriptor_definition = _tool_discovery_definition_for_descriptor(descriptor)
+        descriptor_schema = cast("dict[str, Any]", descriptor_definition["input_schema"])
         if (
             len(canonical_durable_json_bytes(descriptor_schema, "search_tools.input_schema"))
             > TOOL_DISCOVERY_MAX_SCHEMA_BYTES
@@ -1242,7 +1331,7 @@ def _tool_discovery_search_transition(
             tool_ref=grant.tool_ref,
             tool_id=descriptor.tool_id,
             name=descriptor.name,
-            description=_bounded_description(descriptor.description),
+            description=cast("str", descriptor_definition["description"]),
             input_schema=descriptor_schema,
             descriptor_version=descriptor.version,
             schema_fingerprint=descriptor.schema_fingerprint,
@@ -1397,6 +1486,7 @@ __all__ = [
     "ToolDiscoveryGrantInspection",
     "ToolDiscoveryGrantRecord",
     "ToolDiscoveryMode",
+    "ToolDiscoveryProjectionKind",
     "ToolDiscoverySearchMatch",
     "ToolDiscoverySearchResult",
     "ToolDiscoveryViewInconsistentError",
@@ -1409,6 +1499,7 @@ __all__ = [
     "empty_tool_discovery_view",
     "initial_tool_discovery_operation_records",
     "minimized_tool_discovery_result",
+    "resolve_tool_discovery_projection",
     "resolved_discovered_tool_invocation",
     "search_tool_descriptors",
     "search_tools_spec",
@@ -1418,5 +1509,6 @@ __all__ = [
     "tool_discovery_record_matches_descriptor",
     "tool_discovery_reference",
     "tool_discovery_reference_rejection_reason",
+    "tool_discovery_search_match_matches_descriptor",
     "tool_discovery_view_inspection",
 ]

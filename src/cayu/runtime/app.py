@@ -1977,7 +1977,7 @@ class CayuApp:
             raise ToolDiscoveryViewInconsistentError(
                 "The session's registered agent is unavailable."
             )
-        if registered_agent.tool_discovery_mode is not ToolDiscoveryMode.SEARCH_TOOLS:
+        if registered_agent.tool_discovery_mode is None:
             raise ToolDiscoveryViewNotEnabledError(
                 "Tool discovery is not enabled for this session."
             )
@@ -2123,7 +2123,7 @@ class CayuApp:
             tools_by_name[registered_tool.name] = registered_tool
 
         runtime_tools_by_name: dict[str, runtime_records.RegisteredTool] = {}
-        if stored_tool_discovery_mode is ToolDiscoveryMode.SEARCH_TOOLS:
+        if stored_tool_discovery_mode is not None:
             search_tool = _validate_registered_tool(
                 SearchToolsTool(),
                 redactor=self._secret_redactor,

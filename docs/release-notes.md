@@ -122,6 +122,31 @@ runtime, target-input, and limit drift before provider dispatch. Explicit
 applications may publish greater trial or concurrency limits only with an
 application-managed reset contract and stable isolation revision.
 
+### OpenAI Responses can load catalogue tools through client Tool Search
+
+Agents can select `tool_discovery_mode="openai_tool_search_client"` or the
+portable fallback mode `"openai_tool_search_client_or_search_tools"`. One exact
+`OpenAIProvider.client_tool_search_models` allow-list establishes support;
+Cayu performs no model-family inference, rejects compatible endpoints for this
+native projection, and freezes the projection before dispatch. The provider
+adapter maps Cayu's stable search definition to a client
+`tool_search`, validates streamed and non-streamed search calls, runs the same
+durable local catalogue search, and returns branch-authorized registered
+functions in `tool_search_output`. Loaded functions then use the ordinary
+policy, approval, hook, effect, secret, environment, execution, and recovery
+path. Native-only discovery does not expose the portable `call_tool` gateway.
+
+Tool Search call/output state survives inline replay, server chaining,
+background reconnect, and neutral stale-chain recovery. Completed search calls
+are emitted once across lifecycle-plus-terminal evidence. Historical outputs
+are filtered against the current branch view, and server response references
+carry loaded-tool ownership, so a fork cannot inherit parent addressability
+through provider state. A loaded name also unloads if context trimming removes
+the search output that supplied its schema. Exact model allow-lists,
+configured/resolved delivery, and the loaded-definition projection are bound
+into execution-profile or keyed request identity at their respective authority
+boundaries.
+
 ### Local attempts retain complete-tree cleanup ownership across worker loss
 
 `LocalExecutionAttemptCoordinator` adds a task-backed Linux containment boundary
