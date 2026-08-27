@@ -140,7 +140,7 @@ same public v4 runtime-evidence projection used by the research council; the
 report exposes only the allowlisted policy outcome, matched taint labels, and
 source event identity, never the hostile ticket or tool payload.
 
-## Advanced measurement fixture
+## Advanced measurement fixtures
 
 ### Compare stable and changing tool-exposure profiles
 
@@ -157,6 +157,25 @@ smaller schemas and cache stability pull in different directions. It is an
 advanced deterministic measurement fixture, not a provider-portable product
 story or live benchmark, and does not claim that either strategy is universally
 cheaper.
+
+### Validate branch-local tool discovery
+
+The [tool-discovery validation fixture](../examples/tool_discovery_validation/)
+runs Cayu's real provider-neutral `search_tools` / `call_tool` path without an
+API key. A parent discovers and invokes one hidden tool, resumes and reuses the
+same branch-local reference, then forks. The child begins with a distinct empty
+view, rejects the copied parent reference before target execution, performs its
+own search, and invokes through a fresh reference. Typed runtime events,
+content-minimized tool-view inspection, request footprints, and target effects
+provide the evidence; the report never includes either opaque reference.
+
+The same fixture compares a 36-tool direct catalogue with the stable two-tool
+discovery core under one fixed task outcome. It reports a bounded ranking
+corpus, workload-relative unnecessary searches, invalid arguments, model steps,
+provider-visible tool counts, provider-style token/cache categories, local
+wall-clock latency, effects, approvals, exact quality, and fixture-priced cost.
+The usage and price values are synthetic and the timing is machine-local, so
+the report explicitly makes no universal cost, latency, or quality claim.
 
 ## Observed live evidence
 

@@ -42,6 +42,7 @@ examples/
   prompt_cache_compaction/
   repo_maintainer_tournament/
   tainted_incident_response/
+  tool_discovery_validation/
   tool_exposure_economics/
 tests/advanced_examples/
 scripts/nightly_verification.py

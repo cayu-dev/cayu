@@ -77,6 +77,9 @@ corresponding credentials or service.
 - [`cost_quality_comparison.py`](cost_quality_comparison.py) — deterministic paired
   accounting with `verified`, `measured_unmatched`, `unpriced`, and `unavailable`
   proof statuses.
+- [`tool_discovery_validation/`](tool_discovery_validation/) — credential-free
+  discovery, resume, fork reset, copied-reference rejection, ranking, and bounded economics
+  evidence through the real `search_tools` / `call_tool` path.
 - [`real_spend_budget_live.py`](real_spend_budget_live.py) — live causal budget enforcement.
 - [`context_counting_live.py`](context_counting_live.py) and
   [`context_pressure_calibration_live.py`](context_pressure_calibration_live.py) — context limits and calibration.

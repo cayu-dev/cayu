@@ -1804,6 +1804,14 @@ the stable `call_tool` gateway with a returned reference. Applications define
 and register ordinary `Tool` implementations; there is no separate dynamic-tool
 implementation type and no second executor.
 
+The credential-free
+[`tool_discovery_validation`](../examples/tool_discovery_validation/) fixture
+executes the complete resume-and-fork contract through the public runtime and
+reports bounded ranking, search, invalid-argument, model-step, token/cache,
+latency, effect, approval, quality, and fixture-cost evidence. Its local timing
+and synthetic usage/prices are measurement examples, not provider benchmarks or
+universal savings claims.
+
 ### Targeted tool grants and scoped references
 
 A targeted grant gives one already registered catalogue tool bounded

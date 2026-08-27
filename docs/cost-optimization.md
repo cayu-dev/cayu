@@ -34,8 +34,8 @@ research branch calls, with all six final trials passing their runtime and quali
 gates. See [Live Anthropic Haiku cost-savings results](anthropic-haiku-cost-savings-results.md)
 for the exact paired denominators, range, pricing provenance, and run IDs.
 
-Cayu currently has six advanced runtime product stories plus one deterministic
-measurement fixture. Two product stories and the fixture deliberately cover
+Cayu currently has six advanced runtime product stories plus two deterministic
+measurement fixtures. Two product stories and both fixtures deliberately cover
 cost optimization:
 
 - [Prompt-cache compaction](../examples/prompt_cache_compaction/) runs a
@@ -56,6 +56,13 @@ cost optimization:
   identities, provider cache categories, an exact quality outcome, and
   fixture-priced whole-session cost. It explicitly makes no provider benchmark
   or universal savings claim.
+- [Tool-discovery validation](../examples/tool_discovery_validation/) compares a
+  fixed direct-catalogue workload with the provider-neutral two-tool discovery
+  core. Its versioned report includes ranking, unnecessary searches, invalid
+  arguments, model steps, provider tool counts, token/cache categories, local
+  latency, effects, approvals, exact quality, and fixture-priced cost. The
+  fixture demonstrates measurement coverage and makes no universal savings or
+  latency claim.
 
 The other four advanced examples focus on bounded population evaluation,
 authority during approval, verified repository repair, and taint-preserving
@@ -196,7 +203,7 @@ explicit; neither should be silently treated as permission to spend.
 
 ## Start here
 
-- Run the six deterministic product stories and the measurement fixture with
+- Run the six deterministic product stories and both measurement fixtures with
   `uv run pytest -q tests/advanced_examples`.
 - Run the prompt-cache pair with
   `uv run python -m examples.prompt_cache_compaction.app`.

@@ -2,7 +2,7 @@
 
 Start here when you are evaluating, extending, or asking an agent to work on
 Cayu's advanced examples. The suite contains six provider-portable product
-stories and one deterministic measurement fixture. Together they serve two
+stories and two deterministic measurement fixtures. Together they serve two
 purposes:
 
 1. exercise Cayu against deterministic providers and real provider APIs; and
@@ -33,6 +33,7 @@ cost strategy and governance map, see
 | Fixture | Measurement purpose | Stable runtime evidence | Entry point |
 | --- | --- | --- | --- |
 | `tool_exposure_economics` | Compare stable broad and changing narrow direct-tool profiles without assuming that smaller schemas always reduce whole-session cost. | Exposure profiles and transitions, keyed tool-manifest and cache-prefix identities, request/retry counts, provider-style cache categories, exact quality, and fixture-priced cost with no universal savings claim. | [README](tool_exposure_economics/README.md) · [deterministic](tool_exposure_economics/deterministic.py) |
+| `tool_discovery_validation` | Prove branch-local discovery and measure one bounded direct-catalogue versus stable-core workload without treating the fixture as a benchmark. | Parent resume preservation, empty fork generation, copied-reference rejection, child rediscovery, stable provider prefix, deterministic ranking, unnecessary searches, invalid arguments, model steps, token/cache categories, latency, effects, approvals, exact quality, and fixture-priced cost. | [README](tool_discovery_validation/README.md) · [deterministic](tool_discovery_validation/deterministic.py) |
 
 ## Where agents and developers should look
 
@@ -74,10 +75,11 @@ do
 done
 ```
 
-The tool-exposure economics fixture is deliberately deterministic-only:
+The two measurement fixtures are deliberately deterministic-only:
 
 ```bash
 uv run python -m examples.tool_exposure_economics.deterministic
+uv run python -m examples.tool_discovery_validation.deterministic
 ```
 
 Run the deterministic specifications directly with:
@@ -147,8 +149,8 @@ Each provider-portable product-story run writes ignored JSON under
 written under ignored `.cayu-example-workspaces/` or
 `.cayu-example-repositories/` directories.
 
-The deterministic-only tool-exposure economics fixture prints its versioned
-paired report to stdout and does not claim the shared live-result envelope.
+The deterministic-only measurement fixtures print versioned reports to stdout
+and do not claim the shared live-result envelope.
 
 The shared result contains:
 
@@ -167,7 +169,7 @@ and semantic envelope passed—not merely that the provider returned text.
 
 | Layer | Cost and prerequisites | Purpose |
 | --- | --- | --- |
-| Deterministic specifications | No provider key or model spend | PR-safe behavioral coverage for the six product stories and measurement fixture. |
+| Deterministic specifications | No provider key or model spend | PR-safe behavioral coverage for the six product stories and two measurement fixtures. |
 | Primary Gemini checks | `GEMINI_API_KEY`; five trials when the registered nightly checks are invoked | Multi-trial verification of the main live-provider path. |
 | OpenAI and Anthropic portability checks | Matching provider key; one trial per registered check | Detect provider-specific tool, structured-output, and usage regressions. |
 | Real repository promotion | Provider key, GitHub authority, Git credentials, and a disposable repository; manual opt-in | Verify clone, real worktrees, commit, push, PR creation, and idempotent recovery. |

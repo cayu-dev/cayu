@@ -220,6 +220,15 @@ logging. The additive route advances the server contract from version 28 to
 version 29; regenerate committed clients and upgrade separately deployed
 control-plane consumers together. No storage migration is required.
 
+The credential-free `examples/tool_discovery_validation` fixture closes the
+provider-neutral validation loop. It proves discover, invoke, resume, fork,
+copied-reference rejection, child rediscovery, and child invocation through the
+ordinary runtime. Its bounded report covers deterministic ranking, unnecessary
+searches, invalid arguments, model steps, stable request shape, token/cache
+categories, local latency, effects, approvals, exact quality, and synthetic
+fixture cost. It is explicitly not a provider benchmark or universal savings
+claim.
+
 ### Fixed memory interventions have an exact durable execution boundary
 
 Applications can now submit one frozen `MemoryInterventionTrialRequest` to
