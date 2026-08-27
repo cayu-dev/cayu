@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -10,6 +10,9 @@ from cayu import (
     ApprovedEgressDestination,
     Event,
     HttpEgressPolicy,
+    InMemoryKnowledgeStore,
+    KnowledgeAccessScope,
+    KnowledgeStatus,
     VirtualCredentialSpec,
     VirtualEgressEnvironmentFactory,
 )
@@ -254,6 +257,10 @@ class _FakeRunner(Runner):
     async def close(self) -> None:
         self._closed = True
 
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
 
 class _RecordingAdapter(SandboxEgressAdapter):
     runner_kind = "fake"
@@ -262,6 +269,7 @@ class _RecordingAdapter(SandboxEgressAdapter):
     def __init__(self) -> None:
         self.prepare_calls: list[dict[str, Any]] = []
         self.runner_requests: list[Any] = []
+        self.runners: list[_FakeRunner] = []
 
     async def prepare(
         self,
@@ -282,7 +290,9 @@ class _RecordingAdapter(SandboxEgressAdapter):
 
     async def create_runner(self, request: Any) -> Runner:
         self.runner_requests.append(request)
-        return _FakeRunner()
+        runner = _FakeRunner()
+        self.runners.append(runner)
+        return runner
 
 
 def _factory_request() -> EnvironmentFactoryRequest:
@@ -312,6 +322,186 @@ def test_factory_supports_credentialless_only_without_a_resolver_or_fake_environ
     assert dict(runner_request.env_overlay) == {"HTTPS_PROXY": "http://proxy.internal:8080"}
     assert result.environment.spec.metadata["credential_mode"] == "virtual_egress"
     asyncio.run(result.environment.runner.close())  # type: ignore[union-attr]
+
+
+def test_factory_binds_one_exact_host_workspace_into_governed_docker_runner(tmp_path) -> None:
+    workspace = tmp_path / "candidate"
+    workspace.mkdir()
+    (workspace / "agent.py").write_text("VALUE = 1\n")
+    adapter = _RecordingAdapter()
+    adapter.runner_kind = "docker"
+    factory = VirtualEgressEnvironmentFactory(
+        policies={"public-docs": _public_docs_policy()},
+        approved_destinations=[_approved_docs()],
+        credentials=[],
+        adapter=adapter,
+        host_workspace_path=str(workspace),
+    )
+
+    result = asyncio.run(factory.create(_factory_request()))
+
+    assert adapter.runner_requests[0].host_workspace_path == str(workspace.resolve())
+    assert result.environment.workspace is not None
+    assert result.environment.workspace.id.startswith("virtual-egress-host-mount:")
+    asyncio.run(result.environment.runner.close())  # type: ignore[union-attr]
+
+
+def test_factory_resolves_host_workspace_for_each_session_request(tmp_path) -> None:
+    first_workspace = tmp_path / "candidate-one"
+    second_workspace = tmp_path / "candidate-two"
+    first_workspace.mkdir()
+    second_workspace.mkdir()
+    workspaces = {
+        "candidate-one": str(first_workspace),
+        "candidate-two": str(second_workspace),
+    }
+    adapter = _RecordingAdapter()
+    adapter.runner_kind = "docker"
+    factory = VirtualEgressEnvironmentFactory(
+        policies={"public-docs": _public_docs_policy()},
+        approved_destinations=[_approved_docs()],
+        credentials=[],
+        adapter=adapter,
+        host_workspace_path_factory=lambda request: workspaces[request.environment_name],
+    )
+
+    first_result = asyncio.run(
+        factory.create(
+            EnvironmentFactoryRequest(
+                session_id="session-one",
+                agent_name="builder",
+                environment_name="candidate-one",
+            )
+        )
+    )
+    second_result = asyncio.run(
+        factory.create(
+            EnvironmentFactoryRequest(
+                session_id="session-two",
+                agent_name="builder",
+                environment_name="candidate-two",
+            )
+        )
+    )
+
+    assert [request.host_workspace_path for request in adapter.runner_requests] == [
+        str(first_workspace.resolve()),
+        str(second_workspace.resolve()),
+    ]
+    assert first_result.environment.workspace is not None
+    assert second_result.environment.workspace is not None
+    assert first_result.environment.workspace.id != second_result.environment.workspace.id
+    asyncio.run(first_result.environment.runner.close())  # type: ignore[union-attr]
+    asyncio.run(second_result.environment.runner.close())  # type: ignore[union-attr]
+
+
+def test_factory_resolves_private_knowledge_scope_for_each_session_request(tmp_path) -> None:
+    workspace = tmp_path / "candidate"
+    workspace.mkdir()
+    adapter = _RecordingAdapter()
+    adapter.runner_kind = "docker"
+    knowledge = InMemoryKnowledgeStore()
+    factory = VirtualEgressEnvironmentFactory(
+        policies={"public-docs": _public_docs_policy()},
+        approved_destinations=[_approved_docs()],
+        credentials=[],
+        adapter=adapter,
+        host_workspace_path=str(workspace),
+        knowledge_store=knowledge,
+        knowledge_access_scope_factory=lambda request: KnowledgeAccessScope.for_namespace(
+            f"candidate:{request.environment_name}",
+            allowed_statuses=[KnowledgeStatus.ACTIVE, KnowledgeStatus.PENDING],
+        ),
+    )
+
+    result = asyncio.run(
+        factory.create(
+            EnvironmentFactoryRequest(
+                session_id="session-one",
+                agent_name="builder",
+                environment_name="candidate-one",
+            )
+        )
+    )
+
+    assert result.environment.knowledge_store is knowledge
+    assert result.environment.knowledge_access_scope == KnowledgeAccessScope.for_namespace(
+        "candidate:candidate-one",
+        allowed_statuses=[KnowledgeStatus.ACTIVE, KnowledgeStatus.PENDING],
+    )
+    asyncio.run(result.environment.runner.close())  # type: ignore[union-attr]
+
+
+def test_factory_rolls_back_when_private_knowledge_scope_resolution_fails() -> None:
+    async def run() -> tuple[bool, int]:
+        adapter = _RecordingAdapter()
+
+        def fail_scope_resolution(_request: EnvironmentFactoryRequest) -> KnowledgeAccessScope:
+            raise RuntimeError("scope resolution failed")
+
+        factory = VirtualEgressEnvironmentFactory(
+            policies={"public-docs": _public_docs_policy()},
+            approved_destinations=[_approved_docs()],
+            credentials=[],
+            adapter=adapter,
+            knowledge_store=InMemoryKnowledgeStore(),
+            knowledge_access_scope_factory=fail_scope_resolution,
+        )
+
+        with pytest.raises(RuntimeError, match="scope resolution failed"):
+            await factory.create(_factory_request())
+
+        broker = adapter.prepare_calls[0]["broker"]
+        denied = await broker.handle_request(
+            CapturedRequest(
+                method="GET",
+                host="docs.example.com",
+                path="/sdk/index.json",
+            )
+        )
+        return adapter.runners[0].closed, denied.status_code
+
+    runner_closed, denied_status = asyncio.run(run())
+
+    assert runner_closed is True
+    assert denied_status == 403
+
+
+def test_factory_rolls_back_when_private_knowledge_scope_is_invalid() -> None:
+    async def run() -> tuple[bool, int]:
+        adapter = _RecordingAdapter()
+        factory = VirtualEgressEnvironmentFactory(
+            policies={"public-docs": _public_docs_policy()},
+            approved_destinations=[_approved_docs()],
+            credentials=[],
+            adapter=adapter,
+            knowledge_store=InMemoryKnowledgeStore(),
+            knowledge_access_scope_factory=lambda _request: cast(
+                "KnowledgeAccessScope",
+                None,
+            ),
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="knowledge_store and knowledge_access_scope must be configured together",
+        ):
+            await factory.create(_factory_request())
+
+        broker = adapter.prepare_calls[0]["broker"]
+        denied = await broker.handle_request(
+            CapturedRequest(
+                method="GET",
+                host="docs.example.com",
+                path="/sdk/index.json",
+            )
+        )
+        return adapter.runners[0].closed, denied.status_code
+
+    runner_closed, denied_status = asyncio.run(run())
+
+    assert runner_closed is True
+    assert denied_status == 403
 
 
 def test_factory_supports_mixed_credentialed_and_credentialless_destinations() -> None:

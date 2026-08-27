@@ -427,6 +427,25 @@ Context output must preserve complete tool rounds: assistant tool calls must be 
 
 Built-in policies include `RecentTurnsContextPolicy`, `MessageWindowContextPolicy`, `UsageTriggeredContextPolicy`, `CheckpointCompactionContextPolicy`, and `AutomaticRecallContextPolicy`. Recent-turn and message-window policies are pure projections over the current transcript. Built-in policies keep only the latest file-attachment tool result provider-resolvable by default; older attachment references are replaced with text/structured summaries using `strip_old_file_attachments(...)` so providers do not receive the same file bytes on every later request. The same helper keeps user-prompt `FilePart`s provider-resolvable only on the current attach turn — once a file's turn has been answered and a newer user turn begins, its bytes are projected to a short text note (see "Files in prompts" under ArtifactStore). Checkpoint-backed compaction is runtime-managed: it summarizes older messages through a `ContextCompactor`, stores summary state in the session checkpoint under `context_compaction`, emits `context.compaction.started`, `context.compaction.completed` or `context.compaction.failed`, emits `session.checkpointed` after successful checkpoint writes, and sends leading system messages, compacted user-context summary, and recent complete turns to the provider. It does not delete or rewrite transcript messages.
 
+`CheckpointCompactionContextPolicy` can select retained context by user turns or by
+provider-visible size. Configure `compact_after_estimated_context_tokens`,
+`max_recent_context_tokens`, and `reserved_output_tokens` together to trigger on
+estimated context-window pressure and retain the largest recent suffix that fits the
+target. Size selection includes system context, tool schemas and results, provider
+options, attachment estimates, and reserved generation headroom. It advances only at
+validated assistant/tool-round boundaries, so one long user turn can compact safely
+without producing an orphaned tool call or result, and it always leaves the newest
+protocol-atomic unit verbatim. The effective checkpoint projection, not the immutable full
+transcript, is measured after the first compaction so a stable summary does not cause
+repeated compactor calls. The original user task remains verbatim outside the compacted
+prefix, and the same checkpoint remains valid when later user turns are appended.
+Selection uses the policy's configured attachment-retention count. If fixed
+provider-visible overhead or the mandatory recent suffix makes the retained-context target
+impossible, the policy chooses the lowest-pressure valid boundary and proceeds only when
+that best-effort projection falls below the proactive trigger. The actual returned summary
+is remeasured before provider dispatch; an unexpectedly oversized projection fails closed
+while preserving the completed checkpoint and compactor accounting evidence.
+
 Compaction checkpoints store the summary and `compacted_transcript_cursor`, the provider-neutral transcript position covered by that summary. A compactor may advance this cursor only across a contiguous source prefix represented in the returned summary; omitted history remains eligible for a later compaction and is included verbatim between the synthetic summary and recent turns in every model-facing projection. Coverage boundaries may not split an assistant tool call from its matching tool result. A custom provider-backed prompt must cover at least one source message. When recompacting an existing checkpoint, every positive-coverage `CompactionResult` must set `represented_existing_summary_sha256` to the lowercase SHA-256 digest of the exact UTF-8 `CompactionRequest.existing_summary` it represents. A zero-coverage result instead must return that existing summary byte-for-byte unchanged. These checks prevent a valid old cursor from outliving the summary that represents its source range. A result may report zero coverage only as validated `progress_exhausted` state for the current compactor configuration; an ordinary zero-coverage success is rejected so it cannot trigger recurring paid work without cursor progress. Version-1 compaction checkpoints predate explicit source coverage and are invalidated on read; the next eligible compaction rebuilds them from the authoritative transcript as version 2. The model-facing summary is injected as synthetic user context, not as a system instruction, and is not appended to the durable transcript. The authoritative transcript remains immutable and complete, while the checkpoint controls only the model-facing projection. Compaction lifecycle events report requested and represented source ranges, coverage mode, source chunk count/mode, bounded-input state, and failure state through allowlisted scalar fields; they do not include summary, transcript, attachment, provider-state, or instruction content.
 
 When reservation-bearing cost budgets apply, automatic provider-backed
@@ -6536,6 +6555,30 @@ environment binding or close the managed runner; obtaining or closing an
 unmanaged raw provider runner is not part of the contract. Workspace-factory
 failure or cancellation is still environment setup failure and triggers the
 same bounded, idempotent grant, runner, proxy/network, and CA cleanup.
+
+Docker-backed virtual egress can instead receive an exact existing host
+directory through `host_workspace_path` or resolve one per durable
+`EnvironmentFactoryRequest` through `host_workspace_path_factory`. Cayu
+canonicalizes and validates the selected directory before runner dispatch,
+mounts only that directory into the governed container, and exposes the same
+directory as a `LocalWorkspace`. The two host-path forms and
+`workspace_factory` are mutually exclusive. A dynamic resolver must return the
+same path when recovering the same durable request; the application-provided
+execution-profile identity owns the resolver's behavior and versioning. This
+seam lets a coding orchestrator give each child its own mutable checkout while
+keeping command execution and dependency egress inside Cayu's authority.
+
+A virtual-egress factory can also expose application-owned knowledge to the
+environment by configuring `knowledge_store` and
+`knowledge_access_scope_factory` together. The scope factory receives the
+durable `EnvironmentFactoryRequest` and must return the `KnowledgeAccessScope`
+authorized for that environment; configuring either value without the other is
+rejected. Cayu binds the resulting store and scope to the constructed
+`Environment`, so knowledge tools use the child's request-derived authority
+without granting a broader global namespace. Store durability and stable scope
+reconstruction for the same durable request are application responsibilities;
+restart-stable deployments should capture the resolver's behavior and version
+in the application-provided execution-profile identity.
 
 The built-in E2B and Microsandbox adapters are not yet valid for new
 `VirtualEgressEnvironmentFactory` allocations: Cayu rejects those creates

@@ -513,6 +513,7 @@ class VirtualEgressRunnerRequest:
     environment_name: str | None = None
     env_overlay_secret_values_present: bool | None = None
     allocation_id: str | None = None
+    host_workspace_path: str | None = None
 
 
 @dataclass(frozen=True)

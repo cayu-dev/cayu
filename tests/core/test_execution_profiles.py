@@ -2128,6 +2128,34 @@ def test_nondefault_checkpoint_summary_prefix_is_private_process_local_material(
     assert second_app._execution_profile_process_identity not in serialized
 
 
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"compact_after_estimated_context_tokens": 1_100},
+        {"max_recent_context_tokens": 650},
+        {"reserved_output_tokens": 150},
+    ],
+)
+def test_size_based_compaction_settings_change_selection_fingerprint(
+    override: dict[str, int],
+) -> None:
+    def selection_component(**settings: int):
+        policy_settings = {
+            "compact_after_estimated_context_tokens": 1_000,
+            "max_recent_context_tokens": 700,
+            "reserved_output_tokens": 100,
+            **settings,
+        }
+        return _model_semantics_profile(
+            context_policy=CheckpointCompactionContextPolicy(**policy_settings)
+        ).component(ExecutionProfileComponentClass.CONTEXT_SELECTION)
+
+    baseline = selection_component()
+    changed = selection_component(**override)
+
+    assert baseline.fingerprint != changed.fingerprint
+
+
 def test_queued_target_profile_uses_durable_request_controls() -> None:
     async def exercise() -> None:
         store = InMemorySessionStore()

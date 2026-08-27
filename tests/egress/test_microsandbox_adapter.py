@@ -1529,7 +1529,12 @@ def test_microsandbox_post_handoff_failure_restops_resumed_allocation(
         )
         second_factory = factory(second_adapter)
 
-        async def fail_workspace_handoff(_runner: Any) -> Any:
+        async def fail_workspace_handoff(
+            _runner: Any,
+            *,
+            host_workspace_path: str | None,
+        ) -> Any:
+            assert host_workspace_path is None
             raise RuntimeError("workspace handoff failed")
 
         monkeypatch.setattr(second_factory, "_create_workspace", fail_workspace_handoff)

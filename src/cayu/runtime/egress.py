@@ -161,8 +161,9 @@ from cayu.runtime.egress_authority_transitions import (
 from cayu.runtime.execution_profiles import (
     event_with_execution_profile_fingerprint_authority,
 )
+from cayu.storage.memory import KnowledgeAccessScope, KnowledgeStore
 from cayu.vaults import SecretRedactor, SecretRef, SecretResolver
-from cayu.workspaces import RunnerBoundWorkspace, Workspace
+from cayu.workspaces import LocalWorkspace, RunnerBoundWorkspace, Workspace
 from cayu.workspaces.revisions import (
     WorkspaceIdentity,
     WorkspaceRevisionObservation,
@@ -172,6 +173,10 @@ from cayu.workspaces.revisions import (
 
 EventEmitter = Callable[[Event], Awaitable[Event]]
 VirtualEgressWorkspaceFactory = Callable[[Runner], Workspace | Awaitable[Workspace]]
+VirtualEgressHostWorkspacePathFactory = Callable[[EnvironmentFactoryRequest], str]
+VirtualEgressKnowledgeAccessScopeFactory = Callable[
+    [EnvironmentFactoryRequest], KnowledgeAccessScope
+]
 _RollbackResultT = TypeVar("_RollbackResultT")
 
 DEFAULT_SANDBOX_IMAGE = "python:3.12-slim"
@@ -483,7 +488,11 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         runner_kind: str | None = None,
         inner_binding: WorkspaceBinding | None = None,
         workspace_factory: VirtualEgressWorkspaceFactory | None = None,
+        host_workspace_path: str | None = None,
+        host_workspace_path_factory: VirtualEgressHostWorkspacePathFactory | None = None,
         artifact_store: ArtifactStore | None = None,
+        knowledge_store: KnowledgeStore | None = None,
+        knowledge_access_scope_factory: VirtualEgressKnowledgeAccessScopeFactory | None = None,
         event_emitter: EventEmitter | None = None,
         upstream: EgressUpstream | None = None,
         require_test_mode_credentials: bool = True,
@@ -550,13 +559,56 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         self._runner_kind = selected_runner_kind
         if workspace_factory is not None and not callable(workspace_factory):
             raise TypeError("workspace_factory must be callable or None.")
+        selected_workspace_modes = sum(
+            value is not None
+            for value in (workspace_factory, host_workspace_path, host_workspace_path_factory)
+        )
+        if selected_workspace_modes > 1:
+            raise ValueError(
+                "Pass only one of workspace_factory, host_workspace_path, or "
+                "host_workspace_path_factory."
+            )
+        if host_workspace_path_factory is not None and not callable(host_workspace_path_factory):
+            raise TypeError("host_workspace_path_factory must be callable or None.")
+        if host_workspace_path is not None:
+            if selected_runner_kind != "docker":
+                raise UnsupportedEgressError(
+                    "host_workspace_path is supported only by the Docker egress adapter."
+                )
+            if "\0" in host_workspace_path or not os.path.isabs(host_workspace_path):
+                raise ValueError("host_workspace_path must be an absolute path.")
+            host_workspace_path = os.path.realpath(host_workspace_path)
+            if not os.path.isdir(host_workspace_path):
+                raise ValueError("host_workspace_path must name an existing directory.")
+        if host_workspace_path_factory is not None and selected_runner_kind != "docker":
+            raise UnsupportedEgressError(
+                "host_workspace_path_factory is supported only by the Docker egress adapter."
+            )
         self._workspace_factory = workspace_factory
+        self._host_workspace_path = host_workspace_path
+        self._host_workspace_path_factory = host_workspace_path_factory
         self._inner_binding = inner_binding or (
-            NativeBinding() if workspace_factory is not None else NoWorkspaceBinding()
+            NativeBinding()
+            if workspace_factory is not None
+            else (
+                NativeBinding(default_path=host_workspace_path)
+                if host_workspace_path is not None or host_workspace_path_factory is not None
+                else NoWorkspaceBinding()
+            )
         )
         if artifact_store is not None and not isinstance(artifact_store, ArtifactStore):
             raise TypeError("artifact_store must be an ArtifactStore.")
         self._artifact_store = artifact_store
+        if (knowledge_store is None) != (knowledge_access_scope_factory is None):
+            raise ValueError(
+                "knowledge_store and knowledge_access_scope_factory must be configured together."
+            )
+        if knowledge_access_scope_factory is not None and not callable(
+            knowledge_access_scope_factory
+        ):
+            raise TypeError("knowledge_access_scope_factory must be callable or None.")
+        self._knowledge_store = knowledge_store
+        self._knowledge_access_scope_factory = knowledge_access_scope_factory
         self._emitter = event_emitter
         self._upstream = upstream
         self._require_test_mode = require_test_mode_credentials
@@ -1034,6 +1086,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         managed_runner: _EgressManagedRunner | None = None
         workspace: Workspace | None = None
         capability_metadata: dict[str, Any]
+        host_workspace_path = self._resolve_host_workspace_path(request)
         try:
             if reconnect_identity is None:
                 binding = await adapter.prepare(
@@ -1077,6 +1130,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 parent_session_id=request.parent_session_id,
                 reconnect_metadata=reconnect_identity or {},
                 allocation_id=(None if allocation is None else allocation.intent.allocation_id),
+                host_workspace_path=host_workspace_path,
             )
             if allocation is None:
                 runner = await adapter.create_runner(runner_request)
@@ -1169,7 +1223,10 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             runner = None
             binding = None
             ca_dir = None
-            workspace = await self._create_workspace(managed_runner)
+            workspace = await self._create_workspace(
+                managed_runner,
+                host_workspace_path=host_workspace_path,
+            )
             teardown_binding = _EgressTeardownBinding(
                 inner=self._inner_binding,
                 runner=managed_runner,
@@ -1195,6 +1252,52 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             if final_admission.evidence is None:
                 raise RuntimeError("Admitted execution evidence is missing.")
             execution_capability_metadata = final_admission.evidence.to_metadata()
+
+            environment_metadata: dict[str, Any] = {
+                "kind": runner_kind,
+                "credential_mode": CredentialMode.VIRTUAL_EGRESS.value,
+            }
+            result_metadata: dict[str, Any] = {}
+            environment_metadata["egress_capabilities"] = capability_metadata
+            result_metadata["egress_capabilities"] = capability_metadata
+            execution_requirements_metadata = request.execution_requirements.model_dump(mode="json")
+            environment_metadata["execution_requirements"] = execution_requirements_metadata
+            result_metadata["execution_requirements"] = execution_requirements_metadata
+            environment_metadata["execution_capabilities"] = execution_capability_metadata
+            result_metadata["execution_capabilities"] = execution_capability_metadata
+            if configuration_metadata:
+                environment_metadata["egress_configuration"] = configuration_metadata
+                result_metadata["egress_configuration"] = configuration_metadata
+            spec = EnvironmentSpec(name=request.environment_name, metadata=environment_metadata)
+            environment = Environment(
+                spec,
+                workspace=workspace,
+                artifact_store=self._artifact_store,
+                runner=managed_runner,
+                binding=teardown_binding,
+                knowledge_store=self._knowledge_store,
+                knowledge_access_scope=(
+                    None
+                    if self._knowledge_access_scope_factory is None
+                    else self._knowledge_access_scope_factory(request)
+                ),
+            )
+
+            async def release(action: EnvironmentFactoryReleaseAction) -> None:
+                await teardown_binding.release_unbound(
+                    outcome=(
+                        "interrupted"
+                        if action is EnvironmentFactoryReleaseAction.PRESERVE
+                        else None
+                    )
+                )
+
+            return EnvironmentFactoryResult(
+                environment=environment,
+                metadata=result_metadata,
+                reconnect_metadata=reconnect_metadata,
+                release=release,
+            )
         except BaseException as original:
             factory_settlement_tasks: list[asyncio.Task[None]] = []
             if (
@@ -1335,45 +1438,36 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                     )
                 raise rollback_error from rollback_cancellation
             raise
-        environment_metadata: dict[str, Any] = {
-            "kind": runner_kind,
-            "credential_mode": CredentialMode.VIRTUAL_EGRESS.value,
-        }
-        result_metadata: dict[str, Any] = {}
-        environment_metadata["egress_capabilities"] = capability_metadata
-        result_metadata["egress_capabilities"] = capability_metadata
-        execution_requirements_metadata = request.execution_requirements.model_dump(mode="json")
-        environment_metadata["execution_requirements"] = execution_requirements_metadata
-        result_metadata["execution_requirements"] = execution_requirements_metadata
-        environment_metadata["execution_capabilities"] = execution_capability_metadata
-        result_metadata["execution_capabilities"] = execution_capability_metadata
-        if configuration_metadata:
-            environment_metadata["egress_configuration"] = configuration_metadata
-            result_metadata["egress_configuration"] = configuration_metadata
-        spec = EnvironmentSpec(name=request.environment_name, metadata=environment_metadata)
-        environment = Environment(
-            spec,
-            workspace=workspace,
-            artifact_store=self._artifact_store,
-            runner=managed_runner,
-            binding=teardown_binding,
-        )
 
-        async def release(action: EnvironmentFactoryReleaseAction) -> None:
-            await teardown_binding.release_unbound(
-                outcome=(
-                    "interrupted" if action is EnvironmentFactoryReleaseAction.PRESERVE else None
-                )
+    def _resolve_host_workspace_path(
+        self,
+        request: EnvironmentFactoryRequest,
+    ) -> str | None:
+        host_workspace_path = self._host_workspace_path
+        if self._host_workspace_path_factory is not None:
+            host_workspace_path = self._host_workspace_path_factory(request)
+        if host_workspace_path is None:
+            return None
+        if type(host_workspace_path) is not str:
+            raise TypeError("host_workspace_path_factory must return a string path.")
+        if "\0" in host_workspace_path or not os.path.isabs(host_workspace_path):
+            raise ValueError("host workspace paths must be absolute paths.")
+        resolved = os.path.realpath(host_workspace_path)
+        if not os.path.isdir(resolved):
+            raise ValueError("host workspace paths must name existing directories.")
+        return resolved
+
+    async def _create_workspace(
+        self,
+        runner: Runner,
+        *,
+        host_workspace_path: str | None,
+    ) -> Workspace | None:
+        if host_workspace_path is not None:
+            return LocalWorkspace(
+                host_workspace_path,
+                workspace_id=f"virtual-egress-host-mount:{host_workspace_path}",
             )
-
-        return EnvironmentFactoryResult(
-            environment=environment,
-            metadata=result_metadata,
-            reconnect_metadata=reconnect_metadata,
-            release=release,
-        )
-
-    async def _create_workspace(self, runner: Runner) -> Workspace | None:
         if self._workspace_factory is None:
             return None
         created = self._workspace_factory(runner)
@@ -1381,7 +1475,11 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             created = await created
         if not isinstance(created, Workspace):
             raise TypeError("workspace_factory must return a Workspace.")
-        if isinstance(self._inner_binding, NativeBinding):
+        if (
+            isinstance(self._inner_binding, NativeBinding)
+            and self._host_workspace_path is None
+            and self._host_workspace_path_factory is None
+        ):
             if not isinstance(created, RunnerBoundWorkspace):
                 raise TypeError(
                     "A NativeBinding virtual-egress workspace must implement "

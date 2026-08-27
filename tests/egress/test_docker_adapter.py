@@ -138,12 +138,14 @@ def test_create_runner_forwards_explicit_docker_cli_grants(monkeypatch) -> None:
         guest_ca_path=GUEST_CA_PATH,
         setup_commands=(),
         egress_destinations=(),
+        host_workspace_path="/workspace/candidate-one",
     )
 
     runner = asyncio.run(adapter.create_runner(request))
 
     assert runner is expected_runner
     assert observed["kwargs"]["docker_cli_env_allowlist"] == ("AWS_PROFILE",)
+    assert observed["kwargs"]["mount_path"] == "/workspace/candidate-one"
 
 
 @pytest.mark.parametrize("output_secret_values_present", (False, True))

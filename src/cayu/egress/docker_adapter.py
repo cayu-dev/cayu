@@ -510,6 +510,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             request.name,
             image=request.image,
             close_action="remove",
+            mount_path=request.host_workspace_path,
             credential_mode=CredentialMode.VIRTUAL_EGRESS,
             network=network,
             env_overlay=dict(request.env_overlay),

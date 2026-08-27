@@ -4935,6 +4935,100 @@ async def test_openai_provider_emits_nonblank_error_for_blank_exception() -> Non
 
 
 @pytest.mark.anyio
+async def test_openai_protocol_failure_uses_bounded_unknown_retry_path() -> None:
+    class ProtocolFailingTransport(RecordingTransport):
+        async def stream_response_events(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            raise OpenAIProtocolError("malformed compatible endpoint stream")
+            yield {}
+
+    transport = ProtocolFailingTransport()
+    provider = OpenAIProvider(api_key="test-key", transport=transport)
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gpt-test"))
+
+    events = await _collect_events(
+        app,
+        RunRequest(
+            agent_name="assistant",
+            session_id="standard-openai-unknown-protocol-retry",
+            messages=[Message.text("user", "hello")],
+            retry_policy=RetryPolicy(
+                max_attempts=5,
+                max_unknown_attempts=2,
+                initial_delay_s=0.0,
+            ),
+        ),
+    )
+
+    errors = [event for event in events if event.type == EventType.MODEL_ERROR]
+    retries = [event for event in events if event.type == EventType.MODEL_RETRY]
+    assert errors[0].payload.get("provider_error_type") == "protocol_error"
+    assert len(transport.calls) == 2, [
+        (event.type, event.payload) for event in events if event.type == EventType.MODEL_ERROR
+    ]
+    assert [event.payload["effective_max_attempts"] for event in errors] == [2, 2]
+    assert len(retries) == 1
+    assert retries[0].payload["reason"] == "unknown_provider"
+
+
+@pytest.mark.anyio
+async def test_openai_server_completion_validation_uses_bounded_unknown_retry_path() -> None:
+    class InvalidServerCompletionTransport(RecordingTransport):
+        async def stream_response_events(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "model": "gpt-test",
+                    "status": "completed",
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                },
+            }
+
+    transport = InvalidServerCompletionTransport()
+    provider = OpenAIProvider(
+        api_key="test-key",
+        reasoning_state="server",
+        transport=transport,
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gpt-test"))
+
+    events = await _collect_events(
+        app,
+        RunRequest(
+            agent_name="assistant",
+            session_id="openai-server-completion-validation-retry",
+            messages=[Message.text("user", "hello")],
+            retry_policy=RetryPolicy(
+                max_attempts=5,
+                max_unknown_attempts=2,
+                initial_delay_s=0.0,
+            ),
+        ),
+    )
+
+    errors = [event for event in events if event.type == EventType.MODEL_ERROR]
+    retries = [event for event in events if event.type == EventType.MODEL_RETRY]
+    assert len(transport.calls) == 2
+    assert [event.payload["provider_error_type"] for event in errors] == [
+        "protocol_error",
+        "protocol_error",
+    ]
+    assert [event.payload["effective_max_attempts"] for event in errors] == [2, 2]
+    assert len(retries) == 1
+    assert retries[0].payload["reason"] == "unknown_provider"
+
+
+@pytest.mark.anyio
 async def test_openai_provider_stream_propagates_context_overflow() -> None:
     overflow = OpenAIContextOverflowError(
         "OpenAI model context overflow",

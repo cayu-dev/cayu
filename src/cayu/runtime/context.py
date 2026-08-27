@@ -5205,6 +5205,9 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
         compactor: ContextCompactor | None = None,
         max_user_turns: int = 10,
         compact_after_messages: int = 40,
+        compact_after_estimated_context_tokens: int | None = None,
+        max_recent_context_tokens: int | None = None,
+        reserved_output_tokens: int = 0,
         summary_prefix: str = _DEFAULT_CHECKPOINT_COMPACTION_SUMMARY_PREFIX,
         max_attachment_results: int = 1,
     ) -> None:
@@ -5222,8 +5225,38 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
             raise ValueError("max_user_turns must be greater than zero.")
         if compact_after_messages < 1:
             raise ValueError("compact_after_messages must be greater than zero.")
+        compact_after_estimated_context_tokens = _validate_optional_positive_int(
+            compact_after_estimated_context_tokens,
+            "compact_after_estimated_context_tokens",
+        )
+        max_recent_context_tokens = _validate_optional_positive_int(
+            max_recent_context_tokens,
+            "max_recent_context_tokens",
+        )
+        reserved_output_tokens = _validate_nonnegative_int(
+            reserved_output_tokens,
+            "reserved_output_tokens",
+        )
+        if (compact_after_estimated_context_tokens is None) != (max_recent_context_tokens is None):
+            raise ValueError(
+                "compact_after_estimated_context_tokens and max_recent_context_tokens "
+                "must be configured together."
+            )
+        if (
+            compact_after_estimated_context_tokens is not None
+            and max_recent_context_tokens is not None
+            and max_recent_context_tokens + reserved_output_tokens
+            >= compact_after_estimated_context_tokens
+        ):
+            raise ValueError(
+                "max_recent_context_tokens plus reserved_output_tokens must be less "
+                "than compact_after_estimated_context_tokens."
+            )
         self.max_user_turns = max_user_turns
         self.compact_after_messages = compact_after_messages
+        self.compact_after_estimated_context_tokens = compact_after_estimated_context_tokens
+        self.max_recent_context_tokens = max_recent_context_tokens
+        self.reserved_output_tokens = reserved_output_tokens
         self.summary_prefix = require_nonblank(summary_prefix, "summary_prefix")
         self.max_attachment_results = _validate_max_attachment_results(max_attachment_results)
 
@@ -5248,30 +5281,67 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
             previous_summary = None
             previous_cursor = None
 
-        (
-            system_prefix,
-            compactable_messages,
-            recent_messages,
-            compactable_cursor,
-        ) = _split_recent_turns(
-            request.messages,
-            max_user_turns=self.max_user_turns,
-        )
+        system_prefix, _ = _split_system_prefix(request.messages, True)
+        if self.compact_after_estimated_context_tokens is not None:
+            system_prefix = _preserve_original_user_task(request.messages, system_prefix)
         first_compactable_cursor = len(system_prefix)
+        size_selection_triggered = False
+        size_selection_target_satisfied = True
         if (
             previous_summary is None
             or type(previous_cursor) is not int
             or previous_cursor < first_compactable_cursor
-            or previous_cursor > compactable_cursor
+            or previous_cursor > len(request.messages)
             or not _is_compaction_boundary(request.messages, previous_cursor)
         ):
             previous_cursor = first_compactable_cursor
             previous_summary = None
             previous_progress = {}
 
+        if self.compact_after_estimated_context_tokens is None:
+            (
+                system_prefix,
+                compactable_messages,
+                recent_messages,
+                compactable_cursor,
+            ) = _split_recent_turns(
+                request.messages,
+                max_user_turns=self.max_user_turns,
+            )
+            if previous_cursor > compactable_cursor:
+                previous_cursor = first_compactable_cursor
+                previous_summary = None
+                previous_progress = {}
+        else:
+            assert self.max_recent_context_tokens is not None
+            (
+                compactable_messages,
+                recent_messages,
+                compactable_cursor,
+                size_selection_triggered,
+                size_selection_target_satisfied,
+            ) = _split_recent_context_by_size(
+                request,
+                system_prefix=system_prefix,
+                previous_summary=previous_summary,
+                previous_cursor=previous_cursor,
+                compact_after_estimated_context_tokens=(
+                    self.compact_after_estimated_context_tokens
+                ),
+                max_recent_context_tokens=self.max_recent_context_tokens,
+                reserved_output_tokens=self.reserved_output_tokens,
+                summary_prefix=self.summary_prefix,
+                max_attachment_results=self.max_attachment_results,
+            )
+
         newly_compactable = request.messages[previous_cursor:compactable_cursor]
         should_compact = (
-            request.force_compaction or len(compactable_messages) >= self.compact_after_messages
+            request.force_compaction
+            or size_selection_triggered
+            or (
+                self.compact_after_estimated_context_tokens is None
+                and len(compactable_messages) >= self.compact_after_messages
+            )
         ) and bool(newly_compactable)
         current_progress_key = self.compactor._progress_key_for_context_request(
             request,
@@ -5574,6 +5644,35 @@ class CheckpointCompactionContextPolicy(RuntimeManagedContextPolicy):
             messages,
             max_attachment_results=self.max_attachment_results,
         )
+        if size_selection_triggered:
+            assert self.compact_after_estimated_context_tokens is not None
+            assert self.max_recent_context_tokens is not None
+            effective_pressure = _estimate_model_facing_context_pressure(
+                request=request,
+                messages=messages,
+                reserved_output_tokens=self.reserved_output_tokens,
+            )
+            projection_exceeds_target = (
+                size_selection_target_satisfied
+                and effective_pressure.estimated_context_input_tokens
+                > self.max_recent_context_tokens
+            )
+            projection_still_triggered = (
+                effective_pressure.estimated_context_window_tokens
+                >= self.compact_after_estimated_context_tokens
+            )
+            if projection_exceeds_target or projection_still_triggered:
+                cause = ValueError(
+                    "Checkpoint compaction did not produce a model-facing context "
+                    "within the configured size bounds."
+                )
+                raise ContextBuildError(
+                    str(cause),
+                    compaction_telemetry=compaction_telemetry,
+                    checkpoint=checkpoint_update,
+                    checkpoint_event_payload=checkpoint_event_payload,
+                    cause=cause,
+                )
         return ContextBuildResult(
             messages=messages,
             checkpoint=checkpoint_update,
@@ -6148,6 +6247,117 @@ def _split_recent_turns(
     recent_start = turn_starts[-max_user_turns]
     compactable_cursor = len(system_prefix) + recent_start
     return system_prefix, body[:recent_start], body[recent_start:], compactable_cursor
+
+
+def _split_recent_context_by_size(
+    request: ContextRequest,
+    *,
+    system_prefix: list[Message],
+    previous_summary: str | None,
+    previous_cursor: int,
+    compact_after_estimated_context_tokens: int,
+    max_recent_context_tokens: int,
+    reserved_output_tokens: int,
+    summary_prefix: str,
+    max_attachment_results: int,
+) -> tuple[list[Message], list[Message], int, bool, bool]:
+    """Choose a size-bounded recent suffix without splitting a tool round."""
+
+    messages = [copy_message(message) for message in request.messages]
+    validate_context_messages(messages)
+    summary_message = (
+        []
+        if previous_summary is None
+        else [
+            Message.text(
+                MessageRole.USER,
+                f"{summary_prefix}\n{previous_summary}",
+            )
+        ]
+    )
+    current_projection = strip_old_file_attachments(
+        [
+            *(copy_message(message) for message in system_prefix),
+            *summary_message,
+            *(copy_message(message) for message in messages[previous_cursor:]),
+        ],
+        max_attachment_results=max_attachment_results,
+    )
+    pressure = _estimate_model_facing_context_pressure(
+        request=request,
+        messages=current_projection,
+        reserved_output_tokens=reserved_output_tokens,
+    )
+    if (
+        not request.force_compaction
+        and not request.force_bounded_compaction
+        and pressure.estimated_context_window_tokens < compact_after_estimated_context_tokens
+    ):
+        return [], messages[previous_cursor:], previous_cursor, False, True
+
+    projected_summary = previous_summary or "Compacted prior context."
+    best_candidate: tuple[list[Message], list[Message], int] | None = None
+    best_candidate_tokens: int | None = None
+    # Keep the newest protocol-atomic unit verbatim. The size target controls
+    # how much older context remains, but it must not authorize summarizing the
+    # only/latest tool round or user follow-up merely to satisfy the target.
+    for compactable_cursor in range(previous_cursor + 1, len(messages)):
+        if not _is_compaction_boundary(messages, compactable_cursor):
+            continue
+        candidate_projection = strip_old_file_attachments(
+            [
+                *(copy_message(message) for message in system_prefix),
+                Message.text(
+                    MessageRole.USER,
+                    f"{summary_prefix}\n{projected_summary}",
+                ),
+                *(copy_message(message) for message in messages[compactable_cursor:]),
+            ],
+            max_attachment_results=max_attachment_results,
+        )
+        try:
+            validate_context_messages(candidate_projection)
+        except ValueError:
+            continue
+        candidate_pressure = _estimate_model_facing_context_pressure(
+            request=request,
+            messages=candidate_projection,
+            reserved_output_tokens=0,
+        )
+        candidate_tokens = candidate_pressure.estimated_context_input_tokens
+        candidate = (
+            messages[previous_cursor:compactable_cursor],
+            messages[compactable_cursor:],
+            compactable_cursor,
+        )
+        if candidate_tokens <= max_recent_context_tokens:
+            return (
+                *candidate,
+                True,
+                True,
+            )
+        if best_candidate_tokens is None or candidate_tokens <= best_candidate_tokens:
+            best_candidate = candidate
+            best_candidate_tokens = candidate_tokens
+
+    if best_candidate is not None:
+        return *best_candidate, True, False
+    return [], messages[previous_cursor:], previous_cursor, True, False
+
+
+def _preserve_original_user_task(
+    messages: list[Message],
+    system_prefix: list[Message],
+) -> list[Message]:
+    """Keep the first user task verbatim outside every size-compacted prefix."""
+
+    cursor = len(system_prefix)
+    if cursor < len(messages) and messages[cursor].role == MessageRole.USER:
+        return [
+            *(copy_message(message) for message in system_prefix),
+            copy_message(messages[cursor]),
+        ]
+    return [copy_message(message) for message in system_prefix]
 
 
 def _compaction_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any] | None:

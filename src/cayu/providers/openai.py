@@ -925,7 +925,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                 async with aclosing_provider_stream(events):
                     async for event in events:
                         yielded_any = True
-                        completion_emitted = event.type == ModelStreamEventType.COMPLETED
+                        is_completion = event.type == ModelStreamEventType.COMPLETED
                         event = _event_with_server_targeted_tool_ownership(
                             event,
                             reasoning_state=self.reasoning_state,
@@ -935,6 +935,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                                 else request.targeted_tool_projection.marker_id
                             ),
                         )
+                        completion_emitted = is_completion
                         yield event
                         if completion_emitted:
                             break
@@ -954,7 +955,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             events = self._consume(recovery_payload)
             async with aclosing_provider_stream(events):
                 async for event in events:
-                    completion_emitted = event.type == ModelStreamEventType.COMPLETED
+                    is_completion = event.type == ModelStreamEventType.COMPLETED
                     event = _event_with_server_targeted_tool_ownership(
                         event,
                         reasoning_state=self.reasoning_state,
@@ -964,6 +965,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                             else request.targeted_tool_projection.marker_id
                         ),
                     )
+                    completion_emitted = is_completion
                     yield event
                     if completion_emitted:
                         break
@@ -1004,6 +1006,38 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                     error_code=safe.error_code,
                     request_id=safe.request_id,
                     response_body=None,
+                )
+        except OpenAIProtocolError as exc:
+            credential_values = credential_sanitization_values(
+                self.api_key,
+                extra_headers=self.extra_headers,
+            )
+            if completion_emitted:
+                post_completion_failure = credential_safe_post_completion_failure(
+                    exc,
+                    provider_label="OpenAI",
+                    provider_name="openai",
+                    credential_values=credential_values,
+                )
+            else:
+                # A parser/protocol failure is an unknown provider outcome, not
+                # an application exception. Preserve that typed identity so the
+                # runtime applies max_unknown_attempts rather than stopping at 1.
+                protocol_event = credential_safe_error_event(
+                    exc,
+                    provider_label="OpenAI",
+                    provider_name="openai",
+                    credential_values=credential_values,
+                    unresolved_message="OpenAIProtocolError: OpenAI provider failed",
+                )
+                protocol_payload = dict(protocol_event.payload)
+                # Preserve the public protocol-error type while marking the
+                # fixed, credential-free provider classification explicitly.
+                # The runtime can then apply its bounded unknown retry policy.
+                protocol_payload["provider_error_type"] = "protocol_error"
+                error_event = ModelStreamEvent(
+                    type=protocol_event.type,
+                    payload=protocol_payload,
                 )
         except Exception as exc:
             credential_values = credential_sanitization_values(

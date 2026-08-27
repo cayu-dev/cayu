@@ -1378,9 +1378,14 @@ def _cayu_context_policy_material(
                 compaction_process_local = False
         selection: dict[str, Any] = {
             "kind": "checkpoint_compaction",
-            "version": 1,
+            "version": 2,
             "max_user_turns": policy.max_user_turns,
             "compact_after_messages": policy.compact_after_messages,
+            "compact_after_estimated_context_tokens": (
+                policy.compact_after_estimated_context_tokens
+            ),
+            "max_recent_context_tokens": policy.max_recent_context_tokens,
+            "reserved_output_tokens": policy.reserved_output_tokens,
             "summary_prefix": (
                 {
                     "kind": "process_local_private_configuration",
