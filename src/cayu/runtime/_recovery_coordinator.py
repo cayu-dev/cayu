@@ -116,7 +116,11 @@ from cayu.runtime._interruption_coordinator import (
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
 )
 from cayu.runtime._isolated_tool_process import (
+    isolated_tool_dispatch_authority_digests,
+    isolated_tool_dispatch_authority_storage_key,
     isolated_tool_dispatch_record_matches,
+    isolated_tool_dispatch_settlement_matches,
+    isolated_tool_dispatch_settlement_storage_key,
     isolated_tool_dispatch_storage_key,
 )
 from cayu.runtime._memory_evidence import (
@@ -8795,10 +8799,24 @@ class RecoveryCoordinator:
 
         try:
             events = await self._session_store.load_events(session.id)
+            (
+                isolated_dispatched_ids,
+                isolated_call_ids,
+            ) = await self._isolated_tool_dispatch_ids(
+                session=session,
+                pending_round=pending_round,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
             tool_round_recovery.validate_tool_round_recovery_target(
                 events=events,
                 pending_round=pending_round,
                 tool_call_id=request.tool_call_id,
+                execution_started=(
+                    request.tool_call_id in isolated_dispatched_ids
+                    if request.tool_call_id in isolated_call_ids
+                    else None
+                ),
             )
             factory_started_event = await self._environment_lifecycle.emit_factory_started(
                 session=session,
@@ -8926,7 +8944,17 @@ class RecoveryCoordinator:
                 events=events,
                 pending_round=pending_round,
             )
-            remaining_ids = started_ids - set(recorded_outcomes)
+            (
+                isolated_dispatched_ids,
+                isolated_call_ids,
+            ) = await self._isolated_tool_dispatch_ids(
+                session=session,
+                pending_round=pending_round,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+            )
+            effective_started_ids = (started_ids - isolated_call_ids) | isolated_dispatched_ids
+            remaining_ids = effective_started_ids - set(recorded_outcomes)
             if remaining_ids:
                 next_call = next(
                     call for call in pending_round.tool_calls if call.tool_call_id in remaining_ids
@@ -9288,10 +9316,14 @@ class RecoveryCoordinator:
             events=lifecycle_events,
             pending_round=pending_round,
         )
-        isolated_dispatched_ids = await self._isolated_tool_dispatch_ids(
+        (
+            isolated_dispatched_ids,
+            isolated_call_ids,
+        ) = await self._isolated_tool_dispatch_ids(
             session=request.session,
             pending_round=pending_round,
             registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
         )
         interrupted_results = _interrupted_tool_round_results(
             tool_calls=pending_tool_calls,
@@ -9321,7 +9353,9 @@ class RecoveryCoordinator:
             session_id=request.session.id,
             registered_agent=request.registered_agent,
             pending_round=pending_round,
-            execution_scope_unknown_ids=started_ids,
+            execution_scope_unknown_ids=(
+                (started_ids - isolated_call_ids) | isolated_dispatched_ids
+            ),
         )
         if pending_round.assistant_message_state == "quarantined":
             tool_round_recovery.ready_assistant_publication_message(pending_round)
@@ -9435,11 +9469,15 @@ class RecoveryCoordinator:
         session: Session,
         pending_round: tool_round_recovery.PendingToolRound,
         registered_agent: runtime_records.RegisteredAgentState,
-    ) -> set[str]:
-        """Load exact runtime-owned evidence that an isolated child was admitted."""
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> tuple[set[str], set[str]]:
+        """Load exact possible-dispatch evidence and all isolated call IDs."""
 
         identity = tool_round_recovery.pending_tool_round_identity(pending_round)
         dispatched_ids: set[str] = set()
+        isolated_call_ids: set[str] = set()
+        environment_allocation_fingerprint_loaded = False
+        environment_allocation_fingerprint: str | None = None
         for call in pending_round.tool_calls:
             registered_tool = registered_agent.executable_tool(call.tool_name)
             if registered_tool is None:
@@ -9449,6 +9487,7 @@ class RecoveryCoordinator:
                 raise RuntimeError("Registered tool execution contract is malformed.")
             if contract.get("boundary") != "posix_process":
                 continue
+            isolated_call_ids.add(call.tool_call_id)
             idempotency_key = tool_execution.tool_idempotency_key(
                 session_id=session.id,
                 tool_round_id=identity.tool_round_id,
@@ -9463,15 +9502,78 @@ class RecoveryCoordinator:
                 tool_name=call.tool_name,
                 idempotency_key=idempotency_key,
             )
+            authority_storage_key = isolated_tool_dispatch_authority_storage_key(
+                session_id=session.id,
+                model_step_id=identity.model_step_id,
+                model_attempt_id=identity.model_attempt_id,
+                tool_round_id=identity.tool_round_id,
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                idempotency_key=idempotency_key,
+            )
+            settlement_storage_key = isolated_tool_dispatch_settlement_storage_key(
+                session_id=session.id,
+                model_step_id=identity.model_step_id,
+                model_attempt_id=identity.model_attempt_id,
+                tool_round_id=identity.tool_round_id,
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                idempotency_key=idempotency_key,
+            )
             record = await self._session_store.load_session_operation(
                 session.id,
                 storage_key,
             )
+            authority_record = await self._session_store.load_session_operation(
+                session.id,
+                authority_storage_key,
+            )
+            settlement_record = await self._session_store.load_session_operation(
+                session.id,
+                settlement_storage_key,
+            )
             if record is None:
+                if authority_record is not None or settlement_record is not None:
+                    raise RuntimeError("Isolated tool dispatch evidence has no preparation record.")
                 continue
+            if not environment_allocation_fingerprint_loaded:
+                if registered_environment is None:
+                    environment_allocation_fingerprint = None
+                elif registered_environment.factory_backed:
+                    environment_allocation_fingerprint = (
+                        await self._environment_lifecycle.durable_live_allocation_fingerprint(
+                            session_id=session.id,
+                            environment_name=registered_environment.spec.name,
+                        )
+                    )
+                else:
+                    environment_allocation_fingerprint = (
+                        registered_environment.live_allocation_fingerprint
+                    )
+                environment_allocation_fingerprint_loaded = True
+            authority_digests = (
+                None
+                if pending_round.source_run_epoch is None
+                or pending_round.execution_profile_fingerprint is None
+                else isolated_tool_dispatch_authority_digests(
+                    authority_record,
+                    session_id=session.id,
+                    parent_task_id=pending_round.task_id,
+                    parent_run_epoch=pending_round.source_run_epoch,
+                    model_step_id=identity.model_step_id,
+                    model_attempt_id=identity.model_attempt_id,
+                    tool_round_id=identity.tool_round_id,
+                    tool_call_id=call.tool_call_id,
+                    tool_name=call.tool_name,
+                    idempotency_key=idempotency_key,
+                    execution_profile_fingerprint=(pending_round.execution_profile_fingerprint),
+                    environment_allocation_fingerprint=(environment_allocation_fingerprint),
+                )
+            )
             if (
                 pending_round.source_run_epoch is None
                 or pending_round.execution_profile_fingerprint is None
+                or authority_digests is None
                 or not isolated_tool_dispatch_record_matches(
                     record,
                     session_id=session.id,
@@ -9483,14 +9585,26 @@ class RecoveryCoordinator:
                     tool_call_id=call.tool_call_id,
                     tool_name=call.tool_name,
                     idempotency_key=idempotency_key,
+                    request_sha256=authority_digests[0],
+                    effective_arguments_sha256=authority_digests[1],
                     execution_profile_fingerprint=(pending_round.execution_profile_fingerprint),
+                    environment_allocation_fingerprint=(environment_allocation_fingerprint),
                 )
             ):
                 raise RuntimeError(
                     "Isolated tool dispatch evidence conflicts with its pending round."
                 )
+            if settlement_record is not None:
+                if not isolated_tool_dispatch_settlement_matches(
+                    settlement_record,
+                    dispatch_record=record,
+                ):
+                    raise RuntimeError(
+                        "Isolated tool dispatch settlement conflicts with its preparation."
+                    )
+                continue
             dispatched_ids.add(call.tool_call_id)
-        return dispatched_ids
+        return dispatched_ids, isolated_call_ids
 
     async def _complete_recovery_assistant_publication(
         self,
@@ -10310,6 +10424,16 @@ class RecoveryCoordinator:
             events=lifecycle_events,
             pending_round=pending_round,
         )
+        (
+            isolated_dispatched_ids,
+            isolated_call_ids,
+        ) = await self._isolated_tool_dispatch_ids(
+            session=session,
+            pending_round=pending_round,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+        )
+        effective_started_ids = (started_ids - isolated_call_ids) | isolated_dispatched_ids
         subagent_children: dict[str, Session | None] = {}
         subagent_recovery_checkpoint: dict[str, Any] | None = None
         if any(
@@ -10395,7 +10519,7 @@ class RecoveryCoordinator:
                         tool_call.arguments,
                         "durable_tool_recovery.arguments",
                     ),
-                    started=pending_tool_call.tool_call_id in started_ids,
+                    started=pending_tool_call.tool_call_id in effective_started_ids,
                     load_operation=load_durable_tool_operation,
                 )
                 if result is not None and type(result) is not ToolResult:
@@ -10428,7 +10552,7 @@ class RecoveryCoordinator:
                 result = tool_round_recovery.unknown_recovered_tool_result(
                     pending_tool_call=pending_tool_call,
                     pending_round=pending_round,
-                    started=pending_tool_call.tool_call_id in started_ids,
+                    started=pending_tool_call.tool_call_id in effective_started_ids,
                 )
             synthesized_outcomes.append(
                 runtime_records.ToolCallOutcome(call=tool_call, result=result)
@@ -10450,7 +10574,7 @@ class RecoveryCoordinator:
             session_id=session.id,
             registered_agent=registered_agent,
             pending_round=pending_round,
-            execution_scope_unknown_ids=started_ids,
+            execution_scope_unknown_ids=effective_started_ids,
         )
         if pending_round.assistant_message_state == "quarantined":
             tool_round_recovery.ready_assistant_publication_message(pending_round)

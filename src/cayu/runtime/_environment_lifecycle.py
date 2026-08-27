@@ -2884,6 +2884,47 @@ class EnvironmentLifecycle:
             )
         return fingerprint
 
+    async def durable_live_allocation_fingerprint(
+        self,
+        *,
+        session_id: str,
+        environment_name: str,
+    ) -> str | None:
+        """Reconstruct the session-owned allocation identity without reconnecting it."""
+
+        checkpoint = await self._session_store.load_checkpoint(session_id)
+        reconnect_metadata, allocation_owner = _factory_reconnect_state_from_checkpoint(
+            checkpoint,
+            environment_name=environment_name,
+        )
+        if allocation_owner != session_id:
+            raise RuntimeError(
+                "Environment recovery has no session-owned durable allocation identity."
+            )
+        allocation_record = self._allocation_coordinator.record_from_checkpoint(
+            checkpoint,
+            environment_name=environment_name,
+        )
+        allocation_receipt = self._allocation_coordinator.receipt_from_checkpoint(
+            checkpoint,
+            environment_name=environment_name,
+        )
+        if allocation_record is not None:
+            raise RuntimeError(
+                "Environment recovery conflicts with an incomplete allocation intent."
+            )
+        if allocation_receipt is not None and (
+            allocation_receipt.intent.environment_name != environment_name
+            or allocation_receipt.intent.session_id != session_id
+            or allocation_receipt.reconnect_metadata != reconnect_metadata
+        ):
+            raise RuntimeError(
+                "Environment allocation receipt conflicts with durable reconnect state."
+            )
+        return _reconnect_allocation_fingerprint(
+            reconnect_metadata
+        ) or _live_allocation_fingerprint(None, allocation_receipt)
+
     async def _checkpoint_factory_reconnect_metadata(
         self,
         *,

@@ -4,16 +4,27 @@ import asyncio
 import base64
 import json
 import os
+import signal
+import sys
 import time
 import warnings
 from collections.abc import Mapping
+from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+from uuid import uuid4
 
 import httpx
 import pytest
 from pydantic import SecretStr
 
+from cayu import (
+    Environment,
+    EnvironmentFactory,
+    EnvironmentFactoryRequest,
+    EnvironmentFactoryResult,
+    EnvironmentSpec,
+)
 from cayu._validation import DurableValueError, copy_bounded_durable_json_value
 from cayu.core import (
     AgentSpec,
@@ -42,6 +53,8 @@ from cayu.evals.testing import ScriptedModelProvider
 from cayu.providers import ModelStreamEvent
 from cayu.runtime import (
     AlwaysRequireApprovalToolPolicy,
+    BeforeToolCallDecision,
+    BeforeToolCallHookContext,
     CayuApp,
     InMemorySessionStore,
     InMemoryTaskStore,
@@ -49,17 +62,21 @@ from cayu.runtime import (
     PublicAuthorityAliasKeyring,
     ResumeRequest,
     RunRequest,
+    RuntimeHook,
     SessionStatus,
     Task,
     TaskCreate,
     TaskQuery,
     TaskStatus,
     ToolApprovalDecision,
+    ToolApprovalRecoveryOutcome,
     ToolApprovalRequest,
     ToolExecutionContract,
+    ToolRoundRecoveryRequest,
     run_task_worker,
 )
 from cayu.runtime import _isolated_tool_process as isolated_process
+from cayu.runtime import _isolated_tool_supervisor as isolated_supervisor
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime._isolated_tool_process import (
     IsolatedToolDeadlineExceeded,
@@ -88,11 +105,33 @@ from cayu.runtime.tool_policy import (
 from cayu.server import ServerConfig, create_server
 from cayu.vaults import SecretRedactor
 
+pytestmark = pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="complete process-tree containment requires Linux subreaper support",
+)
+
 _SCHEMA = {
     "type": "object",
     "properties": {"text": {"type": "string"}},
     "additionalProperties": False,
 }
+
+
+def _supervisor_settlement_proof(
+    *,
+    supervisor_failed: bool = False,
+) -> isolated_process._SupervisorSettlementProofOwner:
+    owner = isolated_process._SupervisorSettlementProofOwner.create()
+    os.pwrite(
+        owner.descriptor,
+        (
+            isolated_process._SUPERVISOR_SETTLEMENT_ACK_FAILED
+            if supervisor_failed
+            else isolated_process._SUPERVISOR_SETTLEMENT_ACK_COMPLETED
+        ),
+        0,
+    )
+    return owner
 
 
 def _factory_ref(
@@ -119,6 +158,7 @@ def _tool(
     max_response_bytes: int = 1 << 20,
     max_stdout_bytes: int = 64 << 10,
     max_stderr_bytes: int = 64 << 10,
+    term_grace_seconds: float = 0.1,
     effect: ToolEffect = ToolEffect.NONE,
     factory: ProcessIsolatedToolFactoryRef | None = None,
 ) -> ProcessIsolatedTool:
@@ -138,7 +178,7 @@ def _tool(
         factory=_factory_ref() if factory is None else factory,
         limits=ProcessIsolatedToolLimits(
             deadline_seconds=deadline_seconds,
-            term_grace_seconds=0.1,
+            term_grace_seconds=term_grace_seconds,
             kill_grace_seconds=0.5,
             max_request_bytes=max_request_bytes,
             max_response_bytes=max_response_bytes,
@@ -151,20 +191,30 @@ def _tool(
     )
 
 
-async def _load_operation(_storage_key: str) -> dict[str, Any] | None:
-    return None
+def _context(
+    arguments: dict[str, Any],
+    *,
+    operations: dict[str, dict[str, Any]] | None = None,
+) -> ToolContext:
+    if operations is None:
+        operations = {}
 
+    async def load_operation(storage_key: str) -> dict[str, Any] | None:
+        record = operations.get(storage_key)
+        return None if record is None else dict(record)
 
-async def _compare_and_set_operation(
-    _storage_key: str,
-    _expected: dict[str, Any] | None,
-    desired: dict[str, Any],
-    _secondary: Mapping[str, dict[str, Any]],
-) -> dict[str, Any]:
-    return desired
+    async def compare_and_set_operation(
+        storage_key: str,
+        expected: dict[str, Any] | None,
+        desired: dict[str, Any],
+        secondary: Mapping[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        if operations.get(storage_key) != expected:
+            return dict(operations[storage_key])
+        operations[storage_key] = dict(desired)
+        operations.update({key: dict(value) for key, value in secondary.items()})
+        return dict(desired)
 
-
-def _context(arguments: dict[str, Any]) -> ToolContext:
     context = ToolContext(
         session_id="isolated-session",
         idempotency_key="tool-execution-1",
@@ -183,8 +233,8 @@ def _context(arguments: dict[str, Any]) -> ToolContext:
         effective_arguments=arguments,
         execution_profile_fingerprint="e" * 64,
         environment_allocation_fingerprint="a" * 64,
-        load_durable_operation=_load_operation,
-        compare_and_set_durable_operation=_compare_and_set_operation,
+        load_durable_operation=load_operation,
+        compare_and_set_durable_operation=compare_and_set_operation,
         seal_durable_output=lambda value: dict(value),
         secret_publication_sealer=lambda: None,
     )
@@ -305,12 +355,89 @@ def test_registration_rejects_secrets_and_unsupported_platforms_before_dispatch(
             redactor=SecretRedactor("registered-secret"),
         )
 
-    monkeypatch.setattr(isolated_process.os, "name", "nt")
-    with pytest.raises(RuntimeError, match="POSIX"):
+    monkeypatch.setattr(
+        isolated_process,
+        "_complete_process_tree_supervision_available",
+        lambda: False,
+    )
+    with pytest.raises(RuntimeError, match="Linux subreaper"):
         validate_process_isolated_tool_registration(
             _tool(),
             redactor=SecretRedactor(),
         )
+
+
+def test_registration_requires_positive_subreaper_capability_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        isolated_process,
+        "_child_subreaper_probe_succeeds",
+        lambda: False,
+    )
+
+    app = CayuApp(enable_logging=False)
+    with pytest.raises(RuntimeError, match="Linux subreaper"):
+        app.register_agent(
+            AgentSpec(name="assistant", model="test-model"),
+            tools=[_tool()],
+        )
+    assert all(agent.name != "assistant" for agent in app.describe().agents)
+
+
+def test_subreaper_capability_cache_is_process_generation_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process_ids = iter((101, 101, 202))
+    probe_calls: list[list[str]] = []
+
+    def successful_probe(arguments: list[str], **_kwargs: Any):
+        probe_calls.append(arguments)
+        return isolated_process.subprocess.CompletedProcess(arguments, 0)
+
+    isolated_process._child_subreaper_probe_succeeds_for_process.cache_clear()
+    try:
+        monkeypatch.setattr(isolated_process.os, "getpid", lambda: next(process_ids))
+        monkeypatch.setattr(isolated_process.subprocess, "run", successful_probe)
+
+        assert isolated_process._child_subreaper_probe_succeeds() is True
+        assert isolated_process._child_subreaper_probe_succeeds() is True
+        assert isolated_process._child_subreaper_probe_succeeds() is True
+        assert len(probe_calls) == 2
+    finally:
+        isolated_process._child_subreaper_probe_succeeds_for_process.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "first_failure",
+    [
+        OSError("temporary process exhaustion"),
+        isolated_process.subprocess.TimeoutExpired(["subreaper-probe"], 2.0),
+    ],
+)
+def test_subreaper_capability_probe_retries_transient_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    first_failure: BaseException,
+) -> None:
+    probe_calls: list[list[str]] = []
+
+    def probe(arguments: list[str], **_kwargs: Any):
+        probe_calls.append(arguments)
+        if len(probe_calls) == 1:
+            raise first_failure
+        return isolated_process.subprocess.CompletedProcess(arguments, 0)
+
+    isolated_process._child_subreaper_probe_succeeds_for_process.cache_clear()
+    try:
+        monkeypatch.setattr(isolated_process.os, "getpid", lambda: 303)
+        monkeypatch.setattr(isolated_process.subprocess, "run", probe)
+
+        assert isolated_process._child_subreaper_probe_succeeds() is False
+        assert isolated_process._child_subreaper_probe_succeeds() is True
+        assert isolated_process._child_subreaper_probe_succeeds() is True
+        assert len(probe_calls) == 2
+    finally:
+        isolated_process._child_subreaper_probe_succeeds_for_process.cache_clear()
 
 
 def test_registration_revalidates_isolated_tool_workspace_authority() -> None:
@@ -331,6 +458,1141 @@ def test_registration_revalidates_isolated_tool_workspace_authority() -> None:
             AgentSpec(name="assistant", model="test-model"),
             tools=[tool],
         )
+
+
+def test_supervisor_observation_failure_retains_cleanup_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RetryObserved(Exception):
+        pass
+
+    def unavailable_children() -> tuple[int, ...]:
+        raise OSError("proc observation unavailable")
+
+    def retry_sleep(_seconds: float) -> None:
+        raise RetryObserved
+
+    monkeypatch.setattr(isolated_supervisor, "_direct_children", unavailable_children)
+    monkeypatch.setattr(isolated_supervisor.time, "sleep", retry_sleep)
+
+    with pytest.raises(RetryObserved):
+        isolated_supervisor._settle_owned_children(
+            worker_process_group_id=123,
+            worker_status=None,
+            term_grace_seconds=0.1,
+            kill_grace_seconds=0.1,
+        )
+
+
+def test_supervisor_post_spawn_failure_settles_worker_tree_before_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SpawnedWorker:
+        pid = 4312
+
+    result_read_fd, result_write_fd = os.pipe()
+    control_read_fd, control_write_fd = os.pipe()
+    settlement_proof_owner = isolated_process._SupervisorSettlementProofOwner.create()
+    supervisor_settlement_fd = os.dup(settlement_proof_owner.descriptor)
+    settled: list[tuple[int, int | None]] = []
+    settlement_ack = b""
+    original_close = os.close
+    result_close_failed = False
+
+    def fail_first_result_close(descriptor: int) -> None:
+        nonlocal result_close_failed
+        if descriptor == result_write_fd and not result_close_failed:
+            result_close_failed = True
+            raise OSError("injected result-pipe close failure")
+        original_close(descriptor)
+
+    monkeypatch.setattr(isolated_supervisor, "_shutdown_requested", False)
+    monkeypatch.setattr(isolated_supervisor, "_enable_child_subreaper", lambda: None)
+    monkeypatch.setattr(isolated_supervisor.subprocess, "Popen", lambda *_a, **_k: SpawnedWorker())
+    monkeypatch.setattr(isolated_supervisor.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(isolated_supervisor.os, "close", fail_first_result_close)
+    monkeypatch.setattr(
+        isolated_supervisor,
+        "_settle_owned_children",
+        lambda *, worker_process_group_id, worker_status, **_kwargs: (
+            settled.append((worker_process_group_id, worker_status)) or worker_status
+        ),
+    )
+
+    try:
+        os.write(control_write_fd, isolated_supervisor._WORKER_ADMISSION)
+        return_code = isolated_supervisor.main(
+            [
+                "--result-fd",
+                str(result_write_fd),
+                "--control-fd",
+                str(control_read_fd),
+                "--settlement-fd",
+                str(supervisor_settlement_fd),
+                "--worker-module",
+                "cayu.testing_isolated_tool_worker",
+                "--term-grace-seconds",
+                "0",
+                "--kill-grace-seconds",
+                "0.1",
+            ]
+        )
+        assert settlement_proof_owner.require_after_exit() is True
+        settlement_ack = isolated_supervisor._SETTLEMENT_ACK_SUPERVISOR_FAILED
+    finally:
+        for descriptor in (
+            result_read_fd,
+            result_write_fd,
+            control_read_fd,
+            control_write_fd,
+            supervisor_settlement_fd,
+        ):
+            with suppress(OSError):
+                original_close(descriptor)
+        settlement_proof_owner.close_best_effort()
+
+    assert return_code == isolated_supervisor._EXIT_SOFTWARE
+    assert result_close_failed is True
+    assert settled == [(SpawnedWorker.pid, None)]
+    assert settlement_ack == isolated_supervisor._SETTLEMENT_ACK_SUPERVISOR_FAILED
+
+
+def test_supervisor_reaping_retains_only_worker_status_under_descendant_churn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_pid = 50_000
+    descendant_count = 10_000
+    observations = iter(
+        [
+            *((pid, 0) for pid in range(1, descendant_count + 1)),
+            (worker_pid, 7),
+            (worker_pid, 9),
+            (0, 0),
+        ]
+    )
+
+    monkeypatch.setattr(
+        isolated_supervisor.os,
+        "waitpid",
+        lambda _pid, _options: next(observations),
+    )
+
+    assert (
+        isolated_supervisor._reap_exited(
+            worker_pid=worker_pid,
+            worker_status=None,
+        )
+        == 7
+    )
+    with pytest.raises(StopIteration):
+        next(observations)
+
+
+def test_supervisor_reaping_preserves_worker_status_across_transient_wait_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_pid = 50_000
+    observations: list[tuple[int, int] | BaseException] = [
+        (worker_pid, 7),
+        OSError("transient waitpid failure"),
+        ChildProcessError(),
+    ]
+
+    def observe(_pid: int, _options: int) -> tuple[int, int]:
+        observation = observations.pop(0)
+        if isinstance(observation, BaseException):
+            raise observation
+        return observation
+
+    monkeypatch.setattr(isolated_supervisor.os, "waitpid", observe)
+    monkeypatch.setattr(isolated_supervisor, "_direct_children", lambda: ())
+    monkeypatch.setattr(isolated_supervisor.time, "sleep", lambda _seconds: None)
+
+    assert (
+        isolated_supervisor._settle_owned_children(
+            worker_process_group_id=worker_pid,
+            worker_status=None,
+            term_grace_seconds=0.1,
+            kill_grace_seconds=0.1,
+        )
+        == 7
+    )
+    assert observations == []
+
+
+def test_supervisor_spawn_failure_proves_zero_child_settlement_before_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result_read_fd, result_write_fd = os.pipe()
+    control_read_fd, control_write_fd = os.pipe()
+    settlement_proof_owner = isolated_process._SupervisorSettlementProofOwner.create()
+    supervisor_settlement_fd = os.dup(settlement_proof_owner.descriptor)
+    settled: list[tuple[int | None, int | None]] = []
+
+    def fail_spawn(*_args: Any, **_kwargs: Any) -> Any:
+        raise OSError("injected process exhaustion")
+
+    monkeypatch.setattr(isolated_supervisor, "_shutdown_requested", False)
+    monkeypatch.setattr(isolated_supervisor, "_enable_child_subreaper", lambda: None)
+    monkeypatch.setattr(isolated_supervisor.subprocess, "Popen", fail_spawn)
+    monkeypatch.setattr(isolated_supervisor.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(
+        isolated_supervisor,
+        "_settle_owned_children",
+        lambda *, worker_process_group_id, worker_status, **_kwargs: (
+            settled.append((worker_process_group_id, worker_status)) or worker_status
+        ),
+    )
+
+    try:
+        os.write(control_write_fd, isolated_supervisor._WORKER_ADMISSION)
+        return_code = isolated_supervisor.main(
+            [
+                "--result-fd",
+                str(result_write_fd),
+                "--control-fd",
+                str(control_read_fd),
+                "--settlement-fd",
+                str(supervisor_settlement_fd),
+                "--worker-module",
+                "cayu.testing_isolated_tool_worker",
+                "--term-grace-seconds",
+                "0",
+                "--kill-grace-seconds",
+                "0.1",
+            ]
+        )
+        # This is the same exact, private proof owner used by the parent after
+        # observing supervisor exit.  A spawn failure is reusable only after
+        # the supervisor has positively enumerated and settled its empty tree.
+        assert settlement_proof_owner.require_after_exit() is True
+    finally:
+        for descriptor in (
+            result_read_fd,
+            result_write_fd,
+            control_read_fd,
+            control_write_fd,
+            supervisor_settlement_fd,
+        ):
+            with suppress(OSError):
+                os.close(descriptor)
+        settlement_proof_owner.close_best_effort()
+
+    assert return_code == isolated_supervisor._EXIT_SOFTWARE
+    assert settled == [(None, None)]
+
+
+@pytest.mark.parametrize(
+    "admission",
+    [None, b"\x02"],
+    ids=["closed", "malformed"],
+)
+def test_supervisor_requires_exact_worker_admission_before_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+    admission: bytes | None,
+) -> None:
+    result_read_fd, result_write_fd = os.pipe()
+    control_read_fd, control_write_fd = os.pipe()
+    if admission is not None:
+        os.write(control_write_fd, admission)
+    os.close(control_write_fd)
+    settlement_proof_owner = isolated_process._SupervisorSettlementProofOwner.create()
+    supervisor_settlement_fd = os.dup(settlement_proof_owner.descriptor)
+    settled: list[int | None] = []
+
+    monkeypatch.setattr(isolated_supervisor, "_shutdown_requested", False)
+    monkeypatch.setattr(isolated_supervisor, "_enable_child_subreaper", lambda: None)
+    monkeypatch.setattr(isolated_supervisor.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(
+        isolated_supervisor.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail(
+            "missing or malformed parent authority must prevent worker spawn"
+        ),
+    )
+    monkeypatch.setattr(
+        isolated_supervisor,
+        "_settle_owned_children",
+        lambda *, worker_process_group_id, **_kwargs: settled.append(worker_process_group_id) or 0,
+    )
+
+    try:
+        return_code = isolated_supervisor.main(
+            [
+                "--result-fd",
+                str(result_write_fd),
+                "--control-fd",
+                str(control_read_fd),
+                "--settlement-fd",
+                str(supervisor_settlement_fd),
+                "--worker-module",
+                "cayu.testing_isolated_tool_worker",
+                "--term-grace-seconds",
+                "0",
+                "--kill-grace-seconds",
+                "0.1",
+            ]
+        )
+        assert settlement_proof_owner.require_after_exit() is False
+    finally:
+        for descriptor in (
+            result_read_fd,
+            result_write_fd,
+            control_read_fd,
+            supervisor_settlement_fd,
+        ):
+            with suppress(OSError):
+                os.close(descriptor)
+        settlement_proof_owner.close_best_effort()
+
+    assert return_code == 0
+    assert settled == [None]
+
+
+def test_supervisor_observes_shutdown_on_descriptor_above_select_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fcntl
+
+    class SpawnedWorker:
+        pid = 4313
+
+    result_read_fd, result_write_fd = os.pipe()
+    control_read_fd, control_write_fd = os.pipe()
+    settlement_proof_owner = isolated_process._SupervisorSettlementProofOwner.create()
+    supervisor_settlement_fd = os.dup(settlement_proof_owner.descriptor)
+    high_control_read_fd = fcntl.fcntl(control_read_fd, fcntl.F_DUPFD, 1024)
+    os.close(control_read_fd)
+    settled: list[int] = []
+    settlement_ack = b""
+
+    def spawn_then_request_shutdown(*_args: Any, **_kwargs: Any) -> SpawnedWorker:
+        os.close(control_write_fd)
+        return SpawnedWorker()
+
+    monkeypatch.setattr(isolated_supervisor, "_shutdown_requested", False)
+    monkeypatch.setattr(isolated_supervisor, "_enable_child_subreaper", lambda: None)
+    monkeypatch.setattr(isolated_supervisor.subprocess, "Popen", spawn_then_request_shutdown)
+    monkeypatch.setattr(isolated_supervisor.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(
+        isolated_supervisor,
+        "_settle_owned_children",
+        lambda *, worker_process_group_id, **_kwargs: settled.append(worker_process_group_id) or 0,
+    )
+
+    try:
+        os.write(control_write_fd, isolated_supervisor._WORKER_ADMISSION)
+        return_code = isolated_supervisor.main(
+            [
+                "--result-fd",
+                str(result_write_fd),
+                "--control-fd",
+                str(high_control_read_fd),
+                "--settlement-fd",
+                str(supervisor_settlement_fd),
+                "--worker-module",
+                "cayu.testing_isolated_tool_worker",
+                "--term-grace-seconds",
+                "0",
+                "--kill-grace-seconds",
+                "0.1",
+            ]
+        )
+        assert settlement_proof_owner.require_after_exit() is False
+        settlement_ack = isolated_supervisor._SETTLEMENT_ACK_COMPLETED
+    finally:
+        for descriptor in (
+            result_read_fd,
+            result_write_fd,
+            high_control_read_fd,
+            control_write_fd,
+            supervisor_settlement_fd,
+        ):
+            with suppress(OSError):
+                os.close(descriptor)
+        settlement_proof_owner.close_best_effort()
+
+    assert high_control_read_fd >= 1024
+    assert return_code == 0
+    assert settled == [SpawnedWorker.pid]
+    assert settlement_ack == isolated_supervisor._SETTLEMENT_ACK_COMPLETED
+
+
+def test_supervisor_stops_signalling_worker_group_after_leader_is_reaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_children = iter(((456,), ()))
+    group_signals: list[tuple[int, signal.Signals]] = []
+    child_signals: list[tuple[int, signal.Signals]] = []
+
+    monkeypatch.setattr(
+        isolated_supervisor,
+        "_reap_exited",
+        lambda **kwargs: kwargs["worker_status"],
+    )
+    monkeypatch.setattr(isolated_supervisor, "_direct_children", lambda: next(observed_children))
+    monkeypatch.setattr(
+        isolated_supervisor,
+        "_signal_group",
+        lambda process_group_id, selected_signal: group_signals.append(
+            (process_group_id, selected_signal)
+        ),
+    )
+    monkeypatch.setattr(
+        isolated_supervisor,
+        "_signal_pid",
+        lambda child_pid, selected_signal: child_signals.append((child_pid, selected_signal)),
+    )
+    monkeypatch.setattr(isolated_supervisor.time, "sleep", lambda _seconds: None)
+
+    isolated_supervisor._settle_owned_children(
+        worker_process_group_id=123,
+        worker_status=0,
+        term_grace_seconds=0.1,
+        kill_grace_seconds=0.1,
+    )
+
+    assert group_signals == []
+    assert child_signals == [(456, signal.SIGTERM)]
+
+
+def test_parent_uses_exact_control_channel_after_supervisor_wait_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        control_read_fd, control_owner = isolated_process._SupervisorControlOwner.create()
+        process = cast(
+            "asyncio.subprocess.Process",
+            type("ObservedProcess", (), {"pid": 123, "returncode": None})(),
+        )
+        wait_task = asyncio.create_task(asyncio.sleep(0, result=0))
+        await wait_task
+        monkeypatch.setattr(
+            isolated_process.os,
+            "killpg",
+            lambda *_args: pytest.fail("the parent must not signal a numeric process group"),
+        )
+        try:
+            await isolated_process._settle_owned_supervisor(
+                process,
+                wait_task,
+                control_owner=control_owner,
+                settlement_proof_owner=_supervisor_settlement_proof(),
+                term_grace_seconds=0.1,
+                kill_grace_seconds=0.1,
+            )
+            assert os.read(control_read_fd, 1) == b""
+        finally:
+            os.close(control_read_fd)
+
+    asyncio.run(scenario())
+
+
+def test_parent_rejects_valid_terminal_result_when_supervisor_reports_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        owner = isolated_process._IsolatedToolProcessOwner(
+            tool=_tool(),
+            request_bytes=b"{}",
+            request_sha256="sha256:" + "a" * 64,
+        )
+        process = cast(
+            "asyncio.subprocess.Process",
+            type("FailedSupervisor", (), {"pid": 123, "returncode": 70})(),
+        )
+        wait_task = asyncio.create_task(asyncio.sleep(0, result=70))
+        await wait_task
+
+        async def prepared_spawn(*, deadline: float) -> None:
+            del deadline
+            owner._process = process
+            owner._wait_task = wait_task
+            owner._settlement_proof_owner = _supervisor_settlement_proof(supervisor_failed=True)
+
+        async def valid_terminal(*, deadline: float) -> ToolResult:
+            del deadline
+            return ToolResult(content="apparently successful")
+
+        monkeypatch.setattr(owner, "_spawn", prepared_spawn)
+        monkeypatch.setattr(owner, "_exchange", valid_terminal)
+
+        with pytest.raises(IsolatedToolFailure) as caught:
+            await owner.run()
+        assert caught.value.code == "supervisor_failed"
+
+    asyncio.run(scenario())
+
+
+def test_parent_preserves_primary_failure_when_supervisor_also_reports_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        owner = isolated_process._IsolatedToolProcessOwner(
+            tool=_tool(),
+            request_bytes=b"{}",
+            request_sha256="sha256:" + "a" * 64,
+        )
+        process = cast(
+            "asyncio.subprocess.Process",
+            type("FailedSupervisor", (), {"pid": 123, "returncode": 70})(),
+        )
+        wait_task = asyncio.create_task(asyncio.sleep(0, result=70))
+        await wait_task
+
+        async def prepared_spawn(*, deadline: float) -> None:
+            del deadline
+            owner._process = process
+            owner._wait_task = wait_task
+            owner._settlement_proof_owner = _supervisor_settlement_proof(supervisor_failed=True)
+
+        primary = IsolatedToolInvalidOutput("response_invalid")
+
+        async def invalid_terminal(*, deadline: float) -> ToolResult:
+            del deadline
+            raise primary
+
+        monkeypatch.setattr(owner, "_spawn", prepared_spawn)
+        monkeypatch.setattr(owner, "_exchange", invalid_terminal)
+
+        with pytest.raises(IsolatedToolFailure) as caught:
+            await owner.run()
+        assert caught.value.code == "supervisor_failed"
+        assert caught.value.__cause__ is primary
+
+    asyncio.run(scenario())
+
+
+def test_parent_preserves_post_terminal_stream_failures_with_supervisor_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        owner = isolated_process._IsolatedToolProcessOwner(
+            tool=_tool(),
+            request_bytes=b"{}",
+            request_sha256="sha256:" + "a" * 64,
+        )
+        process = cast(
+            "asyncio.subprocess.Process",
+            type("FailedSupervisor", (), {"pid": 123, "returncode": 70})(),
+        )
+        wait_task = asyncio.create_task(asyncio.sleep(0, result=70))
+        await wait_task
+        terminal_failure = IsolatedToolInvalidOutput("response_invalid")
+        diagnostic_failure = IsolatedToolFailure("stdout_exceeded")
+
+        async def prepared_spawn(*, deadline: float) -> None:
+            del deadline
+            owner._process = process
+            owner._wait_task = wait_task
+            owner._settlement_proof_owner = _supervisor_settlement_proof(supervisor_failed=True)
+
+            async def fail_diagnostic() -> None:
+                raise diagnostic_failure
+
+            diagnostic_task = asyncio.create_task(
+                fail_diagnostic(),
+                name="cayu-test-failed-diagnostic",
+            )
+            await asyncio.gather(diagnostic_task, return_exceptions=True)
+            owner._diagnostic_tasks.add(diagnostic_task)
+
+        async def valid_terminal(*, deadline: float) -> ToolResult:
+            del deadline
+            return ToolResult(content="apparently successful")
+
+        async def failed_trailing_frame() -> IsolatedToolFailure:
+            return terminal_failure
+
+        monkeypatch.setattr(owner, "_spawn", prepared_spawn)
+        monkeypatch.setattr(owner, "_exchange", valid_terminal)
+        monkeypatch.setattr(owner, "_settle_terminal_reader", failed_trailing_frame)
+
+        with pytest.raises(IsolatedToolFailure) as caught:
+            await owner.run()
+
+        assert caught.value.code == "supervisor_failed"
+        evidence = caught.value.__cause__
+        assert isinstance(evidence, ExceptionGroup)
+        assert evidence.exceptions == (terminal_failure, diagnostic_failure)
+
+    asyncio.run(scenario())
+
+
+def test_parent_accepts_valid_terminal_result_when_worker_status_is_nonzero_but_supervisor_is_healthy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        owner = isolated_process._IsolatedToolProcessOwner(
+            tool=_tool(),
+            request_bytes=b"{}",
+            request_sha256="sha256:" + "a" * 64,
+        )
+        process = cast(
+            "asyncio.subprocess.Process",
+            type("FailedWorker", (), {"pid": 123, "returncode": 70})(),
+        )
+        wait_task = asyncio.create_task(asyncio.sleep(0, result=70))
+        await wait_task
+
+        async def prepared_spawn(*, deadline: float) -> None:
+            del deadline
+            owner._process = process
+            owner._wait_task = wait_task
+            owner._settlement_proof_owner = _supervisor_settlement_proof()
+
+        expected = ToolResult(content="authenticated terminal result")
+
+        async def valid_terminal(*, deadline: float) -> ToolResult:
+            del deadline
+            return expected
+
+        monkeypatch.setattr(owner, "_spawn", prepared_spawn)
+        monkeypatch.setattr(owner, "_exchange", valid_terminal)
+
+        assert await owner.run() == expected
+
+    asyncio.run(scenario())
+
+
+def test_parent_control_channel_closes_before_delayed_wait_notification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        control_read_fd, control_owner = isolated_process._SupervisorControlOwner.create()
+        process = cast(
+            "asyncio.subprocess.Process",
+            type("ReapedProcess", (), {"pid": 123, "returncode": None})(),
+        )
+        wait_task = asyncio.create_task(asyncio.sleep(10, result=0))
+
+        monkeypatch.setattr(
+            isolated_process.os,
+            "killpg",
+            lambda *_args: pytest.fail("the parent must not signal a reused process group"),
+        )
+
+        async def delayed_notification(
+            *_args: Any,
+            **_kwargs: Any,
+        ) -> isolated_process._SupervisorSettlement:
+            assert os.read(control_read_fd, 1) == b""
+            return isolated_process._SupervisorSettlement(0, False)
+
+        monkeypatch.setattr(isolated_process, "_wait_for_supervisor", delayed_notification)
+        proof_checks = 0
+
+        def prove_after_wait(
+            *_args: Any,
+            **_kwargs: Any,
+        ) -> isolated_process._SupervisorSettlement | None:
+            nonlocal proof_checks
+            proof_checks += 1
+            return isolated_process._SupervisorSettlement(0, False) if proof_checks > 1 else None
+
+        monkeypatch.setattr(
+            isolated_process,
+            "_completed_process_wait_settlement",
+            prove_after_wait,
+        )
+        try:
+            await isolated_process._settle_owned_supervisor(
+                process,
+                wait_task,
+                control_owner=control_owner,
+                settlement_proof_owner=_supervisor_settlement_proof(),
+                term_grace_seconds=0.1,
+                kill_grace_seconds=0.1,
+            )
+        finally:
+            wait_task.cancel()
+            await asyncio.gather(wait_task, return_exceptions=True)
+            os.close(control_read_fd)
+
+    asyncio.run(scenario())
+
+
+def test_late_spawn_stops_signalling_when_spawned_supervisor_is_already_reaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReapedProcess:
+        pid = 123
+        returncode = 0
+        stdin = None
+        stdout = None
+        stderr = None
+
+        async def wait(self) -> int:
+            return 0
+
+    async def scenario() -> None:
+        process = cast("asyncio.subprocess.Process", ReapedProcess())
+        spawn_task = asyncio.create_task(asyncio.sleep(0, result=process))
+        await spawn_task
+        result_read_fd, result_write_fd = os.pipe()
+        control_read_fd, control_owner = isolated_process._SupervisorControlOwner.create()
+        supervisor_control_read_fd = os.dup(control_read_fd)
+        result_write_owner = isolated_process._FileDescriptorOwner.adopt(
+            result_write_fd,
+            mode="wb",
+        )
+        control_read_owner = isolated_process._FileDescriptorOwner.adopt(
+            control_read_fd,
+            mode="rb",
+        )
+        monkeypatch.setattr(
+            isolated_process.os,
+            "killpg",
+            lambda *_args: pytest.fail("late cleanup must not signal a numeric process group"),
+        )
+        try:
+            await isolated_process._settle_late_spawn(
+                spawn_task,
+                _tool().limits,
+                parent_result_write_owner=result_write_owner,
+                parent_control_read_owner=control_read_owner,
+                parent_control_owner=control_owner,
+                settlement_proof_owner=_supervisor_settlement_proof(),
+            )
+            assert os.read(supervisor_control_read_fd, 1) == b""
+        finally:
+            os.close(result_read_fd)
+            os.close(supervisor_control_read_fd)
+
+    asyncio.run(scenario())
+
+
+def test_late_spawn_owner_preserves_failed_supervisor_health_after_tree_settlement() -> None:
+    class ReapedProcess:
+        pid = 123
+        returncode = 70
+        stdin = None
+        stdout = None
+        stderr = None
+
+        async def wait(self) -> int:
+            return 70
+
+    async def scenario() -> None:
+        process = cast("asyncio.subprocess.Process", ReapedProcess())
+        spawn_task = asyncio.create_task(asyncio.sleep(0, result=process))
+        await spawn_task
+        owner = isolated_process._LateSpawnSettlementOwner(
+            spawn_task=spawn_task,
+            limits=_tool().limits,
+            parent_result_write_owner=None,
+            parent_control_read_owner=None,
+            parent_control_owner=None,
+            settlement_proof_owner=_supervisor_settlement_proof(supervisor_failed=True),
+        )
+
+        for _attempt in range(2):
+            with pytest.raises(IsolatedToolFailure) as caught:
+                await owner.settle()
+            assert caught.value.code == "supervisor_failed"
+            assert owner.settled is True
+
+        process_owner = isolated_process._IsolatedToolProcessOwner(
+            tool=_tool(),
+            request_bytes=b"{}",
+            request_sha256="sha256:" + "a" * 64,
+        )
+        process_owner._late_spawn_settlement_owner = owner
+        adopted_failure = await process_owner._adopt_pending_spawn_for_cleanup()
+        assert adopted_failure is not None
+        assert adopted_failure.code == "supervisor_failed"
+        assert process_owner._late_spawn_settlement_owner is None
+
+    asyncio.run(scenario())
+
+
+def test_parent_does_not_treat_cancelled_supervisor_wait_as_cleanup_proof() -> None:
+    async def scenario() -> None:
+        process = cast(
+            "asyncio.subprocess.Process",
+            type("ObservedProcess", (), {"pid": 123, "returncode": 0})(),
+        )
+        wait_task = asyncio.create_task(asyncio.sleep(10))
+        wait_task.cancel()
+        await asyncio.gather(wait_task, return_exceptions=True)
+
+        with pytest.raises(
+            isolated_process.IsolatedToolCleanupUnproven,
+            match="process_wait_cancelled",
+        ):
+            await isolated_process._settle_owned_supervisor(
+                process,
+                wait_task,
+                control_owner=None,
+                settlement_proof_owner=_supervisor_settlement_proof(),
+                term_grace_seconds=0.1,
+                kill_grace_seconds=0.1,
+            )
+
+    asyncio.run(scenario())
+
+
+def test_parent_does_not_treat_failed_supervisor_wait_as_cleanup_proof() -> None:
+    async def fail_wait() -> int:
+        raise RuntimeError("wait transport failed")
+
+    async def scenario() -> None:
+        process = cast(
+            "asyncio.subprocess.Process",
+            type("ObservedProcess", (), {"pid": 123, "returncode": 0})(),
+        )
+        wait_task = asyncio.create_task(fail_wait())
+        await asyncio.gather(wait_task, return_exceptions=True)
+
+        with pytest.raises(
+            isolated_process.IsolatedToolCleanupUnproven,
+            match="process_wait_failed",
+        ):
+            await isolated_process._settle_owned_supervisor(
+                process,
+                wait_task,
+                control_owner=None,
+                settlement_proof_owner=_supervisor_settlement_proof(),
+                term_grace_seconds=0.1,
+                kill_grace_seconds=0.1,
+            )
+
+    asyncio.run(scenario())
+
+
+def test_parent_rejects_conflicting_supervisor_wait_evidence() -> None:
+    async def scenario() -> None:
+        process = cast(
+            "asyncio.subprocess.Process",
+            type("ObservedProcess", (), {"pid": 123, "returncode": 1})(),
+        )
+        wait_task = asyncio.create_task(asyncio.sleep(0, result=0))
+        await wait_task
+
+        with pytest.raises(
+            isolated_process.IsolatedToolCleanupUnproven,
+            match="process_wait_result_conflict",
+        ):
+            await isolated_process._settle_owned_supervisor(
+                process,
+                wait_task,
+                control_owner=None,
+                settlement_proof_owner=_supervisor_settlement_proof(),
+                term_grace_seconds=0.1,
+                kill_grace_seconds=0.1,
+            )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("acknowledgement", [b"", b"\x02", b"\x01extra"])
+def test_parent_requires_exact_post_reaping_acknowledgement_after_supervisor_exit(
+    acknowledgement: bytes,
+) -> None:
+    async def scenario() -> None:
+        process = cast(
+            "asyncio.subprocess.Process",
+            type("KilledSupervisor", (), {"pid": 123, "returncode": -signal.SIGKILL})(),
+        )
+        wait_task = asyncio.create_task(asyncio.sleep(0, result=-signal.SIGKILL))
+        await wait_task
+        settlement_proof_owner = isolated_process._SupervisorSettlementProofOwner.create()
+        os.pwrite(settlement_proof_owner.descriptor, acknowledgement, 0)
+
+        with pytest.raises(
+            isolated_process.IsolatedToolCleanupUnproven,
+            match="supervisor_settlement_ack_missing",
+        ):
+            await isolated_process._settle_owned_supervisor(
+                process,
+                wait_task,
+                control_owner=None,
+                settlement_proof_owner=settlement_proof_owner,
+                term_grace_seconds=0.1,
+                kill_grace_seconds=0.1,
+            )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_settlement_acknowledgement_remains_replayable_after_process_control(
+    monkeypatch: pytest.MonkeyPatch,
+    signal_type: type[BaseException],
+) -> None:
+    settlement_proof_owner = _supervisor_settlement_proof()
+    original_pread = os.pread
+    interrupted = False
+
+    def interrupt_after_read(descriptor: int, length: int, offset: int) -> bytes:
+        nonlocal interrupted
+        acknowledgement = original_pread(descriptor, length, offset)
+        if not interrupted:
+            interrupted = True
+            raise signal_type("settlement acknowledgement interrupted")
+        return acknowledgement
+
+    monkeypatch.setattr(isolated_process.os, "pread", interrupt_after_read)
+    with pytest.raises(signal_type, match="settlement acknowledgement interrupted"):
+        settlement_proof_owner.require_after_exit()
+
+    settlement_proof_owner.require_after_exit()
+    assert interrupted is True
+
+
+@pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_cleanup_retry_retains_exact_control_owner_across_process_control(
+    monkeypatch: pytest.MonkeyPatch,
+    signal_type: type[BaseException],
+) -> None:
+    async def scenario() -> None:
+        control_read_fd, control_owner = isolated_process._SupervisorControlOwner.create()
+        process = cast(
+            "asyncio.subprocess.Process",
+            type("ReapedProcess", (), {"pid": 123, "returncode": 0})(),
+        )
+        wait_task = asyncio.create_task(asyncio.sleep(0, result=0))
+        await wait_task
+        owner = isolated_process._IsolatedToolProcessOwner(
+            tool=_tool(),
+            request_bytes=b"{}",
+            request_sha256="sha256:" + "a" * 64,
+        )
+        owner._process = process
+        owner._wait_task = wait_task
+        owner._control_owner = control_owner
+        owner._settlement_proof_owner = _supervisor_settlement_proof()
+        original_request = isolated_process._SupervisorControlOwner.request_shutdown
+        interrupted = False
+
+        def interrupt_once(candidate: Any) -> None:
+            nonlocal interrupted
+            if candidate is control_owner and not interrupted:
+                interrupted = True
+                raise signal_type("shutdown-channel transfer interrupted")
+            original_request(candidate)
+
+        monkeypatch.setattr(
+            isolated_process._SupervisorControlOwner,
+            "request_shutdown",
+            interrupt_once,
+        )
+        try:
+            with pytest.raises(signal_type, match="shutdown-channel transfer interrupted"):
+                await owner._cleanup_impl()
+            assert owner._control_owner is control_owner
+            assert control_owner._stream.closed is False
+
+            await owner._cleanup_impl()
+            assert owner._control_owner is None
+            assert control_owner._stream.closed is True
+            assert os.read(control_read_fd, 1) == b""
+        finally:
+            control_owner.close_best_effort()
+            os.close(control_read_fd)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_cleanup_retry_retains_settlement_proof_until_process_state_is_retired(
+    monkeypatch: pytest.MonkeyPatch,
+    signal_type: type[BaseException],
+) -> None:
+    async def scenario() -> None:
+        process = cast(
+            "asyncio.subprocess.Process",
+            type("ReapedProcess", (), {"pid": 123, "returncode": 0})(),
+        )
+        wait_task = asyncio.create_task(asyncio.sleep(0, result=0))
+        await wait_task
+        owner = isolated_process._IsolatedToolProcessOwner(
+            tool=_tool(),
+            request_bytes=b"{}",
+            request_sha256="sha256:" + "a" * 64,
+        )
+        proof_owner = _supervisor_settlement_proof()
+        owner._process = process
+        owner._wait_task = wait_task
+        owner._settlement_proof_owner = proof_owner
+        original_require = proof_owner.require_after_exit
+        interrupted = False
+
+        def interrupt_after_proof() -> None:
+            nonlocal interrupted
+            original_require()
+            if not interrupted:
+                interrupted = True
+                raise signal_type("post-settlement retirement interrupted")
+
+        monkeypatch.setattr(proof_owner, "require_after_exit", interrupt_after_proof)
+
+        with pytest.raises(signal_type, match="post-settlement retirement interrupted"):
+            await owner._cleanup_impl()
+        assert owner._process is process
+        assert owner._wait_task is wait_task
+        assert owner._settlement_proof_owner is proof_owner
+
+        await owner._cleanup_impl()
+        assert owner._process is None
+        assert owner._wait_task is None
+        assert owner._settlement_proof_owner is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_late_spawn_retry_retains_exact_control_owner_across_process_control(
+    monkeypatch: pytest.MonkeyPatch,
+    signal_type: type[BaseException],
+) -> None:
+    class ReapedProcess:
+        pid = 123
+        returncode = 0
+        stdin = None
+        stdout = None
+        stderr = None
+
+        async def wait(self) -> int:
+            return 0
+
+    async def scenario() -> None:
+        process = cast("asyncio.subprocess.Process", ReapedProcess())
+        spawn_task = asyncio.create_task(asyncio.sleep(0, result=process))
+        await spawn_task
+        result_read_fd, result_write_fd = os.pipe()
+        control_read_fd, control_owner = isolated_process._SupervisorControlOwner.create()
+        supervisor_control_read_fd = os.dup(control_read_fd)
+        result_write_owner = isolated_process._FileDescriptorOwner.adopt(
+            result_write_fd,
+            mode="wb",
+        )
+        control_read_owner = isolated_process._FileDescriptorOwner.adopt(
+            control_read_fd,
+            mode="rb",
+        )
+        settlement_proof_owner = _supervisor_settlement_proof()
+        original_request = isolated_process._SupervisorControlOwner.request_shutdown
+        interrupted = False
+
+        def interrupt_once(candidate: Any) -> None:
+            nonlocal interrupted
+            if candidate is control_owner and not interrupted:
+                interrupted = True
+                raise signal_type("late shutdown-channel transfer interrupted")
+            original_request(candidate)
+
+        monkeypatch.setattr(
+            isolated_process._SupervisorControlOwner,
+            "request_shutdown",
+            interrupt_once,
+        )
+        try:
+            with pytest.raises(
+                signal_type,
+                match="late shutdown-channel transfer interrupted",
+            ):
+                await isolated_process._settle_late_spawn(
+                    spawn_task,
+                    _tool().limits,
+                    parent_result_write_owner=result_write_owner,
+                    parent_control_read_owner=control_read_owner,
+                    parent_control_owner=control_owner,
+                    settlement_proof_owner=settlement_proof_owner,
+                )
+            assert control_owner._stream.closed is False
+
+            await isolated_process._settle_late_spawn(
+                spawn_task,
+                _tool().limits,
+                parent_result_write_owner=result_write_owner,
+                parent_control_read_owner=control_read_owner,
+                parent_control_owner=control_owner,
+                settlement_proof_owner=settlement_proof_owner,
+            )
+            assert control_owner._stream.closed is True
+            assert os.read(supervisor_control_read_fd, 1) == b""
+        finally:
+            control_owner.close_best_effort()
+            for descriptor in (
+                result_read_fd,
+                result_write_fd,
+                control_read_fd,
+                supervisor_control_read_fd,
+            ):
+                with suppress(OSError):
+                    os.close(descriptor)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_late_spawn_retry_retains_descriptor_owners_across_process_control(
+    monkeypatch: pytest.MonkeyPatch,
+    signal_type: type[BaseException],
+) -> None:
+    async def scenario() -> None:
+        spawn_task = asyncio.create_task(
+            asyncio.sleep(
+                0,
+                result=cast("asyncio.subprocess.Process", None),
+            )
+        )
+        result_read_fd, result_write_fd = os.pipe()
+        control_read_fd, control_write_fd = os.pipe()
+        result_write_owner = isolated_process._FileDescriptorOwner.adopt(
+            result_write_fd,
+            mode="wb",
+        )
+        control_read_owner = isolated_process._FileDescriptorOwner.adopt(
+            control_read_fd,
+            mode="rb",
+        )
+        proof_owner = isolated_process._SupervisorSettlementProofOwner.create()
+        owner = isolated_process._LateSpawnSettlementOwner(
+            spawn_task=spawn_task,
+            limits=_tool().limits,
+            parent_result_write_owner=result_write_owner,
+            parent_control_read_owner=control_read_owner,
+            parent_control_owner=None,
+            settlement_proof_owner=proof_owner,
+        )
+        original_close = isolated_process._FileDescriptorOwner.close_best_effort
+        interrupted = False
+
+        def interrupt_after_first_close(candidate: Any) -> None:
+            nonlocal interrupted
+            original_close(candidate)
+            if candidate is result_write_owner and not interrupted:
+                interrupted = True
+                raise signal_type("descriptor handoff interrupted")
+
+        monkeypatch.setattr(
+            isolated_process._FileDescriptorOwner,
+            "close_best_effort",
+            interrupt_after_first_close,
+        )
+        try:
+            with pytest.raises(signal_type, match="descriptor handoff interrupted"):
+                await owner.settle()
+            assert owner.settled is False
+            assert result_write_owner._stream.closed is True
+            assert control_read_owner._stream.closed is False
+
+            await owner.settle()
+            assert owner.settled is True
+            assert result_write_owner._stream.closed is True
+            assert control_read_owner._stream.closed is True
+        finally:
+            original_close(result_write_owner)
+            original_close(control_read_owner)
+            proof_owner.close_best_effort()
+            for descriptor in (result_read_fd, control_write_fd):
+                with suppress(OSError):
+                    os.close(descriptor)
+            await asyncio.gather(spawn_task, return_exceptions=True)
+
+    asyncio.run(scenario())
 
 
 def test_manifest_distinguishes_unbounded_and_cooperative_ordinary_tools() -> None:
@@ -354,6 +1616,7 @@ def test_manifest_distinguishes_unbounded_and_cooperative_ordinary_tools() -> No
             return ToolResult(content="ordinary")
 
     observed = []
+    descriptor_versions: list[str] = []
     for timeout in (None, 1.0):
         app = CayuApp(enable_logging=False, tool_timeout_seconds=timeout)
         app.register_agent(
@@ -362,6 +1625,7 @@ def test_manifest_distinguishes_unbounded_and_cooperative_ordinary_tools() -> No
         )
         tool_manifest = app.describe().agents[0].tools[0]
         descriptor = app._agents["assistant"].tool_catalogue.descriptors[0]
+        descriptor_versions.append(descriptor.version)
         capability = app._agents["assistant"].tool_capabilities[0]
         observed.append(
             (
@@ -402,6 +1666,7 @@ def test_manifest_distinguishes_unbounded_and_cooperative_ordinary_tools() -> No
             "cooperative_in_process",
         ),
     ]
+    assert descriptor_versions[0] != descriptor_versions[1]
 
 
 def test_bounded_json_preflight_rejects_depth_cycles_nodes_and_bytes_before_copy() -> None:
@@ -588,6 +1853,16 @@ def test_real_process_success_uses_only_projected_context_and_declared_environme
     opened = descriptor_result.structured["file_descriptors"]
     assert opened[:3] == [0, 1, 2]
     assert len(opened) == 4
+
+
+@pytest.mark.process
+def test_real_process_accepts_zero_term_grace() -> None:
+    app = _public_app(_tool(term_grace_seconds=0))
+    events = asyncio.run(_run_public(app, session_id="zero-term-grace"))
+    completed = next(event for event in events if event.type is EventType.TOOL_CALL_COMPLETED)
+
+    assert completed.payload["result"]["content"] == "public hello"
+    assert events[-1].type is EventType.SESSION_COMPLETED
 
 
 @pytest.mark.process
@@ -892,18 +2167,18 @@ def test_ordinary_tool_cannot_attach_a_secret_cause_to_caller_cancellation(
 def test_caller_cancellation_during_cleanup_retains_the_preceding_child_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    original_wait = isolated_process._wait_for_group_and_child
+    original_settle = isolated_process._settle_owned_supervisor
 
     async def scenario() -> tuple[asyncio.CancelledError, int, bool]:
         cleanup_entered = asyncio.Event()
         release_cleanup = asyncio.Event()
 
-        async def blocked_wait(*args, **kwargs):
+        async def blocked_settle(*args, **kwargs):
             cleanup_entered.set()
             await release_cleanup.wait()
-            return await original_wait(*args, **kwargs)
+            return await original_settle(*args, **kwargs)
 
-        monkeypatch.setattr(isolated_process, "_wait_for_group_and_child", blocked_wait)
+        monkeypatch.setattr(isolated_process, "_settle_owned_supervisor", blocked_settle)
         task = asyncio.create_task(_execute(_tool(mode="crash", deadline_seconds=5)))
         await asyncio.wait_for(cleanup_entered.wait(), timeout=5)
         task.cancel("cancel during process cleanup")
@@ -1066,13 +2341,98 @@ def test_process_control_during_settlement_retains_the_live_cleanup_owner(
         try:
             with pytest.raises(signal_type, match="supervisor signal"):
                 await owner._settle()
-            assert cleanup_task in isolated_process._RETAINED_ISOLATED_TOOL_TASKS
+            assert cleanup_task in isolated_process._RETAINED_ISOLATED_TOOL_OWNERS
             assert cleanup_task.done() is False
         finally:
             release_cleanup.set()
             await cleanup_task
             await asyncio.sleep(0)
-        assert cleanup_task not in isolated_process._RETAINED_ISOLATED_TOOL_TASKS
+        assert cleanup_task not in isolated_process._RETAINED_ISOLATED_TOOL_OWNERS
+
+    asyncio.run(scenario())
+
+
+def test_sigint_during_cleanup_owner_publication_keeps_handoff_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        assert not isolated_process._RETAINED_ISOLATED_TOOL_OWNERS
+        owner = isolated_process._IsolatedToolProcessOwner(
+            tool=_tool(),
+            request_bytes=b"{}",
+            request_sha256="sha256:" + "a" * 64,
+        )
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def blocked_cleanup() -> None:
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        cleanup_task = asyncio.create_task(blocked_cleanup())
+        owner._cleanup_task = cleanup_task
+        await cleanup_started.wait()
+
+        original_retain = isolated_process._retain_task
+        interrupted = False
+
+        def interrupt_first_publication(task: asyncio.Task[Any], **kwargs: Any) -> None:
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                signal.raise_signal(signal.SIGINT)
+            original_retain(task, **kwargs)
+
+        monkeypatch.setattr(
+            isolated_process,
+            "_retain_task",
+            interrupt_first_publication,
+        )
+        monkeypatch.setattr(
+            isolated_process,
+            "_complete_process_tree_supervision_available",
+            lambda: True,
+        )
+        previous_sigint_handler = signal.signal(signal.SIGINT, signal.default_int_handler)
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                owner._retain_pending_cleanup()
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
+
+        assert interrupted is True
+        assert cleanup_task not in owner._retained_cleanup_tasks
+        assert cleanup_task not in isolated_process._RETAINED_ISOLATED_TOOL_OWNERS
+
+        # The interrupted handoff did not poison local deduplication, so the
+        # exact cleanup task and retry owner can still be published.
+        owner._retain_pending_cleanup()
+        assert cleanup_task in owner._retained_cleanup_tasks
+        assert isolated_process._RETAINED_ISOLATED_TOOL_OWNERS[cleanup_task] == owner._cleanup_impl
+
+        async def unexpected_spawn(*_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("A child was spawned before retained cleanup settled.")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", unexpected_spawn)
+        arguments = {"text": "later"}
+        tool = _tool()
+        outcome = await tool_execution.run_tool(
+            tool=tool,
+            effect=ToolEffect.NONE,
+            ctx=_context(arguments),
+            arguments=arguments,
+            registered_schema=_SCHEMA,
+            registered_execution_contract=isolated_tool_execution_contract(tool),
+            redactor=SecretRedactor,
+        )
+        assert outcome.result.structured["isolated_tool_failure_code"] == (
+            "prior_process_cleanup_pending"
+        )
+
+        release_cleanup.set()
+        await cleanup_task
+        await asyncio.sleep(0)
+        assert not isolated_process._RETAINED_ISOLATED_TOOL_OWNERS
 
     asyncio.run(scenario())
 
@@ -1085,6 +2445,7 @@ def test_late_spawn_owns_passed_descriptor_until_spawn_settles(
         release_spawn = asyncio.Event()
         passed_descriptor: int | None = None
         retained: list[asyncio.Task[Any]] = []
+        retained_ready = asyncio.Event()
 
         async def delayed_spawn(*_args, **kwargs):
             nonlocal passed_descriptor
@@ -1096,6 +2457,7 @@ def test_late_spawn_owns_passed_descriptor_until_spawn_settles(
 
         def retain(task: asyncio.Task[Any], **_kwargs: Any) -> None:
             retained.append(task)
+            retained_ready.set()
 
         monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
         monkeypatch.setattr(isolated_process, "_retain_task", retain)
@@ -1105,17 +2467,378 @@ def test_late_spawn_owns_passed_descriptor_until_spawn_settles(
             request_sha256="sha256:" + "a" * 64,
         )
 
-        with pytest.raises(IsolatedToolDeadlineExceeded):
-            await owner.run()
-        assert spawn_entered.is_set()
+        run_task = asyncio.create_task(owner.run())
+        await asyncio.wait_for(spawn_entered.wait(), timeout=1)
+        await asyncio.wait_for(retained_ready.wait(), timeout=1)
         assert passed_descriptor is not None
         os.fstat(passed_descriptor)
         assert len(retained) == 1
 
         release_spawn.set()
+        with pytest.raises(IsolatedToolDeadlineExceeded):
+            await run_task
         await retained[0]
         with pytest.raises(OSError):
             os.fstat(passed_descriptor)
+
+    asyncio.run(scenario())
+
+
+def test_completed_supervisor_is_not_admitted_after_the_hard_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReapedProcess:
+        pid = 123
+        returncode = 0
+
+        async def wait(self) -> int:
+            return 0
+
+    async def scenario() -> None:
+        process = cast("asyncio.subprocess.Process", ReapedProcess())
+
+        async def immediate_spawn(*_args: Any, **_kwargs: Any) -> Any:
+            return process
+
+        def forbidden_admission(_owner: Any) -> None:
+            raise AssertionError("An expired supervisor must not admit its worker.")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", immediate_spawn)
+        monkeypatch.setattr(
+            isolated_process._SupervisorControlOwner,
+            "admit_worker",
+            forbidden_admission,
+        )
+        owner = isolated_process._IsolatedToolProcessOwner(
+            tool=_tool(),
+            request_bytes=b"{}",
+            request_sha256="sha256:" + "a" * 64,
+        )
+
+        try:
+            with pytest.raises(IsolatedToolDeadlineExceeded):
+                await owner._spawn(deadline=asyncio.get_running_loop().time() - 1)
+            assert owner.worker_admission_may_have_crossed is False
+        finally:
+            owner._close_parent_pipe_fds()
+            if owner._wait_task is not None:
+                await owner._wait_task
+            if owner._temporary_directory is not None:
+                await isolated_process._remove_temporary_directory(owner._temporary_directory)
+                owner._temporary_directory = None
+
+    asyncio.run(scenario())
+
+
+def test_pre_admission_supervisor_failure_preserves_zero_dispatch_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def expired_spawn(
+        _owner: isolated_process._IsolatedToolProcessOwner,
+        *,
+        deadline: float,
+    ) -> None:
+        del deadline
+        raise IsolatedToolDeadlineExceeded()
+
+    async def failed_supervisor_settlement(
+        _owner: isolated_process._IsolatedToolProcessOwner,
+        *,
+        cancellation: asyncio.CancelledError | None = None,
+    ) -> IsolatedToolFailure:
+        assert cancellation is None
+        return IsolatedToolFailure("supervisor_failed")
+
+    monkeypatch.setattr(
+        isolated_process._IsolatedToolProcessOwner,
+        "_spawn",
+        expired_spawn,
+    )
+    monkeypatch.setattr(
+        isolated_process._IsolatedToolProcessOwner,
+        "_settle",
+        failed_supervisor_settlement,
+    )
+    arguments = {"text": "never admitted"}
+    operations: dict[str, dict[str, Any]] = {}
+
+    async def scenario() -> None:
+        with pytest.raises(IsolatedToolFailure) as caught:
+            await execute_process_isolated_tool(
+                tool=_tool(),
+                context=_context(arguments, operations=operations),
+                arguments=arguments,
+                registered_schema=_SCHEMA,
+                redactor=SecretRedactor(),
+            )
+        assert caught.value.code == "supervisor_failed"
+
+    asyncio.run(scenario())
+
+    dispatch = next(
+        record
+        for record in operations.values()
+        if record.get("record_type") == "cayu.isolated-tool-dispatch"
+    )
+    settlement = next(
+        record
+        for record in operations.values()
+        if record.get("record_type") == "cayu.isolated-tool-dispatch-settlement"
+    )
+    assert settlement["outcome"] == "worker_not_admitted"
+    assert settlement["reason"] == "hard_process_deadline_exceeded"
+    assert isolated_process.isolated_tool_dispatch_settlement_matches(
+        settlement,
+        dispatch_record=dispatch,
+    )
+
+
+def test_late_spawn_requests_supervisor_shutdown_before_process_handle_arrives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        spawn_entered = asyncio.Event()
+        release_spawn = asyncio.Event()
+        retained_ready = asyncio.Event()
+        retained: list[asyncio.Task[Any]] = []
+        control_read_descriptor: int | None = None
+
+        async def delayed_spawn(*_args: Any, **kwargs: Any) -> Any:
+            nonlocal control_read_descriptor
+            control_read_descriptor = kwargs["pass_fds"][1]
+            spawn_entered.set()
+            await release_spawn.wait()
+            raise OSError("deterministic late spawn failure")
+
+        def retain(task: asyncio.Task[Any], **_kwargs: Any) -> None:
+            retained.append(task)
+            retained_ready.set()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+        monkeypatch.setattr(isolated_process, "_retain_task", retain)
+        owner = isolated_process._IsolatedToolProcessOwner(
+            tool=_tool(deadline_seconds=0.01),
+            request_bytes=b"{}",
+            request_sha256="sha256:" + "a" * 64,
+        )
+
+        run_task = asyncio.create_task(owner.run())
+        await asyncio.wait_for(spawn_entered.wait(), timeout=1)
+        await asyncio.wait_for(retained_ready.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert control_read_descriptor is not None
+        os.set_blocking(control_read_descriptor, False)
+        assert os.read(control_read_descriptor, 1) == b""
+        assert run_task.done() is False
+
+        release_spawn.set()
+        with pytest.raises(IsolatedToolDeadlineExceeded):
+            await run_task
+        await retained[0]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.process
+def test_parent_spawn_transport_failure_never_admits_a_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[int, tuple[int, ...], bool]:
+        original_spawn = asyncio.create_subprocess_exec
+        supervisor_pid: int | None = None
+        observed_children: tuple[int, ...] = ()
+        observation_completed = False
+
+        async def fail_after_supervisor_start(*args: Any, **kwargs: Any) -> Any:
+            nonlocal observation_completed, observed_children, supervisor_pid
+            process = await original_spawn(*args, **kwargs)
+            supervisor_pid = process.pid
+            try:
+                # Give the real supervisor time to reach its admission gate. An
+                # implementation that spawns eagerly exposes its worker here.
+                await asyncio.sleep(0.1)
+                contents = (
+                    Path(f"/proc/{process.pid}/task/{process.pid}/children")
+                    .read_text(encoding="ascii")
+                    .strip()
+                )
+                observed_children = tuple(int(value) for value in contents.split())
+                observation_completed = True
+            finally:
+                try:
+                    if process.stdin is not None:
+                        process.stdin.close()
+                finally:
+                    if process.returncode is None:
+                        process.kill()
+                    await process.wait()
+            raise OSError("injected post-fork transport attachment failure")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_after_supervisor_start)
+        owner = isolated_process._IsolatedToolProcessOwner(
+            tool=_tool(deadline_seconds=5),
+            request_bytes=b"{}",
+            request_sha256="sha256:" + "a" * 64,
+        )
+
+        with pytest.raises(IsolatedToolPreDispatchFailure, match="spawn_failed"):
+            await owner.run()
+
+        assert supervisor_pid is not None
+        assert not isolated_process._RETAINED_ISOLATED_TOOL_OWNERS
+        return supervisor_pid, observed_children, observation_completed
+
+    supervisor_pid, observed_children, observation_completed = asyncio.run(scenario())
+    assert observation_completed is True
+    assert observed_children == ()
+    _assert_process_gone(supervisor_pid)
+
+
+@pytest.mark.process
+@pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit, GeneratorExit])
+def test_process_control_during_late_spawn_handoff_keeps_one_settlement_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    signal_type: type[BaseException],
+) -> None:
+    async def scenario() -> int:
+        original_spawn = asyncio.create_subprocess_exec
+        original_retain = isolated_process._retain_task
+        release_spawn = asyncio.Event()
+        process_id: int | None = None
+        interrupted = False
+
+        async def delayed_spawn(*args, **kwargs):
+            nonlocal process_id
+            process = await original_spawn(*args, **kwargs)
+            process_id = process.pid
+            await release_spawn.wait()
+            return process
+
+        def interrupt_late_handoff(task: asyncio.Task[Any], **kwargs: Any) -> None:
+            nonlocal interrupted
+            if task.get_name() == "cayu-isolated-tool-late-spawn-cleanup" and not interrupted:
+                interrupted = True
+                release_spawn.set()
+                raise signal_type("late-spawn ownership handoff interrupted")
+            original_retain(task, **kwargs)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+        monkeypatch.setattr(isolated_process, "_retain_task", interrupt_late_handoff)
+        owner = isolated_process._IsolatedToolProcessOwner(
+            tool=_tool(deadline_seconds=0.01),
+            request_bytes=b"{}",
+            request_sha256="sha256:" + "a" * 64,
+        )
+
+        with pytest.raises(signal_type, match="late-spawn ownership handoff interrupted"):
+            await owner.run()
+
+        assert interrupted is True
+        assert process_id is not None
+        assert owner._late_spawn_settlement_owner is None
+        assert owner._spawn_task is None
+        assert owner._process is None
+        assert owner._wait_task is None
+        await asyncio.sleep(0)
+        assert not isolated_process._RETAINED_ISOLATED_TOOL_OWNERS
+        return process_id
+
+    process_id = asyncio.run(scenario())
+    _assert_process_gone(process_id)
+
+
+def test_failed_late_spawn_settlement_keeps_global_dispatch_fence() -> None:
+    class UnsettledLateSpawnOwner:
+        async def settle(self) -> None:
+            raise isolated_process.IsolatedToolCleanupUnproven("supervisor_settlement_ack_missing")
+
+    async def scenario() -> None:
+        assert not isolated_process._RETAINED_ISOLATED_TOOL_OWNERS
+        owner = isolated_process._IsolatedToolProcessOwner(
+            tool=_tool(),
+            request_bytes=b"{}",
+            request_sha256="sha256:" + "a" * 64,
+        )
+        owner._late_spawn_settlement_owner = cast("Any", UnsettledLateSpawnOwner())
+
+        try:
+            with pytest.raises(
+                isolated_process.IsolatedToolCleanupUnproven,
+                match="supervisor_settlement_ack_missing",
+            ):
+                await owner._settle()
+            await asyncio.sleep(0)
+
+            assert owner._late_spawn_settlement_owner is not None
+            assert isolated_process._retained_isolated_tool_cleanup_pending() is True
+        finally:
+            retained = tuple(isolated_process._RETAINED_ISOLATED_TOOL_OWNERS)
+            for task in retained:
+                if not task.done():
+                    task.cancel()
+            if retained:
+                await asyncio.gather(*retained, return_exceptions=True)
+            isolated_process._RETAINED_ISOLATED_TOOL_OWNERS.clear()
+
+    asyncio.run(scenario())
+
+
+def test_successful_late_spawn_joiner_retires_failed_retained_mirror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        settlement_calls = 0
+
+        async def transient_settlement(*_args: Any, **_kwargs: Any) -> None:
+            nonlocal settlement_calls
+            settlement_calls += 1
+            if settlement_calls == 1:
+                first_entered.set()
+                await release_first.wait()
+                raise isolated_process.IsolatedToolCleanupUnproven("transient_settlement_failure")
+
+        monkeypatch.setattr(isolated_process, "_settle_late_spawn", transient_settlement)
+        spawn_task = asyncio.create_task(
+            asyncio.sleep(
+                0,
+                result=cast("asyncio.subprocess.Process", None),
+            )
+        )
+        proof_owner = isolated_process._SupervisorSettlementProofOwner.create()
+        owner = isolated_process._LateSpawnSettlementOwner(
+            spawn_task=spawn_task,
+            limits=_tool().limits,
+            parent_result_write_owner=None,
+            parent_control_read_owner=None,
+            parent_control_owner=None,
+            settlement_proof_owner=proof_owner,
+        )
+        retained_task = asyncio.create_task(owner.settle())
+        isolated_process._retain_task(retained_task, retry_factory=owner.settle)
+
+        try:
+            await first_entered.wait()
+            foreground_joiner = asyncio.create_task(owner.settle())
+            release_first.set()
+            with pytest.raises(
+                isolated_process.IsolatedToolCleanupUnproven,
+                match="transient_settlement_failure",
+            ):
+                await retained_task
+            await foreground_joiner
+
+            assert owner.settled is True
+            assert settlement_calls == 2
+            assert isolated_process._retained_isolated_tool_cleanup_pending() is False
+            assert retained_task not in isolated_process._RETAINED_ISOLATED_TOOL_OWNERS
+            assert not isolated_process._RETAINED_ISOLATED_TOOL_OWNERS
+        finally:
+            release_first.set()
+            await asyncio.gather(spawn_task, return_exceptions=True)
+            proof_owner.close_best_effort()
+            isolated_process._RETAINED_ISOLATED_TOOL_OWNERS.clear()
 
     asyncio.run(scenario())
 
@@ -1177,7 +2900,7 @@ def test_process_control_during_spawn_retains_and_settles_the_late_child(
         assert owner._process is None
         assert owner._wait_task is None
         await asyncio.sleep(0)
-        assert not isolated_process._RETAINED_ISOLATED_TOOL_TASKS
+        assert not isolated_process._RETAINED_ISOLATED_TOOL_OWNERS
         return process_id
 
     process_id = asyncio.run(scenario())
@@ -1190,12 +2913,17 @@ def test_unproven_cleanup_retains_ownership_and_publishes_bounded_controls(
 ) -> None:
     cleanup_attempts = 0
 
-    async def never_proven(*_args, **_kwargs) -> bool:
+    async def never_proven(*_args, **_kwargs) -> None:
         nonlocal cleanup_attempts
         cleanup_attempts += 1
-        return False
+        return None
 
-    monkeypatch.setattr(isolated_process, "_wait_for_group_and_child", never_proven)
+    monkeypatch.setattr(isolated_process, "_wait_for_supervisor", never_proven)
+    monkeypatch.setattr(
+        isolated_process,
+        "_completed_process_wait_settlement",
+        lambda *_args, **_kwargs: None,
+    )
 
     async def scenario():
         arguments = {"text": "hello"}
@@ -1225,8 +2953,7 @@ def test_unproven_cleanup_retains_ownership_and_publishes_bounded_controls(
         )
         assert isolated_process._retained_isolated_tool_cleanup_pending() is True
     finally:
-        isolated_process._RETAINED_ISOLATED_TOOL_TASKS.clear()
-        isolated_process._RETAINED_ISOLATED_TOOL_RETRIES.clear()
+        isolated_process._RETAINED_ISOLATED_TOOL_OWNERS.clear()
 
 
 @pytest.mark.parametrize("termination", ["cancelled", "failed"])
@@ -1298,8 +3025,7 @@ def test_abnormal_retained_cleanup_keeps_later_isolated_dispatch_fenced(
         finally:
             recovery_loop.close()
     finally:
-        isolated_process._RETAINED_ISOLATED_TOOL_TASKS.clear()
-        isolated_process._RETAINED_ISOLATED_TOOL_RETRIES.clear()
+        isolated_process._RETAINED_ISOLATED_TOOL_OWNERS.clear()
 
 
 @pytest.mark.process
@@ -1310,14 +3036,14 @@ def test_unproven_cleanup_fences_later_isolated_dispatch_until_owner_settles(
     async def scenario() -> None:
         release_cleanup = asyncio.Event()
         cleanup_finished = asyncio.Event()
-        original_settle_group = isolated_process._settle_owned_process_group
+        original_settle_group = isolated_process._settle_owned_supervisor
         original_spawn = isolated_process._IsolatedToolProcessOwner._spawn
         spawn_count = 0
 
         async def blocked_settle_group(*args, **kwargs):
             try:
                 await release_cleanup.wait()
-                await original_settle_group(*args, **kwargs)
+                return await original_settle_group(*args, **kwargs)
             finally:
                 cleanup_finished.set()
 
@@ -1328,7 +3054,7 @@ def test_unproven_cleanup_fences_later_isolated_dispatch_until_owner_settles(
 
         monkeypatch.setattr(
             isolated_process,
-            "_settle_owned_process_group",
+            "_settle_owned_supervisor",
             blocked_settle_group,
         )
         monkeypatch.setattr(
@@ -1389,7 +3115,7 @@ def test_unproven_cleanup_fences_later_isolated_dispatch_until_owner_settles(
             release_cleanup.set()
             pending = [
                 task
-                for task in tuple(isolated_process._RETAINED_ISOLATED_TOOL_TASKS)
+                for task in tuple(isolated_process._RETAINED_ISOLATED_TOOL_OWNERS)
                 if not task.done()
             ]
             if pending:
@@ -1406,16 +3132,23 @@ def test_cleanup_fence_appearing_during_dispatch_publication_blocks_spawn(
         release_publication = asyncio.Event()
         release_cleanup = asyncio.Event()
         published_records: list[dict[str, Any]] = []
+        operations: dict[str, dict[str, Any]] = {}
+
+        async def load_operation(storage_key: str) -> dict[str, Any] | None:
+            record = operations.get(storage_key)
+            return None if record is None else dict(record)
 
         async def delayed_compare_and_set(
             _storage_key: str,
             _expected: dict[str, Any] | None,
             desired: dict[str, Any],
-            _secondary: Mapping[str, dict[str, Any]],
+            secondary: Mapping[str, dict[str, Any]],
         ) -> dict[str, Any]:
             publication_started.set()
             await release_publication.wait()
             published_records.append(desired)
+            operations[_storage_key] = dict(desired)
+            operations.update({key: dict(value) for key, value in secondary.items()})
             return desired
 
         arguments = {"text": "later"}
@@ -1436,7 +3169,7 @@ def test_cleanup_fence_appearing_during_dispatch_publication_blocks_spawn(
             effective_arguments=arguments,
             execution_profile_fingerprint="e" * 64,
             environment_allocation_fingerprint="a" * 64,
-            load_durable_operation=_load_operation,
+            load_durable_operation=load_operation,
             compare_and_set_durable_operation=delayed_compare_and_set,
             seal_durable_output=lambda value: dict(value),
             secret_publication_sealer=lambda: None,
@@ -1466,12 +3199,183 @@ def test_cleanup_fence_appearing_during_dispatch_publication_blocks_spawn(
             with pytest.raises(IsolatedToolPreDispatchFailure) as caught:
                 await invocation
             assert caught.value.code == "prior_process_cleanup_pending"
-            assert len(published_records) == 1
+            assert len(published_records) == 2
+            assert published_records[0]["record_type"] == "cayu.isolated-tool-dispatch"
+            assert (
+                published_records[1]
+                == operations[next(key for key in operations if key.endswith(":settlement"))]
+            )
+            assert published_records[1]["outcome"] == "worker_not_admitted"
+            assert published_records[1]["reason"] == "prior_process_cleanup_pending"
         finally:
             release_cleanup.set()
             await cleanup_task
             await asyncio.sleep(0)
-        assert not isolated_process._RETAINED_ISOLATED_TOOL_TASKS
+        assert not isolated_process._RETAINED_ISOLATED_TOOL_OWNERS
+
+    asyncio.run(scenario())
+
+
+def test_caller_cancellation_after_preparation_records_exact_zero_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[int, bool, dict[str, dict[str, Any]]]:
+        preparation_committed = asyncio.Event()
+        release_preparation = asyncio.Event()
+        operations: dict[str, dict[str, Any]] = {}
+
+        async def load_operation(storage_key: str) -> dict[str, Any] | None:
+            record = operations.get(storage_key)
+            return None if record is None else dict(record)
+
+        async def delayed_compare_and_set(
+            storage_key: str,
+            expected: dict[str, Any] | None,
+            desired: dict[str, Any],
+            secondary: Mapping[str, dict[str, Any]],
+        ) -> dict[str, Any]:
+            current = operations.get(storage_key)
+            if current != expected:
+                if current is None:  # pragma: no cover - test operation invariant
+                    raise AssertionError("Durable operation disappeared unexpectedly.")
+                return dict(current)
+            operations[storage_key] = dict(desired)
+            operations.update({key: dict(value) for key, value in secondary.items()})
+            if desired.get("record_type") == "cayu.isolated-tool-dispatch":
+                preparation_committed.set()
+                try:
+                    await release_preparation.wait()
+                except asyncio.CancelledError:
+                    await release_preparation.wait()
+                    raise
+            return dict(desired)
+
+        arguments = {"text": "cancel before worker admission"}
+        context = ToolContext(
+            session_id="isolated-cancelled-before-admission",
+            idempotency_key="tool-execution-1",
+        )
+        _bind_runtime_tool_invocation_authority(
+            context,
+            parent_task_id="task-1",
+            parent_run_epoch=3,
+            model_step_id="model-step-1",
+            model_attempt_id="model-attempt-1",
+            tool_round_id="tool-round-1",
+            tool_call_id="tool-call-1",
+            tool_name="isolated_fixture",
+            idempotency_key="tool-execution-1",
+            effective_arguments=arguments,
+            execution_profile_fingerprint="e" * 64,
+            environment_allocation_fingerprint="a" * 64,
+            load_durable_operation=load_operation,
+            compare_and_set_durable_operation=delayed_compare_and_set,
+            seal_durable_output=lambda value: dict(value),
+            secret_publication_sealer=lambda: None,
+        )
+
+        async def forbidden_spawn(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("Caller cancellation must win before supervisor spawn.")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden_spawn)
+        invocation = asyncio.create_task(
+            execute_process_isolated_tool(
+                tool=_tool(effect=ToolEffect.EXTERNAL),
+                context=context,
+                arguments=arguments,
+                registered_schema=_SCHEMA,
+                redactor=SecretRedactor(),
+            )
+        )
+        await preparation_committed.wait()
+        invocation.cancel("cancel before isolated worker admission")
+        cancelling = invocation.cancelling()
+        release_preparation.set()
+        with pytest.raises(
+            asyncio.CancelledError,
+            match="cancel before isolated worker admission",
+        ):
+            await invocation
+        return cancelling, invocation.cancelled(), operations
+
+    cancelling, cancelled, operations = asyncio.run(scenario())
+
+    dispatch = next(
+        record
+        for record in operations.values()
+        if record.get("record_type") == "cayu.isolated-tool-dispatch"
+    )
+    settlement = next(
+        record
+        for record in operations.values()
+        if record.get("record_type") == "cayu.isolated-tool-dispatch-settlement"
+    )
+    assert cancelling == 1
+    assert cancelled is True
+    assert settlement["outcome"] == "worker_not_admitted"
+    assert settlement["reason"] == "caller_cancelled_before_admission"
+    assert isolated_process.isolated_tool_dispatch_settlement_matches(
+        settlement,
+        dispatch_record=dispatch,
+    )
+
+
+def test_dispatch_publication_without_secondary_authority_never_spawns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        operations: dict[str, dict[str, Any]] = {}
+
+        async def load_operation(storage_key: str) -> dict[str, Any] | None:
+            record = operations.get(storage_key)
+            return None if record is None else dict(record)
+
+        async def incomplete_compare_and_set(
+            storage_key: str,
+            _expected: dict[str, Any] | None,
+            desired: dict[str, Any],
+            _secondary: Mapping[str, dict[str, Any]],
+        ) -> dict[str, Any]:
+            operations[storage_key] = dict(desired)
+            return dict(desired)
+
+        arguments = {"text": "must not spawn"}
+        context = ToolContext(
+            session_id="isolated-secondary-authority",
+            idempotency_key="isolated-secondary-authority-call",
+        )
+        _bind_runtime_tool_invocation_authority(
+            context,
+            parent_task_id="task-1",
+            parent_run_epoch=3,
+            model_step_id="model-step-1",
+            model_attempt_id="model-attempt-1",
+            tool_round_id="tool-round-1",
+            tool_call_id="tool-call-1",
+            tool_name="isolated_fixture",
+            idempotency_key="isolated-secondary-authority-call",
+            effective_arguments=arguments,
+            execution_profile_fingerprint="e" * 64,
+            environment_allocation_fingerprint="a" * 64,
+            load_durable_operation=load_operation,
+            compare_and_set_durable_operation=incomplete_compare_and_set,
+            seal_durable_output=lambda value: dict(value),
+            secret_publication_sealer=lambda: None,
+        )
+
+        async def forbidden_spawn(*_args, **_kwargs):
+            raise AssertionError("Incomplete durable authority admitted a child.")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden_spawn)
+        with pytest.raises(IsolatedToolFailure) as conflict:
+            await execute_process_isolated_tool(
+                tool=_tool(),
+                context=context,
+                arguments=arguments,
+                registered_schema=_SCHEMA,
+                redactor=SecretRedactor(),
+            )
+        assert conflict.value.code == "dispatch_evidence_conflict"
 
     asyncio.run(scenario())
 
@@ -1535,12 +3439,17 @@ def test_global_timeout_does_not_discard_unproven_process_cleanup(
 ) -> None:
     cleanup_attempts = 0
 
-    async def never_proven(*_args, **_kwargs) -> bool:
+    async def never_proven(*_args, **_kwargs) -> None:
         nonlocal cleanup_attempts
         cleanup_attempts += 1
-        return False
+        return None
 
-    monkeypatch.setattr(isolated_process, "_wait_for_group_and_child", never_proven)
+    monkeypatch.setattr(isolated_process, "_wait_for_supervisor", never_proven)
+    monkeypatch.setattr(
+        isolated_process,
+        "_completed_process_wait_settlement",
+        lambda *_args, **_kwargs: None,
+    )
 
     async def scenario():
         arguments = {"text": "hello"}
@@ -1583,8 +3492,7 @@ def test_global_timeout_does_not_discard_unproven_process_cleanup(
         )
         assert isolated_process._retained_isolated_tool_cleanup_pending() is True
     finally:
-        isolated_process._RETAINED_ISOLATED_TOOL_TASKS.clear()
-        isolated_process._RETAINED_ISOLATED_TOOL_RETRIES.clear()
+        isolated_process._RETAINED_ISOLATED_TOOL_OWNERS.clear()
 
 
 @pytest.mark.process
@@ -1661,6 +3569,103 @@ def test_real_cancellation_kills_the_complete_child_process_group(tmp_path: Path
     assert cancelling == 1
     assert cancelled is True
     _assert_process_gone(int(pid_path.read_text(encoding="utf-8")))
+
+
+@pytest.mark.process
+@pytest.mark.parametrize("termination", ["timeout", "success"])
+def test_supervisor_reaps_descendant_that_escapes_the_worker_process_group(
+    tmp_path: Path,
+    termination: str,
+) -> None:
+    pid_path = tmp_path / f"detached-{termination}.pid"
+    tool = _tool(
+        mode="detached_descendant",
+        deadline_seconds=2.5,
+        factory_config={
+            "pid_path": str(pid_path),
+            "seconds": 30,
+            "started_path": str(tmp_path / f"detached-{termination}.started"),
+            "return_success": termination == "success",
+        },
+    )
+
+    if termination == "timeout":
+        with pytest.raises(IsolatedToolDeadlineExceeded):
+            asyncio.run(_execute(tool))
+    else:
+        assert asyncio.run(_execute(tool)) == ToolResult(content="detached descendant started")
+
+    _assert_process_gone(int(pid_path.read_text(encoding="utf-8")))
+
+
+@pytest.mark.process
+def test_cancellation_reaps_descendant_that_escapes_the_worker_process_group(
+    tmp_path: Path,
+) -> None:
+    pid_path = tmp_path / "detached-cancelled.pid"
+    started_path = tmp_path / "detached-cancelled.started"
+
+    async def scenario() -> tuple[int, bool]:
+        task = asyncio.create_task(
+            _execute(
+                _tool(
+                    mode="detached_descendant",
+                    deadline_seconds=10,
+                    factory_config={
+                        "pid_path": str(pid_path),
+                        "seconds": 30,
+                        "started_path": str(started_path),
+                    },
+                )
+            )
+        )
+        async with asyncio.timeout(5):
+            while not started_path.exists():
+                await asyncio.sleep(0.01)
+        task.cancel("cancel detached descendant owner")
+        cancelling = task.cancelling()
+        with pytest.raises(asyncio.CancelledError, match="cancel detached descendant owner"):
+            await task
+        return cancelling, task.cancelled()
+
+    cancelling, cancelled = asyncio.run(scenario())
+    assert cancelling == 1
+    assert cancelled is True
+    _assert_process_gone(int(pid_path.read_text(encoding="utf-8")))
+
+
+@pytest.mark.process
+def test_abnormal_supervisor_exit_never_acknowledges_process_tree_settlement(
+    tmp_path: Path,
+) -> None:
+    worker_pid_path = tmp_path / "unowned-worker.pid"
+    descendant_pid_path = tmp_path / "unowned-descendant.pid"
+    tool = _tool(
+        mode="kill_supervisor",
+        deadline_seconds=3,
+        factory_config={
+            "worker_pid_path": str(worker_pid_path),
+            "pid_path": str(descendant_pid_path),
+            "seconds": 30,
+        },
+    )
+
+    try:
+        with pytest.raises(isolated_process.IsolatedToolSettlementFailure) as caught:
+            asyncio.run(_execute(tool))
+
+        assert caught.value.cleanup_code == "supervisor_settlement_ack_missing"
+        assert isolated_process._retained_isolated_tool_cleanup_pending() is True
+        with pytest.raises(IsolatedToolPreDispatchFailure) as fenced:
+            asyncio.run(_execute(_tool()))
+        assert fenced.value.code == "prior_process_cleanup_pending"
+    finally:
+        for path in (worker_pid_path, descendant_pid_path):
+            if not path.exists():
+                continue
+            with suppress(ProcessLookupError):
+                os.kill(int(path.read_text(encoding="utf-8")), signal.SIGKILL)
+        isolated_process._RETAINED_ISOLATED_TOOL_OWNERS.clear()
 
 
 def _assert_process_gone(process_id: int) -> None:
@@ -1765,6 +3770,11 @@ def test_process_boundary_setup_failures_are_typed_before_child_creation(
         raise AssertionError("process setup failure must precede child creation")
 
     monkeypatch.setattr(isolated_process.tempfile, "mkdtemp", tracked_mkdtemp)
+    monkeypatch.setattr(
+        isolated_process,
+        "_complete_process_tree_supervision_available",
+        lambda: True,
+    )
     if failure_stage == "result_pipe":
         monkeypatch.setattr(isolated_process.os, "pipe", failing_pipe)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden_spawn)
@@ -1802,6 +3812,7 @@ def test_process_boundary_setup_failures_are_typed_before_child_creation(
 def _public_app(
     tool: ProcessIsolatedTool,
     *,
+    session_store: InMemorySessionStore | None = None,
     tool_policy=None,
     tool_timeout_seconds: float | None = None,
     secret_redactor: SecretRedactor | None = None,
@@ -1824,6 +3835,7 @@ def _public_app(
         ]
     )
     app = CayuApp(
+        session_store=session_store,
         enable_logging=False,
         tool_timeout_seconds=tool_timeout_seconds,
         secret_redactor=secret_redactor,
@@ -1877,6 +3889,162 @@ class _FailingFirstCompletedToolEventStore(InMemorySessionStore):
         await super().append_events(session_id, events)
 
 
+class _FingerprintedEnvironmentFactory(EnvironmentFactory):
+    def __init__(self) -> None:
+        self.requests: list[EnvironmentFactoryRequest] = []
+
+    async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
+        self.requests.append(request)
+        return EnvironmentFactoryResult(
+            environment=Environment(EnvironmentSpec(name=request.environment_name)),
+            reconnect_metadata={"allocation_fingerprint": "a" * 64},
+        )
+
+
+class _ConflictingDispatchEvidenceStore(_FailingFirstCompletedToolEventStore):
+    def __init__(self, field_name: str) -> None:
+        super().__init__()
+        self.field_name = field_name
+        self.corrupt_dispatch_evidence = False
+        self.corrupted_loads = 0
+
+    async def load_session_operation(
+        self,
+        session_id: str,
+        storage_key: str,
+        **kwargs: Any,
+    ) -> dict[str, Any] | None:
+        record = await super().load_session_operation(session_id, storage_key, **kwargs)
+        if (
+            self.corrupt_dispatch_evidence
+            and record is not None
+            and record.get("record_type") == "cayu.isolated-tool-dispatch"
+        ):
+            self.corrupted_loads += 1
+            record[self.field_name] = (
+                "sha256:" + "b" * 64 if self.field_name == "request_sha256" else "b" * 64
+            )
+        return record
+
+
+class _FenceAfterDispatchAndFailFirstFailureStore(InMemorySessionStore):
+    supports_atomic_model_completion_stage_release = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dispatch_published = False
+        self.failed_terminal_once = False
+        self.corrupt_settlement = False
+        self.release_cleanup = asyncio.Event()
+        self.cleanup_started = asyncio.Event()
+
+    async def publish_session_operation(
+        self,
+        session_id: str,
+        **kwargs: Any,
+    ):
+        published = await super().publish_session_operation(session_id, **kwargs)
+        idempotency_key = kwargs["idempotency_key"]
+        if (
+            not self.dispatch_published
+            and idempotency_key.startswith("cayu:isolated-tool-dispatch:sha256:")
+            and not idempotency_key.endswith((":authority", ":settlement"))
+        ):
+            self.dispatch_published = True
+
+            async def retained_cleanup() -> None:
+                self.cleanup_started.set()
+                await self.release_cleanup.wait()
+
+            isolated_process._retain_task(asyncio.create_task(retained_cleanup()))
+            await self.cleanup_started.wait()
+        return published
+
+    async def append_events(self, session_id: str, events: list[Event]) -> None:
+        if not self.failed_terminal_once and any(
+            event.type == EventType.TOOL_CALL_FAILED for event in events
+        ):
+            self.failed_terminal_once = True
+            raise RuntimeError("terminal tool failure event unavailable")
+        await super().append_events(session_id, events)
+
+    async def load_session_operation(
+        self,
+        session_id: str,
+        storage_key: str,
+        **kwargs: Any,
+    ) -> dict[str, Any] | None:
+        record = await super().load_session_operation(session_id, storage_key, **kwargs)
+        if (
+            self.corrupt_settlement
+            and record is not None
+            and record.get("record_type") == "cayu.isolated-tool-dispatch-settlement"
+        ):
+            record["dispatch_record_sha256"] = "sha256:" + "0" * 64
+        return record
+
+
+class _BlockAfterIsolatedDispatchPublicationStore(InMemorySessionStore):
+    supports_atomic_model_completion_stage_release = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dispatch_committed = asyncio.Event()
+        self.release_dispatch_acknowledgement = asyncio.Event()
+
+    async def publish_session_operation(
+        self,
+        session_id: str,
+        **kwargs: Any,
+    ):
+        published = await super().publish_session_operation(session_id, **kwargs)
+        idempotency_key = kwargs["idempotency_key"]
+        if idempotency_key.startswith(
+            "cayu:isolated-tool-dispatch:sha256:"
+        ) and not idempotency_key.endswith((":authority", ":settlement")):
+            self.dispatch_committed.set()
+            await self.release_dispatch_acknowledgement.wait()
+            raise RuntimeError("isolated dispatch publication acknowledgement lost")
+        return published
+
+
+@pytest.mark.process
+def test_public_cancellation_during_dispatch_publication_restores_task_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _BlockAfterIsolatedDispatchPublicationStore()
+    app = _public_app(
+        _tool(effect=ToolEffect.EXTERNAL),
+        session_store=store,
+    )
+
+    async def forbidden_spawn(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("Cancellation before publication acknowledgement must not spawn.")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden_spawn)
+
+    async def scenario() -> tuple[int, int, bool]:
+        invocation = asyncio.create_task(
+            _run_public(app, session_id="isolated-publication-cancellation")
+        )
+        await store.dispatch_committed.wait()
+        invocation.cancel("cancel isolated dispatch publication")
+        cancelling_before_release = invocation.cancelling()
+        store.release_dispatch_acknowledgement.set()
+        with pytest.raises(
+            asyncio.CancelledError,
+            match="cancel isolated dispatch publication",
+        ):
+            await invocation
+        return cancelling_before_release, invocation.cancelling(), invocation.cancelled()
+
+    cancelling_before_release, cancelling_after, cancelled = asyncio.run(scenario())
+
+    assert cancelling_before_release == 1
+    assert cancelling_after == 1
+    assert cancelled is True
+
+
 @pytest.mark.process
 def test_public_runtime_executes_registered_isolated_tool_and_exposes_truthful_evidence() -> None:
     app = _public_app(_tool(deadline_seconds=3))
@@ -1925,11 +4093,53 @@ def test_public_runtime_applies_the_ordinary_secret_safe_result_boundary() -> No
     assert canary not in repr([message.model_dump(mode="json") for message in transcript])
 
 
+def test_predispatch_boundary_controls_survive_runtime_message_redaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = "isolated-predispatch-control-collision"
+    app = _public_app(
+        _tool(),
+        secret_redactor=SecretRedactor("posix_process"),
+    )
+    provider = app.get_provider()
+    monkeypatch.setattr(
+        isolated_process,
+        "_retained_isolated_tool_cleanup_pending",
+        lambda: True,
+    )
+
+    events = asyncio.run(_run_public(app, session_id=session_id))
+    transcript = asyncio.run(app.session_store.load_transcript(session_id))
+    failed = next(event for event in events if event.type is EventType.TOOL_CALL_FAILED)
+    transcript_result = next(
+        part
+        for message in transcript
+        for part in message.content
+        if isinstance(part, ToolResultPart)
+    )
+    provider_result = next(
+        part
+        for message in provider.requests[1].messages
+        for part in message.content
+        if isinstance(part, ToolResultPart)
+    )
+
+    for structured in (
+        failed.payload["result"]["structured"],
+        transcript_result.structured,
+        provider_result.structured,
+    ):
+        assert structured["isolated_tool_failure_code"] == "prior_process_cleanup_pending"
+        assert structured["tool_execution_boundary"] == "posix_process"
+        assert structured["tool_timeout_strength"] == "hard_process_deadline"
+
+
 @pytest.mark.process
 def test_public_hard_timeout_preserves_external_effect_uncertainty_and_no_replay(
     tmp_path: Path,
 ) -> None:
     started_path = tmp_path / "started"
+    session_id = "public-isolated-timeout"
     app = _public_app(
         _tool(
             mode="gil_block",
@@ -1939,17 +4149,42 @@ def test_public_hard_timeout_preserves_external_effect_uncertainty_and_no_replay
         ),
         secret_redactor=SecretRedactor("UNRELATED_REGISTERED_SECRET"),
     )
+    provider = app.get_provider()
 
-    events = asyncio.run(_run_public(app, session_id="public-isolated-timeout"))
+    events = asyncio.run(_run_public(app, session_id=session_id))
 
     assert started_path.read_text(encoding="utf-8") == "started"
     failed = next(event for event in events if event.type == EventType.TOOL_CALL_FAILED)
+    transcript = asyncio.run(app.session_store.load_transcript(session_id))
+    transcript_result = next(
+        part
+        for message in transcript
+        for part in message.content
+        if isinstance(part, ToolResultPart)
+    )
+    provider_result = next(
+        part
+        for message in provider.requests[1].messages
+        for part in message.content
+        if isinstance(part, ToolResultPart)
+    )
     assert failed.payload["terminal_outcome"] == "tool_execution_timeout"
     assert failed.payload["outcome_unknown"] is True
     assert failed.payload["manual_reconciliation_required"] is True
     assert failed.payload["isolated_tool_failure_code"] == "hard_process_deadline_exceeded"
     assert failed.payload["tool_execution_boundary"] == "posix_process"
     assert failed.payload["tool_timeout_strength"] == "hard_process_deadline"
+    for structured in (
+        failed.payload["result"]["structured"],
+        transcript_result.structured,
+        provider_result.structured,
+    ):
+        assert structured["terminal_outcome"] == "tool_execution_timeout"
+        assert structured["outcome_unknown"] is True
+        assert structured["manual_reconciliation_required"] is True
+        assert structured["isolated_tool_failure_code"] == "hard_process_deadline_exceeded"
+        assert structured["tool_execution_boundary"] == "posix_process"
+        assert structured["tool_timeout_strength"] == "hard_process_deadline"
     assert sum(event.type == EventType.TOOL_CALL_STARTED for event in events) == 1
     assert sum(event.type == EventType.TOOL_CALL_FAILED for event in events) == 1
 
@@ -1958,6 +4193,18 @@ def test_public_hard_timeout_preserves_external_effect_uncertainty_and_no_replay
 def test_recovery_of_started_isolated_call_never_launches_a_duplicate_child(
     tmp_path: Path,
 ) -> None:
+    class ModifyArgumentsHook(RuntimeHook):
+        async def before_tool_call(
+            self,
+            context: BeforeToolCallHookContext,
+        ) -> BeforeToolCallDecision:
+            modified = context.arguments
+            modified["text"] = "hook-modified execution"
+            return BeforeToolCallDecision(
+                action="proceed_modified",
+                modified_arguments=modified,
+            )
+
     count_path = tmp_path / "recovery-child-count"
     store = _FailingFirstCompletedToolEventStore()
     provider = ScriptedModelProvider(
@@ -1988,6 +4235,7 @@ def test_recovery_of_started_isolated_call_never_launches_a_duplicate_child(
                 effect=ToolEffect.EXTERNAL,
             )
         ],
+        runtime_hooks=[ModifyArgumentsHook()],
     )
 
     initial = asyncio.run(_run_public(app, session_id="isolated-recovery-no-replay"))
@@ -2010,6 +4258,269 @@ def test_recovery_of_started_isolated_call_never_launches_a_duplicate_child(
     ]
     assert len(terminal_events) == 1
     assert terminal_events[0].payload["result"]["structured"]["outcome_unknown"] is True
+
+
+@pytest.mark.process
+@pytest.mark.parametrize("recovery_mode", ["automatic", "manual"])
+def test_factory_backed_recovery_authenticates_original_isolated_dispatch(
+    tmp_path: Path,
+    recovery_mode: str,
+) -> None:
+    session_id = f"isolated-factory-recovery-{recovery_mode}"
+    count_path = tmp_path / f"factory-recovery-{recovery_mode}-count"
+    store = _FailingFirstCompletedToolEventStore()
+    factory = _FingerprintedEnvironmentFactory()
+    app = _public_app(
+        _tool(
+            mode="counted_success",
+            deadline_seconds=3,
+            factory_config={"count_path": str(count_path)},
+            effect=ToolEffect.EXTERNAL,
+        ),
+        session_store=store,
+    )
+    app.register_environment_factory(
+        EnvironmentSpec(name="factory-environment"),
+        factory,
+        default=True,
+    )
+
+    async def scenario() -> tuple[list[Any], list[Event]]:
+        initial = await _run_public(app, session_id=session_id)
+        assert initial[-1].type is EventType.SESSION_FAILED
+        if recovery_mode == "automatic":
+            recovered = await _resume_public(app, session_id=session_id)
+        else:
+            checkpoint = await store.load_checkpoint(session_id)
+            assert checkpoint is not None
+            pending_round = checkpoint["pending_tool_round"]
+            recovered = [
+                event
+                async for event in app.recover_tool_round(
+                    ToolRoundRecoveryRequest(
+                        session_id=session_id,
+                        round_id=pending_round["tool_round_id"],
+                        tool_call_id="isolated-call-1",
+                        outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                        message="operator reconciled the isolated effect",
+                    )
+                )
+            ]
+        return recovered, await store.load_events(session_id)
+
+    recovered, durable_events = asyncio.run(scenario())
+
+    assert recovered[-1].type is EventType.SESSION_COMPLETED
+    assert count_path.read_text(encoding="utf-8").splitlines() == ["started"]
+    assert [request.operation.value for request in factory.requests] == ["create", "reconnect"]
+    terminal_events = [
+        event
+        for event in durable_events
+        if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+    ]
+    assert len(terminal_events) == 1
+
+
+@pytest.mark.process
+def test_recovery_prefers_exact_zero_dispatch_settlement_after_final_fence_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = "isolated-zero-dispatch-recovery"
+    store = _FenceAfterDispatchAndFailFirstFailureStore()
+    app = _public_app(
+        _tool(effect=ToolEffect.EXTERNAL),
+        session_store=store,
+    )
+
+    async def forbidden_spawn(*_args: Any, **_kwargs: Any):
+        raise AssertionError("A positively rejected isolated worker must never be spawned.")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden_spawn)
+
+    async def scenario() -> tuple[list[Any], list[Any], list[Event]]:
+        initial = await _run_public(app, session_id=session_id)
+        store.release_cleanup.set()
+        async with asyncio.timeout(3):
+            while isolated_process._retained_isolated_tool_cleanup_pending():
+                await asyncio.sleep(0)
+        recovered = await _resume_public(app, session_id=session_id)
+        durable = await store.load_events(session_id)
+        return initial, recovered, durable
+
+    initial, recovered, durable = asyncio.run(scenario())
+
+    assert store.dispatch_published is True
+    assert store.failed_terminal_once is True
+    assert initial[-1].type is EventType.SESSION_FAILED
+    assert recovered[-1].type is EventType.SESSION_COMPLETED
+    recovered_failure = next(
+        event
+        for event in recovered
+        if event.type is EventType.TOOL_CALL_FAILED and event.payload.get("recovered") is True
+    )
+    structured = recovered_failure.payload["result"]["structured"]
+    assert structured["started"] is False
+    assert structured["executed"] is False
+    assert structured.get("outcome_unknown", False) is False
+    assert "was not executed" in recovered_failure.payload["result"]["content"]
+    assert "manual_reconciliation_required" not in structured
+    assert "isolated_tool_failure_code" not in structured
+    terminal_events = [
+        event
+        for event in durable
+        if event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+    ]
+    assert len(terminal_events) == 1
+    durable_structured = terminal_events[0].payload["result"]["structured"]
+    assert durable_structured["started"] is False
+    assert durable_structured["executed"] is False
+    assert durable_structured["outcome_unknown"] is False
+
+
+@pytest.mark.process
+def test_manual_recovery_rejects_exact_zero_dispatch_despite_conflicting_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = "isolated-zero-dispatch-manual-recovery"
+    store = _FenceAfterDispatchAndFailFirstFailureStore()
+    app = _public_app(
+        _tool(effect=ToolEffect.EXTERNAL),
+        session_store=store,
+    )
+
+    async def forbidden_spawn(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("A positively rejected isolated worker must never be spawned.")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden_spawn)
+
+    async def scenario() -> tuple[SessionStatus, dict[str, Any]]:
+        initial = await _run_public(app, session_id=session_id)
+        assert initial[-1].type is EventType.SESSION_FAILED
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        pending_round = checkpoint["pending_tool_round"]
+        store.release_cleanup.set()
+        async with asyncio.timeout(3):
+            while isolated_process._retained_isolated_tool_cleanup_pending():
+                await asyncio.sleep(0)
+
+        durable_events = await store.load_events(session_id)
+        started_event = next(
+            event for event in durable_events if event.type is EventType.TOOL_CALL_STARTED
+        )
+        malformed_terminal = started_event.model_copy(
+            update={
+                "id": str(uuid4()),
+                "type": EventType.TOOL_CALL_COMPLETED,
+                "payload": {
+                    **started_event.payload,
+                    "result": {"content": 7},
+                },
+            },
+            deep=True,
+        )
+        await store.append_events(session_id, [malformed_terminal])
+
+        request = ToolRoundRecoveryRequest(
+            session_id=session_id,
+            round_id=pending_round["tool_round_id"],
+            tool_call_id="isolated-call-1",
+            outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+            message="operator must not override positive zero-dispatch evidence",
+        )
+        with pytest.raises(RuntimeError, match="requires a recorded tool.call.started"):
+            _ = [event async for event in app.recover_tool_round(request)]
+        session = await store.load(session_id)
+        assert session is not None
+        checkpoint_after = await store.load_checkpoint(session_id)
+        assert checkpoint_after is not None
+        return session.status, checkpoint_after
+
+    status, checkpoint_after = asyncio.run(scenario())
+
+    assert status is SessionStatus.FAILED
+    assert "pending_tool_round" in checkpoint_after
+
+
+@pytest.mark.process
+def test_recovery_rejects_zero_dispatch_settlement_with_conflicting_preparation_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = "isolated-conflicting-zero-dispatch-recovery"
+    store = _FenceAfterDispatchAndFailFirstFailureStore()
+    app = _public_app(
+        _tool(effect=ToolEffect.EXTERNAL),
+        session_store=store,
+    )
+
+    async def forbidden_spawn(*_args: Any, **_kwargs: Any):
+        raise AssertionError("A positively rejected isolated worker must never be spawned.")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden_spawn)
+
+    async def scenario() -> None:
+        initial = await _run_public(app, session_id=session_id)
+        assert initial[-1].type is EventType.SESSION_FAILED
+        store.corrupt_settlement = True
+        store.release_cleanup.set()
+        async with asyncio.timeout(3):
+            while isolated_process._retained_isolated_tool_cleanup_pending():
+                await asyncio.sleep(0)
+        recovered = await _resume_public(app, session_id=session_id)
+        assert recovered[-1].type is EventType.SESSION_FAILED
+        assert (
+            "dispatch settlement conflicts with its preparation" in recovered[-1].payload["error"]
+        )
+        assert not any(event.type is EventType.TOOL_CALL_FAILED for event in recovered)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.process
+@pytest.mark.parametrize(
+    "conflicting_field",
+    [
+        "request_sha256",
+        "effective_arguments_sha256",
+        "environment_allocation_fingerprint",
+    ],
+)
+def test_recovery_rejects_conflicting_isolated_dispatch_authority(
+    tmp_path: Path,
+    conflicting_field: str,
+) -> None:
+    count_path = tmp_path / f"conflicting-{conflicting_field}-count"
+    store = _ConflictingDispatchEvidenceStore(conflicting_field)
+    app = _public_app(
+        _tool(
+            mode="counted_success",
+            deadline_seconds=3,
+            factory_config={"count_path": str(count_path)},
+            effect=ToolEffect.EXTERNAL,
+        ),
+        session_store=store,
+    )
+    provider = app.get_provider()
+
+    async def scenario() -> None:
+        initial = await _run_public(app, session_id="isolated-conflicting-recovery")
+        assert initial[-1].type is EventType.SESSION_FAILED
+        store.corrupt_dispatch_evidence = True
+        recovered = await _resume_public(app, session_id="isolated-conflicting-recovery")
+        assert recovered[-1].type is EventType.SESSION_FAILED
+        assert (
+            "dispatch evidence conflicts with its pending round" in recovered[-1].payload["error"]
+        )
+        assert not any(
+            event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+            for event in recovered
+        )
+
+    asyncio.run(scenario())
+
+    assert store.corrupted_loads > 0
+    assert count_path.read_text(encoding="utf-8").splitlines() == ["started"]
+    assert len(provider.requests) == 1
 
 
 @pytest.mark.process

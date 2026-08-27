@@ -25,6 +25,7 @@ from cayu._validation import (
     require_durable_text,
     require_nonblank,
 )
+from cayu.core.isolated_tools import ProcessIsolatedTool
 from cayu.core.tools import ToolContext, ToolEffect, ToolResult
 from cayu.runners.base import ExecCommand, Runner
 from cayu.runners.local import LocalRunner
@@ -853,6 +854,8 @@ async def verify_tool_effect(
     both workspace snapshots, tool execution, and cleanup. Expiration raises
     ``TimeoutError`` without returning a verdict. A blocking tool or filesystem
     operation can delay that failure; a hard stop requires a process boundary.
+    ``ProcessIsolatedTool`` is rejected because invoking it directly would bypass
+    its runtime-owned process and recovery boundary.
     Arguments are validated and copied as portable durable JSON before the tool
     can be invoked.
     """
@@ -893,6 +896,11 @@ async def verify_tool_effect(
         registered_tool = registered_agent.tools[tool_name]
     except KeyError as exc:
         raise KeyError(f"Tool not registered for agent {agent_name}: {tool_name}") from exc
+    if type(registered_tool.tool) is ProcessIsolatedTool:
+        raise ValueError(
+            "verify_tool_effect does not support ProcessIsolatedTool; isolated tools require "
+            "the runtime-owned process execution boundary."
+        )
     effect = registered_tool.effect
     if effect is not ToolEffect.NONE and not allow_effectful_execution:
         raise ValueError(

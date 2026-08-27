@@ -1338,7 +1338,7 @@ def test_process_isolated_tool_tree_composes_with_general_attempt_containment(
                 ),
             )
         )
-        await _wait_for_tree(tree_state)
+        await _wait_for_tree(tree_state, timeout=30)
         evidence_deadline = asyncio.get_running_loop().time() + 25
         isolated_pid_path = tree_state / "isolated-grandchild.pid"
         while not (tree_state / "isolated-started").is_file() or not isolated_pid_path.is_file():

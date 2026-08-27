@@ -276,7 +276,8 @@ def _redact_message_for_boundary(
         structured = part.get("structured")
         if type(structured) is dict:
             terminal_controls = _recognized_runtime_terminal_controls(
-                cast("dict[str, object]", structured)
+                cast("dict[str, object]", structured),
+                trust_boundary_only=trust_runtime_tool_result_projection,
             )
             redacted_structured = redacted_part.get("structured")
             if terminal_controls and type(redacted_structured) is dict:
@@ -402,6 +403,7 @@ def _require_secret_free_message_keys(
                     structured=cast("dict[str, object]", structured),
                     redactor=redactor,
                     field_name=f"{field_name}.content[{index}].structured",
+                    trust_runtime_tool_result_projection=(trust_runtime_tool_result_projection),
                 )
 
 
@@ -488,6 +490,15 @@ def _strip_untrusted_runtime_tool_result_projection_authority(
         part = cast("dict[str, object]", part)
         if part.get("type") != "tool_result":
             continue
+        structured = part.get("structured")
+        if type(structured) is dict:
+            # Shape alone cannot turn application output into runtime control
+            # authority.  Remove only a complete, positively recognized
+            # runtime-control projection; invalid or similarly named ordinary
+            # application fields remain untrusted data and are redacted below.
+            part["structured"] = tool_results.strip_untrusted_runtime_tool_result_control_authority(
+                cast("dict[str, Any]", structured)
+            )
         artifacts = part.get("artifacts")
         if type(artifacts) is not list:
             continue
@@ -502,6 +513,7 @@ def _require_secret_free_tool_result_structure(
     structured: dict[str, object],
     redactor: SecretRedactor,
     field_name: str,
+    trust_runtime_tool_result_projection: bool,
 ) -> None:
     """Exempt only positively identified runtime-owned tool-result schemas."""
 
@@ -514,7 +526,10 @@ def _require_secret_free_tool_result_structure(
         )
         return
 
-    terminal_controls = _recognized_runtime_terminal_controls(structured)
+    terminal_controls = _recognized_runtime_terminal_controls(
+        structured,
+        trust_boundary_only=trust_runtime_tool_result_projection,
+    )
     if terminal_controls:
         runtime_fields = {
             key: value
@@ -612,12 +627,14 @@ def _require_secret_free_tool_result_structure(
 
 def _recognized_runtime_terminal_controls(
     structured: dict[str, object],
+    *,
+    trust_boundary_only: bool,
 ) -> dict[str, object]:
     """Return only positively validated runtime-owned terminal controls."""
 
     try:
         controls: dict[str, object] = tool_results.runtime_terminal_controls(structured)
-        if controls:
+        if controls or trust_boundary_only:
             controls.update(tool_results.runtime_tool_execution_boundary_controls(structured))
         return controls
     except (TypeError, ValueError):

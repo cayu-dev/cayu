@@ -67,7 +67,7 @@ from cayu.runtime import (
     RuntimeHook,
     ToolCallHookContext,
 )
-from cayu.vaults import ResolvedSecret, SecretRef, StaticVault
+from cayu.vaults import ResolvedSecret, SecretRedactor, SecretRef, StaticVault
 
 _HOSTILE_DURABLE_ERROR_SECRET = "workload-secret-durable-error-accessor"
 
@@ -563,7 +563,10 @@ def test_cayu_app_terminalizes_hostile_durable_billing_hook_error(phase: str):
     assert _HOSTILE_DURABLE_ERROR_SECRET not in rendered
 
 
-def test_after_tool_call_hook_can_modify_no_effect_execution_failure_before_persistence():
+@pytest.mark.parametrize("registered_secret", [None, "unrelated-workload-secret"])
+def test_after_tool_call_hook_can_modify_no_effect_execution_failure_before_persistence(
+    registered_secret: str | None,
+):
     class FailingNoEffectTool(Tool):
         spec = ToolSpec(
             name="failing_no_effect",
@@ -600,7 +603,11 @@ def test_after_tool_call_hook_can_modify_no_effect_execution_failure_before_pers
             ],
         ]
     )
-    app = CayuApp(session_store=store, enable_logging=False)
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=(None if registered_secret is None else SecretRedactor(registered_secret)),
+        enable_logging=False,
+    )
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),

@@ -1,24 +1,27 @@
-"""POSIX lifecycle owner for one process-isolated tool invocation."""
+"""Linux process-tree owner for one process-isolated tool invocation."""
 
 from __future__ import annotations
 
 import asyncio
 import os
 import shutil
-import signal
+import subprocess
 import sys
 import tempfile
 from collections.abc import Callable, Coroutine
 from contextlib import suppress
+from dataclasses import dataclass
+from functools import lru_cache
 from hashlib import sha256
 from math import isfinite
-from typing import Any, Final, cast
+from typing import Any, BinaryIO, Final, cast
 from uuid import UUID, uuid4
 
 from cayu._exception_groups import (
     exception_cause,
     exception_tree_contains,
     iter_exception_tree,
+    set_exception_cause,
 )
 from cayu._task_wait import (
     await_shielded_task_outcome,
@@ -48,6 +51,10 @@ from cayu.runtime.tool_gateway import validate_effective_tool_arguments
 from cayu.vaults.redaction import SecretRedactor
 
 _WORKER_MODULE: Final = "cayu.runtime._isolated_tool_worker"
+_SUPERVISOR_SCRIPT: Final = os.path.join(
+    os.path.dirname(__file__),
+    "_isolated_tool_supervisor.py",
+)
 _CHILD_BASE_ENVIRONMENT: Final = {
     "LC_ALL": "C",
     "PYTHONIOENCODING": "utf-8",
@@ -58,13 +65,39 @@ _CLEANUP_SETTLEMENT_HEADROOM_SECONDS: Final = 2.0
 _TEMPORARY_DIRECTORY_SETTLEMENT_SECONDS: Final = 1.0
 _PIPE_CLOSE_SETTLEMENT_SECONDS: Final = 0.5
 _ISOLATED_TOOL_DISPATCH_RECORD_TYPE: Final = "cayu.isolated-tool-dispatch"
-_ISOLATED_TOOL_DISPATCH_RECORD_VERSION: Final = 1
+_ISOLATED_TOOL_DISPATCH_RECORD_VERSION: Final = 2
+_ISOLATED_TOOL_DISPATCH_AUTHORITY_RECORD_TYPE: Final = "cayu.isolated-tool-dispatch-authority"
+_ISOLATED_TOOL_DISPATCH_AUTHORITY_RECORD_VERSION: Final = 1
+_ISOLATED_TOOL_DISPATCH_SETTLEMENT_RECORD_TYPE: Final = "cayu.isolated-tool-dispatch-settlement"
+_ISOLATED_TOOL_DISPATCH_SETTLEMENT_RECORD_VERSION: Final = 1
+_ISOLATED_TOOL_ZERO_DISPATCH_REASONS: Final = frozenset(
+    {
+        "caller_cancelled_before_admission",
+        "hard_process_deadline_exceeded",
+        "prior_process_cleanup_pending",
+        "process_boundary_setup_failed",
+        "spawn_failed",
+    }
+)
+_PROBE_CHILD_SUBREAPER_ARGUMENT: Final = "--probe-child-subreaper"
+_SUPERVISOR_SETTLEMENT_ACK_COMPLETED: Final = b"\x01\x00"
+_SUPERVISOR_SETTLEMENT_ACK_FAILED: Final = b"\x01\x01"
+_SUPERVISOR_WORKER_ADMISSION: Final = b"\x01"
 
-_RETAINED_ISOLATED_TOOL_TASKS: set[asyncio.Task[Any]] = set()
-_RETAINED_ISOLATED_TOOL_RETRIES: dict[
+_RETAINED_ISOLATED_TOOL_OWNERS: dict[
     asyncio.Task[Any],
-    Callable[[], Coroutine[Any, Any, Any]],
+    Callable[[], Coroutine[Any, Any, Any]] | None,
 ] = {}
+
+
+class _ChildSubreaperProbeUnavailable(RuntimeError):
+    """One capability probe failed without establishing a durable result."""
+
+
+@dataclass(frozen=True, slots=True)
+class _SupervisorSettlement:
+    return_code: int
+    supervisor_failed: bool
 
 
 class IsolatedToolFailure(Exception):
@@ -93,7 +126,7 @@ class IsolatedToolDeadlineExceeded(TimeoutError):
 
 
 class IsolatedToolCleanupUnproven(IsolatedToolFailure):
-    """The parent could not prove process-group settlement within its bound."""
+    """The parent could not prove process-tree settlement within its bound."""
 
 
 class IsolatedToolSettlementFailure(IsolatedToolFailure):
@@ -114,6 +147,357 @@ class IsolatedToolSettlementFailure(IsolatedToolFailure):
         else:
             self.primary_kind = "execution_error"
         super().__init__("process_cleanup_unproven")
+
+
+def _ordered_failure_evidence(
+    message: str,
+    *failures: BaseException | None,
+) -> BaseException | None:
+    """Retain distinct failures once while preserving their phase order."""
+
+    ordered: list[BaseException] = []
+    seen: set[int] = set()
+    for failure in failures:
+        if failure is None or id(failure) in seen:
+            continue
+        ordered.append(failure)
+        seen.update(id(candidate) for candidate in iter_exception_tree(failure))
+    if not ordered:
+        return None
+    if len(ordered) == 1:
+        return ordered[0]
+    return BaseExceptionGroup(message, ordered)
+
+
+def _post_terminal_failure(
+    *,
+    supervisor_failure: IsolatedToolFailure | None,
+    terminal_failure: IsolatedToolFailure | None,
+    diagnostic_failure: IsolatedToolFailure | None,
+) -> BaseException | None:
+    """Keep supervisor classification while retaining every later stream failure."""
+
+    if supervisor_failure is None:
+        return _ordered_failure_evidence(
+            "Isolated tool terminal and diagnostic settlement failed.",
+            terminal_failure,
+            diagnostic_failure,
+        )
+    secondary = _ordered_failure_evidence(
+        "Isolated tool terminal and diagnostic settlement also failed.",
+        terminal_failure,
+        diagnostic_failure,
+    )
+    if secondary is not None:
+        set_exception_cause(supervisor_failure, secondary)
+    return supervisor_failure
+
+
+def _independent_cleanup_evidence(
+    primary: BaseException,
+    cleanup: BaseException | None,
+) -> BaseException | None:
+    """Remove duplicate or primary-induced cleanup representations."""
+
+    if cleanup is None:
+        return None
+    primary_nodes = tuple(iter_exception_tree(primary))
+    primary_node_ids = {id(candidate) for candidate in primary_nodes}
+    primary_codes = {
+        (type(candidate), candidate.code)
+        for candidate in primary_nodes
+        if isinstance(candidate, IsolatedToolFailure)
+    }
+
+    def independent(candidate: BaseException) -> BaseException | None:
+        if id(candidate) in primary_node_ids:
+            return None
+        if (
+            isinstance(candidate, IsolatedToolFailure)
+            and (type(candidate), candidate.code) in primary_codes
+        ):
+            return None
+        if isinstance(primary, IsolatedToolDeadlineExceeded) and (
+            type(candidate) is IsolatedToolInvalidOutput
+            and candidate.code
+            in {
+                "missing_terminal_output",
+                "response_read_failed",
+                "terminal_stream_unsettled",
+            }
+        ):
+            return None
+        if isinstance(candidate, BaseExceptionGroup):
+            children = [
+                filtered
+                for child in candidate.exceptions
+                if (filtered := independent(child)) is not None
+            ]
+            if not children:
+                return None
+            if len(children) == 1:
+                return children[0]
+            return BaseExceptionGroup(
+                "Independent isolated tool cleanup failures.",
+                children,
+            )
+        return candidate
+
+    return independent(cleanup)
+
+
+class _FileDescriptorOwner:
+    """Idempotent owner of one parent-only inherited pipe descriptor."""
+
+    def __init__(self, stream: BinaryIO) -> None:
+        self._stream = stream
+
+    @classmethod
+    def adopt(cls, descriptor: int, *, mode: str) -> _FileDescriptorOwner:
+        try:
+            return cls(cast("BinaryIO", os.fdopen(descriptor, mode, buffering=0)))
+        except BaseException:
+            with suppress(OSError):
+                os.close(descriptor)
+            raise
+
+    @classmethod
+    def create_pipe_with_owned_writer(cls) -> tuple[int, _FileDescriptorOwner]:
+        read_descriptor, write_descriptor = os.pipe()
+        try:
+            return read_descriptor, cls.adopt(write_descriptor, mode="wb")
+        except BaseException:
+            with suppress(OSError):
+                os.close(read_descriptor)
+            raise
+
+    @property
+    def descriptor(self) -> int:
+        descriptor = self._stream.fileno()
+        if type(descriptor) is not int or descriptor < 0:
+            raise IsolatedToolCleanupUnproven("parent_pipe_descriptor_invalid")
+        return descriptor
+
+    def close_best_effort(self) -> None:
+        with suppress(OSError):
+            self._stream.close()
+
+
+class _SupervisorControlOwner:
+    """Owner of one supervisor generation's admission and shutdown channel."""
+
+    def __init__(self, stream: BinaryIO) -> None:
+        self._stream = stream
+
+    @classmethod
+    def create(cls) -> tuple[int, _SupervisorControlOwner]:
+        read_descriptor, write_descriptor = os.pipe()
+        try:
+            stream = os.fdopen(write_descriptor, "wb", buffering=0)
+        except BaseException:
+            with suppress(OSError):
+                os.close(read_descriptor)
+            with suppress(OSError):
+                os.close(write_descriptor)
+            raise
+        return read_descriptor, cls(stream)
+
+    @classmethod
+    def create_with_owned_reader(
+        cls,
+    ) -> tuple[_FileDescriptorOwner, _SupervisorControlOwner]:
+        read_descriptor: int | None = None
+        control_owner: _SupervisorControlOwner | None = None
+        try:
+            read_descriptor, control_owner = cls.create()
+            read_owner = _FileDescriptorOwner.adopt(read_descriptor, mode="rb")
+            read_descriptor = None
+            return read_owner, control_owner
+        except BaseException:
+            if read_descriptor is not None:
+                with suppress(OSError):
+                    os.close(read_descriptor)
+            if control_owner is not None:
+                control_owner.close_best_effort()
+            raise
+
+    def request_shutdown(self) -> None:
+        try:
+            self._stream.close()
+        except OSError as exc:
+            raise IsolatedToolCleanupUnproven("supervisor_control_close_failed") from exc
+
+    def admit_worker(self) -> None:
+        """Authorize worker creation only after the supervisor handle is owned."""
+
+        # The invocation owner records uncertainty before calling this method.
+        # A signal or short write cannot be converted into positive
+        # zero-dispatch evidence merely because the caller did not observe it.
+        try:
+            written = self._stream.write(_SUPERVISOR_WORKER_ADMISSION)
+        except (OSError, ValueError):
+            raise IsolatedToolPreDispatchFailure("worker_admission_failed") from None
+        if written != len(_SUPERVISOR_WORKER_ADMISSION):
+            raise IsolatedToolPreDispatchFailure("worker_admission_failed")
+
+    def close_best_effort(self) -> None:
+        with suppress(OSError):
+            self._stream.close()
+
+
+class _SupervisorSettlementProofOwner:
+    """Exact read authority for one supervisor's post-reaping acknowledgement."""
+
+    def __init__(self, stream: BinaryIO) -> None:
+        self._stream = stream
+        self._supervisor_failed: bool | None = None
+        self._invalid = False
+
+    @classmethod
+    def create(cls) -> _SupervisorSettlementProofOwner:
+        return cls(tempfile.TemporaryFile(mode="w+b", prefix="cayu-isolated-settlement-"))
+
+    @property
+    def descriptor(self) -> int:
+        descriptor = self._stream.fileno()
+        if type(descriptor) is not int or descriptor < 0:
+            raise IsolatedToolCleanupUnproven("supervisor_settlement_descriptor_invalid")
+        return descriptor
+
+    def require_after_exit(self) -> bool:
+        if self._supervisor_failed is not None:
+            self.close_best_effort()
+            return self._supervisor_failed
+        if self._invalid or self._stream.closed:
+            raise IsolatedToolCleanupUnproven("supervisor_settlement_ack_missing")
+        try:
+            acknowledgement = os.pread(
+                self.descriptor,
+                max(
+                    len(_SUPERVISOR_SETTLEMENT_ACK_COMPLETED),
+                    len(_SUPERVISOR_SETTLEMENT_ACK_FAILED),
+                )
+                + 1,
+                0,
+            )
+        except InterruptedError as exc:
+            raise IsolatedToolCleanupUnproven("supervisor_settlement_ack_interrupted") from exc
+        except OSError as exc:
+            self._invalid = True
+            self.close_best_effort()
+            raise IsolatedToolCleanupUnproven("supervisor_settlement_ack_failed") from exc
+        if acknowledgement == _SUPERVISOR_SETTLEMENT_ACK_COMPLETED:
+            supervisor_failed = False
+        elif acknowledgement == _SUPERVISOR_SETTLEMENT_ACK_FAILED:
+            supervisor_failed = True
+        else:
+            self._invalid = True
+            self.close_best_effort()
+            raise IsolatedToolCleanupUnproven("supervisor_settlement_ack_missing")
+        self._supervisor_failed = supervisor_failed
+        self.close_best_effort()
+        return supervisor_failed
+
+    def close_best_effort(self) -> None:
+        with suppress(OSError):
+            self._stream.close()
+
+
+class _LateSpawnSettlementOwner:
+    """Single owner for a spawn that outlived the public execution deadline."""
+
+    def __init__(
+        self,
+        *,
+        spawn_task: asyncio.Task[asyncio.subprocess.Process],
+        limits: Any,
+        parent_result_write_owner: _FileDescriptorOwner | None,
+        parent_control_read_owner: _FileDescriptorOwner | None,
+        parent_control_owner: _SupervisorControlOwner | None,
+        settlement_proof_owner: _SupervisorSettlementProofOwner,
+    ) -> None:
+        self._spawn_task = spawn_task
+        self._limits = limits
+        self._parent_result_write_owner = parent_result_write_owner
+        self._parent_control_read_owner = parent_control_read_owner
+        self._parent_control_owner = parent_control_owner
+        self._settlement_proof_owner = settlement_proof_owner
+        self._lock = asyncio.Lock()
+        self._settled = False
+        self._failure_code: str | None = None
+
+    @property
+    def settled(self) -> bool:
+        """Return positive process-local evidence that the exact spawn settled."""
+
+        return self._settled
+
+    async def settle(self) -> None:
+        """Settle the exact spawn once; concurrent foreground cleanup joins it."""
+
+        async with self._lock:
+            if self._settled:
+                _retire_late_spawn_retained_tasks(self)
+                if self._failure_code is not None:
+                    raise IsolatedToolFailure(self._failure_code)
+                return
+            self._failure_code = await _settle_late_spawn(
+                self._spawn_task,
+                self._limits,
+                parent_result_write_owner=self._parent_result_write_owner,
+                parent_control_read_owner=self._parent_control_read_owner,
+                parent_control_owner=self._parent_control_owner,
+                settlement_proof_owner=self._settlement_proof_owner,
+            )
+            self._settled = True
+            _retire_late_spawn_retained_tasks(self)
+            if self._failure_code is not None:
+                raise IsolatedToolFailure(self._failure_code)
+
+
+def _child_subreaper_probe_succeeds() -> bool:
+    """Prove the supervisor can enable and observe subreaper ownership."""
+
+    try:
+        return _child_subreaper_probe_succeeds_for_process(os.getpid())
+    except _ChildSubreaperProbeUnavailable:
+        return False
+
+
+@lru_cache(maxsize=4)
+def _child_subreaper_probe_succeeds_for_process(process_id: int) -> bool:
+    """Cache host capability by process generation, including after fork."""
+
+    del process_id
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-I", _SUPERVISOR_SCRIPT, _PROBE_CHILD_SUBREAPER_ARGUMENT],
+            check=False,
+            close_fds=True,
+            env=_CHILD_BASE_ENVIRONMENT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        # functools caches return values but not raised exceptions.  Keep a
+        # transient launch/deadline failure retryable in this process.
+        raise _ChildSubreaperProbeUnavailable from exc
+    if completed.returncode != 0:
+        raise _ChildSubreaperProbeUnavailable
+    return True
+
+
+def _complete_process_tree_supervision_available() -> bool:
+    """Return whether this host can retain children that escape their group."""
+
+    return (
+        sys.platform == "linux"
+        and hasattr(os, "killpg")
+        and os.path.exists(f"/proc/self/task/{os.getpid()}/children")
+        and _child_subreaper_probe_succeeds()
+    )
 
 
 def isolated_tool_dispatch_storage_key(
@@ -145,7 +529,96 @@ def isolated_tool_dispatch_storage_key(
     return f"cayu:isolated-tool-dispatch:sha256:{digest}"
 
 
-def isolated_tool_dispatch_record_matches(
+def isolated_tool_dispatch_authority_storage_key(
+    *,
+    session_id: str,
+    model_step_id: str,
+    model_attempt_id: str,
+    tool_round_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    idempotency_key: str,
+) -> str:
+    """Return the stable key for independently reconstructed dispatch authority."""
+
+    return (
+        isolated_tool_dispatch_storage_key(
+            session_id=session_id,
+            model_step_id=model_step_id,
+            model_attempt_id=model_attempt_id,
+            tool_round_id=tool_round_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            idempotency_key=idempotency_key,
+        )
+        + ":authority"
+    )
+
+
+def isolated_tool_dispatch_settlement_storage_key(
+    *,
+    session_id: str,
+    model_step_id: str,
+    model_attempt_id: str,
+    tool_round_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    idempotency_key: str,
+) -> str:
+    """Return the stable key for an exact isolated-dispatch settlement."""
+
+    return (
+        isolated_tool_dispatch_storage_key(
+            session_id=session_id,
+            model_step_id=model_step_id,
+            model_attempt_id=model_attempt_id,
+            tool_round_id=tool_round_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            idempotency_key=idempotency_key,
+        )
+        + ":settlement"
+    )
+
+
+def isolated_tool_dispatch_settlement_matches(
+    record: object,
+    *,
+    dispatch_record: dict[str, Any],
+) -> bool:
+    """Authenticate positive zero-dispatch evidence for one preparation record."""
+
+    if type(record) is not dict or set(record) != {
+        "record_type",
+        "version",
+        "outcome",
+        "reason",
+        "dispatch_record_sha256",
+    }:
+        return False
+    digest = (
+        "sha256:"
+        + sha256(
+            canonical_durable_json_bytes(
+                dispatch_record,
+                "isolated_tool_dispatch_record",
+            )
+        ).hexdigest()
+    )
+    copied = cast("dict[str, Any]", record)
+    return all(
+        (
+            copied.get("record_type") == _ISOLATED_TOOL_DISPATCH_SETTLEMENT_RECORD_TYPE,
+            type(copied.get("version")) is int,
+            copied.get("version") == _ISOLATED_TOOL_DISPATCH_SETTLEMENT_RECORD_VERSION,
+            copied.get("outcome") == "worker_not_admitted",
+            copied.get("reason") in _ISOLATED_TOOL_ZERO_DISPATCH_REASONS,
+            copied.get("dispatch_record_sha256") == digest,
+        )
+    )
+
+
+def isolated_tool_dispatch_authority_digests(
     record: object,
     *,
     session_id: str,
@@ -158,6 +631,80 @@ def isolated_tool_dispatch_record_matches(
     tool_name: str,
     idempotency_key: str,
     execution_profile_fingerprint: str,
+    environment_allocation_fingerprint: str | None,
+) -> tuple[str, str] | None:
+    """Return request/argument digests only for exact reconstructed authority."""
+
+    expected = {
+        "record_type",
+        "version",
+        "request_sha256",
+        "session_id",
+        "parent_task_id",
+        "parent_run_epoch",
+        "model_step_id",
+        "model_attempt_id",
+        "tool_round_id",
+        "tool_call_id",
+        "tool_name",
+        "idempotency_key",
+        "effective_arguments_sha256",
+        "execution_profile_fingerprint",
+        "environment_allocation_fingerprint",
+    }
+    if type(record) is not dict or set(record) != expected:
+        return None
+    copied = cast("dict[str, Any]", record)
+    request_sha256 = copied.get("request_sha256")
+    effective_arguments_sha256 = copied.get("effective_arguments_sha256")
+    if (
+        type(request_sha256) is not str
+        or len(request_sha256) != 71
+        or not request_sha256.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in request_sha256[7:])
+        or type(effective_arguments_sha256) is not str
+        or len(effective_arguments_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in effective_arguments_sha256)
+    ):
+        return None
+    matches = all(
+        (
+            copied.get("record_type") == _ISOLATED_TOOL_DISPATCH_AUTHORITY_RECORD_TYPE,
+            type(copied.get("version")) is int,
+            copied.get("version") == _ISOLATED_TOOL_DISPATCH_AUTHORITY_RECORD_VERSION,
+            copied.get("session_id") == session_id,
+            copied.get("parent_task_id") == parent_task_id,
+            type(copied.get("parent_run_epoch")) is int,
+            copied.get("parent_run_epoch") == parent_run_epoch,
+            copied.get("model_step_id") == model_step_id,
+            copied.get("model_attempt_id") == model_attempt_id,
+            copied.get("tool_round_id") == tool_round_id,
+            copied.get("tool_call_id") == tool_call_id,
+            copied.get("tool_name") == tool_name,
+            copied.get("idempotency_key") == idempotency_key,
+            copied.get("execution_profile_fingerprint") == execution_profile_fingerprint,
+            copied.get("environment_allocation_fingerprint") == environment_allocation_fingerprint,
+        )
+    )
+    return (request_sha256, effective_arguments_sha256) if matches else None
+
+
+def isolated_tool_dispatch_record_matches(
+    record: object,
+    *,
+    session_id: str,
+    parent_task_id: str | None,
+    parent_run_epoch: int,
+    model_step_id: str,
+    model_attempt_id: str,
+    tool_round_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    idempotency_key: str,
+    request_sha256: str,
+    effective_arguments_sha256: str,
+    execution_profile_fingerprint: str,
+    environment_allocation_fingerprint: str | None,
 ) -> bool:
     """Authenticate one durable dispatch marker against its recovery authority."""
 
@@ -182,15 +729,15 @@ def isolated_tool_dispatch_record_matches(
         return False
     copied = cast("dict[str, Any]", record)
     owner_id = copied.get("dispatch_owner_id")
-    request_sha256 = copied.get("request_sha256")
+    stored_request_sha256 = copied.get("request_sha256")
     arguments_sha256 = copied.get("effective_arguments_sha256")
     environment_fingerprint = copied.get("environment_allocation_fingerprint")
     if (
         type(owner_id) is not str
-        or type(request_sha256) is not str
-        or len(request_sha256) != 71
-        or not request_sha256.startswith("sha256:")
-        or any(character not in "0123456789abcdef" for character in request_sha256[7:])
+        or type(stored_request_sha256) is not str
+        or len(stored_request_sha256) != 71
+        or not stored_request_sha256.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in stored_request_sha256[7:])
         or type(arguments_sha256) is not str
         or len(arguments_sha256) != 64
         or any(character not in "0123456789abcdef" for character in arguments_sha256)
@@ -218,7 +765,10 @@ def isolated_tool_dispatch_record_matches(
             copied.get("tool_call_id") == tool_call_id,
             copied.get("tool_name") == tool_name,
             copied.get("idempotency_key") == idempotency_key,
+            copied.get("request_sha256") == request_sha256,
+            copied.get("effective_arguments_sha256") == effective_arguments_sha256,
             copied.get("execution_profile_fingerprint") == execution_profile_fingerprint,
+            copied.get("environment_allocation_fingerprint") == environment_allocation_fingerprint,
         )
     )
 
@@ -232,8 +782,10 @@ def validate_process_isolated_tool_registration(
 
     if type(tool) is not ProcessIsolatedTool:
         raise TypeError("Isolated tool registration requires an exact ProcessIsolatedTool.")
-    if os.name != "posix" or not hasattr(os, "killpg"):
-        raise RuntimeError("Hard process-isolated tools require POSIX process-group support.")
+    if not _complete_process_tree_supervision_available():
+        raise RuntimeError(
+            "Hard process-isolated tools require Linux subreaper process-tree support."
+        )
     if not isinstance(redactor, SecretRedactor):
         raise TypeError("redactor must be a SecretRedactor.")
     public_configuration = {
@@ -318,7 +870,7 @@ async def execute_process_isolated_tool(
 
     if type(tool) is not ProcessIsolatedTool:
         raise IsolatedToolPreDispatchFailure("adapter_type_invalid")
-    if os.name != "posix" or not hasattr(os, "killpg"):
+    if not _complete_process_tree_supervision_available():
         raise IsolatedToolPreDispatchFailure("platform_unsupported")
     authority = _runtime_tool_invocation_authority(context)
     if authority is None:
@@ -420,6 +972,34 @@ async def execute_process_isolated_tool(
         tool_name=authority.tool_name,
         idempotency_key=authority.idempotency_key,
     )
+    dispatch_authority_key = isolated_tool_dispatch_authority_storage_key(
+        session_id=context.session_id,
+        model_step_id=authority.model_step_id,
+        model_attempt_id=authority.model_attempt_id,
+        tool_round_id=authority.tool_round_id,
+        tool_call_id=authority.tool_call_id,
+        tool_name=authority.tool_name,
+        idempotency_key=authority.idempotency_key,
+    )
+    dispatch_settlement_key = isolated_tool_dispatch_settlement_storage_key(
+        session_id=context.session_id,
+        model_step_id=authority.model_step_id,
+        model_attempt_id=authority.model_attempt_id,
+        tool_round_id=authority.tool_round_id,
+        tool_call_id=authority.tool_call_id,
+        tool_name=authority.tool_name,
+        idempotency_key=authority.idempotency_key,
+    )
+    dispatch_authority_record = copy_durable_json_object(
+        {
+            "record_type": _ISOLATED_TOOL_DISPATCH_AUTHORITY_RECORD_TYPE,
+            "version": _ISOLATED_TOOL_DISPATCH_AUTHORITY_RECORD_VERSION,
+            "request_sha256": envelope.request_sha256,
+            "session_id": context.session_id,
+            **authority_document,
+        },
+        "isolated_tool_dispatch_authority_record",
+    )
     dispatch_record = copy_durable_json_object(
         {
             "record_type": _ISOLATED_TOOL_DISPATCH_RECORD_TYPE,
@@ -433,11 +1013,13 @@ async def execute_process_isolated_tool(
     )
     try:
         prior_dispatch = await authority.load_durable_operation(dispatch_key)
+        prior_authority = await authority.load_durable_operation(dispatch_authority_key)
+        prior_settlement = await authority.load_durable_operation(dispatch_settlement_key)
     except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, GeneratorExit):
         raise
     except BaseException:
         raise IsolatedToolPreDispatchFailure("dispatch_evidence_lookup_failed") from None
-    if prior_dispatch is not None:
+    if prior_dispatch is not None or prior_authority is not None or prior_settlement is not None:
         raise IsolatedToolFailure("prior_dispatch_recorded")
 
     async def record_dispatch() -> None:
@@ -446,7 +1028,7 @@ async def execute_process_isolated_tool(
                 dispatch_key,
                 None,
                 dispatch_record,
-                {},
+                {dispatch_authority_key: dispatch_authority_record},
             )
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, GeneratorExit):
             raise
@@ -459,14 +1041,121 @@ async def execute_process_isolated_tool(
                 raise IsolatedToolFailure("dispatch_evidence_reconciliation_failed") from None
         if published != dispatch_record:
             raise IsolatedToolFailure("dispatch_evidence_conflict")
+        try:
+            published_authority = await authority.load_durable_operation(dispatch_authority_key)
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, GeneratorExit):
+            raise
+        except BaseException:
+            raise IsolatedToolFailure("dispatch_evidence_reconciliation_failed") from None
+        if published_authority != dispatch_authority_record:
+            raise IsolatedToolFailure("dispatch_evidence_conflict")
 
-    await record_dispatch()
+    async def record_zero_dispatch(reason: str) -> None:
+        """Publish exact positive evidence that the admission byte never crossed."""
+
+        if reason not in _ISOLATED_TOOL_ZERO_DISPATCH_REASONS:
+            raise IsolatedToolFailure("dispatch_settlement_reason_invalid")
+        dispatch_settlement_record = copy_durable_json_object(
+            {
+                "record_type": _ISOLATED_TOOL_DISPATCH_SETTLEMENT_RECORD_TYPE,
+                "version": _ISOLATED_TOOL_DISPATCH_SETTLEMENT_RECORD_VERSION,
+                "outcome": "worker_not_admitted",
+                "reason": reason,
+                "dispatch_record_sha256": "sha256:"
+                + sha256(
+                    canonical_durable_json_bytes(
+                        dispatch_record,
+                        "isolated_tool_dispatch_record",
+                    )
+                ).hexdigest(),
+            },
+            "isolated_tool_dispatch_settlement_record",
+        )
+        try:
+            published = await authority.compare_and_set_durable_operation(
+                dispatch_settlement_key,
+                None,
+                dispatch_settlement_record,
+                {},
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, GeneratorExit):
+            raise
+        except BaseException:
+            try:
+                published = await authority.load_durable_operation(dispatch_settlement_key)
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit, GeneratorExit):
+                raise
+            except BaseException:
+                raise IsolatedToolFailure("dispatch_settlement_reconciliation_failed") from None
+        if published != dispatch_settlement_record:
+            raise IsolatedToolFailure("dispatch_settlement_conflict")
+
+    async def restore_cancellation_after_zero_dispatch(
+        cancellation: asyncio.CancelledError,
+        *,
+        reconcile_preparation: bool,
+    ) -> None:
+        """Retain exact zero-dispatch evidence before restoring caller cancellation."""
+
+        async def publish_settlement() -> None:
+            if reconcile_preparation:
+                try:
+                    current_dispatch = await authority.load_durable_operation(dispatch_key)
+                    current_authority = await authority.load_durable_operation(
+                        dispatch_authority_key
+                    )
+                except (KeyboardInterrupt, SystemExit, GeneratorExit):
+                    raise
+                except BaseException:
+                    raise IsolatedToolFailure("dispatch_settlement_reconciliation_failed") from None
+                if current_dispatch is None and current_authority is None:
+                    return
+                if (
+                    current_dispatch != dispatch_record
+                    or current_authority != dispatch_authority_record
+                ):
+                    raise IsolatedToolFailure("dispatch_evidence_conflict")
+            await record_zero_dispatch("caller_cancelled_before_admission")
+
+        settlement_task = asyncio.create_task(
+            publish_settlement(),
+            name="cayu-isolated-tool-zero-dispatch-cancellation-settlement",
+        )
+        outcome = await await_shielded_task_outcome(
+            settlement_task,
+            cancellation=cancellation,
+        )
+        evidence = exception_cause(cancellation)
+        if outcome.error is not None and (
+            evidence is None
+            or not any(candidate is outcome.error for candidate in iter_exception_tree(evidence))
+        ):
+            evidence = (
+                outcome.error
+                if evidence is None
+                else BaseExceptionGroup(
+                    "Isolated tool cancellation and zero-dispatch settlement evidence.",
+                    [evidence, outcome.error],
+                )
+            )
+        _restore_and_raise_cancellation(outcome, cause=evidence)
+        raise AssertionError("Cancellation restoration must re-raise.") from None
+
+    try:
+        await record_dispatch()
+    except asyncio.CancelledError as cancellation:
+        await restore_cancellation_after_zero_dispatch(
+            cancellation,
+            reconcile_preparation=True,
+        )
+        raise AssertionError("Cancellation settlement must re-raise.") from None
     # Durable admission can block behind another store operation.  Recheck the
     # process-local cleanup fence after that await so a sibling invocation
     # cannot enter retained cleanup while this call is waiting and still let a
-    # new child cross the hard-process boundary.  A committed dispatch marker
-    # remains conservative recovery evidence if this final gate rejects.
+    # new child cross the hard-process boundary.  Bind positive zero-dispatch
+    # evidence to the committed preparation record before reporting rejection.
     if _retained_isolated_tool_cleanup_pending():
+        await record_zero_dispatch("prior_process_cleanup_pending")
         raise IsolatedToolPreDispatchFailure("prior_process_cleanup_pending")
 
     owner = _IsolatedToolProcessOwner(
@@ -474,7 +1163,33 @@ async def execute_process_isolated_tool(
         request_bytes=request_bytes,
         request_sha256=envelope.request_sha256,
     )
-    return await owner.run()
+    try:
+        return await owner.run()
+    except asyncio.CancelledError as cancellation:
+        if not owner.worker_admission_may_have_crossed and not exception_tree_contains(
+            cancellation, (IsolatedToolCleanupUnproven,)
+        ):
+            await restore_cancellation_after_zero_dispatch(
+                cancellation,
+                reconcile_preparation=False,
+            )
+            raise AssertionError("Cancellation settlement must re-raise.") from None
+        raise
+    except (IsolatedToolPreDispatchFailure, IsolatedToolDeadlineExceeded) as error:
+        if (
+            not owner.worker_admission_may_have_crossed
+            and error.code in _ISOLATED_TOOL_ZERO_DISPATCH_REASONS
+        ):
+            await record_zero_dispatch(error.code)
+        raise
+    except BaseException:
+        # Cleanup can make supervisor health the public classification after a
+        # pre-admission deadline or fence.  Preserve the earlier positive
+        # zero-dispatch fact independently of that later classification.
+        zero_dispatch_reason = owner.known_zero_dispatch_reason
+        if not owner.worker_admission_may_have_crossed and zero_dispatch_reason is not None:
+            await record_zero_dispatch(zero_dispatch_reason)
+        raise
 
 
 def _project_context(
@@ -521,12 +1236,30 @@ class _IsolatedToolProcessOwner:
         self._wait_task: asyncio.Task[int] | None = None
         self._io_tasks: set[asyncio.Task[Any]] = set()
         self._diagnostic_tasks: set[asyncio.Task[None]] = set()
-        self._cleanup_task: asyncio.Task[IsolatedToolFailure | None] | None = None
+        self._cleanup_task: asyncio.Task[BaseException | None] | None = None
         self._retained_cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._terminal_read_task: asyncio.Task[None] | None = None
         self._temporary_directory: str | None = None
         self._result_read_fd: int | None = None
-        self._result_write_fd: int | None = None
+        self._result_write_owner: _FileDescriptorOwner | None = None
+        self._control_read_owner: _FileDescriptorOwner | None = None
+        self._control_owner: _SupervisorControlOwner | None = None
+        self._settlement_proof_owner: _SupervisorSettlementProofOwner | None = None
+        self._late_spawn_settlement_owner: _LateSpawnSettlementOwner | None = None
+        self._worker_admission_may_have_crossed = False
+        self._known_zero_dispatch_reason: str | None = None
+
+    @property
+    def worker_admission_may_have_crossed(self) -> bool:
+        """Whether the irreversible supervisor admission byte may have crossed."""
+
+        return self._worker_admission_may_have_crossed
+
+    @property
+    def known_zero_dispatch_reason(self) -> str | None:
+        """Return the pre-admission outcome retained across later cleanup failure."""
+
+        return self._known_zero_dispatch_reason
 
     async def run(self) -> ToolResult:
         loop = asyncio.get_running_loop()
@@ -551,8 +1284,15 @@ class _IsolatedToolProcessOwner:
             if settlement_attempted:
                 self._retain_pending_cleanup()
                 raise
+            if not self._worker_admission_may_have_crossed and (
+                isinstance(primary, IsolatedToolDeadlineExceeded)
+                or type(primary) is IsolatedToolPreDispatchFailure
+            ):
+                reason = primary.code
+                if reason in _ISOLATED_TOOL_ZERO_DISPATCH_REASONS:
+                    self._known_zero_dispatch_reason = reason
             try:
-                await self._settle()
+                post_primary_failure = await self._settle()
             except asyncio.CancelledError as cancellation:
                 cause = cancellation.__cause__
                 evidence: BaseException = (
@@ -619,6 +1359,55 @@ class _IsolatedToolProcessOwner:
                     "Isolated tool execution and cleanup failed.",
                     [primary, cleanup],
                 ) from None
+            if (
+                type(post_primary_failure) is IsolatedToolFailure
+                and post_primary_failure.code == "supervisor_failed"
+            ):
+                if exception_tree_contains(
+                    primary,
+                    (KeyboardInterrupt, SystemExit, GeneratorExit),
+                ):
+                    prior_cause = exception_cause(primary)
+                    supervisor_evidence: BaseException = post_primary_failure
+                    if prior_cause is not None and not any(
+                        candidate is post_primary_failure
+                        for candidate in iter_exception_tree(prior_cause)
+                    ):
+                        supervisor_evidence = BaseExceptionGroup(
+                            "Isolated tool process-control and supervisor evidence.",
+                            [prior_cause, post_primary_failure],
+                        )
+                    raise primary from supervisor_evidence
+                prior_supervisor_evidence = exception_cause(post_primary_failure)
+                independent_supervisor_evidence = _independent_cleanup_evidence(
+                    primary,
+                    prior_supervisor_evidence,
+                )
+                combined_evidence = _ordered_failure_evidence(
+                    "Isolated tool execution and supervisor settlement failed.",
+                    primary,
+                    independent_supervisor_evidence,
+                )
+                raise post_primary_failure from combined_evidence
+            if post_primary_failure is not None:
+                independent_cleanup = _independent_cleanup_evidence(
+                    primary,
+                    post_primary_failure,
+                )
+                if independent_cleanup is None:
+                    raise
+                prior_primary = exception_cause(primary)
+                evidence = _ordered_failure_evidence(
+                    "Isolated tool execution and cleanup evidence.",
+                    prior_primary,
+                    independent_cleanup,
+                )
+                if exception_tree_contains(
+                    primary,
+                    (KeyboardInterrupt, SystemExit, GeneratorExit),
+                ):
+                    raise primary from evidence
+                raise primary from evidence
             raise
         finally:
             self._request_bytes = b""
@@ -630,25 +1419,47 @@ class _IsolatedToolProcessOwner:
     async def _spawn(self, *, deadline: float) -> None:
         try:
             self._temporary_directory = tempfile.mkdtemp(prefix="cayu-isolated-tool-")
-            self._result_read_fd, self._result_write_fd = os.pipe()
+            (
+                self._result_read_fd,
+                self._result_write_owner,
+            ) = _FileDescriptorOwner.create_pipe_with_owned_writer()
+            (
+                self._control_read_owner,
+                self._control_owner,
+            ) = _SupervisorControlOwner.create_with_owned_reader()
+            self._settlement_proof_owner = _SupervisorSettlementProofOwner.create()
         except OSError:
+            self._close_parent_pipe_fds()
             raise IsolatedToolPreDispatchFailure("process_boundary_setup_failed") from None
         environment = {**_CHILD_BASE_ENVIRONMENT, **self._tool.environment_copy()}
         spawn_task = asyncio.create_task(
             asyncio.create_subprocess_exec(
                 sys.executable,
                 "-I",
-                "-m",
-                _WORKER_MODULE,
+                _SUPERVISOR_SCRIPT,
                 "--result-fd",
-                str(self._result_write_fd),
+                str(self._result_write_owner.descriptor),
+                "--control-fd",
+                str(self._control_read_owner.descriptor),
+                "--settlement-fd",
+                str(self._settlement_proof_owner.descriptor),
+                "--worker-module",
+                _WORKER_MODULE,
+                "--term-grace-seconds",
+                str(self._tool.limits.term_grace_seconds),
+                "--kill-grace-seconds",
+                str(self._tool.limits.kill_grace_seconds),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self._temporary_directory,
                 env=environment,
                 close_fds=True,
-                pass_fds=(self._result_write_fd,),
+                pass_fds=(
+                    self._result_write_owner.descriptor,
+                    self._control_read_owner.descriptor,
+                    self._settlement_proof_owner.descriptor,
+                ),
                 start_new_session=True,
             ),
             name="cayu-isolated-tool-spawn",
@@ -659,27 +1470,29 @@ class _IsolatedToolProcessOwner:
             timeout_s=max(0.0, deadline - asyncio.get_running_loop().time()),
         )
         if outcome.timed_out:
+            late_spawn_owner = _LateSpawnSettlementOwner(
+                spawn_task=spawn_task,
+                limits=self._tool.limits,
+                parent_result_write_owner=self._result_write_owner,
+                parent_control_read_owner=self._control_read_owner,
+                parent_control_owner=self._control_owner,
+                settlement_proof_owner=self._settlement_proof_owner,
+            )
+            # Publish the replacement owner before clearing any source field.
+            # Foreground cleanup can therefore join it after process control at
+            # every subsequent handoff point, including task construction and
+            # retained-owner registration.
+            self._late_spawn_settlement_owner = late_spawn_owner
             self._spawn_task = None
-            result_write_fd = self._result_write_fd
-            self._result_write_fd = None
-            if self._result_read_fd is not None:
-                with suppress(OSError):
-                    os.close(self._result_read_fd)
-                self._result_read_fd = None
+            self._result_write_owner = None
+            self._control_read_owner = None
+            self._control_owner = None
             _retain_task(
                 asyncio.create_task(
-                    _settle_late_spawn(
-                        spawn_task,
-                        self._tool.limits,
-                        parent_result_write_fd=result_write_fd,
-                    ),
+                    late_spawn_owner.settle(),
                     name="cayu-isolated-tool-late-spawn-cleanup",
                 ),
-                retry_factory=lambda: _settle_late_spawn(
-                    spawn_task,
-                    self._tool.limits,
-                    parent_result_write_fd=None,
-                ),
+                retry_factory=late_spawn_owner.settle,
             )
             deadline_error = IsolatedToolDeadlineExceeded()
             if outcome.cancellation is not None:
@@ -701,11 +1514,25 @@ class _IsolatedToolProcessOwner:
             name="cayu-isolated-tool-process-wait",
         )
         self._spawn_task = None
-        if self._result_write_fd is not None:
-            os.close(self._result_write_fd)
-            self._result_write_fd = None
+        if self._result_write_owner is not None:
+            self._result_write_owner.close_best_effort()
+            self._result_write_owner = None
+        if self._control_read_owner is not None:
+            self._control_read_owner.close_best_effort()
+            self._control_read_owner = None
         if outcome.cancellation is not None:
             _restore_and_raise_cancellation(outcome, cause=None)
+        if asyncio.get_running_loop().time() >= deadline:
+            raise IsolatedToolDeadlineExceeded()
+        control_owner = self._control_owner
+        if control_owner is None:  # pragma: no cover - construction invariant
+            raise IsolatedToolCleanupUnproven("supervisor_control_owner_missing")
+        if _retained_isolated_tool_cleanup_pending():
+            raise IsolatedToolPreDispatchFailure("prior_process_cleanup_pending")
+        # Copy uncertainty into the invocation owner before the irreversible
+        # write so cleanup can retire the control stream without losing it.
+        self._worker_admission_may_have_crossed = True
+        control_owner.admit_worker()
 
     async def _exchange(
         self,
@@ -873,12 +1700,14 @@ class _IsolatedToolProcessOwner:
         self,
         *,
         cancellation: asyncio.CancelledError | None = None,
-    ) -> IsolatedToolFailure | None:
-        if self._cleanup_task is None:
-            self._cleanup_task = asyncio.create_task(
+    ) -> BaseException | None:
+        cleanup_task = self._cleanup_task
+        if cleanup_task is None:
+            cleanup_task = asyncio.create_task(
                 self._cleanup_impl(),
                 name="cayu-isolated-tool-process-cleanup",
             )
+            self._cleanup_task = cleanup_task
         timeout = (
             self._tool.limits.term_grace_seconds
             + self._tool.limits.kill_grace_seconds
@@ -886,7 +1715,7 @@ class _IsolatedToolProcessOwner:
         )
         try:
             outcome = await await_shielded_task_outcome(
-                self._cleanup_task,
+                cleanup_task,
                 cancellation=cancellation,
                 timeout_s=timeout,
                 timeout_after_cancellation_s=timeout,
@@ -898,13 +1727,24 @@ class _IsolatedToolProcessOwner:
             self._retain_pending_cleanup()
             raise
         if outcome.timed_out:
-            self._retain_cleanup_task(self._cleanup_task)
+            self._retain_cleanup_task(cleanup_task)
             cleanup_error: BaseException = IsolatedToolCleanupUnproven(
                 "process_cleanup_deadline_exceeded"
             )
         else:
             cleanup_error = outcome.error
-            if cleanup_error is not None and type(cleanup_error) is not IsolatedToolCleanupUnproven:
+            if type(cleanup_error) is IsolatedToolCleanupUnproven and (
+                self._process is not None
+                or self._spawn_task is not None
+                or self._late_spawn_settlement_owner is not None
+            ):
+                # Exact process-control failures leave this owner holding the
+                # supervisor generation. Retain a retry before publishing the
+                # bounded failure so later dispatch remains fenced.
+                self._start_retained_cleanup_retry()
+            elif (
+                cleanup_error is not None and type(cleanup_error) is not IsolatedToolCleanupUnproven
+            ):
                 # A terminal cleanup task no longer owns the process state it
                 # abandoned. Install the exact retry owner before propagating
                 # process control or publishing a bounded cleanup failure.
@@ -915,7 +1755,9 @@ class _IsolatedToolProcessOwner:
                 ):
                     raise cleanup_error
                 if type(cleanup_error) is not IsolatedToolCleanupUnproven:
-                    cleanup_error = IsolatedToolCleanupUnproven("process_cleanup_failed")
+                    cleanup_failure = IsolatedToolCleanupUnproven("process_cleanup_failed")
+                    set_exception_cause(cleanup_failure, cleanup_error)
+                    cleanup_error = cleanup_failure
         if outcome.cancellation is not None:
             _restore_and_raise_cancellation(
                 outcome,
@@ -933,29 +1775,56 @@ class _IsolatedToolProcessOwner:
     def _retain_cleanup_task(self, cleanup_task: asyncio.Task[Any]) -> None:
         if cleanup_task in self._retained_cleanup_tasks:
             return
-        self._retained_cleanup_tasks.add(cleanup_task)
         _retain_task(cleanup_task, retry_factory=self._cleanup_impl)
+        # Publish the process-global fence before the local dedupe marker.  A
+        # process-control signal between these steps may cause a harmless
+        # duplicate callback registration, but cannot make a later handoff
+        # mistake an unpublished owner for an already retained one.
+        self._retained_cleanup_tasks.add(cleanup_task)
 
     def _start_retained_cleanup_retry(self) -> None:
-        self._cleanup_task = asyncio.create_task(
+        cleanup_task = asyncio.create_task(
             self._cleanup_impl(),
             name="cayu-isolated-tool-process-cleanup-retry",
         )
-        self._retain_cleanup_task(self._cleanup_task)
+        self._cleanup_task = cleanup_task
+        self._retain_cleanup_task(cleanup_task)
 
-    async def _cleanup_impl(self) -> IsolatedToolFailure | None:
-        await self._adopt_pending_spawn_for_cleanup()
+    async def _cleanup_impl(self) -> BaseException | None:
+        late_spawn_failure = await self._adopt_pending_spawn_for_cleanup()
         process = self._process
         wait_task = self._wait_task
+        control_owner = self._control_owner
+        settlement_proof_owner = self._settlement_proof_owner
+        supervisor_failure = late_spawn_failure
         if process is not None and wait_task is not None:
-            await _settle_owned_process_group(
-                process.pid,
+            if settlement_proof_owner is None:
+                raise IsolatedToolCleanupUnproven("supervisor_settlement_owner_missing")
+            supervisor_settlement = await _settle_owned_supervisor(
+                process,
                 wait_task,
+                control_owner=control_owner,
+                settlement_proof_owner=settlement_proof_owner,
                 term_grace_seconds=self._tool.limits.term_grace_seconds,
                 kill_grace_seconds=self._tool.limits.kill_grace_seconds,
             )
+            if supervisor_settlement.supervisor_failed:
+                supervisor_failure = IsolatedToolFailure("supervisor_failed")
+        elif control_owner is not None:
+            control_owner.request_shutdown()
+        if self._control_owner is control_owner:
+            self._control_owner = None
+        # Retire the process identity before dropping its replayable settlement
+        # proof. Process-control delivered after proof validation can therefore
+        # either replay that proof or observe that no process remains owned.
         self._process = None
         self._wait_task = None
+        if (
+            process is not None
+            and wait_task is not None
+            and self._settlement_proof_owner is settlement_proof_owner
+        ):
+            self._settlement_proof_owner = None
 
         self._close_parent_pipe_fds()
         terminal_failure = await self._settle_terminal_reader()
@@ -985,12 +1854,19 @@ class _IsolatedToolProcessOwner:
             error = task.exception()
             if error is None:
                 continue
-            diagnostic_failure = IsolatedToolFailure(
-                error.code if type(error) is IsolatedToolFailure else "diagnostic_stream_failed"
+            diagnostic_failure = (
+                error
+                if type(error) is IsolatedToolFailure
+                else IsolatedToolFailure("diagnostic_stream_failed")
             )
             break
         self._diagnostic_tasks.clear()
         self._io_tasks.clear()
+        post_terminal_failure = _post_terminal_failure(
+            supervisor_failure=supervisor_failure,
+            terminal_failure=terminal_failure,
+            diagnostic_failure=diagnostic_failure,
+        )
         if self._temporary_directory is not None:
             directory = self._temporary_directory
             removal = asyncio.create_task(
@@ -1007,20 +1883,66 @@ class _IsolatedToolProcessOwner:
                     removal,
                     retry_factory=lambda: _remove_temporary_directory(directory),
                 )
-                raise IsolatedToolCleanupUnproven("temporary_directory_cleanup_deadline_exceeded")
+                directory_failure = IsolatedToolCleanupUnproven(
+                    "temporary_directory_cleanup_deadline_exceeded"
+                )
+                if post_terminal_failure is not None:
+                    raise directory_failure from post_terminal_failure
+                raise directory_failure
             if removal_outcome.cancellation is not None:
                 _restore_and_raise_cancellation(
                     removal_outcome,
-                    cause=removal_outcome.error,
+                    cause=_ordered_failure_evidence(
+                        "Isolated tool stream and directory settlement failed.",
+                        post_terminal_failure,
+                        removal_outcome.error,
+                    ),
                 )
             if removal_outcome.error is not None:  # pragma: no cover - retry owner invariant
+                if post_terminal_failure is not None:
+                    if exception_tree_contains(
+                        removal_outcome.error,
+                        (KeyboardInterrupt, SystemExit, GeneratorExit),
+                    ):
+                        raise removal_outcome.error from post_terminal_failure
+                    raise BaseExceptionGroup(
+                        "Isolated tool stream and directory settlement failed.",
+                        [post_terminal_failure, removal_outcome.error],
+                    ) from None
                 raise removal_outcome.error
             self._temporary_directory = None
-        return terminal_failure or diagnostic_failure
+        # A normal-looking terminal frame cannot authenticate a supervisor
+        # generation that itself reported an internal failure.
+        return post_terminal_failure
 
-    async def _adopt_pending_spawn_for_cleanup(self) -> None:
+    async def _adopt_pending_spawn_for_cleanup(self) -> IsolatedToolFailure | None:
         """Transfer a process-control-interrupted spawn into this lifecycle owner."""
 
+        late_spawn_owner = self._late_spawn_settlement_owner
+        if late_spawn_owner is not None:
+            late_spawn_failure: IsolatedToolFailure | None = None
+            try:
+                await late_spawn_owner.settle()
+            except IsolatedToolFailure as error:
+                if (
+                    type(late_spawn_owner) is not _LateSpawnSettlementOwner
+                    or not late_spawn_owner.settled
+                    or type(error) is not IsolatedToolFailure
+                    or error.code != "supervisor_failed"
+                ):
+                    raise
+                late_spawn_failure = error
+            finally:
+                if type(late_spawn_owner) is _LateSpawnSettlementOwner and late_spawn_owner.settled:
+                    self._late_spawn_settlement_owner = None
+                    # The late-spawn owner consumed these exact fields even when a
+                    # signal interrupted the producer before it cleared its mirrors.
+                    self._spawn_task = None
+                    self._result_write_owner = None
+                    self._control_read_owner = None
+                    self._control_owner = None
+                    self._settlement_proof_owner = None
+            return late_spawn_failure
         spawn_task = self._spawn_task
         if spawn_task is None:
             return
@@ -1092,13 +2014,29 @@ class _IsolatedToolProcessOwner:
         return None
 
     def _close_parent_pipe_fds(self) -> None:
-        for attribute in ("_result_read_fd", "_result_write_fd"):
+        for attribute in ("_result_read_fd",):
             descriptor = getattr(self, attribute)
             if descriptor is None:
                 continue
             with suppress(OSError):
                 os.close(descriptor)
             setattr(self, attribute, None)
+        for attribute in ("_result_write_owner", "_control_read_owner"):
+            descriptor_owner = getattr(self, attribute)
+            if descriptor_owner is None:
+                continue
+            descriptor_owner.close_best_effort()
+            setattr(self, attribute, None)
+        control_owner = self._control_owner
+        if control_owner is not None:
+            control_owner.close_best_effort()
+            if self._control_owner is control_owner:
+                self._control_owner = None
+        settlement_proof_owner = self._settlement_proof_owner
+        if settlement_proof_owner is not None:
+            settlement_proof_owner.close_best_effort()
+            if self._settlement_proof_owner is settlement_proof_owner:
+                self._settlement_proof_owner = None
 
 
 async def _write_request(writer: asyncio.StreamWriter, data: bytes) -> None:
@@ -1234,75 +2172,109 @@ async def _remove_temporary_directory(directory: str) -> None:
             return
 
 
-def _signal_process_group(process_group_id: int, selected_signal: signal.Signals) -> None:
-    try:
-        os.killpg(process_group_id, selected_signal)
-    except ProcessLookupError:
-        return
-    except OSError as exc:
-        raise IsolatedToolCleanupUnproven("process_group_signal_failed") from exc
-
-
-async def _settle_owned_process_group(
-    process_group_id: int,
+async def _settle_owned_supervisor(
+    process: asyncio.subprocess.Process,
     wait_task: asyncio.Task[int],
     *,
+    control_owner: _SupervisorControlOwner | None,
+    settlement_proof_owner: _SupervisorSettlementProofOwner,
     term_grace_seconds: float,
     kill_grace_seconds: float,
-) -> None:
+) -> _SupervisorSettlement:
+    if control_owner is not None:
+        control_owner.request_shutdown()
     retry_delay = 0.05
     while True:
+        completed_settlement = _completed_process_wait_settlement(
+            process,
+            wait_task,
+            settlement_proof_owner=settlement_proof_owner,
+        )
+        if completed_settlement is not None:
+            return completed_settlement
         try:
-            _signal_process_group(process_group_id, signal.SIGTERM)
-            settled = await _wait_for_group_and_child(
-                process_group_id,
+            settlement = await _wait_for_supervisor(
+                process,
                 wait_task,
+                settlement_proof_owner=settlement_proof_owner,
                 timeout=term_grace_seconds,
             )
-            if not settled:
-                _signal_process_group(process_group_id, signal.SIGKILL)
-                settled = await _wait_for_group_and_child(
-                    process_group_id,
+            if settlement is None:
+                settlement = await _wait_for_supervisor(
+                    process,
                     wait_task,
+                    settlement_proof_owner=settlement_proof_owner,
                     timeout=kill_grace_seconds,
                 )
-            if settled:
-                return
+            if settlement is not None:
+                return settlement
         except asyncio.CancelledError:
             raise
         except IsolatedToolCleanupUnproven:
-            pass
+            # A transient wait failure remains retryable while the exact
+            # supervisor is pending. A completed wait is authoritative;
+            # cancellation or failure remains unproven and escapes this owner.
+            completed_settlement = _completed_process_wait_settlement(
+                process,
+                wait_task,
+                settlement_proof_owner=settlement_proof_owner,
+            )
+            if completed_settlement is not None:
+                return completed_settlement
         await asyncio.sleep(retry_delay)
         retry_delay = min(retry_delay * 2, 1.0)
 
 
-def _process_group_exists(process_group_id: int) -> bool:
-    try:
-        os.killpg(process_group_id, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError as exc:
-        raise IsolatedToolCleanupUnproven("process_group_probe_failed") from exc
-    return True
-
-
-async def _wait_for_group_and_child(
-    process_group_id: int,
+def _completed_process_wait_settlement(
+    process: asyncio.subprocess.Process,
     wait_task: asyncio.Task[int],
     *,
+    settlement_proof_owner: _SupervisorSettlementProofOwner,
+) -> _SupervisorSettlement | None:
+    """Return the supervisor outcome after exact post-reaping proof."""
+
+    if not wait_task.done():
+        return None
+    if wait_task.cancelled():
+        raise IsolatedToolCleanupUnproven("process_wait_cancelled")
+    try:
+        waited_return_code = wait_task.result()
+    except BaseException as exc:
+        raise IsolatedToolCleanupUnproven("process_wait_failed") from exc
+    if type(waited_return_code) is not int:
+        raise IsolatedToolCleanupUnproven("process_wait_result_invalid")
+    observed_return_code = process.returncode
+    if observed_return_code is not None:
+        if type(observed_return_code) is not int:
+            raise IsolatedToolCleanupUnproven("process_returncode_invalid")
+        if observed_return_code != waited_return_code:
+            raise IsolatedToolCleanupUnproven("process_wait_result_conflict")
+    supervisor_failed = settlement_proof_owner.require_after_exit()
+    return _SupervisorSettlement(
+        return_code=waited_return_code,
+        supervisor_failed=supervisor_failed,
+    )
+
+
+async def _wait_for_supervisor(
+    process: asyncio.subprocess.Process,
+    wait_task: asyncio.Task[int],
+    *,
+    settlement_proof_owner: _SupervisorSettlementProofOwner,
     timeout: float,
-) -> bool:
+) -> _SupervisorSettlement | None:
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
-        if wait_task.done() and not _process_group_exists(process_group_id):
-            with suppress(BaseException):
-                wait_task.result()
-            return True
+        completed_settlement = _completed_process_wait_settlement(
+            process,
+            wait_task,
+            settlement_proof_owner=settlement_proof_owner,
+        )
+        if completed_settlement is not None:
+            return completed_settlement
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
-            return False
+            return None
         await asyncio.sleep(min(0.01, remaining))
 
 
@@ -1310,39 +2282,65 @@ async def _settle_late_spawn(
     spawn_task: asyncio.Task[asyncio.subprocess.Process],
     limits: Any,
     *,
-    parent_result_write_fd: int | None,
-) -> None:
+    parent_result_write_owner: _FileDescriptorOwner | None,
+    parent_control_read_owner: _FileDescriptorOwner | None,
+    parent_control_owner: _SupervisorControlOwner | None,
+    settlement_proof_owner: _SupervisorSettlementProofOwner,
+) -> str | None:
+    # The hard deadline owns the shutdown decision, not delivery of the
+    # delayed ``Process`` handle. Closing the exact inherited channel first
+    # prevents worker admission while the parent is still waiting and asks an
+    # already-admitted supervisor to settle. The owner remains usable for
+    # idempotent settlement retries.
+    if parent_control_owner is not None:
+        parent_control_owner.request_shutdown()
     try:
-        outcome = await await_shielded_task_outcome(spawn_task)
+        try:
+            outcome = await await_shielded_task_outcome(spawn_task)
+        except BaseException:
+            if parent_control_owner is not None:
+                parent_control_owner.close_best_effort()
+            raise
     finally:
-        if parent_result_write_fd is not None:
-            with suppress(OSError):
-                os.close(parent_result_write_fd)
+        if parent_result_write_owner is not None:
+            parent_result_write_owner.close_best_effort()
+        if parent_control_read_owner is not None:
+            parent_control_read_owner.close_best_effort()
     if outcome.error is not None:
+        if parent_control_owner is not None:
+            parent_control_owner.close_best_effort()
+        settlement_proof_owner.close_best_effort()
         if isinstance(outcome.error, Exception):
             return
         raise IsolatedToolCleanupUnproven("late_spawn_outcome_unproven") from None
     process = outcome.result
     if process is None:
+        if parent_control_owner is not None:
+            parent_control_owner.close_best_effort()
+        settlement_proof_owner.close_best_effort()
         return
-    if process.stdin is not None:
-        process.stdin.close()
-    diagnostic_drains = [
-        asyncio.create_task(_drain_bounded(stream, limit, stream_name))
-        for stream, limit, stream_name in (
-            (process.stdout, limits.max_stdout_bytes, "stdout"),
-            (process.stderr, limits.max_stderr_bytes, "stderr"),
-        )
-        if stream is not None
-    ]
-    wait_task = asyncio.create_task(process.wait())
+    diagnostic_drains: list[asyncio.Task[None]] = []
     try:
-        await _settle_owned_process_group(
-            process.pid,
+        if process.stdin is not None:
+            process.stdin.close()
+        diagnostic_drains = [
+            asyncio.create_task(_drain_bounded(stream, limit, stream_name))
+            for stream, limit, stream_name in (
+                (process.stdout, limits.max_stdout_bytes, "stdout"),
+                (process.stderr, limits.max_stderr_bytes, "stderr"),
+            )
+            if stream is not None
+        ]
+        wait_task = asyncio.create_task(process.wait())
+        settlement = await _settle_owned_supervisor(
+            process,
             wait_task,
+            control_owner=parent_control_owner,
+            settlement_proof_owner=settlement_proof_owner,
             term_grace_seconds=limits.term_grace_seconds,
             kill_grace_seconds=limits.kill_grace_seconds,
         )
+        return "supervisor_failed" if settlement.supervisor_failed else None
     finally:
         for task in diagnostic_drains:
             if not task.done():
@@ -1356,15 +2354,37 @@ def _retain_task(
     *,
     retry_factory: Callable[[], Coroutine[Any, Any, Any]] | None = None,
 ) -> None:
-    _RETAINED_ISOLATED_TOOL_TASKS.add(task)
-    if retry_factory is not None:
-        _RETAINED_ISOLATED_TOOL_RETRIES[task] = retry_factory
+    # Task and retry ownership form one admission-fencing record.  Publishing
+    # them through one mapping assignment prevents interruption from exposing
+    # a retained task without the retry owner needed to settle it.
+    if retry_factory is not None or task not in _RETAINED_ISOLATED_TOOL_OWNERS:
+        _RETAINED_ISOLATED_TOOL_OWNERS[task] = retry_factory
 
     def discard(completed: asyncio.Task[Any]) -> None:
         if _retained_task_completed_successfully(completed):
             _discard_retained_task(completed)
 
     task.add_done_callback(discard)
+
+
+def _late_spawn_retry_owner(
+    retry_factory: Callable[[], Coroutine[Any, Any, Any]] | None,
+) -> _LateSpawnSettlementOwner | None:
+    if retry_factory is None:
+        return None
+    owner = getattr(retry_factory, "__self__", None)
+    function = getattr(retry_factory, "__func__", None)
+    if type(owner) is _LateSpawnSettlementOwner and function is _LateSpawnSettlementOwner.settle:
+        return owner
+    return None
+
+
+def _retire_late_spawn_retained_tasks(owner: _LateSpawnSettlementOwner) -> None:
+    """Remove every retained mirror after any joiner proves exact settlement."""
+
+    for task, retry_factory in tuple(_RETAINED_ISOLATED_TOOL_OWNERS.items()):
+        if _late_spawn_retry_owner(retry_factory) is owner:
+            _discard_retained_task(task)
 
 
 def _retained_task_completed_successfully(task: asyncio.Task[Any]) -> bool:
@@ -1377,8 +2397,7 @@ def _retained_task_completed_successfully(task: asyncio.Task[Any]) -> bool:
 
 
 def _discard_retained_task(task: asyncio.Task[Any]) -> None:
-    _RETAINED_ISOLATED_TOOL_TASKS.discard(task)
-    _RETAINED_ISOLATED_TOOL_RETRIES.pop(task, None)
+    _RETAINED_ISOLATED_TOOL_OWNERS.pop(task, None)
 
 
 def _retained_isolated_tool_cleanup_pending() -> bool:
@@ -1388,11 +2407,17 @@ def _retained_isolated_tool_cleanup_pending() -> bool:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = None
-    for task in tuple(_RETAINED_ISOLATED_TOOL_TASKS):
+    for task, retry_factory in tuple(_RETAINED_ISOLATED_TOOL_OWNERS.items()):
+        late_spawn_owner = _late_spawn_retry_owner(retry_factory)
+        if late_spawn_owner is not None and late_spawn_owner.settled:
+            # A signal can interrupt the successful joiner between recording
+            # proof and retiring its task mirrors.  The admission fence must
+            # still derive from the shared owner's positive state.
+            _discard_retained_task(task)
+            continue
         if _retained_task_completed_successfully(task):
             _discard_retained_task(task)
             continue
-        retry_factory = _RETAINED_ISOLATED_TOOL_RETRIES.get(task)
         if not task.done() or retry_factory is None or loop is None:
             continue
         try:
@@ -1402,9 +2427,11 @@ def _retained_isolated_tool_cleanup_pending() -> bool:
             )
         except BaseException:
             continue
-        _discard_retained_task(task)
         _retain_task(retry_task, retry_factory=retry_factory)
-    return bool(_RETAINED_ISOLATED_TOOL_TASKS)
+        # Publish the replacement before retiring the completed owner so an
+        # interrupt cannot temporarily remove the process-global fence.
+        _discard_retained_task(task)
+    return bool(_RETAINED_ISOLATED_TOOL_OWNERS)
 
 
 def _restore_and_raise_cancellation(outcome: Any, *, cause: BaseException | None) -> None:

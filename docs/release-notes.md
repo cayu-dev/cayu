@@ -133,21 +133,36 @@ arbitrary ambient variables, but still forwards Cayu's minimal operational
 allow-list, and is documented as non-sandboxed. The default and service scaffolds
 remain unchanged, and service plus coding composition is rejected.
 
-### Trusted host tools can opt into a hard POSIX process deadline
+### Trusted host tools can opt into a hard Linux process deadline
 
 `ProcessIsolatedTool` adds an explicit reconstructable JSON-only adapter for
 trusted synchronous or native dependencies that may not cooperate with
 `asyncio` cancellation or may hold the Python interpreter lock. The parent
-owns a versioned bounded protocol, a wall deadline, a fresh process session,
-bounded TERM-to-KILL process-group cleanup, result validation, and existing
+owns a versioned bounded protocol, a wall deadline, a Linux child-subreaper
+supervisor, TERM-to-KILL cleanup of its complete adopted descendant tree,
+result validation, and existing
 effect uncertainty. Ordinary tools remain in process, and
 `tool_timeout_seconds` remains a cooperative cancellation request for them.
+The supervisor admits its worker only after the parent owns the exact process
+handle and settlement waiter. Durable preparation is distinct from a
+content-bound `worker_not_admitted` settlement when setup, spawn, caller
+cancellation, the pre-admission deadline, or the final cleanup fence positively
+settles before admission. Recovery prefers that positive zero-dispatch evidence over
+the conservative preparation marker. The post-reaping acknowledgement proves
+tree cleanup and carries supervisor health separately from the worker status.
+A `supervisor_failed` outcome remains a bounded failure, cannot publish an
+otherwise valid tool result, and retains independent terminal or diagnostic
+failures. Manual recovery follows the same exact zero-dispatch evidence as
+automatic recovery, and durable preparation preserves caller task-cancellation
+bookkeeping. Descendant reaping retains constant-size worker-leader status rather
+than an invocation-long PID history.
 
 Application manifest schema 13 and tool descriptor/capability schema 2 expose
 the configured execution boundary, timeout strength, isolated adapter identity
 and configuration digest, deadline, and the explicit `sandboxed=false` claim.
 Configuration, environment values, arguments, context, and secrets are not
-published. The initial hard boundary requires POSIX process-group support and
+published. The initial hard boundary requires Linux child-subreaper and `/proc`
+child-enumeration support and
 does not claim hostile-code, filesystem, network, credential, privilege,
 kernel, or abrupt-parent-death containment. See
 [Process-isolated host tools](process-isolated-tools.md).

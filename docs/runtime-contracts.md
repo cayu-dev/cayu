@@ -2095,7 +2095,7 @@ baseline but cannot be rewritten in place as governed egress profiles.
 | `runtime` | Cayu runtime name and version | Reject; an explicit policy may classify compatible reuse or adoption. |
 | `provider_target` | Registered provider name and model | Reject; generic compatible reuse is forbidden and target changes use the explicit model-transition boundary. |
 | `durable_system_projection` | Fully rendered durable system message | Reject; an explicit policy may classify a safe boundary. |
-| `direct_tools` | Ordered names, descriptions, schemas, parallel-safety, effects, and workspace-mutation declarations | Reject as authority-changing. |
+| `direct_tools` | Ordered names, descriptions, schemas, parallel-safety, effects, workspace-mutation declarations, and each tool's execution boundary/timeout-strength contract | Reject as authority-changing. An ordinary tool registered with application-wide `tool_timeout_seconds` differs from the same tool registered without that cooperative deadline; recovery must use the same setting or an explicit future profile-adoption boundary. |
 | `tool_implementations` | Ordered application or Cayu behavior/implementation identities | Reject as authority-changing; missing custom identity is `process_local`. |
 | `tool_view_grants` | View kind, generation, and ordered grant baseline | Reject as authority-changing. The current implementation is the direct-tool view; future catalogued tool views can implement this same seam. |
 | `execution_policies` | Tool exposure policy, configured targeted-grant delivery mode, resolved native-or-gateway projection and gateway schema identity where selected, tool policy, per-tool command policies, and ordered app/agent loop policies | Reject as authority-changing; missing custom identity is `process_local`. |
@@ -6514,6 +6514,9 @@ filesystem metadata remain outside mutation evidence but count toward its
 bounded traversal. One cooperative deadline covers seeding, execution, both
 snapshots, and cleanup checks. Expiration raises `TimeoutError` without a
 verdict; only a killable process boundary can enforce a hard wall-clock stop.
+`ProcessIsolatedTool` is rejected by this direct helper: isolated tools must
+enter through Cayu's runtime-owned process boundary so the verifier cannot
+misreport an unsupported direct invocation as a tool failure.
 `cayu check` remains structural and never calls the helper.
 
 Tool declarations are captured when an agent is registered with `CayuApp`.
@@ -9848,21 +9851,38 @@ validated arguments, projected context, declared environment, session, parent
 task/run epoch, model step/attempt, tool round/call, idempotency key, effective
 argument digest, execution-profile fingerprint, and environment-allocation
 fingerprint. Byte, node, type, number, text, and nesting limits are checked
-iteratively before a defensive copy or serialization. The child starts under
-the current Python executable with isolated interpreter mode, a fresh session,
+iteratively before a defensive copy or serialization. A Linux child-subreaper
+supervisor starts under the current Python executable in a fresh session and
+then starts the worker in its own process group with isolated interpreter mode,
 an empty temporary working directory, closed inherited descriptors, fixed
 locale/UTF-8 values, and only explicitly declared environment entries. It
 receives stdin/stdout/stderr plus one private result descriptor; no parent
 store, runner, workspace, provider, policy, approval, event loop, socket, or
 ambient environment is authority.
 
-Immediately before child-process creation, the parent publishes one exact
-durable isolated-dispatch-admission record bound to the session,
+Before child-process creation, the parent atomically publishes one exact
+durable isolated-dispatch preparation/possible-admission record and a separate
+immutable dispatch-authority record bound to the session,
 task/run epoch, model step/attempt, tool round/call, idempotency key, request
-digest, arguments digest, execution profile, and one unique dispatch owner.
-Recovery treats only that record as positive isolated-child admission evidence;
-the generic `tool.call.started` event is not proof that policy, hooks, or child
-admission completed.
+digest, arguments digest, execution profile, environment-allocation
+fingerprint, and one unique dispatch owner. If boundary setup, supervisor
+spawn, caller cancellation, the pre-admission deadline, or the final
+process-cleanup fence settles with positive proof that the private
+worker-admission signal did not cross, the parent publishes a content-bound
+`worker_not_admitted` settlement. Recovery independently reconstructs the stable
+call authority from the pending round and the original session-owned
+environment-allocation fingerprint from durable reconnect/allocation state
+before any factory reconnect. It never uses an empty factory registration or a
+newly allocated environment as authority for the prior dispatch. Recovery then
+authenticates the authority record that owns the
+request/effective-argument digests, and requires every repeated preparation
+field to match. In the absence of an exact zero-dispatch settlement, only that
+complete tuple is positive evidence that isolated-child admission may have
+occurred. The settlement overrides the conservative preparation in both
+automatic and operator-supplied tool-round recovery; the generic
+`tool.call.started` event is not proof that policy, hooks, or child admission
+completed and cannot authorize a manual outcome for a positively unadmitted
+worker.
 
 The child imports exactly the recorded module/qualified factory and requires
 the loaded callable's declared `execution_profile_identity` to equal the
@@ -9882,15 +9902,54 @@ publication as an in-process result.
 
 The hard deadline begins before spawn. Every success, failure, timeout,
 cancellation, signal, pipe failure, or child exit converges on one lifecycle
-owner. That owner closes pipes, sends TERM to the child process group, waits the
-declared grace, escalates to KILL, waits for the direct child, and proves the
-group absent. Unproven cleanup remains attached to a retained lifecycle owner
+owner. That owner closes an invocation-specific inherited control channel to
+ask a Linux child-subreaper supervisor to settle the complete adopted worker
+tree. The supervisor cannot create the worker until the parent has received the
+exact supervisor handle, installed its wait/settlement owner, and sent a private
+one-shot admission signal. Subprocess transport failure, timeout, or cancellation
+before that handoff therefore remains zero-dispatch. The parent never signals the
+supervisor through a reusable numeric PID or process-group identity. The
+supervisor performs TERM-to-KILL
+escalation and reaps descendants even after `setsid()`; after reaping the worker
+leader it stops signalling the reusable numeric process-group identity and
+addresses adopted survivors individually. It retains only the worker leader's
+status and discards completed descendant status history, so descendant churn
+does not grow supervisor memory with invocation duration. Registration requires
+a successful supervisor probe that actually enables child-subreaper ownership
+and reads the adopted-child interface before any invocation may publish
+dispatch authority.
+Only successful proof is cached by process generation; a failed probe remains
+retryable. An observed reaped return code or successful completion of the exact
+invocation-supervisor wait is not sufficient by itself: cleanup proof also
+requires the supervisor's exact post-reaping acknowledgement channel. A
+successful acknowledgement proves the tree was reaped and carries a typed
+supervisor-health outcome separate from the worker status propagated by the
+supervisor process. A `supervisor_failed` outcome cannot publish a successful
+tool result, remains observable after delayed spawn settlement, and retains
+independent terminal-protocol or diagnostic failures as ordered causal evidence;
+a healthy outcome does not duplicate an independently classified worker failure.
+A cancelled or failed wait or a
+missing/malformed acknowledgement is not cleanup proof. Unproven cleanup remains
+attached to a retained lifecycle owner
 and is not reported as a clean terminal result or made replayable. A pending
 retained owner fences every later isolated child dispatch in that process
 before spawn, without fencing ordinary in-process tools; successful retained
-settlement removes the fence. Caller task cancellation is restored only after
-this settlement. Platforms without
-complete POSIX process-group support reject hard registration.
+settlement removes the fence. Caller task cancellation, including requests
+temporarily consumed while publishing durable preparation, is restored only
+after this settlement. Platforms without complete Linux subreaper support reject
+hard registration.
+
+Runtime-authored isolated execution-boundary controls remain stable when a
+registered secret collides with their bounded values. Identically shaped
+application-authored tool-result dictionaries do not acquire that authority.
+Before-hook synthetic results and after-hook replacements are copied, stripped,
+and redacted before durable hook-completion publication. Positively recognized
+reserved controls are also stripped at the shared terminal-publication boundary
+for direct and recovered results, and at untrusted message ingress. Invalid
+lookalikes remain ordinary redacted application data when no runtime authority
+is overlaid; when the runtime restores an exact control tuple after an untrusted
+hook replacement, it removes every caller-shaped reserved sibling first so a
+malformed partial tuple cannot poison that authority.
 
 Process termination proves local quiescence only. The registered `ToolEffect`
 and runtime tool-execution identity remain unchanged. Abnormal termination of

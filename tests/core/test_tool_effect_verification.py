@@ -12,12 +12,18 @@ import cayu.testing as testing
 from cayu import (
     AgentSpec,
     CayuApp,
+    ExecutionProfileBehaviorIdentity,
     LocalWorkspace,
     Tool,
     ToolContext,
     ToolEffect,
     ToolResult,
     ToolSpec,
+)
+from cayu.core.isolated_tools import (
+    ProcessIsolatedTool,
+    ProcessIsolatedToolFactoryRef,
+    ProcessIsolatedToolLimits,
 )
 from cayu.testing import (
     ToolEffectVerificationStatus,
@@ -320,6 +326,46 @@ def test_none_tool_reports_scoped_consistency_without_captured_content() -> None
     assert tool.context.metadata["tool_effect"] == ToolEffect.NONE.value
     assert tool.context.metadata["tool_call_id"] == "tool-effect-verification"
     assert tool.context.metadata["request_id"] == "request-1"
+
+
+def test_verify_tool_effect_rejects_process_isolated_tool_portably(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "cayu.runtime.app.validate_process_isolated_tool_registration",
+        lambda *_args, **_kwargs: None,
+    )
+    tool = ProcessIsolatedTool(
+        ToolSpec(
+            name="isolated",
+            input_schema={"type": "object", "additionalProperties": False},
+            execution_profile_identity=ExecutionProfileBehaviorIdentity(
+                name="tests:isolated-verifier",
+                behavior_version="1",
+                implementation_version="1",
+            ),
+        ),
+        factory=ProcessIsolatedToolFactoryRef(
+            module="cayu.testing_isolated_tools",
+            qualname="build_deterministic_isolated_tool",
+            identity=ExecutionProfileBehaviorIdentity(
+                name="tests:isolated-verifier-factory",
+                behavior_version="1",
+                implementation_version="1",
+            ),
+        ),
+        limits=ProcessIsolatedToolLimits(deadline_seconds=1),
+    )
+
+    with pytest.raises(ValueError, match="does not support ProcessIsolatedTool"):
+        asyncio.run(
+            verify_tool_effect(
+                _app(tool),
+                agent_name="worker",
+                tool_name="isolated",
+                arguments={},
+            )
+        )
 
 
 def test_none_tool_fails_scoped_verdict_on_create_update_and_delete() -> None:

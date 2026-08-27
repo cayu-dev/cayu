@@ -4009,6 +4009,62 @@ def test_declared_remember_knowledge_policy_identity_is_portable() -> None:
     assert component_fingerprints[0] == component_fingerprints[1]
 
 
+def test_ordinary_tool_timeout_drift_changes_direct_tool_recovery_authority() -> None:
+    async def exercise() -> None:
+        session_id = "execution-profile-ordinary-tool-timeout"
+        store = InMemorySessionStore()
+        identity = ExecutionProfileBehaviorIdentity(
+            name="tests:ordinary-timeout-profile-tool",
+            behavior_version="1",
+            implementation_version="1",
+        )
+
+        def configured_app(
+            timeout_seconds: float | None,
+        ) -> tuple[CayuApp, ScriptedModelProvider]:
+            provider = _completed_provider()
+            app = CayuApp(
+                session_store=store,
+                tool_timeout_seconds=timeout_seconds,
+                enable_logging=False,
+            )
+            app.register_provider(provider, default=True)
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[IdentityConfiguredTool(identity)],
+            )
+            return app, provider
+
+        original_app, _original_provider = configured_app(1.0)
+        await _collect(
+            original_app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "first")],
+                )
+            )
+        )
+
+        changed_app, changed_provider = configured_app(None)
+        with pytest.raises(ExecutionProfileMismatchError) as caught:
+            await _collect(
+                changed_app.resume(
+                    ResumeRequest(
+                        session_id=session_id,
+                        messages=[Message.text("user", "changed timeout")],
+                    )
+                )
+            )
+
+        assert caught.value.changed_component_classes == (
+            ExecutionProfileComponentClass.DIRECT_TOOLS,
+        )
+        assert changed_provider.requests == []
+
+    asyncio.run(exercise())
+
+
 def test_unversioned_custom_tool_identity_is_scoped_to_one_app_instance() -> None:
     async def exercise() -> None:
         session_id = "execution-profile-process-local-tool"

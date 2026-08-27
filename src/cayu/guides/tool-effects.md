@@ -225,16 +225,18 @@ application-specific systems through `unobserved_systems`.
 
 The verifier supplies no runner, artifact store, vault, proxy, or knowledge
 store and runs the tool directly without policy, approvals, hooks, events, or
-the model loop. Build a fresh application with controlled adapters for this
-test: the current Python process is not a security sandbox, and tool-instance
-state is not observed. One cooperative asyncio deadline covers workspace
-seeding, tool execution, both snapshots, and cleanup checks. If it expires, the
-helper raises `TimeoutError` and returns no verdict because observation did not
-complete. A tool or filesystem operation that blocks the event loop can delay
-that failure; enforcing a hard wall-clock stop requires a killable process
-boundary. Snapshots stop at configured traversed-entry and regular-file caps,
-and bound per-file and total content bytes. Deadline and observation-limit
-failures therefore fail closed.
+the model loop. It rejects `ProcessIsolatedTool`; those tools must enter through
+Cayu's runtime-owned process boundary so their hard deadline, containment, and
+recovery contracts remain active. Build a fresh application with controlled
+adapters for this test: the current Python process is not a security sandbox,
+and tool-instance state is not observed. One cooperative asyncio deadline
+covers workspace seeding, tool execution, both snapshots, and cleanup checks.
+If it expires, the helper raises `TimeoutError` and returns no verdict because
+observation did not complete. A tool or filesystem operation that blocks the
+event loop can delay that failure; enforcing a hard wall-clock stop requires a
+killable process boundary. Snapshots stop at configured traversed-entry and
+regular-file caps, and bound per-file and total content bytes. Deadline and
+observation-limit failures therefore fail closed.
 
 `IDEMPOTENT` and `EXTERNAL` declarations require the explicit
 `allow_effectful_execution=True` opt-in. They execute once and return `observed`,

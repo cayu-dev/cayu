@@ -118,6 +118,48 @@ class _DeterministicIsolatedToolHandler:
             self._publish_started()
             ctypes.PyDLL(None).sleep(int(self._config.get("seconds", 30)))
             return ToolResult(content="grandchild completed")
+        if mode == "detached_descendant":
+            pid_path = Path(str(self._config["pid_path"]))
+            child = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(60)",
+                ],
+                close_fds=True,
+                start_new_session=True,
+            )
+            pid_path.write_text(str(child.pid), encoding="utf-8")
+            if self._config.get("return_success") is True:
+                return ToolResult(content="detached descendant started")
+            self._publish_started()
+            ctypes.PyDLL(None).sleep(int(self._config.get("seconds", 30)))
+            return ToolResult(content="detached descendant completed")
+        if mode == "kill_supervisor":
+            worker_pid_path = Path(str(self._config["worker_pid_path"]))
+            descendant_pid_path = Path(str(self._config["pid_path"]))
+            child = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(60)",
+                ],
+                close_fds=True,
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            worker_pid_path.write_text(str(os.getpid()), encoding="utf-8")
+            descendant_pid_path.write_text(str(child.pid), encoding="utf-8")
+            # This fixture tests missing supervisor settlement authority, not
+            # diagnostic-pipe ownership.  Release the inherited pipe writers
+            # so the parent can observe exact supervisor exit before its
+            # bounded cleanup deadline.
+            os.close(sys.stdout.fileno())
+            os.close(sys.stderr.fileno())
+            os.kill(os.getppid(), signal.SIGKILL)
+            ctypes.PyDLL(None).sleep(int(self._config.get("seconds", 30)))
+            raise AssertionError("supervisor SIGKILL unexpectedly settled the worker")
         if mode == "fork_then_success":
             child_pid = os.fork()
             if child_pid == 0:

@@ -1301,6 +1301,7 @@ def validate_tool_round_recovery_target(
     events: list[Event],
     pending_round: PendingToolRound,
     tool_call_id: str,
+    execution_started: bool | None = None,
 ) -> None:
     """Reject manual recovery targets that need no recovery or never started.
 
@@ -1331,6 +1332,13 @@ def validate_tool_round_recovery_target(
         terminal_event_types=_TOOL_ROUND_TERMINAL_EVENT_TYPES,
     )
 
+    # Runtime-authenticated positive zero-dispatch evidence is stronger than
+    # an ambiguous event ledger.  Conflict recovery must not let an operator
+    # assign an executed outcome to a worker known never to have been admitted.
+    if execution_started is False:
+        raise RuntimeError(
+            f"Tool round recovery requires a recorded tool.call.started event: {tool_call_id}"
+        )
     if state.conflicting:
         return
     if state.terminal:
@@ -1338,7 +1346,8 @@ def validate_tool_round_recovery_target(
             f"Tool call already has a terminal event and does not need recovery: {tool_call_id}. "
             "Resume the session to close the round from the persisted outcome."
         )
-    if not state.started:
+    effective_execution_started = state.started if execution_started is None else execution_started
+    if not effective_execution_started:
         raise RuntimeError(
             f"Tool round recovery requires a recorded tool.call.started event: {tool_call_id}"
         )

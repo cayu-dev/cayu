@@ -310,17 +310,23 @@ async def _run_process_isolated_tool(root: Path) -> None:
         session_id="local-execution-composition",
         idempotency_key="local-execution-isolated-tool",
     )
+    operations: dict[str, dict[str, Any]] = {}
 
-    async def load_operation(_storage_key: str) -> dict[str, Any] | None:
-        return None
+    async def load_operation(storage_key: str) -> dict[str, Any] | None:
+        record = operations.get(storage_key)
+        return None if record is None else dict(record)
 
     async def compare_and_set_operation(
-        _storage_key: str,
-        _expected: dict[str, Any] | None,
+        storage_key: str,
+        expected: dict[str, Any] | None,
         desired: dict[str, Any],
-        _secondary: Mapping[str, dict[str, Any]],
+        secondary: Mapping[str, dict[str, Any]],
     ) -> dict[str, Any]:
-        return desired
+        if operations.get(storage_key) != expected:
+            return dict(operations[storage_key])
+        operations[storage_key] = dict(desired)
+        operations.update({key: dict(value) for key, value in secondary.items()})
+        return dict(desired)
 
     _bind_runtime_tool_invocation_authority(
         context,

@@ -32,6 +32,7 @@ from cayu._task_wait import (
     await_shielded_task_outcome,
     capture_awaitable_outcome,
     consume_pending_task_cancellation,
+    restore_task_cancellation_requests,
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
@@ -3637,6 +3638,10 @@ class ToolRoundExecutor:
                                 "Durable tool operation publication also failed: "
                                 f"{type(publication_error).__name__}."
                             )
+                            restore_task_cancellation_requests(
+                                outcome.cancellation_requests_consumed,
+                                cancellation=outcome.cancellation,
+                            )
                             raise outcome.cancellation from publication_error
                         raise publication_error
                     for key, value in secondary_copy.items():
@@ -3647,10 +3652,21 @@ class ToolRoundExecutor:
                             )
                             != value
                         ):
-                            raise RuntimeError(
+                            inconsistency = RuntimeError(
                                 "Durable tool operation acknowledgement is inconsistent."
-                            ) from publication_error
+                            )
+                            if outcome.cancellation is not None:
+                                restore_task_cancellation_requests(
+                                    outcome.cancellation_requests_consumed,
+                                    cancellation=outcome.cancellation,
+                                )
+                                raise outcome.cancellation from inconsistency
+                            raise inconsistency from publication_error
                 if outcome.cancellation is not None:
+                    restore_task_cancellation_requests(
+                        outcome.cancellation_requests_consumed,
+                        cancellation=outcome.cancellation,
+                    )
                     raise outcome.cancellation
                 return copy_durable_json_object(
                     desired_copy,
@@ -5252,10 +5268,41 @@ class ToolRoundExecutor:
                     publication_actions_allowed=not quarantine_output,
                     execution_profile=execution_profile,
                 )
+                hook_failure_payload: dict[str, Any] | None = None
                 try:
                     decision = await hook.before_tool_call(context)
-                    stop = _resolve_before_tool_call_decision(decision, resolution)
+                    try:
+                        stop = _resolve_before_tool_call_decision(
+                            decision,
+                            resolution,
+                            redactor=output_redactor,
+                        )
+                    finally:
+                        # Hook-owned objects can retain application secrets. Do
+                        # not carry the raw decision across durable publication.
+                        decision = None
                 except Exception as exc:
+                    hook_failure_payload = (
+                        {
+                            "error_type": "runtime_hook_failure",
+                            "actions": [],
+                            "actions_omitted": True,
+                        }
+                        if quarantine_output
+                        else {
+                            **_hook_failure_payload(
+                                exc,
+                                redactor=output_redactor,
+                            ),
+                            **_hook_actions_payload(
+                                context,
+                                redactor=output_redactor,
+                            ),
+                        }
+                    )
+                # Publish only after the raw hook exception has left the active
+                # handler so a store failure cannot inherit its traceback.
+                if hook_failure_payload is not None:
                     yield await self._event_writer.emit(
                         _redact_event_for_invocation(
                             _runtime_hook_event(
@@ -5271,24 +5318,7 @@ class ToolRoundExecutor:
                                 payload={
                                     "tool_name": tool_call.name,
                                     "tool_call_id": tool_call.id,
-                                    **(
-                                        {
-                                            "error_type": "runtime_hook_failure",
-                                            "actions": [],
-                                            "actions_omitted": True,
-                                        }
-                                        if quarantine_output
-                                        else {
-                                            **_hook_failure_payload(
-                                                exc,
-                                                redactor=output_redactor,
-                                            ),
-                                            **_hook_actions_payload(
-                                                context,
-                                                redactor=output_redactor,
-                                            ),
-                                        }
-                                    ),
+                                    **hook_failure_payload,
                                 },
                             ),
                             redactor=redactor,
@@ -5535,12 +5565,14 @@ class ToolRoundExecutor:
                 event=event,
                 result=final_result,
                 redactor=resolved_output_redactor,
+                restore_terminal_result_controls=False,
             )
             if not resolved_output_redactor.has_same_registry(resolved_redactor):
                 event, final_result = _prepare_tool_result_event(
                     event=event,
                     result=final_result,
                     redactor=resolved_redactor,
+                    restore_terminal_result_controls=False,
                 )
         event, final_result, projection_cancellation = await self._project_terminal_tool_result(
             event=event,
@@ -5778,11 +5810,41 @@ class ToolRoundExecutor:
                 publication_actions_allowed=not quarantine_output,
                 execution_profile=execution_profile,
             )
+            hook_failure_payload: dict[str, Any] | None = None
             try:
                 decision = await hook.after_tool_call(context)
-                resolved = _resolve_after_tool_call_decision(decision)
+                try:
+                    resolved = _resolve_after_tool_call_decision(
+                        decision,
+                        redactor=output_redactor,
+                    )
+                finally:
+                    # The copied, sanitized resolution is the only hook result
+                    # permitted to cross the following durable event await.
+                    decision = None
                 modified = resolved if allow_modification else None
             except Exception as exc:
+                hook_failure_payload = (
+                    {
+                        "error_type": "runtime_hook_failure",
+                        "actions": [],
+                        "actions_omitted": True,
+                    }
+                    if quarantine_output
+                    else {
+                        **_hook_failure_payload(
+                            exc,
+                            redactor=output_redactor,
+                        ),
+                        **_hook_actions_payload(
+                            context,
+                            redactor=output_redactor,
+                        ),
+                    }
+                )
+            # Publish only after the raw hook exception has left the active
+            # handler so a store failure cannot inherit its traceback.
+            if hook_failure_payload is not None:
                 yield (
                     await self._event_writer.emit(
                         _redact_event_for_invocation(
@@ -5799,24 +5861,7 @@ class ToolRoundExecutor:
                                 payload={
                                     "tool_name": tool_call.name,
                                     "tool_call_id": tool_call.id,
-                                    **(
-                                        {
-                                            "error_type": "runtime_hook_failure",
-                                            "actions": [],
-                                            "actions_omitted": True,
-                                        }
-                                        if quarantine_output
-                                        else {
-                                            **_hook_failure_payload(
-                                                exc,
-                                                redactor=output_redactor,
-                                            ),
-                                            **_hook_actions_payload(
-                                                context,
-                                                redactor=output_redactor,
-                                            ),
-                                        }
-                                    ),
+                                    **hook_failure_payload,
                                 },
                             ),
                             redactor=redactor,
@@ -9559,6 +9604,8 @@ def _private_argument_short_circuit_result(result: ToolResult) -> ToolResult:
 def _resolve_before_tool_call_decision(
     decision: BeforeToolCallDecision | None,
     resolution: _BeforeToolCallResolution,
+    *,
+    redactor: SecretRedactor,
 ) -> bool:
     if decision is None:
         return False
@@ -9582,8 +9629,9 @@ def _resolve_before_tool_call_decision(
         synthetic = decision.synthetic_result
         if synthetic is None:
             raise TypeError("A short_circuit decision must carry a synthetic_result.")
-        resolution.short_circuit_result = tool_results.normalize_tool_result(
-            tool_results.validate_tool_result(synthetic)
+        resolution.short_circuit_result = _prepare_hook_authored_tool_result(
+            synthetic,
+            redactor=redactor,
         )
         return True
     if decision.action != "block":
@@ -9597,6 +9645,8 @@ def _resolve_before_tool_call_decision(
 
 def _resolve_after_tool_call_decision(
     decision: AfterToolCallDecision | None,
+    *,
+    redactor: SecretRedactor,
 ) -> ToolResult | None:
     if decision is None:
         return None
@@ -9606,12 +9656,31 @@ def _resolve_after_tool_call_decision(
         modified = decision.modified_result
         if modified is None:
             raise TypeError("An after_tool_call modify decision must carry a modified_result.")
-        return tool_results.normalize_tool_result(tool_results.validate_tool_result(modified))
+        return _prepare_hook_authored_tool_result(modified, redactor=redactor)
     if decision.action == "pass_through":
         if decision.modified_result is not None:
             raise TypeError("A pass_through decision must not carry a modified_result.")
         return None
     raise ValueError("Unsupported after_tool_call decision action.")
+
+
+def _prepare_hook_authored_tool_result(
+    result: ToolResult,
+    *,
+    redactor: SecretRedactor,
+) -> ToolResult:
+    """Detach untrusted hook output before the next runtime-owned await."""
+
+    validated = tool_results.normalize_tool_result(tool_results.validate_tool_result(result))
+    sanitized = ToolResult(
+        content=validated.content,
+        structured=tool_results.strip_untrusted_runtime_tool_result_control_authority(
+            validated.structured
+        ),
+        artifacts=tool_results.strip_runtime_tool_result_projection_authority(validated.artifacts),
+        is_error=validated.is_error,
+    )
+    return tool_results.redact_tool_result(sanitized, redactor)
 
 
 def _runtime_hook_event(
@@ -9677,6 +9746,7 @@ def _prepare_tool_result_event(
     result: ToolResult,
     redactor: SecretRedactor,
     runtime_tool: object | None = None,
+    restore_terminal_result_controls: bool = True,
 ) -> tuple[Event, ToolResult]:
     argument_state = event.payload.get(tool_argument_publication.ARGUMENTS_STATE_FIELD)
     if argument_state is not None and (
@@ -9712,7 +9782,11 @@ def _prepare_tool_result_event(
         event = event.model_copy(update={"payload": payload_without_argument_projection})
     result = ToolResult(
         content=result.content,
-        structured=result.structured,
+        structured=tool_results.restore_runtime_tool_result_control_authority(
+            result.structured,
+            event.payload,
+            include_terminal_controls=restore_terminal_result_controls,
+        ),
         artifacts=tool_results.strip_runtime_tool_result_projection_authority(result.artifacts),
         is_error=result.is_error,
     )
@@ -9736,6 +9810,7 @@ def _prepare_tool_result_event(
             event=event,
             result=result,
             redactor=redactor,
+            include_terminal_controls=restore_terminal_result_controls,
         )
     if argument_projection is not None:
         payload = dict(event.payload)

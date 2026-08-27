@@ -137,6 +137,63 @@ def validate_tool_result(result: ToolResult) -> ToolResult:
     )
 
 
+def strip_untrusted_runtime_tool_result_control_authority(
+    structured: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Remove complete runtime-control projections from application output.
+
+    Runtime-owned controls travel beside ``ToolResult`` in a private execution
+    envelope.  A tool result with the same public dictionary shape therefore
+    remains application data and cannot acquire that private authority.
+    Invalid lookalikes are retained as ordinary data for normal redaction.
+    """
+
+    if structured is None:
+        return None
+    copied = copy_durable_json_value(structured, "structured")
+    if type(copied) is not dict:
+        raise AssertionError("Tool-result structure copied as a non-object.")
+    try:
+        controls = runtime_terminal_controls(copied)
+        controls.update(runtime_tool_execution_boundary_controls(copied))
+    except (TypeError, ValueError):
+        return copied
+    for key in controls:
+        copied.pop(key, None)
+    return copied
+
+
+def restore_runtime_tool_result_control_authority(
+    structured: Mapping[str, Any] | None,
+    authority: Mapping[str, Any],
+    *,
+    include_terminal_controls: bool = True,
+) -> dict[str, Any] | None:
+    """Strip caller-shaped controls and restore only runtime-owned authority."""
+
+    if type(include_terminal_controls) is not bool:
+        raise TypeError("include_terminal_controls must be a bool.")
+    sanitized = strip_untrusted_runtime_tool_result_control_authority(structured)
+    copied_authority = copy_durable_json_value(authority, "tool_result_control_authority")
+    if type(copied_authority) is not dict:
+        raise AssertionError("Tool-result control authority copied as a non-object.")
+    controls = runtime_terminal_controls(copied_authority) if include_terminal_controls else {}
+    controls.update(runtime_tool_execution_boundary_controls(copied_authority))
+    if sanitized is not None and controls:
+        # A malformed or partial caller-shaped tuple is ordinary data at the
+        # untrusted boundary, but it cannot remain beside runtime authority.
+        # Remove the complete reserved family before restoring the exact
+        # runtime-owned tuple so one conflicting sibling cannot poison its
+        # validation or secret-safe projection downstream.
+        for key in _RUNTIME_TERMINAL_CONTROL_FIELDS:
+            sanitized.pop(key, None)
+    if not controls:
+        return sanitized
+    restored = {} if sanitized is None else sanitized
+    restored.update(controls)
+    return restored
+
+
 def redact_tool_result(result: ToolResult, redactor: SecretRedactor) -> ToolResult:
     if type(result) is not ToolResult:
         raise TypeError("Tool results must be ToolResult instances.")
@@ -171,28 +228,34 @@ def redact_tool_result_event(
     event: Event,
     result: ToolResult,
     redactor: SecretRedactor,
+    include_terminal_controls: bool = True,
 ) -> tuple[Event, ToolResult]:
     """Redact a terminal event payload and keep its result field synchronized."""
 
     if not isinstance(redactor, SecretRedactor):
         raise TypeError("redactor must be a SecretRedactor.")
-    terminal_controls = runtime_terminal_controls(event.payload)
-    terminal_controls.update(runtime_tool_execution_boundary_controls(event.payload))
-    if not redactor.has_values:
-        return web_access_results.restore_attested_tool_result(
-            event,
-            original=result,
-            redacted=redact_tool_result(result, redactor),
-        )
-    result_to_redact = _tool_result_without_terminal_controls(
-        result,
-        terminal_controls=terminal_controls,
+    if type(include_terminal_controls) is not bool:
+        raise TypeError("include_terminal_controls must be a bool.")
+    event_controls = runtime_terminal_controls(event.payload)
+    boundary_controls = runtime_tool_execution_boundary_controls(event.payload)
+    event_controls.update(boundary_controls)
+    result_controls = dict(event_controls) if include_terminal_controls else dict(boundary_controls)
+    # Result bodies can originate from tools, hooks, or operator-authored
+    # recovery. Their public dictionary shape is never execution authority.
+    # Strip every complete lookalike before redaction, including when the
+    # current registry is empty, then restore only controls owned by the event.
+    result_to_redact = result.model_copy(
+        update={
+            "structured": strip_untrusted_runtime_tool_result_control_authority(result.structured)
+        }
     )
     redacted_result = (
         _redact_terminal_result(result_to_redact, redactor)
-        if terminal_controls
+        if event_controls
         else redact_tool_result(result_to_redact, redactor)
     )
+    if result_to_redact.structured is None and redacted_result.structured == {}:
+        redacted_result = redacted_result.model_copy(update={"structured": None})
     linkage_fields = _runtime_tool_event_linkage_fields(event.payload)
     profile_attribution = _runtime_execution_profile_attribution(event)
     exposure_attribution = _runtime_tool_exposure_attribution(event)
@@ -203,7 +266,7 @@ def redact_tool_result_event(
         and key not in linkage_fields
         and key not in profile_attribution
         and key not in exposure_attribution
-        and not (terminal_controls and key in _RUNTIME_TERMINAL_CONTROL_FIELDS)
+        and not (event_controls and key in _RUNTIME_TERMINAL_CONTROL_FIELDS)
     }
     payload = redactor.redact_json(payload_to_redact)
     if type(payload) is not dict:
@@ -211,16 +274,17 @@ def redact_tool_result_event(
     payload.update(linkage_fields)
     payload.update(profile_attribution)
     payload.update(exposure_attribution)
-    if terminal_controls:
+    if result_controls:
         structured = dict(redacted_result.structured or {})
-        structured.update(terminal_controls)
+        structured.update(result_controls)
         redacted_result = ToolResult(
             content=redacted_result.content,
             structured=structured,
             artifacts=redacted_result.artifacts,
             is_error=redacted_result.is_error,
         )
-        payload.update(terminal_controls)
+    if event_controls:
+        payload.update(event_controls)
     payload["result"] = redacted_result.model_dump()
     return web_access_results.restore_attested_tool_result(
         event.model_copy(update={"payload": payload}),

@@ -213,6 +213,15 @@ class ToolExecutionOutcome:
         validated_result = tool_results.normalize_tool_result(
             tool_results.validate_tool_result(result)
         )
+        validated_result = ToolResult(
+            content=validated_result.content,
+            structured=tool_results.restore_runtime_tool_result_control_authority(
+                validated_result.structured,
+                terminal_payload,
+            ),
+            artifacts=validated_result.artifacts,
+            is_error=validated_result.is_error,
+        )
         copied_payload = copy_durable_json_object(
             terminal_payload,
             "tool_execution_terminal_payload",

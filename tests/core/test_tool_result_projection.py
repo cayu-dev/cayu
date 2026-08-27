@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import warnings
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -1209,6 +1210,580 @@ def test_application_artifact_cannot_claim_runtime_projection_ownership() -> Non
     assert secret not in serialized
     assert redacted.content[0].content == f"application content with {REDACTED_SECRET}"
     assert redacted.content[0].artifacts[0]["store_id"] == REDACTED_SECRET
+
+
+def test_application_result_cannot_claim_runtime_execution_control_ownership() -> None:
+    from cayu.core import MessageRole, ToolResultPart
+    from cayu.runtime._message_redaction import (
+        redact_runtime_message_for_boundary,
+        redact_untrusted_message_for_boundary,
+    )
+
+    secret = "application_control_secret"
+    lookalike = Message(
+        role=MessageRole.TOOL,
+        content=(
+            ToolResultPart(
+                tool_call_id="call_application_control",
+                tool_name="application_tool",
+                content="application result",
+                structured={
+                    "isolated_tool_failure_code": secret,
+                    "tool_execution_boundary": "posix_process",
+                    "tool_timeout_strength": "hard_process_deadline",
+                    "detail": "safe",
+                },
+                is_error=True,
+            ),
+        ),
+    )
+
+    untrusted = redact_untrusted_message_for_boundary(
+        lookalike,
+        redactor=SecretRedactor([]),
+        field_name="message",
+    )
+    redacted = redact_runtime_message_for_boundary(
+        untrusted,
+        redactor=SecretRedactor(secret),
+        field_name="message",
+    )
+
+    assert secret not in json.dumps(redacted.model_dump(mode="json"))
+    assert redacted.content[0].structured == {"detail": "safe"}
+
+
+@pytest.mark.parametrize("result_source", ["tool", "before_hook", "after_hook"])
+def test_public_tool_result_cannot_claim_execution_controls_after_registry_rotation(
+    result_source: str,
+) -> None:
+    from cayu import (
+        AfterToolCallDecision,
+        BeforeToolCallDecision,
+        ExecutionProfileAdoptionIntent,
+        ExecutionProfileAuthorityDecision,
+        ExecutionProfilePolicy,
+        ExecutionProfilePolicyAction,
+        ExecutionProfilePolicyRequest,
+        ExecutionProfilePolicyResult,
+        ResolutionActor,
+        ResolutionActorSource,
+        RuntimeHook,
+    )
+
+    class AdoptCurrentProfile(ExecutionProfilePolicy):
+        @property
+        def identity(self) -> str:
+            return "tests:adopt-tool-result-redaction-profile:v1"
+
+        async def decide(
+            self,
+            request: ExecutionProfilePolicyRequest,
+        ) -> ExecutionProfilePolicyResult:
+            del request
+            return ExecutionProfilePolicyResult(
+                action=ExecutionProfilePolicyAction.ADOPT,
+                reason="The test operator authorizes the reconstructed application profile.",
+                authority_decision=ExecutionProfileAuthorityDecision.AUTHORIZED,
+            )
+
+    secret = "application_control_secret"
+    session_id = "sess_application_control_rotation"
+    session_store = InMemorySessionStore()
+    policy = AdoptCurrentProfile()
+    claimed_result = ToolResult(
+        content="application result",
+        structured={
+            "isolated_tool_failure_code": secret,
+            "tool_execution_boundary": "posix_process",
+            "tool_timeout_strength": "hard_process_deadline",
+            "detail": "safe",
+        },
+        is_error=True,
+    )
+
+    class ClaimingHook(RuntimeHook):
+        async def before_tool_call(
+            self,
+            context: Any,
+        ) -> BeforeToolCallDecision | None:
+            del context
+            if result_source == "before_hook":
+                return BeforeToolCallDecision(
+                    action="short_circuit",
+                    synthetic_result=claimed_result,
+                )
+            return None
+
+        async def after_tool_call(
+            self,
+            context: Any,
+        ) -> AfterToolCallDecision | None:
+            del context
+            if result_source == "after_hook":
+                return AfterToolCallDecision(
+                    action="modify",
+                    modified_result=claimed_result,
+                )
+            return None
+
+    hook = ClaimingHook()
+    tool = _ResultTool(
+        claimed_result
+        if result_source == "tool"
+        else ToolResult(
+            content="ordinary application result",
+            is_error=result_source == "after_hook",
+        )
+    )
+    first_provider = _FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_application_control",
+                    name="result_tool",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ]
+        ]
+    )
+    first_app = CayuApp(
+        enable_logging=False,
+        session_store=session_store,
+        execution_profile_policy=policy,
+    )
+    first_app.register_provider(first_provider, default=True)
+    first_app.register_environment(Environment(EnvironmentSpec(name="local")), default=True)
+    first_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        runtime_hooks=[hook],
+    )
+
+    first_events = asyncio.run(
+        _collect(
+            first_app.run(
+                RunRequest(
+                    session_id=session_id,
+                    agent_name="assistant",
+                    messages=[Message.text("user", "run")],
+                )
+            )
+        )
+    )
+
+    assert first_events[-1].type is EventType.SESSION_FAILED
+    first_transcript = asyncio.run(session_store.load_transcript(session_id))
+    first_result = next(message for message in first_transcript if message.role == "tool").content[
+        0
+    ]
+    assert first_result.structured == {"detail": "safe"}
+
+    second_provider = _FakeProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        ]
+    )
+    second_app = CayuApp(
+        enable_logging=False,
+        session_store=session_store,
+        secret_redactor=SecretRedactor(secret),
+        execution_profile_policy=policy,
+    )
+    second_app.register_provider(second_provider, default=True)
+    second_app.register_environment(Environment(EnvironmentSpec(name="local")), default=True)
+    second_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+        runtime_hooks=[hook],
+    )
+    resumed_events = asyncio.run(
+        _collect(
+            second_app.resume(
+                ResumeRequest(
+                    session_id=session_id,
+                    messages=[Message.text("user", "continue")],
+                    profile_adoption=ExecutionProfileAdoptionIntent(
+                        idempotency_key="adopt-rotated-tool-result-registry",
+                        reason="The operator authorizes the updated secret registry.",
+                        requested_by=ResolutionActor(
+                            subject="test-operator",
+                            source=ResolutionActorSource.REQUEST,
+                        ),
+                    ),
+                )
+            )
+        )
+    )
+
+    assert resumed_events[-1].type is EventType.SESSION_COMPLETED
+    provider_request = second_provider.requests[0]
+    provider_result = next(
+        message for message in provider_request.messages if message.role == "tool"
+    ).content[0]
+    assert provider_result.structured == {"detail": "safe"}
+    serialized = json.dumps(
+        {
+            "events": [event.model_dump(mode="json") for event in resumed_events],
+            "provider_request": provider_request.model_dump(mode="json"),
+            "transcript": [
+                message.model_dump(mode="json")
+                for message in asyncio.run(session_store.load_transcript(session_id))
+            ],
+        }
+    )
+    assert secret not in serialized
+
+
+def test_partial_hook_control_is_not_promoted_during_public_event_projection() -> None:
+    from cayu import AfterToolCallDecision, RuntimeHook
+
+    secret = "application_partial_terminal_outcome"
+    session_id = "sess_partial_hook_control"
+    session_store = InMemorySessionStore()
+
+    class FailingTool(Tool):
+        spec = ToolSpec(
+            name="failing_tool",
+            input_schema={"type": "object"},
+            effect=ToolEffect.NONE,
+        )
+
+        async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+            del ctx, args
+            raise RuntimeError("deterministic tool failure")
+
+    class PartialControlHook(RuntimeHook):
+        async def after_tool_call(self, context: Any) -> AfterToolCallDecision | None:
+            del context
+            return AfterToolCallDecision(
+                action="modify",
+                modified_result=ToolResult(
+                    content="application replacement",
+                    structured={
+                        "terminal_outcome": secret,
+                        "detail": "safe",
+                    },
+                    is_error=True,
+                ),
+            )
+
+    provider = _FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_partial_hook_control",
+                    name="failing_tool",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(
+        enable_logging=False,
+        session_store=session_store,
+        secret_redactor=SecretRedactor(secret),
+    )
+    app.register_provider(provider, default=True)
+    app.register_environment(Environment(EnvironmentSpec(name="local")), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[FailingTool()],
+        runtime_hooks=[PartialControlHook()],
+    )
+
+    events = asyncio.run(
+        _collect(
+            app.run(
+                RunRequest(
+                    session_id=session_id,
+                    agent_name="assistant",
+                    messages=[Message.text("user", "run")],
+                )
+            )
+        )
+    )
+    durable_events = asyncio.run(session_store.load_events(session_id))
+    transcript = asyncio.run(session_store.load_transcript(session_id))
+
+    public_terminal = next(event for event in events if event.type is EventType.TOOL_CALL_FAILED)
+    durable_terminal = next(
+        event for event in durable_events if event.type is EventType.TOOL_CALL_FAILED
+    )
+    transcript_result = next(message for message in transcript if message.role == "tool").content[0]
+    provider_result = next(
+        message for message in provider.requests[1].messages if message.role == "tool"
+    ).content[0]
+    for structured in (
+        public_terminal.payload["result"]["structured"],
+        durable_terminal.payload["result"]["structured"],
+        transcript_result.structured,
+        provider_result.structured,
+    ):
+        assert structured["terminal_outcome"] == REDACTED_SECRET
+        assert structured["detail"] == "safe"
+
+
+def test_partial_recovery_control_survives_without_runtime_authority_overlay() -> None:
+    from cayu.runtime import _tool_results as tool_results
+
+    structured = {
+        "recovered": True,
+        "outcome_unknown": True,
+        "recovery_reason": "pending_tool_round_missing_terminal_event",
+    }
+
+    assert tool_results.restore_runtime_tool_result_control_authority(structured, {}) == structured
+
+
+def test_partial_hook_control_cannot_poison_runtime_timeout_boundary() -> None:
+    from cayu import AfterToolCallDecision, RuntimeHook
+
+    session_id = "sess_partial_hook_timeout_boundary"
+    session_store = InMemorySessionStore()
+
+    class SlowTool(Tool):
+        spec = ToolSpec(
+            name="slow_tool",
+            input_schema={"type": "object"},
+            effect=ToolEffect.NONE,
+        )
+
+        async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+            del ctx, args
+            await asyncio.sleep(30)
+            return ToolResult(content="unexpected")
+
+    class PartialControlHook(RuntimeHook):
+        async def after_tool_call(self, context: Any) -> AfterToolCallDecision | None:
+            del context
+            return AfterToolCallDecision(
+                action="modify",
+                modified_result=ToolResult(
+                    content="application replacement",
+                    structured={
+                        "isolated_tool_failure_code": "application_value",
+                        "detail": "safe",
+                    },
+                    is_error=True,
+                ),
+            )
+
+    provider = _FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_partial_hook_timeout_boundary",
+                    name="slow_tool",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(
+        enable_logging=False,
+        session_store=session_store,
+        secret_redactor=SecretRedactor("in_process"),
+        tool_timeout_seconds=0.01,
+    )
+    app.register_provider(provider, default=True)
+    app.register_environment(Environment(EnvironmentSpec(name="local")), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[SlowTool()],
+        runtime_hooks=[PartialControlHook()],
+    )
+
+    public_events = asyncio.run(
+        _collect(
+            app.run(
+                RunRequest(
+                    session_id=session_id,
+                    agent_name="assistant",
+                    messages=[Message.text("user", "run")],
+                )
+            )
+        )
+    )
+    durable_events = asyncio.run(session_store.load_events(session_id))
+    transcript = asyncio.run(session_store.load_transcript(session_id))
+
+    public_terminal = next(
+        event for event in public_events if event.type is EventType.TOOL_CALL_FAILED
+    )
+    durable_terminal = next(
+        event for event in durable_events if event.type is EventType.TOOL_CALL_FAILED
+    )
+    transcript_result = next(message for message in transcript if message.role == "tool").content[0]
+    provider_result = next(
+        message for message in provider.requests[1].messages if message.role == "tool"
+    ).content[0]
+    for event in (public_terminal, durable_terminal):
+        assert event.payload["terminal_outcome"] == "tool_execution_timeout"
+        assert event.payload["tool_execution_boundary"] == "in_process"
+        assert event.payload["tool_timeout_strength"] == "cooperative_in_process"
+    for structured in (
+        public_terminal.payload["result"]["structured"],
+        durable_terminal.payload["result"]["structured"],
+        transcript_result.structured,
+        provider_result.structured,
+    ):
+        assert structured["tool_execution_boundary"] == "in_process"
+        assert structured["tool_timeout_strength"] == "cooperative_in_process"
+        assert structured["detail"] == "safe"
+        assert "isolated_tool_failure_code" not in structured
+
+
+@pytest.mark.parametrize("result_source", ["before_hook", "after_hook"])
+@pytest.mark.parametrize("result_validity", ["valid", "invalid"])
+def test_hook_result_is_sanitized_before_secondary_publication_failure(
+    result_source: str,
+    result_validity: str,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from cayu import AfterToolCallDecision, BeforeToolCallDecision, RuntimeHook
+
+    class FailingHookPublicationStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        async def append_events(self, session_id: str, events: list[Event]) -> None:
+            failure_event_type = (
+                EventType.HOOK_COMPLETED if result_validity == "valid" else EventType.HOOK_FAILED
+            )
+            if not self.failed and any(event.type is failure_event_type for event in events):
+                self.failed = True
+                raise SystemExit("hook result publication failed")
+            await super().append_events(session_id, events)
+
+    class SecretResultHook(RuntimeHook):
+        @staticmethod
+        def _claimed_result() -> ToolResult:
+            if result_validity == "invalid":
+                return ToolResult.model_construct(
+                    content="invalid hook result",
+                    structured={"HOOK_PUBLICATION_SECRET_CANARY": object()},
+                    artifacts=[],
+                    is_error=True,
+                )
+            return ToolResult(
+                content="HOOK_PUBLICATION_SECRET_CANARY",
+                structured={
+                    "isolated_tool_failure_code": "HOOK_PUBLICATION_SECRET_CANARY",
+                    "tool_execution_boundary": "posix_process",
+                    "tool_timeout_strength": "hard_process_deadline",
+                    "detail": "safe",
+                },
+                is_error=True,
+            )
+
+        async def before_tool_call(self, context: Any) -> BeforeToolCallDecision | None:
+            del context
+            if result_source != "before_hook":
+                return None
+            if result_validity == "invalid":
+                return BeforeToolCallDecision.model_construct(
+                    action="short_circuit",
+                    synthetic_result=self._claimed_result(),
+                )
+            return BeforeToolCallDecision(
+                action="short_circuit",
+                synthetic_result=self._claimed_result(),
+            )
+
+        async def after_tool_call(self, context: Any) -> AfterToolCallDecision | None:
+            del context
+            if result_source != "after_hook":
+                return None
+            if result_validity == "invalid":
+                return AfterToolCallDecision.model_construct(
+                    action="modify",
+                    modified_result=self._claimed_result(),
+                )
+            return AfterToolCallDecision(
+                action="modify",
+                modified_result=self._claimed_result(),
+            )
+
+    async def scenario() -> None:
+        provider = _FakeProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call_hook_publication_failure",
+                        name="result_tool",
+                        arguments={},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ]
+            ]
+        )
+        app = CayuApp(
+            enable_logging=False,
+            session_store=FailingHookPublicationStore(),
+            secret_redactor=SecretRedactor("HOOK_PUBLICATION_SECRET_CANARY"),
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment(Environment(EnvironmentSpec(name="local")), default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[_ResultTool(ToolResult(content="ordinary application result"))],
+            runtime_hooks=[SecretResultHook()],
+        )
+        await _collect(
+            app.run(
+                RunRequest(
+                    session_id=(f"sess_hook_publication_failure_{result_source}_{result_validity}"),
+                    agent_name="assistant",
+                    messages=[Message.text("user", "run")],
+                )
+            )
+        )
+
+    with (
+        warnings.catch_warnings(record=True) as captured_warnings,
+        pytest.raises(SystemExit) as caught,
+    ):
+        asyncio.run(scenario())
+
+    captured_output = capsys.readouterr()
+    diagnostics = [
+        str(caught.value),
+        repr(caught.value),
+        caplog.text,
+        captured_output.out,
+        captured_output.err,
+        *(str(item.message) for item in captured_warnings),
+    ]
+    current: BaseException | None = caught.value
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        diagnostics.extend((str(current), repr(current), repr(current.args)))
+        traceback = current.__traceback__
+        while traceback is not None:
+            if "/src/cayu/" in traceback.tb_frame.f_code.co_filename:
+                diagnostics.extend(repr(value) for value in traceback.tb_frame.f_locals.values())
+            traceback = traceback.tb_next
+        current = current.__cause__ or current.__context__
+
+    assert "HOOK_PUBLICATION_SECRET_CANARY" not in "\n".join(diagnostics)
 
 
 def test_application_result_cannot_claim_web_access_control_ownership() -> None:

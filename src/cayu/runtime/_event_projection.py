@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Collection, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from hmac import compare_digest
@@ -5396,8 +5397,26 @@ def _restore_nested_controls(
                 if control_key in controls:
                     structured[field_name] = controls[control_key]
 
+    original_result = event.payload.get("result")
+    original_structured = (
+        original_result.get("structured") if type(original_result) is dict else None
+    )
+    validated_nested_controls: dict[str, Any] = {}
+    if type(original_structured) is dict:
+        with suppress(TypeError, ValueError):
+            validated_nested_controls.update(
+                tool_results.runtime_terminal_controls(original_structured)
+            )
+        with suppress(TypeError, ValueError):
+            validated_nested_controls.update(
+                tool_results.runtime_tool_execution_boundary_controls(original_structured)
+            )
     terminal_controls = {
-        key: value for key, value in controls.items() if key in _TERMINAL_CONTROL_KEYS
+        key: value
+        for key, value in controls.items()
+        if key in _TERMINAL_CONTROL_KEYS
+        and key in validated_nested_controls
+        and validated_nested_controls[key] == value
     }
     if not restore_authority:
         terminal_controls = {

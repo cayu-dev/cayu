@@ -26458,7 +26458,13 @@ def test_cayu_app_recover_tool_round_completed_outcome_resumes_without_unknown(
                 tool_call_id="call_1",
                 outcome=ToolApprovalRecoveryOutcome.COMPLETED,
                 message=recovery_message,
-                structured={"verified": True, "provided": recovery_message},
+                structured={
+                    "verified": True,
+                    "provided": recovery_message,
+                    "isolated_tool_failure_code": "application_control_secret",
+                    "tool_execution_boundary": "posix_process",
+                    "tool_timeout_strength": "hard_process_deadline",
+                },
                 reason=recovery_message,
                 metadata={"provided": recovery_message},
                 resolved_by=ResolutionActor(
@@ -26536,6 +26542,9 @@ def test_cayu_app_recover_tool_round_completed_outcome_resumes_without_unknown(
         }
         if dynamic_scope
         else {"verified": True, "provided": recovery_message}
+    )
+    assert "isolated_tool_failure_code" not in json.dumps(
+        [message.model_dump(mode="json") for message in provider_capture[0].requests[-1].messages]
     )
     if dynamic_scope:
         assert recovery_message not in repr(recovery_events)
