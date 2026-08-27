@@ -5016,7 +5016,7 @@
         "description": "Editable assertion contract bound to coherent captured evidence only.",
         "properties": {
           "case": {
-            "$ref": "#/components/schemas/EvalCaseSpec"
+            "$ref": "#/components/schemas/PromotionCaseV1"
           },
           "evidence": {
             "$ref": "#/components/schemas/AssertionEvidenceView"
@@ -5188,7 +5188,7 @@
       },
       "CapturedEvaluationConversion": {
         "additionalProperties": false,
-        "description": "Independent corpus-v1 conversion availability for this source session.",
+        "description": "Independent corpus-v2 conversion availability for this source session.",
         "properties": {
           "available": {
             "title": "Available",
@@ -8451,7 +8451,7 @@
       },
       "EvalCaseSpec": {
         "additionalProperties": false,
-        "description": "One deterministic expectation set with optional fresh-run input.\n\nCaptured-session evaluations intentionally set ``input`` to ``None`` when\nthe retained evidence cannot be represented as one corpus-v1 invocation.\nSuch cases remain portable historical evaluation contracts, but execution\nrejects them until a runnable input or scenario is authored.",
+        "description": "One deterministic expectation set with optional fresh-run input.\n\nCaptured-session evaluations intentionally set ``input`` to ``None`` when\nthe retained evidence cannot be represented as one corpus-v2 invocation.\nSuch cases remain portable historical evaluation contracts, but execution\nrejects them until a runnable input or scenario is authored.",
         "properties": {
           "assertions": {
             "items": {
@@ -8466,6 +8466,7 @@
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
                   "root_status": "#/components/schemas/RootStatusAssertionSpec",
+                  "structured_model_judge": "#/components/schemas/StructuredModelJudgeAssertionSpec",
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
                   "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
                   "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
@@ -8508,6 +8509,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/ModelJudgeAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/StructuredModelJudgeAssertionSpec"
                 }
               ]
             },
@@ -8731,8 +8735,8 @@
             "type": "string"
           },
           "schema_version": {
-            "const": 1,
-            "default": 1,
+            "const": 2,
+            "default": 2,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -9114,6 +9118,31 @@
           "fingerprint"
         ],
         "title": "EvalExecutionTargetMaterialIdentityV1",
+        "type": "object"
+      },
+      "EvalJudgeEvidenceSelectionV1": {
+        "additionalProperties": false,
+        "description": "Candidate evidence a public judge profile is requested to receive.",
+        "properties": {
+          "include_final_output": {
+            "const": true,
+            "default": true,
+            "title": "Include Final Output",
+            "type": "boolean"
+          },
+          "include_transcript": {
+            "default": false,
+            "title": "Include Transcript",
+            "type": "boolean"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "title": "EvalJudgeEvidenceSelectionV1",
         "type": "object"
       },
       "EvalMemoryAttributionCapturePolicyV1": {
@@ -11573,6 +11602,15 @@
             "title": "Execution Profile Ready",
             "type": "boolean"
           },
+          "judge_profiles": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/JudgeProfileIdentityV1"
+            },
+            "maxItems": 32,
+            "title": "Judge Profiles",
+            "type": "array"
+          },
           "label": {
             "maxLength": 512,
             "minLength": 1,
@@ -12887,6 +12925,148 @@
         ],
         "title": "InvocationOriginTrust",
         "type": "string"
+      },
+      "JudgeProfileIdentityV1": {
+        "additionalProperties": false,
+        "description": "Safe, immutable public snapshot of one trusted model-judge route.",
+        "properties": {
+          "allowed_evidence": {
+            "items": {
+              "enum": [
+                "final_output",
+                "transcript",
+                "public_reference",
+                "private_reference"
+              ],
+              "type": "string"
+            },
+            "maxItems": 4,
+            "minItems": 1,
+            "title": "Allowed Evidence",
+            "type": "array"
+          },
+          "cost_currency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Currency"
+          },
+          "implementation_revision": {
+            "title": "Implementation Revision",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "max_estimated_cost": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Estimated Cost"
+          },
+          "max_input_tokens": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Max Input Tokens",
+            "type": "integer"
+          },
+          "max_output_tokens": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Max Output Tokens",
+            "type": "integer"
+          },
+          "max_total_tokens": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Max Total Tokens",
+            "type": "integer"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "pricing_profile_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Profile Fingerprint"
+          },
+          "privacy_policy_key": {
+            "title": "Privacy Policy Key",
+            "type": "string"
+          },
+          "privacy_policy_revision": {
+            "title": "Privacy Policy Revision",
+            "type": "string"
+          },
+          "provider_name": {
+            "title": "Provider Name",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "same_model_use": {
+            "default": "forbidden",
+            "enum": [
+              "forbidden",
+              "allowed_and_labeled"
+            ],
+            "title": "Same Model Use",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "timeout_seconds": {
+            "maximum": 3600.0,
+            "minimum": 1.0,
+            "title": "Timeout Seconds",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "key",
+          "revision",
+          "label",
+          "provider_name",
+          "model",
+          "implementation_revision",
+          "allowed_evidence",
+          "timeout_seconds",
+          "max_input_tokens",
+          "max_output_tokens",
+          "max_total_tokens",
+          "privacy_policy_key",
+          "privacy_policy_revision"
+        ],
+        "title": "JudgeProfileIdentityV1",
+        "type": "object"
       },
       "KnowledgeVisibility": {
         "enum": [
@@ -14743,12 +14923,54 @@
         "title": "PricingResourceMapping",
         "type": "object"
       },
+      "PrivateJudgeReferenceV1": {
+        "additionalProperties": false,
+        "description": "Authority-free identity for evaluator truth retained only by the server.",
+        "properties": {
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "kind": {
+            "const": "private_reference",
+            "default": "private_reference",
+            "title": "Kind",
+            "type": "string"
+          },
+          "privacy_policy_key": {
+            "title": "Privacy Policy Key",
+            "type": "string"
+          },
+          "privacy_policy_revision": {
+            "title": "Privacy Policy Revision",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "key",
+          "revision",
+          "privacy_policy_key",
+          "privacy_policy_revision"
+        ],
+        "title": "PrivateJudgeReferenceV1",
+        "type": "object"
+      },
       "PromotionCandidateV1": {
         "additionalProperties": false,
         "description": "One deterministic, editable case candidate and its public-safe evidence.",
         "properties": {
           "case": {
-            "$ref": "#/components/schemas/EvalCaseSpec"
+            "$ref": "#/components/schemas/PromotionCaseV1"
           },
           "evidence": {
             "$ref": "#/components/schemas/AssertionEvidenceView"
@@ -14806,6 +15028,126 @@
           "warnings"
         ],
         "title": "PromotionCandidateV1",
+        "type": "object"
+      },
+      "PromotionCaseV1": {
+        "additionalProperties": false,
+        "description": "Immutable corpus case restricted to the V1 promotion assertion surface.",
+        "properties": {
+          "assertions": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "child_status": "#/components/schemas/ChildStatusAssertionSpec",
+                  "final_output_contains": "#/components/schemas/FinalOutputContainsAssertionSpec",
+                  "final_output_equals": "#/components/schemas/FinalOutputEqualsAssertionSpec",
+                  "max_estimated_cost": "#/components/schemas/MaxEstimatedCostAssertionSpec",
+                  "max_model_steps": "#/components/schemas/MaxModelStepsAssertionSpec",
+                  "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
+                  "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
+                  "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
+                  "root_status": "#/components/schemas/RootStatusAssertionSpec",
+                  "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
+                  "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
+                  "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/RootStatusAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ChildStatusAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/FinalOutputEqualsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/FinalOutputContainsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolCalledAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxModelStepsAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/UsageRecordedAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxTotalTokensAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/MaxEstimatedCostAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ModelJudgeAssertionSpec"
+                }
+              ]
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "title": "Assertions",
+            "type": "array"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "input": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunInputSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/EvaluationSourceIdentityV1"
+          },
+          "suite_id": {
+            "title": "Suite Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "revision",
+          "suite_id",
+          "name",
+          "source",
+          "input",
+          "assertions"
+        ],
+        "title": "PromotionCaseV1",
         "type": "object"
       },
       "PromotionSourceV1": {
@@ -15065,6 +15407,58 @@
         "title": "ProviderStatePart",
         "type": "object"
       },
+      "PublicJudgeReferenceV1": {
+        "additionalProperties": false,
+        "description": "Evaluator-only, deliberately portable reference truth.",
+        "properties": {
+          "expected_answer": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Answer"
+          },
+          "expected_facts": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 64,
+            "title": "Expected Facts",
+            "type": "array"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "public_reference",
+            "default": "public_reference",
+            "title": "Kind",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "revision"
+        ],
+        "title": "PublicJudgeReferenceV1",
+        "type": "object"
+      },
       "PublishedAssertionResult": {
         "additionalProperties": false,
         "properties": {
@@ -15098,6 +15492,7 @@
                 "max_total_tokens": "#/components/schemas/PublishedMaxTotalTokensDetail",
                 "model_judge": "#/components/schemas/PublishedModelJudgeDetail",
                 "root_status": "#/components/schemas/PublishedRootStatusDetail",
+                "structured_model_judge": "#/components/schemas/PublishedStructuredModelJudgeDetail",
                 "tool_called": "#/components/schemas/PublishedToolCalledDetail",
                 "tools_called_in_order": "#/components/schemas/PublishedToolsCalledInOrderDetail",
                 "usage_recorded": "#/components/schemas/PublishedUsageRecordedDetail"
@@ -15140,6 +15535,9 @@
               },
               {
                 "$ref": "#/components/schemas/PublishedModelJudgeDetail"
+              },
+              {
+                "$ref": "#/components/schemas/PublishedStructuredModelJudgeDetail"
               }
             ],
             "title": "Detail"
@@ -15342,7 +15740,7 @@
             "type": "string"
           },
           "schema_version": {
-            "const": 3,
+            "const": 4,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -15532,6 +15930,63 @@
           }
         },
         "title": "PublishedFinalOutputEqualsDetail",
+        "type": "object"
+      },
+      "PublishedJudgeReferenceIdentityV1": {
+        "additionalProperties": false,
+        "description": "Safe reference identity; private evaluator truth is never represented.",
+        "properties": {
+          "availability": {
+            "const": "available",
+            "default": "available",
+            "title": "Availability",
+            "type": "string"
+          },
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "public_reference",
+              "private_reference"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "privacy_policy_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Privacy Policy Key"
+          },
+          "privacy_policy_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Privacy Policy Revision"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "key",
+          "revision"
+        ],
+        "title": "PublishedJudgeReferenceIdentityV1",
         "type": "object"
       },
       "PublishedMaxEstimatedCostDetail": {
@@ -15797,6 +16252,258 @@
           "expected"
         ],
         "title": "PublishedRootStatusDetail",
+        "type": "object"
+      },
+      "PublishedStructuredJudgeCostV1": {
+        "additionalProperties": false,
+        "properties": {
+          "availability": {
+            "enum": [
+              "priced",
+              "unavailable"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "currency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Currency"
+          },
+          "estimated_cost": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimated Cost"
+          },
+          "priced_model_steps": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Priced Model Steps"
+          },
+          "unpriced_model_steps": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unpriced Model Steps"
+          }
+        },
+        "required": [
+          "availability"
+        ],
+        "title": "PublishedStructuredJudgeCostV1",
+        "type": "object"
+      },
+      "PublishedStructuredJudgeCriterionV1": {
+        "additionalProperties": false,
+        "properties": {
+          "criterion_id": {
+            "title": "Criterion Id",
+            "type": "string"
+          },
+          "explanation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Explanation"
+          },
+          "explanation_state": {
+            "enum": [
+              "available",
+              "redacted",
+              "unavailable"
+            ],
+            "title": "Explanation State",
+            "type": "string"
+          },
+          "score": {
+            "title": "Score",
+            "type": "string"
+          },
+          "weight": {
+            "title": "Weight",
+            "type": "string"
+          }
+        },
+        "required": [
+          "criterion_id",
+          "weight",
+          "score",
+          "explanation",
+          "explanation_state"
+        ],
+        "title": "PublishedStructuredJudgeCriterionV1",
+        "type": "object"
+      },
+      "PublishedStructuredJudgeUsageV1": {
+        "additionalProperties": false,
+        "properties": {
+          "input_tokens": {
+            "pattern": "^(0|[1-9]\\d*)$",
+            "title": "Input Tokens",
+            "type": "string"
+          },
+          "model_steps": {
+            "maximum": 4096.0,
+            "minimum": 1.0,
+            "title": "Model Steps",
+            "type": "integer"
+          },
+          "output_tokens": {
+            "pattern": "^(0|[1-9]\\d*)$",
+            "title": "Output Tokens",
+            "type": "string"
+          },
+          "total_tokens": {
+            "pattern": "^(0|[1-9]\\d*)$",
+            "title": "Total Tokens",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_steps",
+          "input_tokens",
+          "output_tokens",
+          "total_tokens"
+        ],
+        "title": "PublishedStructuredJudgeUsageV1",
+        "type": "object"
+      },
+      "PublishedStructuredModelJudgeDetail": {
+        "additionalProperties": false,
+        "description": "Typed public judgment with no prompt, credentials, options, or private truth.",
+        "properties": {
+          "aggregate_score": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aggregate Score"
+          },
+          "candidate_route_relation": {
+            "enum": [
+              "independent_model",
+              "same_model"
+            ],
+            "title": "Candidate Route Relation",
+            "type": "string"
+          },
+          "cost": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublishedStructuredJudgeCostV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "criteria": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/PublishedStructuredJudgeCriterionV1"
+            },
+            "maxItems": 8,
+            "title": "Criteria",
+            "type": "array"
+          },
+          "diagnostic": {
+            "enum": [
+              "judgment_recorded",
+              "evaluator_error",
+              "evidence_unavailable"
+            ],
+            "title": "Diagnostic",
+            "type": "string"
+          },
+          "evidence": {
+            "$ref": "#/components/schemas/EvalJudgeEvidenceSelectionV1"
+          },
+          "judge_profile": {
+            "$ref": "#/components/schemas/JudgeProfileIdentityV1"
+          },
+          "kind": {
+            "const": "structured_model_judge",
+            "default": "structured_model_judge",
+            "title": "Kind",
+            "type": "string"
+          },
+          "reference": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublishedJudgeReferenceIdentityV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rubric_id": {
+            "title": "Rubric Id",
+            "type": "string"
+          },
+          "rubric_revision": {
+            "title": "Rubric Revision",
+            "type": "string"
+          },
+          "threshold": {
+            "title": "Threshold",
+            "type": "string"
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublishedStructuredJudgeUsageV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "judge_profile",
+          "candidate_route_relation",
+          "rubric_id",
+          "rubric_revision",
+          "threshold",
+          "evidence",
+          "diagnostic"
+        ],
+        "title": "PublishedStructuredModelJudgeDetail",
         "type": "object"
       },
       "PublishedToolCalledDetail": {
@@ -17597,7 +18304,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "30",
+            "default": "31",
             "title": "Contract Version",
             "type": "string"
           },
@@ -18681,6 +19388,85 @@
         "title": "StoreManifest",
         "type": "object"
       },
+      "StructuredModelJudgeAssertionSpec": {
+        "additionalProperties": false,
+        "description": "Typed rubric judgment bound to an exact trusted server profile.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "evidence": {
+            "$ref": "#/components/schemas/EvalJudgeEvidenceSelectionV1"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "judge_profile_key": {
+            "title": "Judge Profile Key",
+            "type": "string"
+          },
+          "judge_profile_revision": {
+            "title": "Judge Profile Revision",
+            "type": "string"
+          },
+          "kind": {
+            "const": "structured_model_judge",
+            "default": "structured_model_judge",
+            "title": "Kind",
+            "type": "string"
+          },
+          "reference": {
+            "anyOf": [
+              {
+                "discriminator": {
+                  "mapping": {
+                    "private_reference": "#/components/schemas/PrivateJudgeReferenceV1",
+                    "public_reference": "#/components/schemas/PublicJudgeReferenceV1"
+                  },
+                  "propertyName": "kind"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/PublicJudgeReferenceV1"
+                  },
+                  {
+                    "$ref": "#/components/schemas/PrivateJudgeReferenceV1"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference"
+          },
+          "rubric": {
+            "$ref": "#/components/schemas/StructuredRubricV1"
+          },
+          "threshold": {
+            "default": "0.5",
+            "title": "Threshold",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "judge_profile_key",
+          "judge_profile_revision",
+          "rubric"
+        ],
+        "title": "StructuredModelJudgeAssertionSpec",
+        "type": "object"
+      },
       "StructuredOutputSpec": {
         "additionalProperties": false,
         "description": "Provider-neutral JSON structured output requirement.",
@@ -18737,6 +19523,72 @@
         ],
         "title": "StructuredOutputStrategy",
         "type": "string"
+      },
+      "StructuredRubricCriterionV1": {
+        "additionalProperties": false,
+        "description": "One stable, weighted dimension that Cayu\u2014not the judge\u2014aggregates.",
+        "properties": {
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "weight": {
+            "title": "Weight",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "weight"
+        ],
+        "title": "StructuredRubricCriterionV1",
+        "type": "object"
+      },
+      "StructuredRubricV1": {
+        "additionalProperties": false,
+        "description": "Content-addressed rubric with an exact, deterministic weight partition.",
+        "properties": {
+          "criteria": {
+            "items": {
+              "$ref": "#/components/schemas/StructuredRubricCriterionV1"
+            },
+            "maxItems": 8,
+            "minItems": 1,
+            "title": "Criteria",
+            "type": "array"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "revision",
+          "criteria"
+        ],
+        "title": "StructuredRubricV1",
+        "type": "object"
       },
       "SystemDeploymentDiagnostics": {
         "additionalProperties": false,
@@ -21656,7 +22508,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "30",
+            "default": "31",
             "title": "Contract Version",
             "type": "string"
           }

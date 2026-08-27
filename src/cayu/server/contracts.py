@@ -31,7 +31,7 @@ from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_CASES,
     EVAL_CORPUS_MAX_TIMEOUT_SECONDS,
     EVAL_CORPUS_MAX_TRIALS,
-    AssertionSpec,
+    JudgeProfileIdentityV1,
     RunInputSpec,
     TrialRequestSpec,
 )
@@ -69,6 +69,7 @@ from cayu.evals.store import (
     EvalScenarioCatalogEntry,
 )
 from cayu.evals.suite_authoring import (
+    EvalSuiteAuthoringAssertionSpecV1,
     EvalSuiteDocumentV1,
     EvalSuiteDraftV1,
     EvalSuiteSelectionV1,
@@ -1037,6 +1038,7 @@ class EvalTargetCatalogEntry(ApiBaseModel):
     max_steps: StrictInt = Field(ge=1, le=256)
     cost_budget_available: StrictBool
     cost_budget_currencies: tuple[StrictStr, ...] = Field(max_length=32)
+    judge_profiles: tuple[JudgeProfileIdentityV1, ...] = Field(default=(), max_length=32)
     execution_profile_ready: StrictBool
     execution_profile: EvalExecutionProfileV1 | None
     execution_profile_diagnostics: tuple[EvalExecutionProfileDiagnostic, ...] = Field(max_length=4)
@@ -1074,6 +1076,17 @@ class EvalTargetCatalogEntry(ApiBaseModel):
         if validated != tuple(sorted(set(validated))):
             raise ValueError("Cost-budget currencies must be unique and sorted.")
         return validated
+
+    @field_validator("judge_profiles")
+    @classmethod
+    def validate_judge_profiles(
+        cls,
+        value: tuple[JudgeProfileIdentityV1, ...],
+    ) -> tuple[JudgeProfileIdentityV1, ...]:
+        keys = tuple(profile.key for profile in value)
+        if keys != tuple(sorted(set(keys))):
+            raise ValueError("Judge profiles must be unique and sorted by key.")
+        return value
 
     @model_validator(mode="after")
     def validate_cost_budget_availability(self) -> EvalTargetCatalogEntry:
@@ -1281,7 +1294,7 @@ class EvaluationPromotionCaseDraft(ApiBaseModel):
     name: StrictStr = Field(min_length=1, max_length=256)
     description: StrictStr | None = Field(default=None, min_length=1, max_length=2_048)
     input: RunInputSpec
-    assertions: tuple[AssertionSpec, ...] = Field(
+    assertions: tuple[EvalSuiteAuthoringAssertionSpecV1, ...] = Field(
         min_length=1,
         max_length=EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     )
@@ -1344,7 +1357,7 @@ class CapturedEvaluationCaseDraft(ApiBaseModel):
     suite_id: PromotionPortableId
     name: StrictStr = Field(min_length=1, max_length=256)
     description: StrictStr | None = Field(default=None, min_length=1, max_length=2_048)
-    assertions: tuple[AssertionSpec, ...] = Field(
+    assertions: tuple[EvalSuiteAuthoringAssertionSpecV1, ...] = Field(
         min_length=1,
         max_length=EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     )
@@ -1363,7 +1376,7 @@ class CapturedEvaluationPreviewRequest(ApiBaseModel):
 
 
 class CapturedEvaluationConversion(ApiBaseModel):
-    """Independent corpus-v1 conversion availability for this source session."""
+    """Independent corpus-v2 conversion availability for this source session."""
 
     available: StrictBool
     reason_code: StrictStr | None = Field(default=None, max_length=128)

@@ -198,7 +198,7 @@ test("eval catalog adapters select only server-published target keys", async () 
 test("eval corpus imports preserve the selected file bytes for strict server validation", async () => {
   const originalFetch = globalThis.fetch
   const prefix = new TextEncoder().encode(
-    '{"schema_version":2,"schema_version":1,"revision":"sha256:corpus",' +
+    '{"schema_version":1,"schema_version":2,"revision":"sha256:corpus",' +
       '"target_key":"target","evidence_policy":{},"description":"',
   )
   const suffix = new TextEncoder().encode('","suites":[],"cases":[]}')

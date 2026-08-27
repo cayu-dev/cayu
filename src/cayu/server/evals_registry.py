@@ -16,6 +16,7 @@ from cayu.evals.execution import (
     CorpusExecutionLimits,
     CorpusTarget,
     evaluation_target_identity,
+    model_judge_profile,
 )
 from cayu.evals.execution_profiles import (
     EvalExecutionProfilePolicyV1,
@@ -608,6 +609,7 @@ def generated_eval_target_registry(
             max_steps=target.request_base.max_steps,
             cost_budget_available=bool(cost_budget_currencies),
             cost_budget_currencies=cost_budget_currencies,
+            judge_profiles=(),
             execution_profile_ready=False,
             execution_profile=None,
             execution_profile_diagnostics=(
@@ -656,6 +658,12 @@ def explicit_eval_target_registry(
         max_steps=target.request_base.max_steps,
         cost_budget_available=bool(cost_budget_currencies),
         cost_budget_currencies=cost_budget_currencies,
+        judge_profiles=tuple(
+            sorted(
+                (model_judge_profile(judge) for judge in target.model_judges),
+                key=lambda profile: profile.key,
+            )
+        ),
         execution_profile_ready=False,
         execution_profile=None,
         execution_profile_diagnostics=(EvalExecutionProfileDiagnostic.for_code("not_resolved"),),

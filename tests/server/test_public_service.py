@@ -2463,6 +2463,7 @@ def test_maintained_service_uses_the_same_generated_eval_target_registry(tmp_pat
                     "max_steps": 16,
                     "cost_budget_available": False,
                     "cost_budget_currencies": [],
+                    "judge_profiles": [],
                     "execution_profile_ready": True,
                     "execution_profile": execution_profile,
                     "execution_profile_diagnostics": [],

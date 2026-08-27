@@ -9,6 +9,7 @@ import tempfile
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import suppress
+from decimal import Context, Decimal, localcontext
 from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeAlias, TypeVar
@@ -40,7 +41,7 @@ from cayu._validation import (
 from cayu.evals.models import EvalCaseContractV1, EvalRunContractV1
 from cayu.runtime.costs import PriceBook
 
-EVAL_CORPUS_SCHEMA_VERSION = 1
+EVAL_CORPUS_SCHEMA_VERSION = 2
 EVALUATION_EVIDENCE_POLICY_SCHEMA_VERSION = 1
 PRICING_PROFILE_IDENTITY_SCHEMA_VERSION = 1
 PRICING_PROFILE_SEMANTICS_VERSION = 1
@@ -52,6 +53,7 @@ EVALUATION_SOURCE_IDENTITY_SCHEMA_VERSION = 1
 _MODEL_JUDGE_RESOLVED_IMPLEMENTATION_REVISION_METADATA_KEY = (
     "cayu.model_judge.resolved_implementation_revision"
 )
+_STRUCTURED_MODEL_JUDGE_RESULT_METADATA_KEY = "cayu.structured_model_judge.result"
 
 EVAL_CORPUS_MAX_BYTES = 8 << 20
 EVAL_CORPUS_MAX_SUITES = 64
@@ -68,6 +70,14 @@ EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS = 262_144
 EVAL_CORPUS_MAX_FINAL_OUTPUT_ASSERTION_CHARS = 65_536
 EVAL_CORPUS_MAX_JUDGE_RUBRIC_CHARS = 16_384
 EVAL_CORPUS_MAX_JUDGE_RUBRIC_VERSION_CHARS = 256
+EVAL_CORPUS_MAX_JUDGE_CRITERIA = 8
+EVAL_CORPUS_MAX_JUDGE_CRITERION_NAME_CHARS = 128
+EVAL_CORPUS_MAX_JUDGE_CRITERION_DESCRIPTION_CHARS = 2_048
+EVAL_CORPUS_MAX_JUDGE_EXPLANATION_CHARS = 2_048
+EVAL_CORPUS_MAX_JUDGE_REFERENCE_ANSWER_CHARS = 65_536
+EVAL_CORPUS_MAX_JUDGE_REFERENCE_FACTS = 64
+EVAL_CORPUS_MAX_JUDGE_REFERENCE_FACT_CHARS = 2_048
+EVAL_CORPUS_MAX_PUBLISHED_JUDGE_EXPLANATION_CHARS = 2 << 20
 EVAL_CORPUS_MAX_TOOL_NAMES = 256
 EVAL_CORPUS_MAX_TRIALS = 100
 EVAL_CORPUS_MAX_TIMEOUT_SECONDS = 3_600
@@ -90,6 +100,7 @@ _CANONICAL_NONNEGATIVE_DECIMAL_PATTERN = re.compile(
     r"(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?\Z",
     re.ASCII,
 )
+_STRUCTURED_JUDGE_DECIMAL_CONTEXT = Context(prec=64)
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
@@ -216,6 +227,25 @@ def _canonical_decimal_text(
             f"`{field_name}` must use canonical decimal notation for a non-negative value."
         )
     return value
+
+
+def _exact_decimal_sum(values: Iterable[Decimal]) -> Decimal:
+    """Add bounded structured-judge decimals independently of ambient context."""
+
+    with localcontext(_STRUCTURED_JUDGE_DECIMAL_CONTEXT):
+        return sum(values, Decimal(0))
+
+
+def _exact_weighted_decimal(
+    values: Iterable[tuple[str, Decimal]],
+) -> Decimal:
+    """Multiply and add bounded structured scores without contextual rounding."""
+
+    with localcontext(_STRUCTURED_JUDGE_DECIMAL_CONTEXT):
+        return sum(
+            (Decimal(weight) * score for weight, score in values),
+            Decimal(0),
+        )
 
 
 def _ordered_sequence_input(
@@ -529,6 +559,430 @@ class ModelJudgeAssertionSpec(_AssertionSpecBase):
         )
 
 
+def _unit_interval_decimal_text(value: str, field_name: str) -> str:
+    value = _canonical_decimal_text(value, field_name, max_chars=20)
+    if Decimal(value) > 1:
+        raise ValueError(f"`{field_name}` must be between 0 and 1.")
+    return value
+
+
+class StructuredRubricCriterionV1(_PortableModel):
+    """One stable, weighted dimension that Cayu—not the judge—aggregates."""
+
+    id: StrictStr
+    name: StrictStr
+    description: StrictStr
+    weight: StrictStr
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=EVAL_CORPUS_MAX_JUDGE_CRITERION_NAME_CHARS,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=EVAL_CORPUS_MAX_JUDGE_CRITERION_DESCRIPTION_CHARS,
+            nonblank=True,
+            clean=False,
+        )
+
+    @field_validator("weight")
+    @classmethod
+    def validate_weight(cls, value: str, info) -> str:
+        return _unit_interval_decimal_text(value, info.field_name)
+
+
+class StructuredRubricV1(_SchemaV1PortableModel):
+    """Content-addressed rubric with an exact, deterministic weight partition."""
+
+    id: StrictStr
+    revision: StrictStr
+    criteria: tuple[StructuredRubricCriterionV1, ...] = Field(
+        min_length=1,
+        max_length=EVAL_CORPUS_MAX_JUDGE_CRITERIA,
+    )
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("revision")
+    @classmethod
+    def validate_revision_shape(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("criteria", mode="before")
+    @classmethod
+    def validate_criteria_are_ordered(cls, value: object, info) -> object:
+        return _ordered_sequence_input(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> StructuredRubricV1:
+        criterion_ids = tuple(criterion.id for criterion in self.criteria)
+        if len(criterion_ids) != len(set(criterion_ids)):
+            raise ValueError("Structured rubric criterion IDs must be unique.")
+        if _exact_decimal_sum(Decimal(criterion.weight) for criterion in self.criteria) != 1:
+            raise ValueError("Structured rubric criterion weights must sum exactly to 1.")
+        if self.revision != _model_content_revision(self, "structured rubric"):
+            raise ValueError("Structured rubric revision does not match its content.")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        id: str,
+        criteria: Sequence[StructuredRubricCriterionV1],
+    ) -> StructuredRubricV1:
+        ordered = _ordered_sequence_argument(criteria, "criteria")
+        validated: list[StructuredRubricCriterionV1] = []
+        for criterion in ordered:
+            if type(criterion) is not StructuredRubricCriterionV1:
+                raise TypeError(
+                    "criteria must contain exact StructuredRubricCriterionV1 instances."
+                )
+            validated.append(
+                StructuredRubricCriterionV1.model_validate(_model_python_input(criterion))
+            )
+        document = {
+            "schema_version": 1,
+            "id": id,
+            "criteria": [criterion.model_dump(mode="json") for criterion in validated],
+        }
+        return cls(
+            revision=_content_revision(document, "structured rubric"),
+            id=id,
+            criteria=tuple(validated),
+        )
+
+
+class EvalJudgeEvidenceSelectionV1(_SchemaV1PortableModel):
+    """Candidate evidence a public judge profile is requested to receive."""
+
+    include_final_output: Literal[True] = True
+    include_transcript: StrictBool = False
+
+    @field_validator("include_final_output", mode="before")
+    @classmethod
+    def validate_final_output_type(cls, value: object) -> object:
+        if type(value) is not bool or value is not True:
+            raise ValueError("include_final_output must be true.")
+        return value
+
+
+class PublicJudgeReferenceV1(_SchemaV1PortableModel):
+    """Evaluator-only, deliberately portable reference truth."""
+
+    kind: Literal["public_reference"] = "public_reference"
+    id: StrictStr
+    revision: StrictStr
+    expected_answer: StrictStr | None = None
+    expected_facts: tuple[StrictStr, ...] = Field(
+        default=(),
+        max_length=EVAL_CORPUS_MAX_JUDGE_REFERENCE_FACTS,
+    )
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("revision")
+    @classmethod
+    def validate_revision_shape(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("expected_answer")
+    @classmethod
+    def validate_expected_answer(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=EVAL_CORPUS_MAX_JUDGE_REFERENCE_ANSWER_CHARS,
+            nonblank=True,
+            clean=False,
+        )
+
+    @field_validator("expected_facts", mode="before")
+    @classmethod
+    def validate_expected_facts(cls, value: object, info) -> tuple[str, ...]:
+        ordered = _ordered_sequence_input(value, info.field_name)
+        return tuple(
+            _bounded_durable_text(
+                fact,
+                f"{info.field_name}[{index}]",
+                max_chars=EVAL_CORPUS_MAX_JUDGE_REFERENCE_FACT_CHARS,
+                nonblank=True,
+                clean=False,
+            )
+            for index, fact in enumerate(ordered)
+        )
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> PublicJudgeReferenceV1:
+        if self.expected_answer is None and not self.expected_facts:
+            raise ValueError("A public judge reference requires an answer or expected facts.")
+        if self.revision != _model_content_revision(self, "public judge reference"):
+            raise ValueError("Public judge reference revision does not match its content.")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        id: str,
+        expected_answer: str | None = None,
+        expected_facts: Sequence[str] = (),
+    ) -> PublicJudgeReferenceV1:
+        ordered_facts = _ordered_sequence_argument(expected_facts, "expected_facts")
+        document = {
+            "schema_version": 1,
+            "kind": "public_reference",
+            "id": id,
+            "expected_answer": expected_answer,
+            "expected_facts": list(ordered_facts),
+        }
+        return cls(
+            revision=_content_revision(document, "public judge reference"),
+            id=id,
+            expected_answer=expected_answer,
+            expected_facts=tuple(ordered_facts),
+        )
+
+
+class PrivateJudgeReferenceV1(_SchemaV1PortableModel):
+    """Authority-free identity for evaluator truth retained only by the server."""
+
+    kind: Literal["private_reference"] = "private_reference"
+    key: StrictStr
+    revision: StrictStr
+    privacy_policy_key: StrictStr
+    privacy_policy_revision: StrictStr
+
+    @field_validator("key", "privacy_policy_key")
+    @classmethod
+    def validate_ids(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("revision", "privacy_policy_revision")
+    @classmethod
+    def validate_revisions(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+
+JudgeReferenceV1: TypeAlias = Annotated[
+    PublicJudgeReferenceV1 | PrivateJudgeReferenceV1,
+    Field(discriminator="kind"),
+]
+
+
+class JudgePrivacyPolicyV1(_SchemaV1PortableModel):
+    """Public identity of the server policy controlling evaluator-only data."""
+
+    key: StrictStr
+    revision: StrictStr
+    allow_transcript: StrictBool = False
+    allow_public_reference: StrictBool = True
+    allow_private_reference: StrictBool = False
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("revision")
+    @classmethod
+    def validate_revision_shape(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> JudgePrivacyPolicyV1:
+        if self.revision != _model_content_revision(self, "judge privacy policy"):
+            raise ValueError("Judge privacy policy revision does not match its content.")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        key: str,
+        allow_transcript: bool = False,
+        allow_public_reference: bool = True,
+        allow_private_reference: bool = False,
+    ) -> JudgePrivacyPolicyV1:
+        document = {
+            "schema_version": 1,
+            "key": key,
+            "allow_transcript": allow_transcript,
+            "allow_public_reference": allow_public_reference,
+            "allow_private_reference": allow_private_reference,
+        }
+        return cls(revision=_content_revision(document, "judge privacy policy"), **document)
+
+    @classmethod
+    def public_only(cls) -> JudgePrivacyPolicyV1:
+        return cls.create(key="public-only")
+
+
+class JudgeProfileIdentityV1(_SchemaV1PortableModel):
+    """Safe, immutable public snapshot of one trusted model-judge route."""
+
+    key: StrictStr
+    revision: StrictStr
+    label: StrictStr
+    provider_name: StrictStr
+    model: StrictStr
+    implementation_revision: StrictStr
+    allowed_evidence: tuple[
+        Literal["final_output", "transcript", "public_reference", "private_reference"], ...
+    ] = Field(min_length=1, max_length=4)
+    timeout_seconds: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TIMEOUT_SECONDS)
+    max_input_tokens: StrictInt = Field(ge=1, le=EVIDENCE_MAX_TOTAL_TOKENS)
+    max_output_tokens: StrictInt = Field(ge=1, le=EVIDENCE_MAX_TOTAL_TOKENS)
+    max_total_tokens: StrictInt = Field(ge=1, le=EVIDENCE_MAX_TOTAL_TOKENS)
+    max_estimated_cost: StrictStr | None = None
+    cost_currency: StrictStr | None = None
+    pricing_profile_fingerprint: StrictStr | None = None
+    privacy_policy_key: StrictStr
+    privacy_policy_revision: StrictStr
+    same_model_use: Literal["forbidden", "allowed_and_labeled"] = "forbidden"
+
+    @field_validator("key", "privacy_policy_key")
+    @classmethod
+    def validate_ids(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("revision", "implementation_revision", "privacy_policy_revision")
+    @classmethod
+    def validate_revisions(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("label", "provider_name", "model")
+    @classmethod
+    def validate_public_text(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=512,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("allowed_evidence", mode="before")
+    @classmethod
+    def validate_allowed_evidence_order(cls, value: object, info) -> object:
+        return _ordered_sequence_input(value, info.field_name)
+
+    @field_validator("max_estimated_cost")
+    @classmethod
+    def validate_max_estimated_cost(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        value = _canonical_decimal_text(value, info.field_name)
+        if Decimal(value) <= 0:
+            raise ValueError("max_estimated_cost must be greater than zero.")
+        return value
+
+    @field_validator("cost_currency")
+    @classmethod
+    def validate_cost_currency(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        value = _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=16,
+            nonblank=True,
+            clean=True,
+        )
+        if _CURRENCY_PATTERN.fullmatch(value) is None:
+            raise ValueError("cost_currency must be a portable uppercase identifier.")
+        return value
+
+    @field_validator("pricing_profile_fingerprint")
+    @classmethod
+    def validate_pricing_fingerprint(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _sha256_revision(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> JudgeProfileIdentityV1:
+        canonical_evidence = tuple(
+            item
+            for item in (
+                "final_output",
+                "transcript",
+                "public_reference",
+                "private_reference",
+            )
+            if item in self.allowed_evidence
+        )
+        if self.allowed_evidence != canonical_evidence:
+            raise ValueError("allowed_evidence must be unique and canonically ordered.")
+        if self.allowed_evidence[0] != "final_output":
+            raise ValueError("Judge profiles must allow final-output evidence.")
+        if self.max_total_tokens < max(self.max_input_tokens, self.max_output_tokens):
+            raise ValueError("max_total_tokens cannot be below an individual token ceiling.")
+        cost_fields = (
+            self.max_estimated_cost,
+            self.cost_currency,
+            self.pricing_profile_fingerprint,
+        )
+        if any(item is None for item in cost_fields) and any(
+            item is not None for item in cost_fields
+        ):
+            raise ValueError("Judge-profile cost ceilings require complete pricing identity.")
+        if self.revision != _model_content_revision(self, "judge profile identity"):
+            raise ValueError("Judge profile revision does not match its content.")
+        return self
+
+
+class StructuredModelJudgeAssertionSpec(_AssertionSpecBase):
+    """Typed rubric judgment bound to an exact trusted server profile."""
+
+    kind: Literal["structured_model_judge"] = "structured_model_judge"
+    judge_profile_key: StrictStr
+    judge_profile_revision: StrictStr
+    rubric: StructuredRubricV1
+    reference: JudgeReferenceV1 | None = None
+    threshold: StrictStr = "0.5"
+    evidence: EvalJudgeEvidenceSelectionV1 = Field(default_factory=EvalJudgeEvidenceSelectionV1)
+
+    @field_validator("judge_profile_key")
+    @classmethod
+    def validate_judge_profile_key(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("judge_profile_revision")
+    @classmethod
+    def validate_judge_profile_revision(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("threshold")
+    @classmethod
+    def validate_threshold(cls, value: str, info) -> str:
+        return _unit_interval_decimal_text(value, info.field_name)
+
+
 AssertionSpec: TypeAlias = Annotated[
     RootStatusAssertionSpec
     | ChildStatusAssertionSpec
@@ -541,7 +995,8 @@ AssertionSpec: TypeAlias = Annotated[
     | UsageRecordedAssertionSpec
     | MaxTotalTokensAssertionSpec
     | MaxEstimatedCostAssertionSpec
-    | ModelJudgeAssertionSpec,
+    | ModelJudgeAssertionSpec
+    | StructuredModelJudgeAssertionSpec,
     Field(discriminator="kind"),
 ]
 
@@ -558,6 +1013,7 @@ _ASSERTION_SPEC_TYPES = (
     MaxTotalTokensAssertionSpec,
     MaxEstimatedCostAssertionSpec,
     ModelJudgeAssertionSpec,
+    StructuredModelJudgeAssertionSpec,
 )
 
 
@@ -897,7 +1353,7 @@ class EvalCaseSpec(_PortableModel):
     """One deterministic expectation set with optional fresh-run input.
 
     Captured-session evaluations intentionally set ``input`` to ``None`` when
-    the retained evidence cannot be represented as one corpus-v1 invocation.
+    the retained evidence cannot be represented as one corpus-v2 invocation.
     Such cases remain portable historical evaluation contracts, but execution
     rejects them until a runnable input or scenario is authored.
     """
@@ -1003,10 +1459,10 @@ class EvalCaseSpec(_PortableModel):
         return cls(revision=_content_revision(document, "eval case spec"), **document)
 
 
-class EvalCorpusDocument(_SchemaV1PortableModel):
+class EvalCorpusDocument(_SchemaV2PortableModel):
     """One canonical, authority-free corpus for exactly one trusted target key."""
 
-    schema_version: Literal[1] = EVAL_CORPUS_SCHEMA_VERSION
+    schema_version: Literal[2] = EVAL_CORPUS_SCHEMA_VERSION
     revision: StrictStr
     target_key: StrictStr
     evidence_policy: EvaluationEvidencePolicySpec
@@ -1057,8 +1513,15 @@ class EvalCorpusDocument(_SchemaV1PortableModel):
             )
         trials_by_suite = {suite.id: suite.trial_request.trials for suite in self.suites}
         published_results_by_suite: Counter[str] = Counter()
+        published_judge_explanation_slots_by_suite: Counter[str] = Counter()
         for case in self.cases:
             published_results_by_suite[case.suite_id] += len(case.assertions)
+            published_judge_explanation_slots_by_suite[case.suite_id] += sum(
+                len(assertion.rubric.criteria)
+                for assertion in case.assertions
+                if type(assertion) is StructuredModelJudgeAssertionSpec
+                and type(assertion.reference) is not PrivateJudgeReferenceV1
+            )
         for suite_id, assertions_per_trial in published_results_by_suite.items():
             published_results = assertions_per_trial * trials_by_suite[suite_id]
             if published_results > EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_RESULTS:
@@ -1066,6 +1529,17 @@ class EvalCorpusDocument(_SchemaV1PortableModel):
                     f"Eval suite {suite_id!r} expands to {published_results} published assertion "
                     "results; the maximum is "
                     f"{EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_RESULTS}."
+                )
+            explanation_chars = (
+                published_judge_explanation_slots_by_suite[suite_id]
+                * trials_by_suite[suite_id]
+                * EVAL_CORPUS_MAX_JUDGE_EXPLANATION_CHARS
+            )
+            if explanation_chars > EVAL_CORPUS_MAX_PUBLISHED_JUDGE_EXPLANATION_CHARS:
+                raise ValueError(
+                    f"Eval suite {suite_id!r} permits {explanation_chars} published judge "
+                    "explanation characters; the maximum is "
+                    f"{EVAL_CORPUS_MAX_PUBLISHED_JUDGE_EXPLANATION_CHARS}."
                 )
         cost_currencies = {
             assertion.currency
@@ -1204,7 +1678,7 @@ def _eval_run_contract_for_validated_corpus(
 
 
 def eval_corpus_to_json(corpus: EvalCorpusDocument) -> str:
-    """Return deterministic, human-readable corpus v1 JSON."""
+    """Return deterministic, human-readable corpus v2 JSON."""
 
     _, document = _validated_model_document(
         corpus,
@@ -1223,7 +1697,7 @@ def eval_corpus_to_json(corpus: EvalCorpusDocument) -> str:
 
 
 def eval_corpus_from_json(source: str) -> EvalCorpusDocument:
-    """Load one bounded corpus v1 JSON document from text."""
+    """Load one bounded corpus v2 JSON document from text."""
 
     if type(source) is not str:
         raise TypeError("eval_corpus_from_json requires text.")

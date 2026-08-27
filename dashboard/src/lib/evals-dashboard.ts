@@ -216,7 +216,7 @@ export function evalLaunchRequestIdentity(
   executionProfileRevision: string,
 ): string {
   return JSON.stringify([
-    "corpus-v1",
+    "corpus-v2",
     corpusRevision,
     suiteId,
     maxConcurrency,
@@ -331,8 +331,8 @@ export async function preflightEvalCorpusFile(file: Blob): Promise<void> {
     throw new Error("The selected file is not valid JSON.")
   }
 
-  if (!isRecord(parsed) || parsed.schema_version !== 1) {
-    throw new Error("The selected file is not a Cayu eval corpus v1 document.")
+  if (!isRecord(parsed) || parsed.schema_version !== 2) {
+    throw new Error("The selected file is not a Cayu eval corpus v2 document.")
   }
   if (
     typeof parsed.revision !== "string" ||

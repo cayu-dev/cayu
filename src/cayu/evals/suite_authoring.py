@@ -4,7 +4,7 @@ import json
 from collections import Counter
 from collections.abc import Sequence
 from functools import partial
-from typing import Annotated, Any, Literal, TypeAlias
+from typing import Annotated, Any, Literal, TypeAlias, cast
 
 from pydantic import Field, StrictStr, field_validator, model_validator
 
@@ -19,11 +19,22 @@ from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_BYTES,
     EVAL_CORPUS_MAX_CASES,
     EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_RESULTS,
-    AssertionSpec,
+    ChildStatusAssertionSpec,
     EvalSuiteSpec,
     EvaluationSourceIdentityV1,
+    FinalOutputContainsAssertionSpec,
+    FinalOutputEqualsAssertionSpec,
+    MaxEstimatedCostAssertionSpec,
+    MaxModelStepsAssertionSpec,
+    MaxToolCallsAssertionSpec,
+    MaxTotalTokensAssertionSpec,
+    ModelJudgeAssertionSpec,
+    RootStatusAssertionSpec,
     RunInputSpec,
+    ToolCalledAssertionSpec,
+    ToolsCalledInOrderAssertionSpec,
     TrialRequestSpec,
+    UsageRecordedAssertionSpec,
     _bounded_durable_text,
     _content_revision,
     _model_content_revision,
@@ -41,6 +52,26 @@ from cayu.evals.corpus import (
 EVAL_SUITE_AUTHORING_SCHEMA_VERSION = 1
 EVAL_SUITE_SELECTION_SCHEMA_VERSION = 1
 EVAL_SUITE_AUTHORING_MAX_BYTES = EVAL_CORPUS_MAX_BYTES
+
+
+# Suite authoring V1 has an already-published wire contract. Structured judge
+# authoring belongs to V2 (PR 05); keeping a separate union prevents the corpus
+# V2 addition from silently widening what V1 clients are expected to round-trip.
+EvalSuiteAuthoringAssertionSpecV1: TypeAlias = Annotated[
+    RootStatusAssertionSpec
+    | ChildStatusAssertionSpec
+    | FinalOutputEqualsAssertionSpec
+    | FinalOutputContainsAssertionSpec
+    | ToolCalledAssertionSpec
+    | ToolsCalledInOrderAssertionSpec
+    | MaxToolCallsAssertionSpec
+    | MaxModelStepsAssertionSpec
+    | UsageRecordedAssertionSpec
+    | MaxTotalTokensAssertionSpec
+    | MaxEstimatedCostAssertionSpec
+    | ModelJudgeAssertionSpec,
+    Field(discriminator="kind"),
+]
 
 
 class EvalSimpleInputStimulusV1(_PortableModel):
@@ -96,7 +127,7 @@ class _EvalCaseAuthoringMaterial(_PortableModel):
     description: StrictStr | None = None
     source: EvaluationSourceIdentityV1 | None = None
     stimulus: EvalCaseStimulusV1
-    assertions: tuple[AssertionSpec, ...] = Field(
+    assertions: tuple[EvalSuiteAuthoringAssertionSpecV1, ...] = Field(
         min_length=1,
         max_length=EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     )
@@ -156,9 +187,12 @@ class _EvalCaseAuthoringMaterial(_PortableModel):
     @classmethod
     def validate_assertions(
         cls,
-        value: tuple[AssertionSpec, ...],
-    ) -> tuple[AssertionSpec, ...]:
-        return tuple(_validated_assertion_spec(assertion) for assertion in value)
+        value: tuple[EvalSuiteAuthoringAssertionSpecV1, ...],
+    ) -> tuple[EvalSuiteAuthoringAssertionSpecV1, ...]:
+        return tuple(
+            cast("EvalSuiteAuthoringAssertionSpecV1", _validated_assertion_spec(assertion))
+            for assertion in value
+        )
 
     @model_validator(mode="after")
     def validate_assertion_ids(self):

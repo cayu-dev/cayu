@@ -2503,7 +2503,7 @@ export type CapabilityOperation = {
  * Editable assertion contract bound to coherent captured evidence only.
  */
 export type CapturedEvaluationCandidateV1 = {
-    case: EvalCaseSpec;
+    case: PromotionCaseV1;
     evidence: AssertionEvidenceView;
     evidence_policy: EvaluationEvidencePolicySpec;
     pricing_profile?: PricingProfileIdentityV1 | null;
@@ -2558,7 +2558,7 @@ export type CapturedEvaluationCaseDraft = {
 /**
  * CapturedEvaluationConversion
  *
- * Independent corpus-v1 conversion availability for this source session.
+ * Independent corpus-v2 conversion availability for this source session.
  */
 export type CapturedEvaluationConversion = {
     /**
@@ -4218,7 +4218,7 @@ export type EvalCaseDraftV1 = {
  * One deterministic expectation set with optional fresh-run input.
  *
  * Captured-session evaluations intentionally set ``input`` to ``None`` when
- * the retained evidence cannot be represented as one corpus-v1 invocation.
+ * the retained evidence cannot be represented as one corpus-v2 invocation.
  * Such cases remain portable historical evaluation contracts, but execution
  * rejects them until a runnable input or scenario is authored.
  */
@@ -4226,7 +4226,7 @@ export type EvalCaseSpec = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -4343,7 +4343,7 @@ export type EvalCorpusDocument = {
     /**
      * Schema Version
      */
-    schema_version?: 1;
+    schema_version?: 2;
     /**
      * Suites
      */
@@ -4553,6 +4553,26 @@ export type EvalExecutionTargetMaterialIdentityV1 = {
      * Process Scope
      */
     process_scope?: string | null;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+};
+
+/**
+ * EvalJudgeEvidenceSelectionV1
+ *
+ * Candidate evidence a public judge profile is requested to receive.
+ */
+export type EvalJudgeEvidenceSelectionV1 = {
+    /**
+     * Include Final Output
+     */
+    include_final_output?: true;
+    /**
+     * Include Transcript
+     */
+    include_transcript?: boolean;
     /**
      * Schema Version
      */
@@ -5835,6 +5855,10 @@ export type EvalTargetCatalogEntry = {
      */
     execution_profile_ready: boolean;
     /**
+     * Judge Profiles
+     */
+    judge_profiles?: Array<JudgeProfileIdentityV1>;
+    /**
      * Label
      */
     label: string;
@@ -6517,6 +6541,86 @@ export type InvocationOrigin = {
  * How Cayu obtained the root invocation identity.
  */
 export type InvocationOriginTrust = 'server_verified' | 'host_asserted' | 'unattributed';
+
+/**
+ * JudgeProfileIdentityV1
+ *
+ * Safe, immutable public snapshot of one trusted model-judge route.
+ */
+export type JudgeProfileIdentityV1 = {
+    /**
+     * Allowed Evidence
+     */
+    allowed_evidence: Array<'final_output' | 'transcript' | 'public_reference' | 'private_reference'>;
+    /**
+     * Cost Currency
+     */
+    cost_currency?: string | null;
+    /**
+     * Implementation Revision
+     */
+    implementation_revision: string;
+    /**
+     * Key
+     */
+    key: string;
+    /**
+     * Label
+     */
+    label: string;
+    /**
+     * Max Estimated Cost
+     */
+    max_estimated_cost?: string | null;
+    /**
+     * Max Input Tokens
+     */
+    max_input_tokens: number;
+    /**
+     * Max Output Tokens
+     */
+    max_output_tokens: number;
+    /**
+     * Max Total Tokens
+     */
+    max_total_tokens: number;
+    /**
+     * Model
+     */
+    model: string;
+    /**
+     * Pricing Profile Fingerprint
+     */
+    pricing_profile_fingerprint?: string | null;
+    /**
+     * Privacy Policy Key
+     */
+    privacy_policy_key: string;
+    /**
+     * Privacy Policy Revision
+     */
+    privacy_policy_revision: string;
+    /**
+     * Provider Name
+     */
+    provider_name: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Same Model Use
+     */
+    same_model_use?: 'forbidden' | 'allowed_and_labeled';
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Timeout Seconds
+     */
+    timeout_seconds: number;
+};
 
 /**
  * KnowledgeVisibility
@@ -7540,12 +7644,44 @@ export type PricingResourceMapping = {
 };
 
 /**
+ * PrivateJudgeReferenceV1
+ *
+ * Authority-free identity for evaluator truth retained only by the server.
+ */
+export type PrivateJudgeReferenceV1 = {
+    /**
+     * Key
+     */
+    key: string;
+    /**
+     * Kind
+     */
+    kind?: 'private_reference';
+    /**
+     * Privacy Policy Key
+     */
+    privacy_policy_key: string;
+    /**
+     * Privacy Policy Revision
+     */
+    privacy_policy_revision: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+};
+
+/**
  * PromotionCandidateV1
  *
  * One deterministic, editable case candidate and its public-safe evidence.
  */
 export type PromotionCandidateV1 = {
-    case: EvalCaseSpec;
+    case: PromotionCaseV1;
     evidence: AssertionEvidenceView;
     evidence_policy: EvaluationEvidencePolicySpec;
     pricing_profile?: PricingProfileIdentityV1 | null;
@@ -7567,6 +7703,40 @@ export type PromotionCandidateV1 = {
      * Warnings
      */
     warnings: Array<PromotionWarningCode>;
+};
+
+/**
+ * PromotionCaseV1
+ *
+ * Immutable corpus case restricted to the V1 promotion assertion surface.
+ */
+export type PromotionCaseV1 = {
+    /**
+     * Assertions
+     */
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    input: RunInputSpec | null;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    source: EvaluationSourceIdentityV1;
+    /**
+     * Suite Id
+     */
+    suite_id: string;
 };
 
 /**
@@ -7740,6 +7910,38 @@ export type ProviderStatePart = {
 };
 
 /**
+ * PublicJudgeReferenceV1
+ *
+ * Evaluator-only, deliberately portable reference truth.
+ */
+export type PublicJudgeReferenceV1 = {
+    /**
+     * Expected Answer
+     */
+    expected_answer?: string | null;
+    /**
+     * Expected Facts
+     */
+    expected_facts?: Array<string>;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'public_reference';
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+};
+
+/**
  * PublishedAssertionResult
  */
 export type PublishedAssertionResult = {
@@ -7782,7 +7984,9 @@ export type PublishedAssertionResult = {
         kind: 'max_estimated_cost';
     } & PublishedMaxEstimatedCostDetail) | ({
         kind: 'model_judge';
-    } & PublishedModelJudgeDetail);
+    } & PublishedModelJudgeDetail) | ({
+        kind: 'structured_model_judge';
+    } & PublishedStructuredModelJudgeDetail);
     /**
      * Message
      */
@@ -7884,7 +8088,7 @@ export type PublishedEvalRun = {
     /**
      * Schema Version
      */
-    schema_version: 3;
+    schema_version: 4;
     /**
      * Score
      */
@@ -7971,6 +8175,38 @@ export type PublishedFinalOutputEqualsDetail = {
      * Matched
      */
     matched?: boolean | null;
+};
+
+/**
+ * PublishedJudgeReferenceIdentityV1
+ *
+ * Safe reference identity; private evaluator truth is never represented.
+ */
+export type PublishedJudgeReferenceIdentityV1 = {
+    /**
+     * Availability
+     */
+    availability?: 'available';
+    /**
+     * Key
+     */
+    key: string;
+    /**
+     * Kind
+     */
+    kind: 'public_reference' | 'private_reference';
+    /**
+     * Privacy Policy Key
+     */
+    privacy_policy_key?: string | null;
+    /**
+     * Privacy Policy Revision
+     */
+    privacy_policy_revision?: string | null;
+    /**
+     * Revision
+     */
+    revision: string;
 };
 
 /**
@@ -8113,6 +8349,125 @@ export type PublishedRootStatusDetail = {
      * Kind
      */
     kind?: 'root_status';
+};
+
+/**
+ * PublishedStructuredJudgeCostV1
+ */
+export type PublishedStructuredJudgeCostV1 = {
+    /**
+     * Availability
+     */
+    availability: 'priced' | 'unavailable';
+    /**
+     * Currency
+     */
+    currency?: string | null;
+    /**
+     * Estimated Cost
+     */
+    estimated_cost?: string | null;
+    /**
+     * Priced Model Steps
+     */
+    priced_model_steps?: number | null;
+    /**
+     * Unpriced Model Steps
+     */
+    unpriced_model_steps?: number | null;
+};
+
+/**
+ * PublishedStructuredJudgeCriterionV1
+ */
+export type PublishedStructuredJudgeCriterionV1 = {
+    /**
+     * Criterion Id
+     */
+    criterion_id: string;
+    /**
+     * Explanation
+     */
+    explanation: string | null;
+    /**
+     * Explanation State
+     */
+    explanation_state: 'available' | 'redacted' | 'unavailable';
+    /**
+     * Score
+     */
+    score: string;
+    /**
+     * Weight
+     */
+    weight: string;
+};
+
+/**
+ * PublishedStructuredJudgeUsageV1
+ */
+export type PublishedStructuredJudgeUsageV1 = {
+    /**
+     * Input Tokens
+     */
+    input_tokens: string;
+    /**
+     * Model Steps
+     */
+    model_steps: number;
+    /**
+     * Output Tokens
+     */
+    output_tokens: string;
+    /**
+     * Total Tokens
+     */
+    total_tokens: string;
+};
+
+/**
+ * PublishedStructuredModelJudgeDetail
+ *
+ * Typed public judgment with no prompt, credentials, options, or private truth.
+ */
+export type PublishedStructuredModelJudgeDetail = {
+    /**
+     * Aggregate Score
+     */
+    aggregate_score?: string | null;
+    /**
+     * Candidate Route Relation
+     */
+    candidate_route_relation: 'independent_model' | 'same_model';
+    cost?: PublishedStructuredJudgeCostV1 | null;
+    /**
+     * Criteria
+     */
+    criteria?: Array<PublishedStructuredJudgeCriterionV1>;
+    /**
+     * Diagnostic
+     */
+    diagnostic: 'judgment_recorded' | 'evaluator_error' | 'evidence_unavailable';
+    evidence: EvalJudgeEvidenceSelectionV1;
+    judge_profile: JudgeProfileIdentityV1;
+    /**
+     * Kind
+     */
+    kind?: 'structured_model_judge';
+    reference?: PublishedJudgeReferenceIdentityV1 | null;
+    /**
+     * Rubric Id
+     */
+    rubric_id: string;
+    /**
+     * Rubric Revision
+     */
+    rubric_revision: string;
+    /**
+     * Threshold
+     */
+    threshold: string;
+    usage?: PublishedStructuredJudgeUsageV1 | null;
 };
 
 /**
@@ -9677,6 +10032,48 @@ export type StoreManifest = {
 };
 
 /**
+ * StructuredModelJudgeAssertionSpec
+ *
+ * Typed rubric judgment bound to an exact trusted server profile.
+ */
+export type StructuredModelJudgeAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    evidence?: EvalJudgeEvidenceSelectionV1;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Judge Profile Key
+     */
+    judge_profile_key: string;
+    /**
+     * Judge Profile Revision
+     */
+    judge_profile_revision: string;
+    /**
+     * Kind
+     */
+    kind?: 'structured_model_judge';
+    /**
+     * Reference
+     */
+    reference?: ({
+        kind: 'public_reference';
+    } & PublicJudgeReferenceV1) | ({
+        kind: 'private_reference';
+    } & PrivateJudgeReferenceV1) | null;
+    rubric: StructuredRubricV1;
+    /**
+     * Threshold
+     */
+    threshold?: string;
+};
+
+/**
  * StructuredOutputSpec
  *
  * Provider-neutral JSON structured output requirement.
@@ -9707,6 +10104,54 @@ export type StructuredOutputSpec = {
  * StructuredOutputStrategy
  */
 export type StructuredOutputStrategy = 'tool' | 'native';
+
+/**
+ * StructuredRubricCriterionV1
+ *
+ * One stable, weighted dimension that Cayu—not the judge—aggregates.
+ */
+export type StructuredRubricCriterionV1 = {
+    /**
+     * Description
+     */
+    description: string;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Weight
+     */
+    weight: string;
+};
+
+/**
+ * StructuredRubricV1
+ *
+ * Content-addressed rubric with an exact, deterministic weight partition.
+ */
+export type StructuredRubricV1 = {
+    /**
+     * Criteria
+     */
+    criteria: Array<StructuredRubricCriterionV1>;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+};
 
 /**
  * SystemDeploymentDiagnostics

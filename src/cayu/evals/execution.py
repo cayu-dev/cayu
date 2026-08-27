@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
 
@@ -9,6 +10,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictInt,
     StrictStr,
     field_validator,
@@ -25,11 +27,17 @@ from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_TIMEOUT_SECONDS,
     EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS,
     EVAL_CORPUS_MAX_TRIALS,
+    EVIDENCE_MAX_TOTAL_TOKENS,
     EvalCorpusDocument,
     EvaluationEvidencePolicySpec,
+    JudgePrivacyPolicyV1,
+    JudgeProfileIdentityV1,
     MaxEstimatedCostAssertionSpec,
     PricingProfileIdentityV1,
+    PrivateJudgeReferenceV1,
+    StructuredModelJudgeAssertionSpec,
     _bounded_durable_text,
+    _canonical_decimal_text,
     _content_revision,
     _model_content_revision,
     _model_python_input,
@@ -43,6 +51,7 @@ from cayu.evals.portable_assertions import (
     _compile_corpus_assertion_specs,
     _model_judge_implementation_revision,
     _trusted_model_judge_binding,
+    _TrustedPrivateJudgeReferenceBinding,
 )
 from cayu.evals.published import PublishedEvalRun, _publish_eval_run_with_trial_public_data
 from cayu.evals.result_contract import (
@@ -66,6 +75,8 @@ CORPUS_EXECUTION_MAX_REQUEST_BASE_BYTES = 64 << 10
 CORPUS_EXECUTION_RESULT_MAX_BYTES = 40 << 20
 CORPUS_EXECUTION_RESULT_SCHEMA_VERSION = 2
 CORPUS_EXECUTION_MAX_MODEL_JUDGES = 32
+MODEL_JUDGE_MAX_PRIVATE_REFERENCES = 256
+MODEL_JUDGE_MAX_PRIVATE_REFERENCE_CHARS = 65_536
 
 
 def _bootstrap_message_text(message: Message) -> str:
@@ -197,6 +208,89 @@ class EvaluationTargetIdentity(BaseModel):
         return self.app_manifest.fingerprint
 
 
+class PrivateJudgeReferenceTarget(BaseModel):
+    """Trusted evaluator-only reference content that never enters a corpus or result."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    key: StrictStr
+    revision: StrictStr
+    content: StrictStr = Field(repr=False)
+    privacy_policy_key: StrictStr
+    privacy_policy_revision: StrictStr
+
+    @field_validator("key", "privacy_policy_key")
+    @classmethod
+    def validate_ids(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("revision", "privacy_policy_revision")
+    @classmethod
+    def validate_revisions(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=MODEL_JUDGE_MAX_PRIVATE_REFERENCE_CHARS,
+            nonblank=True,
+            clean=False,
+        )
+
+    @model_validator(mode="after")
+    def validate_content_revision(self) -> PrivateJudgeReferenceTarget:
+        expected = _content_revision(
+            {
+                "key": self.key,
+                "content": self.content,
+                "privacy_policy_key": self.privacy_policy_key,
+                "privacy_policy_revision": self.privacy_policy_revision,
+            },
+            "private judge reference",
+        )
+        if self.revision != expected:
+            raise ValueError("Private judge reference revision does not match its content.")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        key: str,
+        content: str,
+        privacy_policy: JudgePrivacyPolicyV1,
+    ) -> PrivateJudgeReferenceTarget:
+        if type(privacy_policy) is not JudgePrivacyPolicyV1:
+            raise TypeError("privacy_policy must be an exact JudgePrivacyPolicyV1.")
+        validated_policy = JudgePrivacyPolicyV1.model_validate(_model_python_input(privacy_policy))
+        document = {
+            "key": key,
+            "content": content,
+            "privacy_policy_key": validated_policy.key,
+            "privacy_policy_revision": validated_policy.revision,
+        }
+        return cls(
+            revision=_content_revision(document, "private judge reference"),
+            **document,
+        )
+
+    def portable_identity(self) -> PrivateJudgeReferenceV1:
+        return PrivateJudgeReferenceV1(
+            key=self.key,
+            revision=self.revision,
+            privacy_policy_key=self.privacy_policy_key,
+            privacy_policy_revision=self.privacy_policy_revision,
+        )
+
+
 class ModelJudgeTarget(BaseModel):
     """Trusted local execution authority for one portable evaluator key."""
 
@@ -211,6 +305,32 @@ class ModelJudgeTarget(BaseModel):
     key: StrictStr
     app: CayuApp
     agent_name: StrictStr
+    label: StrictStr | None = None
+    privacy_policy: JudgePrivacyPolicyV1 = Field(default_factory=JudgePrivacyPolicyV1.public_only)
+    private_references: tuple[PrivateJudgeReferenceTarget, ...] = Field(
+        default=(),
+        max_length=MODEL_JUDGE_MAX_PRIVATE_REFERENCES,
+    )
+    timeout_seconds: StrictInt = Field(default=120, ge=1, le=EVAL_CORPUS_MAX_TIMEOUT_SECONDS)
+    max_input_tokens: StrictInt = Field(
+        default=32_768,
+        ge=1,
+        le=EVIDENCE_MAX_TOTAL_TOKENS,
+    )
+    max_output_tokens: StrictInt = Field(
+        default=4_096,
+        ge=1,
+        le=EVIDENCE_MAX_TOTAL_TOKENS,
+    )
+    max_total_tokens: StrictInt = Field(
+        default=36_864,
+        ge=1,
+        le=EVIDENCE_MAX_TOTAL_TOKENS,
+    )
+    max_estimated_cost: StrictStr | None = None
+    cost_currency: StrictStr = "USD"
+    price_book: PriceBook | None = None
+    allow_same_model: StrictBool = False
 
     @field_validator("key")
     @classmethod
@@ -235,9 +355,119 @@ class ModelJudgeTarget(BaseModel):
             clean=True,
         )
 
+    @field_validator("label")
+    @classmethod
+    def validate_label(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=256,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("privacy_policy", mode="before")
+    @classmethod
+    def copy_privacy_policy(cls, value: object) -> JudgePrivacyPolicyV1:
+        if type(value) is not JudgePrivacyPolicyV1:
+            raise TypeError("privacy_policy must be an exact JudgePrivacyPolicyV1.")
+        return JudgePrivacyPolicyV1.model_validate(_model_python_input(value))
+
+    @field_validator("private_references", mode="before")
+    @classmethod
+    def copy_private_references(cls, value: object) -> tuple[PrivateJudgeReferenceTarget, ...]:
+        if not isinstance(value, list | tuple):
+            raise TypeError("private_references must be an ordered list or tuple.")
+        copied: list[PrivateJudgeReferenceTarget] = []
+        for reference in value:
+            if type(reference) is not PrivateJudgeReferenceTarget:
+                raise TypeError(
+                    "private_references must contain exact PrivateJudgeReferenceTarget values."
+                )
+            copied.append(PrivateJudgeReferenceTarget.model_validate(reference.model_dump()))
+        keys = tuple(reference.key for reference in copied)
+        if len(keys) != len(set(keys)):
+            raise ValueError("Private judge reference keys must be unique.")
+        return tuple(copied)
+
+    @field_validator("max_estimated_cost")
+    @classmethod
+    def validate_max_estimated_cost(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        value = _canonical_decimal_text(value, info.field_name)
+        if Decimal(value) <= 0:
+            raise ValueError("max_estimated_cost must be greater than zero.")
+        return value
+
+    @field_validator("cost_currency")
+    @classmethod
+    def validate_cost_currency(cls, value: str, info) -> str:
+        value = _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=16,
+            nonblank=True,
+            clean=True,
+        )
+        if (
+            not value[0].isalpha()
+            or not value.isascii()
+            or not all(
+                character.isupper() or character.isdigit() or character in "._-"
+                for character in value
+            )
+        ):
+            raise ValueError("cost_currency must be a portable uppercase identifier.")
+        return value
+
+    @field_validator("price_book", mode="before")
+    @classmethod
+    def copy_price_book(cls, value: object) -> PriceBook | None:
+        if value is None:
+            return None
+        if type(value) is not PriceBook:
+            raise TypeError("price_book must be an exact PriceBook or None.")
+        return copy_price_book(value)
+
     @model_validator(mode="after")
     def validate_authority_boundary(self) -> ModelJudgeTarget:
         _require_public_target_text(self.app, self.key, "model_judges.key")
+        _require_public_target_text(
+            self.app,
+            self.label or self.key,
+            "model_judges.label",
+        )
+        _require_public_target_text(
+            self.app,
+            self.privacy_policy.key,
+            "model_judges.privacy_policy.key",
+        )
+        if self.max_total_tokens < max(self.max_input_tokens, self.max_output_tokens):
+            raise ValueError("max_total_tokens cannot be below an individual token ceiling.")
+        if (self.max_estimated_cost is None) != (self.price_book is None):
+            raise ValueError(
+                "A model-judge cost ceiling requires both max_estimated_cost and price_book."
+            )
+        if self.price_book is not None:
+            identity = pricing_profile_identity(self.price_book)
+            if self.cost_currency not in identity.currencies:
+                raise ValueError("Model-judge cost currency is absent from its price book.")
+        if self.private_references and not self.privacy_policy.allow_private_reference:
+            raise ValueError("Private references require a policy that permits them.")
+        for reference in self.private_references:
+            _require_public_target_text(
+                self.app,
+                reference.key,
+                "model_judges.private_references.key",
+            )
+            if (
+                reference.privacy_policy_key,
+                reference.privacy_policy_revision,
+            ) != (self.privacy_policy.key, self.privacy_policy.revision):
+                raise ValueError("Private reference privacy policy does not match the judge.")
         _trusted_model_judge_binding(
             key=self.key,
             app=self.app,
@@ -253,6 +483,17 @@ def _copy_model_judge_target(target: ModelJudgeTarget) -> ModelJudgeTarget:
         key=target.key,
         app=target.app,
         agent_name=target.agent_name,
+        label=target.label,
+        privacy_policy=target.privacy_policy,
+        private_references=target.private_references,
+        timeout_seconds=target.timeout_seconds,
+        max_input_tokens=target.max_input_tokens,
+        max_output_tokens=target.max_output_tokens,
+        max_total_tokens=target.max_total_tokens,
+        max_estimated_cost=target.max_estimated_cost,
+        cost_currency=target.cost_currency,
+        price_book=target.price_book,
+        allow_same_model=target.allow_same_model,
     )
 
 
@@ -264,6 +505,101 @@ def model_judge_implementation_revision(target: ModelJudgeTarget) -> str:
         key=validated.key,
         app=validated.app,
         agent_name=validated.agent_name,
+    )
+
+
+def model_judge_profile(target: ModelJudgeTarget) -> JudgeProfileIdentityV1:
+    """Publish the bounded identity and ceilings of one explicit judge route."""
+
+    validated = _copy_model_judge_target(target)
+    manifest = validated.app.describe()
+    agent = next(item for item in manifest.agents if item.name == validated.agent_name)
+    if agent.resolved_provider is None:
+        raise ValueError("Trusted model judge must resolve exactly one provider.")
+    provider_name = agent.resolved_provider
+    model = agent.model
+    allowed_evidence = tuple(
+        item
+        for item, allowed in (
+            ("final_output", True),
+            ("transcript", validated.privacy_policy.allow_transcript),
+            ("public_reference", validated.privacy_policy.allow_public_reference),
+            ("private_reference", validated.privacy_policy.allow_private_reference),
+        )
+        if allowed
+    )
+    pricing = (
+        None
+        if validated.price_book is None
+        else pricing_profile_identity(validated.price_book).fingerprint
+    )
+    implementation_revision = model_judge_implementation_revision(validated)
+    document = {
+        "schema_version": 1,
+        "key": validated.key,
+        "label": validated.label or validated.key,
+        "provider_name": provider_name,
+        "model": model,
+        "implementation_revision": implementation_revision,
+        "allowed_evidence": list(allowed_evidence),
+        "timeout_seconds": validated.timeout_seconds,
+        "max_input_tokens": validated.max_input_tokens,
+        "max_output_tokens": validated.max_output_tokens,
+        "max_total_tokens": validated.max_total_tokens,
+        "max_estimated_cost": validated.max_estimated_cost,
+        "cost_currency": (
+            validated.cost_currency if validated.max_estimated_cost is not None else None
+        ),
+        "pricing_profile_fingerprint": pricing,
+        "privacy_policy_key": validated.privacy_policy.key,
+        "privacy_policy_revision": validated.privacy_policy.revision,
+        "same_model_use": ("allowed_and_labeled" if validated.allow_same_model else "forbidden"),
+    }
+    _require_public_target_text(validated.app, provider_name, "model_judges.provider_name")
+    _require_public_target_text(validated.app, model, "model_judges.model")
+    return JudgeProfileIdentityV1(
+        revision=_content_revision(document, "judge profile identity"),
+        key=validated.key,
+        label=validated.label or validated.key,
+        provider_name=provider_name,
+        model=model,
+        implementation_revision=implementation_revision,
+        allowed_evidence=allowed_evidence,
+        timeout_seconds=validated.timeout_seconds,
+        max_input_tokens=validated.max_input_tokens,
+        max_output_tokens=validated.max_output_tokens,
+        max_total_tokens=validated.max_total_tokens,
+        max_estimated_cost=validated.max_estimated_cost,
+        cost_currency=(
+            validated.cost_currency if validated.max_estimated_cost is not None else None
+        ),
+        pricing_profile_fingerprint=pricing,
+        privacy_policy_key=validated.privacy_policy.key,
+        privacy_policy_revision=validated.privacy_policy.revision,
+        same_model_use=("allowed_and_labeled" if validated.allow_same_model else "forbidden"),
+    )
+
+
+def _candidate_judge_route_relation(
+    target: CorpusTarget,
+    judge_profile: JudgeProfileIdentityV1,
+) -> Literal["independent_model", "same_model"]:
+    request_target = target.request_base.target
+    if request_target is None:
+        manifest = target.app.describe()
+        candidate = next(
+            (agent for agent in manifest.agents if agent.name == target.request_base.agent_name),
+            None,
+        )
+        if candidate is None or candidate.resolved_provider is None:
+            raise ValueError("CorpusTarget candidate agent must resolve exactly one provider.")
+        candidate_route = (candidate.resolved_provider, candidate.model)
+    else:
+        candidate_route = (request_target.provider_name, request_target.model)
+    return (
+        "same_model"
+        if candidate_route == (judge_profile.provider_name, judge_profile.model)
+        else "independent_model"
     )
 
 
@@ -582,6 +918,44 @@ def _compile_prepared_corpus_suite(
         len(_bootstrap_message_text(message)) for message in validated_target.bootstrap_messages
     )
     assertion_counts = tuple(len(case.assertions) for case in case_specs)
+    structured_judge_keys = {
+        assertion.judge_profile_key
+        for case in case_specs
+        for assertion in case.assertions
+        if type(assertion) is StructuredModelJudgeAssertionSpec
+    }
+    trusted_model_judges = []
+    for judge in validated_target.model_judges:
+        profile = model_judge_profile(judge) if judge.key in structured_judge_keys else None
+        trusted_model_judges.append(
+            _trusted_model_judge_binding(
+                key=judge.key,
+                app=judge.app,
+                agent_name=judge.agent_name,
+                profile=profile,
+                privacy_policy=(judge.privacy_policy if profile is not None else None),
+                private_references=(
+                    tuple(
+                        _TrustedPrivateJudgeReferenceBinding(
+                            key=reference.key,
+                            revision=reference.revision,
+                            content=reference.content,
+                            privacy_policy_key=reference.privacy_policy_key,
+                            privacy_policy_revision=reference.privacy_policy_revision,
+                        )
+                        for reference in judge.private_references
+                    )
+                    if profile is not None
+                    else ()
+                ),
+                price_book=judge.price_book if profile is not None else None,
+                candidate_route_relation=(
+                    _candidate_judge_route_relation(validated_target, profile)
+                    if profile is not None
+                    else "independent_model"
+                ),
+            )
+        )
     compiled_assertions = iter(
         _compile_corpus_assertion_specs(
             tuple(assertion for case in case_specs for assertion in case.assertions),
@@ -590,14 +964,7 @@ def _compile_prepared_corpus_suite(
             trusted_pricing=validated_target.price_book,
             expected_pricing_profile=validated_corpus.pricing_profile,
             trusted_pricing_identity=trusted_pricing_identity,
-            trusted_model_judges=tuple(
-                _trusted_model_judge_binding(
-                    key=judge.key,
-                    app=judge.app,
-                    agent_name=judge.agent_name,
-                )
-                for judge in validated_target.model_judges
-            ),
+            trusted_model_judges=tuple(trusted_model_judges),
         )
     )
     compiled_input_chars = 0

@@ -5,7 +5,12 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from tests.evals.test_corpus_execution import _price_book, _provider, _target
+from tests.evals.test_corpus_execution import (
+    _model_judge_target,
+    _price_book,
+    _provider,
+    _target,
+)
 
 import cayu.server.evals_registry as evals_registry_module
 from cayu import (
@@ -152,11 +157,31 @@ def test_generated_registry_maps_each_agent_to_normal_authority_without_serializ
         assert entry.max_steps == 16
         assert entry.cost_budget_available is False
         assert entry.cost_budget_currencies == ()
+        assert entry.judge_profiles == ()
         runtime_target = first.get(entry.target_key)
         assert runtime_target is not None
         assert runtime_target.request_base.agent_name == entry.agent_name
         assert runtime_target.request_base.messages == []
         assert runtime_target.application_release_id == "release-one"
+
+
+def test_explicit_catalog_publishes_safe_exact_judge_profiles() -> None:
+    judge, _ = _model_judge_target()
+    target = _target(_provider(), model_judges=(judge,))
+
+    entry = explicit_eval_target_registry(target).catalog().items[0]
+
+    assert len(entry.judge_profiles) == 1
+    profile = entry.judge_profiles[0]
+    assert profile.key == "quality-judge"
+    assert profile.provider_name == "scripted"
+    assert profile.model == "judge-model"
+    assert profile.allowed_evidence == ("final_output", "public_reference")
+    assert profile.same_model_use == "forbidden"
+    serialized = entry.model_dump_json()
+    assert "provider_options" not in serialized
+    assert "system_prompt" not in serialized
+    assert "api_key" not in serialized
 
 
 def test_resolved_catalog_publishes_deterministic_safe_execution_profiles() -> None:

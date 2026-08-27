@@ -23,8 +23,11 @@ from cayu._validation import (
 from cayu.evals.corpus import (
     _CURRENCY_PATTERN,
     _MODEL_JUDGE_RESOLVED_IMPLEMENTATION_REVISION_METADATA_KEY,
+    _STRUCTURED_MODEL_JUDGE_RESULT_METADATA_KEY,
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_CASES,
+    EVAL_CORPUS_MAX_JUDGE_CRITERIA,
+    EVAL_CORPUS_MAX_JUDGE_EXPLANATION_CHARS,
     EVAL_CORPUS_MAX_JUDGE_RUBRIC_CHARS,
     EVAL_CORPUS_MAX_JUDGE_RUBRIC_VERSION_CHARS,
     EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_RESULTS,
@@ -38,14 +41,19 @@ from cayu.evals.corpus import (
     ChildStatusAssertionSpec,
     EvalCaseSpec,
     EvalCorpusDocument,
+    EvalJudgeEvidenceSelectionV1,
     FinalOutputContainsAssertionSpec,
     FinalOutputEqualsAssertionSpec,
+    JudgeProfileIdentityV1,
     MaxEstimatedCostAssertionSpec,
     MaxModelStepsAssertionSpec,
     MaxToolCallsAssertionSpec,
     MaxTotalTokensAssertionSpec,
     ModelJudgeAssertionSpec,
+    PrivateJudgeReferenceV1,
+    PublicJudgeReferenceV1,
     RootStatusAssertionSpec,
+    StructuredModelJudgeAssertionSpec,
     ToolCalledAssertionSpec,
     ToolsCalledInOrderAssertionSpec,
     UsageRecordedAssertionSpec,
@@ -53,6 +61,8 @@ from cayu.evals.corpus import (
     _canonical_decimal_text,
     _content_revision,
     _eval_run_contract_for_validated_corpus,
+    _exact_decimal_sum,
+    _exact_weighted_decimal,
     _model_content_revision,
     _ordered_sequence_input,
     _portable_id,
@@ -79,7 +89,7 @@ from cayu.evals.result_contract import (
 )
 from cayu.runtime.usage import AggregateCount, aggregate_usage_metrics_from_durable_payload
 
-PUBLISHED_EVAL_SCHEMA_VERSION = 3
+PUBLISHED_EVAL_SCHEMA_VERSION = 4
 PUBLISHED_EVAL_MAX_BYTES = 32 << 20
 PUBLISHED_EVAL_MAX_DURATION_MS = 2**63 - 1
 
@@ -353,6 +363,273 @@ class PublishedModelJudgeDetail(_PublishedAssertionDetail):
         )
 
 
+class PublishedJudgeReferenceIdentityV1(_PortableModel):
+    """Safe reference identity; private evaluator truth is never represented."""
+
+    kind: Literal["public_reference", "private_reference"]
+    key: StrictStr
+    revision: StrictStr
+    availability: Literal["available"] = "available"
+    privacy_policy_key: StrictStr | None = None
+    privacy_policy_revision: StrictStr | None = None
+
+    @field_validator("key", "privacy_policy_key")
+    @classmethod
+    def validate_ids(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _portable_id(value, info.field_name)
+
+    @field_validator("revision", "privacy_policy_revision")
+    @classmethod
+    def validate_revisions(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _sha256_revision(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_privacy_identity(self) -> PublishedJudgeReferenceIdentityV1:
+        privacy = (self.privacy_policy_key, self.privacy_policy_revision)
+        if self.kind == "public_reference" and any(value is not None for value in privacy):
+            raise ValueError("Public reference identity cannot carry a private policy.")
+        if self.kind == "private_reference" and any(value is None for value in privacy):
+            raise ValueError("Private reference identity requires its privacy policy.")
+        return self
+
+
+class PublishedStructuredJudgeCriterionV1(_PortableModel):
+    criterion_id: StrictStr
+    weight: StrictStr
+    score: StrictStr
+    explanation: StrictStr | None
+    explanation_state: Literal["available", "redacted", "unavailable"]
+
+    @field_validator("criterion_id")
+    @classmethod
+    def validate_id(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("weight", "score")
+    @classmethod
+    def validate_unit_decimal(cls, value: str, info) -> str:
+        value = _canonical_decimal_text(value, info.field_name, max_chars=20)
+        if Decimal(value) > 1:
+            raise ValueError(f"{info.field_name} must be between 0 and 1.")
+        return value
+
+    @field_validator("explanation")
+    @classmethod
+    def validate_explanation(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=EVAL_CORPUS_MAX_JUDGE_EXPLANATION_CHARS,
+            nonblank=True,
+            clean=False,
+        )
+
+    @model_validator(mode="after")
+    def validate_explanation_state(self) -> PublishedStructuredJudgeCriterionV1:
+        if (self.explanation is None) != (self.explanation_state == "unavailable"):
+            raise ValueError("Explanation availability must match its publication state.")
+        return self
+
+
+class PublishedStructuredJudgeUsageV1(_PortableModel):
+    model_steps: StrictInt = Field(ge=1, le=EVIDENCE_MAX_MODEL_STEPS)
+    input_tokens: AggregateCount = Field(ge=0)
+    output_tokens: AggregateCount = Field(ge=0)
+    total_tokens: AggregateCount = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_token_totals(self) -> PublishedStructuredJudgeUsageV1:
+        if self.total_tokens < max(self.input_tokens, self.output_tokens):
+            raise ValueError("Published judge total tokens contradict component usage.")
+        return self
+
+
+class PublishedStructuredJudgeCostV1(_PortableModel):
+    availability: Literal["priced", "unavailable"]
+    currency: StrictStr | None = None
+    estimated_cost: StrictStr | None = None
+    priced_model_steps: StrictInt | None = Field(default=None, ge=0)
+    unpriced_model_steps: StrictInt | None = Field(default=None, ge=0)
+
+    @field_validator("currency")
+    @classmethod
+    def validate_currency(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        value = _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=16,
+            nonblank=True,
+            clean=True,
+        )
+        if _CURRENCY_PATTERN.fullmatch(value) is None:
+            raise ValueError("Judge cost currency must be a portable uppercase identifier.")
+        return value
+
+    @field_validator("estimated_cost")
+    @classmethod
+    def validate_estimated_cost(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _canonical_decimal_text(value, info.field_name, max_chars=64)
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> PublishedStructuredJudgeCostV1:
+        observations = (
+            self.currency,
+            self.estimated_cost,
+            self.priced_model_steps,
+            self.unpriced_model_steps,
+        )
+        if self.availability == "unavailable":
+            if any(item is not None for item in observations):
+                raise ValueError("Unavailable judge cost cannot carry priced observations.")
+            return self
+        if any(item is None for item in observations):
+            raise ValueError("Priced judge cost requires complete observations.")
+        if self.unpriced_model_steps != 0:
+            raise ValueError("Priced judge cost cannot contain unpriced model steps.")
+        return self
+
+
+class PublishedStructuredModelJudgeDetail(_PublishedAssertionDetail):
+    """Typed public judgment with no prompt, credentials, options, or private truth."""
+
+    kind: Literal["structured_model_judge"] = "structured_model_judge"
+    judge_profile: JudgeProfileIdentityV1
+    candidate_route_relation: Literal["independent_model", "same_model"]
+    rubric_id: StrictStr
+    rubric_revision: StrictStr
+    reference: PublishedJudgeReferenceIdentityV1 | None = None
+    threshold: StrictStr
+    evidence: EvalJudgeEvidenceSelectionV1
+    diagnostic: PublishedModelJudgeDiagnostic
+    criteria: tuple[PublishedStructuredJudgeCriterionV1, ...] = Field(
+        default=(),
+        max_length=EVAL_CORPUS_MAX_JUDGE_CRITERIA,
+    )
+    aggregate_score: StrictStr | None = None
+    usage: PublishedStructuredJudgeUsageV1 | None = None
+    cost: PublishedStructuredJudgeCostV1 | None = None
+
+    @field_validator("rubric_id")
+    @classmethod
+    def validate_rubric_id(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("rubric_revision")
+    @classmethod
+    def validate_rubric_revision(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("threshold")
+    @classmethod
+    def validate_threshold(cls, value: str, info) -> str:
+        value = _canonical_decimal_text(value, info.field_name, max_chars=20)
+        if Decimal(value) > 1:
+            raise ValueError(f"{info.field_name} must be between 0 and 1.")
+        return value
+
+    @field_validator("aggregate_score")
+    @classmethod
+    def validate_aggregate_score(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        value = _canonical_decimal_text(value, info.field_name, max_chars=64)
+        if Decimal(value) > 1:
+            raise ValueError("aggregate_score must be between 0 and 1.")
+        return value
+
+    @field_validator("criteria", mode="before")
+    @classmethod
+    def validate_criteria_are_ordered(cls, value: object, info) -> object:
+        return _ordered_sequence_input(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_judgment(self) -> PublishedStructuredModelJudgeDetail:
+        if (
+            self.candidate_route_relation == "same_model"
+            and self.judge_profile.same_model_use != "allowed_and_labeled"
+        ):
+            raise ValueError("Published structured judgment used a forbidden same-model route.")
+        if (
+            self.evidence.include_transcript
+            and "transcript" not in self.judge_profile.allowed_evidence
+        ):
+            raise ValueError("Published structured judgment used disallowed transcript evidence.")
+        if self.reference is not None:
+            evidence_kind = (
+                "public_reference"
+                if self.reference.kind == "public_reference"
+                else "private_reference"
+            )
+            if evidence_kind not in self.judge_profile.allowed_evidence:
+                raise ValueError("Published structured judgment used a disallowed reference.")
+            if self.reference.kind == "private_reference" and (
+                self.reference.privacy_policy_key,
+                self.reference.privacy_policy_revision,
+            ) != (
+                self.judge_profile.privacy_policy_key,
+                self.judge_profile.privacy_policy_revision,
+            ):
+                raise ValueError(
+                    "Published private reference does not match the judge privacy policy."
+                )
+        recorded = self.diagnostic == "judgment_recorded"
+        if recorded != bool(self.criteria) or recorded != (self.aggregate_score is not None):
+            raise ValueError("Recorded structured judgments require complete criterion evidence.")
+        if recorded != (self.usage is not None) or recorded != (self.cost is not None):
+            raise ValueError("Recorded structured judgments require judge usage and cost state.")
+        if not recorded:
+            return self
+        if self.usage is None or self.cost is None:
+            raise RuntimeError("Recorded structured judgment lost its observations.")
+        if (
+            self.usage.input_tokens > self.judge_profile.max_input_tokens
+            or self.usage.output_tokens > self.judge_profile.max_output_tokens
+            or self.usage.total_tokens > self.judge_profile.max_total_tokens
+        ):
+            raise ValueError("Published judge usage exceeds its profile ceilings.")
+        priced_profile = self.judge_profile.pricing_profile_fingerprint is not None
+        if priced_profile != (self.cost.availability == "priced"):
+            raise ValueError("Published judge cost contradicts its profile pricing identity.")
+        if self.cost.availability == "priced" and (
+            self.cost.currency != self.judge_profile.cost_currency
+            or self.cost.priced_model_steps != self.usage.model_steps
+        ):
+            raise ValueError("Published judge cost does not match its profile or usage.")
+        if (
+            self.cost.estimated_cost is not None
+            and self.judge_profile.max_estimated_cost is not None
+            and Decimal(self.cost.estimated_cost) > Decimal(self.judge_profile.max_estimated_cost)
+        ):
+            raise ValueError("Published judge cost exceeds its profile ceiling.")
+        ids = tuple(item.criterion_id for item in self.criteria)
+        if len(ids) != len(set(ids)):
+            raise ValueError("Published structured criterion IDs must be unique.")
+        if _exact_decimal_sum(Decimal(item.weight) for item in self.criteria) != 1:
+            raise ValueError("Published structured criterion weights must sum exactly to 1.")
+        expected = _exact_weighted_decimal(
+            (item.weight, Decimal(item.score)) for item in self.criteria
+        )
+        if Decimal(self.aggregate_score or "0") != expected:
+            raise ValueError("Published structured aggregate does not match its criteria.")
+        if (
+            self.reference is not None
+            and self.reference.kind == "private_reference"
+            and any(item.explanation_state != "unavailable" for item in self.criteria)
+        ):
+            raise ValueError("Private-reference judgments cannot publish explanations.")
+        return self
+
+
 PublishedAssertionDetail: TypeAlias = Annotated[
     PublishedRootStatusDetail
     | PublishedChildStatusDetail
@@ -365,7 +642,8 @@ PublishedAssertionDetail: TypeAlias = Annotated[
     | PublishedUsageRecordedDetail
     | PublishedMaxTotalTokensDetail
     | PublishedMaxEstimatedCostDetail
-    | PublishedModelJudgeDetail,
+    | PublishedModelJudgeDetail
+    | PublishedStructuredModelJudgeDetail,
     Field(discriminator="kind"),
 ]
 
@@ -394,12 +672,24 @@ class PublishedAssertionResult(_PortableModel):
         if self.outcome in {"unavailable", "error"}:
             if self.score is not None:
                 raise ValueError("Unavailable/error published assertions cannot have a score.")
-        elif isinstance(self.detail, PublishedModelJudgeDetail):
+        elif isinstance(
+            self.detail,
+            (PublishedModelJudgeDetail, PublishedStructuredModelJudgeDetail),
+        ):
             if self.score is None:
                 raise ValueError("Scored published model judges require a score.")
-            expected_outcome = "passed" if self.score >= self.detail.threshold else "failed"
+            threshold = (
+                self.detail.threshold
+                if type(self.detail) is PublishedModelJudgeDetail
+                else float(Decimal(self.detail.threshold))
+            )
+            expected_outcome = "passed" if self.score >= threshold else "failed"
             if self.outcome != expected_outcome:
                 raise ValueError("Published model-judge score is inconsistent.")
+            if type(self.detail) is PublishedStructuredModelJudgeDetail and self.score != float(
+                Decimal(self.detail.aggregate_score or "0")
+            ):
+                raise ValueError("Published structured score does not match its aggregate.")
         elif self.score != (1.0 if self.outcome == "passed" else 0.0):
             raise ValueError("Published deterministic assertion score is inconsistent.")
         if self.code != self.outcome or self.message != _ASSERTION_MESSAGE[self.outcome]:
@@ -417,7 +707,10 @@ class PublishedAssertionResult(_PortableModel):
                 raise ValueError(
                     "Unavailable published cost observations require unpriced model steps."
                 )
-        if isinstance(self.detail, PublishedModelJudgeDetail):
+        if isinstance(
+            self.detail,
+            (PublishedModelJudgeDetail, PublishedStructuredModelJudgeDetail),
+        ):
             expected_diagnostic = _model_judge_diagnostic(self.outcome)
             if self.detail.diagnostic != expected_diagnostic:
                 raise ValueError("Published model-judge diagnostic contradicts the outcome.")
@@ -556,7 +849,7 @@ class PublishedEvalCaseResult(_PortableModel):
 
 
 class PublishedEvalRun(_PortableModel):
-    schema_version: Literal[3]
+    schema_version: Literal[4]
     revision: StrictStr
     corpus_revision: StrictStr
     target_key: StrictStr
@@ -804,6 +1097,8 @@ def _detail_has_observation(detail: PublishedAssertionDetail) -> bool:
         return detail.estimated_cost is not None
     if isinstance(detail, PublishedModelJudgeDetail):
         return detail.diagnostic == "judgment_recorded"
+    if isinstance(detail, PublishedStructuredModelJudgeDetail):
+        return detail.diagnostic == "judgment_recorded"
     return True
 
 
@@ -832,7 +1127,7 @@ def _detail_expected_pass(detail: PublishedAssertionDetail) -> bool | None:
         if detail.unpriced_model_steps:
             return None
         return Decimal(detail.estimated_cost) <= Decimal(detail.maximum)
-    if isinstance(detail, PublishedModelJudgeDetail):
+    if isinstance(detail, (PublishedModelJudgeDetail, PublishedStructuredModelJudgeDetail)):
         return None
     if isinstance(detail, PublishedToolsCalledInOrderDetail):
         return detail.matched
@@ -861,9 +1156,41 @@ def _detail_evidence_area(detail: PublishedAssertionDetail) -> str:
         return "usage"
     if isinstance(detail, PublishedMaxEstimatedCostDetail):
         return "cost"
-    if isinstance(detail, PublishedModelJudgeDetail):
+    if isinstance(detail, (PublishedModelJudgeDetail, PublishedStructuredModelJudgeDetail)):
         return "model-judge"
     raise AssertionError("Unreachable published assertion detail type.")
+
+
+def _published_reference_contract(
+    reference: PublishedJudgeReferenceIdentityV1 | None,
+) -> list[object] | None:
+    if reference is None:
+        return None
+    return [
+        reference.kind,
+        reference.key,
+        reference.revision,
+        reference.availability,
+        reference.privacy_policy_key,
+        reference.privacy_policy_revision,
+    ]
+
+
+def _spec_reference_contract(reference) -> list[object] | None:
+    if reference is None:
+        return None
+    if type(reference) is PublicJudgeReferenceV1:
+        return [reference.kind, reference.id, reference.revision, "available", None, None]
+    if type(reference) is PrivateJudgeReferenceV1:
+        return [
+            reference.kind,
+            reference.key,
+            reference.revision,
+            "available",
+            reference.privacy_policy_key,
+            reference.privacy_policy_revision,
+        ]
+    raise AssertionError("Unreachable judge reference type.")
 
 
 def _assertion_contract(assertion: PublishedAssertionResult) -> tuple[object, ...]:
@@ -895,6 +1222,19 @@ def _assertion_contract(assertion: PublishedAssertionResult) -> tuple[object, ..
             detail.rubric_version,
             detail.threshold,
             detail.include_transcript,
+        )
+    elif isinstance(detail, PublishedStructuredModelJudgeDetail):
+        static_detail = (
+            detail.kind,
+            detail.judge_profile.key,
+            detail.judge_profile.revision,
+            detail.candidate_route_relation,
+            detail.rubric_id,
+            detail.rubric_revision,
+            _published_reference_contract(detail.reference),
+            detail.threshold,
+            detail.evidence.include_final_output,
+            detail.evidence.include_transcript,
         )
     else:
         raise AssertionError("Unreachable published assertion detail type.")
@@ -934,6 +1274,18 @@ def _assertion_spec_contract(spec: AssertionSpec) -> tuple[object, ...]:
             spec.threshold,
             spec.include_transcript,
         )
+    if type(spec) is StructuredModelJudgeAssertionSpec:
+        return (
+            *base,
+            spec.judge_profile_key,
+            spec.judge_profile_revision,
+            spec.rubric.id,
+            spec.rubric.revision,
+            _spec_reference_contract(spec.reference),
+            spec.threshold,
+            spec.evidence.include_final_output,
+            spec.evidence.include_transcript,
+        )
     raise AssertionError("Unreachable portable assertion specification type.")
 
 
@@ -949,8 +1301,25 @@ def _published_assertion_matches_spec(
     bound to the corpus that requested the evaluator key and rubric.
     """
 
-    if type(spec) is not ModelJudgeAssertionSpec:
+    if type(spec) not in {ModelJudgeAssertionSpec, StructuredModelJudgeAssertionSpec}:
         return _assertion_contract(assertion) == _assertion_spec_contract(spec)
+    if type(spec) is StructuredModelJudgeAssertionSpec:
+        detail = assertion.detail
+        if type(detail) is not PublishedStructuredModelJudgeDetail:
+            return False
+        return (
+            assertion.assertion_id,
+            assertion.assertion_revision,
+            detail.kind,
+            detail.judge_profile.key,
+            detail.judge_profile.revision,
+            detail.rubric_id,
+            detail.rubric_revision,
+            _published_reference_contract(detail.reference),
+            detail.threshold,
+            detail.evidence.include_final_output,
+            detail.evidence.include_transcript,
+        ) == _assertion_spec_contract(spec)
     detail = assertion.detail
     if type(detail) is not PublishedModelJudgeDetail:
         return False
@@ -1035,7 +1404,10 @@ def _validate_trial_observations(
     availability_by_area: dict[str, set[bool]] = {}
     for assertion in assertions:
         detail = assertion.detail
-        if assertion.outcome != "error" and not isinstance(detail, PublishedModelJudgeDetail):
+        if assertion.outcome != "error" and not isinstance(
+            detail,
+            (PublishedModelJudgeDetail, PublishedStructuredModelJudgeDetail),
+        ):
             area = _detail_evidence_area(detail)
             availability_by_area.setdefault(area, set()).add(_detail_has_observation(detail))
         if isinstance(detail, PublishedRootStatusDetail) and detail.actual is not None:
@@ -1293,6 +1665,117 @@ def _published_detail(
             include_transcript=spec.include_transcript,
             diagnostic=_model_judge_diagnostic(result.outcome.value),
         )
+    if type(spec) is StructuredModelJudgeAssertionSpec:
+        raw = result.metadata.get(_STRUCTURED_MODEL_JUDGE_RESULT_METADATA_KEY)
+        if type(raw) is not dict:
+            raise ValueError("Internal structured judgment did not record its public contract.")
+        try:
+            profile = JudgeProfileIdentityV1.model_validate(raw.get("judge_profile"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Internal structured judgment profile is invalid.") from exc
+        if (profile.key, profile.revision) != (
+            spec.judge_profile_key,
+            spec.judge_profile_revision,
+        ):
+            raise ValueError("Internal structured judgment profile does not match the corpus.")
+        route_relation = raw.get("candidate_route_relation")
+        if route_relation not in {"independent_model", "same_model"}:
+            raise ValueError("Internal structured judgment route relation is invalid.")
+        if route_relation == "same_model" and profile.same_model_use != "allowed_and_labeled":
+            raise ValueError("Internal structured judgment used a forbidden same-model route.")
+        if (raw.get("rubric_id"), raw.get("rubric_revision")) != (
+            spec.rubric.id,
+            spec.rubric.revision,
+        ):
+            raise ValueError("Internal structured judgment rubric does not match the corpus.")
+        expected_reference = _spec_reference_contract(spec.reference)
+        raw_reference = raw.get("reference")
+        reference = None
+        if expected_reference is None:
+            if raw_reference is not None:
+                raise ValueError("Internal structured judgment added an unexpected reference.")
+        else:
+            if type(raw_reference) is not dict:
+                raise ValueError("Internal structured judgment reference identity is invalid.")
+            reference = PublishedJudgeReferenceIdentityV1(
+                kind=raw_reference.get("kind"),
+                key=raw_reference.get("id", raw_reference.get("key")),
+                revision=raw_reference.get("revision"),
+                privacy_policy_key=raw_reference.get("privacy_policy_key"),
+                privacy_policy_revision=raw_reference.get("privacy_policy_revision"),
+            )
+            if _published_reference_contract(reference) != expected_reference:
+                raise ValueError(
+                    "Internal structured judgment reference does not match the corpus."
+                )
+        scored = result.outcome.value in {"passed", "failed"}
+        criteria: tuple[PublishedStructuredJudgeCriterionV1, ...] = ()
+        aggregate_score = None
+        usage = None
+        cost = None
+        if scored:
+            raw_criteria = raw.get("criteria")
+            if type(raw_criteria) is not list or len(raw_criteria) != len(spec.rubric.criteria):
+                raise ValueError("Internal structured judgment criterion evidence is incomplete.")
+            published_criteria: list[PublishedStructuredJudgeCriterionV1] = []
+            for raw_item, criterion in zip(
+                raw_criteria,
+                spec.rubric.criteria,
+                strict=True,
+            ):
+                if type(raw_item) is not dict:
+                    raise ValueError("Internal structured criterion evidence is invalid.")
+                raw_criterion = cast("dict[str, Any]", raw_item)
+                criterion_id = raw_criterion.get("criterion_id")
+                score = raw_criterion.get("score")
+                explanation = raw_criterion.get("explanation")
+                explanation_state = raw_criterion.get("explanation_state")
+                if (
+                    type(criterion_id) is not str
+                    or type(score) is not str
+                    or (explanation is not None and type(explanation) is not str)
+                    or explanation_state not in {"available", "redacted", "unavailable"}
+                ):
+                    raise ValueError("Internal structured criterion evidence is invalid.")
+                published = PublishedStructuredJudgeCriterionV1(
+                    criterion_id=criterion_id,
+                    weight=criterion.weight,
+                    score=score,
+                    explanation=cast("str | None", explanation),
+                    explanation_state=cast(
+                        'Literal["available", "redacted", "unavailable"]',
+                        explanation_state,
+                    ),
+                )
+                if published.criterion_id != criterion.id:
+                    raise ValueError("Internal structured criterion order is invalid.")
+                published_criteria.append(published)
+            criteria = tuple(published_criteria)
+            raw_aggregate = raw.get("aggregate_score")
+            if type(raw_aggregate) is not str:
+                raise ValueError("Internal structured judgment aggregate is invalid.")
+            aggregate_score = raw_aggregate
+            try:
+                usage = PublishedStructuredJudgeUsageV1.model_validate(raw.get("usage"))
+                cost = PublishedStructuredJudgeCostV1.model_validate(raw.get("cost"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Internal structured judge observations are invalid.") from exc
+        elif any(key in raw for key in ("criteria", "aggregate_score", "usage", "cost")):
+            raise ValueError("Unscored structured judgments cannot retain judge observations.")
+        return PublishedStructuredModelJudgeDetail(
+            judge_profile=profile,
+            candidate_route_relation=route_relation,
+            rubric_id=spec.rubric.id,
+            rubric_revision=spec.rubric.revision,
+            reference=reference,
+            threshold=spec.threshold,
+            evidence=spec.evidence,
+            diagnostic=_model_judge_diagnostic(result.outcome.value),
+            criteria=criteria,
+            aggregate_score=aggregate_score,
+            usage=usage,
+            cost=cost,
+        )
     raise AssertionError("Unreachable portable assertion detail type.")
 
 
@@ -1307,12 +1790,13 @@ def _published_assertion(
         raise ValueError(
             "Internal assertion result revision does not match the corpus assertion contract."
         )
-    if (
-        type(spec) is ModelJudgeAssertionSpec
-        and result.score is not None
-        and result.threshold != spec.threshold
-    ):
-        raise ValueError("Internal model-judge threshold does not match the corpus contract.")
+    if result.score is not None:
+        if type(spec) is ModelJudgeAssertionSpec and result.threshold != spec.threshold:
+            raise ValueError("Internal model-judge threshold does not match the corpus contract.")
+        if type(spec) is StructuredModelJudgeAssertionSpec and result.threshold != float(
+            Decimal(spec.threshold)
+        ):
+            raise ValueError("Internal model-judge threshold does not match the corpus contract.")
     outcome = result.outcome.value
     return PublishedAssertionResult(
         assertion_id=spec.id,

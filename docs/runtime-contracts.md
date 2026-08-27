@@ -1271,12 +1271,42 @@ remains the same live `CayuApp` reference and is never deep-copied. Corpus-mode
 execution has the same explicit authority seam: `CorpusTarget.app` remains the
 live candidate application, and every `ModelJudgeTarget.app` remains the live
 judge application behind its trusted evaluator key. The portable corpus carries
-only the key and a content revision. Target validation requires the selected
+only authority-free identities and content revisions. Target validation requires the selected
 tool-free judge agent to resolve exactly one provider, and that revision binds
 Cayu's judge semantics, the app manifest, and the exact secret-redacted agent
 specification (including system prompt, provider options, and thinking config).
 Changing any of that authority changes the implementation revision and makes
 results incomparable; corpus data never supplies an app or provider handle.
+Corpus schema V2 adds `StructuredModelJudgeAssertionSpec`: one to eight stable
+criterion IDs with canonical decimal weights totaling exactly one, an exact
+public `JudgeProfileIdentityV1` revision, optional evaluator-only public/private
+reference identity, evidence selection, and a canonical threshold. A structured
+profile publishes only safe provider/model and implementation identity,
+privacy/evidence permissions, timeout/token/optional priced-cost ceilings, and
+same-model posture. The target catalog exposes these snapshots under
+`judge_profiles`; Cayu does not infer one from the candidate route.
+
+Structured judge compilation compare-and-sets the profile, privacy policy, and
+private-reference content revision before candidate dispatch. Private content
+remains only in `PrivateJudgeReferenceTarget`, enters only the judge prompt, and
+never enters corpus/result JSON; explanations are withheld for private-reference
+judgments. Portable public reference truth crosses the candidate app's
+redaction boundary unchanged. Public/no-reference explanations cross both the
+judge and candidate app redaction boundaries and retain an explicit explanation
+availability state. Structured execution binds the
+declared provider and exact tool-free agent into a process-local in-memory app;
+its prompts never enter the configured judge app's ordinary durable session
+catalog. The judge request has one model step, zero tools, and hard
+wall-clock/token/optional priced-cost ceilings. Cayu strictly decodes one typed
+response per criterion and computes the weighted aggregate itself. If the exact
+decimal aggregate/threshold ordering cannot be represented by the existing
+public float score envelope, publication fails as an evaluator configuration
+error rather than reversing the outcome. Any authority, privacy, budget,
+runtime, tool-call, or response failure is an evaluator error without a
+candidate score. Published eval schema V4 retains only typed criterion evidence
+and safe identities plus bounded observed judge usage and exact
+priced-or-unavailable cost state, never raw prompts, raw outputs, credentials,
+private options, or private truth.
 `EvalCaseComparison` and `EvalRunComparison` scores are optional finite values in
 the inclusive range from 0 through 1, matching their source eval results.
 `compare_eval_runs` accepts finite nonnegative score tolerances and rejects
@@ -5353,7 +5383,7 @@ requirements. They cannot carry a provider, tool implementation, environment,
 secret value or handle, actor, approval choice, approval identifier, or source
 session authorization. File parts reference declared fixture digests or stable
 artifact references rather than embedding file bytes. Their canonical JSON,
-content-derived revision, compiler, and corpus-v1 conversion bridge are strict
+content-derived revision, compiler, and corpus-v2 conversion bridge are strict
 and bounded; captured-only corpus cases require separately authored stimuli.
 Compilation produces a validated launch template but resolves no executable
 objects. Built-in stores persist immutable scenarios only after the configured
@@ -5389,7 +5419,7 @@ path.
 
 Controlled scenario execution consumes only an immutable stored scenario and
 the exact current binding returned by preflight. The launch route derives one
-ordinary corpus-v1 case, persists its scenario/binding identity and execution
+ordinary corpus-v2 case, persists its scenario/binding identity and execution
 contractions in the normal eval-run admission record, and lets the existing
 fenced coordinator claim it. Every trial runs through the target's registered
 `CayuApp`; there is no scenario-specific provider, tool, environment, policy,
@@ -9790,7 +9820,7 @@ distinct from a recall-off spec, a no-match receipt, and `truncated`,
 
 Runtime-native Evals carry that attribution across both fresh and captured
 publication. `AssertionEvidenceView.schema_version == 2`,
-`EvalRun.schema_version == 8`, `PublishedEvalRun.schema_version == 3`, and
+`EvalRun.schema_version == 8`, `PublishedEvalRun.schema_version == 4`, and
 `CorpusExecutionResult.schema_version == 2` each require the same nested
 `EvalMemoryAttributionEvidenceV1`. The nested section is independently
 versioned and content-addressed. It binds a fixed capture-policy revision,

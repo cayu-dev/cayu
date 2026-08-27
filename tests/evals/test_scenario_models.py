@@ -408,7 +408,7 @@ def test_scenario_loader_applies_byte_limit_before_json_decode(tmp_path) -> None
         load_eval_scenario(path)
 
 
-def test_corpus_v1_runnable_case_compiles_to_scenario_v2() -> None:
+def test_corpus_v2_runnable_case_compiles_to_scenario_v2() -> None:
     corpus = _corpus(input_text="Evaluate this request")
     case = corpus.cases[0]
 

@@ -163,7 +163,7 @@ def _corpus(*, include_cost: bool = False) -> EvalCorpusDocument:
     )
 
 
-def test_corpus_v1_round_trips_as_deterministic_json():
+def test_corpus_v2_round_trips_as_deterministic_json():
     corpus = _corpus(include_cost=True)
 
     first = eval_corpus_to_json(corpus)
@@ -1057,7 +1057,9 @@ def test_json_loader_rejects_duplicate_keys_unknown_versions_and_nonportable_num
     with pytest.raises(ValueError, match="duplicate"):
         eval_corpus_from_json('{"schema_version":1,"schema_version":1}')
     with pytest.raises(ValueError, match="unsupported schema_version"):
-        eval_corpus_from_json('{"schema_version":2}')
+        eval_corpus_from_json('{"schema_version":1}')
+    with pytest.raises(ValueError, match="unsupported schema_version"):
+        eval_corpus_from_json('{"schema_version":3}')
     with pytest.raises(ValueError, match="finite"):
         eval_corpus_from_json('{"schema_version":1,"value":NaN}')
     with pytest.raises(ValueError, match="signed 64-bit"):

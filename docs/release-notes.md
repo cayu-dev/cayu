@@ -89,6 +89,24 @@ guard.
 
 ## Unreleased
 
+### Evals add structured, bounded model-judge contracts
+
+Portable corpus schema V2 can pin a server-published judge profile and evaluate
+one to eight stable weighted rubric criteria against optional evaluator-only
+public or private reference truth. Cayu strictly decodes each criterion,
+computes the weighted score and threshold itself, and publishes only typed,
+redacted criterion evidence under published-result schema V4. Private reference
+content, raw judge prompts/output, credentials, and provider options never enter
+the corpus or result. Judge calls are tool-free, use an isolated process-local
+session store, and are bounded by explicit timeout, token, and optional
+priced-cost ceilings; profile/reference/privacy drift, public-reference secret
+conflicts, unrepresentable threshold boundaries, and judge failures produce no
+candidate score. Successful judgments retain observed judge token usage and an
+exact priced cost or explicit unavailable cost state. The server contract advances to 31
+so target catalogs can expose safe `judge_profiles`. Suite-authoring V1 remains
+unchanged; Control Plane rubric authoring follows in its separately versioned
+contract.
+
 ### Evals launches are pinned to server-published execution profiles
 
 The Evals target catalog now resolves a public, secret-free snapshot of the
@@ -634,7 +652,7 @@ Conversion is side-effect-free and fail-closed. Redacted or older unattested
 input, missing/inaccessible artifacts, contradictory evidence, limit failures,
 and a source that changes during capture produce stable factual diagnostics.
 They do not disable captured scoring, saving, export, or baseline comparison.
-The Control Plane reports the scenario result beside runnable corpus-v1
+The Control Plane reports the scenario result beside runnable corpus-v2
 conversion. At that delivery slice, scenario editing and controlled multi-stage
 execution remained later workflow layers; both are included in the current
 unreleased build above.
@@ -659,7 +677,7 @@ Cayu now defines an immutable scenario-v2 document for ordered initial,
 queued, and resumed user input plus fresh-approval checkpoints. Text, portable
 JSON, and bounded file requirements can be authored without embedding artifact
 contents, secret values, actor identity, approval decisions, providers, tools,
-environments, or any other executable authority. Runnable corpus-v1 cases can
+environments, or any other executable authority. Runnable corpus-v2 cases can
 be converted explicitly; captured-only cases still require authored stimuli.
 
 Built-in eval stores persist scenario documents behind the same fail-closed

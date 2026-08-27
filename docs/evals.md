@@ -261,7 +261,7 @@ set of structural assertion specifications. It cannot contain a `CayuApp`,
 provider/model/environment selection, import path, callback, raw session ID, or
 runtime event payload.
 
-The portable assertion kinds in schema version 1 cover root and child terminal
+Portable corpus schema version 2 covers root and child terminal
 status, final-output equality/containment, tool presence/order/count, model-step
 and token limits, recorded usage, estimated-cost limits, and trusted model
 judgments. Cost assertions require a `PricingProfileIdentityV1`; the identity
@@ -293,7 +293,7 @@ and publication shapes but are rejected by fresh-run admission until runnable
 input is authored.
 
 `eval_corpus_to_json(...)`, `eval_corpus_from_json(...)`, and
-`load_eval_corpus(...)` enforce schema version 1 and Cayu's durable-JSON rules,
+`load_eval_corpus(...)` enforce schema version 2 and Cayu's durable-JSON rules,
 including duplicate-key, non-finite-number, integer-range, Unicode, and nesting
 validation. Input is rejected before an unbounded read or decode. The hard
 document limit is 8 MiB, with at most 64 suites, 1,000 cases, 64 assertions per
@@ -304,8 +304,8 @@ cases and trials, matching the boundary of the one-suite execution result. A
 multi-suite corpus may exceed that aggregate because suites execute and publish
 independently; inspection reports the complete corpus-wide count without
 materializing result graphs.
-Unknown fields and assertion kinds fail closed; schema version 1 has no legacy
-compatibility loader.
+Unknown fields and assertion kinds fail closed; schema version 2 has no
+prior-version compatibility loader.
 
 ### Trusted corpus execution
 
@@ -407,6 +407,115 @@ incomparable. Deterministic specs do not resolve or invoke this authority.
 `evaluate_assertion_spec(...)` and standalone `compile_assertion_spec(...)`
 therefore reject a model-judge spec: executable resolution is available only
 through an explicit trusted `CorpusTarget`.
+
+### Structured rubric judges
+
+`StructuredModelJudgeAssertionSpec` is the typed, reproducible judge contract.
+It replaces one opaque scalar decision with one to eight stable criterion IDs,
+canonical decimal weights that sum exactly to `1`, a short explanation and
+score per criterion, and a Cayu-computed weighted aggregate. The model does not
+choose the aggregate or pass threshold. Missing, duplicated, reordered, extra,
+out-of-range, overlong, or otherwise malformed criterion output is an evaluator
+`error` with no candidate score. Corpus validation also caps each suite's
+worst-case public explanation expansion at 2 MiB of characters before execution,
+so trials and criterion counts cannot turn individually bounded responses into
+an unbounded or predictably unpublishable result graph.
+
+Every structured assertion pins an exact public `JudgeProfileIdentityV1` from
+`model_judge_profile(...)` or the target catalog's `judge_profiles`. The profile
+contains only its safe label, provider/model route, implementation revision,
+allowed evidence, privacy-policy identity, timeout/token/cost ceilings, and
+same-model posture. It contains no credential, private provider option, raw
+prompt, system prompt, or executable object. Compilation rejects a missing or
+changed profile before candidate dispatch. Cayu never infers a judge from the
+candidate route. If the configured judge resolves to the same provider and
+model, the profile must explicitly set `allow_same_model=True`; successful
+results then retain `candidate_route_relation="same_model"`.
+
+```python
+from cayu import (
+    EvalJudgeEvidenceSelectionV1,
+    ModelJudgeTarget,
+    PublicJudgeReferenceV1,
+    StructuredModelJudgeAssertionSpec,
+    StructuredRubricCriterionV1,
+    StructuredRubricV1,
+    model_judge_profile,
+)
+
+judge = ModelJudgeTarget(
+    key="quality-judge",
+    label="Quality judge",
+    app=judge_app,
+    agent_name="judge",
+)
+profile = model_judge_profile(judge)
+rubric = StructuredRubricV1.create(
+    id="answer-quality",
+    criteria=(
+        StructuredRubricCriterionV1(
+            id="correctness",
+            name="Correctness",
+            description="The answer is factually correct.",
+            weight="0.7",
+        ),
+        StructuredRubricCriterionV1(
+            id="usefulness",
+            name="Usefulness",
+            description="The answer directly helps the user.",
+            weight="0.3",
+        ),
+    ),
+)
+reference = PublicJudgeReferenceV1.create(
+    id="refund-policy-answer",
+    expected_facts=("The standard refund window is 30 days.",),
+)
+quality = StructuredModelJudgeAssertionSpec(
+    id="answer-quality",
+    judge_profile_key=profile.key,
+    judge_profile_revision=profile.revision,
+    rubric=rubric,
+    reference=reference,
+    threshold="0.8",
+    evidence=EvalJudgeEvidenceSelectionV1(include_transcript=False),
+)
+```
+
+Public reference answers/facts are portable but evaluator-only: execution sends
+them to the judge, never to the candidate. They must also cross the candidate
+application's workload-secret redaction boundary unchanged before execution.
+Private truth uses
+`PrivateJudgeReferenceTarget.create(...)` on the trusted server and places only
+its `portable_identity()`—key, content revision, and privacy-policy identity—in
+the corpus. Missing content, revision drift, policy drift, or disallowed
+transcript/reference selection fails before dispatch. Private content never
+enters corpus JSON or public results; criterion explanations are withheld for a
+private-reference judgment so a judge cannot echo that truth through the result.
+For public/no-reference judgments, explanations cross both the judge and
+candidate applications' redaction boundaries and publish with an explicit
+`available`, `redacted`, or `unavailable` state.
+
+Structured judge calls remain tool-free and run in a private process-local
+session store rather than the configured judge application's ordinary session
+catalog. This keeps evaluator prompts—including private reference truth—out of
+durable/control-plane session data even if cleanup fails. Calls run under the
+profile's wall-clock, input-token, output-token, and total-token ceilings. Supplying both
+`max_estimated_cost` and a trusted `PriceBook` adds a priced run budget that
+rejects unpriced usage. Timeout, budget, provider, session, parser, and tool-call
+failures are evaluator errors and never become a zero candidate-quality score.
+The weighted aggregate remains exact decimal evidence. If an aggregate and
+threshold are so close that the existing public float score envelope would
+reverse their exact ordering, Cayu reports an evaluator configuration error
+instead of publishing the wrong pass/fail result.
+Successful judgments retain bounded observed judge model-step and token usage.
+Profiles with trusted pricing also retain the exact currency-local estimated
+cost and priced/unpriced step partition; profiles without pricing publish an
+explicit unavailable cost state rather than an invented zero.
+Suite-authoring schema V1 deliberately remains closed over its existing kinds;
+Control Plane rubric/profile/reference authoring arrives with the separately
+versioned authoring contract rather than silently widening V1.
+
 `run_corpus_suite(...)` and corpus-mode
 `run_eval_plan(...)` execute that compiled suite through `run_eval_suite(...)`,
 bind the pre-dispatch corpus contract, and publish through
@@ -431,12 +540,14 @@ regression comparison. It requires the same target key, corpus/suite/case/
 assertion contract, evidence policy, and applicable pricing identity, while
 deliberately allowing a different fresh application release and AppManifest.
 It returns stable incomparable reason codes; it does not silently compare
-different evaluation contracts. Model-judge rubric text/version, threshold,
+different evaluation contracts. Scalar model-judge rubric text/version, threshold,
 transcript selection, and evaluator key contribute to the assertion and corpus
 revisions. The resolved implementation revision contributes only to the
 published assertion binding, so a judge rollout leaves a portable corpus valid
 while making cross-revision results incomparable rather than manufacturing a
-score delta.
+score delta. Structured judges instead pin the exact public judge-profile
+revision—including its implementation revision—in the corpus; a changed
+profile therefore requires a reviewed corpus revision before another run.
 
 Portable assertions consume one immutable `AssertionEvidenceView`, produced by
 `project_assertion_evidence_view(...)` from a validated `Trajectory`. The view
@@ -538,7 +649,7 @@ credentials.
 
 `publish_eval_run(...)` is the only public result projection for a portable
 corpus run. It matches the complete internal suite result back to the corpus and
-produces a content-addressed schema-version-3 `PublishedEvalRun` containing
+produces a content-addressed schema-version-4 `PublishedEvalRun` containing
 every case, trial, assertion outcome, safe structural detail, duration, and
 identity-free aggregate usage. Every trial also retains the exact bounded
 memory-attribution section used during evaluation, so JSON, SDK, CLI, HTML, and
@@ -570,7 +681,7 @@ direct publication without the runner-owned projection marks output unavailable
 instead of copying `EvalTrialResult.final_output`. Tool-order
 decisions are checked against the complete bounded order retained by evaluation;
 only boolean matches and safe counts cross the publishing boundary.
-Model-judge results retain the bounded rubric and rubric version, threshold,
+Scalar model-judge results retain the bounded rubric and rubric version, threshold,
 transcript-selection flag, evaluator key, implementation revision, continuous
 score/outcome, and fixed safe diagnostic. A valid finite score is candidate
 evidence: the threshold decides `passed` versus `failed`. Missing authority,
@@ -578,13 +689,18 @@ judge configuration drift, provider/runtime failure, an attempted tool call,
 an incomplete session, empty output, or an invalid score is `error` with no
 numeric score; judge failure is never converted into a candidate-quality
 failure.
+Structured model-judge results retain the exact safe judge profile, route
+relation, rubric/reference identities, evidence selection, canonical criterion
+weights and scores, bounded explanation publication states, aggregate, threshold,
+and fixed diagnostic. They never retain the raw prompt, raw judge response,
+credentials, private options, or private reference content.
 Trial, case, and run scores and statuses are rederived from the retained
 published children. Public diagnostics use fixed Cayu-owned reason codes and
 messages that distinguish assertion, lifecycle, evidence, and timeout failures
 without copying raw exception text. Raw assertion metadata, raw final output,
 trajectories, concrete session IDs, and provider/model identity are never copied.
 Cost results require
-the corpus pricing-profile fingerprint. The closed schema-v3 graph is bounded to
+the corpus pricing-profile fingerprint. The closed schema-v4 graph is bounded to
 32 MiB and is the reporting, comparison, and CI substrate for portable corpus
 execution; the lossless `EvalRun` does not cross that publishing boundary.
 The publication model defines and enforces this boundary independently of execution.
@@ -839,7 +955,7 @@ with stable `SessionPromotionErrorCode` values. These rules affect automatic
 portable promotion only: normal Cayu sessions and direct Python evals retain all
 of those capabilities, while runtime tool calls, artifacts, and admitted child
 agents remain eligible. Tool calls and child status remain available as portable
-assertion evidence; corpus v1 does not silently infer replay input or an artifact
+assertion evidence; corpus v2 does not silently infer replay input or an artifact
 assertion from uncaptured state. Caller-driven approval, resume, queued-input, and
 later-interaction phases are checked recursively across every admitted descendant,
 not only on the root.
@@ -861,7 +977,7 @@ intentionally absent from serialized trajectories, so a detached or older trajec
 cannot guess which
 transcript messages were caller input; it fails closed as
 `input_evidence_unavailable` instead. Multiple text parts reject because their
-provider-specific boundaries cannot be represented exactly by corpus v1's single
+provider-specific boundaries cannot be represented exactly by corpus v2's single
 text field. The resulting sanitized input and redaction fact carry one exact content
 revision.
 
@@ -938,10 +1054,10 @@ expectation corpus and its captured score result. That corpus deliberately uses
 `input: null`; Cayu does not invent a prompt, flatten a resumed conversation, or
 pretend that historical execution authority is replayable. The saved result is
 valid and useful for review, baselining, release comparison, and future scenario
-authoring even when runnable corpus-v1 conversion is unavailable. **Export eval
+authoring even when runnable corpus-v2 conversion is unavailable. **Export eval
 JSON** returns the same deterministic captured-only corpus without writing.
 
-Runnable corpus-v1 conversion and scenario-v2 capture are independent
+Runnable corpus-v2 conversion and scenario-v2 capture are independent
 capabilities. Simple fresh invocations may satisfy
 `build_promotion_candidate(...)`. Multi-stage sessions can instead produce an
 ordered scenario preview from their retained initial, queued, resumed,
@@ -1022,7 +1138,7 @@ baseline changes fail instead of silently overwriting another operator's choice.
 
 ### Portable multi-stage scenarios
 
-Corpus v1 remains the supported assertion and execution contract. Scenario v2
+Corpus v2 remains the supported assertion and execution contract. Scenario v2
 adds a separate, authority-free description of external stimuli for sessions
 that need more than one initial user message. A scenario can contain:
 
@@ -1064,7 +1180,7 @@ Compilation validates and indexes the portable template; it does not resolve a
 provider, tool, environment, artifact, secret, actor, or approval. Those are
 trusted launch-time bindings. An approval checkpoint deliberately carries no
 approve/deny choice or reusable authorization. `scenario_from_corpus_case(...)`
-provides the explicit corpus-v1 bridge for runnable cases, while captured-only
+provides the explicit corpus-v2 bridge for runnable cases, while captured-only
 cases fail until input is authored.
 
 Scenario JSON is strict, deterministic, content-revisioned, and capped at 8
@@ -1178,7 +1294,7 @@ external tool effects exactly once: work dispatched immediately before lease
 loss may be repeated unless the provider or tool uses its own durable
 idempotency/reconciliation contract.
 
-Scenario runs publish the same `CorpusExecutionResult` shape as corpus-v1 runs.
+Scenario runs publish the same `CorpusExecutionResult` shape as corpus-v2 runs.
 Their JSON and HTML downloads therefore work with `cayu eval report` and
 `cayu eval compare`, including the existing stable CI exit codes; no separate
 scenario-only result format or execution engine exists.

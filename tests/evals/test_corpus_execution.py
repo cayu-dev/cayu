@@ -421,7 +421,7 @@ def test_run_corpus_suite_retains_every_trial_and_fresh_target_identity():
 
     assert result.target == evaluation_target_identity(target)
     assert result.schema_version == 2
-    assert result.run.schema_version == 3
+    assert result.run.schema_version == 4
     assert result.target.application_release_id == "release-2026-08-06"
     assert result.target.app_manifest_fingerprint == target.app.describe().fingerprint
     assert result.run.corpus_revision == corpus.revision

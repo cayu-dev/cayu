@@ -62,6 +62,7 @@ from cayu.evals.published import (
     _published_score,
     _published_status_from_outcomes,
 )
+from cayu.evals.suite_authoring import EvalSuiteAuthoringAssertionSpecV1
 from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import PriceBook
 from cayu.runtime.sessions import SessionStatus, session_input_messages_sha256
@@ -151,6 +152,29 @@ class PromotionWarningCode(StrEnum):
 
     INPUT_REDACTED = "input_redacted"
     SOURCE_RUN_FAILED = "source_run_failed"
+
+
+class PromotionCaseV1(EvalCaseSpec):
+    """Immutable corpus case restricted to the V1 promotion assertion surface."""
+
+    assertions: tuple[EvalSuiteAuthoringAssertionSpecV1, ...] = Field(
+        min_length=1,
+        max_length=EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
+    )
+
+
+def _promotion_case(case: EvalCaseSpec) -> PromotionCaseV1:
+    if type(case) is EvalCaseSpec:
+        return PromotionCaseV1.model_validate(_model_python_input(case))
+    if type(case) is PromotionCaseV1:
+        return PromotionCaseV1.model_validate(_model_python_input(case))
+    raise TypeError("case must be an exact EvalCaseSpec or PromotionCaseV1.")
+
+
+def _corpus_case(case: PromotionCaseV1) -> EvalCaseSpec:
+    if type(case) is not PromotionCaseV1:
+        raise TypeError("case must be an exact PromotionCaseV1.")
+    return EvalCaseSpec.model_validate(_model_python_input(case))
 
 
 class PromotionSourceV1(_SchemaV1PortableModel):
@@ -254,7 +278,7 @@ class PromotionCandidateV1(_SchemaV1PortableModel):
     pricing_profile: PricingProfileIdentityV1 | None = None
     evidence: AssertionEvidenceView
     suite: EvalSuiteSpec
-    case: EvalCaseSpec
+    case: PromotionCaseV1
     warnings: tuple[PromotionWarningCode, ...] = Field(max_length=2)
 
     @field_validator("target_key")
@@ -327,7 +351,7 @@ class PromotionCandidateV1(_SchemaV1PortableModel):
         )
         validated_evidence = _validate_exact_model(evidence, AssertionEvidenceView, "evidence")
         validated_suite = _validate_exact_model(suite, EvalSuiteSpec, "suite")
-        validated_case = _validate_exact_model(case, EvalCaseSpec, "case")
+        validated_case = _promotion_case(case)
         validated_pricing = (
             None
             if pricing_profile is None
@@ -455,7 +479,7 @@ class CapturedEvaluationCandidateV1(_SchemaV1PortableModel):
     pricing_profile: PricingProfileIdentityV1 | None = None
     evidence: AssertionEvidenceView
     suite: EvalSuiteSpec
-    case: EvalCaseSpec
+    case: PromotionCaseV1
     warnings: tuple[CapturedEvaluationWarningCode, ...] = Field(max_length=1)
 
     @field_validator("target_key")
@@ -542,7 +566,7 @@ class CapturedEvaluationCandidateV1(_SchemaV1PortableModel):
         )
         validated_evidence = _validate_exact_model(evidence, AssertionEvidenceView, "evidence")
         validated_suite = _validate_exact_model(suite, EvalSuiteSpec, "suite")
-        validated_case = _validate_exact_model(case, EvalCaseSpec, "case")
+        validated_case = _promotion_case(case)
         validated_pricing = (
             None
             if pricing_profile is None
@@ -766,19 +790,19 @@ _PROMOTION_ERROR_MESSAGES = {
         "Promotion requires a complete completed/failed descendant tree."
     ),
     SessionPromotionErrorCode.APPROVAL_CONTINUATION_UNSUPPORTED: (
-        "Portable corpus v1 does not support approval continuations."
+        "Portable corpus v2 does not support approval continuations."
     ),
     SessionPromotionErrorCode.SESSION_RESUME_UNSUPPORTED: (
-        "Portable corpus v1 does not support resumed sessions."
+        "Portable corpus v2 does not support resumed sessions."
     ),
     SessionPromotionErrorCode.QUEUED_INPUT_UNSUPPORTED: (
-        "Portable corpus v1 does not support queued later input."
+        "Portable corpus v2 does not support queued later input."
     ),
     SessionPromotionErrorCode.LATER_INTERACTION_UNSUPPORTED: (
-        "Portable corpus v1 requires exactly one initial interaction."
+        "Portable corpus v2 requires exactly one initial interaction."
     ),
     SessionPromotionErrorCode.STRUCTURED_OUTPUT_UNSUPPORTED: (
-        "Portable corpus v1 does not support structured-output runs."
+        "Portable corpus v2 does not support structured-output runs."
     ),
     SessionPromotionErrorCode.INPUT_EVIDENCE_UNAVAILABLE: (
         "The session has no runtime-attested fresh-input boundary."
@@ -787,16 +811,16 @@ _PROMOTION_ERROR_MESSAGES = {
         "The runtime promotion attestation does not match the captured trajectory."
     ),
     SessionPromotionErrorCode.INPUT_MESSAGE_COUNT_UNSUPPORTED: (
-        "Portable corpus v1 requires one or more bounded initial user messages."
+        "Portable corpus v2 requires one or more bounded initial user messages."
     ),
     SessionPromotionErrorCode.INPUT_ROLE_UNSUPPORTED: (
-        "Portable corpus v1 accepts only caller-supplied user messages."
+        "Portable corpus v2 accepts only caller-supplied user messages."
     ),
     SessionPromotionErrorCode.INPUT_PART_UNSUPPORTED: (
-        "Portable corpus v1 requires exactly one text part per caller-supplied message."
+        "Portable corpus v2 requires exactly one text part per caller-supplied message."
     ),
     SessionPromotionErrorCode.INPUT_LIMIT_EXCEEDED: (
-        "The initial input exceeds a portable corpus v1 limit."
+        "The initial input exceeds a portable corpus v2 limit."
     ),
     SessionPromotionErrorCode.INPUT_REDACTION_FAILED: (
         "The initial input could not cross the application redaction boundary."
@@ -968,7 +992,7 @@ def _sanitized_user_messages(
     for message in messages:
         if message.role != MessageRole.USER:
             raise _promotion_error(SessionPromotionErrorCode.INPUT_ROLE_UNSUPPORTED)
-        # Corpus v1 has one text field per user message. Multiple provider input
+        # Corpus v2 has one text field per user message. Multiple provider input
         # blocks are not portably equivalent: some adapters preserve the blocks,
         # while others insert separators. Reject instead of silently collapsing
         # a production prompt into different replay input.
@@ -1417,7 +1441,7 @@ def corpus_from_captured_evaluation_candidate(
         evidence_policy=validated.evidence_policy,
         pricing_profile=validated.pricing_profile,
         suites=(validated.suite,),
-        cases=(validated.case,),
+        cases=(_corpus_case(validated.case),),
     )
 
 
@@ -1781,7 +1805,7 @@ def corpus_from_promotion_candidate(
         evidence_policy=validated_candidate.evidence_policy,
         pricing_profile=validated_candidate.pricing_profile,
         suites=(validated_candidate.suite,),
-        cases=(validated_candidate.case,),
+        cases=(_corpus_case(validated_candidate.case),),
     )
 
 

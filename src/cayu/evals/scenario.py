@@ -725,7 +725,7 @@ def scenario_from_corpus_case(
     *,
     scenario_id: str | None = None,
 ) -> EvalScenarioDocumentV2:
-    """Lift one runnable corpus-v1 case into the scenario-v2 stimulus contract."""
+    """Lift one runnable corpus-v2 case into the scenario-v2 stimulus contract."""
 
     validated, _ = _validated_model_document(
         corpus,

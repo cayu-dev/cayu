@@ -1,20 +1,28 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 from cayu.evals.assertions import EvalAssertion
 from cayu.evals.corpus import (
     _MODEL_JUDGE_RESOLVED_IMPLEMENTATION_REVISION_METADATA_KEY,
+    _STRUCTURED_MODEL_JUDGE_RESULT_METADATA_KEY,
     EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS,
     AssertionSpec,
     EvaluationEvidencePolicySpec,
+    JudgePrivacyPolicyV1,
+    JudgeProfileIdentityV1,
     MaxEstimatedCostAssertionSpec,
     ModelJudgeAssertionSpec,
     PricingProfileIdentityV1,
+    PrivateJudgeReferenceV1,
+    PublicJudgeReferenceV1,
     RootStatusAssertionSpec,
+    StructuredModelJudgeAssertionSpec,
     _bounded_durable_text,
     _content_revision,
+    _model_python_input,
     _portable_id,
     _validated_assertion_spec,
     assertion_spec_revision,
@@ -29,12 +37,18 @@ from cayu.evals.evidence import (
     _validated_pricing,
     _ValidatedPricingSnapshot,
 )
-from cayu.evals.judges import LLMJudge, _first_user_text, _render_transcript
+from cayu.evals.judges import (
+    LLMJudge,
+    StructuredLLMJudge,
+    _first_user_text,
+    _isolated_structured_judge_app,
+    _render_transcript,
+)
 from cayu.evals.memory_attribution import EvalMemoryAttributionEvidenceV1
 from cayu.evals.models import EvalAssertionResult, EvalContext
 from cayu.evals.portable_evaluation import _evaluate_validated_assertion_spec
 from cayu.runtime.app import CayuApp
-from cayu.runtime.costs import PriceBook
+from cayu.runtime.costs import PriceBook, copy_price_book
 from cayu.runtime.manifest import AppManifest
 
 MODEL_JUDGE_EXECUTION_SEMANTICS_VERSION = 1
@@ -59,6 +73,23 @@ class _TrustedModelJudgeBinding:
     app: CayuApp
     agent_name: str
     implementation_revision: str
+    profile: JudgeProfileIdentityV1 | None = None
+    privacy_policy: JudgePrivacyPolicyV1 | None = None
+    private_references: tuple[_TrustedPrivateJudgeReferenceBinding, ...] = ()
+    price_book: PriceBook | None = None
+    candidate_route_relation: str = "independent_model"
+    structured_app: CayuApp | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _TrustedPrivateJudgeReferenceBinding:
+    """Non-portable evaluator truth retained behind one exact public identity."""
+
+    key: str
+    revision: str
+    content: str
+    privacy_policy_key: str
+    privacy_policy_revision: str
 
 
 def _model_judge_implementation_revision(
@@ -80,7 +111,7 @@ def _model_judge_implementation_revision(
         clean=True,
     )
     registered_agent = app.get_agent(validated_agent_name)
-    if registered_agent.tools:
+    if registered_agent.tools or registered_agent.hosted_tools:
         raise ValueError("Trusted model judge agents must be registered without tools.")
     manifest = app.describe()
     if type(manifest) is not AppManifest:
@@ -119,6 +150,11 @@ def _trusted_model_judge_binding(
     key: str,
     app: CayuApp,
     agent_name: str,
+    profile: JudgeProfileIdentityV1 | None = None,
+    privacy_policy: JudgePrivacyPolicyV1 | None = None,
+    private_references: Sequence[_TrustedPrivateJudgeReferenceBinding] = (),
+    price_book: PriceBook | None = None,
+    candidate_route_relation: str = "independent_model",
 ) -> _TrustedModelJudgeBinding:
     validated_key = _portable_id(key, "key")
     validated_agent_name = _bounded_durable_text(
@@ -128,14 +164,86 @@ def _trusted_model_judge_binding(
         nonblank=True,
         clean=True,
     )
+    if profile is not None and type(profile) is not JudgeProfileIdentityV1:
+        raise TypeError("profile must be an exact JudgeProfileIdentityV1 or None.")
+    if privacy_policy is not None and type(privacy_policy) is not JudgePrivacyPolicyV1:
+        raise TypeError("privacy_policy must be an exact JudgePrivacyPolicyV1 or None.")
+    references: list[_TrustedPrivateJudgeReferenceBinding] = []
+    for reference in private_references:
+        if type(reference) is not _TrustedPrivateJudgeReferenceBinding:
+            raise TypeError(
+                "private_references must contain exact trusted private-reference bindings."
+            )
+        references.append(reference)
+    if len({reference.key for reference in references}) != len(references):
+        raise ValueError("Trusted private judge reference keys must be unique.")
+    if price_book is not None and type(price_book) is not PriceBook:
+        raise TypeError("price_book must be an exact PriceBook or None.")
+    if candidate_route_relation not in {"independent_model", "same_model"}:
+        raise ValueError("candidate_route_relation must identify same or independent routing.")
+    implementation_revision = _model_judge_implementation_revision(
+        key=validated_key,
+        app=app,
+        agent_name=validated_agent_name,
+    )
+    if profile is not None and profile.implementation_revision != implementation_revision:
+        raise ValueError("Judge profile implementation does not match its trusted application.")
+    if (profile is None) != (privacy_policy is None):
+        raise ValueError("Judge profile and privacy policy must be supplied together.")
+    if profile is not None and privacy_policy is not None:
+        if profile.key != validated_key:
+            raise ValueError("Judge profile key does not match its trusted binding.")
+        if (profile.privacy_policy_key, profile.privacy_policy_revision) != (
+            privacy_policy.key,
+            privacy_policy.revision,
+        ):
+            raise ValueError("Judge profile privacy identity does not match its trusted policy.")
+        expected_evidence = tuple(
+            item
+            for item, allowed in (
+                ("final_output", True),
+                ("transcript", privacy_policy.allow_transcript),
+                ("public_reference", privacy_policy.allow_public_reference),
+                ("private_reference", privacy_policy.allow_private_reference),
+            )
+            if allowed
+        )
+        if profile.allowed_evidence != expected_evidence:
+            raise ValueError("Judge profile evidence permissions do not match its trusted policy.")
+        if (profile.max_estimated_cost is None) != (price_book is None):
+            raise ValueError("Judge profile cost identity does not match its trusted price book.")
+        if price_book is not None and (
+            profile.pricing_profile_fingerprint != pricing_profile_identity(price_book).fingerprint
+        ):
+            raise ValueError(
+                "Judge profile pricing identity does not match its trusted price book."
+            )
+        if any(
+            (reference.privacy_policy_key, reference.privacy_policy_revision)
+            != (privacy_policy.key, privacy_policy.revision)
+            for reference in references
+        ):
+            raise ValueError("Private judge references do not match the trusted privacy policy.")
     return _TrustedModelJudgeBinding(
         key=validated_key,
         app=app,
         agent_name=validated_agent_name,
-        implementation_revision=_model_judge_implementation_revision(
-            key=validated_key,
-            app=app,
-            agent_name=validated_agent_name,
+        implementation_revision=implementation_revision,
+        profile=(
+            None
+            if profile is None
+            else JudgeProfileIdentityV1.model_validate(_model_python_input(profile))
+        ),
+        privacy_policy=(
+            None
+            if privacy_policy is None
+            else JudgePrivacyPolicyV1.model_validate(_model_python_input(privacy_policy))
+        ),
+        private_references=tuple(references),
+        price_book=None if price_book is None else copy_price_book(price_book),
+        candidate_route_relation=candidate_route_relation,
+        structured_app=(
+            None if profile is None else _isolated_structured_judge_app(app, validated_agent_name)
         ),
     )
 
@@ -383,6 +491,261 @@ class _CompiledModelJudgeAssertion(EvalAssertion):
         )
 
 
+class _CompiledStructuredModelJudgeAssertion(EvalAssertion):
+    """Structured corpus contract bound to one exact trusted judge profile."""
+
+    _app: CayuApp
+    _assertion_revision: str
+    _binding: _TrustedModelJudgeBinding
+    _evidence_policy: EvaluationEvidencePolicySpec
+    _judge: StructuredLLMJudge
+    _reference_identity: dict[str, object] | None
+    _spec: StructuredModelJudgeAssertionSpec
+
+    __slots__ = (
+        "_app",
+        "_assertion_revision",
+        "_binding",
+        "_evidence_policy",
+        "_judge",
+        "_reference_identity",
+        "_spec",
+    )
+
+    def __init__(
+        self,
+        spec: StructuredModelJudgeAssertionSpec,
+        *,
+        binding: _TrustedModelJudgeBinding,
+        app: CayuApp,
+        evidence_policy: EvaluationEvidencePolicySpec,
+    ) -> None:
+        validated_spec = StructuredModelJudgeAssertionSpec.model_validate(_model_python_input(spec))
+        profile = binding.profile
+        policy = binding.privacy_policy
+        if profile is None or policy is None or binding.structured_app is None:
+            raise ValueError("Structured model judges require a complete trusted profile.")
+        public_profile = profile.model_dump(mode="json")
+        try:
+            redacted_profile = app.redact_json(public_profile)
+        except Exception as exc:
+            raise ValueError(
+                "Structured judge profile could not cross the candidate redaction boundary."
+            ) from exc
+        if redacted_profile != public_profile:
+            raise ValueError("Structured judge profile contains a candidate workload secret.")
+        if (validated_spec.judge_profile_key, validated_spec.judge_profile_revision) != (
+            profile.key,
+            profile.revision,
+        ):
+            raise ValueError("Structured model-judge profile does not match the trusted target.")
+        if validated_spec.evidence.include_transcript and not policy.allow_transcript:
+            raise ValueError("Judge profile does not permit transcript evidence.")
+        reference = validated_spec.reference
+        reference_text: str | None = None
+        reference_identity: dict[str, object] | None = None
+        if type(reference) is PublicJudgeReferenceV1:
+            if not policy.allow_public_reference:
+                raise ValueError("Judge profile does not permit public references.")
+            public_reference = reference.model_dump(mode="json")
+            try:
+                redacted_reference = app.redact_json(public_reference)
+            except Exception as exc:
+                raise ValueError(
+                    "Public judge reference could not cross the candidate redaction boundary."
+                ) from exc
+            if redacted_reference != public_reference:
+                raise ValueError("Public judge reference contains a candidate workload secret.")
+            reference_text = json.dumps(
+                {
+                    "expected_answer": reference.expected_answer,
+                    "expected_facts": reference.expected_facts,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            reference_identity = {
+                "kind": reference.kind,
+                "id": reference.id,
+                "revision": reference.revision,
+            }
+        elif type(reference) is PrivateJudgeReferenceV1:
+            if not policy.allow_private_reference:
+                raise ValueError("Judge profile does not permit private references.")
+            if (
+                reference.privacy_policy_key,
+                reference.privacy_policy_revision,
+            ) != (policy.key, policy.revision):
+                raise ValueError("Private reference policy does not match the judge profile.")
+            private = next(
+                (item for item in binding.private_references if item.key == reference.key),
+                None,
+            )
+            if private is None:
+                raise ValueError(f"Private judge reference {reference.key!r} is unavailable.")
+            if (
+                private.revision,
+                private.privacy_policy_key,
+                private.privacy_policy_revision,
+            ) != (
+                reference.revision,
+                reference.privacy_policy_key,
+                reference.privacy_policy_revision,
+            ):
+                raise ValueError("Private judge reference revision or policy changed.")
+            reference_text = private.content
+            reference_identity = {
+                "kind": reference.kind,
+                "key": reference.key,
+                "revision": reference.revision,
+                "privacy_policy_key": reference.privacy_policy_key,
+                "privacy_policy_revision": reference.privacy_policy_revision,
+            }
+        elif reference is not None:
+            raise TypeError("Unsupported structured judge reference type.")
+        if binding.candidate_route_relation == "same_model" and (
+            profile.same_model_use != "allowed_and_labeled"
+        ):
+            raise ValueError(
+                "Structured judge uses the candidate model but its profile forbids that route."
+            )
+        object.__setattr__(self, "_spec", validated_spec)
+        object.__setattr__(self, "_binding", binding)
+        object.__setattr__(self, "_app", app)
+        object.__setattr__(self, "_evidence_policy", _validated_policy(evidence_policy))
+        object.__setattr__(self, "_reference_identity", reference_identity)
+        object.__setattr__(
+            self,
+            "_assertion_revision",
+            assertion_spec_revision(validated_spec),
+        )
+        object.__setattr__(
+            self,
+            "_judge",
+            StructuredLLMJudge(
+                binding.structured_app,
+                judge_authority_app=binding.app,
+                publication_app=app,
+                agent_name=binding.agent_name,
+                rubric=validated_spec.rubric,
+                reference_text=reference_text,
+                threshold=validated_spec.threshold,
+                timeout_seconds=profile.timeout_seconds,
+                max_input_tokens=profile.max_input_tokens,
+                max_output_tokens=profile.max_output_tokens,
+                max_total_tokens=profile.max_total_tokens,
+                max_estimated_cost=profile.max_estimated_cost,
+                cost_currency=profile.cost_currency or "USD",
+                price_book=binding.price_book,
+                publish_explanations=type(reference) is not PrivateJudgeReferenceV1,
+                name=validated_spec.id,
+            ),
+        )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("Compiled structured model judge assertions are immutable.")
+
+    @property
+    def name(self) -> str:
+        return self._spec.id
+
+    @property
+    def assertion_revision(self) -> str:
+        return self._assertion_revision
+
+    def _with_public_contract(self, result: EvalAssertionResult) -> EvalAssertionResult:
+        profile = self._binding.profile
+        if profile is None:
+            raise RuntimeError("Compiled structured judge lost its trusted profile.")
+        raw_judgment = result.metadata.get(_STRUCTURED_MODEL_JUDGE_RESULT_METADATA_KEY)
+        judgment = dict(raw_judgment) if type(raw_judgment) is dict else {}
+        public_record = {
+            "judge_profile": profile.model_dump(mode="json"),
+            "candidate_route_relation": self._binding.candidate_route_relation,
+            "rubric_id": self._spec.rubric.id,
+            "rubric_revision": self._spec.rubric.revision,
+            "reference": self._reference_identity,
+            **judgment,
+        }
+        return result.model_copy(
+            update={
+                "metadata": {
+                    _STRUCTURED_MODEL_JUDGE_RESULT_METADATA_KEY: public_record,
+                }
+            }
+        )
+
+    async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
+        evidence = _build_assertion_evidence_view(
+            context.trajectory,
+            evidence_policy=self._evidence_policy,
+            pricing_snapshot=None,
+            cost_currencies=(),
+            app=self._app,
+            root_evidence_available=context.root_evidence_available,
+            allow_event_count_fallback=True,
+            expected_pricing_profile_fingerprint=None,
+            bind_pricing_profile=True,
+        )
+        try:
+            current_revision = _model_judge_implementation_revision(
+                key=self._binding.key,
+                app=self._binding.app,
+                agent_name=self._binding.agent_name,
+            )
+        except Exception:
+            return self._with_public_contract(
+                self.error("Trusted structured judge configuration became invalid.")
+            )
+        if current_revision != self._binding.implementation_revision:
+            return self._with_public_contract(
+                self.error("Trusted structured judge implementation changed after compilation.")
+            )
+        if evidence.final_output_state != "complete":
+            return self._with_public_contract(
+                self.unavailable("Final-output evidence was not retained completely.")
+            )
+        task = _redacted_text(
+            self._app,
+            _first_user_text(context.transcript),
+            "structured model judge task",
+        )
+        if len(task) > EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS:
+            return self._with_public_contract(
+                self.unavailable("Structured judge task evidence exceeded its portable bound.")
+            )
+        transcript = None
+        if self._spec.evidence.include_transcript:
+            transcript = _redacted_text(
+                self._app,
+                _render_transcript(context.transcript),
+                "structured model judge transcript",
+            )
+            if len(transcript) > EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS:
+                return self._with_public_contract(
+                    self.unavailable(
+                        "Structured judge transcript evidence exceeded its portable bound."
+                    )
+                )
+        result = await self._judge._evaluate_material(
+            task=task,
+            final_output=evidence.final_output,
+            transcript_text=transcript,
+        )
+        return self._with_public_contract(
+            EvalAssertionResult(
+                name=self.name,
+                assertion_revision=self.assertion_revision,
+                outcome=result.outcome,
+                score=result.score,
+                threshold=result.threshold,
+                message=result.message,
+                metadata=result.metadata,
+                cost_summary=result.cost_summary,
+            )
+        )
+
+
 def _prepare_portable_assertion_evidence(
     assertions: Sequence[EvalAssertion],
     context: EvalContext,
@@ -397,7 +760,16 @@ def _prepare_portable_assertion_evidence(
     model_judge_assertions = tuple(
         assertion for assertion in assertions if type(assertion) is _CompiledModelJudgeAssertion
     )
-    compiled = (*portable_assertions, *model_judge_assertions)
+    structured_model_judge_assertions = tuple(
+        assertion
+        for assertion in assertions
+        if type(assertion) is _CompiledStructuredModelJudgeAssertion
+    )
+    compiled = (
+        *portable_assertions,
+        *model_judge_assertions,
+        *structured_model_judge_assertions,
+    )
     if not compiled:
         return None
 
@@ -517,7 +889,10 @@ def compile_assertion_spec(
     if trusted_pricing is not None and type(trusted_pricing) is not PriceBook:
         raise TypeError("trusted_pricing must be an exact PriceBook or None.")
     validated_spec = _validated_assertion_spec(spec)
-    if type(validated_spec) is ModelJudgeAssertionSpec:
+    if type(validated_spec) in {
+        ModelJudgeAssertionSpec,
+        StructuredModelJudgeAssertionSpec,
+    }:
         raise ValueError("Portable model judges require a trusted CorpusTarget evaluator binding.")
     pricing_binding = (
         _compiled_pricing_binding(trusted_pricing)
@@ -596,6 +971,20 @@ def _compile_corpus_assertion_specs(
                 )
             compiled.append(
                 _CompiledModelJudgeAssertion(
+                    spec,
+                    binding=binding,
+                    app=app,
+                    evidence_policy=evidence_policy,
+                )
+            )
+        elif type(spec) is StructuredModelJudgeAssertionSpec:
+            binding = model_judge_bindings.get(spec.judge_profile_key)
+            if binding is None:
+                raise ValueError(
+                    f"Eval corpus requires trusted model judge {spec.judge_profile_key!r}."
+                )
+            compiled.append(
+                _CompiledStructuredModelJudgeAssertion(
                     spec,
                     binding=binding,
                     app=app,
