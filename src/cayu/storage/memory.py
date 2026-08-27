@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
 from math import sqrt
-from typing import Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -37,6 +37,13 @@ from cayu.embeddings import (
     TextEmbeddingRequest,
     copy_text_embedding_result,
 )
+
+if TYPE_CHECKING:
+    from cayu.knowledge_maintenance_persistence import (
+        KnowledgeMaintenanceAcceptedPlan,
+        KnowledgeMaintenanceProposalPublication,
+        KnowledgeMaintenanceProposalPublicationReceipt,
+    )
 
 DEFAULT_KNOWLEDGE_NAMESPACE = "default"
 DEFAULT_KNOWLEDGE_KIND = "fact"
@@ -111,6 +118,13 @@ class KnowledgeStatus(StrEnum):
 
 
 _KNOWLEDGE_RETIREMENT_STATUSES = frozenset({KnowledgeStatus.ARCHIVED, KnowledgeStatus.DELETED})
+_KNOWLEDGE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS = frozenset(
+    {
+        (KnowledgeStatus.PENDING, KnowledgeStatus.ARCHIVED),
+        (KnowledgeStatus.PENDING, KnowledgeStatus.DELETED),
+        (KnowledgeStatus.ARCHIVED, KnowledgeStatus.DELETED),
+    }
+)
 
 
 class KnowledgeVisibility(StrEnum):
@@ -3167,6 +3181,35 @@ class KnowledgeStore(ABC):
             "This KnowledgeStore does not support revision-bound knowledge relations."
         )
 
+    async def publish_maintenance_proposal(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+        *,
+        evidence: list[KnowledgeEvidence],
+        proposal: KnowledgeMaintenanceProposal,
+        accepted_plan: KnowledgeMaintenanceAcceptedPlan,
+        operation_id: str,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceProposalPublicationReceipt:
+        """Atomically persist one accepted plan as a pending review artifact."""
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support maintenance proposal publication."
+        )
+
+    async def load_maintenance_proposal_publication(
+        self,
+        proposal_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceProposalPublication | None:
+        """Load one exact pending or decided maintenance proposal artifact."""
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support maintenance proposal publication."
+        )
+
     async def apply_maintenance_decision(
         self,
         proposal: KnowledgeMaintenanceProposal,
@@ -3186,7 +3229,7 @@ class KnowledgeStore(ABC):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeMaintenanceProposal | None:
-        """Load one durably decided maintenance proposal in scope."""
+        """Load one durably published or decided maintenance proposal in scope."""
 
         raise NotImplementedError(
             "This KnowledgeStore does not support reviewed knowledge maintenance."
@@ -3439,6 +3482,20 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         ] = {}
         self._relation_change_sequences: dict[str, int] = {}
         self._maintenance_proposals: dict[str, KnowledgeMaintenanceProposal] = {}
+        self._maintenance_proposal_publications: dict[
+            str,
+            tuple[
+                KnowledgeMaintenanceProposal,
+                KnowledgeMaintenanceAcceptedPlan,
+                KnowledgeMaintenanceProposalPublicationReceipt,
+            ],
+        ] = {}
+        self._maintenance_proposal_operation_by_id: dict[str, str] = {}
+        self._maintenance_proposal_replacement_revisions: dict[str, int] = {}
+        self._maintenance_proposal_id_by_replacement_entry: dict[str, str] = {}
+        self._maintenance_proposal_publication_access: dict[
+            str, _KnowledgeMaintenanceAccessSnapshot
+        ] = {}
         self._maintenance_decisions: dict[str, KnowledgeMaintenanceDecision] = {}
         self._maintenance_receipts: dict[str, KnowledgeMaintenanceDecisionReceipt] = {}
         self._maintenance_operation_by_proposal: dict[str, str] = {}
@@ -3667,6 +3724,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 actual_revision=entry.revision,
             )
         if hard:
+            self._require_maintenance_replacement_history_preserved(clean_id)
             change = self._prepare_change(entry, kind=KnowledgeChangeKind.HARD_DELETED)
             self._drop_relations_for_entry(clean_id)
             self._entries.pop(clean_id, None)
@@ -3702,6 +3760,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 if (entry := self._current_entry(entry_id)) is not None
                 if entry.expires_at is not None
                 and entry.expires_at <= cutoff
+                and entry.id not in self._maintenance_proposal_replacement_revisions
                 and _knowledge_scope_allows_entry(scope, entry, now=cutoff)
             ),
             key=lambda entry: entry.id,
@@ -3778,6 +3837,11 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 actual_revision=actual_revision,
             )
         if existing_entry is not None:
+            self._require_maintenance_replacement_mutation_allowed(
+                existing_entry,
+                successor=copied_entry,
+                operation="publish_entry_revision",
+            )
             _validate_revision_successor(existing_entry, copied_entry)
         self._require_chunk_ids_available(
             copied_chunks,
@@ -3824,6 +3888,268 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         )
         return copy_knowledge_publication_receipt(receipt)
 
+    async def publish_maintenance_proposal(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+        *,
+        evidence: list[KnowledgeEvidence],
+        proposal: KnowledgeMaintenanceProposal,
+        accepted_plan: KnowledgeMaintenanceAcceptedPlan,
+        operation_id: str,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceProposalPublicationReceipt:
+        from cayu.knowledge_maintenance_persistence import (
+            KnowledgeMaintenanceProposalPublicationConflict,
+            KnowledgeMaintenanceProposalPublicationReceipt,
+            copy_knowledge_maintenance_proposal_publication_receipt,
+            prepare_knowledge_maintenance_proposal_publication,
+            validate_knowledge_maintenance_proposal_publication_replay,
+        )
+
+        scope = self._operation_access_scope(access_scope)
+        (
+            operation_id,
+            copied_entry,
+            copied_chunks,
+            copied_evidence,
+            copied_proposal,
+            copied_plan,
+            request_sha256,
+        ) = prepare_knowledge_maintenance_proposal_publication(
+            entry,
+            chunks,
+            evidence=evidence,
+            proposal=proposal,
+            accepted_plan=accepted_plan,
+            operation_id=operation_id,
+        )
+        operation = "publish_maintenance_proposal"
+        _require_knowledge_entry_access(scope, copied_entry, operation=operation)
+        existing_record = self._maintenance_proposal_publications.get(operation_id)
+        if existing_record is not None:
+            snapshot = self._maintenance_proposal_publication_access.get(operation_id)
+            if snapshot is None:
+                raise KnowledgeMaintenanceProposalPublicationConflict("malformed_receipt")
+            if not _knowledge_scope_allows_maintenance_access_snapshot(scope, snapshot):
+                raise KnowledgeAccessDenied(operation)
+            stored_proposal, stored_plan, receipt = existing_record
+            validate_knowledge_maintenance_proposal_publication_replay(
+                receipt,
+                proposal=copied_proposal,
+                accepted_plan=copied_plan,
+                entry=copied_entry,
+                request_sha256=request_sha256,
+            )
+            if stored_proposal != copied_proposal or stored_plan != copied_plan:
+                raise KnowledgeMaintenanceProposalPublicationConflict("malformed_receipt")
+            return copy_knowledge_maintenance_proposal_publication_receipt(
+                receipt,
+                replayed=True,
+            )
+
+        occupied_operation = self._maintenance_proposal_operation_by_id.get(copied_proposal.id)
+        if occupied_operation is not None:
+            snapshot = self._maintenance_proposal_publication_access.get(occupied_operation)
+            if snapshot is None:
+                raise KnowledgeMaintenanceProposalPublicationConflict("malformed_receipt")
+            if not _knowledge_scope_allows_maintenance_access_snapshot(scope, snapshot):
+                raise KnowledgeAccessDenied(operation)
+            raise KnowledgeMaintenanceProposalPublicationConflict("proposal_id_reuse")
+        decided_operation = self._maintenance_operation_by_proposal.get(copied_proposal.id)
+        if decided_operation is not None:
+            snapshot = self._maintenance_access.get(decided_operation)
+            if snapshot is None:
+                raise KnowledgeMaintenanceProposalPublicationConflict("malformed_receipt")
+            if not _knowledge_scope_allows_maintenance_access_snapshot(scope, snapshot):
+                raise KnowledgeAccessDenied(operation)
+            raise KnowledgeMaintenanceProposalPublicationConflict("proposal_already_decided")
+
+        current_entries = {
+            source.entry_id: current
+            for source in copied_proposal.sources
+            if (current := self._current_entry(source.entry_id)) is not None
+        }
+        current_entries[copied_entry.id] = copied_entry
+        replacement, sources = _require_knowledge_maintenance_current_entries(
+            copied_proposal,
+            current_entries,
+            access_scope=scope,
+            operation=operation,
+        )
+        _require_knowledge_maintenance_publication_boundary(replacement, sources)
+        _require_knowledge_maintenance_source_evidence(copied_evidence, sources)
+        occupied_entry = self._current_entry(copied_entry.id)
+        if occupied_entry is not None:
+            _require_knowledge_entry_access(scope, occupied_entry, operation=operation)
+            raise KnowledgeMaintenanceProposalPublicationConflict("replacement_id_reuse")
+        self._require_chunk_ids_available(
+            copied_chunks,
+            access_scope=scope,
+            operation=operation,
+        )
+        self._require_evidence_ids_available(
+            copied_evidence,
+            access_scope=scope,
+            operation=operation,
+        )
+        payload_bytes = knowledge_entry_payload_bytes(copied_entry)
+        committed_at = max(self._clock(), copied_proposal.created_at)
+        receipt = KnowledgeMaintenanceProposalPublicationReceipt(
+            operation_id=operation_id,
+            proposal_id=copied_proposal.id,
+            proposal_fingerprint=copied_proposal.fingerprint,
+            accepted_plan_fingerprint=copied_plan.fingerprint,
+            request_sha256=request_sha256,
+            replacement=copied_proposal.replacement,
+            committed_at=committed_at,
+        )
+        change = self._prepare_change(
+            copied_entry,
+            kind=KnowledgeChangeKind.CREATED,
+            operation_id=operation_id,
+            committed_at=committed_at,
+        )
+        snapshot = _knowledge_maintenance_access_snapshot([replacement, *sources])
+        self._entries[copied_entry.id] = {copied_entry.revision: copied_entry}
+        self._entry_payload_bytes[(copied_entry.id, copied_entry.revision)] = payload_bytes
+        self._chunks[(copied_entry.id, copied_entry.revision)] = copied_chunks
+        self._evidence[(copied_entry.id, copied_entry.revision)] = copied_evidence
+        self._current_revisions[copied_entry.id] = copied_entry.revision
+        self._maintenance_proposals[copied_proposal.id] = copied_proposal
+        self._maintenance_proposal_replacement_revisions[copied_entry.id] = copied_entry.revision
+        self._maintenance_proposal_id_by_replacement_entry[copied_entry.id] = copied_proposal.id
+        self._maintenance_proposal_publications[operation_id] = (
+            copied_proposal,
+            copied_plan,
+            receipt,
+        )
+        self._maintenance_proposal_operation_by_id[copied_proposal.id] = operation_id
+        self._maintenance_proposal_publication_access[operation_id] = snapshot
+        self._record_change(change, before_entry=None, after_entry=copied_entry)
+        return copy_knowledge_maintenance_proposal_publication_receipt(receipt)
+
+    async def load_maintenance_proposal_publication(
+        self,
+        proposal_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceProposalPublication | None:
+        from cayu.knowledge_maintenance_persistence import (
+            KnowledgeMaintenanceProposalPublication,
+            KnowledgeMaintenanceProposalPublicationConflict,
+            KnowledgeMaintenanceProposalPublicationOutcome,
+            copy_knowledge_maintenance_proposal_publication_receipt,
+        )
+
+        scope = self._operation_access_scope(access_scope)
+        proposal_id = _knowledge_maintenance_identity(proposal_id, "proposal_id")
+        operation_id = self._maintenance_proposal_operation_by_id.get(proposal_id)
+        if operation_id is None:
+            return None
+        snapshot = self._maintenance_proposal_publication_access.get(operation_id)
+        record = self._maintenance_proposal_publications.get(operation_id)
+        if snapshot is None or record is None:
+            raise KnowledgeMaintenanceProposalPublicationConflict("malformed_receipt")
+        if not _knowledge_scope_allows_maintenance_access_snapshot(scope, snapshot):
+            return None
+        proposal, accepted_plan, receipt = record
+        replacement = self._entry_revision(
+            proposal.replacement.entry_id,
+            proposal.replacement.revision,
+        )
+        if replacement is None:
+            raise KnowledgeMaintenanceProposalPublicationConflict("replacement_missing")
+        decision_operation = self._maintenance_operation_by_proposal.get(proposal_id)
+        if decision_operation is not None:
+            decision_snapshot = self._maintenance_access.get(decision_operation)
+            stored_proposal = self._maintenance_proposals.get(proposal_id)
+            stored_decision = self._maintenance_decisions.get(decision_operation)
+            stored_receipt = self._maintenance_receipts.get(decision_operation)
+            try:
+                if stored_proposal is None or stored_decision is None or stored_receipt is None:
+                    raise ValueError("Published decision authority is incomplete.")
+                if decision_snapshot != snapshot or stored_proposal != proposal:
+                    raise ValueError("Published decision authority is inconsistent.")
+                _validate_knowledge_maintenance_record(
+                    stored_proposal,
+                    stored_decision,
+                    stored_receipt,
+                )
+            except Exception:
+                raise KnowledgeMaintenanceProposalPublicationConflict("malformed_receipt") from None
+        decided = decision_operation is not None
+        return KnowledgeMaintenanceProposalPublication(
+            proposal=proposal,
+            accepted_plan=accepted_plan,
+            replacement=replacement,
+            receipt=copy_knowledge_maintenance_proposal_publication_receipt(
+                receipt,
+                replayed=True,
+            ),
+            outcome=(
+                KnowledgeMaintenanceProposalPublicationOutcome.EXISTING_DECIDED
+                if decided
+                else KnowledgeMaintenanceProposalPublicationOutcome.EXISTING_PENDING
+            ),
+        )
+
+    def _require_maintenance_replacement_mutation_allowed(
+        self,
+        current: KnowledgeEntry,
+        *,
+        successor: KnowledgeEntry,
+        operation: str,
+    ) -> None:
+        replacement_revision = self._maintenance_proposal_replacement_revisions.get(current.id)
+        if replacement_revision is None:
+            return
+        proposal_id = self._maintenance_proposal_id_by_replacement_entry.get(current.id)
+        decision_operation = (
+            None
+            if proposal_id is None
+            else self._maintenance_operation_by_proposal.get(proposal_id)
+        )
+        decision = (
+            None
+            if decision_operation is None
+            else self._maintenance_decisions.get(decision_operation)
+        )
+        proposal = None if proposal_id is None else self._maintenance_proposals.get(proposal_id)
+        receipt = (
+            None
+            if decision_operation is None
+            else self._maintenance_receipts.get(decision_operation)
+        )
+        if decision is not None:
+            if proposal is None or receipt is None:
+                raise KnowledgeMaintenanceConflict("malformed_proposal_publication")
+            try:
+                if (
+                    proposal.replacement.entry_id != current.id
+                    or proposal.replacement.revision != replacement_revision
+                ):
+                    raise ValueError("Maintenance proposal replacement binding is inconsistent.")
+                _validate_knowledge_maintenance_record(proposal, decision, receipt)
+            except Exception:
+                raise KnowledgeMaintenanceConflict("malformed_proposal_publication") from None
+        if decision is not None and decision.kind is KnowledgeMaintenanceDecisionKind.APPROVE:
+            if current.revision > replacement_revision:
+                return
+        elif decision is not None and decision.kind is KnowledgeMaintenanceDecisionKind.REJECT:
+            if (
+                operation in {"delete_entry", "transition_entry_status"}
+                and (current.status, successor.status)
+                in _KNOWLEDGE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS
+            ):
+                return
+            raise KnowledgeMaintenanceConflict("rejected_replacement_lifecycle_owned")
+        raise KnowledgeMaintenanceConflict("pending_replacement_lifecycle_owned")
+
+    def _require_maintenance_replacement_history_preserved(self, entry_id: str) -> None:
+        if entry_id in self._maintenance_proposal_replacement_revisions:
+            raise KnowledgeMaintenanceConflict("maintenance_replacement_history_owned")
+
     def _append_revision(
         self,
         entry: KnowledgeEntry,
@@ -3851,6 +4177,11 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 expected_revision=expected_revision,
                 actual_revision=current.revision,
             )
+        self._require_maintenance_replacement_mutation_allowed(
+            current,
+            successor=entry,
+            operation=operation,
+        )
         _validate_revision_successor(current, entry)
         _require_knowledge_successor_access(access_scope, entry, operation=operation)
         previous_chunks = self._chunks.get((current.id, current.revision), [])
@@ -4344,6 +4675,33 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             decision,
         )
         operation = "apply_maintenance_decision"
+        publication_operations: set[str] = set()
+        publication_operation = self._maintenance_proposal_operation_by_id.get(proposal.id)
+        if publication_operation is not None:
+            publication_operations.add(publication_operation)
+        owner_proposal_id = self._maintenance_proposal_id_by_replacement_entry.get(
+            proposal.replacement.entry_id
+        )
+        if owner_proposal_id is not None:
+            owner_operation = self._maintenance_proposal_operation_by_id.get(owner_proposal_id)
+            if owner_operation is None:
+                raise KnowledgeMaintenanceConflict("malformed_proposal_publication")
+            publication_operations.add(owner_operation)
+
+        publication_snapshot: _KnowledgeMaintenanceAccessSnapshot | None = None
+        for owned_operation in sorted(publication_operations):
+            snapshot = self._maintenance_proposal_publication_access.get(owned_operation)
+            record = self._maintenance_proposal_publications.get(owned_operation)
+            if snapshot is None or record is None:
+                raise KnowledgeMaintenanceConflict("malformed_proposal_publication")
+            if not _knowledge_scope_allows_maintenance_access_snapshot(scope, snapshot):
+                raise KnowledgeAccessDenied(operation)
+            stored_proposal = record[0]
+            if stored_proposal != proposal or stored_proposal.fingerprint != proposal.fingerprint:
+                raise KnowledgeMaintenanceConflict("proposal_publication_mismatch")
+            if publication_snapshot is not None and publication_snapshot != snapshot:
+                raise KnowledgeMaintenanceConflict("malformed_proposal_publication")
+            publication_snapshot = snapshot
         existing_receipt = self._maintenance_receipts.get(decision.operation_id)
         if existing_receipt is not None:
             snapshot = self._maintenance_access.get(decision.operation_id)
@@ -4384,12 +4742,26 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             ]
             if (entry := self._current_entry(entry_id)) is not None
         }
-        replacement, sources = _require_knowledge_maintenance_current_entries(
-            proposal,
-            current_entries,
-            access_scope=scope,
-            operation=operation,
-        )
+        if (
+            decision.kind is KnowledgeMaintenanceDecisionKind.REJECT
+            and publication_snapshot is not None
+        ):
+            replacement = _require_knowledge_maintenance_current_replacement(
+                proposal,
+                current_entries,
+                access_scope=scope,
+                operation=operation,
+            )
+            sources: list[KnowledgeEntry] = []
+            decision_snapshot = publication_snapshot
+        else:
+            replacement, sources = _require_knowledge_maintenance_current_entries(
+                proposal,
+                current_entries,
+                access_scope=scope,
+                operation=operation,
+            )
+            decision_snapshot = _knowledge_maintenance_access_snapshot([replacement, *sources])
         committed_at = max(self._clock(), proposal.created_at, decision.decided_at)
         if decision.kind is KnowledgeMaintenanceDecisionKind.REJECT:
             receipt = KnowledgeMaintenanceDecisionReceipt(
@@ -4400,12 +4772,11 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 outcome=KnowledgeMaintenanceOutcome.REJECTED,
                 committed_at=committed_at,
             )
-            snapshot = _knowledge_maintenance_access_snapshot([replacement, *sources])
             self._maintenance_proposals[proposal.id] = proposal
             self._maintenance_decisions[decision.operation_id] = decision
             self._maintenance_receipts[decision.operation_id] = receipt
             self._maintenance_operation_by_proposal[proposal.id] = decision.operation_id
-            self._maintenance_access[decision.operation_id] = snapshot
+            self._maintenance_access[decision.operation_id] = decision_snapshot
             return copy_knowledge_maintenance_decision_receipt(receipt)
 
         active_replacement, archived_sources = _knowledge_maintenance_successors(
@@ -4611,6 +4982,17 @@ class InMemoryKnowledgeStore(KnowledgeStore):
     ) -> KnowledgeMaintenanceProposal | None:
         scope = self._operation_access_scope(access_scope)
         proposal_id = _knowledge_maintenance_identity(proposal_id, "proposal_id")
+        publication_operation = self._maintenance_proposal_operation_by_id.get(proposal_id)
+        if publication_operation is not None:
+            snapshot = self._maintenance_proposal_publication_access.get(publication_operation)
+            proposal = self._maintenance_proposals.get(proposal_id)
+            if (
+                snapshot is None
+                or proposal is None
+                or not _knowledge_scope_allows_maintenance_access_snapshot(scope, snapshot)
+            ):
+                return None
+            return copy_knowledge_maintenance_proposal(proposal)
         operation_id = self._maintenance_operation_by_proposal.get(proposal_id)
         if operation_id is None:
             return None
@@ -7056,16 +7438,12 @@ def _require_knowledge_maintenance_current_entries(
     access_scope: KnowledgeAccessScope,
     operation: str,
 ) -> tuple[KnowledgeEntry, list[KnowledgeEntry]]:
-    if copy_knowledge_access_scope(access_scope) != proposal.access_scope:
-        raise KnowledgeAccessDenied(operation)
-    replacement = current_entries.get(proposal.replacement.entry_id)
-    if replacement is None:
-        raise KnowledgeMaintenanceStale("replacement_missing")
-    _require_knowledge_entry_access(access_scope, replacement, operation=operation)
-    if replacement.revision != proposal.replacement.revision:
-        raise KnowledgeMaintenanceStale("replacement_revision")
-    if replacement.status is not KnowledgeStatus.PENDING:
-        raise KnowledgeMaintenanceStale("replacement_status")
+    replacement = _require_knowledge_maintenance_current_replacement(
+        proposal,
+        current_entries,
+        access_scope=access_scope,
+        operation=operation,
+    )
 
     sources: list[KnowledgeEntry] = []
     for reference in proposal.sources:
@@ -7079,6 +7457,93 @@ def _require_knowledge_maintenance_current_entries(
             raise KnowledgeMaintenanceStale("source_status")
         sources.append(source)
     return replacement, sources
+
+
+def _require_knowledge_maintenance_current_replacement(
+    proposal: KnowledgeMaintenanceProposal,
+    current_entries: dict[str, KnowledgeEntry],
+    *,
+    access_scope: KnowledgeAccessScope,
+    operation: str,
+) -> KnowledgeEntry:
+    if copy_knowledge_access_scope(access_scope) != proposal.access_scope:
+        raise KnowledgeAccessDenied(operation)
+    replacement = current_entries.get(proposal.replacement.entry_id)
+    if replacement is None:
+        raise KnowledgeMaintenanceStale("replacement_missing")
+    _require_knowledge_entry_access(access_scope, replacement, operation=operation)
+    if replacement.revision != proposal.replacement.revision:
+        raise KnowledgeMaintenanceStale("replacement_revision")
+    if replacement.status is not KnowledgeStatus.PENDING:
+        raise KnowledgeMaintenanceStale("replacement_status")
+    return replacement
+
+
+def _require_knowledge_maintenance_publication_boundary(
+    replacement: KnowledgeEntry,
+    sources: list[KnowledgeEntry],
+) -> None:
+    """Prevent a generated replacement from widening any source boundary."""
+
+    boundary = (replacement.namespace, replacement.labels, replacement.visibility)
+    if any((source.namespace, source.labels, source.visibility) != boundary for source in sources):
+        raise ValueError(
+            "A maintenance proposal replacement and every source must have identical "
+            "namespace, labels, and visibility."
+        )
+
+
+def _require_knowledge_maintenance_source_evidence(
+    evidence: list[KnowledgeEvidence],
+    sources: list[KnowledgeEntry],
+) -> None:
+    """Bind one immutable evidence record to every reviewed source revision."""
+
+    by_source: dict[tuple[str, int], KnowledgeEvidence] = {}
+    for item in evidence:
+        if (
+            item.source_type != "knowledge_revision"
+            or item.source_id is None
+            or item.source_revision is None
+            or item.source_hash is None
+            or item.chunk_id is not None
+            or item.role is not KnowledgeEvidenceRole.ORIGIN
+            or item.disposition is not KnowledgeEvidenceDisposition.LIVE
+        ):
+            raise ValueError(
+                "Maintenance proposal evidence must identify one live exact knowledge revision."
+            )
+        try:
+            source_revision = int(item.source_revision)
+        except ValueError:
+            raise ValueError(
+                "Maintenance proposal evidence source revisions must be canonical integers."
+            ) from None
+        if str(source_revision) != item.source_revision:
+            raise ValueError(
+                "Maintenance proposal evidence source revisions must be canonical integers."
+            )
+        key = (item.source_id, source_revision)
+        if key in by_source:
+            raise ValueError("Maintenance proposal evidence cannot repeat a source revision.")
+        by_source[key] = item
+
+    expected = {(source.id, source.revision) for source in sources}
+    if set(by_source) != expected:
+        raise ValueError("Maintenance proposal evidence must exactly cover every source revision.")
+    for source in sources:
+        item = by_source[(source.id, source.revision)]
+        expected_hash = sha256(
+            canonical_durable_json_bytes(
+                source.model_dump(mode="json"),
+                "maintenance source revision",
+            )
+        ).hexdigest()
+        if item.source_hash != expected_hash or item.locator != {
+            "entry_id": source.id,
+            "revision": source.revision,
+        }:
+            raise ValueError("Maintenance proposal evidence does not bind its source revision.")
 
 
 def _knowledge_maintenance_successors(

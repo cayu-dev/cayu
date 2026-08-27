@@ -336,8 +336,9 @@ are explicit, measured over-budget usage remains visible, and results retain sep
 configured planner/evaluator identities and versions. Component calls run in separately
 owned tasks so caller cancellation cannot be consumed, and output observed after a stage
 deadline is discarded. Truncated or empty routing does not call either component.
-Accepted output remains a read-only evaluated draft: this slice cannot persist a pending
-replacement, publish relations, activate knowledge, or archive predecessors.
+Accepted output remains a read-only evaluated draft: the planning workflow itself cannot
+persist a pending replacement, publish relations, activate knowledge, or archive
+predecessors.
 
 The workflow independently enforces the hard 50-source ceiling before a storage read,
 even when a caller constructs its own structurally valid routing-result object. Planner
@@ -345,6 +346,37 @@ budgets disclose the configured evidence-count, claim-size, and replacement-size
 before invocation. Provider model identities are application-authorized per stage; an
 unknown component-reported identity invalidates the output without copying that identity
 into failure diagnostics.
+
+### Accepted maintenance plans persist as exact pending review artifacts
+
+`KnowledgeMaintenanceProposalPublisher` now performs the explicit atomic handoff from an
+accepted planning result to review. It revalidates routing and plan bindings, requires one
+identical namespace/label/visibility boundary, and compares every exact source against the
+active current revision inside the write transaction. A successful publication stores the
+pending replacement and chunks, exact source evidence, accepted semantic plan, review
+proposal, one knowledge-outbox change, and an immutable replay receipt together.
+
+Publication grants no lifecycle authority: it cannot activate the replacement, archive a
+source, or publish a relation. The existing reviewed-decision workflow must consume the
+byte-exact persisted proposal, and altered proposals fail closed. Approval performs the
+existing atomic lifecycle and lineage transaction; rejection leaves active source
+revisions unchanged. A rejected replacement created by this durable publisher can be
+explicitly archived or soft-deleted, but only through forward retirement transitions;
+it cannot be activated or content-mutated, and its exact audit revision cannot be
+hard-deleted or pruned. Attempt telemetry and timestamps do not affect proposal identity,
+so equivalent attempts and retries after a lost response or cancellation converge without
+duplicate artifacts. A published rejection remains available from its immutable access
+snapshot after source revisions advance or expire; approval continues to require every
+source to be current.
+
+Validated accepted plans and publisher configuration cache their immutable fingerprints,
+so maximum-source publication and replay do not repeatedly hash the complete plan.
+
+In-memory, SQLite, and PostgreSQL stores share the same behavior and verify the full
+stored composite before returning it. Storage revision 67 is a breaking prerelease
+boundary that creates an empty proposal-publication table without inferring or backfilling
+accepted plans for existing knowledge. There is no dual-write, legacy interpretation, or
+compatibility wrapper for pre-67 workers.
 
 ### Memory interventions have portable, effect-bound evidence contracts
 

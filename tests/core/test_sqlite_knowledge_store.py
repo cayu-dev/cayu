@@ -1833,6 +1833,13 @@ def test_sqlite_revision_60_initializes_empty_pre_relation_schema_directly(
             ).fetchone()
             is not None
         )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'cayu_knowledge_maintenance_proposals'"
+            ).fetchone()
+            is not None
+        )
     finally:
         connection.close()
 
@@ -1909,6 +1916,13 @@ def test_sqlite_revision_63_initializes_empty_knowledge_schema_directly(tmp_path
             ).fetchone()
             is not None
         )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'cayu_knowledge_maintenance_proposals'"
+            ).fetchone()
+            is not None
+        )
     finally:
         connection.close()
 
@@ -1950,6 +1964,72 @@ def test_sqlite_revision_65_refuses_populated_knowledge_without_backfill(tmp_pat
         )
     finally:
         connection.close()
+
+
+def test_sqlite_revision_67_adds_empty_proposal_storage_without_backfill(tmp_path) -> None:
+    database = tmp_path / "revision-66-to-67-populated.sqlite"
+
+    async def seed() -> None:
+        store = SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
+        try:
+            await store.create_entry(
+                KnowledgeEntry(id="revision-66-entry", text="Preserve this exact revision.")
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+    connection = sqlite_support.connect(database)
+    try:
+        connection.execute("DROP TABLE cayu_knowledge_maintenance_proposals")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 67")
+        connection.execute("PRAGMA user_version = 66")
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = SQLiteKnowledgeStore(
+        database,
+        schema_mode=schema_migrations.SchemaMode.MIGRATE,
+        access_scope=_ACCESS_SCOPE,
+    )
+    store._connection.close()
+    connection = sqlite_support.connect(database)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 67
+        assert (
+            connection.execute(
+                "SELECT text FROM cayu_knowledge_revisions "
+                "WHERE entry_id = 'revision-66-entry' AND revision = 1"
+            ).fetchone()[0]
+            == "Preserve this exact revision."
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM cayu_knowledge_maintenance_proposals"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        connection.close()
+
+
+def test_sqlite_revision_67_rejects_malformed_proposal_storage(tmp_path) -> None:
+    database = tmp_path / "revision-67-malformed-proposals.sqlite"
+    store = SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
+    store._connection.close()
+    connection = sqlite_support.connect(database)
+    try:
+        connection.execute("DROP TABLE cayu_knowledge_maintenance_proposals")
+        connection.execute(
+            "CREATE TABLE cayu_knowledge_maintenance_proposals (operation_id TEXT PRIMARY KEY)"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="pending maintenance proposal contract"):
+        SQLiteKnowledgeStore(database, access_scope=_ACCESS_SCOPE)
 
 
 def test_sqlite_revision_63_rejects_a_malformed_maintenance_table(tmp_path) -> None:

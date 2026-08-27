@@ -158,6 +158,7 @@ _TABLES = (
     "cayu_recall_item_exposures",
     "cayu_context_exposures",
     "cayu_recall_receipts",
+    "cayu_knowledge_maintenance_proposals",
     "cayu_knowledge_maintenance_decisions",
     "cayu_knowledge_relation_publication_receipts",
     "cayu_knowledge_relations",

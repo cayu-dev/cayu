@@ -17,6 +17,7 @@ from cayu.storage.memory import (
     KnowledgeListQuery,
     KnowledgeListResult,
     KnowledgeMaintenanceDecision,
+    KnowledgeMaintenanceDecisionKind,
     KnowledgeMaintenanceDecisionReceipt,
     KnowledgeMaintenanceProposal,
     KnowledgeStatus,
@@ -176,7 +177,10 @@ class KnowledgeReviewWorkflow:
             raise TypeError("proposal must be a KnowledgeMaintenanceProposal.")
         if type(decision) is not KnowledgeMaintenanceDecision:
             raise TypeError("decision must be a KnowledgeMaintenanceDecision.")
-        for reference in [proposal.replacement, *proposal.sources]:
+        references = [proposal.replacement]
+        if decision.kind is KnowledgeMaintenanceDecisionKind.APPROVE:
+            references.extend(proposal.sources)
+        for reference in references:
             entry = await self.store.get_entry(
                 reference.entry_id,
                 revision=reference.revision,

@@ -43,7 +43,7 @@ from cayu.runtime.local_execution_attempts import (
     local_execution_boot_id,
     local_execution_host_identity,
 )
-from cayu.storage.migrations import SchemaMode
+from cayu.storage.migrations import LATEST_REVISION, SchemaMode
 from cayu.vaults import SecretRedactor
 
 
@@ -1850,7 +1850,7 @@ def test_sqlite_revision_sixty_six_installs_attempt_fencing_without_task_loss(
     asyncio.run(migrate())
     connection = sqlite3.connect(database)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone() == (66,)
+        assert connection.execute("PRAGMA user_version").fetchone() == (LATEST_REVISION,)
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' "
             "AND name = 'cayu_local_execution_attempts'"

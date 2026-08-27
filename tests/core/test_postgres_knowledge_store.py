@@ -33,12 +33,22 @@ from tests.core.knowledge_store_conformance import (
     verify_embedding_space_isolation,
     verify_projection_readiness,
 )
+from tests.core.test_knowledge_maintenance_persistence import (
+    _REVIEW_SCOPE,
+    _accepted,
+    _assert_publication_conformance,
+    _decision,
+    _publisher,
+)
 
 from cayu.embeddings import (
     TextEmbedding,
     TextEmbeddingProvider,
     TextEmbeddingRequest,
     TextEmbeddingResult,
+)
+from cayu.knowledge_maintenance_persistence import (
+    KnowledgeMaintenanceProposalPublicationConflict,
 )
 from cayu.storage import (
     MAX_KNOWLEDGE_CHUNK_ID_BYTES,
@@ -78,6 +88,76 @@ from cayu.storage.migrations import LATEST_REVISION, MIN_SUPPORTED_REVISION, Sch
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
 _ACCESS_SCOPE = KnowledgeAccessScope.privileged()
+
+
+def test_postgres_accepted_plan_publication_and_review_handoff(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        store = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            await _assert_publication_conformance(store, "postgres")
+        finally:
+            await store.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_publication_load_validates_the_decision_record(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        store = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            request, routing, planning = await _accepted(store, "malformed-decision")
+            publisher = _publisher(store)
+            publication = await publisher.publish(request, routing, planning)
+            decision = _decision(
+                publication.proposal,
+                kind=KnowledgeMaintenanceDecisionKind.REJECT,
+                suffix="postgres-malformed-decision",
+            )
+            await store.apply_maintenance_decision(
+                publication.proposal,
+                decision,
+                access_scope=_REVIEW_SCOPE,
+            )
+            async with store._pool.connection() as conn, conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE cayu_knowledge_maintenance_decisions "
+                    "SET decision = '{}'::jsonb WHERE operation_id = %s",
+                    (decision.operation_id,),
+                )
+                await conn.commit()
+            with pytest.raises(KnowledgeMaintenanceProposalPublicationConflict) as error:
+                await publisher.load(publication.proposal.id)
+            assert error.value.reason == "malformed_receipt"
+        finally:
+            await store.close()
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
 
 
 def test_postgres_bounded_entry_read_refuses_before_loading_content(
@@ -184,6 +264,7 @@ _TABLES = (
     "cayu_recall_item_exposures",
     "cayu_context_exposures",
     "cayu_recall_receipts",
+    "cayu_knowledge_maintenance_proposals",
     "cayu_knowledge_maintenance_decisions",
     "cayu_knowledge_relation_publication_receipts",
     "cayu_knowledge_relations",
@@ -4401,12 +4482,14 @@ def test_postgres_revision_60_initializes_empty_pre_relation_schema_directly(
             await cursor.execute(
                 "SELECT to_regclass('cayu_knowledge_relations'), "
                 "to_regclass('cayu_knowledge_relation_publication_receipts'), "
-                "to_regclass('cayu_knowledge_maintenance_decisions')"
+                "to_regclass('cayu_knowledge_maintenance_decisions'), "
+                "to_regclass('cayu_knowledge_maintenance_proposals')"
             )
             assert await cursor.fetchone() == (
                 "cayu_knowledge_relations",
                 "cayu_knowledge_relation_publication_receipts",
                 "cayu_knowledge_maintenance_decisions",
+                "cayu_knowledge_maintenance_proposals",
             )
 
     try:
@@ -4495,8 +4578,14 @@ def test_postgres_revision_63_initializes_empty_knowledge_schema_directly(
         ):
             await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
             assert await cursor.fetchone() == (schema_migrations.LATEST_REVISION,)
-            await cursor.execute("SELECT to_regclass('cayu_knowledge_maintenance_decisions')")
-            assert await cursor.fetchone() == ("cayu_knowledge_maintenance_decisions",)
+            await cursor.execute(
+                "SELECT to_regclass('cayu_knowledge_maintenance_decisions'), "
+                "to_regclass('cayu_knowledge_maintenance_proposals')"
+            )
+            assert await cursor.fetchone() == (
+                "cayu_knowledge_maintenance_decisions",
+                "cayu_knowledge_maintenance_proposals",
+            )
 
     try:
         asyncio.run(run())
@@ -4554,6 +4643,118 @@ def test_postgres_revision_65_refuses_populated_knowledge_without_backfill(
                 (entry.id,),
             )
             assert await cursor.fetchone() == (entry.text,)
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_revision_67_adds_empty_proposal_storage_without_backfill(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            await creator.ensure_schema()
+            await creator.create_entry(
+                KnowledgeEntry(
+                    id="revision-66-entry",
+                    text="Preserve this exact revision.",
+                )
+            )
+        finally:
+            await creator.close()
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute("DROP TABLE cayu_knowledge_maintenance_proposals")
+                await cursor.execute("DELETE FROM cayu_schema_migrations WHERE revision = 67")
+            await connection.commit()
+
+        migrator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.MIGRATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert await cursor.fetchone() == (67,)
+            await cursor.execute(
+                "SELECT text FROM cayu_knowledge_revisions "
+                "WHERE entry_id = 'revision-66-entry' AND revision = 1"
+            )
+            assert await cursor.fetchone() == ("Preserve this exact revision.",)
+            await cursor.execute("SELECT COUNT(*) FROM cayu_knowledge_maintenance_proposals")
+            assert await cursor.fetchone() == (0,)
+
+    try:
+        asyncio.run(run())
+    finally:
+        asyncio.run(_drop_all(postgres_dsn))
+
+
+def test_postgres_revision_67_rejects_malformed_proposal_storage(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            await creator.ensure_schema()
+        finally:
+            await creator.close()
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute("DROP TABLE cayu_knowledge_maintenance_proposals")
+                await cursor.execute(
+                    "CREATE TABLE cayu_knowledge_maintenance_proposals "
+                    "(operation_id TEXT PRIMARY KEY)"
+                )
+            await connection.commit()
+
+        validator = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+            access_scope=_ACCESS_SCOPE,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="pending maintenance proposal contract"):
+                await validator.ensure_schema()
+        finally:
+            await validator.close()
 
     try:
         asyncio.run(run())

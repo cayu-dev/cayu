@@ -3066,6 +3066,43 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_local_execution_attempts_discovery
             ON cayu_local_execution_attempts(created_at, attempt_id);
     """,
+    67: """
+        CREATE TABLE IF NOT EXISTS cayu_knowledge_maintenance_proposals (
+            operation_id TEXT PRIMARY KEY,
+            proposal_id TEXT NOT NULL UNIQUE,
+            replacement_entry_id TEXT NOT NULL UNIQUE,
+            replacement_revision INTEGER NOT NULL CHECK (
+                replacement_revision > 0 AND replacement_revision <= 2147483647
+            ),
+            proposal_fingerprint TEXT NOT NULL CHECK (
+                length(proposal_fingerprint) = 64
+                AND proposal_fingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+            accepted_plan_fingerprint TEXT NOT NULL CHECK (
+                length(accepted_plan_fingerprint) = 64
+                AND accepted_plan_fingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+            request_sha256 TEXT NOT NULL CHECK (
+                length(request_sha256) = 64
+                AND request_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            committed_at TEXT NOT NULL,
+            proposal_json TEXT NOT NULL CHECK (
+                json_valid(proposal_json) AND json_type(proposal_json) = 'object'
+            ),
+            accepted_plan_json TEXT NOT NULL CHECK (
+                json_valid(accepted_plan_json)
+                AND json_type(accepted_plan_json) = 'object'
+            ),
+            receipt_json TEXT NOT NULL CHECK (
+                json_valid(receipt_json) AND json_type(receipt_json) = 'object'
+            ),
+            access_snapshot_json TEXT NOT NULL CHECK (
+                json_valid(access_snapshot_json)
+                AND json_type(access_snapshot_json) = 'object'
+            )
+        );
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -3362,6 +3399,7 @@ _KNOWLEDGE_RELATION_CLEAN_BREAK_TABLES = (
 _KNOWLEDGE_MAINTENANCE_CLEAN_BREAK_TABLES = (
     *_KNOWLEDGE_RELATION_CLEAN_BREAK_TABLES,
     "cayu_knowledge_maintenance_decisions",
+    "cayu_knowledge_maintenance_proposals",
 )
 
 
@@ -4606,6 +4644,8 @@ def reconcile_schema(
         _validate_revision_60_knowledge_schema(connection)
     if current.revision >= 63:
         _validate_revision_63_knowledge_schema(connection)
+    if current.revision >= 67:
+        _validate_revision_67_knowledge_schema(connection)
     if app_min_supported >= 38:
         _validate_task_terminalization_receipt_table(connection)
     if app_min_supported >= 39:
@@ -5645,6 +5685,68 @@ def _raise_revision_63_sqlite_schema_error(name: str) -> NoReturn:
     raise RuntimeError(
         "SQLite schema object "
         f"{name!r} conflicts with Cayu's reviewed knowledge maintenance contract. "
+        "Recreate the prerelease knowledge database with schema_mode=CREATE or MIGRATE."
+    )
+
+
+def _validate_revision_67_knowledge_schema(connection: sqlite3.Connection) -> None:
+    table = "cayu_knowledge_maintenance_proposals"
+    expected_columns = (
+        ("operation_id", "TEXT", 0, 1),
+        ("proposal_id", "TEXT", 1, 0),
+        ("replacement_entry_id", "TEXT", 1, 0),
+        ("replacement_revision", "INTEGER", 1, 0),
+        ("proposal_fingerprint", "TEXT", 1, 0),
+        ("accepted_plan_fingerprint", "TEXT", 1, 0),
+        ("request_sha256", "TEXT", 1, 0),
+        ("committed_at", "TEXT", 1, 0),
+        ("proposal_json", "TEXT", 1, 0),
+        ("accepted_plan_json", "TEXT", 1, 0),
+        ("receipt_json", "TEXT", 1, 0),
+        ("access_snapshot_json", "TEXT", 1, 0),
+    )
+    actual_columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in connection.execute(f"PRAGMA table_info({table})")
+    )
+    if actual_columns != expected_columns:
+        _raise_revision_67_sqlite_schema_error(table)
+    if tuple(connection.execute(f"PRAGMA foreign_key_list({table})")):
+        _raise_revision_67_sqlite_schema_error(table)
+    for key in (("operation_id",), ("proposal_id",), ("replacement_entry_id",)):
+        if not _sqlite_has_unique_index(connection, table, key):
+            _raise_revision_67_sqlite_schema_error(table)
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    normalized = _normalize_sqlite_schema_sql(None if row is None else row[0])
+    required = (
+        "replacement_revision > 0",
+        "replacement_revision <= 2147483647",
+        "length(proposal_fingerprint) = 64",
+        "proposal_fingerprint not glob '*[^0-9a-f]*'",
+        "length(accepted_plan_fingerprint) = 64",
+        "accepted_plan_fingerprint not glob '*[^0-9a-f]*'",
+        "length(request_sha256) = 64",
+        "request_sha256 not glob '*[^0-9a-f]*'",
+        "json_valid(proposal_json)",
+        "json_type(proposal_json) = 'object'",
+        "json_valid(accepted_plan_json)",
+        "json_type(accepted_plan_json) = 'object'",
+        "json_valid(receipt_json)",
+        "json_type(receipt_json) = 'object'",
+        "json_valid(access_snapshot_json)",
+        "json_type(access_snapshot_json) = 'object'",
+    )
+    if any(fragment not in normalized for fragment in required):
+        _raise_revision_67_sqlite_schema_error(table)
+
+
+def _raise_revision_67_sqlite_schema_error(name: str) -> NoReturn:
+    raise RuntimeError(
+        "SQLite schema object "
+        f"{name!r} conflicts with Cayu's pending maintenance proposal contract. "
         "Recreate the prerelease knowledge database with schema_mode=CREATE or MIGRATE."
     )
 
@@ -7386,6 +7488,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
             )
         if rev.revision == 66:
             _validate_local_execution_attempt_schema(connection)
+        if rev.revision == 67:
+            _validate_revision_67_knowledge_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

@@ -367,6 +367,10 @@ REVISIONS: tuple[Revision, ...] = (
     # task claiming and lease reclamation. Pre-66 task workers do not consult
     # that fence, so mixed-version task execution is unsafe.
     Revision(revision=66, kind=RevisionKind.BREAKING, compatible_from=66),
+    # Accepted maintenance plans now publish an immutable pending replacement,
+    # exact review proposal, and replay receipt in one transaction. Existing
+    # prerelease knowledge rows are deliberately not inferred or backfilled.
+    Revision(revision=67, kind=RevisionKind.BREAKING, compatible_from=67),
 )
 
 #: The revision an empty database is initialized to.

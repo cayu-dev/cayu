@@ -563,8 +563,9 @@ grants the reviewer read access to the archived revision.
 `derived_from` and `contradicts` sources remain active. In particular,
 contradiction records an unresolved reviewed conflict without silently choosing
 a winner. Rejection persists immutable review history but does not activate,
-archive, relate, or delete any entry. Rejected pending content therefore remains
-pending unless the caller performs a separate lifecycle decision.
+archive, relate, or delete any entry; it leaves entry lifecycle unchanged. Any
+additional lifecycle authority depends on how the application created and owns
+that pending content.
 
 Normal active recall cannot see the pending replacement before approval. After
 approval it sees the replacement only after the predecessor lifecycle and
@@ -750,8 +751,8 @@ cannot substitute unrelated authorized knowledge into a planning attempt.
 Source entries are storage-reauthorized and compared with the routed immutable snapshot
 before planner invocation, after planning, and after evaluation. A revision advance,
 disappearance, or scope loss therefore prevents acceptance; a change during planning
-also avoids spending the evaluator budget on stale work. The later persistence slice
-must still compare-and-swap the same exact revisions because a read-only accepted result
+also avoids spending the evaluator budget on stale work. Pending-proposal publication
+still compares the same exact revisions atomically because a read-only accepted result
 cannot reserve the corpus. A source that actually advances produces a deterministic stale
 rejection. By contrast, a timeout or storage failure while checking currentness remains a
 distinct revalidation-failure outcome, including whether it happened after planning or
@@ -781,8 +782,8 @@ workflow = KnowledgeMaintenancePlanningWorkflow(
 )
 planning = await workflow.plan(request, result)
 if planning.outcome is KnowledgeMaintenancePlanningOutcome.ACCEPTED:
-    # The draft is eligible for a later pending-persistence operation, not activation.
-    queue_for_pending_persistence(planning)
+    # The draft is eligible for explicit pending publication, never activation.
+    queue_for_pending_review_publication(request, result, planning)
 ```
 
 Configuration separately bounds planner input, plan output, evaluator input and output,
@@ -820,6 +821,86 @@ PYTHONPATH=src python scripts/run_knowledge_maintenance_planning_performance.py 
 
 Results are recorded in
 [`benchmarks/memory/knowledge-maintenance-planning-performance-v1.json`](../benchmarks/memory/knowledge-maintenance-planning-performance-v1.json).
+
+## Atomic pending maintenance proposals
+
+`KnowledgeMaintenanceProposalPublisher` is the explicit write boundary after an
+accepted planning result. It defensively revalidates the exact routing request, routing
+result, accepted plan, source coverage, evidence mappings, relation orientation, policy,
+and source security boundary before asking the store to write. Rejected, incomplete, or
+stale planning results cannot reach storage through this workflow.
+
+Publication creates one immutable review artifact in a single store transaction:
+
+- revision 1 of a deterministic pending replacement, including its complete chunk set;
+- one live `KnowledgeEvidence` pointer and content hash for every exact source revision;
+- the exact `KnowledgeMaintenanceProposal` consumed by the reviewed-decision workflow;
+- an attempt-independent `KnowledgeMaintenanceAcceptedPlan` containing the evaluated
+  plan and its routing, configuration, planner, and evaluator bindings;
+- one metadata-only `CREATED` change in the canonical knowledge outbox; and
+- an immutable operation receipt that binds every component by SHA-256.
+
+It does not activate the replacement, archive a source, or publish a relation. Those
+effects remain exclusively owned by `KnowledgeReviewWorkflow.decide_maintenance(...)`
+and the store's atomic reviewed-decision transaction. A decision for a durably published
+proposal must equal the stored proposal exactly; changing its rationale, evidence,
+relations, sources, or any other fingerprinted field is rejected.
+
+Publication also owns the replacement's lifecycle. While review is pending, no
+other entry operation can activate, archive, mutate, delete, or prune it. Rejection
+keeps the replacement pending and unlocks only explicit forward retirement:
+pending to archived or deleted, and archived to deleted. The rejected replacement
+cannot be reactivated or content-mutated, and its exact audit revision cannot be
+hard-deleted or pruned. These fences apply to replacements created by this durable
+publisher; directly constructed maintenance proposals do not acquire publication
+ownership merely by being reviewed.
+
+Approval still requires every source to be the active current revision. Rejection
+does not: the store authorizes an exact published rejection from the immutable
+publication snapshot, so a reviewer can close and retire a proposal after sources
+advance or their expired revisions are pruned. This does not restore or mutate any
+source and does not weaken approval's currentness checks.
+
+All sources must have identical namespace, complete label map, and visibility. The
+pending replacement inherits that exact boundary, while the application supplies an
+explicit review scope that can access current sources and pending knowledge. Publication
+rechecks that every source is still the active current revision and verifies evidence
+hashes inside the same transaction. An advance after evaluation therefore creates no
+replacement, proposal, evidence, chunk, or outbox residue.
+
+```python
+from cayu import (
+    KnowledgeMaintenanceProposalPublisher,
+    KnowledgeMaintenanceProposalPublisherConfig,
+)
+
+publisher = KnowledgeMaintenanceProposalPublisher(
+    store,
+    access_scope=maintenance_review_scope,
+    config=KnowledgeMaintenanceProposalPublisherConfig(
+        publisher_id="billing-maintenance-publisher",
+        publisher_version="2026-08",
+    ),
+)
+
+publication = await publisher.publish(request, result, planning)
+# publication.proposal is pending and must still receive an external review decision.
+```
+
+Proposal, replacement, relation, evidence, and operation identities derive from the
+accepted semantic plan, review scope, and publisher configuration. Attempt timestamps
+and provider usage do not participate, so equivalent accepted attempts converge on the
+same bytes and identity. A retry after a lost response or caller cancellation loads the
+existing artifact and marks the returned receipt as replayed; different material reusing
+an operation or proposal identity fails closed. Loading the artifact after a decision
+retains the exact pending revision for audit while reporting that the proposal is already
+decided.
+
+In-memory, SQLite, and PostgreSQL stores implement the same publication and review-handoff
+contract. Breaking storage revision 67 adds only the new proposal-publication record.
+Existing knowledge revisions are retained, but no proposal, accepted plan, or receipt is
+inferred or backfilled from them. Pre-67 workers cannot share the migrated store; there is
+no dual-write path, legacy proposal interpretation, or compatibility wrapper.
 
 ## Explicit reviewed knowledge curation
 

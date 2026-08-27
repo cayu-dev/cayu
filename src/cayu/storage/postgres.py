@@ -13,8 +13,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
-from typing import Any, ClassVar, Literal, LiteralString, NoReturn, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, LiteralString, NoReturn, cast
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from cayu.knowledge_maintenance_persistence import (
+        KnowledgeMaintenanceAcceptedPlan,
+        KnowledgeMaintenanceProposalPublication,
+        KnowledgeMaintenanceProposalPublicationReceipt,
+    )
 
 try:
     from psycopg import sql
@@ -698,6 +705,9 @@ from cayu.storage.memory import (
     _parse_knowledge_relation_access_snapshot_json,
     _require_knowledge_entry_access,
     _require_knowledge_maintenance_current_entries,
+    _require_knowledge_maintenance_current_replacement,
+    _require_knowledge_maintenance_publication_boundary,
+    _require_knowledge_maintenance_source_evidence,
     _require_knowledge_successor_access,
     _score_entry,
     _search_result_from_scored_embeddings,
@@ -748,6 +758,13 @@ from cayu.storage.memory import (
 # requirement is being a stable constant unlikely to collide with app locks.
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
+_MAINTENANCE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS = frozenset(
+    {
+        (KnowledgeStatus.PENDING, KnowledgeStatus.ARCHIVED),
+        (KnowledgeStatus.PENDING, KnowledgeStatus.DELETED),
+        (KnowledgeStatus.ARCHIVED, KnowledgeStatus.DELETED),
+    }
+)
 _POSTGRES_MIN_REQUIRED_REVISION = 18
 _POSTGRES_SESSION_MIN_REQUIRED_REVISION = 62
 _POSTGRES_TASK_MIN_REQUIRED_REVISION = 66
@@ -3116,6 +3133,32 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "CREATE INDEX IF NOT EXISTS idx_cayu_local_execution_attempts_discovery "
         "ON cayu_local_execution_attempts(created_at, attempt_id)",
     ),
+    67: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_knowledge_maintenance_proposals (
+            operation_id TEXT PRIMARY KEY,
+            proposal_id TEXT NOT NULL UNIQUE,
+            replacement_entry_id TEXT NOT NULL UNIQUE,
+            replacement_revision INTEGER NOT NULL
+                CHECK (replacement_revision > 0 AND replacement_revision <= 2147483647),
+            proposal_fingerprint TEXT NOT NULL
+                CHECK (proposal_fingerprint ~ '^[0-9a-f]{64}$'),
+            accepted_plan_fingerprint TEXT NOT NULL
+                CHECK (accepted_plan_fingerprint ~ '^[0-9a-f]{64}$'),
+            request_sha256 TEXT NOT NULL
+                CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
+            committed_at TIMESTAMPTZ NOT NULL,
+            proposal JSONB NOT NULL,
+            accepted_plan JSONB NOT NULL,
+            receipt JSONB NOT NULL,
+            access_snapshot JSONB NOT NULL,
+            CHECK (jsonb_typeof(proposal) = 'object'),
+            CHECK (jsonb_typeof(accepted_plan) = 'object'),
+            CHECK (jsonb_typeof(receipt) = 'object'),
+            CHECK (jsonb_typeof(access_snapshot) = 'object')
+        )
+        """,
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -4679,6 +4722,8 @@ class _PostgresStoreBase:
                             await self._validate_knowledge_relation_schema(cur)
                         if current_state.revision >= 63:
                             await self._validate_knowledge_maintenance_schema(cur)
+                        if current_state.revision >= 67:
+                            await self._validate_knowledge_maintenance_proposal_schema(cur)
                         if self._min_required_revision >= 45:
                             await self._validate_task_retry_series_schema(cur)
                         if self._min_required_revision >= 46:
@@ -4885,6 +4930,8 @@ class _PostgresStoreBase:
             await self._validate_knowledge_relation_schema(cur)
         if state.revision >= 63:
             await self._validate_knowledge_maintenance_schema(cur)
+        if state.revision >= 67:
+            await self._validate_knowledge_maintenance_proposal_schema(cur)
         if self._min_required_revision >= 45:
             await self._validate_task_retry_series_schema(cur)
         if self._min_required_revision >= 46:
@@ -5045,6 +5092,8 @@ class _PostgresStoreBase:
             )
         if revision.revision == 66:
             await self._validate_local_execution_attempt_schema(cur)
+        if revision.revision == 67:
+            await self._validate_knowledge_maintenance_proposal_schema(cur)
 
     async def _validate_local_execution_attempt_schema(self, cur: Any) -> None:
         await cur.execute(
@@ -6306,6 +6355,80 @@ class _PostgresStoreBase:
         raise RuntimeError(
             "Postgres schema object "
             f"{name!r} conflicts with Cayu's reviewed knowledge maintenance "
+            "contract. Recreate the prerelease knowledge schema with "
+            "schema_mode=CREATE or MIGRATE."
+        )
+
+    async def _validate_knowledge_maintenance_proposal_schema(self, cur: Any) -> None:
+        table = "cayu_knowledge_maintenance_proposals"
+        await cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = %s
+            ORDER BY ordinal_position
+            """,
+            (table,),
+        )
+        expected = (
+            ("operation_id", "text", "NO"),
+            ("proposal_id", "text", "NO"),
+            ("replacement_entry_id", "text", "NO"),
+            ("replacement_revision", "integer", "NO"),
+            ("proposal_fingerprint", "text", "NO"),
+            ("accepted_plan_fingerprint", "text", "NO"),
+            ("request_sha256", "text", "NO"),
+            ("committed_at", "timestamp with time zone", "NO"),
+            ("proposal", "jsonb", "NO"),
+            ("accepted_plan", "jsonb", "NO"),
+            ("receipt", "jsonb", "NO"),
+            ("access_snapshot", "jsonb", "NO"),
+        )
+        if tuple(await cur.fetchall()) != expected:
+            self._raise_knowledge_maintenance_proposal_schema_error(table)
+        await cur.execute(
+            """
+            SELECT constraint_record.contype,
+                   pg_get_constraintdef(constraint_record.oid)
+            FROM pg_catalog.pg_constraint AS constraint_record
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = constraint_record.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = %s
+            """,
+            (table,),
+        )
+        constraints = [
+            (str(kind), " ".join(str(definition).lower().split()))
+            for kind, definition in await cur.fetchall()
+        ]
+        required = (
+            ("p", ("primary key (operation_id)",)),
+            ("u", ("unique (proposal_id)",)),
+            ("u", ("unique (replacement_entry_id)",)),
+            ("c", ("replacement_revision", "> 0", "2147483647")),
+            ("c", ("proposal_fingerprint", "[0-9a-f]{64}")),
+            ("c", ("accepted_plan_fingerprint", "[0-9a-f]{64}")),
+            ("c", ("request_sha256", "[0-9a-f]{64}")),
+            ("c", ("jsonb_typeof(proposal)", "object")),
+            ("c", ("jsonb_typeof(accepted_plan)", "object")),
+            ("c", ("jsonb_typeof(receipt)", "object")),
+            ("c", ("jsonb_typeof(access_snapshot)", "object")),
+        )
+        for kind, fragments in required:
+            if not any(
+                candidate_kind == kind and all(fragment in definition for fragment in fragments)
+                for candidate_kind, definition in constraints
+            ):
+                self._raise_knowledge_maintenance_proposal_schema_error(table)
+
+    @staticmethod
+    def _raise_knowledge_maintenance_proposal_schema_error(name: str) -> NoReturn:
+        raise RuntimeError(
+            "Postgres schema object "
+            f"{name!r} conflicts with Cayu's pending maintenance proposal "
             "contract. Recreate the prerelease knowledge schema with "
             "schema_mode=CREATE or MIGRATE."
         )
@@ -10151,7 +10274,7 @@ async def _lock_knowledge_change_sequence(cur: Any) -> None:
 class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
     """Postgres-backed durable knowledge store with full-text search."""
 
-    _min_required_revision = 65
+    _min_required_revision = 67
 
     def __init__(
         self,
@@ -10472,6 +10595,12 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                             actual_revision=entry.revision,
                         )
                     if hard:
+                        await self._require_maintenance_replacement_mutation_allowed(
+                            cur,
+                            entry_id=entry_id,
+                            entry_revision=entry.revision,
+                            preserve_history=True,
+                        )
                         await self._insert_change(
                             cur,
                             before_entry=entry,
@@ -10526,6 +10655,14 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             scope,
             now=cutoff,
         )
+        maintenance_exclusion_sql = (
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM cayu_knowledge_maintenance_proposals AS proposal "
+            "WHERE proposal.replacement_entry_id = e.id"
+            ") "
+            if self._min_required_revision >= 67
+            else ""
+        )
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
@@ -10536,6 +10673,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                             "SELECT e.id FROM cayu_knowledge_current_entries AS e "
                             "WHERE TRUE "
                             "AND e.expires_at IS NOT NULL AND e.expires_at <= %s "
+                            f"{maintenance_exclusion_sql}"
                             f"{access_sql}",
                         ),
                         (cutoff, *access_params),
@@ -10649,6 +10787,14 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                             actual_revision=actual_revision,
                         )
                     if existing_entry is not None:
+                        await self._require_maintenance_replacement_mutation_allowed(
+                            cur,
+                            entry_id=existing_entry.id,
+                            entry_revision=existing_entry.revision,
+                            current_status=existing_entry.status,
+                            successor_status=copied_entry.status,
+                            operation="publish_entry_revision",
+                        )
                         _validate_revision_successor(existing_entry, copied_entry)
                     await self._require_chunk_ids_available(
                         cur,
@@ -10969,6 +11115,280 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             fingerprint=fingerprint,
         )
 
+    async def publish_maintenance_proposal(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+        *,
+        evidence: list[KnowledgeEvidence],
+        proposal: KnowledgeMaintenanceProposal,
+        accepted_plan: KnowledgeMaintenanceAcceptedPlan,
+        operation_id: str,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceProposalPublicationReceipt:
+        from cayu.knowledge_maintenance_persistence import (
+            KnowledgeMaintenanceProposalPublicationConflict,
+            KnowledgeMaintenanceProposalPublicationReceipt,
+            copy_knowledge_maintenance_proposal_publication_receipt,
+            prepare_knowledge_maintenance_proposal_publication,
+            validate_knowledge_maintenance_proposal_publication_replay,
+        )
+
+        scope = self._operation_access_scope(access_scope)
+        (
+            operation_id,
+            copied_entry,
+            copied_chunks,
+            copied_evidence,
+            copied_proposal,
+            copied_plan,
+            request_sha256,
+        ) = prepare_knowledge_maintenance_proposal_publication(
+            entry,
+            chunks,
+            evidence=evidence,
+            proposal=proposal,
+            accepted_plan=accepted_plan,
+            operation_id=operation_id,
+        )
+        operation = "publish_maintenance_proposal"
+        _require_knowledge_entry_access(scope, copied_entry, operation=operation)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await _lock_knowledge_write_identities(
+                        cur,
+                        operation_ids=(operation_id,),
+                        maintenance_proposal_ids=(copied_proposal.id,),
+                    )
+                    await _lock_knowledge_write_identities(
+                        cur,
+                        entry_ids=(
+                            copied_entry.id,
+                            *(source.entry_id for source in copied_proposal.sources),
+                        ),
+                    )
+                    await _lock_knowledge_write_identities(
+                        cur,
+                        chunk_ids=tuple(chunk.id for chunk in copied_chunks),
+                        evidence_ids=tuple(item.id for item in copied_evidence),
+                    )
+                    existing = await self._load_maintenance_proposal_record(
+                        cur,
+                        operation_id,
+                        access_scope=scope,
+                        deny_inaccessible=True,
+                    )
+                    if existing is not None:
+                        stored_proposal, stored_plan, receipt, _ = existing
+                        validate_knowledge_maintenance_proposal_publication_replay(
+                            receipt,
+                            proposal=copied_proposal,
+                            accepted_plan=copied_plan,
+                            entry=copied_entry,
+                            request_sha256=request_sha256,
+                        )
+                        if stored_proposal != copied_proposal or stored_plan != copied_plan:
+                            raise KnowledgeMaintenanceProposalPublicationConflict(
+                                "malformed_receipt"
+                            )
+                        await conn.commit()
+                        return copy_knowledge_maintenance_proposal_publication_receipt(
+                            receipt,
+                            replayed=True,
+                        )
+
+                    await cur.execute(
+                        "SELECT operation_id FROM cayu_knowledge_maintenance_proposals "
+                        "WHERE proposal_id = %s",
+                        (copied_proposal.id,),
+                    )
+                    occupied = await cur.fetchone()
+                    if occupied is not None:
+                        await self._load_maintenance_proposal_record(
+                            cur,
+                            str(occupied[0]),
+                            access_scope=scope,
+                            deny_inaccessible=True,
+                        )
+                        raise KnowledgeMaintenanceProposalPublicationConflict("proposal_id_reuse")
+                    await cur.execute(
+                        "SELECT operation_id FROM cayu_knowledge_maintenance_decisions "
+                        "WHERE proposal_id = %s",
+                        (copied_proposal.id,),
+                    )
+                    decided = await cur.fetchone()
+                    if decided is not None:
+                        await self._load_maintenance_record(
+                            cur,
+                            str(decided[0]),
+                            access_scope=scope,
+                            deny_inaccessible=True,
+                        )
+                        raise KnowledgeMaintenanceProposalPublicationConflict(
+                            "proposal_already_decided"
+                        )
+
+                    source_entries = await self._load_entries(
+                        cur,
+                        [source.entry_id for source in copied_proposal.sources],
+                    )
+                    current_entries = dict(source_entries)
+                    current_entries[copied_entry.id] = copied_entry
+                    replacement, sources = _require_knowledge_maintenance_current_entries(
+                        copied_proposal,
+                        current_entries,
+                        access_scope=scope,
+                        operation=operation,
+                    )
+                    _require_knowledge_maintenance_publication_boundary(replacement, sources)
+                    _require_knowledge_maintenance_source_evidence(copied_evidence, sources)
+                    occupied_entry = await self._load_entry(cur, copied_entry.id)
+                    if occupied_entry is not None:
+                        _require_knowledge_entry_access(
+                            scope,
+                            occupied_entry,
+                            operation=operation,
+                        )
+                        raise KnowledgeMaintenanceProposalPublicationConflict(
+                            "replacement_id_reuse"
+                        )
+                    await self._require_chunk_ids_available(
+                        cur,
+                        copied_chunks,
+                        access_scope=scope,
+                        operation=operation,
+                    )
+                    await self._require_evidence_ids_available(
+                        cur,
+                        copied_evidence,
+                        access_scope=scope,
+                        operation=operation,
+                    )
+                    committed_at = max(self._clock(), copied_proposal.created_at)
+                    receipt = KnowledgeMaintenanceProposalPublicationReceipt(
+                        operation_id=operation_id,
+                        proposal_id=copied_proposal.id,
+                        proposal_fingerprint=copied_proposal.fingerprint,
+                        accepted_plan_fingerprint=copied_plan.fingerprint,
+                        request_sha256=request_sha256,
+                        replacement=copied_proposal.replacement,
+                        committed_at=committed_at,
+                    )
+                    snapshot = _knowledge_maintenance_access_snapshot([replacement, *sources])
+                    await self._insert_entry(cur, copied_entry)
+                    await self._insert_chunks(cur, copied_entry, copied_chunks)
+                    await self._insert_evidence(cur, copied_evidence)
+                    await _lock_knowledge_change_sequence(cur)
+                    await self._insert_change(
+                        cur,
+                        before_entry=None,
+                        after_entry=copied_entry,
+                        kind=KnowledgeChangeKind.CREATED,
+                        operation_id=operation_id,
+                        committed_at=committed_at,
+                    )
+                    await self._insert_maintenance_proposal_record(
+                        cur,
+                        copied_proposal,
+                        copied_plan,
+                        receipt,
+                        access_snapshot=snapshot,
+                    )
+                await conn.commit()
+                return copy_knowledge_maintenance_proposal_publication_receipt(receipt)
+            except (ForeignKeyViolation, UniqueViolation):
+                await conn.rollback()
+                raise KnowledgeMaintenanceProposalPublicationConflict(
+                    "concurrent_occupancy"
+                ) from None
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def load_maintenance_proposal_publication(
+        self,
+        proposal_id: str,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeMaintenanceProposalPublication | None:
+        from cayu.knowledge_maintenance_persistence import (
+            KnowledgeMaintenanceProposalPublication,
+            KnowledgeMaintenanceProposalPublicationConflict,
+            KnowledgeMaintenanceProposalPublicationOutcome,
+            copy_knowledge_maintenance_proposal_publication_receipt,
+        )
+
+        scope = self._operation_access_scope(access_scope)
+        proposal_id = _knowledge_maintenance_identity(proposal_id, "proposal_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await _begin_knowledge_read_snapshot(cur)
+            await cur.execute(
+                "SELECT operation_id FROM cayu_knowledge_maintenance_proposals "
+                "WHERE proposal_id = %s",
+                (proposal_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            record = await self._load_maintenance_proposal_record(
+                cur,
+                str(row[0]),
+                access_scope=scope,
+                deny_inaccessible=False,
+            )
+            if record is None:
+                return None
+            proposal, accepted_plan, receipt, publication_snapshot = record
+            replacement = await self._load_entry(
+                cur,
+                proposal.replacement.entry_id,
+                revision=proposal.replacement.revision,
+            )
+            if replacement is None:
+                raise KnowledgeMaintenanceProposalPublicationConflict("replacement_missing")
+            await cur.execute(
+                "SELECT operation_id FROM cayu_knowledge_maintenance_decisions "
+                "WHERE proposal_id = %s",
+                (proposal_id,),
+            )
+            decision_row = await cur.fetchone()
+            if decision_row is not None:
+                try:
+                    decision_record = await self._load_maintenance_record(
+                        cur,
+                        str(decision_row[0]),
+                        access_scope=scope,
+                        deny_inaccessible=True,
+                    )
+                except (KnowledgeAccessDenied, KnowledgeMaintenanceConflict):
+                    raise KnowledgeMaintenanceProposalPublicationConflict(
+                        "malformed_receipt"
+                    ) from None
+                if (
+                    decision_record is None
+                    or decision_record[0] != proposal
+                    or decision_record[3] != publication_snapshot
+                ):
+                    raise KnowledgeMaintenanceProposalPublicationConflict("malformed_receipt")
+            decided = decision_row is not None
+        return KnowledgeMaintenanceProposalPublication(
+            proposal=proposal,
+            accepted_plan=accepted_plan,
+            replacement=replacement,
+            receipt=copy_knowledge_maintenance_proposal_publication_receipt(
+                receipt,
+                replayed=True,
+            ),
+            outcome=(
+                KnowledgeMaintenanceProposalPublicationOutcome.EXISTING_DECIDED
+                if decided
+                else KnowledgeMaintenanceProposalPublicationOutcome.EXISTING_PENDING
+            ),
+        )
+
     async def apply_maintenance_decision(
         self,
         proposal: KnowledgeMaintenanceProposal,
@@ -10991,6 +11411,29 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         proposal=proposal,
                         decision=decision,
                     )
+                    await cur.execute(
+                        "SELECT operation_id FROM cayu_knowledge_maintenance_proposals "
+                        "WHERE proposal_id = %s OR replacement_entry_id = %s "
+                        "ORDER BY operation_id",
+                        (proposal.id, proposal.replacement.entry_id),
+                    )
+                    publication_rows = await cur.fetchall()
+                    publication_snapshot: _KnowledgeMaintenanceAccessSnapshot | None = None
+                    for publication_row in publication_rows:
+                        publication = await self._load_maintenance_proposal_record(
+                            cur,
+                            str(publication_row[0]),
+                            access_scope=scope,
+                            deny_inaccessible=True,
+                        )
+                        if publication is None or publication[0] != proposal:
+                            raise KnowledgeMaintenanceConflict("proposal_publication_mismatch")
+                        if (
+                            publication_snapshot is not None
+                            and publication_snapshot != publication[3]
+                        ):
+                            raise KnowledgeMaintenanceConflict("malformed_proposal_publication")
+                        publication_snapshot = publication[3]
                     existing = await self._load_maintenance_record(
                         cur,
                         decision.operation_id,
@@ -10998,7 +11441,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         deny_inaccessible=True,
                     )
                     if existing is not None:
-                        stored_proposal, stored_decision, receipt = existing
+                        stored_proposal, stored_decision, receipt, _ = existing
                         _validate_knowledge_maintenance_replay(
                             stored_proposal,
                             stored_decision,
@@ -11034,12 +11477,28 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                             *(source.entry_id for source in proposal.sources),
                         ],
                     )
-                    replacement, sources = _require_knowledge_maintenance_current_entries(
-                        proposal,
-                        current_entries,
-                        access_scope=scope,
-                        operation=operation,
-                    )
+                    if (
+                        decision.kind is KnowledgeMaintenanceDecisionKind.REJECT
+                        and publication_snapshot is not None
+                    ):
+                        replacement = _require_knowledge_maintenance_current_replacement(
+                            proposal,
+                            current_entries,
+                            access_scope=scope,
+                            operation=operation,
+                        )
+                        sources: list[KnowledgeEntry] = []
+                        decision_snapshot = publication_snapshot
+                    else:
+                        replacement, sources = _require_knowledge_maintenance_current_entries(
+                            proposal,
+                            current_entries,
+                            access_scope=scope,
+                            operation=operation,
+                        )
+                        decision_snapshot = publication_snapshot or (
+                            _knowledge_maintenance_access_snapshot([replacement, *sources])
+                        )
                     committed_at = max(self._clock(), proposal.created_at, decision.decided_at)
                     if decision.kind is KnowledgeMaintenanceDecisionKind.REJECT:
                         receipt = KnowledgeMaintenanceDecisionReceipt(
@@ -11055,9 +11514,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                             proposal,
                             decision,
                             receipt,
-                            access_snapshot=_knowledge_maintenance_access_snapshot(
-                                [replacement, *sources]
-                            ),
+                            access_snapshot=decision_snapshot,
                         )
                         await conn.commit()
                         return copy_knowledge_maintenance_decision_receipt(receipt)
@@ -11129,6 +11586,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                             inherit_evidence=True,
                             change_operation_id=decision.operation_id,
                             committed_at=committed_at,
+                            allow_pending_maintenance_replacement=True,
                         )
 
                     post_current = await self._load_entries(cur, list(current_entries))
@@ -11189,9 +11647,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                         proposal,
                         decision,
                         receipt,
-                        access_snapshot=_knowledge_maintenance_access_snapshot(
-                            [replacement, *sources]
-                        ),
+                        access_snapshot=decision_snapshot,
                     )
                 await conn.commit()
                 return copy_knowledge_maintenance_decision_receipt(receipt)
@@ -11215,6 +11671,25 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         proposal_id = _knowledge_maintenance_identity(proposal_id, "proposal_id")
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
+            await _begin_knowledge_read_snapshot(cur)
+            await cur.execute(
+                "SELECT operation_id FROM cayu_knowledge_maintenance_proposals "
+                "WHERE proposal_id = %s",
+                (proposal_id,),
+            )
+            publication_row = await cur.fetchone()
+            if publication_row is not None:
+                publication = await self._load_maintenance_proposal_record(
+                    cur,
+                    str(publication_row[0]),
+                    access_scope=scope,
+                    deny_inaccessible=False,
+                )
+                return (
+                    None
+                    if publication is None
+                    else copy_knowledge_maintenance_proposal(publication[0])
+                )
             await cur.execute(
                 "SELECT operation_id FROM cayu_knowledge_maintenance_decisions "
                 "WHERE proposal_id = %s",
@@ -12315,6 +12790,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         inherit_evidence: bool,
         change_operation_id: str | None = None,
         committed_at: datetime | None = None,
+        allow_pending_maintenance_replacement: bool = False,
     ) -> None:
         _validate_revision_append(entry, expected_revision=expected_revision)
         current = await self._load_entry(cur, entry.id)
@@ -12330,6 +12806,15 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 entry.id,
                 expected_revision=expected_revision,
                 actual_revision=current.revision,
+            )
+        if not allow_pending_maintenance_replacement:
+            await self._require_maintenance_replacement_mutation_allowed(
+                cur,
+                entry_id=current.id,
+                entry_revision=current.revision,
+                current_status=current.status,
+                successor_status=entry.status,
+                operation=operation,
             )
         _validate_revision_successor(current, entry)
         _require_knowledge_successor_access(access_scope, entry, operation=operation)
@@ -12400,6 +12885,69 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             operation_id=change_operation_id,
             committed_at=committed_at,
         )
+
+    async def _require_maintenance_replacement_mutation_allowed(
+        self,
+        cur: Any,
+        *,
+        entry_id: str,
+        entry_revision: int,
+        current_status: KnowledgeStatus | None = None,
+        successor_status: KnowledgeStatus | None = None,
+        operation: str | None = None,
+        preserve_history: bool = False,
+    ) -> None:
+        if self._min_required_revision < 67:
+            return
+        await cur.execute(
+            "SELECT proposal.proposal_id, proposal.replacement_revision, "
+            "proposal.proposal_fingerprint, decision.operation_id, "
+            "decision.proposal::text, decision.decision::text, decision.receipt::text "
+            "FROM cayu_knowledge_maintenance_proposals AS proposal "
+            "LEFT JOIN cayu_knowledge_maintenance_decisions AS decision "
+            "ON decision.proposal_id = proposal.proposal_id "
+            "WHERE proposal.replacement_entry_id = %s",
+            (entry_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return
+        if preserve_history:
+            raise KnowledgeMaintenanceConflict("maintenance_replacement_history_owned")
+        proposal_id = str(row[0])
+        replacement_revision = int(row[1])
+        decision_operation_id = row[3]
+        if decision_operation_id is None:
+            raise KnowledgeMaintenanceConflict("pending_replacement_lifecycle_owned")
+        try:
+            proposal = KnowledgeMaintenanceProposal.model_validate_json(row[4])
+            decision = KnowledgeMaintenanceDecision.model_validate_json(row[5])
+            receipt = KnowledgeMaintenanceDecisionReceipt.model_validate_json(row[6])
+            if (
+                proposal.id != proposal_id
+                or proposal.fingerprint != str(row[2])
+                or proposal.replacement.entry_id != entry_id
+                or proposal.replacement.revision != replacement_revision
+                or decision.operation_id != str(decision_operation_id)
+                or decision.proposal_id != proposal_id
+                or receipt.operation_id != decision.operation_id
+                or receipt.proposal_id != decision.proposal_id
+            ):
+                raise ValueError("Maintenance decision binding is inconsistent.")
+            _validate_knowledge_maintenance_record(proposal, decision, receipt)
+        except Exception:
+            raise KnowledgeMaintenanceConflict("malformed_proposal_publication") from None
+        if decision.kind is KnowledgeMaintenanceDecisionKind.APPROVE:
+            if entry_revision > replacement_revision:
+                return
+            raise KnowledgeMaintenanceConflict("pending_replacement_lifecycle_owned")
+        if (
+            operation in {"delete_entry", "transition_entry_status"}
+            and (current_status, successor_status)
+            in _MAINTENANCE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS
+        ):
+            return
+        raise KnowledgeMaintenanceConflict("rejected_replacement_lifecycle_owned")
 
     async def _load_publication_receipt(
         self,
@@ -13013,6 +13561,171 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             ),
         )
 
+    async def _load_maintenance_proposal_record(
+        self,
+        cur: Any,
+        operation_id: str,
+        *,
+        access_scope: KnowledgeAccessScope,
+        deny_inaccessible: bool,
+    ) -> (
+        tuple[
+            KnowledgeMaintenanceProposal,
+            KnowledgeMaintenanceAcceptedPlan,
+            KnowledgeMaintenanceProposalPublicationReceipt,
+            _KnowledgeMaintenanceAccessSnapshot,
+        ]
+        | None
+    ):
+        from cayu.knowledge_maintenance_persistence import (
+            KnowledgeMaintenanceAcceptedPlan,
+            KnowledgeMaintenanceProposalPublicationConflict,
+            KnowledgeMaintenanceProposalPublicationReceipt,
+            prepare_knowledge_maintenance_proposal_publication,
+        )
+
+        await cur.execute(
+            "SELECT access_snapshot::text "
+            "FROM cayu_knowledge_maintenance_proposals WHERE operation_id = %s",
+            (operation_id,),
+        )
+        access_row = await cur.fetchone()
+        if access_row is None:
+            return None
+        try:
+            snapshot = _parse_knowledge_maintenance_access_snapshot_json(access_row[0])
+        except Exception:
+            raise KnowledgeMaintenanceProposalPublicationConflict("malformed_receipt") from None
+        if not _knowledge_scope_allows_maintenance_access_snapshot(access_scope, snapshot):
+            if deny_inaccessible:
+                raise KnowledgeAccessDenied("publish_maintenance_proposal")
+            return None
+
+        await cur.execute(
+            """
+            SELECT proposal_id, replacement_entry_id, replacement_revision,
+                   proposal_fingerprint, accepted_plan_fingerprint, request_sha256,
+                   committed_at, proposal::text, accepted_plan::text, receipt::text
+            FROM cayu_knowledge_maintenance_proposals
+            WHERE operation_id = %s
+            """,
+            (operation_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        try:
+            proposal = KnowledgeMaintenanceProposal.model_validate_json(row[7])
+            accepted_plan = KnowledgeMaintenanceAcceptedPlan.model_validate_json(row[8])
+            receipt = KnowledgeMaintenanceProposalPublicationReceipt.model_validate_json(row[9])
+            replacement = await self._load_entry(
+                cur,
+                proposal.replacement.entry_id,
+                revision=proposal.replacement.revision,
+            )
+            if replacement is None:
+                raise ValueError("Published replacement is missing.")
+            chunks = await self._load_chunks(
+                cur,
+                replacement.id,
+                revision=replacement.revision,
+            )
+            evidence = await self._load_evidence(
+                cur,
+                replacement.id,
+                revision=replacement.revision,
+            )
+            (
+                prepared_operation,
+                prepared_entry,
+                prepared_chunks,
+                prepared_evidence,
+                prepared_proposal,
+                prepared_plan,
+                prepared_sha256,
+            ) = prepare_knowledge_maintenance_proposal_publication(
+                replacement,
+                chunks,
+                evidence=evidence,
+                proposal=proposal,
+                accepted_plan=accepted_plan,
+                operation_id=operation_id,
+            )
+            if (
+                prepared_operation != operation_id
+                or prepared_entry != replacement
+                or prepared_chunks != chunks
+                or prepared_evidence != evidence
+                or prepared_proposal != proposal
+                or prepared_plan != accepted_plan
+                or proposal.id != str(row[0])
+                or proposal.replacement.entry_id != str(row[1])
+                or proposal.replacement.revision != int(row[2])
+                or proposal.fingerprint != str(row[3])
+                or accepted_plan.fingerprint != str(row[4])
+                or prepared_sha256 != str(row[5])
+                or receipt.operation_id != operation_id
+                or receipt.proposal_id != proposal.id
+                or receipt.proposal_fingerprint != proposal.fingerprint
+                or receipt.accepted_plan_fingerprint != accepted_plan.fingerprint
+                or receipt.request_sha256 != prepared_sha256
+                or receipt.replacement != proposal.replacement
+                or receipt.committed_at != pg_support.to_utc(row[6])
+                or receipt.replayed
+            ):
+                raise ValueError("Proposal publication indexes conflict with content.")
+        except KnowledgeMaintenanceProposalPublicationConflict:
+            raise
+        except Exception:
+            raise KnowledgeMaintenanceProposalPublicationConflict("malformed_receipt") from None
+        return proposal, accepted_plan, receipt, snapshot
+
+    async def _insert_maintenance_proposal_record(
+        self,
+        cur: Any,
+        proposal: KnowledgeMaintenanceProposal,
+        accepted_plan: KnowledgeMaintenanceAcceptedPlan,
+        receipt: KnowledgeMaintenanceProposalPublicationReceipt,
+        *,
+        access_snapshot: _KnowledgeMaintenanceAccessSnapshot,
+    ) -> None:
+        await cur.execute(
+            """
+            INSERT INTO cayu_knowledge_maintenance_proposals (
+                operation_id,
+                proposal_id,
+                replacement_entry_id,
+                replacement_revision,
+                proposal_fingerprint,
+                accepted_plan_fingerprint,
+                request_sha256,
+                committed_at,
+                proposal,
+                accepted_plan,
+                receipt,
+                access_snapshot
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s,
+                %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb
+            )
+            """,
+            (
+                receipt.operation_id,
+                receipt.proposal_id,
+                proposal.replacement.entry_id,
+                proposal.replacement.revision,
+                receipt.proposal_fingerprint,
+                receipt.accepted_plan_fingerprint,
+                receipt.request_sha256,
+                pg_support.to_utc(receipt.committed_at),
+                _dumps(proposal.model_dump(mode="json")),
+                _dumps(accepted_plan.model_dump(mode="json")),
+                _dumps(receipt.model_dump(mode="json")),
+                _knowledge_maintenance_access_snapshot_json(access_snapshot),
+            ),
+        )
+
     async def _load_maintenance_record(
         self,
         cur: Any,
@@ -13025,6 +13738,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             KnowledgeMaintenanceProposal,
             KnowledgeMaintenanceDecision,
             KnowledgeMaintenanceDecisionReceipt,
+            _KnowledgeMaintenanceAccessSnapshot,
         ]
         | None
     ):
@@ -13068,7 +13782,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             if deny_inaccessible:
                 raise KnowledgeAccessDenied("apply_maintenance_decision")
             return None
-        return proposal, decision, receipt
+        return proposal, decision, receipt, snapshot
 
     async def _insert_maintenance_record(
         self,
