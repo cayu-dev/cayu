@@ -1368,6 +1368,21 @@ class CayuApp:
             max_retained_bytes=max_retained_bytes,
         )
 
+    def redact_utf8_head(
+        self,
+        value: bytes,
+        *,
+        max_bytes: int,
+        source_complete: bool,
+    ) -> tuple[str, bool]:
+        """Project a bounded UTF-8 prefix through the application secret registry."""
+
+        return self._secret_redactor.redact_utf8_head(
+            value,
+            max_bytes=max_bytes,
+            source_complete=source_complete,
+        )
+
     def project_event_record_for_exposure(self, record: EventRecord) -> EventRecord:
         """Project a caller-supplied record without granting persisted authority."""
 

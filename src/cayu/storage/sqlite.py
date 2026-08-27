@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, ClassVar, Literal, TypeVar, cast
 from uuid import uuid4
 
+from pydantic import ValidationError
+
 from cayu._clock import utc_clock
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -86,6 +88,26 @@ from cayu.runtime.interactions import (
     INTERACTION_TERMINAL_EVENT_TYPES,
 )
 from cayu.runtime.invocation import SessionInvocation, SessionInvocationBinding, TaskInvocation
+from cayu.runtime.local_execution_attempts import (
+    LocalExecutionAttemptAuthority,
+    LocalExecutionAttemptConflict,
+    LocalExecutionAttemptListCursor,
+    LocalExecutionAttemptRecord,
+    LocalExecutionAttemptRecoveryClaim,
+    LocalExecutionAttemptSettlement,
+    LocalExecutionAttemptStart,
+    _copy_authenticated_local_execution_attempt_settlement,
+    _copy_local_execution_attempt_authority,
+    _copy_local_execution_attempt_list_cursor,
+    _copy_local_execution_attempt_recovery_claim,
+    _copy_local_execution_attempt_start,
+    advance_local_execution_attempt_start,
+    claim_local_execution_attempt_recovery_record,
+    prepare_local_execution_attempt_record,
+    require_local_execution_recovery_eligible,
+    require_local_execution_task_authority,
+    settle_local_execution_attempt_record,
+)
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, parse_public_authority_alias
 from cayu.runtime.service_manifest import RuntimeStoreDurability
 from cayu.runtime.sessions import (
@@ -549,7 +571,7 @@ from cayu.storage import migrations as schema
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
 _SQLITE_SESSION_MIN_REQUIRED_REVISION = 62
-_SQLITE_TASK_MIN_REQUIRED_REVISION = 62
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 66
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -11973,6 +11995,7 @@ class SQLiteTaskStore(TaskStore):
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
     supports_work_attempt_admission: ClassVar[bool] = True
+    supports_local_execution_attempts: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
 
     def __init__(
@@ -12005,6 +12028,288 @@ class SQLiteTaskStore(TaskStore):
 
     def _verified_transaction_unlocked(self):
         return sqlite_support._transaction(self._connection)
+
+    def _load_local_execution_attempt_unlocked(
+        self,
+        attempt_id: str,
+    ) -> LocalExecutionAttemptRecord | None:
+        row = self._connection.execute(
+            "SELECT attempt_id, task_id, retry_series_id, effect_lineage_id, "
+            "request_sha256, phase, quiescence, retry_admissible, "
+            "recovery_generation, recovery_owner_id, recovery_owner_expires_at, "
+            "record_json, created_at, updated_at "
+            "FROM cayu_local_execution_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            record = LocalExecutionAttemptRecord.model_validate(json.loads(row["record_json"]))
+        except (json.JSONDecodeError, ValidationError):
+            raise LocalExecutionAttemptConflict(
+                "Stored local execution attempt content is malformed."
+            ) from None
+        if (
+            record.authority.attempt_id != row["attempt_id"]
+            or record.authority.task_id != row["task_id"]
+            or record.authority.retry_series_id != row["retry_series_id"]
+            or record.authority.effect_lineage_id != row["effect_lineage_id"]
+            or record.authority.request_sha256 != row["request_sha256"]
+            or record.phase.value != row["phase"]
+            or record.quiescence.value != row["quiescence"]
+            or int(record.retry_admissible) != row["retry_admissible"]
+            or record.recovery_generation != row["recovery_generation"]
+            or record.recovery_owner_id != row["recovery_owner_id"]
+            or record.recovery_owner_expires_at
+            != sqlite_support.parse_optional_datetime(row["recovery_owner_expires_at"])
+            or record.created_at != sqlite_support.parse_datetime(row["created_at"])
+            or record.updated_at != sqlite_support.parse_datetime(row["updated_at"])
+        ):
+            raise LocalExecutionAttemptConflict(
+                "Stored local execution attempt indexes conflict with canonical content."
+            )
+        return record
+
+    def _latest_local_execution_attempt_unlocked(
+        self,
+        authority: LocalExecutionAttemptAuthority,
+    ) -> LocalExecutionAttemptRecord | None:
+        if authority.retry_series_id is None:
+            row = self._connection.execute(
+                "SELECT attempt_id FROM cayu_local_execution_attempts "
+                "WHERE retry_series_id IS NULL AND task_id = ? AND effect_lineage_id = ? "
+                "ORDER BY retry_admissible ASC, created_at DESC, attempt_id DESC LIMIT 1",
+                (authority.task_id, authority.effect_lineage_id),
+            ).fetchone()
+        else:
+            row = self._connection.execute(
+                "SELECT attempt_id FROM cayu_local_execution_attempts "
+                "WHERE retry_series_id = ? AND effect_lineage_id = ? "
+                "ORDER BY retry_admissible ASC, created_at DESC, attempt_id DESC LIMIT 1",
+                (authority.retry_series_id, authority.effect_lineage_id),
+            ).fetchone()
+        return (
+            None if row is None else self._load_local_execution_attempt_unlocked(row["attempt_id"])
+        )
+
+    def _store_local_execution_attempt_unlocked(
+        self,
+        record: LocalExecutionAttemptRecord,
+        *,
+        insert: bool,
+    ) -> None:
+        values = (
+            record.authority.attempt_id,
+            record.authority.task_id,
+            record.authority.retry_series_id,
+            record.authority.effect_lineage_id,
+            record.authority.request_sha256,
+            record.phase.value,
+            record.quiescence.value,
+            int(record.retry_admissible),
+            record.recovery_generation,
+            record.recovery_owner_id,
+            sqlite_support.format_optional_datetime(record.recovery_owner_expires_at),
+            sqlite_support.json_dumps(record.model_dump(mode="json", warnings=False)),
+            sqlite_support.format_datetime(record.created_at),
+            sqlite_support.format_datetime(record.updated_at),
+        )
+        if insert:
+            self._connection.execute(
+                "INSERT INTO cayu_local_execution_attempts ("
+                "attempt_id, task_id, retry_series_id, effect_lineage_id, request_sha256, "
+                "phase, quiescence, retry_admissible, recovery_generation, "
+                "recovery_owner_id, recovery_owner_expires_at, record_json, created_at, "
+                "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                values,
+            )
+            return
+        cursor = self._connection.execute(
+            "UPDATE cayu_local_execution_attempts SET task_id = ?, retry_series_id = ?, "
+            "effect_lineage_id = ?, request_sha256 = ?, phase = ?, quiescence = ?, "
+            "retry_admissible = ?, recovery_generation = ?, recovery_owner_id = ?, "
+            "recovery_owner_expires_at = ?, record_json = ?, created_at = ?, updated_at = ? "
+            "WHERE attempt_id = ? AND request_sha256 = ?",
+            (*values[1:], values[0], values[4]),
+        )
+        if cursor.rowcount != 1:
+            raise LocalExecutionAttemptConflict(
+                "Local execution attempt changed during durable publication."
+            )
+
+    async def prepare_local_execution_attempt(
+        self,
+        authority: LocalExecutionAttemptAuthority,
+    ) -> LocalExecutionAttemptRecord:
+        authority = _copy_local_execution_attempt_authority(authority)
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                existing = self._load_local_execution_attempt_unlocked(authority.attempt_id)
+                task = (
+                    None if existing is not None else self._require_task_unlocked(authority.task_id)
+                )
+                prior = self._latest_local_execution_attempt_unlocked(authority)
+                evidence_now = self._clock()
+                lease_now = datetime.now(UTC)
+                record = prepare_local_execution_attempt_record(
+                    authority=authority,
+                    task=task,
+                    existing=existing,
+                    prior=prior,
+                    evidence_now=evidence_now,
+                    lease_now=lease_now,
+                )
+                if existing is None:
+                    self._store_local_execution_attempt_unlocked(record, insert=True)
+                self._connection.commit()
+                return record.model_copy(deep=True)
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    async def start_local_execution_attempt(
+        self,
+        start: LocalExecutionAttemptStart,
+    ) -> LocalExecutionAttemptRecord:
+        start = _copy_local_execution_attempt_start(start)
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                record = self._load_local_execution_attempt_unlocked(start.attempt_id)
+                if record is None:
+                    raise LocalExecutionAttemptConflict(
+                        "Local execution start has no prepared attempt."
+                    )
+                evidence_now = self._clock()
+                lease_now = datetime.now(UTC)
+                if record.start is None:
+                    require_local_execution_task_authority(
+                        self._require_task_unlocked(record.authority.task_id),
+                        record.authority,
+                        now=lease_now,
+                    )
+                updated = advance_local_execution_attempt_start(
+                    record,
+                    start,
+                    evidence_now=evidence_now,
+                    lease_now=lease_now,
+                )
+                if updated != record:
+                    self._store_local_execution_attempt_unlocked(updated, insert=False)
+                self._connection.commit()
+                return updated.model_copy(deep=True)
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    async def settle_local_execution_attempt(
+        self,
+        settlement: LocalExecutionAttemptSettlement,
+    ) -> LocalExecutionAttemptRecord:
+        settlement = _copy_authenticated_local_execution_attempt_settlement(settlement)
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                record = self._load_local_execution_attempt_unlocked(settlement.attempt_id)
+                if record is None:
+                    raise LocalExecutionAttemptConflict(
+                        "Local execution settlement has no prepared attempt."
+                    )
+                updated = settle_local_execution_attempt_record(
+                    record,
+                    settlement,
+                    evidence_now=self._clock(),
+                    lease_now=datetime.now(UTC),
+                )
+                if updated != record:
+                    self._store_local_execution_attempt_unlocked(updated, insert=False)
+                self._connection.commit()
+                return updated.model_copy(deep=True)
+            except BaseException:
+                self._connection.rollback()
+                raise
+
+    async def load_local_execution_attempt(
+        self,
+        attempt_id: str,
+    ) -> LocalExecutionAttemptRecord | None:
+        attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
+        async with self._lock:
+            record = self._load_local_execution_attempt_unlocked(attempt_id)
+            return None if record is None else record.model_copy(deep=True)
+
+    async def list_unsettled_local_execution_attempts(
+        self,
+        *,
+        limit: int = 100,
+        after: LocalExecutionAttemptListCursor | None = None,
+    ) -> tuple[LocalExecutionAttemptRecord, ...]:
+        limit = _validate_task_positive_int(limit, "limit")
+        after = _copy_local_execution_attempt_list_cursor(after)
+        async with self._lock:
+            predicate = "(phase <> ? OR quiescence IN (?, ?))"
+            parameters: list[Any] = [
+                "terminal",
+                "terminal_not_quiescent",
+                "unavailable",
+            ]
+            if after is not None:
+                predicate += " AND (created_at > ? OR (created_at = ? AND attempt_id > ?))"
+                created_at = sqlite_support.format_datetime(after.created_at)
+                parameters.extend(
+                    (
+                        created_at,
+                        created_at,
+                        after.attempt_id,
+                    )
+                )
+            parameters.append(limit)
+            rows = self._connection.execute(
+                "SELECT attempt_id FROM cayu_local_execution_attempts WHERE "
+                f"{predicate} "
+                "ORDER BY created_at ASC, attempt_id ASC LIMIT ?",
+                parameters,
+            ).fetchall()
+            records = [
+                self._load_local_execution_attempt_unlocked(row["attempt_id"]) for row in rows
+            ]
+            return tuple(record.model_copy(deep=True) for record in records if record is not None)
+
+    async def claim_local_execution_attempt_recovery(
+        self,
+        claim: LocalExecutionAttemptRecoveryClaim,
+    ) -> LocalExecutionAttemptRecord:
+        claim = _copy_local_execution_attempt_recovery_claim(claim)
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                record = self._load_local_execution_attempt_unlocked(claim.attempt_id)
+                if record is None:
+                    raise LocalExecutionAttemptConflict(
+                        "Local execution recovery attempt was not found."
+                    )
+                evidence_now = self._clock()
+                lease_now = datetime.now(UTC)
+                task = self._require_task_unlocked(record.authority.task_id)
+                require_local_execution_recovery_eligible(
+                    task,
+                    record,
+                    now=lease_now,
+                )
+                updated = claim_local_execution_attempt_recovery_record(
+                    record,
+                    claim,
+                    evidence_now=evidence_now,
+                    lease_now=lease_now,
+                )
+                if updated != record:
+                    self._store_local_execution_attempt_unlocked(updated, insert=False)
+                self._connection.commit()
+                return updated.model_copy(deep=True)
+            except BaseException:
+                self._connection.rollback()
+                raise
 
     def _load_work_contract_unlocked(
         self,
@@ -14453,7 +14758,7 @@ class SQLiteTaskStore(TaskStore):
                     SELECT ?
                 ),
                 matching_tasks AS (
-                    SELECT status, session_id, available_at
+                    SELECT id, status, session_id, available_at, retry_series_json
                     FROM cayu_tasks
                     {where_sql}
                 ),
@@ -14466,9 +14771,24 @@ class SQLiteTaskStore(TaskStore):
                     SELECT
                         COALESCE(SUM(
                             CASE
-                                WHEN status = 'pending'
+                                 WHEN status = 'pending'
                                  AND session_id IS NULL
                                  AND (available_at IS NULL OR available_at <= snapshot.as_of)
+                                 AND NOT EXISTS (
+                                     SELECT 1
+                                     FROM cayu_local_execution_attempts AS attempt
+                                     WHERE attempt.retry_admissible = 0
+                                       AND (
+                                           attempt.task_id = matching_tasks.id
+                                           OR (
+                                               matching_tasks.retry_series_json IS NOT NULL
+                                               AND attempt.retry_series_id = json_extract(
+                                                   matching_tasks.retry_series_json,
+                                                   '$.series_id'
+                                               )
+                                           )
+                                       )
+                                 )
                                 THEN 1 ELSE 0
                             END
                         ), 0) AS claimable_pending_count,
@@ -15309,6 +15629,12 @@ class SQLiteTaskStore(TaskStore):
                 "session_id IS NULL",
                 "(available_at IS NULL OR available_at <= ?)",
                 retry_deadline_clause,
+                "NOT EXISTS (SELECT 1 FROM cayu_local_execution_attempts AS attempt "
+                "WHERE attempt.retry_admissible = 0 AND ("
+                "attempt.task_id = cayu_tasks.id OR ("
+                "cayu_tasks.retry_series_json IS NOT NULL AND "
+                "attempt.retry_series_id = json_extract("
+                "cayu_tasks.retry_series_json, '$.series_id'))))",
                 *clauses,
             ]
         )
@@ -15332,6 +15658,15 @@ class SQLiteTaskStore(TaskStore):
                       AND json_extract(retry_series_json, '$.elapsed_deadline') IS NOT NULL
                       AND julianday(json_extract(retry_series_json, '$.elapsed_deadline'))
                           <= julianday(?)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM cayu_local_execution_attempts AS attempt
+                          WHERE attempt.retry_admissible = 0 AND (
+                              attempt.task_id = cayu_tasks.id OR
+                              attempt.retry_series_id = json_extract(
+                                  cayu_tasks.retry_series_json, '$.series_id'
+                              )
+                          )
+                      )
                     ORDER BY created_at ASC, id ASC
                     LIMIT 100
                     """,
@@ -15621,6 +15956,12 @@ class SQLiteTaskStore(TaskStore):
                 "lease_expires_at IS NOT NULL",
                 "lease_expires_at <= ?",
                 "(status_reason IS NULL OR status_reason != ?)",
+                "NOT EXISTS (SELECT 1 FROM cayu_local_execution_attempts AS attempt "
+                "WHERE attempt.retry_admissible = 0 AND ("
+                "attempt.task_id = cayu_tasks.id OR ("
+                "cayu_tasks.retry_series_json IS NOT NULL AND "
+                "attempt.retry_series_id = json_extract("
+                "cayu_tasks.retry_series_json, '$.series_id'))))",
                 *clauses,
             ]
         )

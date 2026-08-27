@@ -363,6 +363,10 @@ REVISIONS: tuple[Revision, ...] = (
     # before entry content crosses the storage boundary. Existing populated
     # prerelease knowledge rows are deliberately not measured or backfilled.
     Revision(revision=65, kind=RevisionKind.BREAKING, compatible_from=65),
+    # General local execution attempts add a durable tree-ownership fence to
+    # task claiming and lease reclamation. Pre-66 task workers do not consult
+    # that fence, so mixed-version task execution is unsafe.
+    Revision(revision=66, kind=RevisionKind.BREAKING, compatible_from=66),
 )
 
 #: The revision an empty database is initialized to.

@@ -384,6 +384,23 @@ def test_revision_sixty_five_breaks_for_bounded_knowledge_entry_reads() -> None:
         )
 
 
+def test_revision_sixty_six_breaks_for_local_execution_attempt_fencing() -> None:
+    revision = m.revision(66)
+    state = m.SchemaState(revision=66, compatible_from=66)
+
+    assert revision.kind is m.RevisionKind.BREAKING
+    assert revision.compatible_from == 66
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 66"):
+        m.validate(state, app_latest=65, app_min_supported=65)
+    m.validate(state, app_latest=66, app_min_supported=66)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 66"):
+        m.validate(
+            m.SchemaState(revision=65, compatible_from=65),
+            app_latest=66,
+            app_min_supported=66,
+        )
+
+
 def test_revision_thirty_four_adds_delayed_task_availability() -> None:
     revision = m.revision(34)
     state = m.SchemaState(

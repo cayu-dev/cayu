@@ -69,6 +69,27 @@ from cayu.runtime.invocation import (
     copy_task_invocation,
     inherited_task_invocation,
 )
+from cayu.runtime.local_execution_attempts import (
+    LocalExecutionAttemptAuthority,
+    LocalExecutionAttemptConflict,
+    LocalExecutionAttemptListCursor,
+    LocalExecutionAttemptRecord,
+    LocalExecutionAttemptRecoveryClaim,
+    LocalExecutionAttemptSettlement,
+    LocalExecutionAttemptStart,
+    _copy_authenticated_local_execution_attempt_settlement,
+    _copy_local_execution_attempt_authority,
+    _copy_local_execution_attempt_list_cursor,
+    _copy_local_execution_attempt_recovery_claim,
+    _copy_local_execution_attempt_start,
+    advance_local_execution_attempt_start,
+    claim_local_execution_attempt_recovery_record,
+    local_execution_effect_scope,
+    prepare_local_execution_attempt_record,
+    require_local_execution_recovery_eligible,
+    require_local_execution_task_authority,
+    settle_local_execution_attempt_record,
+)
 from cayu.runtime.service_manifest import RuntimeStoreDurability
 from cayu.runtime.work_attempt_admission import (
     AdmittedCompletionProposalRequest,
@@ -2387,6 +2408,7 @@ class TaskStore(ABC):
     supports_task_retry_series: ClassVar[bool] = False
     supports_verified_work_contracts: ClassVar[bool] = False
     supports_work_attempt_admission: ClassVar[bool] = False
+    supports_local_execution_attempts: ClassVar[bool] = False
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = False
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
 
@@ -2469,6 +2491,56 @@ class TaskStore(ABC):
     ) -> WorkAttemptExecutionClaim | None:
         """Load one immutable execution-claim generation by stable identity."""
         raise NotImplementedError("This TaskStore does not support work-attempt admission.")
+
+    async def prepare_local_execution_attempt(
+        self,
+        authority: LocalExecutionAttemptAuthority,
+    ) -> LocalExecutionAttemptRecord:
+        """Prepare or exactly replay one task-claim-bound local execution attempt."""
+
+        raise NotImplementedError("This TaskStore does not support local execution attempts.")
+
+    async def start_local_execution_attempt(
+        self,
+        start: LocalExecutionAttemptStart,
+    ) -> LocalExecutionAttemptRecord:
+        """Publish exact supervisor or root launch authority before further work."""
+
+        raise NotImplementedError("This TaskStore does not support local execution attempts.")
+
+    async def settle_local_execution_attempt(
+        self,
+        settlement: LocalExecutionAttemptSettlement,
+    ) -> LocalExecutionAttemptRecord:
+        """Commit or replay one exact terminal/quiescence receipt."""
+
+        raise NotImplementedError("This TaskStore does not support local execution attempts.")
+
+    async def load_local_execution_attempt(
+        self,
+        attempt_id: str,
+    ) -> LocalExecutionAttemptRecord | None:
+        """Load one local execution attempt by immutable identity."""
+
+        raise NotImplementedError("This TaskStore does not support local execution attempts.")
+
+    async def list_unsettled_local_execution_attempts(
+        self,
+        *,
+        limit: int = 100,
+        after: LocalExecutionAttemptListCursor | None = None,
+    ) -> tuple[LocalExecutionAttemptRecord, ...]:
+        """List one keyset page that still lacks positive containment settlement."""
+
+        raise NotImplementedError("This TaskStore does not support local execution attempts.")
+
+    async def claim_local_execution_attempt_recovery(
+        self,
+        claim: LocalExecutionAttemptRecoveryClaim,
+    ) -> LocalExecutionAttemptRecord:
+        """Claim one exact recovery generation without releasing task ownership."""
+
+        raise NotImplementedError("This TaskStore does not support local execution attempts.")
 
     async def renew_work_attempt_execution_claim(
         self,
@@ -2885,6 +2957,7 @@ class InMemoryTaskStore(TaskStore):
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
     supports_work_attempt_admission: ClassVar[bool] = True
+    supports_local_execution_attempts: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
@@ -2907,6 +2980,8 @@ class InMemoryTaskStore(TaskStore):
         self._unreleased_admission_id_by_session: dict[str, str] = {}
         self._latest_admission_id_by_task: dict[str, str] = {}
         self._work_attempt_execution_claims: dict[str, WorkAttemptExecutionClaim] = {}
+        self._local_execution_attempts: dict[str, LocalExecutionAttemptRecord] = {}
+        self._local_execution_attempt_by_lineage: dict[tuple[str, str], str] = {}
         self._completion_proposals: dict[str, CompletionProposal] = {}
         self._proposal_id_by_attempt: dict[str, str] = {}
         self._completion_verifier_profiles: dict[str, CompletionVerifierProfileRecord] = {}
@@ -4396,7 +4471,10 @@ class InMemoryTaskStore(TaskStore):
                     if task.status == TaskStatus.PENDING:
                         if task.available_at is not None and task.available_at > as_of:
                             scheduled_pending_count += 1
-                        elif task.session_id is None:
+                        elif (
+                            task.session_id is None
+                            and not self._task_has_unsettled_local_execution_attempt(task.id)
+                        ):
                             claimable_pending_count += 1
             return TaskOperationalSnapshot(
                 as_of=as_of,
@@ -4857,7 +4935,9 @@ class InMemoryTaskStore(TaskStore):
             availability_now = self._clock()
             now = datetime.now(UTC)
             for task in tuple(self._tasks.values()):
-                if _task_retry_attempt_elapsed(task, series_now=availability_now):
+                if _task_retry_attempt_elapsed(
+                    task, series_now=availability_now
+                ) and not self._task_has_unsettled_local_execution_attempt(task.id):
                     receipt = _expired_task_retry_settlement(
                         task,
                         committed_at=now,
@@ -4873,6 +4953,7 @@ class InMemoryTaskStore(TaskStore):
                 and (task.available_at is None or task.available_at <= availability_now)
                 and not _task_retry_attempt_elapsed(task, series_now=availability_now)
                 and (task.retry_series is None or retry_worker_id_is_bounded)
+                and not self._task_has_unsettled_local_execution_attempt(task.id)
                 and _task_matches_claim_filter(task, query)
             ]
             if not candidates:
@@ -4999,6 +5080,7 @@ class InMemoryTaskStore(TaskStore):
                 if task.status is TaskStatus.CLAIMED
                 and task.session_id is None
                 and not _task_retry_cancellation_requested(task)
+                and not self._task_has_unsettled_local_execution_attempt(task.id)
                 and task.lease_expires_at is not None
                 and task.lease_expires_at <= now
                 and _task_matches_claim_filter(task, query)
@@ -5017,6 +5099,169 @@ class InMemoryTaskStore(TaskStore):
                 self._store_task(updated)
                 reclaimed.append(updated.model_copy(deep=True))
             return reclaimed
+
+    def _task_has_unsettled_local_execution_attempt(self, task_id: str) -> bool:
+        task = self._tasks.get(task_id)
+        retry_series_id = (
+            None if task is None or task.retry_series is None else task.retry_series.series_id
+        )
+        return any(
+            not record.retry_admissible
+            and (
+                record.authority.task_id == task_id
+                or (
+                    retry_series_id is not None
+                    and record.authority.retry_series_id == retry_series_id
+                )
+            )
+            for record in self._local_execution_attempts.values()
+        )
+
+    async def prepare_local_execution_attempt(
+        self,
+        authority: LocalExecutionAttemptAuthority,
+    ) -> LocalExecutionAttemptRecord:
+        authority = _copy_local_execution_attempt_authority(authority)
+        async with self._lock:
+            existing = self._local_execution_attempts.get(authority.attempt_id)
+            task = (
+                None
+                if existing is not None
+                else self._require_owned_leased_task(authority.task_id, authority.worker_id)
+            )
+            lineage_key = local_execution_effect_scope(authority)
+            prior_id = self._local_execution_attempt_by_lineage.get(lineage_key)
+            evidence_now = self._clock()
+            lease_now = datetime.now(UTC)
+            record = prepare_local_execution_attempt_record(
+                authority=authority,
+                task=task,
+                existing=existing,
+                prior=(None if prior_id is None else self._local_execution_attempts[prior_id]),
+                evidence_now=evidence_now,
+                lease_now=lease_now,
+            )
+            if existing is not None:
+                return record
+            self._local_execution_attempts[authority.attempt_id] = record
+            self._local_execution_attempt_by_lineage[lineage_key] = authority.attempt_id
+            return record.model_copy(deep=True)
+
+    async def start_local_execution_attempt(
+        self,
+        start: LocalExecutionAttemptStart,
+    ) -> LocalExecutionAttemptRecord:
+        start = _copy_local_execution_attempt_start(start)
+        async with self._lock:
+            record = self._local_execution_attempts.get(start.attempt_id)
+            if record is None:
+                raise LocalExecutionAttemptConflict(
+                    "Local execution start has no prepared attempt."
+                )
+            evidence_now = self._clock()
+            lease_now = datetime.now(UTC)
+            if record.start is None:
+                require_local_execution_task_authority(
+                    self._require_task(record.authority.task_id),
+                    record.authority,
+                    now=lease_now,
+                )
+            updated = advance_local_execution_attempt_start(
+                record,
+                start,
+                evidence_now=evidence_now,
+                lease_now=lease_now,
+            )
+            self._local_execution_attempts[start.attempt_id] = updated
+            return updated.model_copy(deep=True)
+
+    async def settle_local_execution_attempt(
+        self,
+        settlement: LocalExecutionAttemptSettlement,
+    ) -> LocalExecutionAttemptRecord:
+        settlement = _copy_authenticated_local_execution_attempt_settlement(settlement)
+        async with self._lock:
+            record = self._local_execution_attempts.get(settlement.attempt_id)
+            if record is None:
+                raise LocalExecutionAttemptConflict(
+                    "Local execution settlement has no prepared attempt."
+                )
+            updated = settle_local_execution_attempt_record(
+                record,
+                settlement,
+                evidence_now=self._clock(),
+                lease_now=datetime.now(UTC),
+            )
+            self._local_execution_attempts[settlement.attempt_id] = updated
+            return updated.model_copy(deep=True)
+
+    async def load_local_execution_attempt(
+        self,
+        attempt_id: str,
+    ) -> LocalExecutionAttemptRecord | None:
+        attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
+        async with self._lock:
+            record = self._local_execution_attempts.get(attempt_id)
+            return None if record is None else record.model_copy(deep=True)
+
+    async def list_unsettled_local_execution_attempts(
+        self,
+        *,
+        limit: int = 100,
+        after: LocalExecutionAttemptListCursor | None = None,
+    ) -> tuple[LocalExecutionAttemptRecord, ...]:
+        limit = _validate_positive_int(limit, "limit")
+        after = _copy_local_execution_attempt_list_cursor(after)
+        async with self._lock:
+            after_key = None if after is None else (after.created_at, after.attempt_id)
+            records = sorted(
+                (
+                    record
+                    for record in self._local_execution_attempts.values()
+                    if not record.containment_settled
+                    and (
+                        after_key is None
+                        or (
+                            record.created_at,
+                            record.authority.attempt_id,
+                        )
+                        > after_key
+                    )
+                ),
+                key=lambda item: (
+                    item.created_at,
+                    item.authority.attempt_id,
+                ),
+            )
+            return tuple(record.model_copy(deep=True) for record in records[:limit])
+
+    async def claim_local_execution_attempt_recovery(
+        self,
+        claim: LocalExecutionAttemptRecoveryClaim,
+    ) -> LocalExecutionAttemptRecord:
+        claim = _copy_local_execution_attempt_recovery_claim(claim)
+        async with self._lock:
+            record = self._local_execution_attempts.get(claim.attempt_id)
+            if record is None:
+                raise LocalExecutionAttemptConflict(
+                    "Local execution recovery authority conflicted."
+                )
+            task = self._require_task(record.authority.task_id)
+            evidence_now = self._clock()
+            lease_now = datetime.now(UTC)
+            require_local_execution_recovery_eligible(
+                task,
+                record,
+                now=lease_now,
+            )
+            updated = claim_local_execution_attempt_recovery_record(
+                record,
+                claim,
+                evidence_now=evidence_now,
+                lease_now=lease_now,
+            )
+            self._local_execution_attempts[claim.attempt_id] = updated
+            return updated.model_copy(deep=True)
 
     def _require_task(self, task_id: str) -> Task:
         task = self._tasks.get(task_id)

@@ -7348,6 +7348,119 @@ the default mode, local commands run as the host user and may read absolute
 paths permitted by the operating system, so Cayu reports only environment
 minimization—not provider-credential or filesystem isolation—for `LocalRunner`.
 
+### General local execution-attempt containment
+
+`LocalExecutionAttemptCoordinator` is the task-backed boundary for one complete
+trusted local attempt whose root may start Cayu runners, browser processes, or
+background servers. It is not a security sandbox and does not replace a remote
+runner. Before root dispatch, Cayu binds a versioned immutable attempt identity to
+the exact task incarnation and claim generation (worker, claim-state timestamp,
+and current lease deadline), retry-series/effect lineage, command
+and non-secret launch-configuration digest, caller-supplied execution-profile and
+workspace identities when applicable, containment backend, lifetime, and
+external-effect policy. Environment values are
+transferred only through the private launch boundary. Idempotency keys remain
+caller-owned metadata and are represented durably only by a one-way digest; the
+generic coordinator does not deliver them to downstream operations or treat them
+as positive retry authority.
+
+The default `parent_death_containment` lifetime is available only after the same
+Linux subreaper, pidfd, `/proc` identity, sealed-transfer, and process-control
+preflight used by strong stdio MCP containment succeeds. A supervisor outside the
+owned root tree and root process group holds an authenticated owner-liveness
+descriptor and abstract
+Unix-socket rendezvous. The root and all descendants are identified by PID,
+process start tick, `/proc` inode, and parent/tree authority rather than PID or
+process group alone. Timeout, caller cancellation, ordinary root exit, and abrupt
+Cayu-owner death converge on bounded freeze-to-closure, TERM, KILL, and child
+reaping. The supervisor closes its inherited output descriptors after root launch
+and fsyncs a bounded, content-digested receipt only after it classifies the tree.
+An internal supervisor failure after dispatch enters that same bounded settlement
+state machine; it cannot exit through the pre-dispatch failure path. If process
+settlement does not prove quiescence during its first bounded TERM/KILL pass, the
+authenticated supervisor remains outside the tree as its cleanup owner and repeats
+exact-identity hard settlement. It publishes no terminal receipt until quiescence is
+proven; worker cancellation may stop waiting while that durable attempt remains
+fenced. If process
+loss occurs after the deterministic staging receipt is fsynced but before its
+final rename, recovery authenticates and promotes that exact stage. Incomplete or
+corrupt staging content is never treated as positive settlement evidence.
+
+Durable attempts move through `prepared`, `starting`, `running`, and `terminal`
+phases. Quiescence is independently classified as `not_dispatched`,
+`terminal_not_quiescent`, `quiescent`, `unavailable`, or
+`persistent_detached`. Missing heartbeats, expired task leases, owner process
+death, and disappearance of a numeric PID are not quiescence evidence. Memory,
+SQLite, and PostgreSQL task stores fence claim and lease-reclamation admission for
+the exact task and retry series while any matching attempt lacks an admissible
+terminal receipt. Operational snapshots apply the same fence, so a pending task
+cannot be reported as claimable while claim admission would reject it. Recovery
+may settle an authenticated supervisor receipt without
+the expired task owner, but any inference-based recovery requires an exact
+generation claim and proves that the original task lease is no longer live.
+Host-reboot inference additionally requires an exact machine authority from
+`CAYU_LOCAL_EXECUTION_NODE_ID` or the operating-system machine ID; hostname,
+architecture, and a differing boot ID alone never prove that two workers are the
+same machine.
+`starting` is conservatively outcome-unknown because its durable record spans the
+launch-acknowledgement window; only an authenticated `not_dispatched` receipt may
+restore not-started evidence. The configured coordinator `state_dir` must remain
+stable and owner-private across process replacement. Losing or changing it does
+not authorize retry: same-boot recovery without the exact receipt fails closed as
+unavailable. That directory also defines the host-local coordinator namespace
+used by the abstract rendezvous socket and must be dedicated to one durable task
+store. The rendezvous identity additionally binds the exact task incarnation and
+retry-series/effect scope, so unrelated coordinators with distinct state
+directories cannot fence each other's local attempts even when caller-facing task
+and effect identifiers are identical.
+
+The store settlement entrance accepts only runtime-authenticated evidence from
+the private receipt reader or the claimed recovery path; an identically shaped
+caller-constructed receipt and a self-consistent digest are not settlement
+authority.
+
+Each recovery call scans at most 256 unsettled records independently of how many
+can be settled. A coordinator carries the immutable keyset cursor across calls
+and resets it only after reaching the end, so a live prefix cannot either extend
+one sweep indefinitely or starve later records. Drain passes its remaining
+deadline through rendezvous probing and stops the current scan when that budget
+is exhausted instead of starting another probe.
+
+Retry is admissible only after a terminal `not_dispatched` or `quiescent` receipt.
+Externally mutating attempts become `outcome_unknown` whenever execution may have
+started. Such a result remains non-retryable. Declaring `idempotent_external` and
+binding an idempotency-key digest records the caller's intended downstream
+contract, but the generic process boundary cannot prove that the child consumed
+that key and therefore cannot authorize retry from that declaration alone.
+`local_only` may report a known local success or failure;
+`non_idempotent_external` never turns process quiescence into proof of external
+outcome. `persistent_detached` intentionally releases process ownership, reports
+unknown outcome, and is never presented as complete-tree cleanup.
+Captured stdout and stderr remain process-local results: Cayu applies workload-secret
+redaction before the configured byte bound. Exact terminal replay does not invent or
+reconstruct output that was not durably retained; it returns empty channels with their
+truncation flags set whenever a dispatched attempt's prior output is unavailable.
+
+Caller cancellation is re-delivered only after the owned settlement wait reaches
+a definite result or remains durably fenced. A timed-out drain raises instead of
+claiming success while an active tree or recovery owner remains. Capability
+evidence reports `graceful_cleanup`, `hard_deadline`,
+`parent_death_containment`, and `persistent_detached` separately; configured
+claims remain `declared` until process preflight proves them. Custom `TaskStore`
+implementations must opt into and atomically implement attempt preparation,
+two-stage start publication, exact settlement replay, immutable-keyset-paginated
+unsettled discovery,
+recovery claims, and task/retry-series claim fencing. Stores without that
+capability are rejected before launch.
+
+This boundary composes with the process-isolated host-tool deadline and stdio MCP
+containment rather than weakening or replacing either one. A process-isolated tool
+still owns its narrower invocation boundary inside the general tree. The general
+supervisor reuses the stdio containment kernel primitives and preflight, while its
+task/retry-series receipt owns the larger attempt. Hostile-code isolation, remote
+container lifecycle, a generic service manager, and shared-browser optimization
+remain outside this contract.
+
 `DockerRunner` is available for explicitly selected Docker container execution
 in trusted development, CI, conformance, and packaging workflows. A container
 is not a secure sandbox boundary, and Cayu never implicitly selects

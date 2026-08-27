@@ -88,6 +88,7 @@ _TABLES = (
     "cayu_mcp_manifest_baselines",
     "cayu_checkpoints",
     "cayu_session_operations",
+    "cayu_local_execution_attempts",
     "cayu_tasks",
     "cayu_sessions",
     "cayu_eval_baseline_mutations",

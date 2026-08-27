@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import MethodType
 from typing import Literal
 from uuid import uuid4
 
@@ -73,6 +74,15 @@ from cayu import (
     InvocationOrigin,
     InvocationOriginClaim,
     InvocationOriginTrust,
+    LocalExecutionAttemptEffectOutcome,
+    LocalExecutionAttemptQuiescence,
+    LocalExecutionAttemptReceipt,
+    LocalExecutionAttemptRecoveryClaim,
+    LocalExecutionAttemptRequest,
+    LocalExecutionAttemptSettlement,
+    LocalExecutionAttemptStart,
+    LocalExecutionEffectPolicy,
+    LocalExecutionProcessIdentity,
     Message,
     ResolutionActor,
     ResolutionActorSource,
@@ -104,6 +114,7 @@ from cayu import (
     TaskTopologyQuery,
     WorkAttemptCreate,
     WorkCompletionConflict,
+    build_local_execution_attempt_authority,
     task_create_with_execution_source,
     terminalize_task_with_retry,
 )
@@ -116,12 +127,18 @@ from cayu.runtime.completion_verifier_profiles import (
     build_completion_verifier_execution_profile,
     changed_completion_verifier_profile_components,
 )
+from cayu.runtime.local_execution_attempts import (
+    _authenticate_local_execution_attempt_settlement,
+    local_execution_attempt_list_cursor,
+    local_execution_attempt_receipt_sha256,
+)
 from cayu.runtime.sessions import InMemorySessionStore
 from cayu.runtime.work_contracts import completion_verification_claim_authority_sha256
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
 _TABLES = (
+    "cayu_local_execution_attempts",
     "cayu_knowledge_embeddings",
     "cayu_knowledge_index_readiness_current",
     "cayu_knowledge_index_readiness_events",
@@ -2752,6 +2769,263 @@ def test_postgres_task_store_replays_terminalization_after_reconstruction(postgr
             assert receipt.task == terminal
         finally:
             await reconstructed.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_local_execution_attempt_survives_restart_and_settles_exactly(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        first = _new_store(postgres_dsn)
+        try:
+            app = CayuApp(task_store=first, enable_logging=False)
+            await first.create_task(TaskCreate(task_id="postgres-local-attempt", type="job"))
+            task = await first.claim_task("worker-a", lease_seconds=300)
+            assert task is not None
+            request = LocalExecutionAttemptRequest(
+                effect_lineage_id="postgres-effect",
+                argv=("/usr/bin/true",),
+                effect_policy=LocalExecutionEffectPolicy.LOCAL_ONLY,
+            )
+            authority = build_local_execution_attempt_authority(
+                app=app,
+                task=task,
+                worker_id="worker-a",
+                request=request,
+            )
+            prepared = await first.prepare_local_execution_attempt(authority)
+            supervisor = LocalExecutionProcessIdentity(
+                pid=100,
+                process_group=100,
+                start_tick=1000,
+                proc_inode=2000,
+            )
+            root = LocalExecutionProcessIdentity(
+                pid=101,
+                process_group=100,
+                start_tick=1001,
+                proc_inode=2001,
+            )
+            started = LocalExecutionAttemptStart(
+                attempt_id=authority.attempt_id,
+                request_sha256=authority.request_sha256,
+                host_identity="host-a",
+                boot_id="boot-a",
+                supervisor_nonce="a" * 64,
+                rendezvous_identity="b" * 64,
+                supervisor=supervisor,
+                root=root,
+                started_at=datetime.now(UTC),
+            )
+            await first.start_local_execution_attempt(started)
+            await first.release_task(task.id, "worker-a")
+            fenced_snapshot = await first.aggregate_operational_snapshot()
+            assert fenced_snapshot.counts_by_status.pending == 1
+            assert fenced_snapshot.claimable_pending_count == 0
+        finally:
+            await first.close()
+
+        second = _new_store(postgres_dsn)
+        try:
+            assert await second.load_local_execution_attempt(authority.attempt_id) is not None
+            assert await second.prepare_local_execution_attempt(authority) != prepared
+            assert await second.claim_task("worker-b", lease_seconds=300) is None
+            claimed_recovery = await second.claim_local_execution_attempt_recovery(
+                LocalExecutionAttemptRecoveryClaim(
+                    attempt_id=authority.attempt_id,
+                    request_sha256=authority.request_sha256,
+                    recovery_owner_id="lost-recovery-owner",
+                    expected_recovery_generation=0,
+                    lease_seconds=300,
+                )
+            )
+            assert claimed_recovery.recovery_owner_id == "lost-recovery-owner"
+            payload = {
+                "attempt_id": authority.attempt_id,
+                "boot_id": started.boot_id,
+                "descendants_observed": 2,
+                "effect_outcome": LocalExecutionAttemptEffectOutcome.SUCCEEDED.value,
+                "exit_code": 0,
+                "host_identity": started.host_identity,
+                "kill_sent": False,
+                "quiescence": LocalExecutionAttemptQuiescence.QUIESCENT.value,
+                "request_sha256": authority.request_sha256,
+                "root": root.model_dump(mode="json"),
+                "settled_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "supervisor_nonce": started.supervisor_nonce,
+                "term_sent": False,
+                "terminal_reason": "completed",
+            }
+            payload["receipt_sha256"] = local_execution_attempt_receipt_sha256(payload)
+            receipt = LocalExecutionAttemptReceipt.model_validate(payload)
+            settled = await second.settle_local_execution_attempt(
+                _authenticate_local_execution_attempt_settlement(
+                    LocalExecutionAttemptSettlement(
+                        attempt_id=authority.attempt_id,
+                        request_sha256=authority.request_sha256,
+                        receipt=receipt,
+                    )
+                )
+            )
+            assert settled.retry_admissible is True
+            released_snapshot = await second.aggregate_operational_snapshot()
+            assert released_snapshot.counts_by_status.pending == 1
+            assert released_snapshot.claimable_pending_count == 1
+            assert (
+                await second.settle_local_execution_attempt(
+                    _authenticate_local_execution_attempt_settlement(
+                        LocalExecutionAttemptSettlement(
+                            attempt_id=authority.attempt_id,
+                            request_sha256=authority.request_sha256,
+                            receipt=receipt,
+                        )
+                    )
+                )
+                == settled
+            )
+            replacement = await second.claim_task("worker-b", lease_seconds=300)
+            assert replacement is not None
+            assert replacement.id == task.id
+            replacement_authority = build_local_execution_attempt_authority(
+                app=CayuApp(task_store=second, enable_logging=False),
+                task=replacement,
+                worker_id="worker-b",
+                request=request,
+            )
+            assert replacement_authority.attempt_id != authority.attempt_id
+            replacement_record = await second.prepare_local_execution_attempt(replacement_authority)
+            assert replacement_record.authority == replacement_authority
+        finally:
+            await second.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_unsettled_local_attempt_discovery_uses_stable_keyset_pages(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        try:
+            app = CayuApp(task_store=store, enable_logging=False)
+            records = []
+            for task_id, effect_lineage_id in (
+                ("postgres-local-page-a", "effect-a"),
+                ("postgres-local-page-b", "effect-b"),
+            ):
+                await store.create_task(TaskCreate(task_id=task_id, type="job"))
+                task = await store.claim_task("worker-a", lease_seconds=300)
+                assert task is not None
+                authority = build_local_execution_attempt_authority(
+                    app=app,
+                    task=task,
+                    worker_id="worker-a",
+                    request=LocalExecutionAttemptRequest(
+                        effect_lineage_id=effect_lineage_id,
+                        argv=("/usr/bin/true",),
+                        effect_policy=LocalExecutionEffectPolicy.LOCAL_ONLY,
+                    ),
+                )
+                records.append(await store.prepare_local_execution_attempt(authority))
+
+            first_page = await store.list_unsettled_local_execution_attempts(limit=1)
+            assert len(first_page) == 1
+            second_page = await store.list_unsettled_local_execution_attempts(
+                limit=1,
+                after=local_execution_attempt_list_cursor(first_page[0]),
+            )
+            assert len(second_page) == 1
+            assert {
+                first_page[0].authority.attempt_id,
+                second_page[0].authority.attempt_id,
+            } == {record.authority.attempt_id for record in records}
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_attempt_publication_fences_stale_lease_reclamation_snapshot(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        import psycopg
+
+        await _truncate(postgres_dsn)
+        preparing = _new_store(postgres_dsn)
+        reclaiming = _new_store(postgres_dsn)
+        try:
+            app = CayuApp(task_store=preparing, enable_logging=False)
+            await preparing.create_task(
+                TaskCreate(task_id="postgres-local-attempt-race", type="job")
+            )
+            task = await preparing.claim_task("worker-a", lease_seconds=300)
+            assert task is not None
+            async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE cayu_tasks SET lease_expires_at = "
+                        "clock_timestamp() + INTERVAL '1 second' WHERE id = %s",
+                        (task.id,),
+                    )
+                await conn.commit()
+
+            task = await preparing.load_task(task.id)
+            assert task is not None
+
+            authority = build_local_execution_attempt_authority(
+                app=app,
+                task=task,
+                worker_id="worker-a",
+                request=LocalExecutionAttemptRequest(
+                    effect_lineage_id="postgres-racing-effect",
+                    argv=("/usr/bin/true",),
+                    effect_policy=LocalExecutionEffectPolicy.LOCAL_ONLY,
+                ),
+            )
+            publication_entered = asyncio.Event()
+            allow_publication = asyncio.Event()
+            original_store = preparing._store_local_execution_attempt_row
+
+            async def blocked_store(
+                _self,
+                cur,
+                record,
+                *,
+                insert: bool,
+            ) -> None:
+                if insert:
+                    publication_entered.set()
+                    await allow_publication.wait()
+                await original_store(cur, record, insert=insert)
+
+            object.__getattribute__(preparing, "__dict__")["_store_local_execution_attempt_row"] = (
+                MethodType(blocked_store, preparing)
+            )
+            preparation = asyncio.create_task(preparing.prepare_local_execution_attempt(authority))
+            await asyncio.wait_for(publication_entered.wait(), timeout=5)
+            await asyncio.sleep(1.1)
+
+            reclamation = asyncio.create_task(reclaiming.reclaim_expired())
+            await asyncio.sleep(0.1)
+            assert not reclamation.done()
+
+            allow_publication.set()
+            prepared = await asyncio.wait_for(preparation, timeout=5)
+            assert prepared.retry_admissible is False
+            assert await asyncio.wait_for(reclamation, timeout=5) == []
+
+            retained = await reclaiming.load_task(task.id)
+            assert retained is not None
+            assert retained.status is TaskStatus.CLAIMED
+            assert retained.worker_id == "worker-a"
+            assert await reclaiming.claim_task("worker-b", lease_seconds=300) is None
+        finally:
+            await preparing.close()
+            await reclaiming.close()
 
     asyncio.run(run())
 

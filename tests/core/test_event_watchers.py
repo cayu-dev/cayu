@@ -70,6 +70,7 @@ _POSTGRES_TABLES = (
     "cayu_recall_item_exposures",
     "cayu_context_exposures",
     "cayu_recall_receipts",
+    "cayu_local_execution_attempts",
     "cayu_tasks",
     "cayu_targeted_tool_grant_uses",
     "cayu_targeted_tool_grants",

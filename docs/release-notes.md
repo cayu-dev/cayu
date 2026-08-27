@@ -89,6 +89,25 @@ guard.
 
 ## Unreleased
 
+### Local attempts retain complete-tree cleanup ownership across worker loss
+
+`LocalExecutionAttemptCoordinator` adds a task-backed Linux containment boundary
+for trusted local agent-attempt trees. It freezes an immutable attempt/effect
+identity and exact task-claim generation before launch, supervises descendants
+across timeout, cancellation, and
+abrupt parent death, publishes exact process and quiescence receipts, and blocks
+task or retry-series replacement until positive terminal settlement. Memory,
+SQLite, and PostgreSQL task stores implement the same durable fence. Capability
+evidence distinguishes graceful cleanup, hard deadlines, parent-death
+containment, and intentionally persistent detached work; process quiescence never
+proves the outcome of non-idempotent external effects.
+
+Storage revision 66 is a clean prerelease compatibility break for task workers.
+It installs the local execution-attempt authority and retry fence. Drain task
+workers and migrate every shared task database before starting revision-66
+workers; pre-66 and revision-66 task workers must not share a database because
+older claimers do not consult the attempt fence.
+
 ### Generated projects can opt in to an explicit coding composition
 
 `cayu new NAME --composition coding` now generates one runnable, ordinary-Python

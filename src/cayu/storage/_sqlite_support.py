@@ -3025,6 +3025,47 @@ _MIGRATION_STEPS: dict[int, str] = {
           ON revision.entry_id = logical.id
          AND revision.revision = logical.current_revision;
     """,
+    66: """
+        CREATE TABLE IF NOT EXISTS cayu_local_execution_attempts (
+            attempt_id TEXT COLLATE BINARY NOT NULL PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES cayu_tasks(id) ON DELETE RESTRICT,
+            retry_series_id TEXT COLLATE BINARY,
+            effect_lineage_id TEXT COLLATE BINARY NOT NULL,
+            request_sha256 TEXT COLLATE BINARY NOT NULL,
+            phase TEXT NOT NULL CHECK (
+                phase IN ('prepared', 'starting', 'running', 'terminal')
+            ),
+            quiescence TEXT NOT NULL CHECK (
+                quiescence IN (
+                    'not_dispatched', 'terminal_not_quiescent', 'quiescent',
+                    'unavailable', 'persistent_detached'
+                )
+            ),
+            retry_admissible INTEGER NOT NULL CHECK (retry_admissible IN (0, 1)),
+            recovery_generation INTEGER NOT NULL CHECK (recovery_generation >= 0),
+            recovery_owner_id TEXT,
+            recovery_owner_expires_at TEXT,
+            record_json TEXT NOT NULL CHECK (
+                json_valid(record_json) AND json_type(record_json) = 'object'
+            ),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (task_id, effect_lineage_id, attempt_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_local_execution_attempts_task_fence
+            ON cayu_local_execution_attempts(task_id, retry_admissible, created_at, attempt_id);
+        CREATE INDEX IF NOT EXISTS idx_cayu_local_execution_attempts_lineage
+            ON cayu_local_execution_attempts(
+                retry_series_id, task_id, effect_lineage_id,
+                created_at DESC, attempt_id DESC
+            );
+        CREATE INDEX IF NOT EXISTS idx_cayu_local_execution_attempts_recovery
+            ON cayu_local_execution_attempts(
+                retry_admissible, phase, updated_at, attempt_id
+            );
+        CREATE INDEX IF NOT EXISTS idx_cayu_local_execution_attempts_discovery
+            ON cayu_local_execution_attempts(created_at, attempt_id);
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -4370,6 +4411,84 @@ def _validate_reservation_identity_registry(
         )
 
 
+def _validate_local_execution_attempt_schema(connection: sqlite3.Connection) -> None:
+    expected_columns = (
+        ("attempt_id", "TEXT", 1),
+        ("task_id", "TEXT", 1),
+        ("retry_series_id", "TEXT", 0),
+        ("effect_lineage_id", "TEXT", 1),
+        ("request_sha256", "TEXT", 1),
+        ("phase", "TEXT", 1),
+        ("quiescence", "TEXT", 1),
+        ("retry_admissible", "INTEGER", 1),
+        ("recovery_generation", "INTEGER", 1),
+        ("recovery_owner_id", "TEXT", 0),
+        ("recovery_owner_expires_at", "TEXT", 0),
+        ("record_json", "TEXT", 1),
+        ("created_at", "TEXT", 1),
+        ("updated_at", "TEXT", 1),
+    )
+    actual_columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]))
+        for row in connection.execute("PRAGMA table_info(cayu_local_execution_attempts)")
+    )
+    if actual_columns != expected_columns:
+        raise RuntimeError("SQLite local execution-attempt storage conflicts with revision 66.")
+    table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'cayu_local_execution_attempts'"
+    ).fetchone()
+    definition = (
+        ""
+        if table_row is None or table_row[0] is None
+        else " ".join(str(table_row[0]).lower().split())
+    )
+    required_fragments = (
+        "references cayu_tasks(id) on delete restrict",
+        "json_valid(record_json)",
+        "retry_admissible in (0, 1)",
+        "unique (task_id, effect_lineage_id, attempt_id)",
+    )
+    if any(fragment not in definition for fragment in required_fragments):
+        raise RuntimeError("SQLite local execution-attempt constraints conflict with revision 66.")
+    expected_indexes = {
+        "idx_cayu_local_execution_attempts_task_fence": (
+            "task_id",
+            "retry_admissible",
+            "created_at",
+            "attempt_id",
+        ),
+        "idx_cayu_local_execution_attempts_lineage": (
+            "retry_series_id",
+            "task_id",
+            "effect_lineage_id",
+            "created_at",
+            "attempt_id",
+        ),
+        "idx_cayu_local_execution_attempts_recovery": (
+            "retry_admissible",
+            "phase",
+            "updated_at",
+            "attempt_id",
+        ),
+        "idx_cayu_local_execution_attempts_discovery": (
+            "created_at",
+            "attempt_id",
+        ),
+    }
+    for index_name, expected in expected_indexes.items():
+        row = connection.execute(
+            "SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index_name,),
+        ).fetchone()
+        columns = tuple(
+            str(index_row[2])
+            for index_row in connection.execute(f"PRAGMA index_info({index_name})")
+        )
+        if row is None or row[0] != "cayu_local_execution_attempts" or columns != expected:
+            raise RuntimeError(f"SQLite schema object {index_name!r} conflicts with revision 66.")
+
+
 def reconcile_schema(
     connection: sqlite3.Connection,
     schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
@@ -4531,6 +4650,8 @@ def reconcile_schema(
         _validate_revision_sixty_two_payload_schema(connection)
     if app_min_supported >= 64:
         _validate_eval_authored_suite_schema(connection)
+    if app_min_supported >= 66:
+        _validate_local_execution_attempt_schema(connection)
 
 
 def _validate_session_invocation_column(connection: sqlite3.Connection) -> None:
@@ -7263,6 +7384,8 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
                 connection,
                 require_payload_bytes=True,
             )
+        if rev.revision == 66:
+            _validate_local_execution_attempt_schema(connection)
         _record_revision(connection, rev)
         connection.execute(f"PRAGMA user_version = {rev.revision}")
 

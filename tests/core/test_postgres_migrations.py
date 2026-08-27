@@ -443,7 +443,7 @@ def test_revision_fifty_nine_rejects_a_populated_verified_work_registry(
     asyncio.run(runner())
 
 
-def test_postgres_task_store_validation_requires_revision_sixty_two(
+def test_postgres_task_store_validation_requires_revision_sixty_six(
     postgres_dsn: str,
 ) -> None:
     async def runner() -> None:
@@ -458,12 +458,12 @@ def test_postgres_task_store_validation_requires_revision_sixty_two(
 
         async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
             async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 62")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 66")
             await conn.commit()
 
         validator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 62"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 66"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -929,6 +929,7 @@ _TABLES = (
     "cayu_mcp_manifest_baselines",
     "cayu_checkpoints",
     "cayu_session_operations",
+    "cayu_local_execution_attempts",
     "cayu_tasks",
     "cayu_sessions",
     "cayu_eval_baseline_mutations",

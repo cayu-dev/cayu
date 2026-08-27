@@ -134,13 +134,17 @@ jobs:
       CAYU_REQUIRE_POSTGRES: "1"
       CAYU_REQUIRE_DOCKER_RUNNER: "1"
       CAYU_REQUIRE_DOCKER_EGRESS: "1"
+      CAYU_REQUIRE_PLAYWRIGHT_CONTAINMENT: "1"
       CAYU_REQUIRE_CURRENT_TEST_DURATIONS: "1"
       COVERAGE_FILE: coverage.${{ github.run_attempt }}.specialist-${{ matrix.lane }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - run: uv python install 3.14
-      - run: uv sync --frozen --extra dev --extra server --python 3.14
+      - run: uv sync --frozen --extra dev --extra server --extra browser --python 3.14
+      - name: Install Chromium for process-containment acceptance
+        if: matrix.lane == 'stress-process'
+        run: uv run playwright install --with-deps chromium
       - name: Test specialist lane
         env:
           EVENT_NAME: ${{ github.event_name }}

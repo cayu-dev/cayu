@@ -152,6 +152,26 @@ from cayu.runtime.interactions import (
     INTERACTION_TERMINAL_EVENT_TYPES,
 )
 from cayu.runtime.invocation import SessionInvocation, SessionInvocationBinding, TaskInvocation
+from cayu.runtime.local_execution_attempts import (
+    LocalExecutionAttemptAuthority,
+    LocalExecutionAttemptConflict,
+    LocalExecutionAttemptListCursor,
+    LocalExecutionAttemptRecord,
+    LocalExecutionAttemptRecoveryClaim,
+    LocalExecutionAttemptSettlement,
+    LocalExecutionAttemptStart,
+    _copy_authenticated_local_execution_attempt_settlement,
+    _copy_local_execution_attempt_authority,
+    _copy_local_execution_attempt_list_cursor,
+    _copy_local_execution_attempt_recovery_claim,
+    _copy_local_execution_attempt_start,
+    advance_local_execution_attempt_start,
+    claim_local_execution_attempt_recovery_record,
+    prepare_local_execution_attempt_record,
+    require_local_execution_recovery_eligible,
+    require_local_execution_task_authority,
+    settle_local_execution_attempt_record,
+)
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec, parse_public_authority_alias
 from cayu.runtime.service_manifest import RuntimeStoreDurability
 from cayu.runtime.sessions import (
@@ -730,7 +750,7 @@ _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
 _POSTGRES_SESSION_MIN_REQUIRED_REVISION = 62
-_POSTGRES_TASK_MIN_REQUIRED_REVISION = 62
+_POSTGRES_TASK_MIN_REQUIRED_REVISION = 66
 
 
 async def _postgres_lock_memory_evidence_id(cur: Any, lock_id: str) -> None:
@@ -3058,6 +3078,44 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
          AND revision.revision = logical.current_revision
         """,
     ),
+    66: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_local_execution_attempts (
+            attempt_id TEXT COLLATE "C" PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES cayu_tasks(id) ON DELETE RESTRICT,
+            retry_series_id TEXT COLLATE "C",
+            effect_lineage_id TEXT COLLATE "C" NOT NULL,
+            request_sha256 TEXT COLLATE "C" NOT NULL,
+            phase TEXT NOT NULL CHECK (
+                phase IN ('prepared', 'starting', 'running', 'terminal')
+            ),
+            quiescence TEXT NOT NULL CHECK (
+                quiescence IN (
+                    'not_dispatched', 'terminal_not_quiescent', 'quiescent',
+                    'unavailable', 'persistent_detached'
+                )
+            ),
+            retry_admissible BOOLEAN NOT NULL,
+            recovery_generation BIGINT NOT NULL CHECK (recovery_generation >= 0),
+            recovery_owner_id TEXT,
+            recovery_owner_expires_at TIMESTAMPTZ,
+            record_json JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            UNIQUE (task_id, effect_lineage_id, attempt_id)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_local_execution_attempts_task_fence "
+        "ON cayu_local_execution_attempts(task_id, retry_admissible, created_at, attempt_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_local_execution_attempts_lineage "
+        "ON cayu_local_execution_attempts("
+        "retry_series_id, task_id, effect_lineage_id, created_at DESC, attempt_id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_local_execution_attempts_recovery "
+        "ON cayu_local_execution_attempts("
+        "retry_admissible, phase, updated_at, attempt_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_local_execution_attempts_discovery "
+        "ON cayu_local_execution_attempts(created_at, attempt_id)",
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -4657,6 +4715,8 @@ class _PostgresStoreBase:
                             await self._validate_work_attempt_continuation_authority(cur)
                         if self._min_required_revision >= 64:
                             await self._validate_eval_authored_suite_schema(cur)
+                        if self._min_required_revision >= 66:
+                            await self._validate_local_execution_attempt_schema(cur)
                         if current_state.revision >= 23:
                             await self._validate_budget_reservation_identity_registry(
                                 cur,
@@ -4982,6 +5042,132 @@ class _PostgresStoreBase:
                 cur,
                 allow_revision_43=True,
                 require_payload_bytes=True,
+            )
+        if revision.revision == 66:
+            await self._validate_local_execution_attempt_schema(cur)
+
+    async def _validate_local_execution_attempt_schema(self, cur: Any) -> None:
+        await cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'cayu_local_execution_attempts'
+            ORDER BY ordinal_position
+            """
+        )
+        if tuple(await cur.fetchall()) != (
+            ("attempt_id", "text", "NO"),
+            ("task_id", "text", "NO"),
+            ("retry_series_id", "text", "YES"),
+            ("effect_lineage_id", "text", "NO"),
+            ("request_sha256", "text", "NO"),
+            ("phase", "text", "NO"),
+            ("quiescence", "text", "NO"),
+            ("retry_admissible", "boolean", "NO"),
+            ("recovery_generation", "bigint", "NO"),
+            ("recovery_owner_id", "text", "YES"),
+            ("recovery_owner_expires_at", "timestamp with time zone", "YES"),
+            ("record_json", "jsonb", "NO"),
+            ("created_at", "timestamp with time zone", "NO"),
+            ("updated_at", "timestamp with time zone", "NO"),
+        ):
+            raise RuntimeError(
+                "Postgres local execution-attempt storage conflicts with revision 66."
+            )
+        await cur.execute(
+            """
+            SELECT indexname, indexdef
+            FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND indexname = ANY(%s)
+            ORDER BY indexname
+            """,
+            (
+                [
+                    "idx_cayu_local_execution_attempts_discovery",
+                    "idx_cayu_local_execution_attempts_lineage",
+                    "idx_cayu_local_execution_attempts_recovery",
+                    "idx_cayu_local_execution_attempts_task_fence",
+                ],
+            ),
+        )
+        indexes = tuple(await cur.fetchall())
+        expected_indexes = {
+            "idx_cayu_local_execution_attempts_discovery": (
+                "created_at",
+                "attempt_id",
+            ),
+            "idx_cayu_local_execution_attempts_lineage": (
+                "retry_series_id",
+                "task_id",
+                "effect_lineage_id",
+                "created_at desc",
+                "attempt_id desc",
+            ),
+            "idx_cayu_local_execution_attempts_recovery": (
+                "retry_admissible",
+                "phase",
+                "updated_at",
+                "attempt_id",
+            ),
+            "idx_cayu_local_execution_attempts_task_fence": (
+                "task_id",
+                "retry_admissible",
+                "created_at",
+                "attempt_id",
+            ),
+        }
+        if tuple(row[0] for row in indexes) != (
+            "idx_cayu_local_execution_attempts_discovery",
+            "idx_cayu_local_execution_attempts_lineage",
+            "idx_cayu_local_execution_attempts_recovery",
+            "idx_cayu_local_execution_attempts_task_fence",
+        ) or any(
+            not all(
+                expected_fragment in " ".join(str(index_definition).lower().split())
+                for expected_fragment in expected_indexes[str(index_name)]
+            )
+            for index_name, index_definition in indexes
+        ):
+            raise RuntimeError(
+                "Postgres local execution-attempt indexes conflict with revision 66."
+            )
+        await cur.execute(
+            """
+            SELECT constraint_definition.contype,
+                   pg_get_constraintdef(constraint_definition.oid, TRUE)
+            FROM pg_constraint AS constraint_definition
+            JOIN pg_class AS relation
+              ON relation.oid = constraint_definition.conrelid
+            JOIN pg_namespace AS namespace
+              ON namespace.oid = relation.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND relation.relname = 'cayu_local_execution_attempts'
+            """
+        )
+        constraints = tuple(await cur.fetchall())
+        normalized_constraints = tuple(
+            (str(kind), " ".join(str(definition).lower().split()))
+            for kind, definition in constraints
+        )
+        required_constraints = (
+            ("p", "primary key (attempt_id)"),
+            ("f", "foreign key (task_id) references cayu_tasks(id) on delete restrict"),
+            ("u", "unique (task_id, effect_lineage_id, attempt_id)"),
+            ("c", "recovery_generation >= 0"),
+            ("c", "phase"),
+            ("c", "quiescence"),
+        )
+        if any(
+            not any(
+                kind == expected_kind and fragment in definition
+                for kind, definition in normalized_constraints
+            )
+            for expected_kind, fragment in required_constraints
+        ):
+            raise RuntimeError(
+                "Postgres local execution-attempt constraints conflict with revision 66."
             )
 
     async def _validate_session_instance_schema(self, cur: Any) -> None:
@@ -26495,6 +26681,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
     supports_task_retry_series: ClassVar[bool] = True
     supports_verified_work_contracts: ClassVar[bool] = True
     supports_work_attempt_admission: ClassVar[bool] = True
+    supports_local_execution_attempts: ClassVar[bool] = True
     verified_work_mutations_are_cancellation_quiescent: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
     _min_required_revision = _POSTGRES_TASK_MIN_REQUIRED_REVISION
@@ -26538,6 +26725,397 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
             allowed_configure=self._postgres_mutation_allowed_configure,
         )
         await super()._ensure_ready()
+
+    async def _load_local_execution_attempt_row(
+        self,
+        cur: Any,
+        attempt_id: str,
+        *,
+        for_update: bool = False,
+    ) -> LocalExecutionAttemptRecord | None:
+        await cur.execute(
+            "SELECT attempt_id, task_id, retry_series_id, effect_lineage_id, "
+            "request_sha256, phase, quiescence, retry_admissible, "
+            "recovery_generation, recovery_owner_id, recovery_owner_expires_at, "
+            "record_json, created_at, updated_at "
+            "FROM cayu_local_execution_attempts WHERE attempt_id = %s"
+            + (" FOR UPDATE" if for_update else ""),
+            (attempt_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        try:
+            record = LocalExecutionAttemptRecord.model_validate(_json_obj(row[11]))
+        except (TypeError, ValueError):
+            raise LocalExecutionAttemptConflict(
+                "Stored local execution attempt content is malformed."
+            ) from None
+        if (
+            record.authority.attempt_id != row[0]
+            or record.authority.task_id != row[1]
+            or record.authority.retry_series_id != row[2]
+            or record.authority.effect_lineage_id != row[3]
+            or record.authority.request_sha256 != row[4]
+            or record.phase.value != row[5]
+            or record.quiescence.value != row[6]
+            or record.retry_admissible is not row[7]
+            or record.recovery_generation != row[8]
+            or record.recovery_owner_id != row[9]
+            or record.recovery_owner_expires_at != pg_support.to_utc_optional(row[10])
+            or record.created_at != pg_support.to_utc(row[12])
+            or record.updated_at != pg_support.to_utc(row[13])
+        ):
+            raise LocalExecutionAttemptConflict(
+                "Stored local execution attempt indexes conflict with canonical content."
+            )
+        return record
+
+    async def _latest_local_execution_attempt_row(
+        self,
+        cur: Any,
+        authority: LocalExecutionAttemptAuthority,
+    ) -> LocalExecutionAttemptRecord | None:
+        if authority.retry_series_id is None:
+            await cur.execute(
+                "SELECT attempt_id FROM cayu_local_execution_attempts "
+                "WHERE retry_series_id IS NULL AND task_id = %s "
+                "AND effect_lineage_id = %s "
+                "ORDER BY retry_admissible ASC, created_at DESC, attempt_id DESC LIMIT 1",
+                (authority.task_id, authority.effect_lineage_id),
+            )
+        else:
+            await cur.execute(
+                "SELECT attempt_id FROM cayu_local_execution_attempts "
+                "WHERE retry_series_id = %s AND effect_lineage_id = %s "
+                "ORDER BY retry_admissible ASC, created_at DESC, attempt_id DESC LIMIT 1",
+                (authority.retry_series_id, authority.effect_lineage_id),
+            )
+        row = await cur.fetchone()
+        return None if row is None else await self._load_local_execution_attempt_row(cur, row[0])
+
+    async def _store_local_execution_attempt_row(
+        self,
+        cur: Any,
+        record: LocalExecutionAttemptRecord,
+        *,
+        insert: bool,
+    ) -> None:
+        values = (
+            record.authority.attempt_id,
+            record.authority.task_id,
+            record.authority.retry_series_id,
+            record.authority.effect_lineage_id,
+            record.authority.request_sha256,
+            record.phase.value,
+            record.quiescence.value,
+            record.retry_admissible,
+            record.recovery_generation,
+            record.recovery_owner_id,
+            record.recovery_owner_expires_at,
+            _dumps(record.model_dump(mode="json", warnings=False)),
+            record.created_at,
+            record.updated_at,
+        )
+        if insert:
+            await cur.execute(
+                "INSERT INTO cayu_local_execution_attempts ("
+                "attempt_id, task_id, retry_series_id, effect_lineage_id, request_sha256, "
+                "phase, quiescence, retry_admissible, recovery_generation, "
+                "recovery_owner_id, recovery_owner_expires_at, record_json, created_at, "
+                "updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                "%s, %s, %s)",
+                values,
+            )
+            return
+        await cur.execute(
+            "UPDATE cayu_local_execution_attempts SET task_id = %s, "
+            "retry_series_id = %s, effect_lineage_id = %s, request_sha256 = %s, "
+            "phase = %s, quiescence = %s, retry_admissible = %s, "
+            "recovery_generation = %s, recovery_owner_id = %s, "
+            "recovery_owner_expires_at = %s, record_json = %s, created_at = %s, "
+            "updated_at = %s WHERE attempt_id = %s AND request_sha256 = %s",
+            (*values[1:], values[0], values[4]),
+        )
+        if cur.rowcount != 1:
+            raise LocalExecutionAttemptConflict(
+                "Local execution attempt changed during durable publication."
+            )
+
+    @staticmethod
+    def _local_execution_retry_fence_scope(task: Task) -> str:
+        retry_series = task.retry_series
+        return f"retry:{retry_series.series_id}" if retry_series is not None else f"task:{task.id}"
+
+    async def _lock_local_execution_retry_fence(self, cur: Any, task: Task) -> None:
+        await self._lock_verified_work_identity(
+            cur,
+            "local-execution-retry-admission",
+            self._local_execution_retry_fence_scope(task),
+        )
+
+    async def _local_execution_attempt_fences_task(
+        self,
+        cur: Any,
+        task: Task,
+    ) -> bool:
+        retry_series = task.retry_series
+        if retry_series is None:
+            await cur.execute(
+                "SELECT 1 FROM cayu_local_execution_attempts "
+                "WHERE task_id = %s AND NOT retry_admissible LIMIT 1",
+                (task.id,),
+            )
+        else:
+            await cur.execute(
+                "SELECT 1 FROM cayu_local_execution_attempts "
+                "WHERE NOT retry_admissible AND (task_id = %s OR retry_series_id = %s) "
+                "LIMIT 1",
+                (task.id, retry_series.series_id),
+            )
+        return await cur.fetchone() is not None
+
+    async def _require_no_competing_local_execution_task_owner(
+        self,
+        cur: Any,
+        task: Task,
+    ) -> None:
+        retry_series = task.retry_series
+        if retry_series is None:
+            return
+        await cur.execute(
+            "SELECT 1 FROM cayu_tasks WHERE id <> %s AND retry_series IS NOT NULL "
+            "AND retry_series->>'series_id' = %s AND status IN (%s, %s) LIMIT 1",
+            (
+                task.id,
+                retry_series.series_id,
+                str(TaskStatus.CLAIMED),
+                str(TaskStatus.RUNNING),
+            ),
+        )
+        if await cur.fetchone() is not None:
+            raise LocalExecutionAttemptConflict(
+                "Local execution attempt conflicts with another active retry-series task."
+            )
+
+    async def prepare_local_execution_attempt(
+        self,
+        authority: LocalExecutionAttemptAuthority,
+    ) -> LocalExecutionAttemptRecord:
+        authority = _copy_local_execution_attempt_authority(authority)
+        await self._ensure_ready()
+
+        async def mutation(_conn: Any, cur: Any) -> LocalExecutionAttemptRecord:
+            await self._lock_verified_work_identity(
+                cur,
+                "local-execution-attempt",
+                authority.attempt_id,
+            )
+            scope = (
+                f"retry:{authority.retry_series_id}"
+                if authority.retry_series_id is not None
+                else f"task:{authority.task_id}"
+            )
+            await self._lock_verified_work_identity(
+                cur,
+                "local-execution-lineage",
+                f"{scope}:{authority.effect_lineage_id}",
+            )
+            existing = await self._load_local_execution_attempt_row(
+                cur,
+                authority.attempt_id,
+                for_update=True,
+            )
+            task = (
+                None
+                if existing is not None
+                else await self._load_task_locked(cur, authority.task_id)
+            )
+            if task is not None:
+                # PostgreSQL statements retain their original READ COMMITTED
+                # snapshot after a row-lock wait.  Share one transaction-scoped
+                # fence with lease reclamation and task claiming, then inspect
+                # retry-series ownership again before publishing the attempt.
+                await self._lock_local_execution_retry_fence(cur, task)
+                await self._require_no_competing_local_execution_task_owner(cur, task)
+            prior = await self._latest_local_execution_attempt_row(cur, authority)
+            now = await self._database_now(cur)
+            record = prepare_local_execution_attempt_record(
+                authority=authority,
+                task=task,
+                existing=existing,
+                prior=prior,
+                evidence_now=now,
+                lease_now=now,
+            )
+            if existing is None:
+                await self._store_local_execution_attempt_row(cur, record, insert=True)
+            return record.model_copy(deep=True)
+
+        return await self._run_verified_work_mutation(mutation)
+
+    async def start_local_execution_attempt(
+        self,
+        start: LocalExecutionAttemptStart,
+    ) -> LocalExecutionAttemptRecord:
+        start = _copy_local_execution_attempt_start(start)
+        await self._ensure_ready()
+
+        async def mutation(_conn: Any, cur: Any) -> LocalExecutionAttemptRecord:
+            await self._lock_verified_work_identity(
+                cur,
+                "local-execution-attempt",
+                start.attempt_id,
+            )
+            record = await self._load_local_execution_attempt_row(
+                cur,
+                start.attempt_id,
+                for_update=True,
+            )
+            if record is None:
+                raise LocalExecutionAttemptConflict(
+                    "Local execution start has no prepared attempt."
+                )
+            now = await self._database_now(cur)
+            if record.start is None:
+                require_local_execution_task_authority(
+                    await self._load_task_locked(cur, record.authority.task_id),
+                    record.authority,
+                    now=now,
+                )
+            updated = advance_local_execution_attempt_start(
+                record,
+                start,
+                evidence_now=now,
+                lease_now=now,
+            )
+            if updated != record:
+                await self._store_local_execution_attempt_row(cur, updated, insert=False)
+            return updated.model_copy(deep=True)
+
+        return await self._run_verified_work_mutation(mutation)
+
+    async def settle_local_execution_attempt(
+        self,
+        settlement: LocalExecutionAttemptSettlement,
+    ) -> LocalExecutionAttemptRecord:
+        settlement = _copy_authenticated_local_execution_attempt_settlement(settlement)
+        await self._ensure_ready()
+
+        async def mutation(_conn: Any, cur: Any) -> LocalExecutionAttemptRecord:
+            await self._lock_verified_work_identity(
+                cur,
+                "local-execution-attempt",
+                settlement.attempt_id,
+            )
+            record = await self._load_local_execution_attempt_row(
+                cur,
+                settlement.attempt_id,
+                for_update=True,
+            )
+            if record is None:
+                raise LocalExecutionAttemptConflict(
+                    "Local execution settlement has no prepared attempt."
+                )
+            now = await self._database_now(cur)
+            updated = settle_local_execution_attempt_record(
+                record,
+                settlement,
+                evidence_now=now,
+                lease_now=now,
+            )
+            if updated != record:
+                await self._store_local_execution_attempt_row(cur, updated, insert=False)
+            return updated.model_copy(deep=True)
+
+        return await self._run_verified_work_mutation(mutation)
+
+    async def load_local_execution_attempt(
+        self,
+        attempt_id: str,
+    ) -> LocalExecutionAttemptRecord | None:
+        attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            record = await self._load_local_execution_attempt_row(cur, attempt_id)
+        return None if record is None else record.model_copy(deep=True)
+
+    async def list_unsettled_local_execution_attempts(
+        self,
+        *,
+        limit: int = 100,
+        after: LocalExecutionAttemptListCursor | None = None,
+    ) -> tuple[LocalExecutionAttemptRecord, ...]:
+        limit = _validate_task_positive_int(limit, "limit")
+        after = _copy_local_execution_attempt_list_cursor(after)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            predicate = "(phase <> %s OR quiescence IN (%s, %s))"
+            parameters: list[Any] = [
+                "terminal",
+                "terminal_not_quiescent",
+                "unavailable",
+            ]
+            if after is not None:
+                predicate += " AND (created_at > %s OR (created_at = %s AND attempt_id > %s))"
+                parameters.extend(
+                    (
+                        after.created_at,
+                        after.created_at,
+                        after.attempt_id,
+                    )
+                )
+            parameters.append(limit)
+            await cur.execute(
+                "SELECT attempt_id FROM cayu_local_execution_attempts WHERE "
+                f"{predicate} "
+                "ORDER BY created_at ASC, attempt_id ASC LIMIT %s",
+                parameters,
+            )
+            rows = await cur.fetchall()
+            records = [await self._load_local_execution_attempt_row(cur, row[0]) for row in rows]
+        return tuple(record.model_copy(deep=True) for record in records if record is not None)
+
+    async def claim_local_execution_attempt_recovery(
+        self,
+        claim: LocalExecutionAttemptRecoveryClaim,
+    ) -> LocalExecutionAttemptRecord:
+        claim = _copy_local_execution_attempt_recovery_claim(claim)
+        await self._ensure_ready()
+
+        async def mutation(_conn: Any, cur: Any) -> LocalExecutionAttemptRecord:
+            await self._lock_verified_work_identity(
+                cur,
+                "local-execution-attempt",
+                claim.attempt_id,
+            )
+            record = await self._load_local_execution_attempt_row(
+                cur,
+                claim.attempt_id,
+                for_update=True,
+            )
+            if record is None:
+                raise LocalExecutionAttemptConflict(
+                    "Local execution recovery attempt was not found."
+                )
+            task = await self._load_task_locked(cur, record.authority.task_id)
+            now = await self._database_now(cur)
+            require_local_execution_recovery_eligible(
+                task,
+                record,
+                now=now,
+            )
+            updated = claim_local_execution_attempt_recovery_record(
+                record,
+                claim,
+                evidence_now=now,
+                lease_now=now,
+            )
+            if updated != record:
+                await self._store_local_execution_attempt_row(cur, updated, insert=False)
+            return updated.model_copy(deep=True)
+
+        return await self._run_verified_work_mutation(mutation)
 
     async def create_task(self, request: TaskCreate) -> Task:
         request = copy_task_create(request)
@@ -26987,7 +27565,7 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                             f"""
                             WITH
                             matching_tasks AS (
-                                SELECT status, session_id, available_at
+                                SELECT id, status, session_id, available_at, retry_series
                                 FROM cayu_tasks
                                 {where_sql}
                             ),
@@ -27002,6 +27580,19 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                                         WHERE status = 'pending'
                                           AND session_id IS NULL
                                           AND (available_at IS NULL OR available_at <= %s)
+                                          AND NOT EXISTS (
+                                              SELECT 1
+                                              FROM cayu_local_execution_attempts AS attempt
+                                              WHERE NOT attempt.retry_admissible
+                                                AND (
+                                                    attempt.task_id = matching_tasks.id
+                                                    OR (
+                                                        matching_tasks.retry_series IS NOT NULL
+                                                        AND attempt.retry_series_id =
+                                                            matching_tasks.retry_series->>'series_id'
+                                                    )
+                                                )
+                                          )
                                     ) AS claimable_pending_count,
                                     COUNT(*) FILTER (
                                         WHERE status = 'pending'
@@ -27950,6 +28541,10 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 "session_id IS NULL",
                 availability_clause,
                 retry_deadline_clause,
+                "NOT EXISTS (SELECT 1 FROM cayu_local_execution_attempts AS attempt "
+                "WHERE NOT attempt.retry_admissible AND ("
+                "attempt.task_id = cayu_tasks.id OR (cayu_tasks.retry_series IS NOT NULL "
+                "AND attempt.retry_series_id = cayu_tasks.retry_series->>'series_id')))",
                 *clauses,
             ]
         )
@@ -27974,6 +28569,14 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                           AND retry_series->>'disposition' = %s
                           AND retry_series->>'elapsed_deadline' IS NOT NULL
                           AND {expiration_deadline_clause}
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM cayu_local_execution_attempts AS attempt
+                              WHERE NOT attempt.retry_admissible AND (
+                                  attempt.task_id = cayu_tasks.id OR
+                                  attempt.retry_series_id = retry_series->>'series_id'
+                              )
+                          )
                         ORDER BY created_at ASC, id ASC
                         FOR UPDATE SKIP LOCKED
                         LIMIT 100
@@ -28064,10 +28667,22 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     ],
                 )
                 row = await cur.fetchone()
+                claimed = None if row is None else pg_support.task_from_row(row)
+                fenced = False
+                if claimed is not None:
+                    await self._lock_local_execution_retry_fence(cur, claimed)
+                    # Recheck in a fresh statement after the advisory-lock wait.
+                    # The candidate CTE's snapshot may predate an attempt that
+                    # committed while its task row was locked by preparation.
+                    fenced = await self._local_execution_attempt_fences_task(
+                        cur,
+                        claimed,
+                    )
+            if fenced:
+                await conn.rollback()
+                return None
             await conn.commit()
-        if row is None:
-            return None
-        return pg_support.task_from_row(row).model_copy(deep=True)
+        return None if claimed is None else claimed.model_copy(deep=True)
 
     async def heartbeat(
         self,
@@ -28273,6 +28888,10 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                 "lease_expires_at IS NOT NULL",
                 "lease_expires_at <= timing.now",
                 "status_reason IS DISTINCT FROM %s",
+                "NOT EXISTS (SELECT 1 FROM cayu_local_execution_attempts AS attempt "
+                "WHERE NOT attempt.retry_admissible AND ("
+                "attempt.task_id = cayu_tasks.id OR (cayu_tasks.retry_series IS NOT NULL "
+                "AND attempt.retry_series_id = cayu_tasks.retry_series->>'series_id')))",
                 *clauses,
             ]
         )
@@ -28314,8 +28933,32 @@ class PostgresTaskStore(PostgresVerifiedWorkMixin, _PostgresStoreBase, TaskStore
                     ],
                 )
                 rows = await cur.fetchall()
+                reclaimed = [pg_support.task_from_row(row) for row in rows]
+                # Acquire scope locks in canonical order so a multi-row reclaim
+                # cannot deadlock another reclaimer.  Every eligibility check is
+                # then repeated in a new statement after any lock wait.
+                tasks_by_scope = {
+                    self._local_execution_retry_fence_scope(task): task for task in reclaimed
+                }
+                for scope in sorted(tasks_by_scope):
+                    await self._lock_local_execution_retry_fence(
+                        cur,
+                        tasks_by_scope[scope],
+                    )
+                fenced = any(
+                    [
+                        await self._local_execution_attempt_fences_task(cur, task)
+                        for task in reclaimed
+                    ]
+                )
+            if fenced:
+                # Roll back every row selected by this batch.  A later reclaim
+                # starts from a fresh snapshot and can still settle unrelated
+                # expired tasks without ever publishing a stale retry window.
+                await conn.rollback()
+                return []
             await conn.commit()
-        return [pg_support.task_from_row(row).model_copy(deep=True) for row in rows]
+        return [task.model_copy(deep=True) for task in reclaimed]
 
     # -- internal helpers -------------------------------------------------
 
