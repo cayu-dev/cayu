@@ -351,6 +351,7 @@ _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
 _INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
 _DEFAULT_APPROVAL_MAX_STEPS = 16
 _ABANDONED_RUN_REASON = "event_stream_closed"
+_ABANDONED_UNREPLAYABLE_TOOL_ROUND_CHECKPOINT_KEY = "abandoned_unreplayable_tool_round"
 _INCOMPLETE_RECOVERY_CLAIM_LEASE = timedelta(minutes=5)
 _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS = 30.0
 _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_RETRY_SECONDS = 5.0
@@ -387,6 +388,13 @@ _TOOL_ROUND_RECOVERABLE_SESSION_STATUSES = {
     SessionStatus.INTERRUPTED,
     SessionStatus.FAILED,
 }
+_UNREPLAYABLE_TOOL_ROUND_ARCHIVE_SESSION_STATUSES = frozenset(
+    {
+        SessionStatus.INTERRUPTING,
+        SessionStatus.INTERRUPTED,
+        SessionStatus.FAILED,
+    }
+)
 _MODEL_BOUNDARY_TOOL_TERMINAL_EVENT_TYPES = frozenset(
     {
         EventType.TOOL_CALL_COMPLETED,
@@ -395,6 +403,34 @@ _MODEL_BOUNDARY_TOOL_TERMINAL_EVENT_TYPES = frozenset(
         EventType.TOOL_CALL_APPROVAL_DENIED,
     }
 )
+
+
+def _retain_abandoned_unreplayable_tool_round(
+    checkpoint: dict[str, Any],
+    durable_round: dict[str, Any],
+) -> dict[str, Any]:
+    """Retain every opaque round while making repeated archival idempotent."""
+
+    copied = copy_json_value(checkpoint, "checkpoint")
+    abandoned = copied.get(_ABANDONED_UNREPLAYABLE_TOOL_ROUND_CHECKPOINT_KEY)
+    if abandoned is None:
+        copied[_ABANDONED_UNREPLAYABLE_TOOL_ROUND_CHECKPOINT_KEY] = {
+            "schema_version": 1,
+            "reason": "opaque_provider_state",
+            "tool_round": durable_round,
+        }
+        return copied
+    if type(abandoned) is not dict or type(abandoned.get("tool_round")) is not dict:
+        raise RuntimeError("Session retains malformed abandoned tool-round evidence.")
+    if abandoned["tool_round"] == durable_round:
+        return copied
+    prior = abandoned.get("prior_tool_rounds", [])
+    if type(prior) is not list or any(type(item) is not dict for item in prior):
+        raise RuntimeError("Session retains malformed abandoned tool-round history.")
+    abandoned["prior_tool_rounds"] = [*prior, abandoned["tool_round"]]
+    abandoned["tool_round"] = durable_round
+    return copied
+
 
 _MANUAL_RECOVERY_SECRET_SCOPE_UNAVAILABLE = (
     "Externally verified tool output is unavailable because the invocation "
@@ -14545,6 +14581,37 @@ class RecoveryCoordinator:
                 # paired approval and finish that transition below instead of
                 # treating the pause as failure.
                 pass
+            except tool_round_recovery.UnsafeToolRoundContinuationError:
+                if session.status not in _UNREPLAYABLE_TOOL_ROUND_ARCHIVE_SESSION_STATUSES:
+                    raise
+                await self._archive_unreplayable_tool_round(
+                    session=session,
+                    pending_round=pending_tool_round,
+                )
+                session = await self._finalize_interrupting_for_recovery(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=environment_name,
+                    events=events,
+                    execution_profile=(
+                        None
+                        if execution_profile_snapshot is None
+                        else execution_profile_snapshot.profile
+                    ),
+                )
+                actions.append(IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED)
+                return IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=previous_status,
+                    status=session.status,
+                    actions=tuple(actions),
+                    events=tuple(events),
+                    message=(
+                        "Archived an abandoned tool round whose opaque provider state "
+                        "could not be replayed safely."
+                    ),
+                )
             actions.append(IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND)
             session = await self._require_session(session.id)
             checkpoint = await self._session_store.load_checkpoint(session.id)
@@ -14663,6 +14730,61 @@ class RecoveryCoordinator:
             events=tuple(events),
             message=message,
         )
+
+    async def _archive_unreplayable_tool_round(
+        self,
+        *,
+        session: Session,
+        pending_round: tool_round_recovery.PendingToolRound,
+    ) -> None:
+        """Retain quarantined evidence while removing it from resumable work."""
+
+        expected_identity = tool_round_recovery.pending_tool_round_identity(pending_round)
+        if session.status not in _UNREPLAYABLE_TOOL_ROUND_ARCHIVE_SESSION_STATUSES:
+            raise RuntimeError(
+                "An unreplayable tool round can only be abandoned from a recoverable "
+                "terminal or interrupting session."
+            )
+
+        def archive(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            if (
+                current_session.status is not session.status
+                or current_session.run_epoch != session.run_epoch
+            ):
+                raise RuntimeError(
+                    "Session changed before its unreplayable tool round was abandoned."
+                )
+            current = tool_round_recovery.pending_tool_round_from_checkpoint(
+                checkpoint,
+                redactor=self._secret_redactor,
+                consume_on_rejection=True,
+            )
+            if (
+                current is None
+                or tool_round_recovery.pending_tool_round_identity(current) != expected_identity
+            ):
+                raise RuntimeError(
+                    "Pending tool round changed before its unreplayable state was abandoned."
+                )
+            copied = copy_json_value(checkpoint, "checkpoint")
+            durable_round = copied.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY)
+            pointer = model_completion_publication.model_step_publication_from_checkpoint(copied)
+            if pointer is not None:
+                if (
+                    not pointer.assistant_message_deferred
+                    or pointer.logical_step_id != expected_identity.model_step_id
+                    or pointer.tool_round_id != expected_identity.tool_round_id
+                ):
+                    raise RuntimeError(
+                        "Unreplayable tool round conflicts with its durable model-step pointer."
+                    )
+                copied.pop(model_completion_publication.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY)
+            return _retain_abandoned_unreplayable_tool_round(copied, durable_round)
+
+        await self._session_store.transform_checkpoint(session.id, archive)
 
     async def _finalize_interrupting_for_recovery(
         self,

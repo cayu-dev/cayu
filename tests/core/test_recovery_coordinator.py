@@ -20,6 +20,7 @@ from cayu.runtime._recovery_coordinator import (
     _effective_approval_thinking,
     _interrupted_tool_round_results,
     _recovery_abandonment_signal,
+    _retain_abandoned_unreplayable_tool_round,
     _run_recovery_cleanup_steps,
     _task_cancellation_count,
 )
@@ -69,6 +70,19 @@ def _tool_round_identity() -> ToolRoundIdentity:
         model_attempt_id=f"matt_{'2' * 32}",
         tool_round_id=f"tround_{'3' * 32}",
     )
+
+
+def test_abandoned_opaque_tool_round_history_is_idempotent_and_lossless() -> None:
+    first = {"tool_round_id": "round-one"}
+    second = {"tool_round_id": "round-two"}
+
+    retained = _retain_abandoned_unreplayable_tool_round({}, first)
+    assert _retain_abandoned_unreplayable_tool_round(retained, first) == retained
+
+    retained = _retain_abandoned_unreplayable_tool_round(retained, second)
+    abandoned = retained["abandoned_unreplayable_tool_round"]
+    assert abandoned["tool_round"] == second
+    assert abandoned["prior_tool_rounds"] == [first]
 
 
 def test_effective_approval_run_config_prefers_override_then_pending_then_default() -> None:

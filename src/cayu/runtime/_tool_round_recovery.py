@@ -72,6 +72,10 @@ _TOOL_ROUND_TERMINAL_EVENT_TYPES = frozenset(
 )
 
 
+class UnsafeToolRoundContinuationError(RuntimeError):
+    """A quarantined round cannot be replayed without inventing provider state."""
+
+
 class PendingToolRound(BaseModel):
     """Durable checkpoint state for an ordinary tool round in progress."""
 
@@ -417,7 +421,7 @@ def ready_assistant_publication_message(pending_round: PendingToolRound) -> Mess
     if publication is None:
         raise RuntimeError("Quarantined tool round has no durable assistant publication evidence.")
     if publication.state == "blocked":
-        raise RuntimeError(
+        raise UnsafeToolRoundContinuationError(
             "Quarantined tool round cannot safely continue with opaque provider state."
         )
     if publication.state != "ready" or publication.message is None:

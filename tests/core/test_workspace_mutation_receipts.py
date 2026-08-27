@@ -2632,10 +2632,15 @@ def test_configured_observation_identity_is_admitted_before_durable_intent(
     assert secret_identity not in combined
 
 
+@pytest.mark.parametrize(
+    "first_recovery_status",
+    [SessionStatus.INTERRUPTED, SessionStatus.FAILED],
+)
 def test_dynamic_observation_identity_is_opaque_before_tool_secret_resolution(
     tmp_path,
     caplog,
     capsys,
+    first_recovery_status: SessionStatus,
 ) -> None:
     secret_identity = "PRIVATE_DYNAMIC_WORKSPACE_ID_CANARY"
 
@@ -2646,27 +2651,33 @@ def test_dynamic_observation_identity_is_opaque_before_tool_secret_resolution(
 
     async def run():
         store = InMemorySessionStore()
-        app = CayuApp(session_store=store, enable_logging=False)
-        app.register_provider(
-            _SingleToolProvider(tool_name="noop_workspace_mutation", arguments={}),
-            default=True,
-        )
-        app.register_environment(
-            Environment(
-                _portable_environment_spec("local"),
-                workspace=LocalWorkspace(tmp_path, workspace_id=secret_identity),
-                binding=AbortAfterIntentBinding(),
-                vault=StaticVault({"workspace_identity": secret_identity}),
-            ),
-            default=True,
-        )
-        app.register_agent(
-            AgentSpec(name="assistant", model="scripted-model"),
-            tools=[_NoopWorkspaceMutationTool()],
-        )
+
+        def registered_app() -> tuple[CayuApp, _SingleToolProvider]:
+            app = CayuApp(session_store=store, enable_logging=False)
+            provider = _SingleToolProvider(
+                tool_name="noop_workspace_mutation",
+                arguments={},
+            )
+            app.register_provider(provider, default=True)
+            app.register_environment(
+                Environment(
+                    _portable_environment_spec("local"),
+                    workspace=LocalWorkspace(tmp_path, workspace_id=secret_identity),
+                    binding=AbortAfterIntentBinding(),
+                    vault=StaticVault({"workspace_identity": secret_identity}),
+                ),
+                default=True,
+            )
+            app.register_agent(
+                AgentSpec(name="assistant", model="scripted-model"),
+                tools=[_NoopWorkspaceMutationTool()],
+            )
+            return app, provider
+
+        app, _provider = registered_app()
         with (
             warnings.catch_warnings(record=True) as captured_warnings,
-            pytest.raises(SystemExit) as raised,
+            pytest.raises(SystemExit) as first_raised,
         ):
             await collect_events(
                 app,
@@ -2676,79 +2687,143 @@ def test_dynamic_observation_identity_is_opaque_before_tool_secret_resolution(
                     messages=[Message.text("user", "observe")],
                 ),
             )
-        checkpoint = await store.load_checkpoint("session-dynamic-identity-intent")
+        first_checkpoint = await store.load_checkpoint("session-dynamic-identity-intent")
         durable_before_recovery = await store.query_events(
             EventQuery(session_id="session-dynamic-identity-intent")
         )
         await store.release_run_fence("session-dynamic-identity-intent")
         await store.update_status(
             "session-dynamic-identity-intent",
-            SessionStatus.INTERRUPTED,
+            first_recovery_status,
         )
-        recovery_app = CayuApp(session_store=store, enable_logging=False)
-        recovery_provider = _SingleToolProvider(
-            tool_name="noop_workspace_mutation",
-            arguments={},
+        recovery_app, recovery_provider = registered_app()
+        first_recovery = await recovery_app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id="session-dynamic-identity-intent")
         )
-        recovery_app.register_provider(recovery_provider, default=True)
-        recovery_app.register_environment(
-            Environment(
-                _portable_environment_spec("local"),
-                workspace=LocalWorkspace(tmp_path, workspace_id=secret_identity),
-                binding=AbortAfterIntentBinding(),
-                vault=StaticVault({"workspace_identity": secret_identity}),
-            ),
-            default=True,
-        )
-        recovery_app.register_agent(
-            AgentSpec(name="assistant", model="scripted-model"),
-            tools=[_NoopWorkspaceMutationTool()],
-        )
-        with pytest.raises(
-            RuntimeError,
-            match="cannot safely continue with opaque provider state",
+        first_recovered_checkpoint = await store.load_checkpoint("session-dynamic-identity-intent")
+
+        with (
+            warnings.catch_warnings(record=True) as resumed_warnings,
+            pytest.raises(SystemExit) as second_raised,
         ):
-            await recovery_app.recover_incomplete_session(
-                IncompleteSessionRecoveryRequest(session_id="session-dynamic-identity-intent")
-            )
+            async for _event in recovery_app.resume(
+                ResumeRequest(
+                    session_id="session-dynamic-identity-intent",
+                    messages=[Message.text("user", "observe again")],
+                )
+            ):
+                pass
+        second_checkpoint = await store.load_checkpoint("session-dynamic-identity-intent")
+        await store.release_run_fence("session-dynamic-identity-intent")
+        await store.update_status(
+            "session-dynamic-identity-intent",
+            SessionStatus.INTERRUPTING,
+        )
+        final_recovery_app, final_recovery_provider = registered_app()
+        second_recovery = await final_recovery_app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id="session-dynamic-identity-intent")
+        )
+        final_checkpoint = await store.load_checkpoint("session-dynamic-identity-intent")
+        terminal_evidence_recovery = await final_recovery_app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id="session-dynamic-identity-intent")
+        )
+        repeated_recovery = await final_recovery_app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id="session-dynamic-identity-intent")
+        )
         durable_after_recovery = await store.query_events(
             EventQuery(session_id="session-dynamic-identity-intent")
         )
         return (
-            raised.value,
-            checkpoint,
+            first_raised.value,
+            second_raised.value,
+            first_checkpoint,
+            first_recovered_checkpoint,
+            second_checkpoint,
+            final_checkpoint,
             durable_before_recovery,
             recovery_provider.requests,
+            final_recovery_provider.requests,
+            first_recovery,
+            second_recovery,
+            terminal_evidence_recovery,
+            repeated_recovery,
             durable_after_recovery,
             captured_warnings,
+            resumed_warnings,
         )
 
     (
-        error,
-        checkpoint,
+        first_error,
+        second_error,
+        first_checkpoint,
+        first_recovered_checkpoint,
+        second_checkpoint,
+        final_checkpoint,
         durable_before_recovery,
         recovery_requests,
+        final_recovery_requests,
+        first_recovery,
+        second_recovery,
+        terminal_evidence_recovery,
+        repeated_recovery,
         durable_after_recovery,
         captured_warnings,
+        resumed_warnings,
     ) = asyncio.run(run())
     captured = capsys.readouterr()
-    assert error.code == 23
-    observations = workspace_observations_from_checkpoint(checkpoint)
+    assert first_error.code == second_error.code == 23
+    observations = workspace_observations_from_checkpoint(first_checkpoint)
     assert len(observations) == 1
     (lifecycle,) = observations.values()
     assert lifecycle.workspace_id != secret_identity
     assert lifecycle.workspace_id.startswith("cayu_authority_")
-    assert recovery_requests == 0
+    assert recovery_requests == 1
+    assert final_recovery_requests == 0
+    assert first_recovery.status is first_recovery_status
+    assert first_recovery.actions[-1] is IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED
+    assert second_recovery.status is SessionStatus.INTERRUPTED
+    assert second_recovery.actions[-1] is IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED
+    expected_terminal_evidence_action = (
+        IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE
+        if first_recovery_status is SessionStatus.INTERRUPTED
+        else IncompleteSessionRecoveryAction.SKIPPED_TERMINAL
+    )
+    assert terminal_evidence_recovery.actions == (expected_terminal_evidence_action,)
+    assert repeated_recovery.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
+    assert first_recovered_checkpoint is not None
+    assert second_checkpoint is not None
+    assert final_checkpoint is not None
+    assert "pending_tool_round" not in first_recovered_checkpoint
+    assert "last_model_step_publication" not in first_recovered_checkpoint
+    first_abandoned = first_recovered_checkpoint["abandoned_unreplayable_tool_round"]
+    assert "pending_tool_round" in second_checkpoint
+    assert "last_model_step_publication" in second_checkpoint
+    assert second_checkpoint["abandoned_unreplayable_tool_round"] == first_abandoned
+    second_round = second_checkpoint["pending_tool_round"]
+    assert second_round["tool_round_id"] != first_abandoned["tool_round"]["tool_round_id"]
+    assert "pending_tool_round" not in final_checkpoint
+    assert "last_model_step_publication" not in final_checkpoint
+    final_abandoned = final_checkpoint["abandoned_unreplayable_tool_round"]
+    assert final_abandoned["tool_round"]["tool_round_id"] == second_round["tool_round_id"]
+    assert final_abandoned["tool_round"]["assistant_publication"]["state"] == "blocked"
+    assert final_abandoned["prior_tool_rounds"] == [first_abandoned["tool_round"]]
     assert any(
         record.event.type is EventType.WORKSPACE_OBSERVATION_FINALIZED
         for record in durable_after_recovery
     )
+    assert any(
+        record.event.type is EventType.SESSION_INTERRUPTED for record in durable_after_recovery
+    )
     combined = repr(
         (
-            checkpoint,
+            first_checkpoint,
+            first_recovered_checkpoint,
+            second_checkpoint,
+            final_checkpoint,
             [record.event.model_dump(mode="json") for record in durable_before_recovery],
             [record.event.model_dump(mode="json") for record in durable_after_recovery],
             captured_warnings,
+            resumed_warnings,
             caplog.records,
             captured.out,
             captured.err,
@@ -7713,19 +7788,9 @@ def test_fresh_process_factory_observation_recovery_closes_without_reconnect(
             AgentSpec(name="assistant", model="scripted-model"),
             tools=[ExecCommandTool()],
         )
-        if crash_phase == "intent":
-            with pytest.raises(
-                RuntimeError,
-                match="cannot safely continue with opaque provider state",
-            ):
-                await recovery_app.recover_incomplete_session(
-                    IncompleteSessionRecoveryRequest(session_id=session_id)
-                )
-            recovery = None
-        else:
-            recovery = await recovery_app.recover_incomplete_session(
-                IncompleteSessionRecoveryRequest(session_id=session_id)
-            )
+        recovery = await recovery_app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id=session_id)
+        )
         durable = await store.query_events(EventQuery(session_id=session_id))
         checkpoint_after = await store.load_checkpoint(session_id)
         return (
@@ -7752,8 +7817,7 @@ def test_fresh_process_factory_observation_recovery_closes_without_reconnect(
     assert recovery_factory.create_calls == 0
     assert first_provider.requests == 1
     assert recovery_provider.requests == 0
-    if recovery is not None:
-        assert IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_OBSERVATION in recovery.actions
+    assert IncompleteSessionRecoveryAction.REPAIRED_WORKSPACE_OBSERVATION in recovery.actions
     finalized = [
         event for event in durable_events if event.type is EventType.WORKSPACE_OBSERVATION_FINALIZED
     ]
@@ -7762,6 +7826,11 @@ def test_fresh_process_factory_observation_recovery_closes_without_reconnect(
     assert finalized[0].payload["detail_code"] == detail_code
     assert checkpoint is not None
     assert "workspace_observations" not in checkpoint
+    if crash_phase == "intent":
+        assert recovery.actions[-1] is IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED
+        assert "pending_tool_round" not in checkpoint
+        assert "last_model_step_publication" not in checkpoint
+        assert "abandoned_unreplayable_tool_round" in checkpoint
 
 
 @pytest.mark.parametrize(
