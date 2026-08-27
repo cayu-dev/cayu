@@ -63,9 +63,11 @@ from cayu.providers._sse import aiter_sse_json_events
 from cayu.providers.base import (
     CALL_TOOL_CORE_CALLABLE_OPTION,
     OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
+    OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
     TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION,
     TARGETED_TOOL_PROJECTION_MARKER_TYPE,
     TargetedToolProjectionRequest,
+    ToolDiscoveryProjectionRequest,
 )
 from cayu.providers.openai import openai_stream_events
 from cayu.runtime.execution_profiles import execution_profile_from_session_metadata
@@ -1054,6 +1056,479 @@ def test_build_openai_payload_translates_cayu_messages() -> None:
         "include": ["reasoning.encrypted_content"],
         "temperature": 0.2,
     }
+
+
+def test_build_openai_payload_projects_client_tool_search_and_replays_loaded_tools() -> None:
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"fact": {"type": "string"}},
+        "required": ["fact"],
+    }
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message.text("user", "Find a memory tool."),
+            Message(
+                role=MessageRole.ASSISTANT,
+                content=[
+                    ToolCallPart(
+                        tool_call_id="search_call_1",
+                        tool_name="search_tools",
+                        arguments={"query": "durable memory", "limit": 1},
+                    ),
+                    ProviderStatePart(
+                        provider="openai",
+                        state={
+                            "type": "tool_search_call",
+                            "id": "ts_search_1",
+                            "call_id": "search_call_1",
+                            "execution": "client",
+                            "arguments": {"query": "durable memory", "limit": 1},
+                            "status": "completed",
+                        },
+                    ),
+                ],
+            ),
+            Message.tool_result(
+                tool_call_id="search_call_1",
+                tool_name="search_tools",
+                content="private discovery payload",
+                structured={
+                    "schema_version": 1,
+                    "query": "durable memory",
+                    "matches": [
+                        {
+                            "tool_ref": f"cayu_tool_v1_{'a' * 64}",
+                            "tool_id": "tool:remember_knowledge",
+                            "name": "remember_knowledge",
+                            "description": "Save durable knowledge.",
+                            "input_schema": schema,
+                            "descriptor_version": f"sha256:{'b' * 64}",
+                            "schema_fingerprint": f"sha256:{'c' * 64}",
+                            "readiness": "registered",
+                        }
+                    ],
+                    "view_revision": 1,
+                    "truncated": False,
+                },
+            ),
+        ],
+        tools=[search_tools_spec(), call_tool_spec()],
+        tool_discovery_projection=ToolDiscoveryProjectionRequest(
+            loaded_tools=(
+                {
+                    "name": "remember_knowledge",
+                    "description": "Save durable knowledge.",
+                    "input_schema": schema,
+                },
+            )
+        ),
+    )
+
+    payload = build_openai_payload(request)
+
+    assert payload["tools"] == [
+        {
+            "type": "tool_search",
+            "execution": "client",
+            "description": (
+                "Search the current session's registered tool catalogue. Matching registered "
+                "functions are loaded for direct use through the client Tool Search protocol. "
+                "Already visible tools are omitted."
+            ),
+            "parameters": search_tools_spec()["input_schema"],
+        }
+    ]
+    assert payload["input"][1] == {
+        "type": "tool_search_call",
+        "id": "ts_search_1",
+        "call_id": "search_call_1",
+        "execution": "client",
+        "arguments": {"query": "durable memory", "limit": 1},
+        "status": "completed",
+    }
+    assert payload["input"][2] == {
+        "type": "tool_search_output",
+        "call_id": "search_call_1",
+        "execution": "client",
+        "tools": [
+            {
+                "type": "function",
+                "name": "remember_knowledge",
+                "description": "Save durable knowledge.",
+                "parameters": schema,
+                "strict": False,
+            }
+        ],
+        "status": "completed",
+    }
+
+    fork_payload = build_openai_payload(
+        request.model_copy(update={"tool_discovery_projection": ToolDiscoveryProjectionRequest()})
+    )
+    assert fork_payload["input"][2] == {
+        "type": "tool_search_output",
+        "call_id": "search_call_1",
+        "execution": "client",
+        "tools": [],
+        "status": "completed",
+    }
+    neutral_payload = build_openai_payload(request, chain=False, reasoning_state="server")
+    assert neutral_payload["input"][1]["id"] == "ts_search_1"
+
+
+def test_build_openai_payload_rejects_altered_tool_search_replay() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"fact": {"type": "string"}},
+        "required": ["fact"],
+        "additionalProperties": False,
+    }
+    call = Message(
+        role=MessageRole.ASSISTANT,
+        content=(
+            ToolCallPart(
+                tool_call_id="search_call_1",
+                tool_name="search_tools",
+                arguments={"query": "memory", "limit": 1},
+            ),
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": "tool_search_call",
+                    "id": "ts_search_1",
+                    "call_id": "search_call_1",
+                    "execution": "client",
+                    "arguments": {"query": "memory", "limit": 1},
+                    "status": "completed",
+                },
+            ),
+        ),
+    )
+    structured = {
+        "schema_version": 1,
+        "query": "memory",
+        "matches": [
+            {
+                "tool_ref": f"cayu_tool_v1_{'a' * 64}",
+                "tool_id": "tool:remember_knowledge",
+                "name": "remember_knowledge",
+                "description": "Save durable knowledge.",
+                "input_schema": schema,
+                "descriptor_version": f"sha256:{'b' * 64}",
+                "schema_fingerprint": f"sha256:{'c' * 64}",
+                "readiness": "registered",
+            }
+        ],
+        "view_revision": 1,
+        "truncated": False,
+    }
+
+    def request(result: Message, *, assistant: Message = call) -> ModelRequest:
+        return ModelRequest(
+            model="gpt-test",
+            messages=[Message.text("user", "find memory"), assistant, result],
+            tools=[search_tools_spec(), call_tool_spec()],
+            tool_discovery_projection=ToolDiscoveryProjectionRequest(
+                loaded_tools=(
+                    {
+                        "name": "remember_knowledge",
+                        "description": "Save durable knowledge.",
+                        "input_schema": schema,
+                    },
+                )
+            ),
+        )
+
+    mismatched_result = Message.tool_result(
+        tool_call_id="different_call",
+        tool_name="search_tools",
+        content="one match",
+        structured=structured,
+    )
+    with pytest.raises(OpenAIProtocolError, match="no matching pending search call"):
+        build_openai_payload(request(mismatched_result))
+
+    altered_structured = json.loads(json.dumps(structured))
+    altered_structured["matches"][0]["description"] = "Altered definition."
+    altered_result = Message.tool_result(
+        tool_call_id="search_call_1",
+        tool_name="search_tools",
+        content="one match",
+        structured=altered_structured,
+    )
+    with pytest.raises(OpenAIProtocolError, match="trusted loaded definition"):
+        build_openai_payload(request(altered_result))
+
+    altered_call = Message(
+        role=MessageRole.ASSISTANT,
+        content=(
+            ToolCallPart(
+                tool_call_id="search_call_1",
+                tool_name="search_tools",
+                arguments={},
+            ),
+            call.content[1],
+        ),
+    )
+    valid_result = Message.tool_result(
+        tool_call_id="search_call_1",
+        tool_name="search_tools",
+        content="one match",
+        structured=structured,
+    )
+    payload = build_openai_payload(
+        request(valid_result, assistant=altered_call),
+        chain=False,
+        reasoning_state="server",
+    )
+    assert payload["input"][1]["arguments"] == {"query": "memory", "limit": 1}
+
+
+def test_openai_response_events_normalizes_client_tool_search_call() -> None:
+    events = openai_response_events(
+        {
+            "id": "resp_tool_search",
+            "model": "gpt-test",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "tool_search_call",
+                    "id": "ts_1",
+                    "call_id": "call_1",
+                    "execution": "client",
+                    "arguments": {"query": "durable memory", "limit": 2},
+                    "status": "completed",
+                }
+            ],
+        }
+    )
+
+    assert events[0] == ModelStreamEvent.tool_call(
+        id="call_1",
+        name="search_tools",
+        arguments={"query": "durable memory", "limit": 2},
+    )
+    assert events[-1].completion is not None
+    assert events[-1].completion.finish_reason is ModelFinishReason.TOOL_CALLS
+    assert events[-1].payload["provider_state"] == [
+        {
+            "provider": "openai",
+            "state": {
+                "type": "tool_search_call",
+                "id": "ts_1",
+                "call_id": "call_1",
+                "execution": "client",
+                "arguments": {"query": "durable memory", "limit": 2},
+                "status": "completed",
+            },
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_openai_stream_events_normalizes_client_tool_search_lifecycle_once() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "tool_search_call",
+                "id": "ts_stream_1",
+                "call_id": "call_stream_1",
+                "execution": "client",
+                "arguments": {},
+                "status": "in_progress",
+            },
+        }
+        completed_item = {
+            "type": "tool_search_call",
+            "id": "ts_stream_1",
+            "call_id": "call_stream_1",
+            "execution": "client",
+            "arguments": {"query": "durable memory"},
+            "status": "completed",
+        }
+        yield {
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": completed_item,
+        }
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_stream_tool_search",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [completed_item],
+            },
+        }
+
+    events = [event async for event in openai_stream_events(raw_events())]
+
+    tool_calls = [event for event in events if event.type is ModelStreamEventType.TOOL_CALL]
+    assert tool_calls == [
+        ModelStreamEvent.tool_call(
+            id="call_stream_1",
+            name="search_tools",
+            arguments={"query": "durable memory"},
+        )
+    ]
+    assert events[-1].type is ModelStreamEventType.COMPLETED
+    assert events[-1].completion is not None
+    assert events[-1].completion.finish_reason is ModelFinishReason.TOOL_CALLS
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("case", ["duplicate", "mismatch", "unfinished"])
+async def test_openai_stream_events_rejects_invalid_tool_search_lifecycle(case: str) -> None:
+    added = {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+            "type": "tool_search_call",
+            "id": "ts_stream_bad",
+            "call_id": "call_stream_bad",
+            "execution": "client",
+            "arguments": {},
+            "status": "in_progress",
+        },
+    }
+
+    async def raw_events():
+        yield added
+        if case == "duplicate":
+            yield added
+            return
+        if case == "mismatch":
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "tool_search_call",
+                    "id": "ts_stream_bad",
+                    "call_id": "different_call",
+                    "execution": "client",
+                    "arguments": {"query": "memory"},
+                    "status": "completed",
+                },
+            }
+            return
+        yield {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_stream_bad",
+                "model": "gpt-test",
+                "status": "completed",
+                "output": [],
+            },
+        }
+
+    message = {
+        "duplicate": "was repeated",
+        "mismatch": "identity mismatch",
+        "unfinished": "unfinished tool search calls",
+    }[case]
+    with pytest.raises(OpenAIProtocolError, match=message):
+        _ = [event async for event in openai_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
+async def test_openai_incomplete_stream_drops_an_unfinished_tool_search_call() -> None:
+    async def raw_events():
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "type": "tool_search_call",
+                "id": "ts_stream_incomplete",
+                "call_id": "call_stream_incomplete",
+                "execution": "client",
+                "arguments": {},
+                "status": "in_progress",
+            },
+        }
+        yield {
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_stream_incomplete",
+                "model": "gpt-test",
+                "status": "incomplete",
+                "output": [],
+                "incomplete_details": {"reason": "max_output_tokens"},
+            },
+        }
+
+    events = [event async for event in openai_stream_events(raw_events())]
+
+    assert all(event.type is not ModelStreamEventType.TOOL_CALL for event in events)
+    assert events[-1].type is ModelStreamEventType.COMPLETED
+    assert events[-1].completion is not None
+    assert events[-1].completion.finish_reason is ModelFinishReason.LENGTH
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("execution", "server", "must use client execution"),
+        ("status", "incomplete", "must be completed"),
+        ("arguments", {"query": ""}, "requires a bounded query"),
+        ("arguments", {"query": "memory", "unknown": True}, "unsupported arguments"),
+    ],
+)
+def test_openai_response_events_rejects_malformed_client_tool_search_calls(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    item = {
+        "type": "tool_search_call",
+        "id": "ts_bad",
+        "call_id": "call_bad",
+        "execution": "client",
+        "arguments": {"query": "memory"},
+        "status": "completed",
+    }
+    item[field] = value
+
+    with pytest.raises(OpenAIProtocolError, match=message):
+        openai_response_events({"status": "completed", "output": [item]})
+
+
+def test_openai_provider_requires_explicit_client_tool_search_model_support() -> None:
+    provider = OpenAIProvider(
+        api_key="test-key",
+        client_tool_search_models=("gpt-verified",),
+    )
+
+    assert provider.supports_tool_discovery_projection(
+        model="gpt-verified",
+        protocol=OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
+    )
+    assert not provider.supports_tool_discovery_projection(
+        model="gpt-unverified",
+        protocol=OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
+    )
+    with pytest.raises(ValueError, match="client Tool Search support is not established"):
+        provider.preflight_tool_discovery_projection(
+            model="gpt-unverified",
+            protocol=OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
+        )
+    compatible_endpoint = OpenAIProvider(
+        api_key="test-key",
+        base_url="https://compatible.example.test",
+        client_tool_search_models=("gpt-verified",),
+    )
+    assert not compatible_endpoint.supports_tool_discovery_projection(
+        model="gpt-verified",
+        protocol=OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
+    )
+    with pytest.raises(ValueError, match="official OpenAI Responses endpoint"):
+        compatible_endpoint.preflight_tool_discovery_projection(
+            model="gpt-verified",
+            protocol=OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
+        )
 
 
 def test_build_openai_payload_passes_provider_cache_options() -> None:
@@ -5317,6 +5792,80 @@ def _native_cache_anchor_fields() -> dict[str, object]:
     }
 
 
+def test_openai_native_targeting_allows_the_native_search_surface_not_portable_alias() -> None:
+    marker, targeted_projection = _targeted_projection_fixture()
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "find and remember"), marker],
+        tools=[search_tools_spec(), call_tool_spec()],
+        targeted_tool_projection=targeted_projection,
+        tool_discovery_projection=ToolDiscoveryProjectionRequest(
+            loaded_tools=(
+                {
+                    "name": "search_knowledge",
+                    "description": "Search knowledge.",
+                    "input_schema": {"type": "object"},
+                },
+            )
+        ),
+        options={TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION: CALL_TOOL_NAME},
+    )
+
+    payload = build_openai_payload(request)
+
+    assert payload["tool_choice"] == {
+        "type": "allowed_tools",
+        "mode": "auto",
+        "tools": [
+            {"type": "tool_search"},
+            {"type": "function", "name": "remember"},
+            {"type": "function", "name": "search_knowledge"},
+        ],
+    }
+    assert all(
+        selector.get("name") != "search_tools" for selector in payload["tool_choice"]["tools"]
+    )
+
+    search_only_payload = build_openai_payload(
+        request.model_copy(
+            update={
+                "options": {
+                    TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION: CALL_TOOL_NAME,
+                    "openai": {
+                        "tool_choice": {
+                            "type": "allowed_tools",
+                            "mode": "required",
+                            "tools": [{"type": "tool_search"}],
+                        }
+                    },
+                }
+            }
+        )
+    )
+    assert search_only_payload["tool_choice"] == {
+        "type": "allowed_tools",
+        "mode": "required",
+        "tools": [{"type": "tool_search"}],
+    }
+
+    inactive_targeted_payload = build_openai_payload(
+        request.model_copy(
+            update={
+                "messages": [Message.text("user", "keep searching")],
+                "targeted_tool_projection": None,
+            }
+        )
+    )
+    assert [tool.get("name") for tool in inactive_targeted_payload["tools"]] == [
+        None,
+        "call_tool",
+    ]
+    assert inactive_targeted_payload["tool_choice"]["tools"] == [
+        {"type": "tool_search"},
+        {"type": "function", "name": "search_knowledge"},
+    ]
+
+
 def test_openai_payload_renders_targeted_tools_at_the_exact_marker_position() -> None:
     marker, projection = _targeted_projection_fixture()
     request = ModelRequest(
@@ -5613,6 +6162,109 @@ def test_openai_server_chain_preserves_targeted_item_ownership_and_recovery_posi
     assert additional_tools_indices == [1]
 
 
+def test_openai_server_chain_rebuilds_when_current_branch_lacks_retained_discovery_tools() -> None:
+    response_ref = Message(
+        role=MessageRole.ASSISTANT,
+        content=(
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": "response_ref",
+                    "id": "resp_with_parent_discovery_tools",
+                    "targeted_tool_marker_id": None,
+                    "tool_discovery_loaded_tool_names": ["remember_knowledge"],
+                },
+            ),
+        ),
+    )
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message.text("user", "parent turn"),
+            response_ref,
+            Message.text("user", "child turn"),
+        ],
+        tools=[search_tools_spec(), call_tool_spec()],
+        tool_discovery_projection=ToolDiscoveryProjectionRequest(),
+    )
+
+    payload = build_openai_payload(request, reasoning_state="server")
+
+    assert "previous_response_id" not in payload
+    assert [item["role"] for item in payload["input"]] == ["user", "user"]
+
+
+def test_openai_server_chain_rebuilds_when_discovery_is_no_longer_projected() -> None:
+    response_ref = Message(
+        role=MessageRole.ASSISTANT,
+        content=(
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": "response_ref",
+                    "id": "resp_with_inactive_discovery_tools",
+                    "targeted_tool_marker_id": None,
+                    "tool_discovery_loaded_tool_names": ["remember_knowledge"],
+                },
+            ),
+        ),
+    )
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message.text("user", "discovery-enabled turn"),
+            response_ref,
+            Message.text("user", "discovery-disabled turn"),
+        ],
+    )
+
+    payload = build_openai_payload(request, reasoning_state="server")
+
+    assert "previous_response_id" not in payload
+    assert [item["role"] for item in payload["input"]] == ["user", "user"]
+
+
+def test_openai_server_chain_keeps_a_safe_subset_of_current_discovery_authority() -> None:
+    response_ref = Message(
+        role=MessageRole.ASSISTANT,
+        content=(
+            ProviderStatePart(
+                provider="openai",
+                state={
+                    "type": "response_ref",
+                    "id": "resp_with_existing_discovery_tools",
+                    "targeted_tool_marker_id": None,
+                    "tool_discovery_loaded_tool_names": ["remember_knowledge"],
+                },
+            ),
+        ),
+    )
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[response_ref, Message.text("user", "continue")],
+        tools=[search_tools_spec(), call_tool_spec()],
+        tool_discovery_projection=ToolDiscoveryProjectionRequest(
+            loaded_tools=(
+                {
+                    "name": "remember_knowledge",
+                    "description": "Remember knowledge.",
+                    "input_schema": {"type": "object"},
+                },
+                {
+                    "name": "search_knowledge",
+                    "description": "Search knowledge.",
+                    "input_schema": {"type": "object"},
+                },
+            )
+        ),
+    )
+
+    payload = build_openai_payload(request, reasoning_state="server")
+
+    assert payload["previous_response_id"] == "resp_with_existing_discovery_tools"
+    assert len(payload["input"]) == 1
+
+
 def test_openai_server_chain_drops_inactive_targeted_provider_authority() -> None:
     marker, _projection = _targeted_projection_fixture()
     response_ref = Message(
@@ -5724,10 +6376,10 @@ def test_openai_server_chain_resumes_after_an_explicit_targeted_clear() -> None:
 
 @pytest.mark.parametrize(
     "owned_marker_id",
-    [f"sha256:{'b' * 64}", "not-a-marker"],
+    [None, f"sha256:{'b' * 64}", "not-a-marker"],
 )
 def test_openai_server_chain_rebuilds_for_conflicting_or_malformed_explicit_ownership(
-    owned_marker_id: str,
+    owned_marker_id: str | None,
 ) -> None:
     marker, projection = _targeted_projection_fixture()
     response_ref = Message(

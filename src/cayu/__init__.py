@@ -904,6 +904,7 @@ from cayu.providers import (
     ProviderOperationState,
     ProviderOperationStatus,
     TargetedToolProjectionRequest,
+    ToolDiscoveryProjectionRequest,
     UsageDialect,
     VertexProvider,
 )
@@ -3711,6 +3712,7 @@ __all__ = [
     "ToolDiscoveryGrantInspection",
     "ToolDiscoveryGrantRecord",
     "ToolDiscoveryMode",
+    "ToolDiscoveryProjectionRequest",
     "ToolDiscoverySearchMatch",
     "ToolDiscoverySearchResult",
     "ToolDiscoveryViewFootprint",

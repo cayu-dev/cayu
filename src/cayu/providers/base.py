@@ -87,6 +87,7 @@ _DEFAULT_FINGERPRINT_RUNTIME_OPTION_KEYS = frozenset(
 )
 
 OPENAI_ADDITIONAL_TOOLS_PROTOCOL = "openai.additional_tools.v1"
+OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL = "openai.tool_search.client.v1"
 TARGETED_TOOL_PROJECTION_MARKER_TYPE = "cayu.targeted-tool-projection-marker"
 TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION = "targeted_tool_native_cache_anchor"
 CALL_TOOL_CORE_CALLABLE_OPTION = "call_tool_core_callable"
@@ -594,6 +595,54 @@ class TargetedToolProjectionRequest(BaseModel):
         return self
 
 
+class ToolDiscoveryProjectionRequest(BaseModel):
+    """Provider-native projection of Cayu's durable discovery protocol."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    protocol: Literal["openai.tool_search.client.v1"] = OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL
+    loaded_tools: tuple[dict[str, Any], ...] = Field(default=(), max_length=256)
+
+    @field_validator("loaded_tools", mode="before")
+    @classmethod
+    def copy_loaded_tools(cls, value: object) -> tuple[dict[str, Any], ...]:
+        if not isinstance(value, (list, tuple)):
+            raise TypeError("Loaded discovery tools must be a sequence.")
+        copied = copy_durable_json_value(list(value), "loaded discovery tools")
+        if type(copied) is not list or any(type(tool) is not dict for tool in copied):
+            raise TypeError("Loaded discovery tools must contain objects.")
+        return tuple(copied)
+
+    @model_validator(mode="after")
+    def validate_loaded_tools(self) -> ToolDiscoveryProjectionRequest:
+        names: list[str] = []
+        for tool in self.loaded_tools:
+            if set(tool) != {"name", "description", "input_schema"}:
+                raise ValueError("Loaded discovery tools must use the canonical tool shape.")
+            name = tool.get("name")
+            description = tool.get("description")
+            input_schema = tool.get("input_schema")
+            if type(name) is not str or type(description) is not str:
+                raise ValueError("Loaded discovery tool text fields must be strings.")
+            names.append(require_clean_nonblank(name, "loaded discovery tool name"))
+            if type(input_schema) is not dict:
+                raise ValueError("Loaded discovery tool input_schema must be an object.")
+        if names != sorted(names) or len(names) != len(set(names)):
+            raise ValueError("Loaded discovery tools must have unique canonical names.")
+        return self
+
+    @property
+    def loaded_tool_names(self) -> tuple[str, ...]:
+        """Return the canonical names without duplicating projection authority."""
+
+        return tuple(cast("str", tool["name"]) for tool in self.loaded_tools)
+
+
 class ModelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
@@ -602,6 +651,7 @@ class ModelRequest(BaseModel):
     tools: list[dict[str, Any]] = Field(default_factory=list)
     hosted_tools: tuple[OpenAIWebSearch, ...] = ()
     targeted_tool_projection: TargetedToolProjectionRequest | None = None
+    tool_discovery_projection: ToolDiscoveryProjectionRequest | None = None
     options: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("targeted_tool_projection", mode="before")
@@ -615,6 +665,18 @@ class ModelRequest(BaseModel):
         if isinstance(value, TargetedToolProjectionRequest):
             value = value.model_dump(mode="python")
         return TargetedToolProjectionRequest.model_validate(value)
+
+    @field_validator("tool_discovery_projection", mode="before")
+    @classmethod
+    def copy_tool_discovery_projection(
+        cls,
+        value: object,
+    ) -> ToolDiscoveryProjectionRequest | None:
+        if value is None:
+            return None
+        if isinstance(value, ToolDiscoveryProjectionRequest):
+            value = value.model_dump(mode="python")
+        return ToolDiscoveryProjectionRequest.model_validate(value)
 
     @field_validator("messages")
     @classmethod
@@ -1202,6 +1264,22 @@ class ModelProvider(ABC):
         if not self.supports_targeted_tool_projection(model=model, protocol=protocol):
             raise ValueError(
                 f"Targeted-tool projection {protocol!r} is not established for "
+                f"provider {self.name!r} and model {model!r}."
+            )
+
+    def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
+        """Report an explicitly established provider/model discovery capability."""
+
+        require_clean_nonblank(model, "model")
+        require_clean_nonblank(protocol, "protocol")
+        return False
+
+    def preflight_tool_discovery_projection(self, *, model: str, protocol: str) -> None:
+        """Reject discovery authority that this provider cannot project."""
+
+        if not self.supports_tool_discovery_projection(model=model, protocol=protocol):
+            raise ValueError(
+                f"Tool-discovery projection {protocol!r} is not established for "
                 f"provider {self.name!r} and model {model!r}."
             )
 

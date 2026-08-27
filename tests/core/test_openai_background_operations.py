@@ -27,6 +27,7 @@ from cayu.providers import (
     ProviderOperationState,
     ProviderOperationStatus,
     TargetedToolProjectionRequest,
+    ToolDiscoveryProjectionRequest,
 )
 from cayu.providers.base import (
     OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
@@ -44,6 +45,7 @@ from cayu.runtime.provider_operations import (
     inspect_provider_operation,
 )
 from cayu.runtime.tool_catalogue import CALL_TOOL_NAME
+from cayu.runtime.tool_discovery import search_tools_spec
 from cayu.runtime.tool_gateway import call_tool_spec
 
 
@@ -92,6 +94,15 @@ def _targeted_request() -> tuple[ModelRequest, str]:
             options={TARGETED_TOOL_NATIVE_CACHE_ANCHOR_OPTION: CALL_TOOL_NAME},
         ),
         marker_id,
+    )
+
+
+def _native_discovery_request() -> ModelRequest:
+    return ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "find a memory tool")],
+        tools=[search_tools_spec(), call_tool_spec()],
+        tool_discovery_projection=ToolDiscoveryProjectionRequest(),
     )
 
 
@@ -1071,6 +1082,105 @@ async def test_openai_background_checkpoints_parser_state_between_tool_events() 
     }
     assert [event.recovery_metadata.cursor for event in recovered] == [3, 4]  # type: ignore[union-attr]
     assert "parser" not in recovered[0].recovery_metadata.opaque  # type: ignore[union-attr]
+
+
+@pytest.mark.anyio
+async def test_openai_background_reconnect_does_not_repeat_completed_tool_search_call() -> None:
+    transport = BackgroundTransport()
+    completed_tool_search = {
+        "type": "tool_search_call",
+        "id": "ts_1",
+        "call_id": "call_1",
+        "execution": "client",
+        "arguments": {"query": "durable memory", "limit": 1},
+        "status": "completed",
+    }
+    transport.start_batches.append(
+        [
+            _created(),
+            {
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": {
+                    "type": "tool_search_call",
+                    "id": "ts_1",
+                    "call_id": "call_1",
+                    "execution": "client",
+                    "arguments": {},
+                    "status": "in_progress",
+                },
+            },
+            {
+                "type": "response.output_item.done",
+                "sequence_number": 2,
+                "output_index": 0,
+                "item": completed_tool_search,
+            },
+        ]
+    )
+    provider = OpenAIProvider(
+        api_key="test-key",
+        background=True,
+        reasoning_state="server",
+        client_tool_search_models=("gpt-test",),
+        transport=transport,
+    )
+    adapter = provider.provider_operations
+    assert adapter is not None
+    started = await adapter.start(
+        ProviderOperationStartRequest(
+            request=_native_discovery_request(),
+            idempotency_key="native-discovery-start",
+        )
+    )
+
+    started_events = [event async for event in started.events]
+
+    assert [event.type for event in started_events] == [
+        ModelStreamEventType.THINKING,
+        ModelStreamEventType.TOOL_CALL,
+    ]
+    checkpoint = started_events[-1].recovery_metadata
+    assert checkpoint is not None
+    assert checkpoint.opaque["tool_discovery_loaded_tool_names"] == []
+    parser = checkpoint.opaque["parser"]
+    assert isinstance(parser, dict)
+    assert parser["pending_tool_search_calls"] == []
+    assert parser["completed_tool_search_items"] == [
+        {"output_index": 0, "item": completed_tool_search}
+    ]
+    recovered_state = ProviderOperationState(
+        operation_id=started.state.operation_id,
+        stream_protocol=started.state.stream_protocol,
+        recovery_metadata=checkpoint,
+    )
+    transport.reconnect_batches.append(
+        [
+            {
+                "type": "response.completed",
+                "sequence_number": 3,
+                "response": {
+                    "id": "resp_background_123",
+                    "model": "gpt-test",
+                    "status": "completed",
+                    "output": [completed_tool_search],
+                    "usage": {"input_tokens": 4, "output_tokens": 2},
+                },
+            }
+        ]
+    )
+
+    reconnected = await adapter.reconnect(recovered_state)
+    recovered_events = [event async for event in reconnected.events]
+
+    assert [event.type for event in recovered_events] == [ModelStreamEventType.COMPLETED]
+    response_ref = next(
+        item["state"]
+        for item in recovered_events[0].payload["provider_state"]
+        if item["state"].get("type") == "response_ref"
+    )
+    assert response_ref["tool_discovery_loaded_tool_names"] == []
 
 
 @pytest.mark.anyio

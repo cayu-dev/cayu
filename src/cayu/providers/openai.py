@@ -72,6 +72,7 @@ from cayu.providers._http import (
 )
 from cayu.providers.base import (
     OPENAI_ADDITIONAL_TOOLS_PROTOCOL,
+    OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL,
     TARGETED_TOOL_PROJECTION_MARKER_TYPE,
     InputTokenCountConfidence,
     InputTokenCountMethod,
@@ -87,6 +88,7 @@ from cayu.providers.base import (
     ModelStreamEventType,
     NativeStructuredOutputSchemaInvalid,
     TargetedToolProjectionRequest,
+    ToolDiscoveryProjectionRequest,
     UsageDialect,
     _preflight_provider_portable_messages,
     call_tool_core_callable,
@@ -115,6 +117,16 @@ DEFAULT_OPENAI_BASE_URL = "https://api.openai.com"
 DEFAULT_OPENAI_TIMEOUT_SECONDS = 60.0
 DEFAULT_OPENAI_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
 OPENAI_CONTEXT_PRESSURE_TOOL_SCHEMA_CHARS_PER_TOKEN = 6
+_CAYU_SEARCH_TOOLS_NAME = "search_tools"
+_CAYU_CALL_TOOL_NAME = "call_tool"
+_OPENAI_CLIENT_TOOL_SEARCH_MAX_ITEMS = 256
+_OPENAI_CLIENT_TOOL_SEARCH_MAX_QUERY_CHARS = 256
+_OPENAI_CLIENT_TOOL_SEARCH_MAX_RESULTS = 8
+_OPENAI_CLIENT_TOOL_SEARCH_DESCRIPTION = (
+    "Search the current session's registered tool catalogue. Matching registered "
+    "functions are loaded for direct use through the client Tool Search protocol. "
+    "Already visible tools are omitted."
+)
 
 _RESERVED_OPENAI_OPTIONS = {
     "background",
@@ -164,8 +176,45 @@ _OPENAI_POINTER_INDEX_RE = re.compile(r"0|[1-9][0-9]*")
 # any schema OpenAI native mode accepts; NOT a model of OpenAI's (drifting)
 # nesting limit.
 _OPENAI_SCHEMA_PREFLIGHT_MAX_DEPTH = 128
-_OPENAI_ADDITIONAL_TOOLS_MAX_MODELS = 256
-_OPENAI_ADDITIONAL_TOOLS_MODEL_MAX_BYTES = 1024
+_OPENAI_NATIVE_CAPABILITY_MAX_MODELS = 256
+_OPENAI_NATIVE_CAPABILITY_MODEL_MAX_BYTES = 1024
+
+
+def _copy_exact_model_allowlist(
+    value: Iterable[str] | None,
+    *,
+    field_name: str,
+) -> frozenset[str]:
+    if isinstance(value, (str, bytes, bytearray, Mapping)):
+        raise TypeError(f"{field_name} must be an iterable of model names.")
+    try:
+        iterator = iter(() if value is None else value)
+    except TypeError as exc:
+        raise TypeError(f"{field_name} must be an iterable of model names.") from exc
+    models: list[str] = []
+    for index, configured_model in enumerate(iterator):
+        if index >= _OPENAI_NATIVE_CAPABILITY_MAX_MODELS:
+            raise ValueError(
+                f"{field_name} cannot contain more than "
+                f"{_OPENAI_NATIVE_CAPABILITY_MAX_MODELS} names."
+            )
+        if type(configured_model) is not str:
+            raise TypeError(f"{field_name} must contain strings.")
+        model = require_durable_clean_nonblank(
+            configured_model,
+            f"{field_name} item",
+        )
+        if len(model.encode("utf-8")) > _OPENAI_NATIVE_CAPABILITY_MODEL_MAX_BYTES:
+            raise ValueError(
+                f"{field_name} items cannot exceed "
+                f"{_OPENAI_NATIVE_CAPABILITY_MODEL_MAX_BYTES} UTF-8 bytes."
+            )
+        models.append(model)
+    if len(models) != len(set(models)):
+        raise ValueError(f"{field_name} must contain unique model names.")
+    return frozenset(models)
+
+
 # OpenAI rejects every $ref sibling key except these containers.
 _OPENAI_REF_SIBLING_ALLOWLIST = frozenset({"$ref", "$defs", "definitions"})
 _VALID_REASONING_STATES = {"inline", "server"}
@@ -468,7 +517,7 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
     ) -> ProviderOperationConnection:
         if type(request) is not ProviderOperationStartRequest:
             raise TypeError("request must be a ProviderOperationStartRequest.")
-        self._provider._preflight_targeted_tool_request(request.request)
+        self._provider._preflight_dynamic_tool_request(request.request)
         payload = build_openai_payload(
             request.request,
             stream=True,
@@ -495,6 +544,11 @@ class _OpenAIBackgroundOperationAdapter(ProviderOperationAdapter):
                     None
                     if request.request.targeted_tool_projection is None
                     else request.request.targeted_tool_projection.marker_id
+                ),
+                discovery_loaded_tool_names=(
+                    None
+                    if request.request.tool_discovery_projection is None
+                    else request.request.tool_discovery_projection.loaded_tool_names
                 ),
             )
         except asyncio.CancelledError as exc:
@@ -748,6 +802,31 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             protocol == OPENAI_ADDITIONAL_TOOLS_PROTOCOL and model in self.additional_tools_models
         )
 
+    def supports_tool_discovery_projection(self, *, model: str, protocol: str) -> bool:
+        require_clean_nonblank(model, "model")
+        require_clean_nonblank(protocol, "protocol")
+        return (
+            protocol == OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL
+            and self.base_url == _validate_base_url(DEFAULT_OPENAI_BASE_URL)
+            and model in self.client_tool_search_models
+        )
+
+    def preflight_tool_discovery_projection(self, *, model: str, protocol: str) -> None:
+        model = require_clean_nonblank(model, "model")
+        protocol = require_clean_nonblank(protocol, "protocol")
+        if protocol != OPENAI_CLIENT_TOOL_SEARCH_PROTOCOL:
+            raise ValueError(f"OpenAIProvider does not support projection {protocol!r}.")
+        if self.base_url != _validate_base_url(DEFAULT_OPENAI_BASE_URL):
+            raise ValueError(
+                "OpenAI client Tool Search is established only for the official OpenAI "
+                "Responses endpoint."
+            )
+        if model not in self.client_tool_search_models:
+            raise ValueError(
+                "OpenAI client Tool Search support is not established for model "
+                f"{model!r}; list the exact verified model in client_tool_search_models."
+            )
+
     def preflight_targeted_tool_projection(self, *, model: str, protocol: str) -> None:
         model = require_clean_nonblank(model, "model")
         protocol = require_clean_nonblank(protocol, "protocol")
@@ -759,12 +838,16 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                 f"{model!r}; list the exact verified model in additional_tools_models."
             )
 
-    def _preflight_targeted_tool_request(self, request: ModelRequest) -> None:
+    def _preflight_dynamic_tool_request(self, request: ModelRequest) -> None:
         if type(request) is not ModelRequest:
             raise TypeError("request must be a ModelRequest.")
         projection = request.targeted_tool_projection
         cache_anchor = targeted_tool_native_cache_anchor_name(request.options)
-        if call_tool_core_callable(request.options) and cache_anchor is None:
+        if (
+            call_tool_core_callable(request.options)
+            and cache_anchor is None
+            and request.tool_discovery_projection is None
+        ):
             raise ValueError("Callable call_tool core requires a stable cache anchor.")
         if cache_anchor is not None:
             self.preflight_targeted_tool_projection(
@@ -779,6 +862,12 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             self.preflight_targeted_tool_projection(
                 model=request.model,
                 protocol=projection.protocol,
+            )
+        discovery_projection = request.tool_discovery_projection
+        if discovery_projection is not None:
+            self.preflight_tool_discovery_projection(
+                model=request.model,
+                protocol=discovery_projection.protocol,
             )
 
     @property
@@ -813,6 +902,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         reasoning_state: str = "inline",
         hosted_web_search_supported: bool | None = None,
         additional_tools_models: Iterable[str] | None = None,
+        client_tool_search_models: Iterable[str] | None = None,
         background: bool = False,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
@@ -836,40 +926,14 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             if hosted_web_search_supported is None
             else hosted_web_search_supported
         )
-        if isinstance(additional_tools_models, (str, bytes, bytearray, Mapping)):
-            raise TypeError("additional_tools_models must be an iterable of model names.")
-        try:
-            model_iterator = iter(
-                () if additional_tools_models is None else additional_tools_models
-            )
-        except TypeError as exc:
-            raise TypeError("additional_tools_models must be an iterable of model names.") from exc
-        copied_additional_tools_models: list[str] = []
-        for index, configured_model in enumerate(model_iterator):
-            if index >= _OPENAI_ADDITIONAL_TOOLS_MAX_MODELS:
-                raise ValueError(
-                    "additional_tools_models cannot contain more than "
-                    f"{_OPENAI_ADDITIONAL_TOOLS_MAX_MODELS} names."
-                )
-            if type(configured_model) is not str:
-                raise TypeError("additional_tools_models must contain strings.")
-            copied_additional_tools_models.append(configured_model)
-        normalized_models: list[str] = []
-        for configured_model in copied_additional_tools_models:
-            model_name = require_durable_clean_nonblank(
-                configured_model,
-                "additional_tools_models item",
-            )
-            if len(model_name.encode("utf-8")) > _OPENAI_ADDITIONAL_TOOLS_MODEL_MAX_BYTES:
-                raise ValueError(
-                    "additional_tools_models items cannot exceed "
-                    f"{_OPENAI_ADDITIONAL_TOOLS_MODEL_MAX_BYTES} UTF-8 bytes."
-                )
-            normalized_models.append(model_name)
-        normalized_additional_tools_models = tuple(normalized_models)
-        if len(normalized_additional_tools_models) != len(set(normalized_additional_tools_models)):
-            raise ValueError("additional_tools_models must contain unique model names.")
-        self.additional_tools_models = frozenset(normalized_additional_tools_models)
+        self.additional_tools_models = _copy_exact_model_allowlist(
+            additional_tools_models,
+            field_name="additional_tools_models",
+        )
+        self.client_tool_search_models = _copy_exact_model_allowlist(
+            client_tool_search_models,
+            field_name="client_tool_search_models",
+        )
         if type(background) is not bool:
             raise TypeError("background must be a bool.")
         if background and self.base_url != _validate_base_url(DEFAULT_OPENAI_BASE_URL):
@@ -915,7 +979,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         error_event: ModelStreamEvent | None = None
         completion_emitted = False
         try:
-            self._preflight_targeted_tool_request(request)
+            self._preflight_dynamic_tool_request(request)
             payload = build_openai_payload(
                 request, stream=True, reasoning_state=self.reasoning_state
             )
@@ -926,13 +990,18 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                     async for event in events:
                         yielded_any = True
                         is_completion = event.type == ModelStreamEventType.COMPLETED
-                        event = _event_with_server_targeted_tool_ownership(
+                        event = _event_with_server_dynamic_tool_ownership(
                             event,
                             reasoning_state=self.reasoning_state,
                             marker_id=(
                                 None
                                 if request.targeted_tool_projection is None
                                 else request.targeted_tool_projection.marker_id
+                            ),
+                            discovery_loaded_tool_names=(
+                                None
+                                if request.tool_discovery_projection is None
+                                else request.tool_discovery_projection.loaded_tool_names
                             ),
                         )
                         completion_emitted = is_completion
@@ -956,13 +1025,18 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             async with aclosing_provider_stream(events):
                 async for event in events:
                     is_completion = event.type == ModelStreamEventType.COMPLETED
-                    event = _event_with_server_targeted_tool_ownership(
+                    event = _event_with_server_dynamic_tool_ownership(
                         event,
                         reasoning_state=self.reasoning_state,
                         marker_id=(
                             None
                             if request.targeted_tool_projection is None
                             else request.targeted_tool_projection.marker_id
+                        ),
+                        discovery_loaded_tool_names=(
+                            None
+                            if request.tool_discovery_projection is None
+                            else request.tool_discovery_projection.loaded_tool_names
                         ),
                     )
                     completion_emitted = is_completion
@@ -1072,7 +1146,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         self,
         request: ModelRequest,
     ) -> InputTokenCountResult | None:
-        self._preflight_targeted_tool_request(request)
+        self._preflight_dynamic_tool_request(request)
         payload = build_openai_token_count_payload(
             request,
             reasoning_state=self.reasoning_state,
@@ -1224,13 +1298,15 @@ def build_openai_payload(
     if reasoning_state == "server" and chain:
         previous_response_id, messages_to_send = _server_chain(request.messages)
         server_owned_count = len(request.messages) - len(messages_to_send)
-        if previous_response_id is not None and _server_prefix_owns_inactive_targeted_tools(
+        if previous_response_id is not None and _server_prefix_has_unsafe_dynamic_tools(
             request.messages[:server_owned_count],
-            request.targeted_tool_projection,
+            targeted_projection=request.targeted_tool_projection,
+            discovery_projection=request.tool_discovery_projection,
         ):
             # A previous_response_id would keep an earlier interaction's
-            # additional_tools item alive on the provider. Rebuild neutrally so
-            # inactive targeted authority cannot remain model-addressable.
+            # dynamic tool definitions alive on the provider. Rebuild neutrally
+            # so authority absent from the current request cannot remain
+            # model-addressable.
             previous_response_id = None
             messages_to_send = request.messages
             use_provider_state = False
@@ -1240,6 +1316,10 @@ def build_openai_payload(
     _validate_targeted_tool_projection_marker(
         request.messages,
         request.targeted_tool_projection,
+    )
+    _validate_tool_search_replay(
+        request.messages,
+        request.tool_discovery_projection,
     )
     direct_tool_names = {name for tool in request.tools if type(name := tool.get("name")) is str}
     if request.targeted_tool_projection is not None and any(
@@ -1258,6 +1338,7 @@ def build_openai_payload(
                 reasoning_state=reasoning_state,
                 use_provider_state=use_provider_state,
                 targeted_tool_projection=request.targeted_tool_projection,
+                tool_discovery_projection=request.tool_discovery_projection,
             )
         )
     if not input_items:
@@ -1266,7 +1347,7 @@ def build_openai_payload(
     if previous_response_id is not None:
         payload["previous_response_id"] = previous_response_id
 
-    tools = [_openai_tool(tool) for tool in request.tools]
+    tools = _openai_request_tools(request)
     tools.extend(_openai_hosted_tool(tool) for tool in request.hosted_tools)
     if tools:
         payload["tools"] = tools
@@ -1461,6 +1542,7 @@ def openai_response_events(
     provider_state_items: list[dict[str, Any]] = []
     completion_output_items: list[Mapping[str, Any]] = []
     hosted_call_indexes: dict[str, int] = {}
+    tool_search_call_count = 0
     assistant_text_offset = 0
     response_status = _optional_string(response, "status")
     for index, item in enumerate(output):
@@ -1486,6 +1568,14 @@ def openai_response_events(
             provider_state_items.append(
                 {"provider": "openai", "state": copy_json_value(item, "output_item")}
             )
+        elif item_type == "tool_search_call":
+            tool_search_call_count += 1
+            if tool_search_call_count > _OPENAI_CLIENT_TOOL_SEARCH_MAX_ITEMS:
+                raise OpenAIProtocolError("OpenAI response contains too many tool search calls.")
+            normalized = _normalized_tool_search_call(item, item_index=index)
+            events.append(_tool_search_call_event(normalized))
+            completion_output_items.append(normalized)
+            provider_state_items.append({"provider": "openai", "state": normalized})
         elif item_type == "reasoning":
             # Surface the readable reasoning summary as display-only thinking, but keep
             # capturing the full reasoning item (incl. encrypted_content) as provider
@@ -1562,12 +1652,45 @@ def _openai_background_targeted_tool_marker_id(
     return value
 
 
+def _openai_background_discovery_loaded_tool_names(
+    metadata: ProviderOperationRecoveryMetadata,
+) -> tuple[str, ...] | None:
+    value = metadata.opaque.get("tool_discovery_loaded_tool_names")
+    if value is None:
+        return None
+    if type(value) is not list:
+        raise OpenAIProtocolError(
+            "OpenAI background recovery metadata has invalid discovery tool names."
+        )
+    if len(value) > _OPENAI_CLIENT_TOOL_SEARCH_MAX_ITEMS or any(
+        type(name) is not str for name in value
+    ):
+        raise OpenAIProtocolError(
+            "OpenAI background recovery metadata has invalid discovery tool names."
+        )
+    try:
+        names = tuple(
+            require_clean_nonblank(name, "background discovery tool name")
+            for name in cast("list[str]", value)
+        )
+    except (TypeError, ValueError):
+        raise OpenAIProtocolError(
+            "OpenAI background recovery metadata has invalid discovery tool names."
+        ) from None
+    if names != tuple(sorted(set(names))):
+        raise OpenAIProtocolError(
+            "OpenAI background recovery metadata has invalid discovery tool names."
+        )
+    return names
+
+
 def _require_openai_background_state(state: ProviderOperationState) -> ProviderOperationState:
     state = copy_provider_operation_state(state)
     if state.stream_protocol != _OPENAI_BACKGROUND_STREAM_PROTOCOL:
         raise OpenAIProtocolError("OpenAI background operation uses an unknown stream protocol.")
     _openai_recovery_sequence_number(state.recovery_metadata)
     _openai_background_targeted_tool_marker_id(state.recovery_metadata)
+    _openai_background_discovery_loaded_tool_names(state.recovery_metadata)
     return state
 
 
@@ -1589,6 +1712,7 @@ def _openai_background_created_state(
     event: Mapping[str, Any],
     *,
     targeted_tool_marker_id: str | None,
+    discovery_loaded_tool_names: tuple[str, ...] | None,
 ) -> tuple[ProviderOperationState, ProviderOperationStatus]:
     if not isinstance(event, Mapping) or event.get("type") != "response.created":
         raise OpenAIProtocolError("OpenAI background start must begin with response.created.")
@@ -1610,6 +1734,11 @@ def _openai_background_created_state(
                     "opaque": {
                         "sequence_number": sequence_number,
                         "targeted_tool_marker_id": targeted_tool_marker_id,
+                        **(
+                            {"tool_discovery_loaded_tool_names": list(discovery_loaded_tool_names)}
+                            if discovery_loaded_tool_names is not None
+                            else {}
+                        ),
                     },
                 }
             ),
@@ -1650,13 +1779,17 @@ def _openai_background_snapshot(
     cursor = state.recovery_metadata.cursor
     cursor = 0 if cursor is None else cursor
     targeted_tool_marker_id = _openai_background_targeted_tool_marker_id(state.recovery_metadata)
+    discovery_loaded_tool_names = _openai_background_discovery_loaded_tool_names(
+        state.recovery_metadata
+    )
     events: list[ModelStreamEvent] = []
     for event in parsed:
         cursor += 1
-        event = _event_with_server_targeted_tool_ownership(
+        event = _event_with_server_dynamic_tool_ownership(
             event,
             reasoning_state=reasoning_state,
             marker_id=targeted_tool_marker_id,
+            discovery_loaded_tool_names=discovery_loaded_tool_names,
         )
         events.append(
             event.model_copy(
@@ -1668,6 +1801,15 @@ def _openai_background_snapshot(
                                 state.recovery_metadata
                             ),
                             "targeted_tool_marker_id": targeted_tool_marker_id,
+                            **(
+                                {
+                                    "tool_discovery_loaded_tool_names": list(
+                                        discovery_loaded_tool_names
+                                    )
+                                }
+                                if discovery_loaded_tool_names is not None
+                                else {}
+                            ),
                         },
                     )
                 },
@@ -1707,16 +1849,30 @@ def _openai_stream_operation_status(event: Mapping[str, Any]) -> ProviderOperati
 
 def _openai_background_parser_state(
     metadata: ProviderOperationRecoveryMetadata,
-) -> tuple[dict[int, _PendingFunctionCall], set[int]]:
+) -> tuple[
+    dict[int, _PendingFunctionCall],
+    set[int],
+    dict[int, tuple[str, str]],
+    dict[int, dict[str, Any]],
+]:
     parser = metadata.opaque.get("parser")
     if parser is None:
-        return {}, set()
+        return {}, set(), {}, {}
     if type(parser) is not dict:
         raise OpenAIProtocolError("OpenAI recovery parser state must be an object.")
     parser = cast("dict[str, Any]", parser)
     raw_calls = parser.get("pending_function_calls", [])
     raw_reasoning = parser.get("pending_reasoning_output_indexes", [])
-    if type(raw_calls) is not list or type(raw_reasoning) is not list:
+    raw_tool_search = parser.get("pending_tool_search_calls", [])
+    raw_completed_tool_search = parser.get("completed_tool_search_items", [])
+    if (
+        type(raw_calls) is not list
+        or type(raw_reasoning) is not list
+        or type(raw_tool_search) is not list
+        or type(raw_completed_tool_search) is not list
+        or len(raw_tool_search) + len(raw_completed_tool_search)
+        > _OPENAI_CLIENT_TOOL_SEARCH_MAX_ITEMS
+    ):
         raise OpenAIProtocolError("OpenAI recovery parser state is malformed.")
     calls: dict[int, _PendingFunctionCall] = {}
     for raw in raw_calls:
@@ -1737,7 +1893,41 @@ def _openai_background_parser_state(
         if type(raw_index) is not int or raw_index < 0:
             raise OpenAIProtocolError("OpenAI pending reasoning index is malformed.")
         reasoning.add(raw_index)
-    return calls, reasoning
+    tool_search: dict[int, tuple[str, str]] = {}
+    for raw in raw_tool_search:
+        if type(raw) is not dict:
+            raise OpenAIProtocolError("OpenAI pending tool-search state is malformed.")
+        output_index = raw.get("output_index")
+        item_id = _mapping_optional_string(raw, "item_id")
+        call_id = _mapping_optional_string(raw, "call_id")
+        if (
+            type(output_index) is not int
+            or output_index < 0
+            or output_index in tool_search
+            or item_id is None
+            or call_id is None
+        ):
+            raise OpenAIProtocolError("OpenAI pending tool-search state is malformed.")
+        tool_search[output_index] = (item_id, call_id)
+    completed_tool_search: dict[int, dict[str, Any]] = {}
+    for raw in raw_completed_tool_search:
+        if type(raw) is not dict:
+            raise OpenAIProtocolError("OpenAI completed tool-search state is malformed.")
+        output_index = raw.get("output_index")
+        item = raw.get("item")
+        if (
+            type(output_index) is not int
+            or output_index < 0
+            or output_index in completed_tool_search
+            or output_index in tool_search
+            or not isinstance(item, Mapping)
+        ):
+            raise OpenAIProtocolError("OpenAI completed tool-search state is malformed.")
+        completed_tool_search[output_index] = _normalized_tool_search_call(
+            item,
+            item_index=output_index,
+        )
+    return calls, reasoning, tool_search, completed_tool_search
 
 
 def _openai_background_recovery_metadata(
@@ -1746,13 +1936,26 @@ def _openai_background_recovery_metadata(
     sequence_number: int,
     pending_function_calls: Mapping[int, _PendingFunctionCall],
     pending_reasoning_items: set[int],
+    pending_tool_search_calls: Mapping[int, tuple[str, str]],
+    completed_tool_search_items: Mapping[int, Mapping[str, Any]],
     targeted_tool_marker_id: str | None,
+    discovery_loaded_tool_names: tuple[str, ...] | None,
 ) -> ProviderOperationRecoveryMetadata:
     opaque: dict[str, object] = {
         "sequence_number": sequence_number,
         "targeted_tool_marker_id": targeted_tool_marker_id,
+        **(
+            {"tool_discovery_loaded_tool_names": list(discovery_loaded_tool_names)}
+            if discovery_loaded_tool_names is not None
+            else {}
+        ),
     }
-    if pending_function_calls or pending_reasoning_items:
+    if (
+        pending_function_calls
+        or pending_reasoning_items
+        or pending_tool_search_calls
+        or completed_tool_search_items
+    ):
         calls: list[dict[str, object]] = []
         for output_index, pending in sorted(pending_function_calls.items()):
             call: dict[str, object] = {"output_index": output_index}
@@ -1766,6 +1969,21 @@ def _openai_background_recovery_metadata(
         opaque["parser"] = {
             "pending_function_calls": calls,
             "pending_reasoning_output_indexes": sorted(pending_reasoning_items),
+            "pending_tool_search_calls": [
+                {
+                    "output_index": output_index,
+                    "item_id": item_id,
+                    "call_id": call_id,
+                }
+                for output_index, (item_id, call_id) in sorted(pending_tool_search_calls.items())
+            ],
+            "completed_tool_search_items": [
+                {
+                    "output_index": output_index,
+                    "item": copy_json_value(item, "completed tool_search item"),
+                }
+                for output_index, item in sorted(completed_tool_search_items.items())
+            ],
         }
     return ProviderOperationRecoveryMetadata(cursor=cursor, opaque=opaque)
 
@@ -1777,7 +1995,10 @@ def _openai_background_event_with_recovery(
     sequence_number: int,
     pending_function_calls: Mapping[int, _PendingFunctionCall],
     pending_reasoning_items: set[int],
+    pending_tool_search_calls: Mapping[int, tuple[str, str]],
+    completed_tool_search_items: Mapping[int, Mapping[str, Any]],
     targeted_tool_marker_id: str | None,
+    discovery_loaded_tool_names: tuple[str, ...] | None,
 ) -> ModelStreamEvent:
     return event.model_copy(
         update={
@@ -1786,7 +2007,10 @@ def _openai_background_event_with_recovery(
                 sequence_number=sequence_number,
                 pending_function_calls=pending_function_calls,
                 pending_reasoning_items=pending_reasoning_items,
+                pending_tool_search_calls=pending_tool_search_calls,
+                completed_tool_search_items=completed_tool_search_items,
                 targeted_tool_marker_id=targeted_tool_marker_id,
+                discovery_loaded_tool_names=discovery_loaded_tool_names,
             )
         },
         deep=True,
@@ -1804,9 +2028,15 @@ async def _openai_background_stream_events(
     cursor = 0 if cursor is None else cursor
     last_sequence_number = _openai_recovery_sequence_number(state.recovery_metadata)
     targeted_tool_marker_id = _openai_background_targeted_tool_marker_id(state.recovery_metadata)
-    pending_function_calls, pending_reasoning_items = _openai_background_parser_state(
+    discovery_loaded_tool_names = _openai_background_discovery_loaded_tool_names(
         state.recovery_metadata
     )
+    (
+        pending_function_calls,
+        pending_reasoning_items,
+        pending_tool_search_calls,
+        completed_tool_search_items,
+    ) = _openai_background_parser_state(state.recovery_metadata)
 
     async def ordered_raw_events() -> AsyncIterator[Mapping[str, Any]]:
         if first is not None:
@@ -1843,6 +2073,24 @@ async def _openai_background_stream_events(
             item = event.get("item")
             if isinstance(item, Mapping) and item.get("type") == "reasoning":
                 pending_reasoning_items.add(_stream_output_index(event))
+            if isinstance(item, Mapping) and item.get("type") == "tool_search_call":
+                output_index = _stream_output_index(event)
+                item_id = _mapping_optional_string(item, "id")
+                call_id = _mapping_optional_string(item, "call_id")
+                if (
+                    output_index in pending_tool_search_calls
+                    or output_index in completed_tool_search_items
+                    or len(pending_tool_search_calls) + len(completed_tool_search_items)
+                    >= _OPENAI_CLIENT_TOOL_SEARCH_MAX_ITEMS
+                    or item_id is None
+                    or call_id is None
+                    or item.get("execution") != "client"
+                    or item.get("status") != "in_progress"
+                ):
+                    raise OpenAIProtocolError(
+                        "OpenAI background tool_search_call added item is malformed."
+                    )
+                pending_tool_search_calls[output_index] = (item_id, call_id)
             _record_stream_output_item_added(event, pending_function_calls)
             normalized = ModelStreamEvent.thinking()
         elif event_type == "response.output_item.done":
@@ -1851,28 +2099,44 @@ async def _openai_background_stream_events(
                 pending_reasoning_items.discard(_stream_output_index(event))
             if not isinstance(item, Mapping):
                 raise OpenAIProtocolError("OpenAI output_item.done requires item object.")
-            normalized = ModelStreamEvent.thinking()
+            if item.get("type") == "tool_search_call":
+                output_index = _stream_output_index(event)
+                pending = pending_tool_search_calls.pop(output_index, None)
+                tool_search = _normalized_tool_search_call(item, item_index=output_index)
+                if pending != (tool_search["id"], tool_search["call_id"]):
+                    raise OpenAIProtocolError(
+                        "OpenAI background tool_search_call output identity mismatch."
+                    )
+                completed_tool_search_items[output_index] = tool_search
+                normalized = _tool_search_call_event(tool_search)
+            else:
+                normalized = ModelStreamEvent.thinking()
         elif event_type == "response.function_call_arguments.delta":
             _record_stream_function_call_delta(event, pending_function_calls)
             normalized = ModelStreamEvent.thinking()
         elif event_type == "response.function_call_arguments.done":
             normalized, _ = _stream_function_call_event(event, pending_function_calls)
         elif event_type in {"response.completed", "response.incomplete"}:
-            unfinished = {*pending_function_calls, *pending_reasoning_items}
+            unfinished = {
+                *pending_function_calls,
+                *pending_reasoning_items,
+                *pending_tool_search_calls,
+            }
             if event_type == "response.completed" and unfinished:
                 raise OpenAIProtocolError(
                     "OpenAI background response completed with unfinished output items."
                 )
             for terminal_event in _stream_terminal_events(
                 event,
-                {},
+                completed_tool_search_items,
                 excluded_output_indexes=unfinished,
                 reasoning_state=reasoning_state,
             ):
-                terminal_event = _event_with_server_targeted_tool_ownership(
+                terminal_event = _event_with_server_dynamic_tool_ownership(
                     terminal_event,
                     reasoning_state=reasoning_state,
                     marker_id=targeted_tool_marker_id,
+                    discovery_loaded_tool_names=discovery_loaded_tool_names,
                 )
                 yield _openai_background_event_with_recovery(
                     terminal_event,
@@ -1880,7 +2144,10 @@ async def _openai_background_stream_events(
                     sequence_number=sequence_number,
                     pending_function_calls=pending_function_calls,
                     pending_reasoning_items=pending_reasoning_items,
+                    pending_tool_search_calls=pending_tool_search_calls,
+                    completed_tool_search_items=completed_tool_search_items,
                     targeted_tool_marker_id=targeted_tool_marker_id,
+                    discovery_loaded_tool_names=discovery_loaded_tool_names,
                 )
             return
         elif event_type == "response.failed":
@@ -1918,7 +2185,10 @@ async def _openai_background_stream_events(
             sequence_number=sequence_number,
             pending_function_calls=pending_function_calls,
             pending_reasoning_items=pending_reasoning_items,
+            pending_tool_search_calls=pending_tool_search_calls,
+            completed_tool_search_items=completed_tool_search_items,
             targeted_tool_marker_id=targeted_tool_marker_id,
+            discovery_loaded_tool_names=discovery_loaded_tool_names,
         )
         if event_type in {
             "response.completed",
@@ -2028,6 +2298,8 @@ async def _openai_stream_events(
     pending_function_calls: dict[int, _PendingFunctionCall] = {}
     pending_reasoning_items: set[int] = set()
     pending_web_search_calls: dict[int, tuple[str, str]] = {}
+    pending_tool_search_calls: dict[int, tuple[str, str]] = {}
+    seen_tool_search_output_indexes: set[int] = set()
     streamed_text: dict[tuple[int, int], str] = {}
     streamed_text_offsets: dict[tuple[int, int], int] = {}
     streamed_visible_text: list[str] = []
@@ -2119,6 +2391,26 @@ async def _openai_stream_events(
                     normalized["status"],
                 )
                 yield _web_search_call_event(normalized)
+            if isinstance(item, Mapping) and item.get("type") == "tool_search_call":
+                output_index = _stream_output_index(event)
+                if output_index in seen_tool_search_output_indexes:
+                    raise OpenAIProtocolError(
+                        "OpenAI tool_search_call output_item.added was repeated."
+                    )
+                if len(seen_tool_search_output_indexes) >= _OPENAI_CLIENT_TOOL_SEARCH_MAX_ITEMS:
+                    raise OpenAIProtocolError("OpenAI stream contains too many tool search calls.")
+                item_id = _mapping_optional_string(item, "id")
+                call_id = _mapping_optional_string(item, "call_id")
+                if item_id is None or call_id is None:
+                    raise OpenAIProtocolError(
+                        "OpenAI tool_search_call output_item.added requires exact identities."
+                    )
+                if item.get("execution") != "client" or item.get("status") != "in_progress":
+                    raise OpenAIProtocolError(
+                        "OpenAI tool_search_call output_item.added must be client/in_progress."
+                    )
+                seen_tool_search_output_indexes.add(output_index)
+                pending_tool_search_calls[output_index] = (item_id, call_id)
             _record_stream_output_item_added(event, pending_function_calls)
             continue
         if event_type in {
@@ -2162,6 +2454,21 @@ async def _openai_stream_events(
                     raise OpenAIProtocolError("OpenAI web_search_call output identity mismatch.")
                 fallback_output_items[output_index] = normalized
                 yield _web_search_call_event(normalized)
+            if isinstance(item, Mapping) and item.get("type") == "tool_search_call":
+                output_index = _stream_output_index(event)
+                pending = pending_tool_search_calls.pop(output_index, None)
+                if pending is None:
+                    raise OpenAIProtocolError(
+                        "OpenAI tool_search_call output_item.done arrived before added."
+                    )
+                normalized_tool_search = _normalized_tool_search_call(
+                    item,
+                    item_index=output_index,
+                )
+                if (normalized_tool_search["id"], normalized_tool_search["call_id"]) != pending:
+                    raise OpenAIProtocolError("OpenAI tool_search_call output identity mismatch.")
+                fallback_output_items[output_index] = normalized_tool_search
+                yield _tool_search_call_event(normalized_tool_search)
             _record_stream_output_item_done(
                 event,
                 fallback_output_items,
@@ -2187,6 +2494,7 @@ async def _openai_stream_events(
                 *pending_function_calls,
                 *pending_reasoning_items,
                 *pending_web_search_calls,
+                *pending_tool_search_calls,
                 *pending_replay_items,
             }
             # A completed response promises complete output items. An incomplete
@@ -2210,10 +2518,15 @@ async def _openai_stream_events(
                 raise OpenAIProtocolError(
                     "OpenAI streaming response completed with unfinished web search calls."
                 )
+            if event_type == "response.completed" and pending_tool_search_calls:
+                raise OpenAIProtocolError(
+                    "OpenAI streaming response completed with unfinished tool search calls."
+                )
             if event_type == "response.incomplete":
                 for call_id, _status in pending_web_search_calls.values():
                     yield _web_search_outcome_unknown_event(call_id)
                 pending_web_search_calls.clear()
+                pending_tool_search_calls.clear()
             for terminal_event in _stream_terminal_events(
                 event,
                 fallback_output_items,
@@ -2559,6 +2872,76 @@ def _function_call_event(
     )
 
 
+def _normalized_tool_search_call(
+    item: Mapping[str, Any],
+    *,
+    item_index: int,
+) -> dict[str, Any]:
+    item_id = item.get("id")
+    call_id = item.get("call_id")
+    if not isinstance(item_id, str) or not item_id.strip():
+        raise OpenAIProtocolError(
+            f"OpenAI tool_search_call item {item_index} requires nonblank id."
+        )
+    if not isinstance(call_id, str) or not call_id.strip():
+        raise OpenAIProtocolError(
+            f"OpenAI tool_search_call item {item_index} requires nonblank call_id."
+        )
+    if item.get("execution") != "client":
+        raise OpenAIProtocolError(
+            f"OpenAI tool_search_call item {item_index} must use client execution."
+        )
+    if item.get("status") != "completed":
+        raise OpenAIProtocolError(f"OpenAI tool_search_call item {item_index} must be completed.")
+    arguments = item.get("arguments")
+    if type(arguments) is not dict:
+        raise OpenAIProtocolError(
+            f"OpenAI tool_search_call item {item_index} arguments must be an object."
+        )
+    if not set(arguments).issubset({"query", "limit"}):
+        raise OpenAIProtocolError(
+            f"OpenAI tool_search_call item {item_index} has unsupported arguments."
+        )
+    query = arguments.get("query")
+    if type(query) is not str:
+        raise OpenAIProtocolError(
+            f"OpenAI tool_search_call item {item_index} requires a bounded query."
+        )
+    try:
+        query = require_durable_clean_nonblank(query, "tool_search query")
+    except (TypeError, ValueError):
+        raise OpenAIProtocolError(
+            f"OpenAI tool_search_call item {item_index} requires a bounded query."
+        ) from None
+    if len(query) > _OPENAI_CLIENT_TOOL_SEARCH_MAX_QUERY_CHARS:
+        raise OpenAIProtocolError(
+            f"OpenAI tool_search_call item {item_index} requires a bounded query."
+        )
+    limit = arguments.get("limit")
+    if limit is not None and (
+        type(limit) is not int or not 1 <= limit <= _OPENAI_CLIENT_TOOL_SEARCH_MAX_RESULTS
+    ):
+        raise OpenAIProtocolError(
+            f"OpenAI tool_search_call item {item_index} has an invalid limit."
+        )
+    return {
+        "type": "tool_search_call",
+        "id": item_id,
+        "call_id": call_id,
+        "execution": "client",
+        "arguments": copy_json_value(arguments, "tool_search arguments"),
+        "status": "completed",
+    }
+
+
+def _tool_search_call_event(item: Mapping[str, Any]) -> ModelStreamEvent:
+    return ModelStreamEvent.tool_call(
+        id=cast("str", item["call_id"]),
+        name=_CAYU_SEARCH_TOOLS_NAME,
+        arguments=copy_json_value(item["arguments"], "tool_search arguments"),
+    )
+
+
 def _completed_event_from_response(
     response: Mapping[str, Any],
     provider_state_items: list[dict[str, Any]] | None = None,
@@ -2685,7 +3068,7 @@ def _openai_output_items(response: Mapping[str, Any]) -> list[Mapping[str, Any]]
 
 
 def _output_items_have_function_call(output_items: list[Mapping[str, Any]]) -> bool:
-    return any(item.get("type") == "function_call" for item in output_items)
+    return any(item.get("type") in {"function_call", "tool_search_call"} for item in output_items)
 
 
 def _stream_terminal_events(
@@ -2725,6 +3108,7 @@ def _stream_terminal_events(
         raise OpenAIProtocolError("OpenAI response output must be a list.")
 
     terminal_hosted_calls: dict[int, dict[str, Any]] = {}
+    terminal_tool_search_calls: dict[int, dict[str, Any]] = {}
     hosted_call_indexes: dict[str, int] = {}
     completion_output_items: list[Mapping[str, Any]] = []
     for output_index, item in enumerate(output):
@@ -2733,6 +3117,18 @@ def _stream_terminal_events(
         if not isinstance(item, Mapping):
             raise OpenAIProtocolError(f"OpenAI output item {output_index} must be an object.")
         item = cast("Mapping[str, Any]", item)
+        if item.get("type") == "tool_search_call":
+            if len(terminal_tool_search_calls) >= _OPENAI_CLIENT_TOOL_SEARCH_MAX_ITEMS:
+                raise OpenAIProtocolError(
+                    "OpenAI terminal response contains too many tool search calls."
+                )
+            normalized_tool_search = _normalized_tool_search_call(
+                item,
+                item_index=output_index,
+            )
+            terminal_tool_search_calls[output_index] = normalized_tool_search
+            completion_output_items.append(normalized_tool_search)
+            continue
         if item.get("type") != "web_search_call":
             completion_output_items.append(item)
             continue
@@ -2779,6 +3175,14 @@ def _stream_terminal_events(
             )
 
     terminal_events: list[ModelStreamEvent] = []
+    for output_index, terminal_item in terminal_tool_search_calls.items():
+        fallback_item = fallback_output_items.get(output_index)
+        if fallback_item is not None and fallback_item != terminal_item:
+            raise OpenAIProtocolError(
+                "OpenAI terminal tool search evidence conflicts with lifecycle evidence."
+            )
+        if fallback_item is None:
+            terminal_events.append(_tool_search_call_event(terminal_item))
     for output_index, terminal_item in terminal_hosted_calls.items():
         fallback_item = fallback_output_items.get(output_index)
         if fallback_item is not None and fallback_item.get("type") != "web_search_call":
@@ -2830,6 +3234,14 @@ def _provider_state_items_from_response(response: Mapping[str, Any]) -> list[dic
                 {"provider": "openai", "state": copy_json_value(item, "output_item")}
             )
             continue
+        if item_type == "tool_search_call":
+            provider_state_items.append(
+                {
+                    "provider": "openai",
+                    "state": _normalized_tool_search_call(item, item_index=index),
+                }
+            )
+            continue
         if item_type == "web_search_call":
             normalized = _normalized_web_search_call(item, item_index=index)
             _claim_web_search_call_identity(
@@ -2867,6 +3279,8 @@ def _provider_state_items_from_output_items(
             normalized = _normalized_web_search_call(item, item_index=output_index)
             if normalized["status"] != "completed":
                 continue
+        elif item_type == "tool_search_call":
+            item = _normalized_tool_search_call(item, item_index=output_index)
         else:
             raise OpenAIProtocolError(
                 f"Unsupported OpenAI fallback output item type: {item_type!r}."
@@ -2973,6 +3387,15 @@ def _record_stream_output_item_done(
                 "OpenAI function_call output_item.done conflicts with streamed arguments."
             )
         output_items[output_index] = copy_json_value(item, "output_item")
+        return
+    if item_type == "tool_search_call":
+        normalized = _normalized_tool_search_call(item, item_index=output_index)
+        existing = output_items.get(output_index)
+        if existing != normalized:
+            raise OpenAIProtocolError(
+                "OpenAI tool_search_call output_item.done conflicts with lifecycle evidence."
+            )
+        output_items[output_index] = normalized
         return
     if item_type != "web_search_call":
         raise OpenAIProtocolError(f"Unsupported OpenAI output_item.done item type: {item_type!r}.")
@@ -3391,6 +3814,12 @@ def _openai_native_allowed_tool_selectors(
     callable_anchor = call_tool_core_callable(request.options)
     for tool in request.tools:
         selector = _openai_function_tool_selector(tool)
+        if (
+            request.tool_discovery_projection is not None
+            and selector["name"] == _CAYU_SEARCH_TOOLS_NAME
+        ):
+            selectors.append({"type": "tool_search"})
+            continue
         if selector["name"] != cache_anchor_name or callable_anchor:
             selectors.append(selector)
     for hosted_tool in request.hosted_tools:
@@ -3410,6 +3839,11 @@ def _openai_native_allowed_tool_selectors(
                 "A targeted additional_tools function cannot also be a direct request tool."
             )
         selectors.extend(targeted_selectors)
+    discovery_projection = request.tool_discovery_projection
+    if discovery_projection is not None:
+        selectors.extend(
+            {"type": "function", "name": name} for name in discovery_projection.loaded_tool_names
+        )
     identities = [tuple(sorted(selector.items())) for selector in selectors]
     if len(identities) != len(set(identities)):
         raise ValueError("OpenAI native targeted-tool callability contains duplicate tools.")
@@ -3447,7 +3881,7 @@ def _openai_native_tool_choice(
     copied = copy_json_value(configured, "options.openai.tool_choice")
     if type(copied) is not dict:
         raise ValueError(
-            "OpenAI native targeted-tool mode supports tool_choice none, auto, required, "
+            "OpenAI native dynamic-tool mode supports tool_choice none, auto, required, "
             "a named callable tool, or an allowed_tools subset."
         )
     choice_type = copied.get("type")
@@ -3493,7 +3927,9 @@ def _openai_allowed_tool_selector(value: object) -> dict[str, str]:
         return {"type": "function", "name": name}
     if selector_type == "web_search" and set(selector) == {"type"}:
         return {"type": "web_search"}
-    raise ValueError("OpenAI native targeted-tool mode received an unsupported tool selector.")
+    if selector_type == "tool_search" and set(selector) == {"type"}:
+        return {"type": "tool_search"}
+    raise ValueError("OpenAI native dynamic-tool mode received an unsupported tool selector.")
 
 
 def preflight_openai_native_structured_output_schema(json_schema: dict[str, Any]) -> None:
@@ -3722,6 +4158,7 @@ def _openai_input_items(
     reasoning_state: str = "inline",
     use_provider_state: bool = True,
     targeted_tool_projection: TargetedToolProjectionRequest | None = None,
+    tool_discovery_projection: ToolDiscoveryProjectionRequest | None = None,
 ) -> list[dict[str, Any]]:
     if message.role == MessageRole.SYSTEM:
         return []
@@ -3740,11 +4177,15 @@ def _openai_input_items(
             reasoning_state=reasoning_state,
             use_provider_state=use_provider_state,
             targeted_tool_projection=targeted_tool_projection,
+            tool_discovery_projection=tool_discovery_projection,
         )
         if provider_state_items:
             return provider_state_items
         if not use_provider_state:
-            return _openai_neutral_assistant_items(message)
+            return _openai_neutral_assistant_items(
+                message,
+                tool_discovery_projection=tool_discovery_projection,
+            )
 
         items: list[dict[str, Any]] = []
         text_parts = [_output_text_part(part) for part in message.content if type(part) is TextPart]
@@ -3759,7 +4200,12 @@ def _openai_input_items(
             )
         for part in message.content:
             if type(part) is ToolCallPart:
-                items.append(_function_call_input_item(part))
+                items.append(
+                    _assistant_tool_call_input_item(
+                        part,
+                        tool_discovery_projection=tool_discovery_projection,
+                    )
+                )
             elif type(part) not in {
                 TextPart,
                 ProviderStatePart,
@@ -3778,7 +4224,12 @@ def _openai_input_items(
         items: list[dict[str, Any]] = []
         attachment_parts: list[dict[str, Any]] = []
         for part in message.content:
-            items.append(_function_call_output_item(part))
+            items.append(
+                _tool_result_output_item(
+                    part,
+                    tool_discovery_projection=tool_discovery_projection,
+                )
+            )
             if type(part) is ToolResultPart:
                 attachment_parts.extend(_openai_file_attachment_parts(part, resolved_attachments))
         if attachment_parts:
@@ -3798,7 +4249,11 @@ def _openai_input_items(
     raise OpenAIProtocolError(f"Unsupported Cayu message role: {message.role!r}.")
 
 
-def _openai_neutral_assistant_items(message: Message) -> list[dict[str, Any]]:
+def _openai_neutral_assistant_items(
+    message: Message,
+    *,
+    tool_discovery_projection: ToolDiscoveryProjectionRequest | None = None,
+) -> list[dict[str, Any]]:
     """Rebuild accepted assistant output without server-owned provider state."""
 
     items: list[dict[str, Any]] = []
@@ -3806,6 +4261,23 @@ def _openai_neutral_assistant_items(message: Message) -> list[dict[str, Any]]:
     pending_citations: list[CitationPart] = []
     assembled_text_length = 0
     pending_text_offset = 0
+    tool_search_items_by_call_id: dict[str, dict[str, Any]] = {}
+    used_tool_search_call_ids: set[str] = set()
+    if tool_discovery_projection is not None:
+        for index, part in enumerate(message.content):
+            if (
+                type(part) is not ProviderStatePart
+                or part.provider != "openai"
+                or part.state.get("type") != "tool_search_call"
+            ):
+                continue
+            normalized = _normalized_tool_search_call(part.state, item_index=index)
+            call_id = cast("str", normalized["call_id"])
+            if call_id in tool_search_items_by_call_id:
+                raise OpenAIProtocolError(
+                    "OpenAI neutral replay contains duplicate tool search call identity."
+                )
+            tool_search_items_by_call_id[call_id] = normalized
 
     def flush_text() -> None:
         nonlocal pending_text_offset
@@ -3872,13 +4344,30 @@ def _openai_neutral_assistant_items(message: Message) -> list[dict[str, Any]]:
             continue
         if type(part) is ToolCallPart:
             flush_text()
-            items.append(_function_call_input_item(part))
+            tool_search_item = tool_search_items_by_call_id.get(part.tool_call_id)
+            if tool_search_item is not None and part.tool_name != _CAYU_SEARCH_TOOLS_NAME:
+                raise OpenAIProtocolError(
+                    "OpenAI tool search provider state conflicts with neutral tool-call replay."
+                )
+            if tool_search_item is not None:
+                used_tool_search_call_ids.add(part.tool_call_id)
+            items.append(
+                _assistant_tool_call_input_item(
+                    part,
+                    tool_discovery_projection=tool_discovery_projection,
+                    tool_search_item=tool_search_item,
+                )
+            )
             continue
         if type(part) in {ProviderStatePart, ThinkingPart}:
             continue
         raise OpenAIProtocolError(
             "Assistant messages can only contain text, tool_call, provider_state, "
             "thinking, hosted_tool_call, and citation parts."
+        )
+    if used_tool_search_call_ids != set(tool_search_items_by_call_id):
+        raise OpenAIProtocolError(
+            "OpenAI neutral replay has tool search provider state without terminal tool evidence."
         )
     flush_text()
     return items
@@ -3933,13 +4422,15 @@ def _server_chain(messages: list[Message]) -> tuple[str | None, list[Message]]:
     return last_id, messages[last_index + 1 :]
 
 
-def _server_prefix_owns_inactive_targeted_tools(
+def _server_prefix_has_unsafe_dynamic_tools(
     server_owned_messages: list[Message],
-    projection: TargetedToolProjectionRequest | None,
+    *,
+    targeted_projection: TargetedToolProjectionRequest | None,
+    discovery_projection: ToolDiscoveryProjectionRequest | None,
 ) -> bool:
-    """Return whether a server chain retains any non-current targeted item."""
+    """Return whether a server chain retains authority absent from this request."""
 
-    active_marker_id = None if projection is None else projection.marker_id
+    active_marker_id = None if targeted_projection is None else targeted_projection.marker_id
     latest_response_state: dict[str, Any] | None = None
     for message in server_owned_messages:
         if message.role is not MessageRole.ASSISTANT:
@@ -3956,24 +4447,48 @@ def _server_prefix_owns_inactive_targeted_tools(
         return True
     owned_marker_id = latest_response_state["targeted_tool_marker_id"]
     if owned_marker_id is None:
-        return False
-    if (
+        if active_marker_id is not None:
+            return True
+    elif (
         type(owned_marker_id) is not str
         or len(owned_marker_id) != 71
         or not owned_marker_id.startswith("sha256:")
         or any(character not in "0123456789abcdef" for character in owned_marker_id[7:])
+        or owned_marker_id != active_marker_id
     ):
         return True
-    return owned_marker_id != active_marker_id
+
+    raw_owned_names = latest_response_state.get("tool_discovery_loaded_tool_names")
+    if discovery_projection is None:
+        # No current discovery projection means no loaded discovery authority
+        # may remain addressable through a server-owned prefix.
+        return "tool_discovery_loaded_tool_names" in latest_response_state
+    if (
+        type(raw_owned_names) is not list
+        or len(raw_owned_names) > _OPENAI_CLIENT_TOOL_SEARCH_MAX_ITEMS
+        or any(type(name) is not str for name in raw_owned_names)
+    ):
+        return True
+    try:
+        owned_names = tuple(
+            require_clean_nonblank(name, "server-owned discovery tool name")
+            for name in cast("list[str]", raw_owned_names)
+        )
+    except (TypeError, ValueError):
+        return True
+    if owned_names != tuple(sorted(set(owned_names))):
+        return True
+    return not set(owned_names).issubset(discovery_projection.loaded_tool_names)
 
 
-def _event_with_server_targeted_tool_ownership(
+def _event_with_server_dynamic_tool_ownership(
     event: ModelStreamEvent,
     *,
     reasoning_state: str,
     marker_id: str | None,
+    discovery_loaded_tool_names: tuple[str, ...] | None,
 ) -> ModelStreamEvent:
-    """Bind one server response reference to its retained targeted item, if any."""
+    """Bind a response reference to the dynamic tools retained on the server."""
 
     if reasoning_state != "server" or event.type is not ModelStreamEventType.COMPLETED:
         return event
@@ -3994,6 +4509,10 @@ def _event_with_server_targeted_tool_ownership(
     if len(response_refs) != 1:
         raise OpenAIProtocolError("OpenAI server completion requires one exact response reference.")
     response_refs[0]["state"]["targeted_tool_marker_id"] = marker_id
+    if discovery_loaded_tool_names is not None:
+        response_refs[0]["state"]["tool_discovery_loaded_tool_names"] = list(
+            discovery_loaded_tool_names
+        )
     return ModelStreamEvent(
         type=event.type,
         delta=event.delta,
@@ -4010,6 +4529,7 @@ def _openai_provider_state_items(
     reasoning_state: str = "inline",
     use_provider_state: bool = True,
     targeted_tool_projection: TargetedToolProjectionRequest | None = None,
+    tool_discovery_projection: ToolDiscoveryProjectionRequest | None = None,
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for part in message.content:
@@ -4045,6 +4565,13 @@ def _openai_provider_state_items(
             if reasoning_state == "server":
                 continue
             items.append(state)
+            continue
+        if item_type == "tool_search_call":
+            if tool_discovery_projection is None:
+                raise OpenAIProtocolError(
+                    "OpenAI tool_search_call state requires an active client Tool Search projection."
+                )
+            items.append(_normalized_tool_search_call(state, item_index=len(items)))
             continue
         if item_type not in {"message", "function_call", "web_search_call"}:
             raise OpenAIProtocolError(
@@ -4087,6 +4614,62 @@ def _validate_targeted_tool_projection_marker(
         raise OpenAIProtocolError(
             "An active targeted-tool projection requires one exact acquisition marker."
         )
+
+
+def _validate_tool_search_replay(
+    messages: list[Message],
+    projection: ToolDiscoveryProjectionRequest | None,
+) -> None:
+    """Require exact provider call evidence and one matching result per native search."""
+
+    if projection is None:
+        return
+    calls: dict[str, dict[str, Any]] = {}
+    pending_results: set[str] = set()
+    for message in messages:
+        if message.role is MessageRole.ASSISTANT:
+            provider_calls: dict[str, dict[str, Any]] = {}
+            assistant_calls: dict[str, ToolCallPart] = {}
+            for index, part in enumerate(message.content):
+                if (
+                    type(part) is ProviderStatePart
+                    and part.provider == "openai"
+                    and part.state.get("type") == "tool_search_call"
+                ):
+                    normalized = _normalized_tool_search_call(part.state, item_index=index)
+                    call_id = cast("str", normalized["call_id"])
+                    if call_id in provider_calls or call_id in calls:
+                        raise OpenAIProtocolError(
+                            "OpenAI tool search replay repeats a provider call identity."
+                        )
+                    provider_calls[call_id] = normalized
+                elif type(part) is ToolCallPart and part.tool_name == _CAYU_SEARCH_TOOLS_NAME:
+                    if part.tool_call_id in assistant_calls or part.tool_call_id in calls:
+                        raise OpenAIProtocolError(
+                            "OpenAI tool search replay repeats an assistant call identity."
+                        )
+                    assistant_calls[part.tool_call_id] = part
+            if set(provider_calls) != set(assistant_calls):
+                raise OpenAIProtocolError(
+                    "OpenAI tool search replay requires matching provider and assistant calls."
+                )
+            for call_id in assistant_calls:
+                provider_call = provider_calls[call_id]
+                calls[call_id] = provider_call
+                pending_results.add(call_id)
+            continue
+        if message.role is not MessageRole.TOOL:
+            continue
+        for part in message.content:
+            if type(part) is not ToolResultPart or part.tool_name != _CAYU_SEARCH_TOOLS_NAME:
+                continue
+            if part.tool_call_id not in pending_results:
+                raise OpenAIProtocolError(
+                    "OpenAI tool search output has no matching pending search call."
+                )
+            pending_results.remove(part.tool_call_id)
+    if pending_results:
+        raise OpenAIProtocolError("OpenAI tool search replay has a call without its output.")
 
 
 def _user_input_part(
@@ -4141,6 +4724,116 @@ def _function_call_input_item(part: ToolCallPart) -> dict[str, Any]:
         "call_id": part.tool_call_id,
         "name": part.tool_name,
         "arguments": _json_arguments(part.arguments),
+        "status": "completed",
+    }
+
+
+def _assistant_tool_call_input_item(
+    part: ToolCallPart,
+    *,
+    tool_discovery_projection: ToolDiscoveryProjectionRequest | None,
+    tool_search_item: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if tool_discovery_projection is not None and part.tool_name == _CAYU_SEARCH_TOOLS_NAME:
+        if tool_search_item is None:
+            raise OpenAIProtocolError(
+                "OpenAI client Tool Search replay requires the provider-issued item id."
+            )
+        normalized = _normalized_tool_search_call(tool_search_item, item_index=0)
+        if normalized["call_id"] != part.tool_call_id:
+            raise OpenAIProtocolError(
+                "OpenAI tool search provider state conflicts with neutral tool-call replay."
+            )
+        return normalized
+    return _function_call_input_item(part)
+
+
+def _tool_result_output_item(
+    part: TextPart
+    | ToolCallPart
+    | ToolResultPart
+    | ProviderStatePart
+    | ThinkingPart
+    | FilePart
+    | HostedToolCallPart
+    | CitationPart,
+    *,
+    tool_discovery_projection: ToolDiscoveryProjectionRequest | None,
+) -> dict[str, Any]:
+    if (
+        type(part) is ToolResultPart
+        and tool_discovery_projection is not None
+        and part.tool_name == _CAYU_SEARCH_TOOLS_NAME
+    ):
+        return _tool_search_output_item(
+            part,
+            loaded_tools=tool_discovery_projection.loaded_tools,
+        )
+    return _function_call_output_item(part)
+
+
+def _tool_search_output_item(
+    part: ToolResultPart,
+    *,
+    loaded_tools: tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    trusted_tools = {cast("str", tool["name"]): tool for tool in loaded_tools}
+    tools: list[dict[str, Any]] = []
+    if not part.is_error:
+        structured = part.structured
+        if type(structured) is not dict or set(structured) != {
+            "schema_version",
+            "query",
+            "matches",
+            "view_revision",
+            "truncated",
+        }:
+            raise OpenAIProtocolError(
+                "A successful search_tools result requires the canonical structured payload."
+            )
+        matches = structured.get("matches")
+        if type(matches) is not list or len(matches) > _OPENAI_CLIENT_TOOL_SEARCH_MAX_RESULTS:
+            raise OpenAIProtocolError("search_tools result matches must be a bounded list.")
+        names: set[str] = set()
+        for index, match in enumerate(matches):
+            if type(match) is not dict or set(match) != {
+                "tool_ref",
+                "tool_id",
+                "name",
+                "description",
+                "input_schema",
+                "descriptor_version",
+                "schema_fingerprint",
+                "readiness",
+            }:
+                raise OpenAIProtocolError(f"search_tools result match {index} is not canonical.")
+            match = cast("dict[str, Any]", match)
+            name = match.get("name")
+            if not isinstance(name, str) or name in names:
+                raise OpenAIProtocolError("search_tools result tool names must be unique.")
+            if match.get("readiness") != "registered":
+                raise OpenAIProtocolError("search_tools result contains an unready tool.")
+            names.add(name)
+            # Search results are durable transcript evidence, but callable
+            # authority belongs to the current branch-local discovery view. A
+            # fork starts with an empty view, so inherited matches must replay as
+            # an empty client Tool Search output instead of reloading parent tools.
+            trusted_tool = trusted_tools.get(name)
+            if trusted_tool is None:
+                continue
+            if (
+                match.get("description") != trusted_tool["description"]
+                or match.get("input_schema") != trusted_tool["input_schema"]
+            ):
+                raise OpenAIProtocolError(
+                    "search_tools result conflicts with the trusted loaded definition."
+                )
+            tools.append(_openai_tool(trusted_tool))
+    return {
+        "type": "tool_search_output",
+        "call_id": part.tool_call_id,
+        "execution": "client",
+        "tools": tools,
         "status": "completed",
     }
 
@@ -4219,6 +4912,44 @@ def _openai_tool(tool: Mapping[str, Any]) -> dict[str, Any]:
         "parameters": copy_json_value(input_schema, "input_schema"),
         "strict": False,
     }
+
+
+def _openai_request_tools(request: ModelRequest) -> list[dict[str, Any]]:
+    projection = request.tool_discovery_projection
+    if projection is None:
+        return [_openai_tool(tool) for tool in request.tools]
+    for name in projection.loaded_tool_names:
+        _validate_openai_tool_name(name)
+    cache_anchor_name = targeted_tool_native_cache_anchor_name(request.options)
+    search_indexes = [
+        index
+        for index, tool in enumerate(request.tools)
+        if tool.get("name") == _CAYU_SEARCH_TOOLS_NAME
+    ]
+    if len(search_indexes) != 1:
+        raise ValueError("OpenAI client Tool Search requires one exact search_tools definition.")
+    projected: list[dict[str, Any]] = []
+    for index, tool in enumerate(request.tools):
+        name = tool.get("name")
+        if index == search_indexes[0]:
+            function = _openai_tool(tool)
+            projected.append(
+                {
+                    "type": "tool_search",
+                    "execution": "client",
+                    "description": _OPENAI_CLIENT_TOOL_SEARCH_DESCRIPTION,
+                    "parameters": function["parameters"],
+                }
+            )
+            continue
+        if (
+            name == _CAYU_CALL_TOOL_NAME
+            and cache_anchor_name != _CAYU_CALL_TOOL_NAME
+            and not call_tool_core_callable(request.options)
+        ):
+            continue
+        projected.append(_openai_tool(tool))
+    return projected
 
 
 def _openai_tool_name(tool: Mapping[str, Any]) -> str:
