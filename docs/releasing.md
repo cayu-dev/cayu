@@ -103,15 +103,14 @@ PyPI access.
    git push origin "v${version}"
    ```
 
-4. Wait for the `static`, `test`, `sqlite-cancellation`, `package`,
-   `windows-dashboard-artifact`, and `dashboard` jobs to pass on the tagged commit. The
+4. Wait for `static`, all `test_shards` and `test_specialists` workers,
+   `sqlite-cancellation`, `package`, and `dashboard` to pass on the tagged commit. The
    `package` job checks that the tag matches the project version and uploads the exact
-   distribution it validated. Its artifact gate verifies identical dashboard-source bundles in
-   the wheel and sdist, ejects from both installed artifacts, installs the locked Node
-   dependencies, runs lint/tests/typechecking/API drift checks, reproduces the packaged dashboard
-   tree, and browser-smokes a non-root deep link plus a bounded control-plane read against the
-   installed server. The Windows artifact job separately verifies native extraction, inherited
-   permissions, and the installed API-check workflow.
+   distribution it validated. It verifies identical dashboard-source bundles in the wheel and
+   sdist, ejects from both installed artifacts, installs the locked Node dependencies, runs
+   lint/tests/typechecking/API drift checks, reproduces the packaged dashboard tree,
+   browser-smokes a non-root deep link plus a bounded control-plane read against the installed
+   server, and verifies the ARM64 sidecar image.
 5. Confirm the environment request names the expected tag and commit, then
    approve the `pypi` deployment.
 6. Wait for PyPI publication and the dependent GitHub release to complete.

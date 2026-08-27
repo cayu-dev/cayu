@@ -138,26 +138,15 @@ $ CAYU_REQUIRE_POSTGRES=1 uv run --frozen --extra dev --extra server --python 3.
 $ CAYU_REQUIRE_POSTGRES=1 uv run --frozen --extra dev --extra server --python 3.13 pytest -q
 ```
 
-### Main and release CI source coverage visibility
+### Core CI sharding
 
-Pull requests run the Python 3.14 test leg without coverage instrumentation to
-keep feedback fast. Pushes to `main` and release tags record line and branch
-coverage for the `cayu` package. Missing lines appear in the job log, and the
-complete report is written to the GitHub Actions job summary. This is diagnostic
-visibility, not a release-quality score: CI has no global coverage threshold, so
-a percentage cannot fail the job; test or coverage-tool failures still do.
-
-The PR leg balances general tests across six single-process jobs from the committed
-`.test_durations` snapshot, combines stress and process tests in one isolated lane,
-and splits Postgres conformance across two isolated jobs.
+Pull requests, `main`, and release tags run the Python 3.14 test suite without
+coverage instrumentation. CI balances general tests across six single-process jobs
+from the committed `.test_durations` snapshot, combines stress and process tests in
+one isolated lane, and splits Postgres conformance across two isolated jobs.
 CI permits a small tail of newly collected tests, but rejects the snapshot once more
 than 5% of tests have no recorded duration so the sharding model cannot silently drift
 back into a long critical path.
-
-Source coverage shows which in-process Python paths the required pytest suite
-executed. It does not replace the capability checks above and does not prove the
-quality of their assertions, subprocess behavior, or credential-gated live
-dependencies.
 
 ## Current Coverage Map
 

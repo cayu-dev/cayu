@@ -188,10 +188,11 @@ future schedules retain the evidence for the published transition and become
 freshness-gated when they take effect. A gap or expired current price triggers
 verification rather than falling back to another schedule.
 
-Ordinary PR CI does not make an unchanged branch fail solely because wall time passed.
-The weekly maintenance workflow performs the freshness audit, and release-tag
-verification enforces it for published artifacts. Installed releases remain offline and
-deterministic; applications decide when to upgrade or replace either snapshot.
+Ordinary PR and `main` CI do not make an unchanged branch fail solely because wall time
+passed. Release-tag verification enforces freshness for published artifacts; maintainers
+run the documented local refresh when that gate reports stale records. Installed releases
+remain offline and deterministic; applications decide when to upgrade or replace either
+snapshot.
 
 ## Repository maintenance
 

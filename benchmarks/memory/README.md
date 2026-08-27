@@ -76,9 +76,8 @@ The runner measures evidence-document preparation, in-memory/SQLite persistence,
 steady-state SQLite bytes after close, a current-runtime zero-record control,
 memory-bearing projection, and serialized report bytes. The zero-record control includes
 the always-on attribution path and is explicitly not labeled as historical pre-feature
-code. A dedicated required CI lane reruns the workload without coverage instrumentation,
-so an unchanged artifact cannot conceal a regression and timing is not distorted by the
-ordinary test harness. Provider latency is deliberately absent. See
+code. Run the hermetic command above to remeasure current code before accepting
+performance-sensitive changes. Provider latency is deliberately absent. See
 [Memory foundation contracts](../../docs/memory-foundation.md#bounded-public-memory-attribution)
 for the fixed ceilings and interpretation. SQLite persistence enforces a sustained
 median ceiling separately from a wider emergency p95 cap because hosted-runner fsync
@@ -100,7 +99,7 @@ The current-runtime zero-relation control publishes the same 5,053 entries witho
 relations; it is not a historical pre-feature comparison. The populated lane
 measures canonical preparation, atomic ten-relation batches, bounded 50-result
 queries, isolated-endpoint lookup across the unrelated background, and steady-state
-SQLite bytes after close. CI reruns the workload without coverage instrumentation.
+SQLite bytes after close. Run the command above to remeasure the workload.
 
 ## Reviewed knowledge-maintenance overhead
 

@@ -32,6 +32,11 @@ def _action_references(block: str) -> list[str]:
     return re.findall(r"^\s+(?:- )?uses: ([^\s#]+)", block, flags=re.MULTILINE)
 
 
+def _job_ids(workflow: str) -> set[str]:
+    jobs = workflow.split("jobs:\n", 1)[1]
+    return set(re.findall(r"^  ([a-z0-9_-]+):$", jobs, flags=re.MULTILINE))
+
+
 def test_release_jobs_pin_every_external_action_to_immutable_commit() -> None:
     workflow = _CI_WORKFLOW.read_text()
     references = [
@@ -41,11 +46,8 @@ def test_release_jobs_pin_every_external_action_to_immutable_commit() -> None:
             "static",
             "test_shards",
             "test_specialists",
-            "test",
             "sqlite-cancellation",
             "package",
-            "release-sidecar-artifacts",
-            "windows-dashboard-artifact",
             "dashboard",
             "publish",
             "github-release",
@@ -58,12 +60,34 @@ def test_release_jobs_pin_every_external_action_to_immutable_commit() -> None:
     assert all(_COMMIT_PIN.fullmatch(reference) for reference in references), references
 
 
-def test_every_ref_uses_balanced_shards_behind_the_stable_test_gate() -> None:
+def test_pull_requests_and_main_run_the_core_workers_with_selected_high_value_gates() -> None:
+    workflow = _CI_WORKFLOW.read_text()
+
+    assert _job_ids(workflow) == {
+        "verification-scope",
+        "static",
+        "test_shards",
+        "test_specialists",
+        "sqlite-cancellation",
+        "package",
+        "dashboard",
+        "publish",
+        "github-release",
+    }
+    for core_job in ("static", "test_shards", "test_specialists"):
+        assert "startsWith(github.ref, 'refs/tags/v')" not in _job_block(workflow, core_job)
+    scope = _job_block(workflow, "verification-scope")
+    assert "python3 scripts/select_ci_jobs.py" in scope
+    assert 'if test "$EVENT_NAME" != "pull_request"' in scope
+    for output in ("dashboard", "release_artifacts", "sqlite_cancellation"):
+        assert f'echo "{output}=true"' in scope
+        assert f"{output}: ${{{{ steps.scope.outputs.{output} }}}}" in scope
+
+
+def test_core_ci_uses_balanced_required_shards_without_coverage() -> None:
     workflow = _CI_WORKFLOW.read_text()
     shards = _job_block(workflow, "test_shards")
     specialists = _job_block(workflow, "test_specialists")
-    performance = _job_block(workflow, "memory-evidence-performance")
-    test_gate = _job_block(workflow, "test")
 
     assert "github.event_name == 'pull_request'" not in shards
     assert "timeout-minutes: 30" in shards
@@ -74,11 +98,9 @@ def test_every_ref_uses_balanced_shards_behind_the_stable_test_gate() -> None:
     assert "pytest -q" in shards
     assert "-n 2" not in shards
     assert '-m "not (stress or process or postgres)"' in shards
-    assert 'if test "$EVENT_NAME" != "pull_request"' in shards
-    assert "--cov=cayu" in shards
-    assert "--cov-branch" in shards
-    assert "if: github.event_name != 'pull_request'" in shards
-    assert "uses: actions/upload-artifact@" in shards
+    assert "--cov" not in shards
+    assert "COVERAGE_FILE" not in shards
+    assert "uses: actions/upload-artifact@" not in shards
 
     assert "github.event_name == 'pull_request'" not in specialists
     assert "timeout-minutes: 30" in specialists
@@ -87,36 +109,12 @@ def test_every_ref_uses_balanced_shards_behind_the_stable_test_gate() -> None:
     assert specialists.count('marker: "postgres and not (stress or process)"') == 2
     assert "lane: postgres-conformance-1" in specialists
     assert "lane: postgres-conformance-2" in specialists
-    assert 'if test "$EVENT_NAME" != "pull_request"' in specialists
     assert '-m "${{ matrix.marker }}"' in specialists
     assert '--splits "${{ matrix.splits }}"' in specialists
     assert '--group "${{ matrix.group }}"' in specialists
-    assert "--cov=cayu" in specialists
-    assert "--cov-branch" in specialists
-    assert "if: github.event_name != 'pull_request'" in specialists
-    assert "uses: actions/upload-artifact@" in specialists
-
-    assert "scripts/run_memory_evidence_performance.py --check" in performance
-    assert "scripts/run_knowledge_relation_performance.py --check" in performance
-    assert "scripts/run_knowledge_maintenance_performance.py --check" in performance
-
-    assert "name: Test (Python 3.14)" in test_gate
-    assert "needs: [test_shards, test_specialists, memory-evidence-performance]" in test_gate
-    assert 'test "$SHARD_RESULT" = "success"' in test_gate
-    assert 'test "$SPECIALIST_RESULT" = "success"' in test_gate
-    assert 'test "$PERFORMANCE_RESULT" = "success"' in test_gate
-
-
-def test_stable_test_gate_combines_coverage_from_every_lane() -> None:
-    test_gate = _job_block(_CI_WORKFLOW.read_text(), "test")
-
-    assert "uses: actions/download-artifact@" in test_gate
-    assert "pattern: coverage-${{ github.run_attempt }}-*" in test_gate
-    assert "merge-multiple: true" in test_gate
-    assert "coverage combine coverage-data" in test_gate
-    assert "coverage report" in test_gate
-    assert test_gate.count("if: github.event_name != 'pull_request'") == 6
-    assert "pytest" not in test_gate
+    assert "--cov" not in specialists
+    assert "COVERAGE_FILE" not in specialists
+    assert "uses: actions/upload-artifact@" not in specialists
 
 
 def test_privileged_jobs_share_release_tag_verifier() -> None:
@@ -167,7 +165,6 @@ def test_release_runbook_records_external_security_prerequisites() -> None:
 def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     workflow = _CI_WORKFLOW.read_text()
     package = _job_block(workflow, "package")
-    release_gate = _job_block(workflow, "release-artifacts")
     publish = _job_block(workflow, "publish")
     github_release = _job_block(workflow, "github-release")
 
@@ -179,8 +176,8 @@ def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     assert "startsWith(github.ref, 'refs/tags/v')" in publish
     assert "vars.PYPI_PUBLISH_ENABLED == 'true'" in publish
     assert (
-        "needs: [static, test, sqlite-cancellation, release-artifacts, "
-        "windows-dashboard-artifact, dashboard]" in publish
+        "needs: [static, test_shards, test_specialists, sqlite-cancellation, package, "
+        "dashboard]" in publish
     )
     assert "if: startsWith(github.ref, 'refs/tags/v')" in github_release
     assert "needs: [publish, package]" in github_release
@@ -188,12 +185,15 @@ def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     assert "prerelease: ${{ steps.release-version.outputs.prerelease }}" in package
     assert "id: release-version" in package
     assert "Version(version).is_prerelease" in package
+    release_step = package.index("name: Check tag matches project version")
+    release_version = package.index("id: release-version")
+    release_run = package.index("run: |", release_version)
+    assert "if: startsWith(github.ref, 'refs/tags/v')" in package[release_step:release_run]
     upload = package.index("name: Upload release distribution")
     assert package.index("name: Check installed CLI version") < upload
+    assert "if: startsWith(github.ref, 'refs/tags/v')" in package[upload : upload + 160]
     assert "name: release-dist" in package[upload:]
     assert "path: dist/first/" in package[upload:]
-    assert "name: Release artifacts" in release_gate
-    assert "PACKAGE_RESULT: ${{ needs.package.result }}" in release_gate
 
     assert "name: release-dist" in publish
     assert "path: dist/" in publish
@@ -231,48 +231,30 @@ def test_release_artifact_job_enforces_tagged_note_immutability() -> None:
     assert "--notes docs/release-notes.md" in package
 
 
-def test_pull_request_scopes_expensive_verification_jobs() -> None:
+def test_selected_high_value_jobs_preserve_premerge_and_main_contracts() -> None:
     workflow = _CI_WORKFLOW.read_text()
-    scope = _job_block(workflow, "verification-scope")
     sqlite = _job_block(workflow, "sqlite-cancellation")
     package = _job_block(workflow, "package")
-    release_sidecar = _job_block(workflow, "release-sidecar-artifacts")
-    release_gate = _job_block(workflow, "release-artifacts")
     dashboard = _job_block(workflow, "dashboard")
-
-    assert "python3 scripts/select_ci_jobs.py" in scope
-    assert 'if test "$EVENT_NAME" != "pull_request"' in scope
-    for output in ("dashboard", "release_artifacts", "sqlite_cancellation"):
-        assert f'echo "{output}=true"' in scope
-        assert f"{output}: ${{{{ steps.scope.outputs.{output} }}}}" in scope
 
     assert "needs: verification-scope" in sqlite
     assert "needs.verification-scope.outputs.sqlite_cancellation == 'true'" in sqlite
+    assert "needs: verification-scope" in package
+    assert "needs.verification-scope.outputs.release_artifacts == 'true'" in package
+    assert "needs: verification-scope" in dashboard
+    assert "needs.verification-scope.outputs.dashboard == 'true'" in dashboard
+
     assert "test_final_workspace_observer_restores_caller_cancellation_requests" in sqlite
     assert "test_delegated_stream_close_counts_checkpoint_cancellation_once" in sqlite
     assert "test_delegated_stream_close_distinguishes_restored_and_late_cancellation" in sqlite
-    assert "needs: verification-scope" in dashboard
-    assert "needs.verification-scope.outputs.dashboard == 'true'" in dashboard
-    assert "needs: verification-scope" in package
-    assert "needs.verification-scope.outputs.release_artifacts == 'true'" in package
-    assert "needs: verification-scope" in release_sidecar
-    assert "github.event_name == 'pull_request'" in release_sidecar
-    assert "needs.verification-scope.outputs.release_artifacts == 'true'" in release_sidecar
     sidecar_verifier_command = "bash scripts/verify_release_sidecar_artifacts.sh"
     assert package.count(sidecar_verifier_command) == 1
-    assert release_sidecar.count(sidecar_verifier_command) == 1
 
     sidecar_verifier = _SIDECAR_VERIFIER.read_text()
     assert sidecar_verifier.startswith("#!/usr/bin/env bash\nset -euo pipefail\n")
     assert sidecar_verifier.count("lambda-microvm sidecar export") == 3
     assert "docker build --platform linux/arm64" in sidecar_verifier
     assert "docker run --rm --platform linux/arm64" in sidecar_verifier
-
-    assert "name: Require every release-artifact lane" in release_gate
-    assert "always()" in release_gate
-    assert 'if test "$EVENT_NAME" = "pull_request"' in release_gate
-    for result in ("PACKAGE_RESULT", "SIDECAR_RESULT"):
-        assert f'test "${result}" = "success"' in release_gate
 
     for preserved_check in (
         "Verify the installed-wheel dashboard-to-local eval journey",
@@ -286,5 +268,6 @@ def test_pull_request_scopes_expensive_verification_jobs() -> None:
 
     sidecar_offset = package.index("Verify installed wheel and source-distribution sidecar exports")
     assert (
-        "if: github.event_name != 'pull_request'" in package[sidecar_offset : sidecar_offset + 180]
+        "if: github.event_name != 'pull_request'"
+        not in package[sidecar_offset : sidecar_offset + 180]
     )

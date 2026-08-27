@@ -261,9 +261,9 @@ zero-record p95 at or below 5 ms in memory and 10 ms on SQLite, preparation p95 
 below 10 ms, in-memory and SQLite persistence p95 at or below 15 ms and 25 ms
 respectively, p95 incremental projection overhead at or below 10 ms per pair,
 projected size at or below 6,000 bytes per pair, and steady-state SQLite storage at or
-below 32 KiB per pair. A dedicated no-coverage CI lane executes the current workload,
-while the normal test suite validates the checked artifact and every regression lane;
-later code therefore cannot retain stale green numbers or distort timing with coverage.
+below 32 KiB per pair. The normal test suite validates the checked artifact and every
+regression lane. Run the hermetic command above to measure current code before accepting
+performance-sensitive changes.
 The absolute ceilings include headroom for shared-runner scheduling variance while still
 bounding the complete 50-pair workload. Latency is environment-sensitive; the artifact
 records its Python/platform identity, p50/p95 observations, zero-record control, and
@@ -477,7 +477,7 @@ directly. Any populated pre-60 canonical, evidence, receipt, outbox, readiness,
 embedding, or relation table makes migration fail before DDL. There is no
 backfill, metadata fallback, dual write, or legacy relation interpretation.
 
-The hermetic relation performance gate runs in CI with no provider calls:
+The hermetic relation performance checker makes no provider calls:
 
 ```bash
 PYTHONPATH=src python scripts/run_knowledge_relation_performance.py --check

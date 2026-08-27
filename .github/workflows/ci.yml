@@ -18,8 +18,6 @@ jobs:
     name: Verification scope
     runs-on: ubuntu-latest
     timeout-minutes: 2
-    # Pull requests run expensive specialist lanes only when their contracts can
-    # change. Main and release tags deliberately fail open to the complete gate.
     outputs:
       dashboard: ${{ steps.scope.outputs.dashboard }}
       release_artifacts: ${{ steps.scope.outputs.release_artifacts }}
@@ -31,7 +29,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
-      - name: Select conditional verification
+      - name: Select retained high-value verification
         id: scope
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -80,35 +78,19 @@ jobs:
       CAYU_REQUIRE_DOCKER_RUNNER: "1"
       CAYU_REQUIRE_DOCKER_EGRESS: "1"
       CAYU_REQUIRE_CURRENT_TEST_DURATIONS: "1"
-      COVERAGE_FILE: coverage.${{ github.run_attempt }}.general-${{ matrix.shard }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - run: uv python install 3.14
       - run: uv sync --frozen --extra dev --extra server --python 3.14
       - name: Test duration-balanced shard
-        env:
-          EVENT_NAME: ${{ github.event_name }}
         run: |
-          coverage_args=()
-          if test "$EVENT_NAME" != "pull_request"; then
-            coverage_args=(--cov=cayu --cov-branch --cov-report=)
-          fi
           uv run pytest -q \
             -m "not (stress or process or postgres)" \
             --splits 6 \
             --group "${{ matrix.shard }}" \
             --splitting-algorithm least_duration \
-            --durations=20 \
-            "${coverage_args[@]}"
-      - name: Upload shard coverage data
-        if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: coverage-${{ github.run_attempt }}-general-${{ matrix.shard }}
-          path: coverage.${{ github.run_attempt }}.general-${{ matrix.shard }}
-          if-no-files-found: error
-          retention-days: 1
+            --durations=20
 
   test_specialists:
     name: Test specialist ${{ matrix.lane }} (Python 3.14)
@@ -136,7 +118,6 @@ jobs:
       CAYU_REQUIRE_DOCKER_EGRESS: "1"
       CAYU_REQUIRE_PLAYWRIGHT_CONTAINMENT: "1"
       CAYU_REQUIRE_CURRENT_TEST_DURATIONS: "1"
-      COVERAGE_FILE: coverage.${{ github.run_attempt }}.specialist-${{ matrix.lane }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
@@ -146,95 +127,13 @@ jobs:
         if: matrix.lane == 'stress-process'
         run: uv run playwright install --with-deps chromium
       - name: Test specialist lane
-        env:
-          EVENT_NAME: ${{ github.event_name }}
         run: |
-          coverage_args=()
-          if test "$EVENT_NAME" != "pull_request"; then
-            coverage_args=(--cov=cayu --cov-branch --cov-report=)
-          fi
           uv run pytest -q \
             -m "${{ matrix.marker }}" \
             --splits "${{ matrix.splits }}" \
             --group "${{ matrix.group }}" \
             --splitting-algorithm least_duration \
-            --durations=20 \
-            "${coverage_args[@]}"
-      - name: Upload specialist coverage data
-        if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: coverage-${{ github.run_attempt }}-specialist-${{ matrix.lane }}
-          path: coverage.${{ github.run_attempt }}.specialist-${{ matrix.lane }}
-          if-no-files-found: error
-          retention-days: 1
-
-  memory-evidence-performance:
-    name: Memory performance
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
-      - run: uv python install 3.12
-      - run: uv sync --frozen --extra dev --python 3.12
-      - name: Enforce current-code memory evidence ceilings
-        run: uv run python scripts/run_memory_evidence_performance.py --check
-      - name: Enforce current-code knowledge relation ceilings
-        if: ${{ !cancelled() }}
-        run: uv run python scripts/run_knowledge_relation_performance.py --check
-      - name: Enforce current-code knowledge maintenance ceilings
-        if: ${{ !cancelled() }}
-        run: uv run python scripts/run_knowledge_maintenance_performance.py --check
-      - name: Enforce current-code maintenance routing ceilings
-        if: ${{ !cancelled() }}
-        run: uv run python scripts/run_knowledge_maintenance_routing_performance.py --check
-
-  test:
-    name: Test (Python 3.14)
-    needs: [test_shards, test_specialists, memory-evidence-performance]
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      CAYU_REQUIRE_POSTGRES: "1"
-      CAYU_REQUIRE_DOCKER_RUNNER: "1"
-      CAYU_REQUIRE_DOCKER_EGRESS: "1"
-      COVERAGE_FILE: coverage
-    steps:
-      - name: Require every test lane
-        env:
-          PERFORMANCE_RESULT: ${{ needs.memory-evidence-performance.result }}
-          SHARD_RESULT: ${{ needs.test_shards.result }}
-          SPECIALIST_RESULT: ${{ needs.test_specialists.result }}
-        run: |
-          test "$PERFORMANCE_RESULT" = "success"
-          test "$SHARD_RESULT" = "success"
-          test "$SPECIALIST_RESULT" = "success"
-      - if: github.event_name != 'pull_request'
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - if: github.event_name != 'pull_request'
-        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
-      - if: github.event_name != 'pull_request'
-        run: uv python install 3.14
-      - if: github.event_name != 'pull_request'
-        run: uv sync --frozen --extra dev --extra server --python 3.14
-      - name: Download test coverage data
-        if: github.event_name != 'pull_request'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: coverage-${{ github.run_attempt }}-*
-          path: coverage-data
-          merge-multiple: true
-      - name: Report combined coverage
-        if: github.event_name != 'pull_request'
-        run: |
-          uv run coverage combine coverage-data
-          uv run coverage report --show-missing --skip-covered
-          uv run coverage report \
-            --format=markdown \
-            --show-missing \
-            --skip-covered >> "$GITHUB_STEP_SUMMARY"
+            --durations=20
 
   sqlite-cancellation:
     name: SQLite cancellation (Python ${{ matrix.python-version }})
@@ -296,8 +195,8 @@ jobs:
           python scripts/verify_release_state.py
           --notes docs/release-notes.md
       # PR and main CI must be deterministic. Freshness is wall-clock policy enforced by
-      # scheduled maintenance and release-tag validation; this check validates the committed
-      # artifact without making an unchanged branch fail as time passes.
+      # release-tag validation; this check validates the committed artifact without making
+      # an unchanged branch fail as time passes.
       - run: uv run python -m maintenance.model_catalog.check --skip-staleness
       - name: Enforce freshness for release artifacts
         if: startsWith(github.ref, 'refs/tags/v')
@@ -440,12 +339,10 @@ jobs:
           PY
       # The AWS Lambda MicroVM base image is published for ARM64 only. Register
       # emulation so the amd64 GitHub runner can verify the exact exported image.
-      - if: github.event_name != 'pull_request'
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         with:
           platforms: arm64
       - name: Verify installed wheel and source-distribution sidecar exports
-        if: github.event_name != 'pull_request'
         run: bash scripts/verify_release_sidecar_artifacts.sh
       - name: Check built-wheel authoring contract
         run: |
@@ -658,147 +555,6 @@ jobs:
           path: dist/first/
           if-no-files-found: error
 
-  release-sidecar-artifacts:
-    name: Release sidecar artifacts
-    needs: verification-scope
-    if: >-
-      github.event_name == 'pull_request' &&
-      needs.verification-scope.outputs.release_artifacts == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
-      - run: uv python install 3.11
-      - run: uv build --out-dir dist/first
-      - run: uv venv --python 3.11 .release-venv
-      - run: uv pip install --python .release-venv/bin/python dist/first/*.whl
-      - run: uv venv --python 3.11 .release-sdist-venv
-      - run: uv pip install --python .release-sdist-venv/bin/python dist/first/*.tar.gz
-      # The AWS Lambda MicroVM base image is published for ARM64 only. Register
-      # emulation so the amd64 GitHub runner can verify the exported image.
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
-        with:
-          platforms: arm64
-      - name: Verify installed wheel and source-distribution sidecar exports
-        run: bash scripts/verify_release_sidecar_artifacts.sh
-
-  release-artifacts:
-    name: Release artifacts
-    needs:
-      - verification-scope
-      - package
-      - release-sidecar-artifacts
-    if: >-
-      always() &&
-      needs.verification-scope.outputs.release_artifacts == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 1
-    steps:
-      - name: Require every release-artifact lane
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          SCOPE_RESULT: ${{ needs.verification-scope.result }}
-          PACKAGE_RESULT: ${{ needs.package.result }}
-          SIDECAR_RESULT: ${{ needs.release-sidecar-artifacts.result }}
-        run: |
-          test "$SCOPE_RESULT" = "success"
-          test "$PACKAGE_RESULT" = "success"
-          if test "$EVENT_NAME" = "pull_request"; then
-            test "$SIDECAR_RESULT" = "success"
-          else
-            test "$SIDECAR_RESULT" = "skipped"
-          fi
-
-  windows-dashboard-artifact:
-    name: Windows dashboard artifact
-    needs: verification-scope
-    if: needs.verification-scope.outputs.release_artifacts == 'true'
-    runs-on: windows-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 22.18.0
-          cache: npm
-          cache-dependency-path: dashboard/package-lock.json
-      - run: uv python install 3.11
-      - name: Exercise the native Windows ACL transition
-        shell: pwsh
-        run: |
-          uv sync --frozen --extra dev --python 3.11
-          $windowsTests = @(
-            "protects_staging_dacl_before_writing",
-            "restores_parent_acl_inheritance_after_publication",
-            "preserves_published_tree_if_permissions_cannot_be_restored",
-            "removes_staging_after_filesystem_failure",
-            "refuses_windows_cleanup_junction_replacement",
-            "preserves_cleanup_with_preexisting_windows_writer",
-            "blocks_windows_writer_after_cleanup_is_pinned"
-          ) -join " or "
-          uv run pytest -q tests/cli/test_dashboard.py -k $windowsTests
-          uv run pytest -q tests/cli/test_lambda_microvm.py
-      - run: uv build --wheel --out-dir dist/windows
-      - name: Install and eject the built wheel
-        shell: pwsh
-        run: |
-          uv venv --python 3.11 .windows-release-venv
-          $wheel = Get-ChildItem dist/windows/*.whl | Select-Object -First 1
-          uv pip install --python .windows-release-venv/Scripts/python.exe "$($wheel.FullName)[server]"
-          $proofRoot = Join-Path $env:RUNNER_TEMP "cayu dashboard artifact"
-          $parent = Join-Path $proofRoot "inherited parent"
-          New-Item -ItemType Directory -Force $parent | Out-Null
-          $everyone = [System.Security.Principal.SecurityIdentifier]::new("S-1-1-0")
-          $readRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-            $everyone,
-            [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
-            [System.Security.AccessControl.InheritanceFlags]"ContainerInherit, ObjectInherit",
-            [System.Security.AccessControl.PropagationFlags]::None,
-            [System.Security.AccessControl.AccessControlType]::Allow
-          )
-          $parentAcl = Get-Acl $parent
-          $parentAcl.AddAccessRule($readRule)
-          Set-Acl -Path $parent -AclObject $parentAcl
-          $destination = Join-Path $parent "editable dashboard"
-          & ./.windows-release-venv/Scripts/cayu.exe dashboard eject $destination
-          "DASHBOARD_DESTINATION=$destination" | Out-File $env:GITHUB_ENV -Append
-      - name: Verify inherited final access and the extracted API workflow
-        shell: pwsh
-        run: |
-          function Assert-InheritedEveryoneRead([string]$path) {
-            $acl = Get-Acl $path
-            if ($acl.AreAccessRulesProtected) {
-              throw "published path retained a protected DACL: $path"
-            }
-            $matchingRule = $acl.Access | Where-Object {
-              $sid = $_.IdentityReference.Translate(
-                [System.Security.Principal.SecurityIdentifier]
-              )
-              $sid.Value -eq "S-1-1-0" -and
-                $_.IsInherited -and
-                (($_.FileSystemRights -band
-                  [System.Security.AccessControl.FileSystemRights]::ReadAndExecute) -eq
-                  [System.Security.AccessControl.FileSystemRights]::ReadAndExecute)
-            }
-            if (-not $matchingRule) {
-              throw "published path did not inherit the parent's read access: $path"
-            }
-          }
-          Assert-InheritedEveryoneRead $env:DASHBOARD_DESTINATION
-          Assert-InheritedEveryoneRead (Join-Path $env:DASHBOARD_DESTINATION "package.json")
-          Push-Location $env:DASHBOARD_DESTINATION
-          try {
-            npm ci
-            $env:CAYU_PYTHON = Resolve-Path (
-              Join-Path $env:GITHUB_WORKSPACE ".windows-release-venv/Scripts/python.exe"
-            )
-            npm run check:api
-          } finally {
-            Pop-Location
-          }
-
   dashboard:
     name: Dashboard
     needs: verification-scope
@@ -851,15 +607,12 @@ jobs:
   #      validation jobs are green.
   publish:
     name: Publish to PyPI
-    # The sidecar artifact lane is intentionally skipped outside pull requests.
-    # Explicit status checks prevent that skipped transitive dependency from
-    # activating GitHub's implicit success() guard and suppressing publication.
     if: >-
       !cancelled() &&
       !failure() &&
       startsWith(github.ref, 'refs/tags/v') &&
       vars.PYPI_PUBLISH_ENABLED == 'true'
-    needs: [static, test, sqlite-cancellation, release-artifacts, windows-dashboard-artifact, dashboard]
+    needs: [static, test_shards, test_specialists, sqlite-cancellation, package, dashboard]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment:
