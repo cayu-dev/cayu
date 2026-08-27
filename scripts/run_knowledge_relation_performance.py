@@ -19,6 +19,7 @@ from cayu import (
     InMemoryKnowledgeStore,
     KnowledgeAccessScope,
     KnowledgeEntry,
+    KnowledgeLineageQuery,
     KnowledgeRelation,
     KnowledgeRelationKind,
     KnowledgeRelationQuery,
@@ -45,10 +46,14 @@ _CEILINGS = {
     # multi-fold regression guard without failing ordinary runner variation.
     "memory_bounded_query_p95_ms": 50.0,
     "sqlite_bounded_query_p95_ms": 75.0,
+    "memory_bounded_lineage_query_p95_ms": 75.0,
+    "sqlite_bounded_lineage_query_p95_ms": 100.0,
     # A lookup for an isolated endpoint in a store containing thousands of
     # unrelated relations must stay index-bound instead of scanning the store.
     "memory_unrelated_lookup_p95_ms": 2.0,
     "sqlite_unrelated_lookup_p95_ms": 10.0,
+    "memory_unrelated_lineage_lookup_p95_ms": 2.0,
+    "sqlite_unrelated_lineage_lookup_p95_ms": 10.0,
     "sqlite_storage_bytes_per_relation": 32_768,
 }
 
@@ -220,8 +225,19 @@ async def _backend_result(
         ),
         limit=1,
     )
+    lineage_query = KnowledgeLineageQuery(
+        reference=query.reference,
+        limit=relation_count,
+        max_bytes=relation_count * 8_192,
+    )
+    unrelated_lineage_query = KnowledgeLineageQuery(
+        reference=unrelated_query.reference,
+        limit=1,
+    )
     query_latencies: list[float] = []
     unrelated_query_latencies: list[float] = []
+    lineage_query_latencies: list[float] = []
+    unrelated_lineage_query_latencies: list[float] = []
     for _ in range(query_iterations):
         started = time.perf_counter_ns()
         result = await populated_store.read_relations(query)
@@ -234,6 +250,26 @@ async def _backend_result(
         unrelated_query_latencies.append((time.perf_counter_ns() - started) / 1_000_000)
         if unrelated_result is None or unrelated_result.relations or unrelated_result.truncated:
             raise RuntimeError("Unrelated relation performance lookup returned records.")
+
+        started = time.perf_counter_ns()
+        lineage_result = await populated_store.inspect_lineage(lineage_query)
+        lineage_query_latencies.append((time.perf_counter_ns() - started) / 1_000_000)
+        if (
+            lineage_result is None
+            or len(lineage_result.links) != relation_count
+            or lineage_result.truncated
+        ):
+            raise RuntimeError("Bounded lineage performance query lost links.")
+
+        started = time.perf_counter_ns()
+        unrelated_lineage_result = await populated_store.inspect_lineage(unrelated_lineage_query)
+        unrelated_lineage_query_latencies.append((time.perf_counter_ns() - started) / 1_000_000)
+        if (
+            unrelated_lineage_result is None
+            or unrelated_lineage_result.links
+            or unrelated_lineage_result.truncated
+        ):
+            raise RuntimeError("Unrelated lineage performance lookup returned links.")
 
     await _close(zero_store)
     await _close(populated_store)
@@ -264,6 +300,8 @@ async def _backend_result(
         "relation_publish_latency_per_relation": _latency_summary(publication_per_relation),
         "bounded_query_latency": _latency_summary(query_latencies),
         "unrelated_lookup_latency": _latency_summary(unrelated_query_latencies),
+        "bounded_lineage_query_latency": _latency_summary(lineage_query_latencies),
+        "unrelated_lineage_lookup_latency": _latency_summary(unrelated_lineage_query_latencies),
         "zero_relation_storage_bytes": zero_storage_bytes,
         "populated_relation_storage_bytes": populated_storage_bytes,
         "storage_byte_overhead": storage_overhead,
@@ -289,6 +327,12 @@ def _ceiling_findings(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
             ]["p95_ms"],
             f"{backend}_bounded_query_p95_ms": result["bounded_query_latency"]["p95_ms"],
             f"{backend}_unrelated_lookup_p95_ms": result["unrelated_lookup_latency"]["p95_ms"],
+            f"{backend}_bounded_lineage_query_p95_ms": result["bounded_lineage_query_latency"][
+                "p95_ms"
+            ],
+            f"{backend}_unrelated_lineage_lookup_p95_ms": result[
+                "unrelated_lineage_lookup_latency"
+            ]["p95_ms"],
         }
         if backend == "sqlite":
             checks["sqlite_storage_bytes_per_relation"] = result["storage_bytes_per_relation"]

@@ -177,6 +177,23 @@ class KnowledgeRelationDirection(StrEnum):
     BOTH = "both"
 
 
+class KnowledgeLineageRole(StrEnum):
+    """Meaning of one relation from the inspected revision's perspective."""
+
+    SUPERSEDES = "supersedes"
+    SUPERSEDED_BY = "superseded_by"
+    DERIVED_FROM = "derived_from"
+    DERIVATION_SOURCE_FOR = "derivation_source_for"
+    CONTRADICTS = "contradicts"
+
+
+class KnowledgeLineageCurrentness(StrEnum):
+    """Whether both exact relation endpoints are still their logical current revisions."""
+
+    CURRENT = "current"
+    STALE = "stale"
+
+
 class KnowledgeMaintenanceDecisionKind(StrEnum):
     """Reviewer disposition for one exact maintenance proposal."""
 
@@ -1585,6 +1602,280 @@ class KnowledgeRelationResult(BaseModel):
             raise ValueError("A truncated relation page requires exactly one next cursor.")
         if self.next_cursor is not None and not self.relations:
             raise ValueError("An empty relation page cannot have a next cursor.")
+        return self
+
+
+class KnowledgeLineageLink(BaseModel):
+    """Privacy-safe relation projection around one exact inspected revision.
+
+    The projection deliberately excludes entry text, relation metadata, actors, and
+    policy payloads. It is therefore suitable for recall explanations without
+    granting ordinary read access to an archived predecessor's content.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    relation_id: str
+    kind: KnowledgeRelationKind
+    role: KnowledgeLineageRole
+    counterpart: KnowledgeRevisionRef
+    counterpart_current: KnowledgeRevisionRef
+    counterpart_status: KnowledgeStatus
+    currentness: KnowledgeLineageCurrentness
+    unresolved_contradiction: bool = False
+    created_at: datetime
+
+    @field_validator("relation_id")
+    @classmethod
+    def validate_relation_id(cls, value: str) -> str:
+        return _knowledge_relation_identity(value, "relation_id")
+
+    @field_validator("counterpart", "counterpart_current", mode="before")
+    @classmethod
+    def copy_reference(cls, value):
+        if isinstance(value, KnowledgeRevisionRef):
+            return copy_knowledge_revision_ref(value)
+        return value
+
+    @field_validator("unresolved_contradiction", mode="before")
+    @classmethod
+    def validate_unresolved_contradiction(cls, value) -> bool:
+        if type(value) is not bool:
+            raise ValueError("`unresolved_contradiction` must be a boolean.")
+        return value
+
+    @field_validator("created_at")
+    @classmethod
+    def validate_created_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("`created_at` must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_projection(self) -> KnowledgeLineageLink:
+        expected_kinds = {
+            KnowledgeLineageRole.SUPERSEDES: KnowledgeRelationKind.SUPERSEDES,
+            KnowledgeLineageRole.SUPERSEDED_BY: KnowledgeRelationKind.SUPERSEDES,
+            KnowledgeLineageRole.DERIVED_FROM: KnowledgeRelationKind.DERIVED_FROM,
+            KnowledgeLineageRole.DERIVATION_SOURCE_FOR: KnowledgeRelationKind.DERIVED_FROM,
+            KnowledgeLineageRole.CONTRADICTS: KnowledgeRelationKind.CONTRADICTS,
+        }
+        if expected_kinds[self.role] is not self.kind:
+            raise ValueError("Knowledge lineage role conflicts with relation kind.")
+        if self.counterpart.entry_id != self.counterpart_current.entry_id:
+            raise ValueError("Lineage counterpart exact/current identities must match.")
+        if self.counterpart.revision > self.counterpart_current.revision:
+            raise ValueError("A lineage counterpart cannot postdate its current revision.")
+        if (
+            self.currentness is KnowledgeLineageCurrentness.CURRENT
+            and self.counterpart != self.counterpart_current
+        ):
+            raise ValueError("A current lineage link requires a current counterpart.")
+        if self.unresolved_contradiction and (
+            self.kind is not KnowledgeRelationKind.CONTRADICTS
+            or self.currentness is not KnowledgeLineageCurrentness.CURRENT
+            or self.counterpart_status is not KnowledgeStatus.ACTIVE
+        ):
+            raise ValueError("Only a current active contradiction can be unresolved.")
+        return self
+
+
+class KnowledgeLineageQuery(BaseModel):
+    """Bounded filters for safe exact-revision lineage inspection."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        validate_default=True,
+    )
+
+    reference: KnowledgeRevisionRef
+    direction: KnowledgeRelationDirection = KnowledgeRelationDirection.BOTH
+    kinds: list[KnowledgeRelationKind] = Field(default_factory=list)
+    currentnesses: list[KnowledgeLineageCurrentness] = Field(
+        default_factory=lambda: list(KnowledgeLineageCurrentness)
+    )
+    counterpart_statuses: list[KnowledgeStatus] = Field(
+        default_factory=lambda: list(KnowledgeStatus)
+    )
+    unresolved_only: bool = False
+    limit: int = DEFAULT_KNOWLEDGE_LIMIT
+    max_bytes: int = DEFAULT_KNOWLEDGE_MAX_BYTES
+    cursor: str | None = None
+
+    @field_validator("reference", mode="before")
+    @classmethod
+    def copy_reference(cls, value):
+        if isinstance(value, KnowledgeRevisionRef):
+            return copy_knowledge_revision_ref(value)
+        return value
+
+    @field_validator("kinds", mode="before")
+    @classmethod
+    def copy_kinds(cls, value) -> list[KnowledgeRelationKind]:
+        return _copy_enum_filter(value, KnowledgeRelationKind, "kinds")
+
+    @field_validator("currentnesses", mode="before")
+    @classmethod
+    def copy_currentnesses(cls, value) -> list[KnowledgeLineageCurrentness]:
+        return _copy_enum_filter(value, KnowledgeLineageCurrentness, "currentnesses")
+
+    @field_validator("counterpart_statuses", mode="before")
+    @classmethod
+    def copy_counterpart_statuses(cls, value) -> list[KnowledgeStatus]:
+        return _copy_enum_filter(value, KnowledgeStatus, "counterpart_statuses")
+
+    @field_validator("currentnesses", "counterpart_statuses")
+    @classmethod
+    def validate_nonempty_filters(cls, value: list[Any], info) -> list[Any]:
+        if not value:
+            raise ValueError(f"`{info.field_name}` cannot be empty.")
+        return value
+
+    @field_validator("unresolved_only", mode="before")
+    @classmethod
+    def validate_unresolved_only(cls, value) -> bool:
+        if type(value) is not bool:
+            raise ValueError("`unresolved_only` must be a boolean.")
+        return value
+
+    @field_validator("limit")
+    @classmethod
+    def validate_limit(cls, value: int) -> int:
+        _validate_positive_int(value, "limit")
+        if value > MAX_KNOWLEDGE_RELATION_LIMIT:
+            raise ValueError(f"`limit` must be at most {MAX_KNOWLEDGE_RELATION_LIMIT}.")
+        return value
+
+    @field_validator("max_bytes")
+    @classmethod
+    def validate_max_bytes(cls, value: int) -> int:
+        _validate_positive_int(value, "max_bytes")
+        if value < MAX_KNOWLEDGE_RELATION_BYTES:
+            raise ValueError(
+                f"`max_bytes` must be at least {MAX_KNOWLEDGE_RELATION_BYTES} so "
+                "one valid lineage link can always advance the cursor."
+            )
+        return value
+
+    @field_validator("cursor")
+    @classmethod
+    def validate_cursor(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_knowledge_relation_cursor(value, "cursor")
+
+    @model_validator(mode="after")
+    def validate_unresolved_filter(self) -> KnowledgeLineageQuery:
+        if (
+            self.unresolved_only
+            and self.kinds
+            and (KnowledgeRelationKind.CONTRADICTS not in self.kinds)
+        ):
+            raise ValueError("`unresolved_only` requires the contradiction kind.")
+        if self.unresolved_only and (
+            KnowledgeLineageCurrentness.CURRENT not in self.currentnesses
+            or KnowledgeStatus.ACTIVE not in self.counterpart_statuses
+        ):
+            raise ValueError("`unresolved_only` requires current, active counterparts.")
+        return self
+
+
+class KnowledgeLineageResult(BaseModel):
+    """One bounded safe lineage page for an authorized exact revision."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    query: KnowledgeLineageQuery
+    reference_current: KnowledgeRevisionRef
+    reference_status: KnowledgeStatus
+    links: list[KnowledgeLineageLink] = Field(default_factory=list)
+    truncated: bool = False
+    next_cursor: str | None = None
+
+    @field_validator("query", mode="before")
+    @classmethod
+    def copy_query(cls, value):
+        if isinstance(value, KnowledgeLineageQuery):
+            return copy_knowledge_lineage_query(value)
+        return value
+
+    @field_validator("reference_current", mode="before")
+    @classmethod
+    def copy_reference(cls, value):
+        if isinstance(value, KnowledgeRevisionRef):
+            return copy_knowledge_revision_ref(value)
+        return value
+
+    @field_validator("links", mode="before")
+    @classmethod
+    def copy_links(cls, value):
+        if type(value) is not list:
+            raise ValueError("`links` must be a list.")
+        return [
+            copy_knowledge_lineage_link(item) if isinstance(item, KnowledgeLineageLink) else item
+            for item in value
+        ]
+
+    @field_validator("truncated", mode="before")
+    @classmethod
+    def validate_truncated(cls, value) -> bool:
+        if type(value) is not bool:
+            raise ValueError("`truncated` must be a boolean.")
+        return value
+
+    @field_validator("next_cursor")
+    @classmethod
+    def validate_next_cursor(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_knowledge_relation_cursor(value, "next_cursor")
+
+    @model_validator(mode="after")
+    def validate_page(self) -> KnowledgeLineageResult:
+        if self.reference_current.entry_id != self.query.reference.entry_id:
+            raise ValueError("Lineage exact/current reference identities must match.")
+        if self.reference_current.revision < self.query.reference.revision:
+            raise ValueError("Lineage current reference cannot predate the inspected revision.")
+        if len(self.links) > self.query.limit:
+            raise ValueError("`links` cannot contain more records than `query.limit`.")
+        keys = [(item.created_at, item.relation_id) for item in self.links]
+        if keys != sorted(set(keys)):
+            raise ValueError("Knowledge lineage links must have unique increasing page order.")
+        if any(not _knowledge_lineage_link_matches_query(item, self.query) for item in self.links):
+            raise ValueError("Knowledge lineage links must match the result query.")
+        if any(
+            item.currentness
+            is not (
+                KnowledgeLineageCurrentness.CURRENT
+                if (
+                    self.query.reference == self.reference_current
+                    and item.counterpart == item.counterpart_current
+                )
+                else KnowledgeLineageCurrentness.STALE
+            )
+            for item in self.links
+        ):
+            raise ValueError("A lineage link misstates its exact-revision currentness.")
+        if any(
+            item.unresolved_contradiction
+            != (
+                item.kind is KnowledgeRelationKind.CONTRADICTS
+                and item.currentness is KnowledgeLineageCurrentness.CURRENT
+                and self.reference_status is KnowledgeStatus.ACTIVE
+                and item.counterpart_status is KnowledgeStatus.ACTIVE
+            )
+            for item in self.links
+        ):
+            raise ValueError("A lineage contradiction misstates its unresolved lifecycle.")
+        serialized_bytes = sum(_knowledge_lineage_link_bytes(item) for item in self.links)
+        if serialized_bytes > self.query.max_bytes:
+            raise ValueError("Knowledge lineage page exceeds `query.max_bytes`.")
+        if self.truncated != (self.next_cursor is not None):
+            raise ValueError("A truncated lineage page requires exactly one next cursor.")
+        if self.next_cursor is not None and not self.links:
+            raise ValueError("An empty lineage page cannot have a next cursor.")
         return self
 
 
@@ -3181,6 +3472,18 @@ class KnowledgeStore(ABC):
             "This KnowledgeStore does not support revision-bound knowledge relations."
         )
 
+    async def inspect_lineage(
+        self,
+        query: KnowledgeLineageQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeLineageResult | None:
+        """Inspect safe lineage around one exact authorized revision."""
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support knowledge lineage inspection."
+        )
+
     async def publish_maintenance_proposal(
         self,
         entry: KnowledgeEntry,
@@ -4619,6 +4922,109 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         return _bounded_knowledge_relation_result(
             query,
             candidates,
+            fingerprint=fingerprint,
+        )
+
+    async def inspect_lineage(
+        self,
+        query: KnowledgeLineageQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeLineageResult | None:
+        scope = self._operation_access_scope(access_scope)
+        query = copy_knowledge_lineage_query(query)
+        fingerprint = _knowledge_lineage_query_fingerprint(query, scope)
+        cursor = _decode_knowledge_lineage_cursor(query.cursor, fingerprint=fingerprint)
+        access_now = datetime.now(UTC)
+        reference_exact = self._entry_revision(
+            query.reference.entry_id,
+            query.reference.revision,
+        )
+        reference_current = self._current_entry(query.reference.entry_id)
+        if (
+            reference_exact is None
+            or reference_current is None
+            or not _knowledge_scope_allows_lineage_endpoint(
+                scope,
+                reference_exact,
+                reference_current,
+                now=access_now,
+            )
+        ):
+            return None
+        candidates: list[KnowledgeLineageLink] = []
+        endpoint = (query.reference.entry_id, query.reference.revision)
+        for relation_id in self._relation_ids_by_endpoint.get(endpoint, ()):
+            relation = self._relations.get(relation_id)
+            if relation is None:
+                raise RuntimeError("In-memory knowledge relation endpoint index is inconsistent.")
+            if not _knowledge_relation_matches_lineage_query(relation, query):
+                continue
+            if cursor is not None and (relation.created_at, relation.id) <= (
+                cursor.created_at,
+                cursor.relation_id,
+            ):
+                continue
+            subject_exact = self._entry_revision(
+                relation.subject.entry_id,
+                relation.subject.revision,
+            )
+            subject_current = self._current_entry(relation.subject.entry_id)
+            object_exact = self._entry_revision(
+                relation.object.entry_id,
+                relation.object.revision,
+            )
+            object_current = self._current_entry(relation.object.entry_id)
+            if any(
+                item is None
+                for item in (subject_exact, subject_current, object_exact, object_current)
+            ):
+                raise RuntimeError("In-memory knowledge relation endpoint is missing.")
+            assert subject_exact is not None
+            assert subject_current is not None
+            assert object_exact is not None
+            assert object_current is not None
+            if not _knowledge_scope_allows_lineage_endpoint(
+                scope,
+                subject_exact,
+                subject_current,
+                now=access_now,
+            ) or not _knowledge_scope_allows_lineage_endpoint(
+                scope,
+                object_exact,
+                object_current,
+                now=access_now,
+            ):
+                continue
+            link = _knowledge_lineage_link(
+                relation_id=relation.id,
+                kind=relation.kind,
+                subject=relation.subject,
+                object_=relation.object,
+                created_at=relation.created_at,
+                reference=query.reference,
+                subject_current=KnowledgeRevisionRef(
+                    entry_id=subject_current.id,
+                    revision=subject_current.revision,
+                ),
+                subject_status=subject_current.status,
+                object_current=KnowledgeRevisionRef(
+                    entry_id=object_current.id,
+                    revision=object_current.revision,
+                ),
+                object_status=object_current.status,
+            )
+            if _knowledge_lineage_link_matches_query(link, query):
+                candidates.append(link)
+        candidates.sort(key=lambda item: (item.created_at, item.relation_id))
+        return _bounded_knowledge_lineage_result(
+            query,
+            reference_current=KnowledgeRevisionRef(
+                entry_id=reference_current.id,
+                revision=reference_current.revision,
+            ),
+            reference_status=reference_current.status,
+            candidates=candidates,
             fingerprint=fingerprint,
         )
 
@@ -6867,6 +7273,41 @@ def _require_knowledge_successor_access(
     _require_knowledge_entry_access(scope, entry, operation=operation)
 
 
+def _knowledge_scope_allows_lineage_endpoint(
+    scope: KnowledgeAccessScope,
+    exact: KnowledgeEntry,
+    current: KnowledgeEntry,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Authorize a safe reference while keeping archived content inaccessible.
+
+    The exact revision must satisfy the caller's complete scope. Its logical current
+    revision must satisfy the same scope, except that reviewed archival may be
+    observed as lifecycle metadata. Deleted, pending, expired, or otherwise
+    inaccessible authorities are never widened.
+    """
+
+    if exact.id != current.id or exact.revision > current.revision:
+        raise ValueError("Lineage exact/current endpoint authorities do not match.")
+    cutoff = datetime.now(UTC) if now is None else now
+    if not _knowledge_scope_allows_entry(scope, exact, now=cutoff):
+        return False
+    if _knowledge_scope_allows_entry(scope, current, now=cutoff):
+        return True
+    if current.status is not KnowledgeStatus.ARCHIVED:
+        return False
+    archived_scope = scope.model_copy(
+        update={
+            "allowed_statuses": sorted(
+                {*scope.allowed_statuses, KnowledgeStatus.ARCHIVED},
+                key=str,
+            )
+        }
+    )
+    return _knowledge_scope_allows_entry(archived_scope, current, now=cutoff)
+
+
 def copy_knowledge_entry(entry: KnowledgeEntry) -> KnowledgeEntry:
     if type(entry) is not KnowledgeEntry:
         raise TypeError("KnowledgeEntry instances must not be subclasses.")
@@ -6990,6 +7431,38 @@ def copy_knowledge_relation_query(query: KnowledgeRelationQuery) -> KnowledgeRel
         reference=copy_knowledge_revision_ref(query.reference),
         direction=query.direction,
         kinds=list(query.kinds),
+        limit=query.limit,
+        max_bytes=query.max_bytes,
+        cursor=query.cursor,
+    )
+
+
+def copy_knowledge_lineage_link(link: KnowledgeLineageLink) -> KnowledgeLineageLink:
+    if type(link) is not KnowledgeLineageLink:
+        raise TypeError("KnowledgeLineageLink instances must not be subclasses.")
+    return KnowledgeLineageLink(
+        relation_id=link.relation_id,
+        kind=link.kind,
+        role=link.role,
+        counterpart=copy_knowledge_revision_ref(link.counterpart),
+        counterpart_current=copy_knowledge_revision_ref(link.counterpart_current),
+        counterpart_status=link.counterpart_status,
+        currentness=link.currentness,
+        unresolved_contradiction=link.unresolved_contradiction,
+        created_at=link.created_at,
+    )
+
+
+def copy_knowledge_lineage_query(query: KnowledgeLineageQuery) -> KnowledgeLineageQuery:
+    if type(query) is not KnowledgeLineageQuery:
+        raise TypeError("KnowledgeLineageQuery instances must not be subclasses.")
+    return KnowledgeLineageQuery(
+        reference=copy_knowledge_revision_ref(query.reference),
+        direction=query.direction,
+        kinds=list(query.kinds),
+        currentnesses=list(query.currentnesses),
+        counterpart_statuses=list(query.counterpart_statuses),
+        unresolved_only=query.unresolved_only,
         limit=query.limit,
         max_bytes=query.max_bytes,
         cursor=query.cursor,
@@ -7620,6 +8093,114 @@ def _knowledge_relation_matches_query(
     return subject_matches or object_matches
 
 
+def _knowledge_relation_matches_lineage_query(
+    relation: KnowledgeRelation,
+    query: KnowledgeLineageQuery,
+) -> bool:
+    if query.kinds and relation.kind not in query.kinds:
+        return False
+    reference = query.reference
+    subject_matches = relation.subject == reference
+    object_matches = relation.object == reference
+    if relation.kind is KnowledgeRelationKind.CONTRADICTS:
+        return subject_matches or object_matches
+    if query.direction is KnowledgeRelationDirection.OUTGOING:
+        return subject_matches
+    if query.direction is KnowledgeRelationDirection.INCOMING:
+        return object_matches
+    return subject_matches or object_matches
+
+
+def _knowledge_lineage_link(
+    *,
+    relation_id: str,
+    kind: KnowledgeRelationKind,
+    subject: KnowledgeRevisionRef,
+    object_: KnowledgeRevisionRef,
+    created_at: datetime,
+    reference: KnowledgeRevisionRef,
+    subject_current: KnowledgeRevisionRef,
+    subject_status: KnowledgeStatus,
+    object_current: KnowledgeRevisionRef,
+    object_status: KnowledgeStatus,
+) -> KnowledgeLineageLink:
+    subject_matches = subject == reference
+    object_matches = object_ == reference
+    if not subject_matches and not object_matches:
+        raise ValueError("The inspected revision is not a relation endpoint.")
+    if kind is KnowledgeRelationKind.CONTRADICTS:
+        role = KnowledgeLineageRole.CONTRADICTS
+    elif kind is KnowledgeRelationKind.SUPERSEDES:
+        role = (
+            KnowledgeLineageRole.SUPERSEDES
+            if subject_matches
+            else KnowledgeLineageRole.SUPERSEDED_BY
+        )
+    else:
+        role = (
+            KnowledgeLineageRole.DERIVED_FROM
+            if subject_matches
+            else KnowledgeLineageRole.DERIVATION_SOURCE_FOR
+        )
+    counterpart = object_ if subject_matches else subject
+    counterpart_current = object_current if subject_matches else subject_current
+    counterpart_status = object_status if subject_matches else subject_status
+    currentness = (
+        KnowledgeLineageCurrentness.CURRENT
+        if (
+            subject.revision == subject_current.revision
+            and object_.revision == object_current.revision
+        )
+        else KnowledgeLineageCurrentness.STALE
+    )
+    unresolved = (
+        kind is KnowledgeRelationKind.CONTRADICTS
+        and currentness is KnowledgeLineageCurrentness.CURRENT
+        and subject_status is KnowledgeStatus.ACTIVE
+        and object_status is KnowledgeStatus.ACTIVE
+    )
+    return KnowledgeLineageLink(
+        relation_id=relation_id,
+        kind=kind,
+        role=role,
+        counterpart=counterpart,
+        counterpart_current=counterpart_current,
+        counterpart_status=counterpart_status,
+        currentness=currentness,
+        unresolved_contradiction=unresolved,
+        created_at=created_at,
+    )
+
+
+def _knowledge_lineage_link_matches_query(
+    link: KnowledgeLineageLink,
+    query: KnowledgeLineageQuery,
+) -> bool:
+    direction_matches = (
+        query.direction is KnowledgeRelationDirection.BOTH
+        or link.role is KnowledgeLineageRole.CONTRADICTS
+        or (
+            query.direction is KnowledgeRelationDirection.OUTGOING
+            and link.role in {KnowledgeLineageRole.SUPERSEDES, KnowledgeLineageRole.DERIVED_FROM}
+        )
+        or (
+            query.direction is KnowledgeRelationDirection.INCOMING
+            and link.role
+            in {
+                KnowledgeLineageRole.SUPERSEDED_BY,
+                KnowledgeLineageRole.DERIVATION_SOURCE_FOR,
+            }
+        )
+    )
+    return (
+        direction_matches
+        and (not query.kinds or link.kind in query.kinds)
+        and link.currentness in query.currentnesses
+        and link.counterpart_status in query.counterpart_statuses
+        and (not query.unresolved_only or link.unresolved_contradiction)
+    )
+
+
 def _knowledge_relation_query_fingerprint(
     query: KnowledgeRelationQuery,
     access_scope: KnowledgeAccessScope,
@@ -7639,6 +8220,28 @@ def _knowledge_relation_query_fingerprint(
     ).hexdigest()
 
 
+def _knowledge_lineage_query_fingerprint(
+    query: KnowledgeLineageQuery,
+    access_scope: KnowledgeAccessScope,
+) -> str:
+    query = copy_knowledge_lineage_query(query)
+    return sha256(
+        canonical_durable_json_bytes(
+            {
+                "contract": "cayu-knowledge-lineage-query-v1",
+                "reference": query.reference.model_dump(mode="json"),
+                "direction": query.direction.value,
+                "kinds": [kind.value for kind in query.kinds],
+                "currentnesses": [value.value for value in query.currentnesses],
+                "counterpart_statuses": [status.value for status in query.counterpart_statuses],
+                "unresolved_only": query.unresolved_only,
+                "access_scope_sha256": _knowledge_access_scope_sha256(access_scope),
+            },
+            "knowledge lineage query",
+        )
+    ).hexdigest()
+
+
 def _encode_knowledge_relation_cursor(
     *,
     fingerprint: str,
@@ -7653,6 +8256,25 @@ def _encode_knowledge_relation_cursor(
     raw = canonical_durable_json_bytes(
         cursor.model_dump(mode="json"),
         "knowledge relation cursor",
+    )
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return _bounded_knowledge_relation_cursor(encoded, "next_cursor")
+
+
+def _encode_knowledge_lineage_cursor(
+    *,
+    fingerprint: str,
+    link: KnowledgeLineageLink,
+) -> str:
+    cursor = _KnowledgeRelationCursor(
+        version=1,
+        fingerprint=fingerprint,
+        created_at=link.created_at,
+        relation_id=link.relation_id,
+    )
+    raw = canonical_durable_json_bytes(
+        cursor.model_dump(mode="json"),
+        "knowledge lineage cursor",
     )
     encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
     return _bounded_knowledge_relation_cursor(encoded, "next_cursor")
@@ -7679,6 +8301,31 @@ def _decode_knowledge_relation_cursor(
         raise ValueError(
             "Knowledge relation cursor does not match this reference, direction, "
             "kind filter, and access scope."
+        )
+    return parsed
+
+
+def _decode_knowledge_lineage_cursor(
+    cursor: str | None,
+    *,
+    fingerprint: str,
+) -> _KnowledgeRelationCursor | None:
+    if cursor is None:
+        return None
+    cursor = _bounded_knowledge_relation_cursor(cursor, "cursor")
+    try:
+        encoded = cursor.encode("ascii")
+        padding = b"=" * (-len(encoded) % 4)
+        raw = base64.b64decode(encoded + padding, altchars=b"-_", validate=True)
+        if base64.urlsafe_b64encode(raw).rstrip(b"=") != encoded:
+            raise ValueError("Non-canonical lineage cursor encoding.")
+        parsed = _KnowledgeRelationCursor.model_validate_json(raw)
+    except (binascii.Error, TypeError, UnicodeError, ValueError) as exc:
+        raise ValueError("Invalid knowledge lineage cursor.") from exc
+    if parsed.fingerprint != fingerprint:
+        raise ValueError(
+            "Knowledge lineage cursor does not match this reference, direction, "
+            "relation filters, lifecycle filters, and access scope."
         )
     return parsed
 
@@ -7718,6 +8365,54 @@ def _bounded_knowledge_relation_result(
     return KnowledgeRelationResult(
         query=query,
         relations=selected,
+        truncated=truncated,
+        next_cursor=next_cursor,
+    )
+
+
+def _knowledge_lineage_link_bytes(link: KnowledgeLineageLink) -> int:
+    return len(
+        canonical_durable_json_bytes(
+            link.model_dump(mode="json"),
+            "knowledge lineage link",
+        )
+    )
+
+
+def _bounded_knowledge_lineage_result(
+    query: KnowledgeLineageQuery,
+    *,
+    reference_current: KnowledgeRevisionRef,
+    reference_status: KnowledgeStatus,
+    candidates: list[KnowledgeLineageLink],
+    fingerprint: str,
+) -> KnowledgeLineageResult:
+    selected: list[KnowledgeLineageLink] = []
+    used_bytes = 0
+    for link in candidates:
+        if len(selected) >= query.limit:
+            break
+        link_bytes = _knowledge_lineage_link_bytes(link)
+        if used_bytes + link_bytes > query.max_bytes:
+            break
+        selected.append(copy_knowledge_lineage_link(link))
+        used_bytes += link_bytes
+    truncated = len(selected) < len(candidates)
+    next_cursor = (
+        _encode_knowledge_lineage_cursor(
+            fingerprint=fingerprint,
+            link=selected[-1],
+        )
+        if truncated and selected
+        else None
+    )
+    if truncated and not selected:
+        raise RuntimeError("A valid lineage link did not fit the minimum byte budget.")
+    return KnowledgeLineageResult(
+        query=query,
+        reference_current=reference_current,
+        reference_status=reference_status,
+        links=selected,
         truncated=truncated,
         next_cursor=next_cursor,
     )
@@ -8927,3 +9622,10 @@ def _validate_nonnegative_int(value: int, field_name: str) -> None:
 
 def _dedupe_strings(values: list[str]) -> list[str]:
     return list(dict.fromkeys(values))
+
+
+def _copy_enum_filter(value, enum_type: type[Any], field_name: str) -> list[Any]:
+    if type(value) is not list:
+        raise ValueError(f"`{field_name}` must be a list.")
+    copied = [item if isinstance(item, enum_type) else enum_type(item) for item in value]
+    return sorted(set(copied), key=lambda item: item.value)

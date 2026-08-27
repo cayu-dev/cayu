@@ -8908,6 +8908,14 @@ Postgres embedding operational contract:
   incoming/outgoing/both-direction lookup with optional kind filters, stable
   count/byte bounds, honest truncation, and a cursor bound to the complete query
   and access scope.
+- `KnowledgeLineageQuery` / `KnowledgeLineageResult`: the safe recall and
+  inspection projection around one exact revision. Each link records its
+  direction-relative role, exact/current counterpart reference, lifecycle
+  status, current/stale state, and whether a current active contradiction is
+  unresolved. Count, bytes, direction, relation kinds, currentness,
+  counterpart statuses, unresolved-only filtering, and pagination are bounded
+  and cursor-bound. Entry text, relation metadata, actor/policy material, and
+  evidence locators are never hydrated into this result.
 - `KnowledgeQuery`: scoped retrieval request with simple query text, structured
   keyword fields (`any_terms`, `all_terms`, `none_terms`, `phrases`), namespace,
   labels, kinds, status/visibility filters, aspects, impact targets, source
@@ -8974,6 +8982,9 @@ relation_receipt = await store.publish_relations(
 relation_page = await store.read_relations(
     KnowledgeRelationQuery(reference=relation.subject, limit=100)
 )
+lineage_page = await store.inspect_lineage(
+    KnowledgeLineageQuery(reference=relation.subject, limit=20)
+)
 await store.read_chunks(entry_id, revision=1, chunk_index=3, around=1)
 result = await store.search(query)
 listing = await store.list_entries(list_query)
@@ -8988,6 +8999,10 @@ authorizes the current revision. An authorized principal may retire it to
 `archived` or `deleted` without receiving read permission for that destination;
 promotion or reactivation still requires the destination status, namespace,
 labels, visibility, source, and expiration constraints to pass.
+`inspect_lineage(...)` preserves those dimensions but may reveal only the exact
+identity and `archived` current lifecycle state of an otherwise authorized
+predecessor; it never grants an ordinary archived-content read. Deleted,
+expired, relabeled, or foreign-scope endpoints remain hidden.
 
 Embeddings use a separate provider contract so model providers and vector stores
 do not need to share implementation details:

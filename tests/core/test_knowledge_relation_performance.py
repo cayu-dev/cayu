@@ -43,7 +43,9 @@ def test_knowledge_relation_performance_baseline_is_complete_and_bounded() -> No
             "preparation_latency_per_relation",
             "relation_publish_latency_per_relation",
             "bounded_query_latency",
+            "bounded_lineage_query_latency",
             "unrelated_lookup_latency",
+            "unrelated_lineage_lookup_latency",
         ):
             assert result[metric]["p50_ms"] <= result[metric]["p95_ms"]
         assert result["matched_relation_count"] == 50
@@ -67,7 +69,9 @@ def test_knowledge_relation_performance_check_detects_every_regression_lane() ->
         result["preparation_latency_per_relation"]["p95_ms"] = 10_000
         result["relation_publish_latency_per_relation"]["p95_ms"] = 10_000
         result["bounded_query_latency"]["p95_ms"] = 10_000
+        result["bounded_lineage_query_latency"]["p95_ms"] = 10_000
         result["unrelated_lookup_latency"]["p95_ms"] = 10_000
+        result["unrelated_lineage_lookup_latency"]["p95_ms"] = 10_000
     regressed[1]["storage_bytes_per_relation"] = 100_000
 
     findings = _RUNNER["_ceiling_findings"](regressed)

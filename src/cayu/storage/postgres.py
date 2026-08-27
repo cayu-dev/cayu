@@ -631,6 +631,9 @@ from cayu.storage.memory import (
     KnowledgeIndexReadinessConflict,
     KnowledgeIndexReadinessUpdate,
     KnowledgeIndexState,
+    KnowledgeLineageCurrentness,
+    KnowledgeLineageQuery,
+    KnowledgeLineageResult,
     KnowledgeListGroup,
     KnowledgeListItem,
     KnowledgeListQuery,
@@ -660,12 +663,14 @@ from cayu.storage.memory import (
     KnowledgeVisibility,
     _bounded_knowledge_evidence,
     _bounded_knowledge_index_identity,
+    _bounded_knowledge_lineage_result,
     _bounded_knowledge_relation_result,
     _copy_chunks_for_revision,
     _copy_entry_evidence,
     _copy_evidence_for_revision,
     _copy_knowledge_embedding_projections,
     _decode_knowledge_embedding_backfill_cursor,
+    _decode_knowledge_lineage_cursor,
     _decode_knowledge_relation_cursor,
     _encode_knowledge_embedding_backfill_cursor,
     _initialize_knowledge_change_consumer_state,
@@ -683,6 +688,8 @@ from cayu.storage.memory import (
     _knowledge_embedding_vector_sha256,
     _knowledge_entry_id,
     _knowledge_index_readiness_update_sha256,
+    _knowledge_lineage_link,
+    _knowledge_lineage_query_fingerprint,
     _knowledge_maintenance_access_snapshot,
     _knowledge_maintenance_access_snapshot_json,
     _knowledge_maintenance_identity,
@@ -694,6 +701,7 @@ from cayu.storage.memory import (
     _knowledge_relation_identity,
     _knowledge_relation_query_fingerprint,
     _knowledge_relation_semantic_key,
+    _knowledge_scope_allows_lineage_endpoint,
     _knowledge_scope_allows_maintenance_access_snapshot,
     _knowledge_scope_allows_relation_access_snapshot,
     _knowledge_scope_allows_snapshot,
@@ -735,6 +743,7 @@ from cayu.storage.memory import (
     copy_knowledge_embedding_identity,
     copy_knowledge_entry,
     copy_knowledge_index_readiness_update,
+    copy_knowledge_lineage_query,
     copy_knowledge_list_query,
     copy_knowledge_maintenance_decision,
     copy_knowledge_maintenance_decision_receipt,
@@ -11112,6 +11121,119 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         return _bounded_knowledge_relation_result(
             query,
             [_knowledge_relation_from_row(row) for row in rows],
+            fingerprint=fingerprint,
+        )
+
+    async def inspect_lineage(
+        self,
+        query: KnowledgeLineageQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeLineageResult | None:
+        scope = self._operation_access_scope(access_scope)
+        query = copy_knowledge_lineage_query(query)
+        fingerprint = _knowledge_lineage_query_fingerprint(query, scope)
+        cursor = _decode_knowledge_lineage_cursor(query.cursor, fingerprint=fingerprint)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await _begin_knowledge_read_snapshot(cur)
+            access_now = datetime.now(UTC)
+            reference_exact = await self._load_entry(
+                cur,
+                query.reference.entry_id,
+                revision=query.reference.revision,
+            )
+            reference_current = await self._load_entry(cur, query.reference.entry_id)
+            if (
+                reference_exact is None
+                or reference_current is None
+                or not _knowledge_scope_allows_lineage_endpoint(
+                    scope,
+                    reference_exact,
+                    reference_current,
+                    now=access_now,
+                )
+            ):
+                return None
+            relation_sql, relation_params = _postgres_relation_query_filter_sql(query)
+            lineage_sql, lineage_params = _postgres_lineage_filter_sql(query)
+            access_sql, access_params = _postgres_relation_access_scope_filter_sql(
+                scope,
+                allow_archived_current=True,
+                now=access_now,
+            )
+            cursor_sql = ""
+            cursor_params: list[object] = []
+            if cursor is not None:
+                cursor_sql = ' AND (relation.created_at, relation.id COLLATE "C") > (%s, %s)'
+                cursor_params.extend([cursor.created_at, cursor.relation_id])
+            await cur.execute(
+                cast(
+                    "LiteralString",
+                    """
+                    SELECT relation.id, relation.subject_entry_id,
+                           relation.subject_revision, relation.object_entry_id,
+                           relation.object_revision, relation.kind,
+                           relation.created_at,
+                           subject_current.revision, subject_current.status,
+                           object_current.revision, object_current.status
+                    FROM cayu_knowledge_relations AS relation
+                    JOIN cayu_knowledge_current_entries AS subject_current
+                      ON subject_current.id = relation.subject_entry_id
+                    JOIN cayu_knowledge_current_entries AS object_current
+                      ON object_current.id = relation.object_entry_id
+                    WHERE TRUE
+                    """
+                    + relation_sql
+                    + lineage_sql
+                    + cursor_sql
+                    + access_sql
+                    + ' ORDER BY relation.created_at, relation.id COLLATE "C" LIMIT %s',
+                ),
+                (
+                    *relation_params,
+                    *lineage_params,
+                    *cursor_params,
+                    *access_params,
+                    query.limit + 1,
+                ),
+            )
+            rows = await cur.fetchall()
+        links = [
+            _knowledge_lineage_link(
+                relation_id=str(row[0]),
+                kind=KnowledgeRelationKind(str(row[5])),
+                subject=KnowledgeRevisionRef(
+                    entry_id=str(row[1]),
+                    revision=int(row[2]),
+                ),
+                object_=KnowledgeRevisionRef(
+                    entry_id=str(row[3]),
+                    revision=int(row[4]),
+                ),
+                created_at=pg_support.to_utc(row[6]),
+                reference=query.reference,
+                subject_current=KnowledgeRevisionRef(
+                    entry_id=str(row[1]),
+                    revision=int(row[7]),
+                ),
+                subject_status=KnowledgeStatus(str(row[8])),
+                object_current=KnowledgeRevisionRef(
+                    entry_id=str(row[3]),
+                    revision=int(row[9]),
+                ),
+                object_status=KnowledgeStatus(str(row[10])),
+            )
+            for row in rows
+        ]
+        return _bounded_knowledge_lineage_result(
+            query,
+            reference_current=KnowledgeRevisionRef(
+                entry_id=reference_current.id,
+                revision=reference_current.revision,
+            ),
+            reference_status=reference_current.status,
+            candidates=links,
             fingerprint=fingerprint,
         )
 
@@ -30419,7 +30541,7 @@ def _postgres_knowledge_access_scope_filter_sql(
 
 
 def _postgres_relation_query_filter_sql(
-    query: KnowledgeRelationQuery,
+    query: KnowledgeRelationQuery | KnowledgeLineageQuery,
 ) -> tuple[str, list[object]]:
     entry_id = query.reference.entry_id
     revision = query.reference.revision
@@ -30454,10 +30576,13 @@ def _postgres_relation_query_filter_sql(
 
 def _postgres_relation_access_scope_filter_sql(
     scope: KnowledgeAccessScope,
+    *,
+    allow_archived_current: bool = False,
+    now: datetime | None = None,
 ) -> tuple[str, list[object]]:
     clauses: list[str] = []
     params: list[object] = []
-    access_now = datetime.now(UTC)
+    access_now = datetime.now(UTC) if now is None else now
     for entry_column, revision_column in (
         ("subject_entry_id", "subject_revision"),
         ("object_entry_id", "object_revision"),
@@ -30491,8 +30616,20 @@ def _postgres_relation_access_scope_filter_sql(
             """
         )
         params.extend(exact_access_params)
+        current_scope = (
+            scope.model_copy(
+                update={
+                    "allowed_statuses": sorted(
+                        {*scope.allowed_statuses, KnowledgeStatus.ARCHIVED},
+                        key=str,
+                    )
+                }
+            )
+            if allow_archived_current
+            else scope
+        )
         current_access_sql, current_access_params = _postgres_knowledge_access_scope_filter_sql(
-            scope,
+            current_scope,
             now=access_now,
         )
         clauses.append(
@@ -30506,6 +30643,40 @@ def _postgres_relation_access_scope_filter_sql(
             """
         )
         params.extend(current_access_params)
+    return " AND " + " AND ".join(clauses), params
+
+
+def _postgres_lineage_filter_sql(query: KnowledgeLineageQuery) -> tuple[str, list[object]]:
+    subject_is_anchor = "(relation.subject_entry_id = %s AND relation.subject_revision = %s)"
+    counterpart_status = (
+        f"CASE WHEN {subject_is_anchor} THEN object_current.status ELSE subject_current.status END"
+    )
+    current_relation = (
+        "(relation.subject_revision = subject_current.revision "
+        "AND relation.object_revision = object_current.revision)"
+    )
+    clauses = [f"{counterpart_status} = ANY(%s)"]
+    params: list[object] = [
+        query.reference.entry_id,
+        query.reference.revision,
+        [status.value for status in query.counterpart_statuses],
+    ]
+    current_values = set(query.currentnesses)
+    if len(current_values) == 1:
+        clauses.append(
+            current_relation
+            if KnowledgeLineageCurrentness.CURRENT in current_values
+            else f"NOT {current_relation}"
+        )
+    if query.unresolved_only:
+        clauses.extend(
+            [
+                "relation.kind = 'contradicts'",
+                current_relation,
+                "subject_current.status = 'active'",
+                "object_current.status = 'active'",
+            ]
+        )
     return " AND " + " AND ".join(clauses), params
 
 

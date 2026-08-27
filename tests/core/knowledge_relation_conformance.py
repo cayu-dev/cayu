@@ -9,6 +9,9 @@ from cayu.storage import (
     KnowledgeAccessScope,
     KnowledgeChangeKind,
     KnowledgeEntry,
+    KnowledgeLineageCurrentness,
+    KnowledgeLineageQuery,
+    KnowledgeLineageRole,
     KnowledgeRelation,
     KnowledgeRelationConflict,
     KnowledgeRelationDirection,
@@ -16,6 +19,7 @@ from cayu.storage import (
     KnowledgeRelationPublicationReceipt,
     KnowledgeRelationQuery,
     KnowledgeRevisionRef,
+    KnowledgeStatus,
 )
 
 _NOW = datetime(2026, 8, 25, 9, 0, tzinfo=UTC)
@@ -483,6 +487,242 @@ async def assert_knowledge_relation_scope_conformance(store: Any) -> None:
         )
         is None
     )
+    await _assert_knowledge_relation_historical_scope_conformance(store)
+
+
+async def assert_knowledge_lineage_conformance(store: Any) -> None:
+    privileged = KnowledgeAccessScope.privileged()
+    active_scope = KnowledgeAccessScope.for_namespace("lineage")
+    entries = {
+        entry.id: entry
+        for entry in (
+            relation_entry("lineage-replacement", namespace="lineage"),
+            relation_entry("lineage-predecessor", namespace="lineage"),
+            relation_entry("lineage-source", namespace="lineage"),
+            relation_entry("lineage-alternative", namespace="lineage"),
+            relation_entry("lineage-deleted", namespace="lineage"),
+            relation_entry("lineage-private", namespace="private"),
+        )
+    }
+    for entry in entries.values():
+        await store.create_entry(entry, access_scope=privileged)
+    relations = [
+        relation_record(
+            "lineage-a-supersedes",
+            subject="lineage-replacement",
+            object_="lineage-predecessor",
+            kind=KnowledgeRelationKind.SUPERSEDES,
+        ).model_copy(update={"metadata": {"private_rationale": "must not leak"}}),
+        relation_record(
+            "lineage-b-derived",
+            subject="lineage-replacement",
+            object_="lineage-source",
+            kind=KnowledgeRelationKind.DERIVED_FROM,
+            offset=1,
+        ),
+        relation_record(
+            "lineage-c-contradiction",
+            subject="lineage-replacement",
+            object_="lineage-alternative",
+            kind=KnowledgeRelationKind.CONTRADICTS,
+            offset=2,
+        ),
+        relation_record(
+            "lineage-d-private",
+            subject="lineage-replacement",
+            object_="lineage-private",
+            kind=KnowledgeRelationKind.DERIVED_FROM,
+            offset=3,
+        ),
+        relation_record(
+            "lineage-e-deleted",
+            subject="lineage-replacement",
+            object_="lineage-deleted",
+            kind=KnowledgeRelationKind.DERIVED_FROM,
+            offset=4,
+        ),
+    ]
+    await store.publish_relations(
+        relations,
+        operation_id="lineage-relations",
+        access_scope=privileged,
+    )
+    predecessor = entries["lineage-predecessor"]
+    await store.append_entry_revision(
+        predecessor.model_copy(
+            update={
+                "revision": 2,
+                "status": KnowledgeStatus.ARCHIVED,
+                "updated_at": _NOW + timedelta(minutes=1),
+            }
+        ),
+        expected_revision=1,
+        access_scope=privileged,
+    )
+    deleted = entries["lineage-deleted"]
+    await store.append_entry_revision(
+        deleted.model_copy(
+            update={
+                "revision": 2,
+                "status": KnowledgeStatus.DELETED,
+                "updated_at": _NOW + timedelta(minutes=1),
+            }
+        ),
+        expected_revision=1,
+        access_scope=privileged,
+    )
+
+    query = KnowledgeLineageQuery(
+        reference=KnowledgeRevisionRef(entry_id="lineage-replacement", revision=1),
+        limit=1,
+    )
+    page_1 = await store.inspect_lineage(query, access_scope=active_scope)
+    assert page_1 is not None
+    assert page_1.reference_current == query.reference
+    assert page_1.reference_status is KnowledgeStatus.ACTIVE
+    assert [link.relation_id for link in page_1.links] == ["lineage-a-supersedes"]
+    assert page_1.links[0].role is KnowledgeLineageRole.SUPERSEDES
+    assert page_1.links[0].counterpart == KnowledgeRevisionRef(
+        entry_id="lineage-predecessor",
+        revision=1,
+    )
+    assert page_1.links[0].counterpart_current == KnowledgeRevisionRef(
+        entry_id="lineage-predecessor",
+        revision=2,
+    )
+    assert page_1.links[0].counterpart_status is KnowledgeStatus.ARCHIVED
+    assert page_1.links[0].currentness is KnowledgeLineageCurrentness.STALE
+    assert "private_rationale" not in page_1.model_dump_json()
+    assert page_1.truncated is True
+    assert page_1.next_cursor is not None
+
+    page_2 = await store.inspect_lineage(
+        query.model_copy(update={"cursor": page_1.next_cursor}),
+        access_scope=active_scope,
+    )
+    assert page_2 is not None
+    assert [link.relation_id for link in page_2.links] == ["lineage-b-derived"]
+    assert page_2.links[0].role is KnowledgeLineageRole.DERIVED_FROM
+    assert page_2.truncated is True
+    page_3 = await store.inspect_lineage(
+        query.model_copy(update={"cursor": page_2.next_cursor}),
+        access_scope=active_scope,
+    )
+    assert page_3 is not None
+    assert [link.relation_id for link in page_3.links] == ["lineage-c-contradiction"]
+    assert page_3.links[0].role is KnowledgeLineageRole.CONTRADICTS
+    assert page_3.links[0].unresolved_contradiction is True
+    assert page_3.truncated is False
+    assert page_3.next_cursor is None
+    privileged_lineage = await store.inspect_lineage(
+        query.model_copy(update={"limit": 10}),
+        access_scope=privileged,
+    )
+    assert privileged_lineage is not None
+    assert {link.relation_id for link in privileged_lineage.links} == {
+        "lineage-a-supersedes",
+        "lineage-b-derived",
+        "lineage-c-contradiction",
+        "lineage-d-private",
+        "lineage-e-deleted",
+    }
+
+    unresolved = await store.inspect_lineage(
+        query.model_copy(update={"unresolved_only": True, "limit": 10, "cursor": None}),
+        access_scope=active_scope,
+    )
+    assert unresolved is not None
+    assert [link.relation_id for link in unresolved.links] == ["lineage-c-contradiction"]
+    stale = await store.inspect_lineage(
+        query.model_copy(
+            update={
+                "currentnesses": [KnowledgeLineageCurrentness.STALE],
+                "limit": 10,
+                "cursor": None,
+            }
+        ),
+        access_scope=active_scope,
+    )
+    assert stale is not None
+    assert [link.relation_id for link in stale.links] == ["lineage-a-supersedes"]
+    active_counterparts = await store.inspect_lineage(
+        query.model_copy(
+            update={
+                "counterpart_statuses": [KnowledgeStatus.ACTIVE],
+                "limit": 10,
+                "cursor": None,
+            }
+        ),
+        access_scope=active_scope,
+    )
+    assert active_counterparts is not None
+    assert [link.relation_id for link in active_counterparts.links] == [
+        "lineage-b-derived",
+        "lineage-c-contradiction",
+    ]
+    assert all(link.counterpart.entry_id != "lineage-private" for link in page_3.links)
+    assert all(link.counterpart.entry_id != "lineage-deleted" for link in page_3.links)
+
+    predecessor_history = await store.inspect_lineage(
+        KnowledgeLineageQuery(
+            reference=KnowledgeRevisionRef(entry_id="lineage-predecessor", revision=1),
+            direction=KnowledgeRelationDirection.INCOMING,
+        ),
+        access_scope=active_scope,
+    )
+    assert predecessor_history is not None
+    assert predecessor_history.reference_status is KnowledgeStatus.ARCHIVED
+    assert predecessor_history.links[0].role is KnowledgeLineageRole.SUPERSEDED_BY
+    assert (
+        await store.get_entry(
+            "lineage-predecessor",
+            revision=1,
+            access_scope=active_scope,
+        )
+        is None
+    )
+
+    try:
+        await store.inspect_lineage(
+            query.model_copy(
+                update={
+                    "counterpart_statuses": [KnowledgeStatus.ACTIVE],
+                    "cursor": page_1.next_cursor,
+                }
+            ),
+            access_scope=active_scope,
+        )
+    except ValueError:
+        pass
+    else:  # pragma: no cover - assertion branch
+        raise AssertionError("A lineage cursor crossed a changed lifecycle filter.")
+
+    alternative = entries["lineage-alternative"]
+    await store.append_entry_revision(
+        alternative.model_copy(
+            update={
+                "revision": 2,
+                "text": "updated alternative",
+                "updated_at": _NOW + timedelta(minutes=2),
+            }
+        ),
+        expected_revision=1,
+        access_scope=privileged,
+    )
+    resolved_by_advance = await store.inspect_lineage(
+        query.model_copy(update={"limit": 10, "cursor": None}),
+        access_scope=active_scope,
+    )
+    assert resolved_by_advance is not None
+    contradiction = next(
+        link for link in resolved_by_advance.links if link.relation_id == "lineage-c-contradiction"
+    )
+    assert contradiction.currentness is KnowledgeLineageCurrentness.STALE
+    assert contradiction.unresolved_contradiction is False
+
+
+async def _assert_knowledge_relation_historical_scope_conformance(store: Any) -> None:
+    privileged = KnowledgeAccessScope.privileged()
 
     historical_subject = relation_entry(
         "scope-historical-subject",

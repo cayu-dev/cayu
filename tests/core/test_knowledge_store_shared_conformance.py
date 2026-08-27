@@ -18,6 +18,7 @@ from tests.core.knowledge_maintenance_conformance import (
     assert_knowledge_maintenance_conformance,
 )
 from tests.core.knowledge_relation_conformance import (
+    assert_knowledge_lineage_conformance,
     assert_knowledge_relation_conformance,
     assert_knowledge_relation_scope_conformance,
 )
@@ -210,6 +211,14 @@ def test_knowledge_store_shared_relation_contract(knowledge_store_case) -> None:
         finally:
             await _close_store(store)
 
+        await _reset_case(knowledge_store_case)
+        lineage_store = await _open_store(knowledge_store_case, access_scope=None)
+        try:
+            await assert_knowledge_lineage_conformance(lineage_store)
+        finally:
+            await _close_store(lineage_store)
+
+        await _reset_case(knowledge_store_case)
         unbound = await _open_store(knowledge_store_case, access_scope=None)
         try:
             await assert_knowledge_relation_scope_conformance(unbound)

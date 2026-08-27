@@ -22,6 +22,11 @@ from cayu.storage import (
     KnowledgeChange,
     KnowledgeChangeKind,
     KnowledgeEntry,
+    KnowledgeLineageCurrentness,
+    KnowledgeLineageLink,
+    KnowledgeLineageQuery,
+    KnowledgeLineageResult,
+    KnowledgeLineageRole,
     KnowledgeRelation,
     KnowledgeRelationDirection,
     KnowledgeRelationKind,
@@ -29,6 +34,7 @@ from cayu.storage import (
     KnowledgeRelationQuery,
     KnowledgeRelationResult,
     KnowledgeRevisionRef,
+    KnowledgeStatus,
     prepare_knowledge_relations,
 )
 
@@ -83,6 +89,14 @@ def test_knowledge_relation_public_vocabulary_is_closed_and_exported() -> None:
         "derived_from",
         "contradicts",
     ]
+    assert [role.value for role in KnowledgeLineageRole] == [
+        "supersedes",
+        "superseded_by",
+        "derived_from",
+        "derivation_source_for",
+        "contradicts",
+    ]
+    assert [value.value for value in KnowledgeLineageCurrentness] == ["current", "stale"]
     for name in (
         "KnowledgeRevisionRef",
         "KnowledgeRelationKind",
@@ -90,6 +104,11 @@ def test_knowledge_relation_public_vocabulary_is_closed_and_exported() -> None:
         "KnowledgeRelationPublicationReceipt",
         "KnowledgeRelationQuery",
         "KnowledgeRelationResult",
+        "KnowledgeLineageCurrentness",
+        "KnowledgeLineageLink",
+        "KnowledgeLineageQuery",
+        "KnowledgeLineageResult",
+        "KnowledgeLineageRole",
         "prepare_knowledge_relations",
     ):
         assert name in cayu.__all__
@@ -105,6 +124,31 @@ def test_knowledge_relation_models_reject_ambiguous_or_unbounded_material() -> N
                 **_relation().model_dump(),
                 "kind": "application_defined_edge",
             }
+        )
+
+    lineage_query = KnowledgeLineageQuery(
+        reference=KnowledgeRevisionRef(entry_id="subject-entry", revision=1)
+    )
+    with pytest.raises(ValidationError, match="currentness"):
+        KnowledgeLineageResult(
+            query=lineage_query,
+            reference_current=lineage_query.reference,
+            reference_status=KnowledgeStatus.ACTIVE,
+            links=[
+                KnowledgeLineageLink(
+                    relation_id="relation-id",
+                    kind=KnowledgeRelationKind.DERIVED_FROM,
+                    role=KnowledgeLineageRole.DERIVED_FROM,
+                    counterpart=KnowledgeRevisionRef(entry_id="object-entry", revision=1),
+                    counterpart_current=KnowledgeRevisionRef(
+                        entry_id="object-entry",
+                        revision=1,
+                    ),
+                    counterpart_status=KnowledgeStatus.ACTIVE,
+                    currentness=KnowledgeLineageCurrentness.STALE,
+                    created_at=_NOW,
+                )
+            ],
         )
     with pytest.raises(ValidationError, match="metadata.*budget"):
         _relation(metadata={"payload": "x" * MAX_KNOWLEDGE_RELATION_BYTES})
@@ -130,6 +174,14 @@ def test_knowledge_relation_models_defensively_copy_nested_inputs() -> None:
     )
     kinds.append(KnowledgeRelationKind.CONTRADICTS)
     assert query.kinds == [KnowledgeRelationKind.SUPERSEDES]
+
+    default_lineage_query = KnowledgeLineageQuery(reference=relation.subject)
+    explicit_lineage_query = KnowledgeLineageQuery(
+        reference=relation.subject,
+        currentnesses=list(KnowledgeLineageCurrentness),
+        counterpart_statuses=list(KnowledgeStatus),
+    )
+    assert default_lineage_query == explicit_lineage_query
 
     relation_ids = ["relation-a"]
     receipt = KnowledgeRelationPublicationReceipt(

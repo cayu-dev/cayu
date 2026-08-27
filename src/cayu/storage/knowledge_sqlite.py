@@ -58,6 +58,9 @@ from cayu.storage.memory import (
     KnowledgeIndexReadinessConflict,
     KnowledgeIndexReadinessUpdate,
     KnowledgeIndexState,
+    KnowledgeLineageCurrentness,
+    KnowledgeLineageQuery,
+    KnowledgeLineageResult,
     KnowledgeListGroup,
     KnowledgeListItem,
     KnowledgeListQuery,
@@ -87,10 +90,12 @@ from cayu.storage.memory import (
     KnowledgeVisibility,
     _bounded_knowledge_evidence,
     _bounded_knowledge_index_identity,
+    _bounded_knowledge_lineage_result,
     _bounded_knowledge_relation_result,
     _copy_chunks_for_revision,
     _copy_entry_evidence,
     _copy_evidence_for_revision,
+    _decode_knowledge_lineage_cursor,
     _decode_knowledge_relation_cursor,
     _initialize_knowledge_change_consumer_state,
     _knowledge_access_scope_sha256,
@@ -105,6 +110,8 @@ from cayu.storage.memory import (
     _knowledge_embedding_identity_sha256,
     _knowledge_entry_id,
     _knowledge_index_readiness_update_sha256,
+    _knowledge_lineage_link,
+    _knowledge_lineage_query_fingerprint,
     _knowledge_maintenance_access_snapshot,
     _knowledge_maintenance_access_snapshot_json,
     _knowledge_maintenance_identity,
@@ -115,6 +122,7 @@ from cayu.storage.memory import (
     _knowledge_relation_change_audiences,
     _knowledge_relation_identity,
     _knowledge_relation_query_fingerprint,
+    _knowledge_scope_allows_lineage_endpoint,
     _knowledge_scope_allows_maintenance_access_snapshot,
     _knowledge_scope_allows_relation_access_snapshot,
     _knowledge_scope_allows_snapshot,
@@ -149,6 +157,7 @@ from cayu.storage.memory import (
     copy_knowledge_embedding_identity,
     copy_knowledge_entry,
     copy_knowledge_index_readiness_update,
+    copy_knowledge_lineage_query,
     copy_knowledge_list_query,
     copy_knowledge_maintenance_decision,
     copy_knowledge_maintenance_decision_receipt,
@@ -882,6 +891,120 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         return _bounded_knowledge_relation_result(
             query,
             [_relation_from_row(row) for row in rows],
+            fingerprint=fingerprint,
+        )
+
+    async def inspect_lineage(
+        self,
+        query: KnowledgeLineageQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeLineageResult | None:
+        scope = self._operation_access_scope(access_scope)
+        query = copy_knowledge_lineage_query(query)
+        fingerprint = _knowledge_lineage_query_fingerprint(query, scope)
+        cursor = _decode_knowledge_lineage_cursor(query.cursor, fingerprint=fingerprint)
+        async with self._lock:
+            with sqlite_support._transaction(self._connection, begin_immediate=False):
+                access_now = datetime.now(UTC)
+                reference_exact = self._load_entry_unlocked(
+                    query.reference.entry_id,
+                    revision=query.reference.revision,
+                )
+                reference_current = self._load_entry_unlocked(query.reference.entry_id)
+                if (
+                    reference_exact is None
+                    or reference_current is None
+                    or not _knowledge_scope_allows_lineage_endpoint(
+                        scope,
+                        reference_exact,
+                        reference_current,
+                        now=access_now,
+                    )
+                ):
+                    return None
+                relation_sql, relation_params = _sqlite_relation_query_filter_sql(query)
+                lineage_sql, lineage_params = _sqlite_lineage_filter_sql(query)
+                access_sql, access_params = _sqlite_relation_access_scope_filter_sql(
+                    scope,
+                    allow_archived_current=True,
+                    now=access_now,
+                )
+                cursor_sql = ""
+                cursor_params: list[object] = []
+                if cursor is not None:
+                    cursor_sql = (
+                        " AND (relation.created_at > ? OR "
+                        "(relation.created_at = ? AND relation.id COLLATE BINARY > ?))"
+                    )
+                    created_at = sqlite_support.format_datetime(cursor.created_at)
+                    cursor_params.extend([created_at, created_at, cursor.relation_id])
+                rows = self._connection.execute(
+                    f"""
+                    SELECT relation.id, relation.subject_entry_id,
+                           relation.subject_revision, relation.object_entry_id,
+                           relation.object_revision, relation.kind,
+                           relation.created_at,
+                           subject_current.revision AS subject_current_revision,
+                           subject_current.status AS subject_current_status,
+                           object_current.revision AS object_current_revision,
+                           object_current.status AS object_current_status
+                    FROM cayu_knowledge_relations AS relation
+                    JOIN cayu_knowledge_current_entries AS subject_current
+                      ON subject_current.id = relation.subject_entry_id
+                    JOIN cayu_knowledge_current_entries AS object_current
+                      ON object_current.id = relation.object_entry_id
+                    WHERE 1 = 1
+                    {relation_sql}
+                    {lineage_sql}
+                    {cursor_sql}
+                    {access_sql}
+                    ORDER BY relation.created_at ASC, relation.id COLLATE BINARY ASC
+                    LIMIT ?
+                    """,
+                    (
+                        *relation_params,
+                        *lineage_params,
+                        *cursor_params,
+                        *access_params,
+                        query.limit + 1,
+                    ),
+                ).fetchall()
+        links = [
+            _knowledge_lineage_link(
+                relation_id=str(row["id"]),
+                kind=KnowledgeRelationKind(str(row["kind"])),
+                subject=KnowledgeRevisionRef(
+                    entry_id=str(row["subject_entry_id"]),
+                    revision=int(row["subject_revision"]),
+                ),
+                object_=KnowledgeRevisionRef(
+                    entry_id=str(row["object_entry_id"]),
+                    revision=int(row["object_revision"]),
+                ),
+                created_at=sqlite_support.parse_datetime(str(row["created_at"])),
+                reference=query.reference,
+                subject_current=KnowledgeRevisionRef(
+                    entry_id=str(row["subject_entry_id"]),
+                    revision=int(row["subject_current_revision"]),
+                ),
+                subject_status=KnowledgeStatus(str(row["subject_current_status"])),
+                object_current=KnowledgeRevisionRef(
+                    entry_id=str(row["object_entry_id"]),
+                    revision=int(row["object_current_revision"]),
+                ),
+                object_status=KnowledgeStatus(str(row["object_current_status"])),
+            )
+            for row in rows
+        ]
+        return _bounded_knowledge_lineage_result(
+            query,
+            reference_current=KnowledgeRevisionRef(
+                entry_id=reference_current.id,
+                revision=reference_current.revision,
+            ),
+            reference_status=reference_current.status,
+            candidates=links,
             fingerprint=fingerprint,
         )
 
@@ -4753,7 +4876,7 @@ def _change_consumer_from_row(row: sqlite3.Row) -> KnowledgeChangeConsumerState:
 
 
 def _sqlite_relation_query_filter_sql(
-    query: KnowledgeRelationQuery,
+    query: KnowledgeRelationQuery | KnowledgeLineageQuery,
 ) -> tuple[str, list[object]]:
     entry_id = query.reference.entry_id
     revision = query.reference.revision
@@ -4789,10 +4912,13 @@ def _sqlite_relation_query_filter_sql(
 
 def _sqlite_relation_access_scope_filter_sql(
     scope: KnowledgeAccessScope,
+    *,
+    allow_archived_current: bool = False,
+    now: datetime | None = None,
 ) -> tuple[str, list[object]]:
     clauses: list[str] = []
     params: list[object] = []
-    access_now = datetime.now(UTC)
+    access_now = datetime.now(UTC) if now is None else now
     for entry_column, revision_column in (
         ("subject_entry_id", "subject_revision"),
         ("object_entry_id", "object_revision"),
@@ -4826,8 +4952,20 @@ def _sqlite_relation_access_scope_filter_sql(
             """
         )
         params.extend(exact_access_params)
+        current_scope = (
+            scope.model_copy(
+                update={
+                    "allowed_statuses": sorted(
+                        {*scope.allowed_statuses, KnowledgeStatus.ARCHIVED},
+                        key=str,
+                    )
+                }
+            )
+            if allow_archived_current
+            else scope
+        )
         current_access_sql, current_access_params = _knowledge_access_scope_filter_sql(
-            scope,
+            current_scope,
             now=access_now,
         )
         clauses.append(
@@ -4841,6 +4979,45 @@ def _sqlite_relation_access_scope_filter_sql(
             """
         )
         params.extend(current_access_params)
+    return " AND " + " AND ".join(clauses), params
+
+
+def _sqlite_lineage_filter_sql(query: KnowledgeLineageQuery) -> tuple[str, list[object]]:
+    subject_is_anchor = "(relation.subject_entry_id = ? AND relation.subject_revision = ?)"
+    counterpart_status = (
+        f"CASE WHEN {subject_is_anchor} THEN object_current.status ELSE subject_current.status END"
+    )
+    current_relation = (
+        "(relation.subject_revision = subject_current.revision "
+        "AND relation.object_revision = object_current.revision)"
+    )
+    clauses: list[str] = []
+    params: list[object] = []
+    placeholders = ", ".join("?" for _ in query.counterpart_statuses)
+    clauses.append(f"{counterpart_status} IN ({placeholders})")
+    params.extend(
+        [
+            query.reference.entry_id,
+            query.reference.revision,
+            *(status.value for status in query.counterpart_statuses),
+        ]
+    )
+    current_values = set(query.currentnesses)
+    if len(current_values) == 1:
+        clauses.append(
+            current_relation
+            if KnowledgeLineageCurrentness.CURRENT in current_values
+            else f"NOT {current_relation}"
+        )
+    if query.unresolved_only:
+        clauses.extend(
+            [
+                "relation.kind = 'contradicts'",
+                current_relation,
+                "subject_current.status = 'active'",
+                "object_current.status = 'active'",
+            ]
+        )
     return " AND " + " AND ".join(clauses), params
 
 
