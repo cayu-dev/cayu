@@ -103,6 +103,26 @@ The effective policy remains part of each admitted invocation's durable
 finalization identity. Active sessions and recovered work therefore retain
 their admitted authority instead of silently adopting the new default.
 
+### Evals can assert lifecycle, approval, and child process behavior
+
+Portable suites and Control Plane now support required, forbidden, and ranged
+counts over a closed payload-free process-event vocabulary. An advanced exact
+order assertion filters the root trace to the selected fact kinds and checks
+the complete filtered sequence and multiplicity. Child-status assertions now
+also support interrupted direct children. This covers useful session, tool,
+approval, structured-output, and budget-limit behavior without admitting raw
+event names, custom events, payload predicates, approval identity, or
+executable browser input.
+
+Process evidence is bounded to 4,096 typed facts. Missing root evidence and
+bounded prefixes remain unavailable rather than becoming candidate failures or
+passes, and incomplete child capture remains unavailable. Safe typed result
+details are shared by suite authoring, captured-session promotion, execution,
+stores, Control Plane, CLI, reports, and comparison. Published eval results
+advance to schema version 7, assertion evidence to schema version 4, and the
+server/dashboard contract from version 35 to 36. Upgrade servers, generated
+clients, and dashboards together. No storage migration is required.
+
 ### Evals can assert bounded public tool arguments and retained results
 
 Control Plane and the portable SDK/HTTP suite contracts now support exact

@@ -41,9 +41,12 @@ from cayu.evals.evidence import _canonical_decimal
 from cayu.evals.execution import CorpusExecutionResult
 from cayu.evals.published import (
     PublishedAssertionResult,
+    PublishedChildStatusDetail,
     PublishedEvalTrialResult,
     PublishedModelJudgeDetail,
     PublishedOutcome,
+    PublishedProcessEventDetail,
+    PublishedProcessEventsInOrderDetail,
     PublishedStatus,
     PublishedStructuredModelJudgeDetail,
     PublishedToolArgumentsContainDetail,
@@ -192,6 +195,12 @@ class EvalAssertionPresentationV1(_PortableModel):
     score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
     structured_judge: EvalStructuredJudgePresentationV1 | None = None
     tool_json: PublishedToolArgumentsContainDetail | PublishedToolResultContainsDetail | None = None
+    process: (
+        PublishedChildStatusDetail
+        | PublishedProcessEventDetail
+        | PublishedProcessEventsInOrderDetail
+        | None
+    ) = None
 
     @field_validator("tool_json", mode="before")
     @classmethod
@@ -207,6 +216,23 @@ class EvalAssertionPresentationV1(_PortableModel):
             return detail.model_dump(mode="python", round_trip=True, warnings="none")
         if isinstance(value, BaseModel):
             raise TypeError("tool_json must be an exact published tool-JSON detail or JSON object.")
+        return value
+
+    @field_validator("process", mode="before")
+    @classmethod
+    def copy_process(cls, value: object) -> object:
+        if type(value) in {
+            PublishedChildStatusDetail,
+            PublishedProcessEventDetail,
+            PublishedProcessEventsInOrderDetail,
+        }:
+            detail = cast(
+                "PublishedChildStatusDetail | PublishedProcessEventDetail | PublishedProcessEventsInOrderDetail",
+                value,
+            )
+            return detail.model_dump(mode="python", round_trip=True, warnings="none")
+        if isinstance(value, BaseModel):
+            raise TypeError("process must be an exact published process detail or JSON object.")
         return value
 
     @field_validator("assertion_id")
@@ -242,6 +268,15 @@ class EvalAssertionPresentationV1(_PortableModel):
             raise ValueError("Only tool-JSON assertions carry safe tool-JSON detail.")
         if self.tool_json is not None and self.tool_json.kind != self.kind:
             raise ValueError("Tool-JSON presentation kind contradicts its retained detail.")
+        process_kind = self.kind in {
+            "child_status",
+            "process_event",
+            "process_events_in_order",
+        }
+        if process_kind != (self.process is not None):
+            raise ValueError("Only process assertions carry safe process detail.")
+        if self.process is not None and self.process.kind != self.kind:
+            raise ValueError("Process presentation kind contradicts its retained detail.")
         if self.structured_judge is None:
             return self
         detail = self.structured_judge.detail
@@ -658,6 +693,19 @@ def _present_assertion(assertion: PublishedAssertionResult) -> EvalAssertionPres
         if type(detail) in {PublishedToolArgumentsContainDetail, PublishedToolResultContainsDetail}
         else None
     )
+    process = (
+        cast(
+            "PublishedChildStatusDetail | PublishedProcessEventDetail | PublishedProcessEventsInOrderDetail",
+            detail,
+        )
+        if type(detail)
+        in {
+            PublishedChildStatusDetail,
+            PublishedProcessEventDetail,
+            PublishedProcessEventsInOrderDetail,
+        }
+        else None
+    )
     return EvalAssertionPresentationV1(
         assertion_id=validated.assertion_id,
         assertion_revision=validated.assertion_revision,
@@ -671,6 +719,7 @@ def _present_assertion(assertion: PublishedAssertionResult) -> EvalAssertionPres
             else None
         ),
         tool_json=tool_json,
+        process=process,
     )
 
 

@@ -81,6 +81,8 @@ EVAL_CORPUS_MAX_JUDGE_REFERENCE_FACTS = 64
 EVAL_CORPUS_MAX_JUDGE_REFERENCE_FACT_CHARS = 2_048
 EVAL_CORPUS_MAX_PUBLISHED_JUDGE_EXPLANATION_CHARS = 2 << 20
 EVAL_CORPUS_MAX_TOOL_NAMES = 256
+EVAL_CORPUS_MAX_PROCESS_EVENTS = 256
+EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS = 4_096
 EVAL_TOOL_CALL_EVIDENCE_MAX_CALLS = 256
 EVAL_CORPUS_MAX_TRIALS = 100
 EVAL_CORPUS_MAX_TIMEOUT_SECONDS = 3_600
@@ -412,7 +414,7 @@ class RootStatusAssertionSpec(_AssertionSpecBase):
 
 class ChildStatusAssertionSpec(_AssertionSpecBase):
     kind: Literal["child_status"] = "child_status"
-    expected: Literal["completed", "failed"]
+    expected: Literal["completed", "failed", "interrupted"]
     min_count: StrictInt = Field(default=1, ge=0, le=EVIDENCE_MAX_CHILD_SESSIONS)
     max_count: StrictInt | None = Field(default=None, ge=0, le=EVIDENCE_MAX_CHILD_SESSIONS)
 
@@ -544,6 +546,62 @@ class ToolsCalledInOrderAssertionSpec(_AssertionSpecBase):
             )
             for index, item in enumerate(ordered)
         )
+
+
+EvalProcessEventKind: TypeAlias = Literal[
+    "session_started",
+    "session_resumed",
+    "session_awaiting_user_input",
+    "session_completed",
+    "session_failed",
+    "session_interrupted",
+    "session_limit_reached",
+    "tool_call_started",
+    "tool_call_completed",
+    "tool_call_failed",
+    "tool_call_blocked",
+    "tool_approval_requested",
+    "tool_approved",
+    "tool_approval_denied",
+    "tool_approval_expired",
+    "structured_output_validated",
+    "structured_output_failed",
+    "budget_limit_reached",
+]
+
+
+class ProcessEventAssertionSpec(_AssertionSpecBase):
+    """Require or forbid one closed, payload-free runtime process fact."""
+
+    kind: Literal["process_event"] = "process_event"
+    event: EvalProcessEventKind
+    min_count: StrictInt = Field(default=1, ge=0, le=EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS)
+    max_count: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS,
+    )
+
+    @model_validator(mode="after")
+    def validate_count_range(self) -> ProcessEventAssertionSpec:
+        if self.max_count is not None and self.max_count < self.min_count:
+            raise ValueError("max_count must be greater than or equal to min_count.")
+        return self
+
+
+class ProcessEventsInOrderAssertionSpec(_AssertionSpecBase):
+    """Require the exact filtered order of selected portable process facts."""
+
+    kind: Literal["process_events_in_order"] = "process_events_in_order"
+    events: tuple[EvalProcessEventKind, ...] = Field(
+        min_length=1,
+        max_length=EVAL_CORPUS_MAX_PROCESS_EVENTS,
+    )
+
+    @field_validator("events", mode="before")
+    @classmethod
+    def validate_events_are_ordered(cls, value: object, info) -> object:
+        return _ordered_sequence_input(value, info.field_name)
 
 
 class MaxToolCallsAssertionSpec(_AssertionSpecBase):
@@ -1062,6 +1120,8 @@ AssertionSpec: TypeAlias = Annotated[
     | ToolArgumentsContainAssertionSpec
     | ToolResultContainsAssertionSpec
     | ToolsCalledInOrderAssertionSpec
+    | ProcessEventAssertionSpec
+    | ProcessEventsInOrderAssertionSpec
     | MaxToolCallsAssertionSpec
     | MaxModelStepsAssertionSpec
     | UsageRecordedAssertionSpec
@@ -1081,6 +1141,8 @@ _ASSERTION_SPEC_TYPES = (
     ToolArgumentsContainAssertionSpec,
     ToolResultContainsAssertionSpec,
     ToolsCalledInOrderAssertionSpec,
+    ProcessEventAssertionSpec,
+    ProcessEventsInOrderAssertionSpec,
     MaxToolCallsAssertionSpec,
     MaxModelStepsAssertionSpec,
     UsageRecordedAssertionSpec,

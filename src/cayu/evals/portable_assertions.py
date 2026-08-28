@@ -17,6 +17,8 @@ from cayu.evals.corpus import (
     ModelJudgeAssertionSpec,
     PricingProfileIdentityV1,
     PrivateJudgeReferenceV1,
+    ProcessEventAssertionSpec,
+    ProcessEventsInOrderAssertionSpec,
     PublicJudgeReferenceV1,
     RootStatusAssertionSpec,
     StructuredModelJudgeAssertionSpec,
@@ -54,6 +56,14 @@ from cayu.runtime.costs import PriceBook, copy_price_book
 from cayu.runtime.manifest import AppManifest
 
 MODEL_JUDGE_EXECUTION_SEMANTICS_VERSION = 1
+
+_ROOT_TERMINAL_PROCESS_EVENTS = frozenset(
+    {
+        "session_completed",
+        "session_failed",
+        "session_interrupted",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,7 +309,18 @@ class _CompiledPortableAssertion(EvalAssertion):
 
     @property
     def evaluates_failed_session(self) -> bool:
-        return type(self._spec) is RootStatusAssertionSpec
+        # The runner otherwise treats a failed root as an execution error. Only
+        # assertions that explicitly select its terminal state may own that
+        # outcome: nonterminal facts can occur before a crash and must never
+        # turn the failed run into a passing evaluation.
+        spec = self._spec
+        if type(spec) is RootStatusAssertionSpec:
+            return True
+        if type(spec) is ProcessEventAssertionSpec:
+            return spec.event in _ROOT_TERMINAL_PROCESS_EVENTS
+        if type(spec) is ProcessEventsInOrderAssertionSpec:
+            return not _ROOT_TERMINAL_PROCESS_EVENTS.isdisjoint(spec.events)
+        return False
 
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
         currencies = (

@@ -6,6 +6,13 @@ This is a design/maintainer document for Cayu's production agent runtime. It nam
 
 Runtime boundary data should be portable across local processes, remote runners, hosted runtimes, event stores, dashboards, and replay tools.
 
+Portable Evals process evidence is a separate closed projection over selected
+runtime event types. It retains only bounded typed lifecycle, tool, approval,
+structured-output, and budget-limit facts in root-session order; it never
+publishes raw event payloads or invents ordering across parent and child
+sessions. Missing or bounded-prefix evidence is inconclusive, while child
+terminal outcomes use the child-tree completeness contract.
+
 The target contract for payloads, metadata, tool arguments, tool results, model options, checkpoints, task data, and event data is portable durable JSON. Portable values contain only objects, arrays, strings, signed 64-bit integers, finite floats, booleans, and null, with at most 128 nested object/array levels. Strings and object keys may contain ordinary Unicode but not NUL or lone UTF-16 surrogate code points. JSON has one number domain, so Cayu normalizes every finite integral float in the signed 64-bit range to an integer (including negative zero); non-integral floats retain their value. Tuples, arbitrary Python objects, non-string object keys, circular references, raw decimals, NaN, and Infinity are not portable; integral floats outside the signed 64-bit range are rejected, and larger exact numbers use a field-specific canonical string format. Task input, result, error, and metadata fields remain top-level JSON objects.
 
 Core message parts, tool results, events, model requests, session/task stores, checkpoints, durable message queues, and JSONL import/export apply portable-value validation while taking their defensive copy. The bundled in-memory, SQLite, and PostgreSQL session/task stores therefore accept, reject, and reload the same representations. Provider stream events remain ephemeral, untrusted observations so terminal accounting can be retained; the runtime validates them strictly before producing a durable event, transcript message, or checkpoint value. Direct validation failures raise the public `cayu.DurableValueError`, a `ValueError` subtype with stable `code`, `field_name`, and input-value-independent `path` fields. Model validators may wrap it in their ordinary validation error; `cayu.extract_durable_value_error(error)` safely recovers the typed failure from either form without rendering rejected input. Migrated producer models hide Pydantic input values, and the bounded ASCII durable-value diagnostic never includes the rejected value or an object key.
@@ -10290,8 +10297,8 @@ distinct from a recall-off spec, a no-match receipt, and `truncated`,
 `unavailable`, `redacted`, or `contradictory` attribution.
 
 Runtime-native Evals carry that attribution across both fresh and captured
-publication. `AssertionEvidenceView.schema_version == 3`,
-`EvalRun.schema_version == 8`, `PublishedEvalRun.schema_version == 6`, and
+publication. `AssertionEvidenceView.schema_version == 4`,
+`EvalRun.schema_version == 8`, `PublishedEvalRun.schema_version == 7`, and
 `CorpusExecutionResult.schema_version == 3` each require the same nested
 `EvalMemoryAttributionEvidenceV1`. The nested section is independently
 versioned and content-addressed. It binds a fixed capture-policy revision,

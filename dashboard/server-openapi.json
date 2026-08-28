@@ -4814,6 +4814,43 @@
             ],
             "title": "Pricing Profile Fingerprint"
           },
+          "process_event_evidence_state": {
+            "enum": [
+              "complete",
+              "unavailable",
+              "limit_exceeded"
+            ],
+            "title": "Process Event Evidence State",
+            "type": "string"
+          },
+          "process_events": {
+            "items": {
+              "enum": [
+                "session_started",
+                "session_resumed",
+                "session_awaiting_user_input",
+                "session_completed",
+                "session_failed",
+                "session_interrupted",
+                "session_limit_reached",
+                "tool_call_started",
+                "tool_call_completed",
+                "tool_call_failed",
+                "tool_call_blocked",
+                "tool_approval_requested",
+                "tool_approved",
+                "tool_approval_denied",
+                "tool_approval_expired",
+                "structured_output_validated",
+                "structured_output_failed",
+                "budget_limit_reached"
+              ],
+              "type": "string"
+            },
+            "maxItems": 4096,
+            "title": "Process Events",
+            "type": "array"
+          },
           "requested_tool_names": {
             "items": {
               "type": "string"
@@ -4847,8 +4884,8 @@
             "title": "Root Status"
           },
           "schema_version": {
-            "const": 3,
-            "default": 3,
+            "const": 4,
+            "default": 4,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -4936,6 +4973,8 @@
           "tool_evidence_state",
           "tool_calls",
           "tool_call_evidence_state",
+          "process_events",
+          "process_event_evidence_state",
           "model_step_evidence_state",
           "usage_evidence_state",
           "costs",
@@ -5318,6 +5357,8 @@
                   "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
+                  "process_event": "#/components/schemas/ProcessEventAssertionSpec",
+                  "process_events_in_order": "#/components/schemas/ProcessEventsInOrderAssertionSpec",
                   "root_status": "#/components/schemas/RootStatusAssertionSpec",
                   "tool_arguments_contain": "#/components/schemas/ToolArgumentsContainAssertionSpec",
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
@@ -5351,6 +5392,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcessEventAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcessEventsInOrderAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -6203,7 +6250,8 @@
           "expected": {
             "enum": [
               "completed",
-              "failed"
+              "failed",
+              "interrupted"
             ],
             "title": "Expected",
             "type": "string"
@@ -9024,6 +9072,23 @@
             "title": "Outcome",
             "type": "string"
           },
+          "process": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublishedChildStatusDetail"
+              },
+              {
+                "$ref": "#/components/schemas/PublishedProcessEventDetail"
+              },
+              {
+                "$ref": "#/components/schemas/PublishedProcessEventsInOrderDetail"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Process"
+          },
           "score": {
             "anyOf": [
               {
@@ -9781,6 +9846,8 @@
                   "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
+                  "process_event": "#/components/schemas/ProcessEventAssertionSpec",
+                  "process_events_in_order": "#/components/schemas/ProcessEventsInOrderAssertionSpec",
                   "root_status": "#/components/schemas/RootStatusAssertionSpec",
                   "tool_arguments_contain": "#/components/schemas/ToolArgumentsContainAssertionSpec",
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
@@ -9814,6 +9881,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcessEventAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcessEventsInOrderAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -9918,6 +9991,8 @@
                   "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
+                  "process_event": "#/components/schemas/ProcessEventAssertionSpec",
+                  "process_events_in_order": "#/components/schemas/ProcessEventsInOrderAssertionSpec",
                   "root_status": "#/components/schemas/RootStatusAssertionSpec",
                   "structured_model_judge": "#/components/schemas/StructuredModelJudgeAssertionSpec",
                   "tool_arguments_contain": "#/components/schemas/ToolArgumentsContainAssertionSpec",
@@ -9952,6 +10027,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcessEventAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcessEventsInOrderAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -10059,6 +10140,8 @@
                   "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
+                  "process_event": "#/components/schemas/ProcessEventAssertionSpec",
+                  "process_events_in_order": "#/components/schemas/ProcessEventsInOrderAssertionSpec",
                   "root_status": "#/components/schemas/RootStatusAssertionSpec",
                   "tool_arguments_contain": "#/components/schemas/ToolArgumentsContainAssertionSpec",
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
@@ -10092,6 +10175,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcessEventAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcessEventsInOrderAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -10191,6 +10280,8 @@
                   "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
+                  "process_event": "#/components/schemas/ProcessEventAssertionSpec",
+                  "process_events_in_order": "#/components/schemas/ProcessEventsInOrderAssertionSpec",
                   "root_status": "#/components/schemas/RootStatusAssertionSpec",
                   "structured_model_judge": "#/components/schemas/StructuredModelJudgeAssertionDraftV1",
                   "tool_arguments_contain": "#/components/schemas/ToolArgumentsContainAssertionSpec",
@@ -10225,6 +10316,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcessEventAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcessEventsInOrderAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -10384,6 +10481,8 @@
                   "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
+                  "process_event": "#/components/schemas/ProcessEventAssertionSpec",
+                  "process_events_in_order": "#/components/schemas/ProcessEventsInOrderAssertionSpec",
                   "root_status": "#/components/schemas/RootStatusAssertionSpec",
                   "structured_model_judge": "#/components/schemas/StructuredModelJudgeAssertionSpec",
                   "tool_arguments_contain": "#/components/schemas/ToolArgumentsContainAssertionSpec",
@@ -10418,6 +10517,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcessEventAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcessEventsInOrderAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -15420,6 +15525,8 @@
                   "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
+                  "process_event": "#/components/schemas/ProcessEventAssertionSpec",
+                  "process_events_in_order": "#/components/schemas/ProcessEventsInOrderAssertionSpec",
                   "root_status": "#/components/schemas/RootStatusAssertionSpec",
                   "tool_arguments_contain": "#/components/schemas/ToolArgumentsContainAssertionSpec",
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
@@ -15453,6 +15560,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcessEventAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcessEventsInOrderAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -22153,6 +22266,145 @@
         "title": "PrivateJudgeReferenceV1",
         "type": "object"
       },
+      "ProcessEventAssertionSpec": {
+        "additionalProperties": false,
+        "description": "Require or forbid one closed, payload-free runtime process fact.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "event": {
+            "enum": [
+              "session_started",
+              "session_resumed",
+              "session_awaiting_user_input",
+              "session_completed",
+              "session_failed",
+              "session_interrupted",
+              "session_limit_reached",
+              "tool_call_started",
+              "tool_call_completed",
+              "tool_call_failed",
+              "tool_call_blocked",
+              "tool_approval_requested",
+              "tool_approved",
+              "tool_approval_denied",
+              "tool_approval_expired",
+              "structured_output_validated",
+              "structured_output_failed",
+              "budget_limit_reached"
+            ],
+            "title": "Event",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "process_event",
+            "default": "process_event",
+            "title": "Kind",
+            "type": "string"
+          },
+          "max_count": {
+            "anyOf": [
+              {
+                "maximum": 4096.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Count"
+          },
+          "min_count": {
+            "default": 1,
+            "maximum": 4096.0,
+            "minimum": 0.0,
+            "title": "Min Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "event"
+        ],
+        "title": "ProcessEventAssertionSpec",
+        "type": "object"
+      },
+      "ProcessEventsInOrderAssertionSpec": {
+        "additionalProperties": false,
+        "description": "Require the exact filtered order of selected portable process facts.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "events": {
+            "items": {
+              "enum": [
+                "session_started",
+                "session_resumed",
+                "session_awaiting_user_input",
+                "session_completed",
+                "session_failed",
+                "session_interrupted",
+                "session_limit_reached",
+                "tool_call_started",
+                "tool_call_completed",
+                "tool_call_failed",
+                "tool_call_blocked",
+                "tool_approval_requested",
+                "tool_approved",
+                "tool_approval_denied",
+                "tool_approval_expired",
+                "structured_output_validated",
+                "structured_output_failed",
+                "budget_limit_reached"
+              ],
+              "type": "string"
+            },
+            "maxItems": 256,
+            "minItems": 1,
+            "title": "Events",
+            "type": "array"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "process_events_in_order",
+            "default": "process_events_in_order",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "events"
+        ],
+        "title": "ProcessEventsInOrderAssertionSpec",
+        "type": "object"
+      },
       "PromotionCandidateV1": {
         "additionalProperties": false,
         "description": "One deterministic, editable case candidate and its public-safe evidence.",
@@ -22234,6 +22486,8 @@
                   "max_tool_calls": "#/components/schemas/MaxToolCallsAssertionSpec",
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
+                  "process_event": "#/components/schemas/ProcessEventAssertionSpec",
+                  "process_events_in_order": "#/components/schemas/ProcessEventsInOrderAssertionSpec",
                   "root_status": "#/components/schemas/RootStatusAssertionSpec",
                   "tool_arguments_contain": "#/components/schemas/ToolArgumentsContainAssertionSpec",
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
@@ -22267,6 +22521,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcessEventAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ProcessEventsInOrderAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/MaxToolCallsAssertionSpec"
@@ -22734,6 +22994,8 @@
                 "max_tool_calls": "#/components/schemas/PublishedMaxToolCallsDetail",
                 "max_total_tokens": "#/components/schemas/PublishedMaxTotalTokensDetail",
                 "model_judge": "#/components/schemas/PublishedModelJudgeDetail",
+                "process_event": "#/components/schemas/PublishedProcessEventDetail",
+                "process_events_in_order": "#/components/schemas/PublishedProcessEventsInOrderDetail",
                 "root_status": "#/components/schemas/PublishedRootStatusDetail",
                 "structured_model_judge": "#/components/schemas/PublishedStructuredModelJudgeDetail",
                 "tool_arguments_contain": "#/components/schemas/PublishedToolArgumentsContainDetail",
@@ -22768,6 +23030,12 @@
               },
               {
                 "$ref": "#/components/schemas/PublishedToolsCalledInOrderDetail"
+              },
+              {
+                "$ref": "#/components/schemas/PublishedProcessEventDetail"
+              },
+              {
+                "$ref": "#/components/schemas/PublishedProcessEventsInOrderDetail"
               },
               {
                 "$ref": "#/components/schemas/PublishedMaxToolCallsDetail"
@@ -22838,7 +23106,8 @@
           "expected": {
             "enum": [
               "completed",
-              "failed"
+              "failed",
+              "interrupted"
             ],
             "title": "Expected",
             "type": "string"
@@ -22991,7 +23260,7 @@
             "type": "string"
           },
           "schema_version": {
-            "const": 6,
+            "const": 7,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -23470,6 +23739,148 @@
           "diagnostic"
         ],
         "title": "PublishedModelJudgeDetail",
+        "type": "object"
+      },
+      "PublishedProcessEventDetail": {
+        "additionalProperties": false,
+        "properties": {
+          "event": {
+            "enum": [
+              "session_started",
+              "session_resumed",
+              "session_awaiting_user_input",
+              "session_completed",
+              "session_failed",
+              "session_interrupted",
+              "session_limit_reached",
+              "tool_call_started",
+              "tool_call_completed",
+              "tool_call_failed",
+              "tool_call_blocked",
+              "tool_approval_requested",
+              "tool_approved",
+              "tool_approval_denied",
+              "tool_approval_expired",
+              "structured_output_validated",
+              "structured_output_failed",
+              "budget_limit_reached"
+            ],
+            "title": "Event",
+            "type": "string"
+          },
+          "kind": {
+            "const": "process_event",
+            "default": "process_event",
+            "title": "Kind",
+            "type": "string"
+          },
+          "matching_count": {
+            "anyOf": [
+              {
+                "maximum": 4096.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Matching Count"
+          },
+          "max_count": {
+            "anyOf": [
+              {
+                "maximum": 4096.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Count"
+          },
+          "min_count": {
+            "maximum": 4096.0,
+            "minimum": 0.0,
+            "title": "Min Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "event",
+          "min_count"
+        ],
+        "title": "PublishedProcessEventDetail",
+        "type": "object"
+      },
+      "PublishedProcessEventsInOrderDetail": {
+        "additionalProperties": false,
+        "properties": {
+          "actual_count": {
+            "anyOf": [
+              {
+                "maximum": 4096.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actual Count"
+          },
+          "expected": {
+            "items": {
+              "enum": [
+                "session_started",
+                "session_resumed",
+                "session_awaiting_user_input",
+                "session_completed",
+                "session_failed",
+                "session_interrupted",
+                "session_limit_reached",
+                "tool_call_started",
+                "tool_call_completed",
+                "tool_call_failed",
+                "tool_call_blocked",
+                "tool_approval_requested",
+                "tool_approved",
+                "tool_approval_denied",
+                "tool_approval_expired",
+                "structured_output_validated",
+                "structured_output_failed",
+                "budget_limit_reached"
+              ],
+              "type": "string"
+            },
+            "maxItems": 256,
+            "minItems": 1,
+            "title": "Expected",
+            "type": "array"
+          },
+          "kind": {
+            "const": "process_events_in_order",
+            "default": "process_events_in_order",
+            "title": "Kind",
+            "type": "string"
+          },
+          "matched": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Matched"
+          }
+        },
+        "required": [
+          "expected"
+        ],
+        "title": "PublishedProcessEventsInOrderDetail",
         "type": "object"
       },
       "PublishedRootStatusDetail": {
@@ -24379,7 +24790,7 @@
       },
       "RetryPolicy": {
         "additionalProperties": false,
-        "description": "Retry controls for one provider model step.\n\n`max_attempts` includes the initial attempt. The default of 1 means retries\nare disabled.\n\nFrozen: policies are immutable value objects, so they can be shared across\nattempts and sessions without per-attempt defensive copies.",
+        "description": "Retry controls for one provider model step.\n\n`max_attempts` includes the initial attempt. The default permits five total\nattempts for classified transient provider failures. Unknown provider\nfailures retain the stricter `max_unknown_attempts` ceiling.\n\nFrozen: policies are immutable value objects, so they can be shared across\nattempts and sessions without per-attempt defensive copies.",
         "properties": {
           "backoff_multiplier": {
             "default": 2.0,
@@ -24396,21 +24807,21 @@
             "type": "number"
           },
           "jitter_s": {
-            "default": 0.0,
+            "default": 0.5,
             "maximum": 60.0,
             "minimum": 0.0,
             "title": "Jitter S",
             "type": "number"
           },
           "max_attempts": {
-            "default": 1,
+            "default": 5,
             "maximum": 10.0,
             "minimum": 1.0,
             "title": "Max Attempts",
             "type": "integer"
           },
           "max_delay_s": {
-            "default": 10.0,
+            "default": 30.0,
             "maximum": 300.0,
             "minimum": 0.0,
             "title": "Max Delay S",
@@ -25803,7 +26214,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "35",
+            "default": "36",
             "title": "Contract Version",
             "type": "string"
           },
@@ -30302,7 +30713,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "35",
+            "default": "36",
             "title": "Contract Version",
             "type": "string"
           }

@@ -30,9 +30,11 @@ from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_JUDGE_EXPLANATION_CHARS,
     EVAL_CORPUS_MAX_JUDGE_RUBRIC_CHARS,
     EVAL_CORPUS_MAX_JUDGE_RUBRIC_VERSION_CHARS,
+    EVAL_CORPUS_MAX_PROCESS_EVENTS,
     EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_RESULTS,
     EVAL_CORPUS_MAX_TOOL_NAMES,
     EVAL_CORPUS_MAX_TRIALS,
+    EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS,
     EVAL_TOOL_CALL_EVIDENCE_MAX_CALLS,
     EVIDENCE_MAX_CHILD_SESSIONS,
     EVIDENCE_MAX_MODEL_STEPS,
@@ -43,6 +45,7 @@ from cayu.evals.corpus import (
     EvalCaseSpec,
     EvalCorpusDocument,
     EvalJudgeEvidenceSelectionV1,
+    EvalProcessEventKind,
     FinalOutputContainsAssertionSpec,
     FinalOutputEqualsAssertionSpec,
     JudgeProfileIdentityV1,
@@ -52,6 +55,8 @@ from cayu.evals.corpus import (
     MaxTotalTokensAssertionSpec,
     ModelJudgeAssertionSpec,
     PrivateJudgeReferenceV1,
+    ProcessEventAssertionSpec,
+    ProcessEventsInOrderAssertionSpec,
     PublicJudgeReferenceV1,
     RootStatusAssertionSpec,
     StructuredModelJudgeAssertionSpec,
@@ -99,7 +104,7 @@ from cayu.evals.result_contract import (
 from cayu.evals.revisions import eval_trial_result_revision
 from cayu.runtime.usage import AggregateCount, aggregate_usage_metrics_from_durable_payload
 
-PUBLISHED_EVAL_SCHEMA_VERSION = 6
+PUBLISHED_EVAL_SCHEMA_VERSION = 7
 PUBLISHED_EVAL_MAX_BYTES = 32 << 20
 PUBLISHED_EVAL_MAX_DURATION_MS = 2**63 - 1
 
@@ -207,7 +212,7 @@ class PublishedRootStatusDetail(_PublishedAssertionDetail):
 
 class PublishedChildStatusDetail(_PublishedAssertionDetail):
     kind: Literal["child_status"] = "child_status"
-    expected: Literal["completed", "failed"]
+    expected: Literal["completed", "failed", "interrupted"]
     min_count: StrictInt = Field(ge=0, le=EVIDENCE_MAX_CHILD_SESSIONS)
     max_count: StrictInt | None = Field(default=None, ge=0, le=EVIDENCE_MAX_CHILD_SESSIONS)
     matching_count: StrictInt | None = Field(default=None, ge=0, le=EVIDENCE_MAX_CHILD_SESSIONS)
@@ -353,6 +358,55 @@ class PublishedToolsCalledInOrderDetail(_PublishedAssertionDetail):
             raise ValueError("A matching tool order must have the expected call count.")
         if self.matched is False and self.expected_count == self.actual_count == 0:
             raise ValueError("Empty expected and actual tool orders must match.")
+        return self
+
+
+class PublishedProcessEventDetail(_PublishedAssertionDetail):
+    kind: Literal["process_event"] = "process_event"
+    event: EvalProcessEventKind
+    min_count: StrictInt = Field(ge=0, le=EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS)
+    max_count: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS,
+    )
+    matching_count: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS,
+    )
+
+    @model_validator(mode="after")
+    def validate_count_range(self) -> PublishedProcessEventDetail:
+        if self.max_count is not None and self.max_count < self.min_count:
+            raise ValueError("max_count must be greater than or equal to min_count.")
+        return self
+
+
+class PublishedProcessEventsInOrderDetail(_PublishedAssertionDetail):
+    kind: Literal["process_events_in_order"] = "process_events_in_order"
+    expected: tuple[EvalProcessEventKind, ...] = Field(
+        min_length=1,
+        max_length=EVAL_CORPUS_MAX_PROCESS_EVENTS,
+    )
+    actual_count: StrictInt | None = Field(
+        default=None,
+        ge=0,
+        le=EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS,
+    )
+    matched: StrictBool | None = None
+
+    @field_validator("expected", mode="before")
+    @classmethod
+    def validate_expected_is_ordered(cls, value: object, info) -> object:
+        return _ordered_sequence_input(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_observation(self) -> PublishedProcessEventsInOrderDetail:
+        if (self.actual_count is None) != (self.matched is None):
+            raise ValueError("Published process-order observations must be present together.")
+        if self.matched and self.actual_count != len(self.expected):
+            raise ValueError("A matching process order must have the expected event count.")
         return self
 
 
@@ -754,6 +808,8 @@ PublishedAssertionDetail: TypeAlias = Annotated[
     | PublishedToolArgumentsContainDetail
     | PublishedToolResultContainsDetail
     | PublishedToolsCalledInOrderDetail
+    | PublishedProcessEventDetail
+    | PublishedProcessEventsInOrderDetail
     | PublishedMaxToolCallsDetail
     | PublishedMaxModelStepsDetail
     | PublishedUsageRecordedDetail
@@ -974,7 +1030,7 @@ class PublishedEvalCaseResult(_PortableModel):
 
 
 class PublishedEvalRun(_PortableModel):
-    schema_version: Literal[6]
+    schema_version: Literal[7]
     revision: StrictStr
     corpus_revision: StrictStr
     target_key: StrictStr
@@ -1207,6 +1263,10 @@ def _detail_has_observation(detail: PublishedAssertionDetail) -> bool:
         return detail.matching_count is not None
     if isinstance(detail, PublishedToolsCalledInOrderDetail):
         return detail.actual_count is not None and detail.matched is not None
+    if isinstance(detail, PublishedProcessEventDetail):
+        return detail.matching_count is not None
+    if isinstance(detail, PublishedProcessEventsInOrderDetail):
+        return detail.actual_count is not None and detail.matched is not None
     if isinstance(
         detail,
         (PublishedToolArgumentsContainDetail, PublishedToolResultContainsDetail),
@@ -1266,6 +1326,14 @@ def _detail_expected_pass(detail: PublishedAssertionDetail) -> bool | None:
         return None
     if isinstance(detail, PublishedToolsCalledInOrderDetail):
         return detail.matched
+    if isinstance(detail, PublishedProcessEventDetail):
+        if detail.matching_count is None:
+            return None
+        return detail.matching_count >= detail.min_count and (
+            detail.max_count is None or detail.matching_count <= detail.max_count
+        )
+    if isinstance(detail, PublishedProcessEventsInOrderDetail):
+        return detail.matched
     return None
 
 
@@ -1289,6 +1357,11 @@ def _detail_evidence_area(detail: PublishedAssertionDetail) -> str:
         return "tool-arguments"
     if isinstance(detail, PublishedToolResultContainsDetail):
         return "tool-result"
+    if isinstance(
+        detail,
+        (PublishedProcessEventDetail, PublishedProcessEventsInOrderDetail),
+    ):
+        return "process-event"
     if isinstance(detail, PublishedMaxModelStepsDetail):
         return "model-step"
     if isinstance(detail, (PublishedUsageRecordedDetail, PublishedMaxTotalTokensDetail)):
@@ -1354,6 +1427,10 @@ def _assertion_contract(assertion: PublishedAssertionResult) -> tuple[object, ..
         )
     elif isinstance(detail, PublishedToolsCalledInOrderDetail):
         static_detail = (detail.kind, detail.expected_count)
+    elif isinstance(detail, PublishedProcessEventDetail):
+        static_detail = (detail.kind, detail.event, detail.min_count, detail.max_count)
+    elif isinstance(detail, PublishedProcessEventsInOrderDetail):
+        static_detail = (detail.kind, *detail.expected)
     elif isinstance(detail, (PublishedMaxToolCallsDetail, PublishedMaxModelStepsDetail)):
         static_detail = (detail.kind, detail.maximum)
     elif isinstance(detail, PublishedUsageRecordedDetail):
@@ -1417,6 +1494,10 @@ def _assertion_spec_contract(spec: AssertionSpec) -> tuple[object, ...]:
         )
     if type(spec) is ToolsCalledInOrderAssertionSpec:
         return (*base, len(spec.tool_names))
+    if type(spec) is ProcessEventAssertionSpec:
+        return (*base, spec.event, spec.min_count, spec.max_count)
+    if type(spec) is ProcessEventsInOrderAssertionSpec:
+        return (*base, *spec.events)
     if isinstance(spec, (MaxToolCallsAssertionSpec, MaxModelStepsAssertionSpec)):
         return (*base, spec.maximum)
     if type(spec) is UsageRecordedAssertionSpec:
@@ -1560,6 +1641,7 @@ def _validate_trial_observations(
     child_counts: dict[str, set[int]] = {}
     tool_counts: dict[str, set[int]] = {}
     tool_order_counts: set[int] = set()
+    process_event_counts: dict[str, set[int]] = {}
     cost_observations: dict[str, set[tuple[str, int, int]]] = {}
     availability_by_area: dict[str, set[bool]] = {}
     for assertion in assertions:
@@ -1581,6 +1663,8 @@ def _validate_trial_observations(
             and detail.actual_count is not None
         ):
             tool_order_counts.add(detail.actual_count)
+        elif isinstance(detail, PublishedProcessEventDetail) and detail.matching_count is not None:
+            process_event_counts.setdefault(detail.event, set()).add(detail.matching_count)
         elif isinstance(detail, PublishedMaxModelStepsDetail) and detail.actual is not None:
             metric_values["model_steps"].append(detail.actual)
         elif isinstance(detail, PublishedMaxToolCallsDetail) and detail.actual is not None:
@@ -1637,6 +1721,17 @@ def _validate_trial_observations(
         )
     if len(tool_order_counts) > 1:
         raise ValueError("Published tool-order observations must agree within a trial.")
+    if any(len(values) > 1 for values in process_event_counts.values()):
+        raise ValueError(
+            "Published process-event observations for the same event must agree within a trial."
+        )
+    if (
+        sum(count for values in process_event_counts.values() for count in values)
+        > EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS
+    ):
+        raise ValueError(
+            "Published process-event observations cannot exceed retained process evidence."
+        )
     if any(len(values) > 1 for values in cost_observations.values()):
         raise ValueError(
             "Published cost observations for the same currency must agree within a trial."
@@ -1801,6 +1896,25 @@ def _published_detail(
             expected_count=len(spec.tool_names),
             actual_count=len(actual) if valid_actual else None,
             matched=(actual == list(spec.tool_names) if valid_actual else None),
+        )
+    if type(spec) is ProcessEventAssertionSpec:
+        return PublishedProcessEventDetail(
+            event=spec.event,
+            min_count=spec.min_count,
+            max_count=spec.max_count,
+            matching_count=_safe_metadata_int(result, "count"),
+        )
+    if type(spec) is ProcessEventsInOrderAssertionSpec:
+        actual = result.metadata.get("actual")
+        valid_actual = (
+            type(actual) is list
+            and len(actual) <= EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS
+            and all(type(item) is str for item in actual)
+        )
+        return PublishedProcessEventsInOrderDetail(
+            expected=spec.events,
+            actual_count=len(actual) if valid_actual else None,
+            matched=(actual == list(spec.events) if valid_actual else None),
         )
     if type(spec) is MaxToolCallsAssertionSpec:
         return PublishedMaxToolCallsDetail(

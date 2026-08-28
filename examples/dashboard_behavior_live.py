@@ -1692,6 +1692,34 @@ async def _exercise_captured_evaluation(
         "Expected result JSON subset",
         exact=True,
     ).fill('{"structured":{"status":"ok"}}')
+    await assertion_kind.select_option("process_event")
+    await authoring.get_by_role("button", name="Add expectation", exact=True).click()
+    process_count_assertion = authoring.get_by_test_id("promotion-assertion").last
+    await process_count_assertion.get_by_label("Process event", exact=True).select_option(
+        "tool_call_started"
+    )
+    await process_count_assertion.get_by_label("Maximum count", exact=True).fill("1")
+    await assertion_kind.select_option("process_events_in_order")
+    await authoring.get_by_role("button", name="Add expectation", exact=True).click()
+    process_order_assertion = authoring.get_by_test_id("promotion-assertion").last
+    await process_order_assertion.get_by_label(
+        "Expected process event 1",
+        exact=True,
+    ).select_option("session_started")
+    await process_order_assertion.get_by_label(
+        "Expected process event 2",
+        exact=True,
+    ).select_option("tool_call_started")
+    await process_order_assertion.get_by_role("button", name="Add event", exact=True).click()
+    await process_order_assertion.get_by_label(
+        "Expected process event 3",
+        exact=True,
+    ).select_option("tool_call_completed")
+    await process_order_assertion.get_by_role("button", name="Add event", exact=True).click()
+    await process_order_assertion.get_by_label(
+        "Expected process event 4",
+        exact=True,
+    ).select_option("session_completed")
     await authoring.get_by_role("button", name="Add case", exact=True).click()
     case_list = authoring.get_by_test_id("authored-suite-cases")
     case_id_input = authoring.get_by_test_id("authored-case-id")
@@ -1866,6 +1894,8 @@ async def _exercise_captured_evaluation(
     await expect(page.get_by_text("root_status", exact=True)).to_be_visible()
     await expect(page.get_by_text("tool_arguments_contain", exact=True)).to_be_visible()
     await expect(page.get_by_text("tool_result_contains", exact=True)).to_be_visible()
+    await expect(page.get_by_text("process_event", exact=True)).to_be_visible()
+    await expect(page.get_by_text("process_events_in_order", exact=True)).to_be_visible()
     await expect(page.get_by_text("Dashboard quality judge", exact=False)).to_be_visible()
     await expect(page.get_by_text("same model · explicitly allowed", exact=True)).to_be_visible()
     await expect(page.get_by_text("correctness", exact=True)).to_be_visible()
@@ -1899,6 +1929,31 @@ async def _exercise_captured_evaluation(
         ["passed", "passed"],
         "fresh tool JSON assertions must pass through the canonical evaluator",
     )
+    authored_process_assertions = {
+        item["detail"]["kind"]: item
+        for item in authored_assertions
+        if item["detail"]["kind"] in {"process_event", "process_events_in_order"}
+    }
+    require_equal(
+        sorted(authored_process_assertions),
+        ["process_event", "process_events_in_order"],
+        "fresh authoring must publish both portable process assertion details",
+    )
+    require_equal(
+        [item["outcome"] for item in authored_process_assertions.values()],
+        ["passed", "passed"],
+        "fresh process assertions must pass through the canonical evaluator",
+    )
+    require_equal(
+        authored_process_assertions["process_events_in_order"]["detail"]["expected"],
+        [
+            "session_started",
+            "tool_call_started",
+            "tool_call_completed",
+            "session_completed",
+        ],
+        "published process order must retain the exact closed-vocabulary expectation",
+    )
     authored_presentation = authored_result_body["presentation"]
     authored_tool_presentations = [
         item["tool_json"]
@@ -1912,6 +1967,10 @@ async def _exercise_captured_evaluation(
     )
     await expect(page.get_by_test_id("eval-tool-json-detail")).to_have_count(2)
     await expect(page.get_by_text("Observed safe value", exact=True)).to_have_count(2)
+    await expect(page.get_by_test_id("eval-process-detail")).to_have_count(2)
+    await expect(page.get_by_test_id("eval-process-expected-order")).to_contain_text(
+        "Session started → Tool call started → Tool call completed → Session completed"
+    )
     require_equal(
         authored_presentation["dimensions"]["evaluator_health"],
         "healthy",

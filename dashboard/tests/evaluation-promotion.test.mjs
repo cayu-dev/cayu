@@ -2,9 +2,11 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import {
+  capturedAssertionSuggestionUnavailable,
   capturedEvaluationDraftFromCandidate,
   capturedEvaluationPreviewMatchesDraft,
   createCapturedEvaluationAssertion,
+  createCapturedEvaluationAssertionDraft,
   createPromotionAssertion,
   PROMOTION_ASSERTION_KINDS,
   parsePromotionInteger,
@@ -84,6 +86,13 @@ function capturedCandidate() {
           value: { content: "found", structured: { status: "ok" }, is_error: false },
         },
       },
+    ],
+    process_event_evidence_state: "complete",
+    process_events: [
+      "session_started",
+      "tool_approval_requested",
+      "tool_approved",
+      "session_completed",
     ],
     model_step_evidence_state: "complete",
     model_steps: 3,
@@ -205,6 +214,135 @@ test("captured drafts omit replay input and quick-add assertions use observed fa
       occurrence: 1,
       expected_subset: { content: "found", structured: { status: "ok" }, is_error: false },
     },
+  )
+  assert.deepEqual(
+    assertions.find((item) => item.kind === "process_event"),
+    {
+      id: "process_event",
+      kind: "process_event",
+      event: "tool_approval_requested",
+      min_count: 1,
+      max_count: 1,
+    },
+  )
+  assert.deepEqual(
+    assertions.find((item) => item.kind === "process_events_in_order"),
+    {
+      id: "process_events_in_order",
+      kind: "process_events_in_order",
+      events: ["session_started", "tool_approval_requested", "tool_approved", "session_completed"],
+    },
+  )
+})
+
+test("process assertions use a closed vocabulary and bounded exact order", () => {
+  const valid = draftFromCandidate()
+  valid.case.assertions = [
+    {
+      id: "approval",
+      kind: "process_event",
+      event: "tool_approval_requested",
+      min_count: 1,
+      max_count: 1,
+    },
+    {
+      id: "protocol",
+      kind: "process_events_in_order",
+      events: ["tool_approval_requested", "tool_approved", "tool_call_started"],
+    },
+    {
+      id: "child-interrupted",
+      kind: "child_status",
+      expected: "interrupted",
+      min_count: 1,
+      max_count: null,
+    },
+  ]
+  assert.deepEqual(validatePromotionDraft(valid), { ok: true, draft: valid })
+
+  const raw = structuredClone(valid)
+  raw.case.assertions[0].event = "tool.call.approval_requested"
+  assert.match(validatePromotionDraft(raw).error, /closed portable vocabulary/)
+
+  const emptyOrder = structuredClone(valid)
+  emptyOrder.case.assertions[1].events = []
+  assert.match(validatePromotionDraft(emptyOrder).error, /between 1 and 256/)
+
+  const reversedRange = structuredClone(valid)
+  reversedRange.case.assertions[0].min_count = 2
+  reversedRange.case.assertions[0].max_count = 1
+  assert.match(validatePromotionDraft(reversedRange).error, /cannot be below its minimum/)
+})
+
+test("captured process suggestions never invent facts when evidence is incomplete or oversized", () => {
+  const complete = capturedCandidate().evidence
+  complete.process_events = [
+    "session_started",
+    ...Array(257).fill("tool_call_started"),
+    "session_completed",
+  ]
+
+  assert.equal(capturedAssertionSuggestionUnavailable("process_events_in_order", complete), false)
+  assert.deepEqual(createCapturedEvaluationAssertion("process_events_in_order", [], complete), {
+    id: "process_events_in_order",
+    kind: "process_events_in_order",
+    events: ["session_started", "session_completed"],
+  })
+  assert.deepEqual(
+    createCapturedEvaluationAssertionDraft("process_events_in_order", [], complete),
+    {
+      assertion: {
+        id: "process_events_in_order",
+        kind: "process_events_in_order",
+        events: ["session_started", "session_completed"],
+      },
+      source: "observed",
+    },
+  )
+
+  const unrepresentable = structuredClone(complete)
+  unrepresentable.process_events = Array(257).fill("tool_call_started")
+  assert.equal(
+    capturedAssertionSuggestionUnavailable("process_events_in_order", unrepresentable),
+    true,
+  )
+  assert.deepEqual(
+    createCapturedEvaluationAssertionDraft("process_events_in_order", [], unrepresentable),
+    {
+      assertion: {
+        id: "process_events_in_order",
+        kind: "process_events_in_order",
+        events: ["tool_approval_requested", "tool_approved"],
+      },
+      source: "expectation",
+    },
+  )
+  assert.throws(
+    () => createCapturedEvaluationAssertion("process_events_in_order", [], unrepresentable),
+    /Complete captured process-event evidence with a representable order is required/,
+  )
+
+  const limited = structuredClone(complete)
+  limited.process_event_evidence_state = "limit_exceeded"
+  assert.equal(capturedAssertionSuggestionUnavailable("process_event", limited), true)
+  assert.equal(capturedAssertionSuggestionUnavailable("process_events_in_order", limited), true)
+  assert.deepEqual(createCapturedEvaluationAssertionDraft("process_event", [], limited), {
+    assertion: {
+      id: "process_event",
+      kind: "process_event",
+      event: "tool_approval_requested",
+      min_count: 1,
+      max_count: null,
+    },
+    source: "expectation",
+  })
+  assert.throws(
+    () => createCapturedEvaluationAssertion("process_event", [], limited),
+    /Complete captured process-event evidence is required/,
+  )
+  assert.throws(
+    () => createCapturedEvaluationAssertion("process_events_in_order", [], limited),
+    /Complete captured process-event evidence with a representable order is required/,
   )
 })
 

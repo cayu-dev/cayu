@@ -2410,6 +2410,14 @@ export type AssertionEvidenceView = {
      */
     pricing_profile_fingerprint?: string | null;
     /**
+     * Process Event Evidence State
+     */
+    process_event_evidence_state: 'complete' | 'unavailable' | 'limit_exceeded';
+    /**
+     * Process Events
+     */
+    process_events: Array<'session_started' | 'session_resumed' | 'session_awaiting_user_input' | 'session_completed' | 'session_failed' | 'session_interrupted' | 'session_limit_reached' | 'tool_call_started' | 'tool_call_completed' | 'tool_call_failed' | 'tool_call_blocked' | 'tool_approval_requested' | 'tool_approved' | 'tool_approval_denied' | 'tool_approval_expired' | 'structured_output_validated' | 'structured_output_failed' | 'budget_limit_reached'>;
+    /**
      * Requested Tool Names
      */
     requested_tool_names: Array<string>;
@@ -2428,7 +2436,7 @@ export type AssertionEvidenceView = {
     /**
      * Schema Version
      */
-    schema_version?: 3;
+    schema_version?: 4;
     /**
      * Started Tool Names
      */
@@ -2664,7 +2672,7 @@ export type CapturedEvaluationCaseDraft = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -3128,7 +3136,7 @@ export type ChildStatusAssertionSpec = {
     /**
      * Expected
      */
-    expected: 'completed' | 'failed';
+    expected: 'completed' | 'failed' | 'interrupted';
     /**
      * Id
      */
@@ -4527,6 +4535,10 @@ export type EvalAssertionPresentationV1 = {
      */
     outcome: 'passed' | 'failed' | 'unavailable' | 'error';
     /**
+     * Process
+     */
+    process?: PublishedChildStatusDetail | PublishedProcessEventDetail | PublishedProcessEventsInOrderDetail | null;
+    /**
      * Score
      */
     score?: number | null;
@@ -4919,7 +4931,7 @@ export type EvalCaseDefinitionV1 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -4956,7 +4968,7 @@ export type EvalCaseDefinitionV2 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -4993,7 +5005,7 @@ export type EvalCaseDraftV1 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -5026,7 +5038,7 @@ export type EvalCaseDraftV2 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionDraftV1>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionDraftV1>;
     /**
      * Description
      */
@@ -5091,7 +5103,7 @@ export type EvalCaseSpec = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -7717,7 +7729,7 @@ export type EvaluationPromotionCaseDraft = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -11260,6 +11272,62 @@ export type PrivateJudgeReferenceV1 = {
 };
 
 /**
+ * ProcessEventAssertionSpec
+ *
+ * Require or forbid one closed, payload-free runtime process fact.
+ */
+export type ProcessEventAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Event
+     */
+    event: 'session_started' | 'session_resumed' | 'session_awaiting_user_input' | 'session_completed' | 'session_failed' | 'session_interrupted' | 'session_limit_reached' | 'tool_call_started' | 'tool_call_completed' | 'tool_call_failed' | 'tool_call_blocked' | 'tool_approval_requested' | 'tool_approved' | 'tool_approval_denied' | 'tool_approval_expired' | 'structured_output_validated' | 'structured_output_failed' | 'budget_limit_reached';
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'process_event';
+    /**
+     * Max Count
+     */
+    max_count?: number | null;
+    /**
+     * Min Count
+     */
+    min_count?: number;
+};
+
+/**
+ * ProcessEventsInOrderAssertionSpec
+ *
+ * Require the exact filtered order of selected portable process facts.
+ */
+export type ProcessEventsInOrderAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Events
+     */
+    events: Array<'session_started' | 'session_resumed' | 'session_awaiting_user_input' | 'session_completed' | 'session_failed' | 'session_interrupted' | 'session_limit_reached' | 'tool_call_started' | 'tool_call_completed' | 'tool_call_failed' | 'tool_call_blocked' | 'tool_approval_requested' | 'tool_approved' | 'tool_approval_denied' | 'tool_approval_expired' | 'structured_output_validated' | 'structured_output_failed' | 'budget_limit_reached'>;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'process_events_in_order';
+};
+
+/**
  * PromotionCandidateV1
  *
  * One deterministic, editable case candidate and its public-safe evidence.
@@ -11298,7 +11366,7 @@ export type PromotionCaseV1 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | ProcessEventAssertionSpec | ProcessEventsInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -11589,6 +11657,10 @@ export type PublishedAssertionResult = {
     } & PublishedToolResultContainsDetail) | ({
         kind: 'tools_called_in_order';
     } & PublishedToolsCalledInOrderDetail) | ({
+        kind: 'process_event';
+    } & PublishedProcessEventDetail) | ({
+        kind: 'process_events_in_order';
+    } & PublishedProcessEventsInOrderDetail) | ({
         kind: 'max_tool_calls';
     } & PublishedMaxToolCallsDetail) | ({
         kind: 'max_model_steps';
@@ -11624,7 +11696,7 @@ export type PublishedChildStatusDetail = {
     /**
      * Expected
      */
-    expected: 'completed' | 'failed';
+    expected: 'completed' | 'failed' | 'interrupted';
     /**
      * Kind
      */
@@ -11704,7 +11776,7 @@ export type PublishedEvalRun = {
     /**
      * Schema Version
      */
-    schema_version: 6;
+    schema_version: 7;
     /**
      * Score
      */
@@ -11951,6 +12023,54 @@ export type PublishedModelJudgeDetail = {
      * Threshold
      */
     threshold: number;
+};
+
+/**
+ * PublishedProcessEventDetail
+ */
+export type PublishedProcessEventDetail = {
+    /**
+     * Event
+     */
+    event: 'session_started' | 'session_resumed' | 'session_awaiting_user_input' | 'session_completed' | 'session_failed' | 'session_interrupted' | 'session_limit_reached' | 'tool_call_started' | 'tool_call_completed' | 'tool_call_failed' | 'tool_call_blocked' | 'tool_approval_requested' | 'tool_approved' | 'tool_approval_denied' | 'tool_approval_expired' | 'structured_output_validated' | 'structured_output_failed' | 'budget_limit_reached';
+    /**
+     * Kind
+     */
+    kind?: 'process_event';
+    /**
+     * Matching Count
+     */
+    matching_count?: number | null;
+    /**
+     * Max Count
+     */
+    max_count?: number | null;
+    /**
+     * Min Count
+     */
+    min_count: number;
+};
+
+/**
+ * PublishedProcessEventsInOrderDetail
+ */
+export type PublishedProcessEventsInOrderDetail = {
+    /**
+     * Actual Count
+     */
+    actual_count?: number | null;
+    /**
+     * Expected
+     */
+    expected: Array<'session_started' | 'session_resumed' | 'session_awaiting_user_input' | 'session_completed' | 'session_failed' | 'session_interrupted' | 'session_limit_reached' | 'tool_call_started' | 'tool_call_completed' | 'tool_call_failed' | 'tool_call_blocked' | 'tool_approval_requested' | 'tool_approved' | 'tool_approval_denied' | 'tool_approval_expired' | 'structured_output_validated' | 'structured_output_failed' | 'budget_limit_reached'>;
+    /**
+     * Kind
+     */
+    kind?: 'process_events_in_order';
+    /**
+     * Matched
+     */
+    matched?: boolean | null;
 };
 
 /**
@@ -12417,8 +12537,9 @@ export type ResumeBody = {
  *
  * Retry controls for one provider model step.
  *
- * `max_attempts` includes the initial attempt. The default of 1 means retries
- * are disabled.
+ * `max_attempts` includes the initial attempt. The default permits five total
+ * attempts for classified transient provider failures. Unknown provider
+ * failures retain the stricter `max_unknown_attempts` ceiling.
  *
  * Frozen: policies are immutable value objects, so they can be shared across
  * attempts and sessions without per-attempt defensive copies.

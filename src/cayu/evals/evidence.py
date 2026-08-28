@@ -22,12 +22,14 @@ from cayu.evals._memory_attribution import (
 )
 from cayu.evals.corpus import (
     _CURRENCY_PATTERN,
+    EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS,
     EVAL_TOOL_CALL_EVIDENCE_MAX_CALLS,
     EVIDENCE_MAX_CHILD_SESSIONS,
     EVIDENCE_MAX_FINAL_OUTPUT_CHARS,
     EVIDENCE_MAX_MODEL_STEPS,
     EVIDENCE_MAX_TOOL_CALLS,
     EVIDENCE_MAX_TOTAL_TOKENS,
+    EvalProcessEventKind,
     EvaluationEvidencePolicySpec,
     PricingProfileIdentityV1,
     _bounded_durable_text,
@@ -55,7 +57,7 @@ from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import PriceBook, _estimate_session_cost
 from cayu.runtime.usage import AggregateCount
 
-ASSERTION_EVIDENCE_SCHEMA_VERSION = 3
+ASSERTION_EVIDENCE_SCHEMA_VERSION = 4
 ASSERTION_EVIDENCE_MAX_BYTES = 10 << 20
 ASSERTION_EVIDENCE_MAX_TOOL_NAME_CHARS = 256
 ASSERTION_EVIDENCE_MAX_COST_CURRENCIES = 32
@@ -71,6 +73,28 @@ ToolValueEvidenceState = Literal[
     "incompatible",
 ]
 TerminalEvidenceStatus = Literal["completed", "failed", "interrupted"]
+
+
+_PORTABLE_PROCESS_EVENT_KINDS: dict[str, EvalProcessEventKind] = {
+    str(EventType.SESSION_STARTED): "session_started",
+    str(EventType.SESSION_RESUMED): "session_resumed",
+    str(EventType.SESSION_AWAITING_USER_INPUT): "session_awaiting_user_input",
+    str(EventType.SESSION_COMPLETED): "session_completed",
+    str(EventType.SESSION_FAILED): "session_failed",
+    str(EventType.SESSION_INTERRUPTED): "session_interrupted",
+    str(EventType.SESSION_LIMIT_REACHED): "session_limit_reached",
+    str(EventType.TOOL_CALL_STARTED): "tool_call_started",
+    str(EventType.TOOL_CALL_COMPLETED): "tool_call_completed",
+    str(EventType.TOOL_CALL_FAILED): "tool_call_failed",
+    str(EventType.TOOL_CALL_BLOCKED): "tool_call_blocked",
+    str(EventType.TOOL_CALL_APPROVAL_REQUESTED): "tool_approval_requested",
+    str(EventType.TOOL_CALL_APPROVED): "tool_approved",
+    str(EventType.TOOL_CALL_APPROVAL_DENIED): "tool_approval_denied",
+    str(EventType.TOOL_CALL_APPROVAL_EXPIRED): "tool_approval_expired",
+    str(EventType.STRUCTURED_OUTPUT_VALIDATED): "structured_output_validated",
+    str(EventType.STRUCTURED_OUTPUT_FAILED): "structured_output_failed",
+    str(EventType.BUDGET_LIMIT_REACHED): "budget_limit_reached",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,7 +220,7 @@ class ToolCallEvidenceV1(_PortableModel):
 class AssertionEvidenceView(_PortableModel):
     """The bounded, content-minimized data consumed by every portable assertion."""
 
-    schema_version: Literal[3] = ASSERTION_EVIDENCE_SCHEMA_VERSION
+    schema_version: Literal[4] = ASSERTION_EVIDENCE_SCHEMA_VERSION
     revision: StrictStr
     policy_revision: StrictStr
     pricing_profile_fingerprint: StrictStr | None = None
@@ -218,6 +242,10 @@ class AssertionEvidenceView(_PortableModel):
     tool_evidence_state: EvidenceState
     tool_calls: tuple[ToolCallEvidenceV1, ...] = Field(max_length=EVAL_TOOL_CALL_EVIDENCE_MAX_CALLS)
     tool_call_evidence_state: ToolCallEvidenceState
+    process_events: tuple[EvalProcessEventKind, ...] = Field(
+        max_length=EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS
+    )
+    process_event_evidence_state: EvidenceState
     model_steps: StrictInt | None = Field(
         default=None,
         ge=0,
@@ -236,6 +264,7 @@ class AssertionEvidenceView(_PortableModel):
         "requested_tool_names",
         "started_tool_names",
         "tool_calls",
+        "process_events",
         "costs",
         mode="before",
     )
@@ -252,7 +281,7 @@ class AssertionEvidenceView(_PortableModel):
     @classmethod
     def validate_schema_version_type(cls, value: object) -> object:
         if type(value) is not int:
-            raise ValueError("schema_version must be the integer 3.")
+            raise ValueError("schema_version must be the integer 4.")
         return value
 
     @field_validator("pricing_profile_fingerprint")
@@ -301,6 +330,7 @@ class AssertionEvidenceView(_PortableModel):
                 self.final_output_state,
                 self.tool_evidence_state,
                 self.tool_call_evidence_state,
+                self.process_event_evidence_state,
                 self.model_step_evidence_state,
                 self.usage_evidence_state,
             )
@@ -391,6 +421,15 @@ class AssertionEvidenceView(_PortableModel):
                     )
             elif item.result.state != "unsupported":
                 raise ValueError("Disabled tool-result evidence must have an unsupported state.")
+        if self.process_event_evidence_state == "unavailable":
+            if self.process_events:
+                raise ValueError("Unavailable process-event evidence cannot carry observations.")
+        elif self.process_event_evidence_state == "limit_exceeded" and (
+            len(self.process_events) != EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS
+        ):
+            raise ValueError(
+                "Limited process-event evidence must retain exactly its bounded prefix."
+            )
         if self.model_step_evidence_state == "unavailable":
             if self.model_steps is not None:
                 raise ValueError("Unavailable model-step evidence cannot carry a count.")
@@ -930,6 +969,23 @@ def _build_assertion_evidence_view(
         started_tool_names=started_tool_names,
     )
 
+    if not root_available:
+        process_events: tuple[EvalProcessEventKind, ...] = ()
+        process_event_state: EvidenceState = "unavailable"
+    else:
+        retained_process_events: list[EvalProcessEventKind] = []
+        process_events_overflow = False
+        for event in trajectory.events:
+            process_event = _PORTABLE_PROCESS_EVENT_KINDS.get(event.type)
+            if process_event is None:
+                continue
+            if len(retained_process_events) == EVAL_PROCESS_EVENT_EVIDENCE_MAX_EVENTS:
+                process_events_overflow = True
+                break
+            retained_process_events.append(process_event)
+        process_events = tuple(retained_process_events)
+        process_event_state = "limit_exceeded" if process_events_overflow else "complete"
+
     # Public projection derives completeness from the durable root. The compiled
     # EvalAssertion adapter may instead receive an explicitly complete synthetic
     # context, matching the existing direct-assertion contract.
@@ -1034,6 +1090,8 @@ def _build_assertion_evidence_view(
         "tool_evidence_state": tool_state,
         "tool_calls": [item.model_dump(mode="json") for item in tool_calls],
         "tool_call_evidence_state": tool_call_state,
+        "process_events": list(process_events),
+        "process_event_evidence_state": process_event_state,
         "model_steps": model_steps,
         "model_step_evidence_state": model_step_state,
         "total_tokens": total_tokens,

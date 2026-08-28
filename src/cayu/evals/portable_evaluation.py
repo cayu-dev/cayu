@@ -14,6 +14,8 @@ from cayu.evals.corpus import (
     MaxToolCallsAssertionSpec,
     MaxTotalTokensAssertionSpec,
     ModelJudgeAssertionSpec,
+    ProcessEventAssertionSpec,
+    ProcessEventsInOrderAssertionSpec,
     RootStatusAssertionSpec,
     StructuredModelJudgeAssertionSpec,
     ToolArgumentsContainAssertionSpec,
@@ -286,6 +288,60 @@ def _evaluate_tools_in_order(
     )
 
 
+def _evaluate_process_event(
+    *,
+    name: str,
+    event: str,
+    actual: Sequence[str],
+    state: EvidenceState,
+    minimum: int,
+    maximum: int | None,
+) -> EvalAssertionResult:
+    if state != "complete":
+        return _unavailable(name, "process event", state)
+    count = sum(item == event for item in actual)
+    within_range = count >= minimum and (maximum is None or count <= maximum)
+    return _result(
+        name,
+        EvalOutcome.PASSED if within_range else EvalOutcome.FAILED,
+        (
+            f"Observed process event {event} {count} time(s)."
+            if within_range
+            else f"Process event {event} count {count} is outside the required range."
+        ),
+        metadata={
+            "event": event,
+            "count": count,
+            "minimum": minimum,
+            "maximum": maximum,
+        },
+    )
+
+
+def _evaluate_process_events_in_order(
+    *,
+    name: str,
+    expected: Sequence[str],
+    observed: Sequence[str],
+    state: EvidenceState,
+) -> EvalAssertionResult:
+    if state != "complete":
+        return _unavailable(name, "process event", state)
+    selected = frozenset(expected)
+    actual = tuple(event for event in observed if event in selected)
+    matched = actual == tuple(expected)
+    return _result(
+        name,
+        EvalOutcome.PASSED if matched else EvalOutcome.FAILED,
+        (
+            "Selected process events matched the exact expected order."
+            if matched
+            else "Selected process events did not match the exact expected order."
+        ),
+        metadata={"expected": list(expected), "actual": list(actual), "matched": matched},
+    )
+
+
 def _evaluate_maximum(
     *,
     name: str,
@@ -454,6 +510,22 @@ def _evaluate_validated_assertion_outcome(
             expected=validated_spec.tool_names,
             actual=evidence.requested_tool_names,
             state=evidence.tool_evidence_state,
+        )
+    if type(validated_spec) is ProcessEventAssertionSpec:
+        return _evaluate_process_event(
+            name=validated_spec.id,
+            event=validated_spec.event,
+            actual=evidence.process_events,
+            state=evidence.process_event_evidence_state,
+            minimum=validated_spec.min_count,
+            maximum=validated_spec.max_count,
+        )
+    if type(validated_spec) is ProcessEventsInOrderAssertionSpec:
+        return _evaluate_process_events_in_order(
+            name=validated_spec.id,
+            expected=validated_spec.events,
+            observed=evidence.process_events,
+            state=evidence.process_event_evidence_state,
         )
     if type(validated_spec) is MaxToolCallsAssertionSpec:
         return _evaluate_maximum(

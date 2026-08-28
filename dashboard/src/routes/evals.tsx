@@ -103,6 +103,7 @@ import {
   evalsReadinessStateLabel,
 } from "@/lib/evals-readiness"
 import { type EvalsSearch, evalResultRevisionIsValid, evalsSearchWithout } from "@/lib/evals-search"
+import { PROCESS_EVENT_OPTIONS } from "@/lib/evaluation-promotion"
 import { formatBytes, formatCount, formatDateTime } from "@/lib/format"
 import type {
   EvalAssertionPresentationV1,
@@ -113,6 +114,7 @@ import type {
   EvalStructuredJudgePresentationV1,
   EvalsReadiness,
   EvalToolJsonAssertionComparisonV1,
+  PublishedProcessEventsInOrderDetail,
 } from "@/lib/generated/server-api"
 
 const PAGE_LIMIT = 25
@@ -2422,6 +2424,11 @@ function ResultInspector({
                           />
                         ) : presentedAssertion?.tool_json ? (
                           <ToolJsonDetails className="mt-3" detail={presentedAssertion.tool_json} />
+                        ) : presentedAssertion?.process ? (
+                          <ProcessAssertionDetails
+                            className="mt-3"
+                            detail={presentedAssertion.process}
+                          />
                         ) : (
                           <details className="mt-2 text-xs">
                             <summary className="cursor-pointer text-primary">
@@ -2591,6 +2598,9 @@ function PresentedAssertions({ assertions }: { assertions: Array<EvalAssertionPr
             <StructuredJudgeDetails className="mt-3" judgment={assertion.structured_judge} />
           )}
           {assertion.tool_json && <ToolJsonDetails className="mt-3" detail={assertion.tool_json} />}
+          {assertion.process && (
+            <ProcessAssertionDetails className="mt-3" detail={assertion.process} />
+          )}
         </div>
       ))}
     </div>
@@ -2645,6 +2655,73 @@ function ToolJsonDetails({
       </div>
     </div>
   )
+}
+
+const PROCESS_EVENT_LABELS = new Map(PROCESS_EVENT_OPTIONS)
+
+function ProcessAssertionDetails({
+  detail,
+  className,
+}: {
+  detail: NonNullable<EvalAssertionPresentationV1["process"]>
+  className?: string
+}) {
+  let facts: Array<[string, string]>
+  if (detail.kind === "child_status") {
+    facts = [
+      ["Child status", detail.expected],
+      ["Observed", detail.matching_count == null ? "unavailable" : String(detail.matching_count)],
+      ["Required", formatCountRange(detail.min_count, detail.max_count)],
+    ]
+  } else if (detail.kind === "process_event") {
+    facts = [
+      ["Process event", PROCESS_EVENT_LABELS.get(detail.event) ?? detail.event],
+      ["Observed", detail.matching_count == null ? "unavailable" : String(detail.matching_count)],
+      ["Required", formatCountRange(detail.min_count, detail.max_count)],
+    ]
+  } else {
+    const order = detail as PublishedProcessEventsInOrderDetail
+    facts = [
+      ["Expected selected events", String(order.expected.length)],
+      [
+        "Observed selected events",
+        order.actual_count == null ? "unavailable" : String(order.actual_count),
+      ],
+      [
+        "Exact order",
+        order.matched == null ? "unavailable" : order.matched ? "matched" : "mismatch",
+      ],
+    ]
+  }
+  return (
+    <div
+      className={`rounded-lg border border-border bg-muted/20 p-3 ${className ?? ""}`}
+      data-testid="eval-process-detail"
+    >
+      <div className="grid gap-3 text-xs sm:grid-cols-3">
+        {facts.map(([label, value]) => (
+          <RunFact key={label} label={label} value={value} />
+        ))}
+      </div>
+      {detail.kind === "process_events_in_order" && (
+        <div className="mt-3 space-y-2 text-xs text-muted-foreground">
+          <p className="break-words font-mono" data-testid="eval-process-expected-order">
+            {detail.expected.map((event) => PROCESS_EVENT_LABELS.get(event) ?? event).join(" → ")}
+          </p>
+          <p>
+            Only the event kinds selected by the assertion participate; their complete filtered
+            sequence and multiplicity must match exactly.
+          </p>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function formatCountRange(minimum: number, maximum: number | null | undefined): string {
+  if (maximum === minimum) return String(minimum)
+  if (maximum == null) return `at least ${minimum}`
+  return `${minimum} to ${maximum}`
 }
 
 function StructuredJudgeDetails({

@@ -55,10 +55,13 @@ import {
 } from "@/lib/evals-dashboard"
 import { evalsReadinessReasonText } from "@/lib/evals-readiness"
 import {
-  createCapturedEvaluationAssertion,
+  capturedAssertionSuggestionUnavailable,
+  createCapturedEvaluationAssertionDraft,
   createPromotionAssertion,
+  PROCESS_EVENT_OPTIONS,
   PROMOTION_ASSERTION_KINDS,
   PROMOTION_ASSERTION_LABELS,
+  type ProcessEventKind,
   type PromotionAssertion,
   type PromotionAssertionKind,
   capturedEvaluationPreviewMatchesDraft as previewMatchesDraft,
@@ -718,6 +721,14 @@ function PromotionEvidenceSummary({
           label="Tool results"
           value={toolValueEvidenceSummary(evidence.tool_calls, "result")}
         />
+        <EvidenceFact
+          label="Process events"
+          value={
+            evidence.process_event_evidence_state === "complete"
+              ? String(evidence.process_events.length)
+              : evidence.process_event_evidence_state
+          }
+        />
       </CardContent>
       {candidate.warnings.length > 0 && (
         <div className="mx-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-2.5 text-xs text-amber-700 dark:text-amber-300">
@@ -1132,11 +1143,13 @@ export function ExpectedBehaviorEditor({
     editAssertions((next) => {
       next.push(
         evidence
-          ? createCapturedEvaluationAssertion(quickKind, next, evidence)
+          ? createCapturedEvaluationAssertionDraft(quickKind, next, evidence).assertion
           : createPromotionAssertion(quickKind, next),
       )
     })
   const quickKindUnavailable = assertionKindUnavailable(quickKind, evidencePolicy)
+  const quickAddsObserved =
+    evidence !== undefined && !capturedAssertionSuggestionUnavailable(quickKind, evidence)
   return (
     <Card size="sm">
       <CardHeader className="grid-cols-[1fr_auto]">
@@ -1172,7 +1185,7 @@ export function ExpectedBehaviorEditor({
             disabled={assertions.length >= 64 || quickKindUnavailable}
             onClick={addAssertion}
           >
-            <Plus /> {evidence ? "Add observed" : "Add expectation"}
+            <Plus /> {quickAddsObserved ? "Add observed" : "Add expectation"}
           </Button>
         </div>
       </CardHeader>
@@ -1219,7 +1232,7 @@ function AssertionEditor({
   const replaceKind = (kind: PromotionAssertionKind) => {
     const remaining = assertions.filter((_, candidateIndex) => candidateIndex !== index)
     const replacement = evidence
-      ? createCapturedEvaluationAssertion(kind, remaining, evidence)
+      ? createCapturedEvaluationAssertionDraft(kind, remaining, evidence).assertion
       : createPromotionAssertion(kind, remaining)
     replacement.id = assertion.id
     replacement.description = assertion.description ?? null
@@ -1307,7 +1320,7 @@ function AssertionFields({
       return (
         <div className="grid gap-3 sm:grid-cols-3">
           <PromotionField label="Expected child status" id={id("expected")}>
-            <TerminalStatusSelect
+            <ChildTerminalStatusSelect
               id={id("expected")}
               value={assertion.expected}
               onChange={(expected) => update({ ...assertion, expected })}
@@ -1466,6 +1479,96 @@ function AssertionFields({
               ))}
             </div>
           )}
+        </div>
+      )
+    case "process_event":
+      return (
+        <div className="space-y-3">
+          <div className="grid gap-3 sm:grid-cols-3">
+            <PromotionField label="Process event" id={id("event")}>
+              <ProcessEventSelect
+                id={id("event")}
+                value={assertion.event}
+                onChange={(event) => update({ ...assertion, event })}
+              />
+            </PromotionField>
+            <IntegerField
+              label="Minimum count"
+              id={id("minimum")}
+              value={assertion.min_count ?? 1}
+              onChange={(min_count) => update({ ...assertion, min_count })}
+            />
+            <NullableIntegerField
+              label="Maximum count"
+              id={id("maximum")}
+              value={assertion.max_count}
+              onChange={(max_count) => update({ ...assertion, max_count })}
+            />
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Set both counts to zero to forbid this event. Event payloads and approval identity are
+            never retained in portable assertions.
+          </p>
+        </div>
+      )
+    case "process_events_in_order":
+      return (
+        <div>
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <span className={LABEL_CLASS}>Exact selected process order</span>
+            <Button
+              size="xs"
+              variant="outline"
+              disabled={assertion.events.length >= 256}
+              onClick={() =>
+                update({
+                  ...assertion,
+                  events: [...assertion.events, "tool_call_completed"],
+                })
+              }
+            >
+              <Plus /> Add event
+            </Button>
+          </div>
+          <div className="space-y-2">
+            {assertion.events.map((processEvent, eventIndex) => (
+              <div
+                // biome-ignore lint/suspicious/noArrayIndexKey: ordered values own no local state.
+                key={eventIndex}
+                className="flex items-start gap-2"
+              >
+                <ProcessEventSelect
+                  ariaLabel={`Expected process event ${eventIndex + 1}`}
+                  value={processEvent}
+                  onChange={(event) => {
+                    const events = [...assertion.events]
+                    events[eventIndex] = event
+                    update({ ...assertion, events })
+                  }}
+                />
+                <Button
+                  size="icon-xs"
+                  variant="ghost"
+                  aria-label={`Remove expected process event ${eventIndex + 1}`}
+                  disabled={assertion.events.length === 1}
+                  onClick={() =>
+                    update({
+                      ...assertion,
+                      events: assertion.events.filter(
+                        (_, candidateIndex) => candidateIndex !== eventIndex,
+                      ),
+                    })
+                  }
+                >
+                  <Trash2 />
+                </Button>
+              </div>
+            ))}
+          </div>
+          <p className="mt-2 text-xs text-muted-foreground">
+            Advanced protocol check: Cayu filters the trace to the event kinds selected here, then
+            requires the complete filtered sequence and multiplicity to match exactly.
+          </p>
         </div>
       )
     case "max_tool_calls":
@@ -1695,6 +1798,57 @@ function TerminalStatusSelect({
     >
       <option value="completed">Completed</option>
       <option value="failed">Failed</option>
+    </select>
+  )
+}
+
+function ChildTerminalStatusSelect({
+  id,
+  value,
+  onChange,
+}: {
+  id: string
+  value: "completed" | "failed" | "interrupted"
+  onChange: (value: "completed" | "failed" | "interrupted") => void
+}) {
+  return (
+    <select
+      id={id}
+      className={SELECT_CLASS}
+      value={value}
+      onChange={(event) => onChange(event.target.value as "completed" | "failed" | "interrupted")}
+    >
+      <option value="completed">Completed</option>
+      <option value="failed">Failed</option>
+      <option value="interrupted">Interrupted</option>
+    </select>
+  )
+}
+
+function ProcessEventSelect({
+  id,
+  ariaLabel,
+  value,
+  onChange,
+}: {
+  id?: string
+  ariaLabel?: string
+  value: ProcessEventKind
+  onChange: (value: ProcessEventKind) => void
+}) {
+  return (
+    <select
+      id={id}
+      aria-label={ariaLabel}
+      className={SELECT_CLASS}
+      value={value}
+      onChange={(event) => onChange(event.target.value as ProcessEventKind)}
+    >
+      {PROCESS_EVENT_OPTIONS.map(([event, label]) => (
+        <option key={event} value={event}>
+          {label}
+        </option>
+      ))}
     </select>
   )
 }

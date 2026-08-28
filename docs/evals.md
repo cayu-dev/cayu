@@ -414,6 +414,68 @@ unselected extra field does not prevent a safe comparison. These states and the
 bounded safe actual value are the same in SDK/HTTP results, Control Plane
 drill-down, CLI, and JSON/HTML reports.
 
+### Portable lifecycle, approval, and child assertions
+
+`ProcessEventAssertionSpec` requires or forbids one decision-useful runtime
+fact with bounded minimum and maximum counts. `ProcessEventsInOrderAssertionSpec`
+is the advanced protocol form: Cayu filters the root session's ordered event
+record to the fact kinds named by the assertion and then requires the complete
+filtered sequence, including duplicates, to match exactly. Other runtime events
+do not affect that selected protocol check.
+
+```python
+from cayu import ProcessEventAssertionSpec, ProcessEventsInOrderAssertionSpec
+
+approval_required = ProcessEventAssertionSpec(
+    id="approval-required",
+    event="tool_approval_requested",
+    min_count=1,
+)
+approval_not_denied = ProcessEventAssertionSpec(
+    id="approval-not-denied",
+    event="tool_approval_denied",
+    min_count=0,
+    max_count=0,
+)
+approval_protocol = ProcessEventsInOrderAssertionSpec(
+    id="approval-protocol",
+    events=(
+        "tool_approval_requested",
+        "tool_approved",
+        "tool_call_started",
+        "tool_call_completed",
+    ),
+)
+```
+
+The closed vocabulary covers session started, resumed, awaiting-input,
+completed, failed, interrupted, and limit-reached facts; tool started,
+completed, failed, and blocked facts; approval requested, approved, denied, and
+expired facts; structured-output validated and failed facts; and the budget
+limit-reached fact. Portable input cannot name custom events or internal event
+strings and cannot inspect raw payloads, approval IDs, actors, reasons, policy
+metadata, or secrets. Direct Python `EventOccurred` remains available for
+application-owned specialized assertions, but it is intentionally not a
+portable Control Plane or corpus contract.
+
+Process evidence retains at most 4,096 allowlisted facts. Missing root evidence
+and bounded prefixes are `unavailable`, never a pass or candidate mismatch.
+Exact ordering applies only within the root session because Cayu has no durable
+cross-session total order to invent. `ChildStatusAssertionSpec` separately
+supports completed, failed, and interrupted direct children; incomplete child
+tree capture remains unavailable. Control Plane can author all three contracts
+for a new suite or captured-session promotion, and SDK, stores, result
+presentation, CLI, comparison, and JSON/HTML reports consume the same evaluator
+and safe published details.
+
+Captured-session quick authoring uses only complete process evidence. For a
+trace longer than the 256-event order contract, it selects whole observed event
+kinds whose complete filtered occurrence sequence fits the bound; it never
+truncates one kind or substitutes generic events. When evidence is incomplete
+or no exact observed sequence is representable, Control Plane labels the action
+`Add expectation` and creates an editable explicit draft instead of claiming
+the default was observed.
+
 ### Trusted corpus execution
 
 A corpus deliberately contains no executable application authority. Local SDK
@@ -878,7 +940,7 @@ credentials.
 
 `publish_eval_run(...)` is the only public result projection for a portable
 corpus run. It matches the complete internal suite result back to the corpus and
-produces a content-addressed schema-version-6 `PublishedEvalRun` containing
+produces a content-addressed schema-version-7 `PublishedEvalRun` containing
 every case, trial, exact source-trial revision, assertion outcome, safe
 structural detail, duration, and identity-free aggregate usage. Every trial also
 retains the exact bounded memory-attribution section used during evaluation, so

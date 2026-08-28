@@ -36,6 +36,8 @@ from cayu.evals.corpus import (
     MaxTotalTokensAssertionSpec,
     ModelJudgeAssertionSpec,
     PrivateJudgeReferenceV1,
+    ProcessEventAssertionSpec,
+    ProcessEventsInOrderAssertionSpec,
     PublicJudgeReferenceV1,
     RootStatusAssertionSpec,
     RunInputSpec,
@@ -82,6 +84,8 @@ EvalSuiteAuthoringAssertionSpecV1: TypeAlias = Annotated[
     | ToolArgumentsContainAssertionSpec
     | ToolResultContainsAssertionSpec
     | ToolsCalledInOrderAssertionSpec
+    | ProcessEventAssertionSpec
+    | ProcessEventsInOrderAssertionSpec
     | MaxToolCallsAssertionSpec
     | MaxModelStepsAssertionSpec
     | UsageRecordedAssertionSpec
@@ -100,6 +104,8 @@ EvalSuiteAuthoringAssertionSpecV2: TypeAlias = Annotated[
     | ToolArgumentsContainAssertionSpec
     | ToolResultContainsAssertionSpec
     | ToolsCalledInOrderAssertionSpec
+    | ProcessEventAssertionSpec
+    | ProcessEventsInOrderAssertionSpec
     | MaxToolCallsAssertionSpec
     | MaxModelStepsAssertionSpec
     | UsageRecordedAssertionSpec
@@ -323,6 +329,8 @@ EvalSuiteAuthoringAssertionDraftSpecV2: TypeAlias = Annotated[
     | ToolArgumentsContainAssertionSpec
     | ToolResultContainsAssertionSpec
     | ToolsCalledInOrderAssertionSpec
+    | ProcessEventAssertionSpec
+    | ProcessEventsInOrderAssertionSpec
     | MaxToolCallsAssertionSpec
     | MaxModelStepsAssertionSpec
     | UsageRecordedAssertionSpec

@@ -22,6 +22,8 @@ export const PROMOTION_ASSERTION_KINDS = [
   "tool_arguments_contain",
   "tool_result_contains",
   "tools_called_in_order",
+  "process_event",
+  "process_events_in_order",
   "max_tool_calls",
   "max_model_steps",
   "usage_recorded",
@@ -33,6 +35,81 @@ const PORTABLE_ID_PATTERN = /^[a-z][a-z0-9._-]{0,127}$/
 const SHA256_REVISION_PATTERN = /^sha256:[a-f0-9]{64}$/
 const CURRENCY_PATTERN = /^[A-Z][A-Z0-9._-]{0,15}$/
 const MAX_SAFE_COUNTER = Number.MAX_SAFE_INTEGER
+const MAX_PROCESS_EVENT_ORDER = 256
+
+export const PROCESS_EVENT_OPTIONS = [
+  ["session_started", "Session started"],
+  ["session_resumed", "Session resumed"],
+  ["session_awaiting_user_input", "Session awaiting user input"],
+  ["session_completed", "Session completed"],
+  ["session_failed", "Session failed"],
+  ["session_interrupted", "Session interrupted"],
+  ["session_limit_reached", "Session limit reached"],
+  ["tool_call_started", "Tool call started"],
+  ["tool_call_completed", "Tool call completed"],
+  ["tool_call_failed", "Tool call failed"],
+  ["tool_call_blocked", "Tool call blocked"],
+  ["tool_approval_requested", "Tool approval requested"],
+  ["tool_approved", "Tool approved"],
+  ["tool_approval_denied", "Tool approval denied"],
+  ["tool_approval_expired", "Tool approval expired"],
+  ["structured_output_validated", "Structured output validated"],
+  ["structured_output_failed", "Structured output failed"],
+  ["budget_limit_reached", "Budget limit reached"],
+] as const
+
+export type ProcessEventKind = (typeof PROCESS_EVENT_OPTIONS)[number][0]
+
+const PROCESS_EVENT_KINDS = new Set<string>(PROCESS_EVENT_OPTIONS.map(([kind]) => kind))
+
+type CapturedProcessEvidence = Pick<
+  CapturedEvaluationCandidateV1["evidence"],
+  "process_event_evidence_state" | "process_events"
+>
+
+function observedProcessOrder(
+  evidence: CapturedProcessEvidence,
+): readonly ProcessEventKind[] | null {
+  if (evidence.process_event_evidence_state !== "complete") return null
+
+  const counts = new Map<ProcessEventKind, number>()
+  for (const event of evidence.process_events) {
+    counts.set(event, (counts.get(event) ?? 0) + 1)
+  }
+
+  // An exact-order assertion filters by event kind, so a suggestion must retain
+  // every occurrence of each selected kind. Greedily select whole kinds in
+  // first-observed order; never truncate a kind merely to fit the draft limit.
+  const selected = new Set<ProcessEventKind>()
+  let retainedCount = 0
+  for (const event of evidence.process_events) {
+    if (selected.has(event)) continue
+    const count = counts.get(event)
+    if (count === undefined || retainedCount + count > MAX_PROCESS_EVENT_ORDER) continue
+    selected.add(event)
+    retainedCount += count
+  }
+  if (selected.size === 0) return null
+  return evidence.process_events.filter((event) => selected.has(event))
+}
+
+export function capturedAssertionSuggestionUnavailable(
+  kind: PromotionAssertionKind,
+  evidence: CapturedProcessEvidence,
+): boolean {
+  if (kind === "process_event") {
+    return (
+      evidence.process_event_evidence_state !== "complete" || evidence.process_events.length === 0
+    )
+  }
+  if (kind === "process_events_in_order") return observedProcessOrder(evidence) === null
+  return false
+}
+
+export type CapturedAssertionDraft = {
+  assertion: PromotionAssertion
+  source: "observed" | "expectation"
+}
 
 export const PROMOTION_ASSERTION_LABELS: Record<PromotionAssertionKind, string> = {
   root_status: "Root status",
@@ -43,6 +120,8 @@ export const PROMOTION_ASSERTION_LABELS: Record<PromotionAssertionKind, string> 
   tool_arguments_contain: "Tool arguments contain JSON",
   tool_result_contains: "Tool result contains JSON",
   tools_called_in_order: "Tools called in order",
+  process_event: "Process event count",
+  process_events_in_order: "Process events in order",
   max_tool_calls: "Maximum tool calls",
   max_model_steps: "Maximum model steps",
   usage_recorded: "Usage recorded",
@@ -242,7 +321,7 @@ function validateAssertion(assertion: PromotionAssertion): void {
       requireTerminalStatus(assertion.expected)
       return
     case "child_status":
-      requireTerminalStatus(assertion.expected)
+      requireChildTerminalStatus(assertion.expected)
       requireRange(assertion.min_count ?? 1, assertion.max_count, "Child count", 500)
       return
     case "final_output_equals":
@@ -285,6 +364,16 @@ function validateAssertion(assertion: PromotionAssertion): void {
       for (const name of assertion.tool_names) {
         requireBoundedCleanText(name, "Tool name", 256)
       }
+      return
+    case "process_event":
+      requireProcessEvent(assertion.event)
+      requireRange(assertion.min_count ?? 1, assertion.max_count, "Process event count", 4_096)
+      return
+    case "process_events_in_order":
+      if (assertion.events.length < 1 || assertion.events.length > 256) {
+        throw new Error("Process event order must contain between 1 and 256 events.")
+      }
+      for (const event of assertion.events) requireProcessEvent(event)
       return
     case "max_tool_calls":
       requireInteger(assertion.maximum, "Maximum tool calls", 0, 4_096)
@@ -342,6 +431,10 @@ export function createPromotionAssertion(
       }
     case "tools_called_in_order":
       return { id, kind, tool_names: ["tool"] }
+    case "process_event":
+      return { id, kind, event: "tool_approval_requested", min_count: 1, max_count: null }
+    case "process_events_in_order":
+      return { id, kind, events: ["tool_approval_requested", "tool_approved"] }
     case "max_tool_calls":
       return { id, kind, maximum: 1 }
     case "max_model_steps":
@@ -366,7 +459,8 @@ export function createCapturedEvaluationAssertion(
       return evidence.root_status === "failed" ? { ...assertion, expected: "failed" } : assertion
     case "child_status": {
       const expected = evidence.child_statuses.find(
-        (status): status is "completed" | "failed" => status === "completed" || status === "failed",
+        (status): status is "completed" | "failed" | "interrupted" =>
+          status === "completed" || status === "failed" || status === "interrupted",
       )
       if (expected === undefined) return assertion
       const count = evidence.child_statuses.filter((status) => status === expected).length
@@ -407,6 +501,29 @@ export function createCapturedEvaluationAssertion(
     }
     case "tools_called_in_order":
       return { ...assertion, tool_names: [...evidence.requested_tool_names] }
+    case "process_event": {
+      if (capturedAssertionSuggestionUnavailable(assertion.kind, evidence)) {
+        throw new Error("Complete captured process-event evidence is required for this assertion.")
+      }
+      const event =
+        evidence.process_events.find(
+          (item) => item !== "session_started" && item !== "session_completed",
+        ) ?? evidence.process_events[0]
+      if (event === undefined) {
+        throw new Error("Complete captured process-event evidence must contain an observed event.")
+      }
+      const count = evidence.process_events.filter((item) => item === event).length
+      return { ...assertion, event, min_count: count, max_count: count }
+    }
+    case "process_events_in_order": {
+      const events = observedProcessOrder(evidence)
+      if (events === null) {
+        throw new Error(
+          "Complete captured process-event evidence with a representable order is required for this assertion.",
+        )
+      }
+      return { ...assertion, events: [...events] }
+    }
     case "max_tool_calls":
       return evidence.tool_calls_started == null
         ? assertion
@@ -437,6 +554,29 @@ function safeEvidenceInteger(value: string | null | undefined): number | null {
   if (value == null || !/^(0|[1-9]\d*)$/.test(value)) return null
   const parsed = Number(value)
   return Number.isSafeInteger(parsed) ? parsed : null
+}
+
+function requireProcessEvent(value: string): asserts value is ProcessEventKind {
+  if (!PROCESS_EVENT_KINDS.has(value)) {
+    throw new Error("Process event must use Cayu's closed portable vocabulary.")
+  }
+}
+
+export function createCapturedEvaluationAssertionDraft(
+  kind: PromotionAssertionKind,
+  existing: readonly PromotionAssertion[],
+  evidence: CapturedEvaluationCandidateV1["evidence"],
+): CapturedAssertionDraft {
+  if (capturedAssertionSuggestionUnavailable(kind, evidence)) {
+    return {
+      assertion: createPromotionAssertion(kind, existing),
+      source: "expectation",
+    }
+  }
+  return {
+    assertion: createCapturedEvaluationAssertion(kind, existing, evidence),
+    source: "observed",
+  }
 }
 
 function nextAssertionId(
@@ -526,6 +666,12 @@ function validateToolJsonSubset(value: unknown, label: string): Record<string, u
 function requireTerminalStatus(value: string): void {
   if (value !== "completed" && value !== "failed") {
     throw new Error("Status assertions must expect completed or failed.")
+  }
+}
+
+function requireChildTerminalStatus(value: string): void {
+  if (value !== "completed" && value !== "failed" && value !== "interrupted") {
+    throw new Error("Child status assertions must expect completed, failed, or interrupted.")
   }
 }
 

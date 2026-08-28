@@ -21,6 +21,8 @@ from cayu.evals.corpus import (
     CorpusUserMessageSpec,
     EvaluationEvidencePolicySpec,
     FinalOutputContainsAssertionSpec,
+    ProcessEventAssertionSpec,
+    ProcessEventsInOrderAssertionSpec,
     RootStatusAssertionSpec,
     RunInputSpec,
     ToolArgumentsContainAssertionSpec,
@@ -46,6 +48,16 @@ def _simple_case() -> EvalCaseDraftV1:
         assertions=(
             RootStatusAssertionSpec(id="completed", expected="completed"),
             FinalOutputContainsAssertionSpec(id="mentions-refund", expected="refund"),
+            ProcessEventAssertionSpec(
+                id="started-once",
+                event="session_started",
+                min_count=1,
+                max_count=1,
+            ),
+            ProcessEventsInOrderAssertionSpec(
+                id="session-lifecycle",
+                events=("session_started", "session_completed"),
+            ),
         ),
     )
 
