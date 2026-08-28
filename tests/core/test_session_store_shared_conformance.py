@@ -184,6 +184,7 @@ from cayu.runtime import (
     RuntimeHookContext,
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
+    RuntimePublicationOperationRecordMutation,
     RuntimePublicationRequest,
     Session,
     SessionExecutionSource,
@@ -224,6 +225,7 @@ from cayu.runtime import (
     runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
     runtime_publication_event_reference,
+    runtime_publication_operation_record_value_digest,
 )
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _tool_execution as tool_execution
@@ -9693,6 +9695,7 @@ def _assistant_model_completion_publication(
     event_payload: dict[str, Any] | None = None,
     reservation_ids: tuple[str, ...] = (),
     include_classification: bool = True,
+    operation_record_mutations: tuple[RuntimePublicationOperationRecordMutation, ...] = (),
 ) -> RuntimePublicationRequest:
     if classification is None:
         assert assistant_message is not None
@@ -9758,6 +9761,7 @@ def _assistant_model_completion_publication(
                 payload=completion_payload,
             ),
         ),
+        operation_record_mutations=operation_record_mutations,
     )
 
 
@@ -9847,6 +9851,177 @@ def test_session_store_conformance_model_completion_accepts_root_schema_stamp(
             )
 
             assert completed.stage.state == "completed"
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_model_completion_atomically_mutates_operation_record(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = "sess_model_completion_operation_mutation"
+        operation_key = "test:hosted-discovery-view"
+        source_operation = {"schema_version": 1, "revision": 0, "grants": []}
+        desired_operation = {
+            "schema_version": 1,
+            "revision": 1,
+            "grants": [{"tool_name": "remember_knowledge"}],
+        }
+        logical_step_id = "model-step:operation-mutation"
+        stage_id = f"{logical_step_id}:attempt-0"
+        intent = {"logical_step": logical_step_id}
+        try:
+            await store.create(
+                RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+                identity=_identity(),
+                operation_initializer=lambda _session: {operation_key: source_operation},
+            )
+            running = await store.transition_status(
+                session_id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            await store.prepare_model_completion_stage(
+                session_id,
+                request=ModelCompletionStageRequest(
+                    stage_id=stage_id,
+                    logical_step_id=logical_step_id,
+                    dispatch_ordinal=0,
+                    intent=intent,
+                ),
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=running.run_epoch,
+                expected_transcript_cursor=0,
+            )
+            publication = _assistant_model_completion_publication(
+                session_id=session_id,
+                stage_id=stage_id,
+                logical_step_id=logical_step_id,
+                intent=intent,
+                completion_event_id="operation-mutation-completed",
+                source_transcript_cursor=0,
+                assistant_message=Message.text("assistant", "authoritative"),
+                operation_record_mutations=(
+                    RuntimePublicationOperationRecordMutation(
+                        key=operation_key,
+                        expected_value_digest=(
+                            runtime_publication_operation_record_value_digest(source_operation)
+                        ),
+                        value=desired_operation,
+                    ),
+                ),
+            )
+
+            completed = await store.complete_model_completion_stage(
+                session_id,
+                stage_id=stage_id,
+                publication=publication,
+            )
+            assert completed.stage.publication == publication
+            assert await store.load_session_operation(session_id, operation_key) == source_operation
+
+            promoted = await store.promote_model_completion_stage(
+                session_id,
+                stage_id=stage_id,
+                expected_run_epoch=running.run_epoch,
+            )
+            assert promoted.replayed is False
+            assert (
+                await store.load_session_operation(session_id, operation_key) == desired_operation
+            )
+            assert await store.load_transcript(session_id) == [
+                Message.text("assistant", "authoritative")
+            ]
+            assert [event.id for event in await store.load_events(session_id)] == [
+                "operation-mutation-completed"
+            ]
+
+            store = await _reopen_store(session_store_case, store)
+            replayed = await store.promote_model_completion_stage(
+                session_id,
+                stage_id=stage_id,
+                expected_run_epoch=running.run_epoch,
+            )
+            assert replayed.replayed is True
+            assert replayed.receipt == promoted.receipt
+            assert (
+                await store.load_session_operation(session_id, operation_key) == desired_operation
+            )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_operation_record_cas_rejects_whole_publication(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = "sess_runtime_publication_stale_operation"
+        operation_key = "test:stale-hosted-discovery-view"
+        source_operation = {"schema_version": 1, "revision": 0}
+        try:
+            await store.create(
+                RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+                identity=_identity(),
+                operation_initializer=lambda _session: {operation_key: source_operation},
+            )
+            request = RuntimePublicationRequest(
+                publication_id="stale-operation-record",
+                kind="model-step",
+                intent={"logical_step": "stale-operation-record"},
+                mutation=runtime_publication_checkpoint_mutation(
+                    None,
+                    {"phase": "must-not-publish"},
+                ),
+                transcript_messages=(Message.text("assistant", "must not publish"),),
+                events=(
+                    Event(
+                        id="stale-operation-record-completed",
+                        type=EventType.MODEL_COMPLETED,
+                        session_id=session_id,
+                    ),
+                ),
+                operation_record_mutations=(
+                    RuntimePublicationOperationRecordMutation(
+                        key=operation_key,
+                        expected_value_digest=(
+                            runtime_publication_operation_record_value_digest(
+                                {"schema_version": 1, "revision": 99}
+                            )
+                        ),
+                        value={"schema_version": 1, "revision": 1},
+                    ),
+                ),
+            )
+
+            with pytest.raises(
+                SessionRuntimePublicationConflict,
+                match="operation record changed before publication",
+            ):
+                await store.publish_runtime_publication(
+                    session_id,
+                    request=request,
+                    expected_statuses={SessionStatus.PENDING},
+                    expected_run_epoch=0,
+                    expected_transcript_cursor=0,
+                )
+
+            assert await store.load_session_operation(session_id, operation_key) == source_operation
+            assert await store.load_checkpoint(session_id) is None
+            assert await store.load_transcript(session_id) == []
+            assert await store.load_events(session_id) == []
+            assert (
+                await store.load_runtime_publication_receipt(
+                    session_id,
+                    request.publication_id,
+                )
+                is None
+            )
         finally:
             await _close_store(store)
 
@@ -15164,6 +15339,45 @@ def test_session_store_conformance_runtime_publication_rejects_before_mutation_a
                 )
                 is None
             )
+
+            malformed_operation_mutation = RuntimePublicationRequest.model_construct(
+                publication_id="malformed-operation-mutation",
+                kind="model-step",
+                intent={"step": 1},
+                mutation=runtime_publication_checkpoint_mutation(
+                    {"phase": "before"},
+                    {"phase": "must-not-publish"},
+                ),
+                transcript_messages=(Message.text("assistant", "must not persist"),),
+                events=(
+                    Event(
+                        id="malformed-operation-mutation-event",
+                        type=EventType.MODEL_COMPLETED,
+                        session_id=session_id,
+                        timestamp=fixed_at,
+                    ),
+                ),
+                operation_record_mutations=(
+                    RuntimePublicationOperationRecordMutation.model_construct(
+                        key="test:malformed-operation-mutation",
+                        expected_value_digest="not-a-digest",
+                        value={"schema_version": 1},
+                    ),
+                ),
+                referenced_events=(),
+            )
+            with pytest.raises(
+                ValueError,
+                match="operation record mutation is malformed",
+            ):
+                await store.publish_runtime_publication(
+                    session_id,
+                    request=malformed_operation_mutation,
+                )
+            assert await store.load(session_id) == before_session
+            assert await store.load_checkpoint(session_id) == before_checkpoint
+            assert await store.load_transcript(session_id) == before_transcript
+            assert await store.load_events(session_id) == before_events
 
             stale_request = RuntimePublicationRequest(
                 publication_id="stale-mutation",

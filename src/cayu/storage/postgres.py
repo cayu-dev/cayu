@@ -296,6 +296,7 @@ from cayu.runtime.sessions import (
     _active_unexpired_incomplete_recovery_claim_id,
     _active_unexpired_session_operation_id,
     _apply_runtime_publication_checkpoint_mutation,
+    _apply_runtime_publication_operation_record_mutations,
     _assemble_terminal_session_evidence,
     _assert_session_run_epoch,
     _assert_session_run_epoch_value,
@@ -23779,6 +23780,26 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             replayed=True,
                         )
 
+                    operation_mutation_records: dict[str, dict[str, Any]] = {}
+                    if request.operation_record_mutations:
+                        mutation_keys = [
+                            mutation.key for mutation in request.operation_record_mutations
+                        ]
+                        await cur.execute(
+                            "SELECT idempotency_key, record FROM cayu_session_operations "
+                            "WHERE session_id = %s AND idempotency_key = ANY(%s) FOR UPDATE",
+                            (session_id, mutation_keys),
+                        )
+                        current_mutation_records = {
+                            row[0]: _json_obj(row[1]) for row in await cur.fetchall()
+                        }
+                        operation_mutation_records = (
+                            _apply_runtime_publication_operation_record_mutations(
+                                request.operation_record_mutations,
+                                current_mutation_records,
+                            )
+                        )
+
                     if locked_stage is not None:
                         assert _model_completion_stage is not None
                         if winner_record is not None:
@@ -24092,6 +24113,18 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             cur,
                             session_id,
                             request.events,
+                        )
+                    if operation_mutation_records:
+                        await cur.executemany(
+                            "INSERT INTO cayu_session_operations "
+                            "(session_id, idempotency_key, record, updated_at) "
+                            "VALUES (%s, %s, %s, %s) "
+                            "ON CONFLICT(session_id, idempotency_key) DO UPDATE SET "
+                            "record = excluded.record, updated_at = excluded.updated_at",
+                            [
+                                (session_id, key, _dumps(record), published_at)
+                                for key, record in operation_mutation_records.items()
+                            ],
                         )
                     await cur.execute(
                         """

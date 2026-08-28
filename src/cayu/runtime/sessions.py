@@ -4136,6 +4136,67 @@ class RuntimePublicationCheckpointOperation(BaseModel):
         return self
 
 
+class RuntimePublicationOperationRecordMutation(BaseModel):
+    """One CAS-protected session-operation record committed with a publication."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    key: str = Field(max_length=512)
+    expected_value_digest: str | None
+    value: dict[str, Any]
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, value: str) -> str:
+        value = require_clean_nonblank(value, "operation record mutation key")
+        _reject_reserved_runtime_publication_key(value, "operation record mutation key")
+        return value
+
+    @field_validator("expected_value_digest")
+    @classmethod
+    def validate_expected_value_digest(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if (
+            type(value) is not str
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError("expected_value_digest must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def copy_value(cls, value: object) -> dict[str, Any]:
+        return copy_durable_json_object(value, "operation record mutation value")
+
+
+_RuntimePublicationOperationRecordMutationValues = (
+    list[RuntimePublicationOperationRecordMutation | dict[str, Any]]
+    | tuple[RuntimePublicationOperationRecordMutation | dict[str, Any], ...]
+)
+
+
+def _copy_runtime_publication_operation_record_mutation(
+    mutation: RuntimePublicationOperationRecordMutation | dict[str, Any],
+) -> RuntimePublicationOperationRecordMutation:
+    try:
+        if type(mutation) is RuntimePublicationOperationRecordMutation:
+            return RuntimePublicationOperationRecordMutation(
+                key=mutation.key,
+                expected_value_digest=mutation.expected_value_digest,
+                value=mutation.value,
+            )
+        if type(mutation) is dict:
+            return RuntimePublicationOperationRecordMutation.model_validate(mutation)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("Runtime publication operation record mutation is malformed.") from exc
+    raise TypeError(
+        "Operation record mutations must be "
+        "RuntimePublicationOperationRecordMutation values or objects."
+    )
+
+
 def _copy_runtime_publication_checkpoint_operation(
     operation: RuntimePublicationCheckpointOperation | dict[str, Any],
 ) -> RuntimePublicationCheckpointOperation:
@@ -4215,6 +4276,9 @@ class RuntimePublicationRequest(BaseModel):
     mutation: RuntimePublicationMutation
     transcript_messages: tuple[Message, ...]
     events: tuple[Event, ...]
+    operation_record_mutations: tuple[RuntimePublicationOperationRecordMutation, ...] = Field(
+        default_factory=tuple
+    )
     referenced_events: tuple[RuntimePublicationEventReference, ...] = Field(default_factory=tuple)
 
     @field_validator("publication_id", "kind")
@@ -4266,6 +4330,33 @@ class RuntimePublicationRequest(BaseModel):
             seen.add(copied_event.id)
             copied.append(copied_event)
         return tuple(copied)
+
+    @field_validator("operation_record_mutations", mode="before")
+    @classmethod
+    def copy_operation_record_mutations(
+        cls,
+        value: object,
+    ) -> tuple[RuntimePublicationOperationRecordMutation, ...]:
+        if type(value) not in (list, tuple):
+            raise TypeError("operation_record_mutations must be a list or tuple.")
+        mutation_values = cast("_RuntimePublicationOperationRecordMutationValues", value)
+        if len(mutation_values) > RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS:
+            raise ValueError(
+                "operation_record_mutations cannot exceed the runtime publication bound."
+            )
+        copied = tuple(
+            sorted(
+                (
+                    _copy_runtime_publication_operation_record_mutation(mutation)
+                    for mutation in mutation_values
+                ),
+                key=lambda mutation: mutation.key,
+            )
+        )
+        keys = tuple(mutation.key for mutation in copied)
+        if len(keys) != len(set(keys)):
+            raise ValueError("operation_record_mutations cannot repeat a key.")
+        return copied
 
     @field_validator("referenced_events", mode="before")
     @classmethod
@@ -14679,6 +14770,15 @@ class InMemorySessionStore(SessionStore):
                 replayed=True,
             )
 
+        mutated_operation_records = (
+            operation_records
+            if not request.operation_record_mutations
+            else _apply_runtime_publication_operation_record_mutations(
+                request.operation_record_mutations,
+                operation_records,
+            )
+        )
+
         _assert_session_run_epoch(session_id, session)
         if (
             prepared.expected_statuses is not None
@@ -14827,14 +14927,15 @@ class InMemorySessionStore(SessionStore):
         )
         if prepared_checkpoint is not None:
             self._apply_checkpoint_store_unlocked(session_id, prepared_checkpoint)
-        operation_records[prepared.storage_key] = receipt_record
+        mutated_operation_records[prepared.storage_key] = receipt_record
         if model_completion_stage is not None:
             assert winner_record is not None
             winner_storage_key = _model_completion_stage_winner_storage_key(
                 model_completion_stage.logical_step_id
             )
-            operation_records[winner_storage_key] = winner_record
-            operation_records.pop(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY)
+            mutated_operation_records[winner_storage_key] = winner_record
+            mutated_operation_records.pop(MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY)
+        self._session_operation_records[session_id] = mutated_operation_records
         self._sessions[session_id] = updated
         return RuntimePublicationResult(
             session=updated.model_copy(deep=True),
@@ -19090,6 +19191,7 @@ def runtime_publication_request_digest(
             ),
             transcript_messages=request.transcript_messages,
             events=request.events,
+            operation_record_mutations=request.operation_record_mutations,
             referenced_events=request.referenced_events,
         )
     return _prepare_runtime_publication(
@@ -19193,6 +19295,40 @@ def apply_runtime_publication_checkpoint_mutation(
     """Apply a validated runtime publication mutation to a defensive checkpoint copy."""
 
     return _apply_runtime_publication_checkpoint_mutation(mutation, checkpoint)
+
+
+def runtime_publication_operation_record_value_digest(value: object) -> str:
+    """Return the CAS digest used for one session-operation record value."""
+
+    return _canonical_runtime_publication_digest(
+        copy_durable_json_object(value, "operation record value")
+    )
+
+
+def _apply_runtime_publication_operation_record_mutations(
+    mutations: tuple[RuntimePublicationOperationRecordMutation, ...],
+    records: Mapping[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    updated = dict(records)
+    for mutation in mutations:
+        current = updated.get(mutation.key)
+        matches = (
+            current is None
+            if mutation.expected_value_digest is None
+            else current is not None
+            and runtime_publication_operation_record_value_digest(current)
+            == mutation.expected_value_digest
+        )
+        if not matches:
+            raise SessionRuntimePublicationConflict(
+                "A runtime publication operation record changed before publication: "
+                f"{mutation.key!r}."
+            )
+        updated[mutation.key] = copy_durable_json_object(
+            mutation.value,
+            "operation record mutation value",
+        )
+    return updated
 
 
 def _runtime_publication_event_digest(event: Event) -> str:
@@ -20232,6 +20368,7 @@ def _prepare_model_completion_stage_terminal(
             mutation=publication.mutation,
             transcript_messages=publication.transcript_messages,
             events=publication.events,
+            operation_record_mutations=publication.operation_record_mutations,
             referenced_events=publication.referenced_events,
         )
     except AttributeError as exc:
@@ -21598,6 +21735,7 @@ def _reconstruct_model_completion_stage_terminal(
                 Message.model_validate(message) for message in raw_transcript
             ),
             events=tuple(Event.model_validate(event) for event in raw_events),
+            operation_record_mutations=publication_record["operation_record_mutations"],
             referenced_events=publication_record["referenced_events"],
         )
         reconstructed = _ModelCompletionStageTerminalRecord.model_validate(
@@ -22216,12 +22354,16 @@ def _prepare_runtime_publication(
             mutation=request.mutation,
             transcript_messages=request.transcript_messages,
             events=request.events,
+            operation_record_mutations=request.operation_record_mutations,
             referenced_events=request.referenced_events,
         )
     except AttributeError as exc:
         raise ValueError("Runtime publication request is malformed.") from exc
 
     _validate_workspace_observation_publication(copied_request, session_id=session_id)
+    _validate_session_operation_record_keys(
+        {mutation.key: mutation.value for mutation in copied_request.operation_record_mutations}
+    )
 
     appended_event_ids = {event.id for event in copied_request.events}
     referenced_event_ids = set(

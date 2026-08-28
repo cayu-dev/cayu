@@ -578,6 +578,7 @@ class _RuntimeCheckpointSessionStore:
             ),
             transcript_messages=request.transcript_messages,
             events=request.events,
+            operation_record_mutations=request.operation_record_mutations,
             referenced_events=request.referenced_events,
         )
 

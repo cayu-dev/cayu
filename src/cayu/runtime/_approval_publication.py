@@ -269,5 +269,6 @@ def _copy_request(request: RuntimePublicationRequest) -> RuntimePublicationReque
         mutation=request.mutation,
         transcript_messages=request.transcript_messages,
         events=request.events,
+        operation_record_mutations=request.operation_record_mutations,
         referenced_events=request.referenced_events,
     )

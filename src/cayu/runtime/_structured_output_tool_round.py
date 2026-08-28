@@ -74,6 +74,7 @@ class _StructuredOutputToolRoundPublicationExtension:
             mutation=ordinary_request.mutation,
             transcript_messages=ordinary_request.transcript_messages,
             events=tuple(copy_event(event) for event in self.events),
+            operation_record_mutations=ordinary_request.operation_record_mutations,
             referenced_events=ordinary_request.referenced_events,
         )
 

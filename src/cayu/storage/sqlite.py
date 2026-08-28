@@ -229,6 +229,7 @@ from cayu.runtime.sessions import (
     _active_unexpired_incomplete_recovery_claim_id,
     _active_unexpired_session_operation_id,
     _apply_runtime_publication_checkpoint_mutation,
+    _apply_runtime_publication_operation_record_mutations,
     _assemble_terminal_session_evidence,
     _assert_session_run_epoch,
     _assert_session_run_epoch_value,
@@ -7824,6 +7825,28 @@ class SQLiteSessionStore(SessionStore):
                         replayed=True,
                     )
 
+                operation_mutation_records: dict[str, dict[str, Any]] = {}
+                if request.operation_record_mutations:
+                    mutation_keys = tuple(
+                        mutation.key for mutation in request.operation_record_mutations
+                    )
+                    placeholders = ", ".join("?" for _ in mutation_keys)
+                    mutation_rows = connection.execute(
+                        "SELECT idempotency_key, record_json FROM cayu_session_operations "
+                        f"WHERE session_id = ? AND idempotency_key IN ({placeholders})",
+                        (session_id, *mutation_keys),
+                    ).fetchall()
+                    current_mutation_records = {
+                        row["idempotency_key"]: json.loads(row["record_json"])
+                        for row in mutation_rows
+                    }
+                    operation_mutation_records = (
+                        _apply_runtime_publication_operation_record_mutations(
+                            request.operation_record_mutations,
+                            current_mutation_records,
+                        )
+                    )
+
                 if locked_stage is not None:
                     assert _model_completion_stage is not None
                     if winner_record is not None:
@@ -8095,6 +8118,23 @@ class SQLiteSessionStore(SessionStore):
                         connection,
                         session_id,
                         request.events,
+                    )
+                if operation_mutation_records:
+                    connection.executemany(
+                        "INSERT INTO cayu_session_operations "
+                        "(session_id, idempotency_key, record_json, updated_at) "
+                        "VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(session_id, idempotency_key) DO UPDATE SET "
+                        "record_json = excluded.record_json, updated_at = excluded.updated_at",
+                        [
+                            (
+                                session_id,
+                                key,
+                                sqlite_support.json_dumps(record),
+                                formatted_published_at,
+                            )
+                            for key, record in operation_mutation_records.items()
+                        ],
                     )
                 connection.execute(
                     """
