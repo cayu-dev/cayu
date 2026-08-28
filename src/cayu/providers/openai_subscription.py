@@ -29,6 +29,7 @@ import httpx
 
 from cayu._validation import require_clean_nonblank
 from cayu._version import package_version
+from cayu.core.billing import BillingIdentity
 from cayu.core.messages import Message
 from cayu.providers._config import positive_finite_seconds
 from cayu.providers._credential_boundary import (
@@ -629,6 +630,7 @@ class OpenAISubscriptionProvider(ModelProvider):
     """
 
     name = "openai_subscription"
+    billing_provider_name = "openai"
     usage_dialect = UsageDialect.OPENAI
     supports_native_structured_output = True
 
@@ -674,6 +676,16 @@ class OpenAISubscriptionProvider(ModelProvider):
     def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
         effective = _effective_openai_request_options(request.options)
         return {"openai": effective} if effective else {}
+
+    async def billing_identity_for_request(self, request: ModelRequest) -> BillingIdentity:
+        return BillingIdentity(
+            provider_name="openai",
+            resource_id=request.model,
+            request_evidence={
+                "access_mode": "chatgpt_subscription",
+                "pricing_basis": "openai_api_equivalent_estimate",
+            },
+        )
 
     def __init__(
         self,

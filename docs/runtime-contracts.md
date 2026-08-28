@@ -6565,9 +6565,16 @@ first-party Codex identity. Codex `end_turn` continuation signals are validated
 and honored inside the current run without synthetic user messages. The backend
 exposes no documented input-token
 counting or embeddings endpoint, so `count_input_tokens(...)` returns `None`
-and the provider does not implement `TextEmbeddingProvider`. Its provider name
-is `openai_subscription`; subscription usage is intentionally unpriced because
-flat-plan quota is not equivalent to per-token API spend. This adapter is an
+and the provider does not implement `TextEmbeddingProvider`. Its execution and
+provider-attribution name remains `openai_subscription`. For estimated-cost
+accounting only, its runtime-owned billing identity selects the `openai` price
+book resource for the requested model and records
+`access_mode="chatgpt_subscription"` plus
+`pricing_basis="openai_api_equivalent_estimate"` as request evidence. This lets
+an application apply an explicitly selected OpenAI API price book to sealed
+estimated-cost budgets without claiming that a flat ChatGPT plan incurs those
+per-token charges. The estimate is not subscription quota, actual plan spend,
+or a provider invoice; unknown models remain unpriced. This adapter is an
 experimental local-testing path, not a documented OpenAI Platform API or a
 hosted multi-user authentication mechanism. See
 [`docs/openai-subscription.md`](openai-subscription.md).

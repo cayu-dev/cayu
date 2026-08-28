@@ -74,6 +74,21 @@ app.register_provider(OpenAISubscriptionProvider(), default=True)
 app.register_agent(AgentSpec(name="assistant", model="gpt-5.4"))
 ```
 
+## Estimated cost accounting
+
+The provider remains `openai_subscription` for execution attribution. When an
+application supplies an OpenAI price book, Cayu separately resolves the billing
+identity to `openai` and the requested model so ordinary cost summaries and
+sealed estimated-cost budgets can apply the corresponding API token rates. The
+durable identity labels this as a ChatGPT-subscription request using an
+`openai_api_equivalent_estimate` pricing basis.
+
+That value is only an API-equivalent estimate. It is not the subscription's
+actual spend, quota consumption, invoice, or evidence that the flat plan bills
+per token. Unknown models remain unpriced. Applications should choose a price
+book and budget threshold appropriate for the conservative control they want;
+see the official [OpenAI API pricing documentation](https://developers.openai.com/api/docs/pricing).
+
 The experimental adapter also supports the same typed native hosted-search
 authority as `OpenAIProvider` while the Codex backend continues to accept it:
 

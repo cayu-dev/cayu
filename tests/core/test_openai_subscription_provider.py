@@ -8,7 +8,16 @@ from typing import Any
 import pytest
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-from cayu import AgentSpec, CayuApp, EventType, Message, RetryPolicy, RunRequest, __version__
+from cayu import (
+    AgentSpec,
+    CayuApp,
+    EventType,
+    Message,
+    RetryPolicy,
+    RunRequest,
+    __version__,
+    default_price_book,
+)
 from cayu.providers import (
     HostedToolCapabilityError,
     ModelContextOverflowError,
@@ -118,6 +127,68 @@ def test_subscription_provider_projects_privacy_safe_openai_options() -> None:
             "metadata": {"private": "provider-option-secret"},
         }
     }
+
+
+@pytest.mark.anyio
+async def test_subscription_provider_uses_openai_pricing_identity() -> None:
+    provider = OpenAISubscriptionProvider(auth=StaticSubscriptionAuth())
+    request = ModelRequest(
+        model="gpt-5.4",
+        messages=[Message.text("user", "Say hello")],
+    )
+
+    assert provider.name == "openai_subscription"
+    assert provider.billing_provider_name == "openai"
+    identity = await provider.billing_identity_for_request(request)
+    assert identity.provider_name == "openai"
+    assert identity.resource_id == "gpt-5.4"
+    assert identity.request_evidence == {
+        "access_mode": "chatgpt_subscription",
+        "pricing_basis": "openai_api_equivalent_estimate",
+    }
+
+
+@pytest.mark.anyio
+async def test_subscription_runtime_retains_openai_pricing_identity() -> None:
+    provider = OpenAISubscriptionProvider(
+        auth=StaticSubscriptionAuth(),
+        transport=RecordingTransport(),
+    )
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gpt-5.6-sol"))
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="subscription-pricing-identity",
+                messages=[Message.text("user", "Say hello")],
+                max_steps=1,
+            )
+        )
+    ]
+
+    completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
+    assert completed.payload["provider_name"] == "openai_subscription"
+    assert completed.payload["billing_identity"] == {
+        "provider_name": "openai",
+        "resource_id": "gpt-5.6-sol",
+        "request_evidence": {
+            "access_mode": "chatgpt_subscription",
+            "pricing_basis": "openai_api_equivalent_estimate",
+        },
+        "completion_evidence": {},
+        "pricing_contexts": [],
+    }
+    cost = await app.get_session_cost(
+        "subscription-pricing-identity",
+        default_price_book(),
+    )
+    assert cost.line_items[0].priced is True
+    assert cost.line_items[0].provider_name == "openai_subscription"
+    assert cost.line_items[0].pricing_provider_name == "openai"
 
 
 def test_subscription_provider_uses_codex_endpoint_with_honest_cayu_identity() -> None:
