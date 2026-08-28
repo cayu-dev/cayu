@@ -2762,6 +2762,15 @@ events. If the parent model needs an asynchronous child result later, register
 current parent session. Pass the same `TaskStore` as `task_store=` when durable
 children are enabled so results also report verified queue-task status; without
 it, child results remain available but task status is explicitly unavailable.
+Applications with their own durable child authorization can instead call
+`project_terminal_subagent_result(...)` after proving that the requested child
+and task belong to the authorized domain work item. The function is read-only,
+loads only bounded tail/result evidence, validates Cayu's durable child/task
+authority, accepts an optional exact `expected_task_id`, and returns a stable
+`projection_fingerprint`. It does **not** authorize arbitrary child reads: the
+application must resolve the child identity from trusted durable state before
+calling it. It never relaxes `SubagentResultTool`'s exact-parent rule or appends
+to the child transcript.
 The initial subagent context mode is `task_only`: the child receives the
 delegated task as a user message and does not copy the parent's transcript.
 Transcript-copying remains the job of `ForkSessionRequest`; future subagent

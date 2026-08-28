@@ -61,6 +61,7 @@ from cayu.tools.subagents import (
     SubagentSpec,
     SubagentTool,
     default_background_subagent_registry,
+    project_terminal_subagent_result,
 )
 from cayu.tools.user_input import UserInputTool
 from cayu.tools.web import (
@@ -183,4 +184,5 @@ __all__ = [
     "WriteFileTool",
     "default_artifact_readers",
     "default_background_subagent_registry",
+    "project_terminal_subagent_result",
 ]

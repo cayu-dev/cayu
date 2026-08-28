@@ -2124,6 +2124,7 @@ from cayu.tools import (
     WriteFileTool,
     default_artifact_readers,
     default_background_subagent_registry,
+    project_terminal_subagent_result,
 )
 from cayu.vaults import (
     REDACTED_SECRET,
@@ -4407,6 +4408,7 @@ __all__ = [
     "present_eval_result",
     "pricing_profile_identity",
     "project_assertion_evidence_view",
+    "project_terminal_subagent_result",
     "promotable_run_input",
     "public_authority_alias_codec_from_environment",
     "public_authority_alias_is_reserved",

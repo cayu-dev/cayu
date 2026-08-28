@@ -78,6 +78,7 @@ from cayu.tools import (
     SubagentResultTool,
     SubagentSpec,
     SubagentTool,
+    project_terminal_subagent_result,
 )
 from cayu.vaults import SecretRedactor, SecretRef, StaticVault
 
@@ -1046,6 +1047,43 @@ def test_durable_subagent_creates_child_before_claimable_task_and_worker_complet
         assert result_without_task_store.is_error is False
         assert result_without_task_store.content == "durable child complete"
         assert result_without_task_store.structured["task_authority_status"] == "unavailable"
+        event_count_before_projection = (await sessions.summarize_events(child.id)).total_events
+        projection = await project_terminal_subagent_result(
+            sessions,
+            child.id,
+            task_store=tasks,
+            expected_task_id=queued[0].id,
+            max_chars=7,
+        )
+        assert projection["result_text"] == "durable"
+        assert projection["result_truncated"] is True
+        assert projection["retrieval_status"] == "ready"
+        assert projection["task_authority_status"] == "verified"
+        assert projection["task_status"] == TaskStatus.COMPLETED.value
+        assert len(projection["projection_fingerprint"]) == 64
+        assert (
+            await project_terminal_subagent_result(
+                sessions,
+                child.id,
+                task_store=tasks,
+                expected_task_id=queued[0].id,
+                max_chars=7,
+            )
+            == projection
+        )
+        with pytest.raises(
+            ValueError,
+            match="does not bind the expected durable task",
+        ):
+            await project_terminal_subagent_result(
+                sessions,
+                child.id,
+                task_store=tasks,
+                expected_task_id="another-task",
+            )
+        assert (
+            await sessions.summarize_events(child.id)
+        ).total_events == event_count_before_projection
         assert len(provider.requests) == 3
 
     asyncio.run(run())
@@ -3366,6 +3404,27 @@ def test_result_inspection_rejects_completed_task_with_nonterminal_child() -> No
         assert result.structured["task_authority_status"] == "verified"
         assert result.structured["task_status"] == TaskStatus.COMPLETED.value
         assert result.structured["retrieval_status"] == "queue_conflict"
+        projection = await project_terminal_subagent_result(
+            sessions,
+            child_id,
+            task_store=tasks,
+            expected_task_id=queued.id,
+        )
+        assert projection["task_authority_status"] == "verified"
+        assert projection["task_status"] == TaskStatus.COMPLETED.value
+        assert projection["retrieval_status"] == "queue_conflict"
+        assert projection["is_error"] is True
+        await sessions.update_status(child_id, SessionStatus.INTERRUPTED)
+        interrupted = await project_terminal_subagent_result(
+            sessions,
+            child_id,
+            task_store=tasks,
+            expected_task_id=queued.id,
+        )
+        assert interrupted["status"] == SessionStatus.INTERRUPTED.value
+        assert interrupted["task_status"] == TaskStatus.COMPLETED.value
+        assert interrupted["retrieval_status"] == "ready"
+        assert interrupted["is_error"] is True
 
     asyncio.run(run())
 

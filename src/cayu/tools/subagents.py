@@ -1587,6 +1587,65 @@ async def _summarize_child_session(
     return summary
 
 
+async def project_terminal_subagent_result(
+    session_store: SessionStore,
+    child_session_id: str,
+    *,
+    task_store: TaskStore | None = None,
+    expected_task_id: str | None = None,
+    max_chars: int = DEFAULT_SUBAGENT_RESULT_MAX_CHARS,
+) -> dict[str, Any]:
+    """Project one bounded child result after domain authorization.
+
+    This read-only primitive deliberately does not decide whether an application
+    caller may inspect ``child_session_id``. Applications must establish that
+    authorization from their own durable state before calling it. Cayu still
+    validates the child/session/task authority and returns the same bounded
+    result semantics used by :class:`SubagentResultTool`.
+    """
+
+    if not isinstance(session_store, SessionStore):
+        raise TypeError("project_terminal_subagent_result requires a SessionStore.")
+    if task_store is not None and not isinstance(task_store, TaskStore):
+        raise TypeError("task_store must be a TaskStore.")
+    child_session_id = require_unicode_scalar_text(
+        require_clean_nonblank(child_session_id, "child_session_id"),
+        "child_session_id",
+    )
+    if expected_task_id is not None:
+        expected_task_id = require_unicode_scalar_text(
+            require_clean_nonblank(expected_task_id, "expected_task_id"),
+            "expected_task_id",
+        )
+        if task_store is None:
+            raise ValueError("expected_task_id requires task_store.")
+    if not isinstance(max_chars, int) or isinstance(max_chars, bool):
+        raise TypeError("max_chars must be an integer.")
+    if max_chars < 1 or max_chars > MAX_SUBAGENT_RESULT_MAX_CHARS:
+        raise ValueError(
+            f"max_chars must be between 1 and {MAX_SUBAGENT_RESULT_MAX_CHARS} characters."
+        )
+
+    child = await session_store.load(child_session_id)
+    if child is None:
+        raise KeyError(f"Unknown child session: {child_session_id}")
+    summary = await _summarize_child_session(
+        session_store,
+        child,
+        max_chars=max_chars,
+        task_store=task_store,
+    )
+    if expected_task_id is not None and summary.get("queue_task_id") != expected_task_id:
+        raise ValueError("Child session does not bind the expected durable task.")
+    material = copy_json_object(summary, "subagent_result_projection")
+    return {
+        **material,
+        "projection_fingerprint": sha256(
+            canonical_durable_json_bytes(material, "subagent_result_projection")
+        ).hexdigest(),
+    }
+
+
 async def _durable_subagent_task_summary(
     session_store: SessionStore,
     task_store: TaskStore | None,
