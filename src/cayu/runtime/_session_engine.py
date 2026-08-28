@@ -15715,7 +15715,7 @@ class SessionEngine:
                 ),
                 limits=(None if initial_invocation is None else initial_invocation.request.limits),
                 retry_policy=(
-                    None
+                    self._effective_retry_policy(None)
                     if initial_invocation is None
                     else self._effective_retry_policy(initial_invocation.request.retry_policy)
                 ),

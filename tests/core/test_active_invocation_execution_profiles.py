@@ -1126,6 +1126,12 @@ def test_fork_current_child_profile_requires_and_records_authorized_adoption(
     tmp_path,
 ) -> None:
     async def scenario() -> None:
+        retry_policy = RetryPolicy(
+            max_attempts=8,
+            max_unknown_attempts=8,
+            initial_delay_s=0.25,
+            max_delay_s=5.0,
+        )
         store: SessionStore = (
             InMemorySessionStore()
             if store_kind == "memory"
@@ -1138,7 +1144,11 @@ def test_fork_current_child_profile_requires_and_records_authorized_adoption(
             ],
             name="fake",
         )
-        source_app = CayuApp(session_store=store, enable_logging=False)
+        source_app = CayuApp(
+            session_store=store,
+            retry_policy=retry_policy,
+            enable_logging=False,
+        )
         source_app.register_provider(source_provider, default=True)
         source_app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
@@ -1160,6 +1170,7 @@ def test_fork_current_child_profile_requires_and_records_authorized_adoption(
         policy = RecordingAdoptionPolicy()
         fork_app = CayuApp(
             session_store=store,
+            retry_policy=retry_policy,
             enable_logging=False,
             execution_profile_policy=policy,
         )
@@ -1191,6 +1202,9 @@ def test_fork_current_child_profile_requires_and_records_authorized_adoption(
         assert relationship.selection is ForkExecutionProfileSelection.CURRENT_CHILD
         assert relationship.source_profile == source_profile
         assert relationship.selected_profile != source_profile
+        assert relationship.selected_profile.component(
+            ExecutionProfileComponentClass.FINALIZATION
+        ) == source_profile.component(ExecutionProfileComponentClass.FINALIZATION)
         assert relationship.decision is not None
         assert relationship.decision.kind is ExecutionProfileDecisionKind.ADOPTED
         assert relationship.decision.actor.subject == "operator"
