@@ -14455,7 +14455,15 @@ class RecoveryCoordinator:
                     ),
                 )
 
-        if session.status in {SessionStatus.PENDING, SessionStatus.RUNNING}:
+        failed_with_recoverable_tool_round = (
+            session.status is SessionStatus.FAILED
+            and pending_tool_round is not None
+            and pending_approval is None
+            and pending_user_input is None
+        )
+        if session.status in {SessionStatus.PENDING, SessionStatus.RUNNING} or (
+            failed_with_recoverable_tool_round
+        ):
             if pending_approval is not None:
                 interrupt_payload = {
                     "model_step_id": pending_approval.model_step_id,

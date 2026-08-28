@@ -2779,16 +2779,17 @@ def test_dynamic_observation_identity_is_opaque_before_tool_secret_resolution(
     assert lifecycle.workspace_id.startswith("cayu_authority_")
     assert recovery_requests == 1
     assert final_recovery_requests == 0
-    assert first_recovery.status is first_recovery_status
+    # Archiving an opaque abandoned tool round always settles the session as
+    # interrupted, including when the source session had already been marked
+    # failed.  Interrupted is the recoverable terminal classification for this
+    # evidence-preserving path.
+    assert first_recovery.status is SessionStatus.INTERRUPTED
     assert first_recovery.actions[-1] is IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED
     assert second_recovery.status is SessionStatus.INTERRUPTED
     assert second_recovery.actions[-1] is IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED
-    expected_terminal_evidence_action = (
-        IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE
-        if first_recovery_status is SessionStatus.INTERRUPTED
-        else IncompleteSessionRecoveryAction.SKIPPED_TERMINAL
+    assert terminal_evidence_recovery.actions == (
+        IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
     )
-    assert terminal_evidence_recovery.actions == (expected_terminal_evidence_action,)
     assert repeated_recovery.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
     assert first_recovered_checkpoint is not None
     assert second_checkpoint is not None

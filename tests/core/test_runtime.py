@@ -31818,6 +31818,64 @@ def test_cayu_app_recover_incomplete_session_uses_recorded_tool_result():
     )
 
 
+def test_cayu_app_recovers_failed_session_pending_tool_round_before_publication():
+    store = FailingOrdinaryToolResultCloseStore()
+    tool = SideEffectTool()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="side_effect",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[tool])
+    session_id = "sess_recover_failed_pending_tool_round"
+
+    initial_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "use tool")],
+            ),
+        )
+    )
+    checkpoint = asyncio.run(store.load_checkpoint(session_id))
+    session = asyncio.run(store.load(session_id))
+    assert initial_events[-1].type is EventType.SESSION_FAILED
+    assert session is not None
+    assert session.status is SessionStatus.FAILED
+    assert checkpoint is not None
+    assert "pending_tool_round" in checkpoint
+
+    result = asyncio.run(
+        app.recover_incomplete_session(IncompleteSessionRecoveryRequest(session_id=session_id))
+    )
+
+    recovered = asyncio.run(store.load(session_id))
+    transcript = asyncio.run(store.load_transcript(session_id))
+    assert recovered is not None
+    assert recovered.status is SessionStatus.INTERRUPTED
+    assert result.status is SessionStatus.INTERRUPTED
+    assert result.actions == (
+        IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
+        IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
+        IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,
+    )
+    assert tool.calls == [{}]
+    assert [message.role for message in transcript] == ["user", "assistant", "tool"]
+    assert transcript[-1].content[0].content == "recorded"
+    assert_only_model_step_publication_checkpoint(asyncio.run(store.load_checkpoint(session_id)))
+
+
 def test_cayu_app_recover_incomplete_session_preserves_pending_tool_approval():
     store = InMemorySessionStore()
     tool = SideEffectTool()
