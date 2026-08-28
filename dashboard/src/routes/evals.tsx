@@ -104,7 +104,15 @@ import {
 } from "@/lib/evals-readiness"
 import { type EvalsSearch, evalResultRevisionIsValid, evalsSearchWithout } from "@/lib/evals-search"
 import { formatBytes, formatCount, formatDateTime } from "@/lib/format"
-import type { EvalScenarioTrialProgress, EvalsReadiness } from "@/lib/generated/server-api"
+import type {
+  EvalAssertionPresentationV1,
+  EvalResultOutcomeDimensionsV1,
+  EvalResultPresentationV1,
+  EvalScenarioTrialProgress,
+  EvalStructuredJudgeComparisonV1,
+  EvalStructuredJudgePresentationV1,
+  EvalsReadiness,
+} from "@/lib/generated/server-api"
 
 const PAGE_LIMIT = 25
 type UpdateEvalsSearch = (next: (current: EvalsSearch) => EvalsSearch) => Promise<void>
@@ -1653,11 +1661,15 @@ function CapturedResultInspector({
         )}
       </DataCard>
       <DataCard
-        title="Immutable score evidence"
-        description="Public-safe result content persisted with the corpus revision."
+        title="Explainable result"
+        description="Canonical public-safe outcome, evaluator, criterion, evidence, usage, and cost facts."
         contentClassName="p-4"
       >
-        <PayloadViewer value={detail.result} maxHeight="max-h-[36rem]" />
+        <ResultPresentationInspector presentation={detail.presentation} />
+        <details className="mt-4 border-t border-border pt-4 text-xs">
+          <summary className="cursor-pointer text-primary">Inspect immutable JSON evidence</summary>
+          <PayloadViewer value={detail.result} className="mt-3" maxHeight="max-h-[36rem]" />
+        </details>
       </DataCard>
     </div>
   )
@@ -2180,6 +2192,8 @@ function ResultInspector({
     ? Math.min(currentSelection.trialIndex, selectedCase.trials.length - 1)
     : 0
   const selectedTrial = selectedCase?.trials[trialIndex]
+  const presentedCase = result.presentation.cases[caseIndex]
+  const presentedTrial = presentedCase?.trials[trialIndex]
   const selectedTrialCost = selectedTrial ? evalTrialCostSummary(selectedTrial.assertions) : null
 
   return (
@@ -2232,8 +2246,37 @@ function ResultInspector({
           value={shortEvalIdentity(result.result.target.app_manifest.fingerprint)}
         />
       </div>
+      <div className="border-t border-border p-4">
+        <div className="mb-4 grid gap-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
+          <RunFact
+            label="Corpus"
+            value={shortEvalIdentity(result.presentation.corpus_revision)}
+            title={result.presentation.corpus_revision}
+          />
+          <RunFact
+            label="Suite revision"
+            value={shortEvalIdentity(result.presentation.suite_revision)}
+            title={result.presentation.suite_revision}
+          />
+          <RunFact
+            label="Evidence policy"
+            value={shortEvalIdentity(result.presentation.evidence_policy_revision)}
+            title={result.presentation.evidence_policy_revision}
+          />
+          <RunFact
+            label="Pricing profile"
+            value={
+              result.presentation.pricing_profile_fingerprint
+                ? shortEvalIdentity(result.presentation.pricing_profile_fingerprint)
+                : "not used"
+            }
+            title={result.presentation.pricing_profile_fingerprint ?? undefined}
+          />
+        </div>
+        <OutcomeDimensionsGrid dimensions={result.presentation.dimensions} />
+      </div>
 
-      {selectedCase && selectedTrial && (
+      {selectedCase && selectedTrial && presentedCase && presentedTrial && (
         <div className="space-y-4 border-t border-border p-4">
           <div className="grid gap-3 sm:grid-cols-2">
             <label className="min-w-0 text-xs font-medium text-muted-foreground">
@@ -2307,6 +2350,7 @@ function ResultInspector({
               title={selectedTrialCost?.exact}
             />
           </div>
+          <OutcomeDimensionsGrid dimensions={presentedTrial.dimensions} />
 
           <div className="text-sm">
             <div className="text-xs font-medium text-muted-foreground">Trial diagnostic</div>
@@ -2347,35 +2391,50 @@ function ResultInspector({
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {selectedTrial.assertions.map((assertion) => (
-                  <TableRow key={assertion.assertion_id}>
-                    <TableCell>
-                      <div className="max-w-52 truncate font-medium" title={assertion.assertion_id}>
-                        {assertion.assertion_id}
-                      </div>
-                      <div className="mt-1 text-xs text-muted-foreground">
-                        {assertion.detail.kind?.replaceAll("_", " ") ?? "assertion"}
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <OutcomeBadge outcome={assertion.outcome} />
-                      <div className="mt-1 text-xs text-muted-foreground">
-                        {formatScore(assertion.score)}
-                      </div>
-                    </TableCell>
-                    <TableCell className="min-w-64 whitespace-normal">
-                      <div>{assertion.message}</div>
-                      <details className="mt-2 text-xs">
-                        <summary className="cursor-pointer text-primary">Inspect evidence</summary>
-                        <PayloadViewer
-                          value={assertion.detail}
-                          className="mt-2"
-                          maxHeight="max-h-40"
-                        />
-                      </details>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                {selectedTrial.assertions.map((assertion, assertionIndex) => {
+                  const presentedAssertion = presentedTrial.assertions[assertionIndex]
+                  return (
+                    <TableRow key={assertion.assertion_id}>
+                      <TableCell>
+                        <div
+                          className="max-w-52 truncate font-medium"
+                          title={assertion.assertion_id}
+                        >
+                          {assertion.assertion_id}
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {assertion.detail.kind?.replaceAll("_", " ") ?? "assertion"}
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <OutcomeBadge outcome={assertion.outcome} />
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {formatScore(assertion.score)}
+                        </div>
+                      </TableCell>
+                      <TableCell className="min-w-64 whitespace-normal">
+                        <div>{assertion.message}</div>
+                        {presentedAssertion?.structured_judge ? (
+                          <StructuredJudgeDetails
+                            className="mt-3"
+                            judgment={presentedAssertion.structured_judge}
+                          />
+                        ) : (
+                          <details className="mt-2 text-xs">
+                            <summary className="cursor-pointer text-primary">
+                              Inspect evidence
+                            </summary>
+                            <PayloadViewer
+                              value={assertion.detail}
+                              className="mt-2"
+                              maxHeight="max-h-40"
+                            />
+                          </details>
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  )
+                })}
               </TableBody>
             </Table>
           </div>
@@ -2383,6 +2442,282 @@ function ResultInspector({
       )}
     </DataCard>
   )
+}
+
+function ResultPresentationInspector({ presentation }: { presentation: EvalResultPresentationV1 }) {
+  const [selection, setSelection] = useState({
+    revision: presentation.result_revision,
+    caseIndex: 0,
+    trialIndex: 0,
+  })
+  const current =
+    selection.revision === presentation.result_revision
+      ? selection
+      : { revision: presentation.result_revision, caseIndex: 0, trialIndex: 0 }
+  const caseIndex = Math.min(current.caseIndex, presentation.cases.length - 1)
+  const selectedCase = presentation.cases[caseIndex]
+  const trialIndex = selectedCase ? Math.min(current.trialIndex, selectedCase.trials.length - 1) : 0
+  const selectedTrial = selectedCase?.trials[trialIndex]
+
+  if (!selectedCase || !selectedTrial) {
+    return <StateMessage>No retained case and trial presentation is available.</StateMessage>
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="grid gap-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
+        <RunFact label="Release" value={presentation.application_release_id} />
+        <RunFact
+          label={presentation.origin === "fresh_execution" ? "Published run" : "Captured score"}
+          value={shortEvalIdentity(presentation.evaluation_revision)}
+          title={presentation.evaluation_revision}
+        />
+        <RunFact
+          label="App manifest"
+          value={shortEvalIdentity(presentation.app_manifest_fingerprint)}
+          title={presentation.app_manifest_fingerprint}
+        />
+        <RunFact
+          label="Evidence policy"
+          value={shortEvalIdentity(presentation.evidence_policy_revision)}
+          title={presentation.evidence_policy_revision}
+        />
+        <RunFact
+          label="Pricing profile"
+          value={
+            presentation.pricing_profile_fingerprint
+              ? shortEvalIdentity(presentation.pricing_profile_fingerprint)
+              : "not used"
+          }
+          title={presentation.pricing_profile_fingerprint ?? undefined}
+        />
+      </div>
+      <OutcomeDimensionsGrid dimensions={presentation.dimensions} />
+      <div className="grid gap-3 sm:grid-cols-2">
+        <label className="min-w-0 text-xs font-medium text-muted-foreground">
+          Case
+          <select
+            className="mt-1 h-9 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground"
+            value={caseIndex}
+            onChange={(event) =>
+              setSelection({
+                revision: presentation.result_revision,
+                caseIndex: Number(event.target.value),
+                trialIndex: 0,
+              })
+            }
+          >
+            {presentation.cases.map((evalCase, index) => (
+              <option key={evalCase.case_id} value={index}>
+                {evalCase.case_id} — {evalCase.status}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="min-w-0 text-xs font-medium text-muted-foreground">
+          Trial
+          <select
+            className="mt-1 h-9 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground"
+            value={trialIndex}
+            onChange={(event) =>
+              setSelection({
+                revision: presentation.result_revision,
+                caseIndex,
+                trialIndex: Number(event.target.value),
+              })
+            }
+          >
+            {selectedCase.trials.map((trial, index) => (
+              <option key={trial.trial_number ?? `captured-${index}`} value={index}>
+                {trial.trial_number ? `Trial ${trial.trial_number}` : "Captured evidence"} —{" "}
+                {trial.status}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      <div className="grid gap-3 rounded-lg border border-border bg-muted/20 p-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
+        <RunFact label="Case outcome" value={selectedCase.status} />
+        <RunFact label="Case score" value={formatScore(selectedCase.score)} />
+        <RunFact label="Trial outcome" value={selectedTrial.status} />
+        <RunFact label="Trial score" value={formatScore(selectedTrial.score)} />
+      </div>
+      <OutcomeDimensionsGrid dimensions={selectedTrial.dimensions} />
+      <PresentedAssertions assertions={selectedTrial.assertions} />
+    </div>
+  )
+}
+
+function OutcomeDimensionsGrid({ dimensions }: { dimensions: EvalResultOutcomeDimensionsV1 }) {
+  const items = [
+    ["Candidate", dimensions.candidate],
+    ["Deterministic assertions", dimensions.deterministic_assertions],
+    ["Semantic quality", dimensions.semantic_quality],
+    ["Evaluator health", dimensions.evaluator_health],
+    ["Runtime", dimensions.runtime],
+    ["Evidence", dimensions.evidence],
+  ] as const
+  return (
+    <div className="grid gap-3 rounded-lg border border-border bg-muted/20 p-3 text-sm sm:grid-cols-2 lg:grid-cols-3">
+      {items.map(([label, value]) => (
+        <RunFact key={label} label={label} value={value.replaceAll("_", " ")} />
+      ))}
+    </div>
+  )
+}
+
+function PresentedAssertions({ assertions }: { assertions: Array<EvalAssertionPresentationV1> }) {
+  return (
+    <div className="space-y-3">
+      <div className="text-sm font-medium">Assertions ({formatCount(assertions.length)})</div>
+      {assertions.map((assertion) => (
+        <div key={assertion.assertion_id} className="rounded-lg border border-border p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <div className="font-medium">{assertion.assertion_id}</div>
+              <div className="text-xs text-muted-foreground">
+                {assertion.kind.replaceAll("_", " ")} · {assertion.category}
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <OutcomeBadge outcome={assertion.outcome} />
+              <span className="text-xs text-muted-foreground">{formatScore(assertion.score)}</span>
+            </div>
+          </div>
+          {assertion.structured_judge && (
+            <StructuredJudgeDetails className="mt-3" judgment={assertion.structured_judge} />
+          )}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function StructuredJudgeDetails({
+  judgment,
+  className,
+}: {
+  judgment: EvalStructuredJudgePresentationV1
+  className?: string
+}) {
+  const detail = judgment.detail
+  const profile = detail.judge_profile
+  const reference = detail.reference
+  const criteria = judgment.criteria ?? []
+  const thresholdState =
+    judgment.threshold_passed === null
+      ? "unavailable"
+      : judgment.threshold_passed
+        ? "passed"
+        : "failed"
+  const usage = structuredJudgeUsageText(judgment)
+  const cost = structuredJudgeCostText(judgment)
+  return (
+    <div className={`space-y-3 rounded-lg border border-border bg-muted/20 p-3 ${className ?? ""}`}>
+      <div className="grid gap-3 text-xs sm:grid-cols-2 lg:grid-cols-3">
+        <RunFact
+          label="Judge profile"
+          value={`${profile.label} · ${shortEvalIdentity(profile.revision)}`}
+          title={`${profile.key}@${profile.revision}`}
+        />
+        <RunFact label="Provider / model" value={`${profile.provider_name} / ${profile.model}`} />
+        <RunFact
+          label="Candidate route"
+          value={
+            detail.candidate_route_relation === "same_model"
+              ? "same model · explicitly allowed"
+              : "independent model"
+          }
+        />
+        <RunFact
+          label="Rubric"
+          value={`${detail.rubric_id} · ${shortEvalIdentity(detail.rubric_revision)}`}
+          title={detail.rubric_revision}
+        />
+        <RunFact label="Evaluator" value={detail.diagnostic.replaceAll("_", " ")} />
+        <RunFact
+          label="Aggregate / threshold"
+          value={`${detail.aggregate_score ?? "unavailable"} / ${detail.threshold} · ${thresholdState}`}
+        />
+        <RunFact label="Observed usage" value={usage} />
+        <RunFact label="Observed cost" value={cost} />
+        <RunFact
+          label="Evidence"
+          value={
+            [
+              detail.evidence.include_final_output ? "final output" : null,
+              detail.evidence.include_transcript ? "transcript" : null,
+            ]
+              .filter(Boolean)
+              .join(" + ") || "none"
+          }
+        />
+        <RunFact
+          label="Reference"
+          value={reference ? `${reference.kind.replaceAll("_", " ")} · available` : "none"}
+          title={reference ? `${reference.key}@${reference.revision}` : undefined}
+        />
+        <RunFact
+          label="Evaluator implementation"
+          value={shortEvalIdentity(profile.implementation_revision)}
+          title={profile.implementation_revision}
+        />
+        <RunFact
+          label="Evidence privacy policy"
+          value={`${profile.privacy_policy_key} · ${shortEvalIdentity(profile.privacy_policy_revision)}`}
+          title={profile.privacy_policy_revision}
+        />
+      </div>
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>Criterion</TableHead>
+            <TableHead>Weight</TableHead>
+            <TableHead>Score</TableHead>
+            <TableHead>Contribution</TableHead>
+            <TableHead>Explanation</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {criteria.length === 0 ? (
+            <TableRow>
+              <TableCell colSpan={5}>No criterion scores were recorded.</TableCell>
+            </TableRow>
+          ) : (
+            criteria.map((criterion) => (
+              <TableRow key={criterion.criterion_id}>
+                <TableCell className="font-medium">{criterion.criterion_id}</TableCell>
+                <TableCell>{criterion.weight}</TableCell>
+                <TableCell>{criterion.score}</TableCell>
+                <TableCell>{criterion.weighted_contribution}</TableCell>
+                <TableCell className="min-w-64 whitespace-normal">
+                  <div>{criterion.explanation ?? "Unavailable"}</div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    {criterion.explanation_state}
+                  </div>
+                </TableCell>
+              </TableRow>
+            ))
+          )}
+        </TableBody>
+      </Table>
+    </div>
+  )
+}
+
+function structuredJudgeUsageText(judgment: EvalStructuredJudgePresentationV1): string {
+  const usage = judgment.detail.usage
+  return usage
+    ? `${formatCount(usage.total_tokens)} tokens · ${formatCount(usage.model_steps)} model steps`
+    : "unavailable"
+}
+
+function structuredJudgeCostText(judgment: EvalStructuredJudgePresentationV1): string {
+  const cost = judgment.detail.cost
+  if (!cost) return "unavailable · not observed"
+  return cost.availability === "priced"
+    ? `${cost.estimated_cost} ${cost.currency}`
+    : "unavailable · unpriced"
 }
 
 function ComparisonPanel({
@@ -2494,6 +2829,9 @@ function ComparisonSummary({ comparison }: { comparison: EvalResultComparison })
   const { comparison: resultComparison, baseline, current } = comparison
   const { compatibility } = resultComparison
   const regressions = resultComparison.regressions ?? []
+  const structuredJudgments = resultComparison.structured_judgments ?? []
+  const structuredRegressions = structuredJudgments.filter((item) => item.regressed)
+  const regressionCount = regressions.length + structuredRegressions.length
   const reasons = compatibility.reasons ?? []
   return (
     <div className="space-y-4 p-4">
@@ -2534,16 +2872,16 @@ function ComparisonSummary({ comparison }: { comparison: EvalResultComparison })
       {compatibility.comparable && (
         <div
           className={
-            regressions.length === 0
+            regressionCount === 0
               ? "rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3 text-sm"
               : "rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm"
           }
           data-testid="eval-comparison-regressions"
         >
           <div className="font-medium">
-            {regressions.length === 0
+            {regressionCount === 0
               ? "No compatible-result regressions."
-              : `${regressions.length} compatible-result regression${regressions.length === 1 ? "" : "s"}.`}
+              : `${regressionCount} compatible-result regression${regressionCount === 1 ? "" : "s"}.`}
           </div>
           {regressions.length > 0 && (
             <ul className="mt-2 list-disc space-y-1 pl-5">
@@ -2557,8 +2895,22 @@ function ComparisonSummary({ comparison }: { comparison: EvalResultComparison })
               ))}
             </ul>
           )}
+          {structuredRegressions.length > 0 && (
+            <ul className="mt-2 list-disc space-y-1 pl-5">
+              {structuredRegressions.map((item) => (
+                <li key={`${item.case_id}:${item.trial_number ?? "captured"}:${item.assertion_id}`}>
+                  Case {item.case_id},{" "}
+                  {item.trial_number ? `trial ${item.trial_number}` : "captured evidence"},
+                  assertion {item.assertion_id}: evaluator {item.evaluator_change}, aggregate{" "}
+                  {item.aggregate_change}
+                  {item.aggregate_delta === null ? "" : ` (${item.aggregate_delta})`}.
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
+      <StructuredJudgeComparison comparison={resultComparison} />
       <div className="grid gap-4 rounded-lg border border-border bg-muted/20 p-3 text-xs sm:grid-cols-2">
         <RunFact
           label="Baseline result revision"
@@ -2569,6 +2921,185 @@ function ComparisonSummary({ comparison }: { comparison: EvalResultComparison })
           value={shortEvalIdentity(compatibility.current_result_revision)}
         />
       </div>
+    </div>
+  )
+}
+
+function StructuredJudgeComparison({
+  comparison,
+}: {
+  comparison: EvalResultComparison["comparison"]
+}) {
+  const state = comparison.structured_judge_comparison_state
+  const stateText = {
+    compared: "Exact retained case, trial, and assertion identities were paired.",
+    contract_incompatible:
+      "Judged outcomes were not diffed because the immutable evaluation contracts differ.",
+    no_structured_judges: "Neither result contains structured AI-judge observations.",
+    observation_identity_mismatch:
+      "Judged outcomes were not paired because retained observation identities differ.",
+    source_detail_unavailable:
+      "One compact result projection does not retain structured judgment detail.",
+  }[state]
+  const mismatches = comparison.structured_judge_observation_mismatches ?? []
+  const judgments = comparison.structured_judgments ?? []
+  return (
+    <div className="space-y-3">
+      <div>
+        <div className="font-medium">Structured judge comparison</div>
+        <div className="mt-1 text-xs text-muted-foreground">
+          {stateText} State: {state.replaceAll("_", " ")}.
+        </div>
+      </div>
+      {mismatches.length > 0 && (
+        <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm">
+          <div className="font-medium">Unmatched retained observations</div>
+          <ul className="mt-2 list-disc space-y-1 pl-5">
+            {mismatches.map((item) => (
+              <li
+                key={`${item.availability}:${item.case_id}:${item.trial_number ?? "captured"}:${item.assertion_id}`}
+              >
+                {item.case_id} ·{" "}
+                {item.trial_number ? `trial ${item.trial_number}` : "captured evidence"} ·{" "}
+                {item.assertion_id}: {item.availability.replaceAll("_", " ")}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {judgments.map((item) => (
+        <StructuredJudgeComparisonDetails
+          key={`${item.case_id}:${item.trial_number ?? "captured"}:${item.assertion_id}`}
+          item={item}
+        />
+      ))}
+    </div>
+  )
+}
+
+function StructuredJudgeComparisonDetails({ item }: { item: EvalStructuredJudgeComparisonV1 }) {
+  const criteria = item.criteria ?? []
+  const baselineCriteria = new Map(
+    (item.baseline.criteria ?? []).map((criterion) => [criterion.criterion_id, criterion]),
+  )
+  const currentCriteria = new Map(
+    (item.current.criteria ?? []).map((criterion) => [criterion.criterion_id, criterion]),
+  )
+  const profile = item.baseline.detail.judge_profile
+  return (
+    <div
+      className={
+        item.regressed
+          ? "rounded-lg border border-destructive/30 bg-destructive/5 p-3"
+          : "rounded-lg border border-border p-3"
+      }
+    >
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <div className="font-medium">
+            {item.case_id} ·{" "}
+            {item.trial_number ? `trial ${item.trial_number}` : "captured evidence"} ·{" "}
+            {item.assertion_id}
+          </div>
+          <div className="mt-1 text-xs text-muted-foreground">
+            {profile.label} · {profile.provider_name}/{profile.model} ·{" "}
+            {item.baseline.detail.candidate_route_relation.replaceAll("_", " ")}
+          </div>
+        </div>
+        <Badge variant={item.regressed ? "destructive" : "outline"}>
+          {item.regressed ? "regressed" : item.aggregate_change}
+        </Badge>
+      </div>
+      <div className="mt-3 grid gap-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
+        <RunFact label="Outcome" value={`${item.baseline_outcome} → ${item.current_outcome}`} />
+        <RunFact label="Evaluator" value={item.evaluator_change} />
+        <RunFact
+          label="Aggregate"
+          value={`${item.baseline.detail.aggregate_score ?? "unavailable"} → ${item.current.detail.aggregate_score ?? "unavailable"}`}
+        />
+        <RunFact
+          label="Aggregate delta"
+          value={`${item.aggregate_delta ?? "unavailable"} · ${item.aggregate_change}`}
+        />
+        <RunFact
+          label="Rubric"
+          value={`${item.baseline.detail.rubric_id} · ${shortEvalIdentity(item.baseline.detail.rubric_revision)}`}
+          title={item.baseline.detail.rubric_revision}
+        />
+        <RunFact
+          label="Judge profile"
+          value={`${profile.key} · ${shortEvalIdentity(profile.revision)}`}
+          title={profile.revision}
+        />
+        <RunFact
+          label="Evaluator diagnostic"
+          value={`${item.baseline.detail.diagnostic.replaceAll("_", " ")} → ${item.current.detail.diagnostic.replaceAll("_", " ")}`}
+        />
+        <RunFact
+          label="Reference"
+          value={
+            item.baseline.detail.reference
+              ? `${item.baseline.detail.reference.kind.replaceAll("_", " ")} · available`
+              : "none"
+          }
+        />
+        <RunFact
+          label="Observed usage"
+          value={`${structuredJudgeUsageText(item.baseline)} → ${structuredJudgeUsageText(item.current)}`}
+        />
+        <RunFact
+          label="Observed cost"
+          value={`${structuredJudgeCostText(item.baseline)} → ${structuredJudgeCostText(item.current)}`}
+        />
+      </div>
+      <Table className="mt-3">
+        <TableHeader>
+          <TableRow>
+            <TableHead>Criterion</TableHead>
+            <TableHead>Weight</TableHead>
+            <TableHead>Baseline</TableHead>
+            <TableHead>Current</TableHead>
+            <TableHead>Delta</TableHead>
+            <TableHead>Explanations</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {criteria.length === 0 ? (
+            <TableRow>
+              <TableCell colSpan={6}>
+                Criterion deltas are unavailable because one or both judgments were not recorded.
+              </TableCell>
+            </TableRow>
+          ) : (
+            criteria.map((criterion) => {
+              const baseline = baselineCriteria.get(criterion.criterion_id)
+              const current = currentCriteria.get(criterion.criterion_id)
+              return (
+                <TableRow key={criterion.criterion_id}>
+                  <TableCell className="font-medium">{criterion.criterion_id}</TableCell>
+                  <TableCell>{criterion.weight}</TableCell>
+                  <TableCell>{criterion.baseline_score}</TableCell>
+                  <TableCell>{criterion.current_score}</TableCell>
+                  <TableCell>{criterion.score_delta}</TableCell>
+                  <TableCell className="min-w-72 whitespace-normal">
+                    <div>
+                      <span className="font-medium">Baseline:</span>{" "}
+                      {baseline?.explanation ?? "Unavailable"}
+                    </div>
+                    <div className="mt-1">
+                      <span className="font-medium">Current:</span>{" "}
+                      {current?.explanation ?? "Unavailable"}
+                    </div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      {criterion.baseline_explanation_state} → {criterion.current_explanation_state}
+                    </div>
+                  </TableCell>
+                </TableRow>
+              )
+            })
+          )}
+        </TableBody>
+      </Table>
     </div>
   )
 }
@@ -2597,9 +3128,34 @@ function ComparisonResultSummary({
           }
         />
         <RunFact label="Suite" value={record.suite_id} />
+        <RunFact label="Target" value={result.target_key} />
         <RunFact label="Release" value={result.application_release_id} />
         <RunFact label="App manifest" value={shortEvalIdentity(result.app_manifest_fingerprint)} />
         <RunFact label="Score" value={formatScore(result.score)} />
+        <RunFact
+          label="Corpus"
+          value={shortEvalIdentity(result.corpus_revision)}
+          title={result.corpus_revision}
+        />
+        <RunFact
+          label="Suite revision"
+          value={shortEvalIdentity(result.suite_revision)}
+          title={result.suite_revision}
+        />
+        <RunFact
+          label="Evidence policy"
+          value={shortEvalIdentity(result.evidence_policy_revision)}
+          title={result.evidence_policy_revision}
+        />
+        <RunFact
+          label="Pricing profile"
+          value={
+            result.pricing_profile_fingerprint
+              ? shortEvalIdentity(result.pricing_profile_fingerprint)
+              : "not used"
+          }
+          title={result.pricing_profile_fingerprint ?? undefined}
+        />
         <RunFact label="Created" value={formatDateTime(record.created_at)} />
       </div>
     </div>

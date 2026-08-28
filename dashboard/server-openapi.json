@@ -7496,11 +7496,41 @@
             "title": "Application Release Id",
             "type": "string"
           },
+          "corpus_revision": {
+            "title": "Corpus Revision",
+            "type": "string"
+          },
+          "evidence_policy_revision": {
+            "title": "Evidence Policy Revision",
+            "type": "string"
+          },
+          "external_target_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "External Target Revision"
+          },
           "memory_attribution_support": {
             "const": "unsupported",
             "default": "unsupported",
             "title": "Memory Attribution Support",
             "type": "string"
+          },
+          "pricing_profile_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Profile Fingerprint"
           },
           "result_revision": {
             "title": "Result Revision",
@@ -7528,12 +7558,31 @@
             ],
             "title": "Status",
             "type": "string"
+          },
+          "suite_id": {
+            "title": "Suite Id",
+            "type": "string"
+          },
+          "suite_revision": {
+            "title": "Suite Revision",
+            "type": "string"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
           }
         },
         "required": [
           "result_revision",
+          "target_key",
           "application_release_id",
           "app_manifest_fingerprint",
+          "external_target_revision",
+          "corpus_revision",
+          "suite_id",
+          "suite_revision",
+          "evidence_policy_revision",
+          "pricing_profile_fingerprint",
           "status"
         ],
         "title": "CorpusComparisonResultSummary",
@@ -7569,8 +7618,8 @@
             "type": "array"
           },
           "schema_version": {
-            "const": 1,
-            "default": 1,
+            "const": 2,
+            "default": 2,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -7580,12 +7629,42 @@
             "minimum": 0.0,
             "title": "Score Tolerance",
             "type": "number"
+          },
+          "structured_judge_comparison_state": {
+            "enum": [
+              "compared",
+              "contract_incompatible",
+              "no_structured_judges",
+              "observation_identity_mismatch",
+              "source_detail_unavailable"
+            ],
+            "title": "Structured Judge Comparison State",
+            "type": "string"
+          },
+          "structured_judge_observation_mismatches": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalStructuredJudgeObservationMismatchV1"
+            },
+            "maxItems": 12800000,
+            "title": "Structured Judge Observation Mismatches",
+            "type": "array"
+          },
+          "structured_judgments": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalStructuredJudgeComparisonV1"
+            },
+            "maxItems": 6400000,
+            "title": "Structured Judgments",
+            "type": "array"
           }
         },
         "required": [
           "compatibility",
           "baseline",
-          "current"
+          "current",
+          "structured_judge_comparison_state"
         ],
         "title": "CorpusExecutionComparison",
         "type": "object"
@@ -8854,6 +8933,73 @@
         "title": "EnvironmentsResponse",
         "type": "object"
       },
+      "EvalAssertionPresentationV1": {
+        "additionalProperties": false,
+        "properties": {
+          "assertion_id": {
+            "title": "Assertion Id",
+            "type": "string"
+          },
+          "assertion_revision": {
+            "title": "Assertion Revision",
+            "type": "string"
+          },
+          "category": {
+            "enum": [
+              "deterministic",
+              "semantic"
+            ],
+            "title": "Category",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "passed",
+              "failed",
+              "unavailable",
+              "error"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
+          "structured_judge": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalStructuredJudgePresentationV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "assertion_id",
+          "assertion_revision",
+          "kind",
+          "category",
+          "outcome"
+        ],
+        "title": "EvalAssertionPresentationV1",
+        "type": "object"
+      },
       "EvalAuthoredSuiteAdmittedRun": {
         "additionalProperties": false,
         "properties": {
@@ -10057,6 +10203,63 @@
           "assertions"
         ],
         "title": "EvalCaseDraftV2",
+        "type": "object"
+      },
+      "EvalCasePresentationV1": {
+        "additionalProperties": false,
+        "properties": {
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "case_revision": {
+            "title": "Case Revision",
+            "type": "string"
+          },
+          "dimensions": {
+            "$ref": "#/components/schemas/EvalResultOutcomeDimensionsV1"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
+          "status": {
+            "enum": [
+              "passed",
+              "failed",
+              "unavailable",
+              "error"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "trials": {
+            "items": {
+              "$ref": "#/components/schemas/EvalTrialPresentationV1"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Trials",
+            "type": "array"
+          }
+        },
+        "required": [
+          "case_id",
+          "case_revision",
+          "status",
+          "dimensions",
+          "trials"
+        ],
+        "title": "EvalCasePresentationV1",
         "type": "object"
       },
       "EvalCaseSpec": {
@@ -11756,6 +11959,9 @@
               }
             ]
           },
+          "presentation": {
+            "$ref": "#/components/schemas/EvalResultPresentationV1"
+          },
           "record": {
             "$ref": "#/components/schemas/EvalResultRecord"
           },
@@ -11773,7 +11979,8 @@
         },
         "required": [
           "record",
-          "result"
+          "result",
+          "presentation"
         ],
         "title": "EvalResultDetailResponse",
         "type": "object"
@@ -11786,6 +11993,82 @@
         ],
         "title": "EvalResultOrigin",
         "type": "string"
+      },
+      "EvalResultOutcomeDimensionsV1": {
+        "additionalProperties": false,
+        "description": "Orthogonal result states that must not be collapsed into one opaque status.",
+        "properties": {
+          "candidate": {
+            "enum": [
+              "passed",
+              "failed",
+              "not_scored"
+            ],
+            "title": "Candidate",
+            "type": "string"
+          },
+          "deterministic_assertions": {
+            "enum": [
+              "passed",
+              "failed",
+              "unavailable",
+              "error",
+              "not_used"
+            ],
+            "title": "Deterministic Assertions",
+            "type": "string"
+          },
+          "evaluator_health": {
+            "enum": [
+              "healthy",
+              "unavailable",
+              "error",
+              "not_used"
+            ],
+            "title": "Evaluator Health",
+            "type": "string"
+          },
+          "evidence": {
+            "enum": [
+              "complete",
+              "incomplete",
+              "unavailable"
+            ],
+            "title": "Evidence",
+            "type": "string"
+          },
+          "runtime": {
+            "enum": [
+              "completed",
+              "failed",
+              "unavailable",
+              "not_executed"
+            ],
+            "title": "Runtime",
+            "type": "string"
+          },
+          "semantic_quality": {
+            "enum": [
+              "passed",
+              "failed",
+              "unavailable",
+              "error",
+              "not_used"
+            ],
+            "title": "Semantic Quality",
+            "type": "string"
+          }
+        },
+        "required": [
+          "candidate",
+          "deterministic_assertions",
+          "semantic_quality",
+          "evaluator_health",
+          "runtime",
+          "evidence"
+        ],
+        "title": "EvalResultOutcomeDimensionsV1",
+        "type": "object"
       },
       "EvalResultPage": {
         "additionalProperties": false,
@@ -11819,6 +12102,121 @@
           "items"
         ],
         "title": "EvalResultPage",
+        "type": "object"
+      },
+      "EvalResultPresentationV1": {
+        "additionalProperties": false,
+        "description": "Canonical explainable projection for one immutable public eval result.",
+        "properties": {
+          "app_manifest_fingerprint": {
+            "title": "App Manifest Fingerprint",
+            "type": "string"
+          },
+          "application_release_id": {
+            "title": "Application Release Id",
+            "type": "string"
+          },
+          "cases": {
+            "items": {
+              "$ref": "#/components/schemas/EvalCasePresentationV1"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Cases",
+            "type": "array"
+          },
+          "corpus_revision": {
+            "title": "Corpus Revision",
+            "type": "string"
+          },
+          "dimensions": {
+            "$ref": "#/components/schemas/EvalResultOutcomeDimensionsV1"
+          },
+          "evaluation_revision": {
+            "title": "Evaluation Revision",
+            "type": "string"
+          },
+          "evidence_policy_revision": {
+            "title": "Evidence Policy Revision",
+            "type": "string"
+          },
+          "origin": {
+            "$ref": "#/components/schemas/EvalResultOrigin"
+          },
+          "pricing_profile_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Profile Fingerprint"
+          },
+          "result_revision": {
+            "title": "Result Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
+          "status": {
+            "enum": [
+              "passed",
+              "failed",
+              "unavailable",
+              "error"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "suite_id": {
+            "title": "Suite Id",
+            "type": "string"
+          },
+          "suite_revision": {
+            "title": "Suite Revision",
+            "type": "string"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result_revision",
+          "evaluation_revision",
+          "origin",
+          "target_key",
+          "application_release_id",
+          "app_manifest_fingerprint",
+          "corpus_revision",
+          "suite_id",
+          "suite_revision",
+          "evidence_policy_revision",
+          "pricing_profile_fingerprint",
+          "status",
+          "dimensions",
+          "cases"
+        ],
+        "title": "EvalResultPresentationV1",
         "type": "object"
       },
       "EvalResultRecord": {
@@ -11909,6 +12307,9 @@
               }
             ]
           },
+          "presentation": {
+            "$ref": "#/components/schemas/EvalResultPresentationV1"
+          },
           "result": {
             "$ref": "#/components/schemas/CorpusExecutionResult"
           },
@@ -11918,7 +12319,8 @@
         },
         "required": [
           "run",
-          "result"
+          "result",
+          "presentation"
         ],
         "title": "EvalResultResponse",
         "type": "object"
@@ -13385,6 +13787,299 @@
         "title": "EvalSimpleInputStimulusV1",
         "type": "object"
       },
+      "EvalStructuredJudgeComparisonV1": {
+        "additionalProperties": false,
+        "description": "Explainable comparison of one exact case/trial/assertion observation.",
+        "properties": {
+          "aggregate_change": {
+            "enum": [
+              "improved",
+              "regressed",
+              "unchanged",
+              "unavailable"
+            ],
+            "title": "Aggregate Change",
+            "type": "string"
+          },
+          "aggregate_delta": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Aggregate Delta"
+          },
+          "assertion_id": {
+            "title": "Assertion Id",
+            "type": "string"
+          },
+          "baseline": {
+            "$ref": "#/components/schemas/EvalStructuredJudgePresentationV1"
+          },
+          "baseline_outcome": {
+            "enum": [
+              "passed",
+              "failed",
+              "unavailable",
+              "error"
+            ],
+            "title": "Baseline Outcome",
+            "type": "string"
+          },
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "criteria": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalStructuredJudgeCriterionComparisonV1"
+            },
+            "maxItems": 8,
+            "title": "Criteria",
+            "type": "array"
+          },
+          "current": {
+            "$ref": "#/components/schemas/EvalStructuredJudgePresentationV1"
+          },
+          "current_outcome": {
+            "enum": [
+              "passed",
+              "failed",
+              "unavailable",
+              "error"
+            ],
+            "title": "Current Outcome",
+            "type": "string"
+          },
+          "evaluator_change": {
+            "enum": [
+              "improved",
+              "regressed",
+              "unchanged"
+            ],
+            "title": "Evaluator Change",
+            "type": "string"
+          },
+          "regressed": {
+            "title": "Regressed",
+            "type": "boolean"
+          },
+          "trial_number": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trial Number"
+          }
+        },
+        "required": [
+          "case_id",
+          "assertion_id",
+          "baseline_outcome",
+          "current_outcome",
+          "baseline",
+          "current",
+          "evaluator_change",
+          "aggregate_change",
+          "aggregate_delta",
+          "regressed"
+        ],
+        "title": "EvalStructuredJudgeComparisonV1",
+        "type": "object"
+      },
+      "EvalStructuredJudgeCriterionComparisonV1": {
+        "additionalProperties": false,
+        "description": "Exact criterion delta for one identity-matched structured judgment.",
+        "properties": {
+          "baseline_explanation_state": {
+            "enum": [
+              "available",
+              "redacted",
+              "unavailable"
+            ],
+            "title": "Baseline Explanation State",
+            "type": "string"
+          },
+          "baseline_score": {
+            "title": "Baseline Score",
+            "type": "string"
+          },
+          "criterion_id": {
+            "title": "Criterion Id",
+            "type": "string"
+          },
+          "current_explanation_state": {
+            "enum": [
+              "available",
+              "redacted",
+              "unavailable"
+            ],
+            "title": "Current Explanation State",
+            "type": "string"
+          },
+          "current_score": {
+            "title": "Current Score",
+            "type": "string"
+          },
+          "score_delta": {
+            "title": "Score Delta",
+            "type": "string"
+          },
+          "weight": {
+            "title": "Weight",
+            "type": "string"
+          }
+        },
+        "required": [
+          "criterion_id",
+          "weight",
+          "baseline_score",
+          "current_score",
+          "score_delta",
+          "baseline_explanation_state",
+          "current_explanation_state"
+        ],
+        "title": "EvalStructuredJudgeCriterionComparisonV1",
+        "type": "object"
+      },
+      "EvalStructuredJudgeCriterionPresentationV1": {
+        "additionalProperties": false,
+        "properties": {
+          "criterion_id": {
+            "title": "Criterion Id",
+            "type": "string"
+          },
+          "explanation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Explanation"
+          },
+          "explanation_state": {
+            "enum": [
+              "available",
+              "redacted",
+              "unavailable"
+            ],
+            "title": "Explanation State",
+            "type": "string"
+          },
+          "score": {
+            "title": "Score",
+            "type": "string"
+          },
+          "weight": {
+            "title": "Weight",
+            "type": "string"
+          },
+          "weighted_contribution": {
+            "title": "Weighted Contribution",
+            "type": "string"
+          }
+        },
+        "required": [
+          "criterion_id",
+          "weight",
+          "score",
+          "weighted_contribution",
+          "explanation",
+          "explanation_state"
+        ],
+        "title": "EvalStructuredJudgeCriterionPresentationV1",
+        "type": "object"
+      },
+      "EvalStructuredJudgeObservationMismatchV1": {
+        "additionalProperties": false,
+        "description": "One structured observation present on only one side of a comparison.",
+        "properties": {
+          "assertion_id": {
+            "title": "Assertion Id",
+            "type": "string"
+          },
+          "availability": {
+            "enum": [
+              "baseline_only",
+              "current_only"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "trial_number": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trial Number"
+          }
+        },
+        "required": [
+          "case_id",
+          "assertion_id",
+          "availability"
+        ],
+        "title": "EvalStructuredJudgeObservationMismatchV1",
+        "type": "object"
+      },
+      "EvalStructuredJudgePresentationV1": {
+        "additionalProperties": false,
+        "description": "Decision-useful safe view of one admitted structured judgment.",
+        "properties": {
+          "criteria": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalStructuredJudgeCriterionPresentationV1"
+            },
+            "maxItems": 8,
+            "title": "Criteria",
+            "type": "array"
+          },
+          "detail": {
+            "$ref": "#/components/schemas/PublishedStructuredModelJudgeDetail"
+          },
+          "threshold_passed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Threshold Passed"
+          }
+        },
+        "required": [
+          "detail",
+          "threshold_passed"
+        ],
+        "title": "EvalStructuredJudgePresentationV1",
+        "type": "object"
+      },
       "EvalSuiteAuthoringDiagnostic": {
         "additionalProperties": false,
         "properties": {
@@ -14211,6 +14906,76 @@
           "retained_bytes"
         ],
         "title": "EvalTrialOutputPreviewV1",
+        "type": "object"
+      },
+      "EvalTrialPresentationV1": {
+        "additionalProperties": false,
+        "properties": {
+          "assertions": {
+            "items": {
+              "$ref": "#/components/schemas/EvalAssertionPresentationV1"
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "title": "Assertions",
+            "type": "array"
+          },
+          "diagnostic_code": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalTrialDiagnosticCode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "dimensions": {
+            "$ref": "#/components/schemas/EvalResultOutcomeDimensionsV1"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
+          "status": {
+            "enum": [
+              "passed",
+              "failed",
+              "unavailable",
+              "error"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "trial_number": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trial Number"
+          }
+        },
+        "required": [
+          "status",
+          "dimensions",
+          "assertions"
+        ],
+        "title": "EvalTrialPresentationV1",
         "type": "object"
       },
       "EvalsOperationReadiness": {
@@ -24510,7 +25275,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "33",
+            "default": "34",
             "title": "Contract Version",
             "type": "string"
           },
@@ -28824,7 +29589,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "33",
+            "default": "34",
             "title": "Contract Version",
             "type": "string"
           }

@@ -54,6 +54,7 @@ from cayu.evals.promotion import (
     CapturedRunScoreV1,
     PromotionCandidateV1,
 )
+from cayu.evals.result_presentation import EvalResultPresentationV1, present_eval_result
 from cayu.evals.results import CapturedEvaluationResultV1
 from cayu.evals.scenario import EvalScenarioDocumentV2
 from cayu.evals.scenario_authoring import EvalScenarioDraftV2
@@ -1302,8 +1303,12 @@ class EvalResultComparisonResponse(ApiBaseModel):
                 summary.result_revision != record.revision
                 or summary.status != record.status
                 or summary.score != record.score
+                or summary.target_key != record.target.target_key
                 or summary.application_release_id != record.target.application_release_id
                 or summary.app_manifest_fingerprint != record.target.app_manifest_fingerprint
+                or summary.corpus_revision != record.corpus_revision
+                or summary.suite_id != record.suite_id
+                or summary.suite_revision != record.suite_revision
             ):
                 raise ValueError(f"{label} comparison summary does not match its result record.")
         return self
@@ -1312,6 +1317,7 @@ class EvalResultComparisonResponse(ApiBaseModel):
 class EvalResultResponse(ApiBaseModel):
     run: EvalRunRecord
     result: CorpusExecutionResult
+    presentation: EvalResultPresentationV1
     baseline: EvalBaselineRecord | None = None
 
     @model_validator(mode="after")
@@ -1341,6 +1347,8 @@ class EvalResultResponse(ApiBaseModel):
             or self.baseline.key.suite_id != spec.suite_id
         ):
             raise ValueError("Eval result baseline does not match its run specification.")
+        if self.presentation != present_eval_result(self.result):
+            raise ValueError("Eval result presentation does not match its immutable result.")
         return self
 
 
@@ -1896,7 +1904,47 @@ class EvalBaselineSelectionResponse(ApiBaseModel):
 class EvalResultDetailResponse(ApiBaseModel):
     record: EvalResultRecord
     result: CapturedEvaluationResultV1 | CorpusExecutionResult
+    presentation: EvalResultPresentationV1
     baseline: EvalBaselineRecord | None = None
+
+    @model_validator(mode="after")
+    def validate_presentation(self) -> EvalResultDetailResponse:
+        if isinstance(self.result, CapturedEvaluationResultV1):
+            actual_revision = self.result.revision
+            actual_origin = "captured_session"
+            actual_target = self.result.target
+            actual_corpus_revision = self.result.corpus_revision
+            actual_suite_id = self.result.suite_id
+            actual_suite_revision = self.result.suite_revision
+            actual_status = self.result.score.status
+            actual_score = self.result.score.score
+        else:
+            actual_revision = self.result.revision
+            actual_origin = "fresh_execution"
+            actual_target = self.result.target
+            actual_corpus_revision = self.result.run.corpus_revision
+            actual_suite_id = self.result.run.suite_id
+            actual_suite_revision = self.result.run.suite_revision
+            actual_status = self.result.run.status
+            actual_score = self.result.run.score
+        if (
+            self.record.revision != actual_revision
+            or self.record.origin != actual_origin
+            or self.record.target.target_key != actual_target.target_key
+            or self.record.target.application_release_id != actual_target.application_release_id
+            or self.record.target.app_manifest_schema_version
+            != actual_target.app_manifest_schema_version
+            or self.record.target.app_manifest_fingerprint != actual_target.app_manifest_fingerprint
+            or self.record.corpus_revision != actual_corpus_revision
+            or self.record.suite_id != actual_suite_id
+            or self.record.suite_revision != actual_suite_revision
+            or self.record.status != actual_status
+            or self.record.score != actual_score
+        ):
+            raise ValueError("Eval result record does not match its immutable content.")
+        if self.presentation != present_eval_result(self.result):
+            raise ValueError("Eval result presentation does not match its immutable content.")
+        return self
 
 
 CAPTURED_EVALUATION_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {

@@ -6,7 +6,9 @@ from decimal import Decimal, localcontext
 
 import pytest
 from pydantic import ValidationError
+from tests.evals.eval_store_conformance import captured_result_for_corpus
 
+import cayu.evals.result_presentation as result_presentation_module
 from cayu import (
     AgentSpec,
     CapturedEvaluationCandidateV1,
@@ -21,6 +23,7 @@ from cayu import (
     EvalSuiteSpec,
     EvaluationEvidencePolicySpec,
     EvaluationSourceIdentityV1,
+    FinalOutputEqualsAssertionSpec,
     JudgePrivacyPolicyV1,
     Message,
     ModelJudgeTarget,
@@ -39,11 +42,19 @@ from cayu import (
     StructuredRubricCriterionV1,
     StructuredRubricV1,
     TrialRequestSpec,
+    compare_corpus_execution_results,
+    compare_eval_results,
     compile_corpus_suite,
+    corpus_execution_comparison_to_json,
     corpus_execution_compatibility,
+    eval_result_report_from_json,
+    eval_result_report_to_json,
     model_judge_profile,
+    render_corpus_execution_comparison_html,
+    render_corpus_execution_html,
     run_corpus_suite,
 )
+from cayu.evals.result_presentation import present_eval_result
 from cayu.runtime.app import CayuApp
 from cayu.runtime.sessions import InMemorySessionStore, SessionStore
 
@@ -296,10 +307,14 @@ def test_structured_aggregation_is_independent_of_ambient_decimal_precision():
     with localcontext() as context:
         context.prec = 2
         result = asyncio.run(run_corpus_suite(target, exact_corpus, "quality-suite"))
+        presentation = present_eval_result(result)
+        report_source = eval_result_report_to_json(result)
 
     assertion = result.run.cases[0].trials[0].assertions[0]
     assert assertion.outcome == "passed"
     assert assertion.detail.aggregate_score == "0.555555555555555555777777777777777778"
+    assert type(presentation).model_validate(presentation.model_dump(mode="python")) == presentation
+    assert eval_result_report_from_json(report_source).presentation == presentation
 
 
 def test_corpus_bounds_worst_case_public_judge_explanation_growth():
@@ -409,6 +424,325 @@ def test_structured_judge_aggregates_exact_scores_and_publishes_safe_typed_evide
     assert "Refunds are allowed within 30 days." not in (
         candidate_provider.requests[0].messages[-1].content[0].text
     )
+
+
+def test_structured_judge_result_presentation_separates_outcomes_and_contributions():
+    judge, _ = _judge(_judgment())
+    result = asyncio.run(run_corpus_suite(_target(judge)[0], _corpus(judge), "quality-suite"))
+
+    presentation = present_eval_result(result)
+    trial = presentation.cases[0].trials[0]
+    assertion = trial.assertions[0]
+    judgment = assertion.structured_judge
+
+    assert presentation.result_revision == result.revision
+    assert presentation.evaluation_revision == result.run.revision
+    assert presentation.dimensions.model_dump() == {
+        "candidate": "passed",
+        "deterministic_assertions": "not_used",
+        "semantic_quality": "passed",
+        "evaluator_health": "healthy",
+        "runtime": "completed",
+        "evidence": "complete",
+    }
+    assert assertion.category == "semantic"
+    assert judgment is not None
+    assert judgment.threshold_passed is True
+    assert judgment.detail.judge_profile.key == "quality-judge"
+    assert [item.weighted_contribution for item in judgment.criteria] == ["0.25", "0.375"]
+    assert [item.explanation_state for item in judgment.criteria] == [
+        "available",
+        "available",
+    ]
+    rendered = render_corpus_execution_html(result)
+    assert "Outcome dimensions" in rendered
+    assert "Quality judge" in rendered
+    assert "weighted" not in rendered.lower()
+    assert "0.375" in rendered
+    assert "Somewhat useful." in rendered
+    assert "observed cost: Unavailable (unpriced)" in rendered
+    assert "judge_output" not in rendered
+
+
+def test_result_presentation_rejects_forged_nested_outcome_dimensions():
+    judge, _ = _judge(_judgment())
+    result = asyncio.run(run_corpus_suite(_target(judge)[0], _corpus(judge), "quality-suite"))
+    document = present_eval_result(result).model_dump(mode="python")
+    document["cases"][0]["trials"][0]["dimensions"]["candidate"] = "failed"
+
+    with pytest.raises(ValidationError, match="dimensions contradict"):
+        type(present_eval_result(result)).model_validate(document)
+
+
+def test_explainable_json_report_binds_immutable_result_to_its_presentation():
+    judge, _ = _judge(_judgment())
+    result = asyncio.run(run_corpus_suite(_target(judge)[0], _corpus(judge), "quality-suite"))
+
+    report_source = eval_result_report_to_json(result)
+    report = eval_result_report_from_json(report_source)
+
+    assert report.result == result
+    assert report.presentation == present_eval_result(result)
+    assert report.presentation.cases[0].trials[0].assertions[0].structured_judge is not None
+
+    forged = json.loads(report_source)
+    forged_judgment = forged["presentation"]["cases"][0]["trials"][0]["assertions"][0][
+        "structured_judge"
+    ]
+    forged_judgment["detail"]["criteria"][0]["explanation"] = "Forged explanation."
+    forged_judgment["criteria"][0]["explanation"] = "Forged explanation."
+    with pytest.raises(ValidationError, match="presentation does not match"):
+        eval_result_report_from_json(json.dumps(forged))
+
+
+def test_explainable_json_report_rejects_ambiguous_or_nonportable_json():
+    judge, _ = _judge(_judgment())
+    result = asyncio.run(run_corpus_suite(_target(judge)[0], _corpus(judge), "quality-suite"))
+    report_source = eval_result_report_to_json(result)
+    duplicate = report_source.replace(
+        '  "record_type": "cayu.eval-result-report",',
+        '  "record_type": "cayu.eval-result-report",\n  "record_type": "cayu.eval-result-report",',
+        1,
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON object key"):
+        eval_result_report_from_json(duplicate)
+    with pytest.raises(ValueError, match="finite JSON numbers"):
+        eval_result_report_from_json(
+            report_source.replace('"schema_version": 1', '"schema_version": NaN', 1)
+        )
+    with pytest.raises(ValueError, match="valid Unicode scalar text"):
+        eval_result_report_from_json('{"invalid":"\ud800"}')
+
+
+def test_explainable_json_report_enforces_input_size_before_whole_input_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(result_presentation_module, "EVAL_RESULT_REPORT_MAX_BYTES", 8)
+
+    with pytest.raises(ValueError, match="exceeds 8 bytes"):
+        eval_result_report_from_json("\ud800" * 9)
+    with pytest.raises(ValueError, match="exceeds 8 bytes"):
+        eval_result_report_from_json("🙂" * 3)
+    with pytest.raises(ValueError, match="exceeds 8 bytes"):
+        eval_result_report_from_json(bytearray(b"{" + (b" " * 8)))
+
+
+def test_structured_judge_result_presentation_keeps_evaluator_error_out_of_candidate_failure():
+    judge, _ = _judge('{"criteria":[]}')
+    result = asyncio.run(run_corpus_suite(_target(judge)[0], _corpus(judge), "quality-suite"))
+
+    presentation = present_eval_result(result)
+    trial = presentation.cases[0].trials[0]
+    judgment = trial.assertions[0].structured_judge
+
+    assert trial.dimensions.candidate == "not_scored"
+    assert trial.dimensions.semantic_quality == "error"
+    assert trial.dimensions.evaluator_health == "error"
+    assert trial.dimensions.runtime == "completed"
+    assert trial.dimensions.evidence == "complete"
+    assert judgment is not None
+    assert judgment.threshold_passed is None
+    assert judgment.criteria == ()
+    assert "observed cost: Unavailable (not observed)" in render_corpus_execution_html(result)
+
+
+def test_result_presentation_does_not_hide_inconclusive_judging_behind_a_deterministic_failure():
+    judge, _ = _judge('{"criteria":[]}')
+    corpus = _corpus(judge)
+    source_case = corpus.cases[0]
+    mixed_case = EvalCaseSpec.create(
+        id=source_case.id,
+        suite_id=source_case.suite_id,
+        name=source_case.name,
+        source=source_case.source,
+        input=source_case.input,
+        assertions=(
+            FinalOutputEqualsAssertionSpec(id="exact-output", expected="Denied"),
+            *source_case.assertions,
+        ),
+    )
+    mixed_corpus = EvalCorpusDocument.create(
+        target_key=corpus.target_key,
+        evidence_policy=corpus.evidence_policy,
+        suites=corpus.suites,
+        cases=(mixed_case,),
+    )
+    result = asyncio.run(run_corpus_suite(_target(judge)[0], mixed_corpus, "quality-suite"))
+
+    dimensions = present_eval_result(result).dimensions
+
+    assert dimensions.candidate == "not_scored"
+    assert dimensions.deterministic_assertions == "failed"
+    assert dimensions.semantic_quality == "error"
+    assert dimensions.evaluator_health == "error"
+
+
+def test_structured_judge_comparison_reports_exact_criterion_and_aggregate_regressions():
+    baseline_judge, _ = _judge(_judgment())
+    current_judge, _ = _judge(_judgment(first_score="0.5"))
+    corpus = _corpus(baseline_judge)
+    baseline = asyncio.run(run_corpus_suite(_target(baseline_judge)[0], corpus, "quality-suite"))
+    current = asyncio.run(run_corpus_suite(_target(current_judge)[0], corpus, "quality-suite"))
+
+    comparison = compare_corpus_execution_results(baseline, current)
+    judgment = comparison.structured_judgments[0]
+
+    assert comparison.schema_version == 2
+    assert comparison.structured_judge_comparison_state == "compared"
+    assert judgment.case_id == "answer-case"
+    assert judgment.trial_number == 1
+    assert judgment.assertion_id == "answer-quality"
+    assert judgment.evaluator_change == "unchanged"
+    assert judgment.aggregate_delta == "-0.125"
+    assert judgment.aggregate_change == "regressed"
+    assert judgment.regressed is True
+    assert [item.score_delta for item in judgment.criteria] == ["-0.5", "0"]
+    assert judgment.baseline.detail.aggregate_score == "0.625"
+    assert judgment.current.detail.aggregate_score == "0.5"
+    rendered = render_corpus_execution_comparison_html(comparison)
+    assert "Exact retained structured-judge observations were compared." in rendered
+    assert "-0.125" in rendered
+    assert "correctness" in rendered
+    assert "Quality judge" in rendered
+
+    forged = comparison.model_dump(mode="python", round_trip=True, warnings="none")
+    forged["structured_judgments"][0]["baseline_outcome"] = "failed"
+    with pytest.raises(ValidationError, match="outcomes contradict"):
+        type(comparison).model_validate(forged)
+
+
+def test_structured_judge_comparison_is_independent_of_ambient_decimal_precision():
+    baseline_judge, _ = _judge(
+        _judgment(
+            first_score="0.98765432109876543",
+            second_score="0.98765432109876543",
+        )
+    )
+    current_judge, _ = _judge(
+        _judgment(
+            first_score="0.12345678901234567",
+            second_score="0.12345678901234567",
+        )
+    )
+    corpus = _corpus(baseline_judge)
+    baseline = asyncio.run(run_corpus_suite(_target(baseline_judge)[0], corpus, "quality-suite"))
+    current = asyncio.run(run_corpus_suite(_target(current_judge)[0], corpus, "quality-suite"))
+
+    with localcontext() as context:
+        context.prec = 5
+        comparison = compare_eval_results(baseline, current)
+
+    judgment = comparison.structured_judgments[0]
+    assert judgment.aggregate_delta == "-0.86419753208641976"
+    assert [item.score_delta for item in judgment.criteria] == [
+        "-0.86419753208641976",
+        "-0.86419753208641976",
+    ]
+    assert type(comparison).model_validate(comparison.model_dump(mode="python")) == comparison
+    assert '"aggregate_delta": "-0.86419753208641976"' in (
+        corpus_execution_comparison_to_json(comparison)
+    )
+
+
+def test_structured_threshold_failure_is_a_regression_despite_score_tolerance():
+    baseline_judge, _ = _judge(_judgment(first_score="0.61", second_score="0.61"))
+    current_judge, _ = _judge(_judgment(first_score="0.59", second_score="0.59"))
+    corpus = _corpus(baseline_judge, threshold="0.6")
+    baseline = asyncio.run(run_corpus_suite(_target(baseline_judge)[0], corpus, "quality-suite"))
+    current = asyncio.run(run_corpus_suite(_target(current_judge)[0], corpus, "quality-suite"))
+
+    comparison = compare_eval_results(baseline, current, score_tolerance=0.05)
+    judgment = comparison.structured_judgments[0]
+
+    assert judgment.baseline_outcome == "passed"
+    assert judgment.current_outcome == "failed"
+    assert judgment.aggregate_delta == "-0.02"
+    assert judgment.aggregate_change == "unchanged"
+    assert judgment.regressed is True
+
+
+def test_html_comparison_does_not_hide_a_masked_structured_regression():
+    baseline_judge, _ = _judge(_judgment(first_score="0.61", second_score="0.61"))
+    current_judge, _ = _judge(_judgment(first_score="0.59", second_score="0.59"))
+    source_corpus = _corpus(baseline_judge, threshold="0.6")
+    source_case = source_corpus.cases[0]
+    mixed_case = EvalCaseSpec.create(
+        id=source_case.id,
+        suite_id=source_case.suite_id,
+        name=source_case.name,
+        source=source_case.source,
+        input=source_case.input,
+        assertions=(
+            FinalOutputEqualsAssertionSpec(
+                id="always-fails",
+                expected="not-the-answer",
+            ),
+            *source_case.assertions,
+        ),
+    )
+    corpus = EvalCorpusDocument.create(
+        target_key=source_corpus.target_key,
+        evidence_policy=source_corpus.evidence_policy,
+        suites=source_corpus.suites,
+        cases=(mixed_case,),
+    )
+    baseline = asyncio.run(run_corpus_suite(_target(baseline_judge)[0], corpus, "quality-suite"))
+    current = asyncio.run(run_corpus_suite(_target(current_judge)[0], corpus, "quality-suite"))
+
+    comparison = compare_eval_results(baseline, current, score_tolerance=0.05)
+    rendered = render_corpus_execution_comparison_html(comparison)
+
+    assert comparison.baseline.status == comparison.current.status == "failed"
+    assert comparison.regressions == ()
+    assert comparison.structured_judgments[0].regressed is True
+    assert "No compatible-result regressions." not in rendered
+    assert "structured judge" in rendered
+    assert "outcome passed → failed" in rendered
+    assert "aggregate unchanged (-0.02)" in rendered
+
+
+def test_structured_judge_comparison_does_not_coerce_evaluator_failure_to_a_score():
+    baseline_judge, _ = _judge(_judgment())
+    current_judge, _ = _judge('{"criteria":[]}')
+    corpus = _corpus(baseline_judge)
+    baseline = asyncio.run(run_corpus_suite(_target(baseline_judge)[0], corpus, "quality-suite"))
+    current = asyncio.run(run_corpus_suite(_target(current_judge)[0], corpus, "quality-suite"))
+
+    comparison = compare_corpus_execution_results(baseline, current)
+    judgment = comparison.structured_judgments[0]
+
+    assert judgment.current_outcome == "error"
+    assert judgment.current.detail.diagnostic == "evaluator_error"
+    assert judgment.evaluator_change == "regressed"
+    assert judgment.aggregate_delta is None
+    assert judgment.aggregate_change == "unavailable"
+    assert judgment.criteria == ()
+    assert judgment.regressed is True
+    assert "unavailable (unpriced) → unavailable (not observed)" in (
+        render_corpus_execution_comparison_html(comparison)
+    )
+
+
+def test_structured_judge_comparison_never_heuristically_pairs_captured_and_fresh_trials():
+    judge, _ = _judge(_judgment())
+    corpus = _corpus(judge)
+    fresh = asyncio.run(run_corpus_suite(_target(judge)[0], corpus, "quality-suite"))
+    captured = captured_result_for_corpus(corpus, fresh)
+
+    comparison = compare_eval_results(captured, fresh)
+
+    assert comparison.compatibility.comparable is True
+    assert comparison.structured_judge_comparison_state == "observation_identity_mismatch"
+    assert comparison.structured_judgments == ()
+    assert [item.availability for item in comparison.structured_judge_observation_mismatches] == [
+        "baseline_only",
+        "current_only",
+    ]
+    assert [item.trial_number for item in comparison.structured_judge_observation_mismatches] == [
+        None,
+        1,
+    ]
 
 
 def test_public_explanations_cross_both_judge_and_candidate_secret_boundaries():

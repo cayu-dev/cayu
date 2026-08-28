@@ -367,15 +367,16 @@ def test_eval_report_and_compare_round_trip_captured_and_fresh_results(
         )
         == 0
     )
-    assert captured_json_path.read_text(encoding="utf-8") == captured_path.read_text(
-        encoding="utf-8"
-    )
+    captured_report = json.loads(captured_json_path.read_text(encoding="utf-8"))
+    assert captured_report["record_type"] == "cayu.eval-result-report"
+    assert captured_report["result"] == json.loads(captured_path.read_text(encoding="utf-8"))
+    assert captured_report["presentation"]["result_revision"] == captured.revision
     assert (
         main(
             [
                 "eval",
                 "report",
-                str(captured_path),
+                str(captured_json_path),
                 "--output",
                 str(captured_html_path),
             ]

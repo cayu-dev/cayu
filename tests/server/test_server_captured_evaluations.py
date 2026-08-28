@@ -296,8 +296,12 @@ def test_click_to_evaluate_saves_catalogs_baselines_and_exports_without_runnable
             headers=_AUTH_HEADERS,
         )
         assert detail.status_code == 200
-        assert detail.json()["result"] == saved["result"]
-        assert detail.json()["baseline"] is None
+        detail_body = detail.json()
+        assert detail_body["result"] == saved["result"]
+        assert detail_body["baseline"] is None
+        assert detail_body["presentation"]["origin"] == "captured_session"
+        assert detail_body["presentation"]["result_revision"] == result_revision
+        assert detail_body["presentation"]["dimensions"]["runtime"] == "not_executed"
 
         captured_json_report = client.get(
             f"/api/evals/results/{result_revision}/report.json",
@@ -305,7 +309,10 @@ def test_click_to_evaluate_saves_catalogs_baselines_and_exports_without_runnable
         )
         assert captured_json_report.status_code == 200
         assert captured_json_report.content.endswith(b"\n")
-        assert captured_json_report.json() == saved["result"]
+        captured_json_body = captured_json_report.json()
+        assert captured_json_body["record_type"] == "cayu.eval-result-report"
+        assert captured_json_body["result"] == saved["result"]
+        assert captured_json_body["presentation"]["result_revision"] == result_revision
         assert (
             captured_json_report.headers["content-disposition"]
             == f'attachment; filename="{result_revision.removeprefix("sha256:")}.eval-result.json"'
@@ -624,7 +631,10 @@ def test_reviewed_simple_session_launches_one_fresh_trial_with_http_operator_pro
             headers=_AUTH_HEADERS,
         )
         assert fresh_json_report.status_code == 200
-        assert fresh_json_report.json()["revision"] == fresh_result_revision
+        fresh_json_body = fresh_json_report.json()
+        assert fresh_json_body["record_type"] == "cayu.eval-result-report"
+        assert fresh_json_body["result"]["revision"] == fresh_result_revision
+        assert fresh_json_body["presentation"]["result_revision"] == fresh_result_revision
 
         sessions = asyncio.run(app.session_store.list_sessions()).sessions
         fresh = next(session for session in sessions if session.id != _SESSION_ID)

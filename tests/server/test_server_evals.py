@@ -44,6 +44,7 @@ from cayu.evals.memory_reporting import (
     MemoryExperimentReportRequest,
     build_memory_experiment_report,
 )
+from cayu.evals.result_presentation import present_eval_result
 from cayu.evals.store import (
     EvalRunInvocation,
     EvalRunRequest,
@@ -654,7 +655,19 @@ def test_evals_api_imports_executes_compares_and_exports_deterministically(
 
             result = client.get(f"/api/evals/runs/{run_id}/result", headers=_AUTH_HEADERS)
             assert result.status_code == 200
-            assert result.json()["result"]["run"]["status"] == "passed"
+            result_body = result.json()
+            assert result_body["result"]["run"]["status"] == "passed"
+            assert (
+                result_body["presentation"]["result_revision"] == result_body["result"]["revision"]
+            )
+            assert result_body["presentation"]["dimensions"] == {
+                "candidate": "passed",
+                "deterministic_assertions": "passed",
+                "semantic_quality": "not_used",
+                "evaluator_health": "not_used",
+                "runtime": "completed",
+                "evidence": "complete",
+            }
             comparison = client.post(
                 "/api/evals/comparisons",
                 headers=_AUTH_HEADERS,
@@ -670,7 +683,13 @@ def test_evals_api_imports_executes_compares_and_exports_deterministically(
             )
             assert json_report.status_code == 200
             assert json_report.content.endswith(b"\n")
-            assert json.loads(json_report.content)["revision"] == terminal["result"]["revision"]
+            json_report_body = json.loads(json_report.content)
+            assert json_report_body["record_type"] == "cayu.eval-result-report"
+            assert json_report_body["result"]["revision"] == terminal["result"]["revision"]
+            assert (
+                json_report_body["presentation"]["result_revision"]
+                == terminal["result"]["revision"]
+            )
             assert (
                 client.get(
                     f"/api/evals/runs/{run_id}/report.json",
@@ -839,7 +858,27 @@ def test_eval_result_refreshes_run_after_concurrent_publication(tmp_path, monkey
 
     active_record, completed_record, result = asyncio.run(seed_result())
     with pytest.raises(ValidationError, match="requires a completed run"):
-        EvalResultResponse(run=active_record, result=result)
+        EvalResultResponse(
+            run=active_record,
+            result=result,
+            presentation=present_eval_result(result),
+        )
+    canonical_presentation = present_eval_result(result)
+    forged_presentation_payload = canonical_presentation.model_dump(
+        mode="python",
+        round_trip=True,
+        warnings="none",
+    )
+    forged_presentation_payload["cases"][0]["trials"][0]["assertions"][0]["kind"] = (
+        "forged_deterministic_kind"
+    )
+    forged_presentation = type(canonical_presentation).model_validate(forged_presentation_payload)
+    with pytest.raises(ValidationError, match="presentation does not match"):
+        EvalResultResponse(
+            run=completed_record,
+            result=result,
+            presentation=forged_presentation,
+        )
 
     original_load_run = store.load_run
     load_run_calls = 0

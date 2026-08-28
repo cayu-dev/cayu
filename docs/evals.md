@@ -989,6 +989,60 @@ The same suite/assertion surface supports several modes:
 
 ## Results and repeated trials
 
+Every captured or fresh immutable result can be compiled with
+`present_eval_result(...)` into `EvalResultPresentationV1`. This bounded,
+versioned projection is the single human-facing result contract used by the
+protected HTTP API, Control Plane, and HTML reporting. It does not rerun an
+assertion or reinterpret raw model output. It validates and presents only the
+facts already admitted into the immutable public result.
+
+The projection retains the result revision and its underlying published-run or
+captured-score `evaluation_revision`, together with target/release, app
+manifest, corpus, suite, case, trial, assertion, evidence-policy, rubric,
+reference, judge-profile, and evaluator-implementation identities.
+
+The projection deliberately separates six dimensions that a single score
+cannot represent safely:
+
+- candidate outcome;
+- deterministic assertion outcome;
+- semantic quality;
+- evaluator health;
+- candidate runtime outcome; and
+- retained evidence completeness.
+
+An evaluator error therefore appears as an evaluator error and a candidate
+that was not scored, not as a zero-quality candidate. Runtime failure and
+unavailable or incomplete evidence are likewise explicit. CI callers can keep
+using the stable `0` / `1` / `2` exit contract: candidate failures and genuine
+regressions return `1`; evaluator/runtime failure, incomplete evidence, and
+incompatible or identity-unmatched comparisons return `2`.
+
+For every structured judgment, the presentation retains the safe judge-profile
+and evaluator-implementation identity, independent/same-model label, rubric and
+reference identity, evidence selection and privacy policy, diagnostic, observed
+usage, priced cost or explicit unpriced state, criterion scores and explanation
+states, exact weights and Cayu-computed contributions, aggregate, threshold,
+and threshold outcome. Private reference content, judge prompts, provider
+credentials/options, and raw judge output are not part of this contract.
+
+The Control Plane Results and Runs views expose the same projection with
+case/trial drill-down. Users can see why a judgment passed or failed, including
+each bounded explanation and contribution, without opening JSON. Downloaded
+JSON reports use the versioned `EvalResultReportV1` envelope, which binds the
+complete immutable source document to its canonical presentation. Those reports
+remain valid inputs to `cayu eval report` and `cayu eval compare`; Cayu unwraps
+and revalidates the binding instead of guessing the format. HTML renders the
+same explainable facts for portable review.
+
+`compare_eval_results(...)` pairs structured judgments only when the immutable
+evaluation contract and exact `(case_id, trial_number, assertion_id)` identity
+match. It reports criterion and aggregate deltas, evaluator recovery/regression,
+observed usage/cost, explanation state, and exact unmatched identities. It
+never pairs a captured observation with a fresh trial heuristically and never
+diffs incompatible contracts. The protected comparison API, Control Plane,
+CLI JSON, and HTML comparison all consume this same comparison document.
+
 `run_eval_case(..., trials=N)` executes trials sequentially with a fresh concrete
 session ID each time. `EvalCaseResult.trials` is an ordered tuple of
 `EvalTrialResult` values; every trial retains its own status, session ID, final

@@ -89,6 +89,22 @@ guard.
 
 ## Unreleased
 
+### Evals results are explainable across the Control Plane, SDK, CLI, and reports
+
+Captured and fresh immutable results now expose one bounded
+`EvalResultPresentationV1` projection. It keeps candidate outcome,
+deterministic assertions, semantic quality, evaluator health, runtime, and
+evidence completeness separate, and presents structured rubric criteria,
+explanations, exact contributions, aggregate/threshold, safe judge/reference
+identity, observed usage, and priced or explicitly unpriced cost without
+publishing private truth or raw judge prompts/output. Exact-identity comparison
+adds per-criterion and aggregate deltas and refuses heuristic pairing. The
+Control Plane, protected API, versioned JSON/HTML reports, and CLI comparison
+use the same semantics. JSON report downloads now contain both immutable source
+and its bound presentation and remain accepted CLI report/compare inputs. The
+server/dashboard contract advances from version 33 to 34; deploy those clients
+together. No storage migration is required.
+
 ### OpenAI Responses can defer catalogue schemas through hosted Tool Search
 
 Agents can select `tool_discovery_mode="openai_tool_search_hosted"` or the

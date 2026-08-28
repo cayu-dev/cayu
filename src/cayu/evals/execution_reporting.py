@@ -18,17 +18,29 @@ from cayu.evals.execution import (
     CorpusExecutionResult,
 )
 from cayu.evals.execution_comparison import (
+    CORPUS_EXECUTION_COMPARISON_MAX_BYTES,
     CorpusExecutionComparison,
     CorpusExecutionRegression,
     CorpusRegressionKind,
+    EvalStructuredJudgeComparisonV1,
 )
 from cayu.evals.memory_attribution import eval_memory_attribution_summary
+from cayu.evals.result_presentation import (
+    EVAL_RESULT_REPORT_MAX_BYTES,
+    EvalAssertionPresentationV1,
+    EvalCasePresentationV1,
+    EvalResultOutcomeDimensionsV1,
+    EvalResultReportV1,
+    EvalStructuredJudgePresentationV1,
+    EvalTrialPresentationV1,
+    present_eval_result,
+)
 from cayu.evals.results import CapturedEvaluationResultV1
 
 CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES = 48 << 20
 CORPUS_EXECUTION_RESULT_MAX_HTML_BYTES = 48 << 20
-CORPUS_EXECUTION_COMPARISON_MAX_JSON_BYTES = 4 << 20
-CORPUS_EXECUTION_COMPARISON_MAX_HTML_BYTES = 4 << 20
+CORPUS_EXECUTION_COMPARISON_MAX_JSON_BYTES = CORPUS_EXECUTION_COMPARISON_MAX_BYTES
+CORPUS_EXECUTION_COMPARISON_MAX_HTML_BYTES = CORPUS_EXECUTION_COMPARISON_MAX_BYTES
 
 
 def _validated_result(result: CorpusExecutionResult) -> CorpusExecutionResult:
@@ -82,6 +94,36 @@ def captured_evaluation_result_to_json(result: CapturedEvaluationResultV1) -> st
             raise ValueError(
                 "Captured evaluation result JSON exceeds "
                 f"{CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES} bytes."
+            )
+        chunks.append(chunk)
+    return "".join(chunks) + "\n"
+
+
+def eval_result_report_to_json(
+    result: CorpusExecutionResult | CapturedEvaluationResultV1,
+) -> str:
+    """Return a bounded report containing immutable source and canonical presentation."""
+
+    if type(result) not in {CorpusExecutionResult, CapturedEvaluationResultV1}:
+        raise TypeError(
+            "result must be an exact CorpusExecutionResult or CapturedEvaluationResultV1."
+        )
+    report = EvalResultReportV1(
+        result=result,
+        presentation=present_eval_result(result),
+    )
+    document = copy_durable_json_object(
+        report.model_dump(mode="json"),
+        "eval result report",
+    )
+    encoder = json.JSONEncoder(ensure_ascii=False, indent=2, sort_keys=True)
+    chunks: list[str] = []
+    total_bytes = 1
+    for chunk in encoder.iterencode(document):
+        total_bytes += len(chunk.encode("utf-8"))
+        if total_bytes > EVAL_RESULT_REPORT_MAX_BYTES:
+            raise ValueError(
+                f"Eval result report JSON exceeds {EVAL_RESULT_REPORT_MAX_BYTES} bytes."
             )
         chunks.append(chunk)
     return "".join(chunks) + "\n"
@@ -211,6 +253,7 @@ def render_corpus_execution_html(result: CorpusExecutionResult) -> str:
 
     result = _validated_result(result)
     run = result.run
+    presentation = present_eval_result(result)
     case_rows = "\n".join(
         "<tr>"
         f"<td><code>{_escape(case.case_id)}</code></td>"
@@ -221,7 +264,10 @@ def render_corpus_execution_html(result: CorpusExecutionResult) -> str:
         "</tr>"
         for case in run.cases
     )
-    case_sections = "\n".join(_case_section(case) for case in run.cases)
+    case_sections = "\n".join(
+        _case_section(case, presented_case)
+        for case, presented_case in zip(run.cases, presentation.cases, strict=True)
+    )
     rendered = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -238,6 +284,10 @@ def render_corpus_execution_html(result: CorpusExecutionResult) -> str:
     .metrics {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:24px 0; }}
     .metric,.case,.trial,table {{ background:var(--paper); border:1px solid var(--line); border-radius:9px; }}
     .metric {{ padding:14px; }} .metric strong {{ display:block; font-size:1.25rem; }}
+    .dimensions {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin:14px 0 24px; }}
+    .dimension,.judge {{ background:var(--paper); border:1px solid var(--line); border-radius:8px; padding:10px; }}
+    .dimension strong {{ display:block; font-size:.76rem; text-transform:uppercase; color:var(--muted); }}
+    .judge {{ margin-top:10px; }} .judge p {{ margin:5px 0; }}
     table {{ width:100%; border-collapse:collapse; overflow:hidden; }}
     th,td {{ padding:10px 12px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }}
     th {{ background:#f0f4f3; font-size:.78rem; text-transform:uppercase; letter-spacing:.04em; }} tr:last-child td {{ border-bottom:0; }}
@@ -247,7 +297,7 @@ def render_corpus_execution_html(result: CorpusExecutionResult) -> str:
     .badge {{ display:inline-block; padding:3px 8px; border-radius:999px; font-size:.78rem; font-weight:700; }}
     .passed {{ color:#0f5132; background:#d9f2e3; }} .failed {{ color:#842029; background:#f8d7da; }}
     .unavailable {{ color:#553c00; background:#fff0b3; }} .error {{ color:#664d03; background:#fff3cd; }}
-    @media (max-width:760px) {{ .metrics {{ grid-template-columns:1fr 1fr; }} .assertion {{ grid-template-columns:1fr; }} }}
+    @media (max-width:760px) {{ .metrics,.dimensions {{ grid-template-columns:1fr 1fr; }} .assertion {{ grid-template-columns:1fr; }} }}
   </style>
 </head>
 <body>
@@ -260,8 +310,10 @@ def render_corpus_execution_html(result: CorpusExecutionResult) -> str:
       <div class="metric"><strong>{len(run.cases)}</strong><span>Cases</span></div>
       <div class="metric"><strong>{run.duration_ms} ms</strong><span>Duration</span></div>
     </div>
+    {_outcome_dimensions_html(presentation.dimensions)}
     <section class="case" aria-labelledby="target-identity">
       <h2 id="target-identity">Execution identity</h2>
+      <p>Result <code>{_escape(result.revision)}</code> · published run <code>{_escape(presentation.evaluation_revision)}</code></p>
       <p>Application release <code>{_escape(result.target.application_release_id)}</code></p>
       <p>AppManifest schema <code>{_escape(result.target.app_manifest_schema_version)}</code> · fingerprint <code>{_escape(result.target.app_manifest_fingerprint)}</code></p>
       <p>Corpus <code>{_escape(run.corpus_revision)}</code> · suite <code>{_escape(run.suite_revision)}</code> · evidence policy <code>{_escape(run.evidence_policy_revision)}</code></p>
@@ -294,7 +346,16 @@ def render_captured_evaluation_html(result: CapturedEvaluationResultV1) -> str:
         result.model_dump(mode="python", round_trip=True, warnings="none")
     )
     score = result.score
-    assertion_rows = "\n".join(_assertion_row(assertion) for assertion in score.assertions)
+    presentation = present_eval_result(result)
+    presented_trial = presentation.cases[0].trials[0]
+    assertion_rows = "\n".join(
+        _assertion_row(assertion, presented_assertion)
+        for assertion, presented_assertion in zip(
+            score.assertions,
+            presented_trial.assertions,
+            strict=True,
+        )
+    )
     memory = score.memory_attribution
     memory_summary = eval_memory_attribution_summary(memory)
     rendered = f"""<!doctype html>
@@ -312,12 +373,17 @@ def render_captured_evaluation_html(result: CapturedEvaluationResultV1) -> str:
     .metrics {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin:24px 0; }}
     .metric,.card {{ background:var(--paper); border:1px solid var(--line); border-radius:9px; }}
     .metric {{ padding:14px; }} .metric strong {{ display:block; font-size:1.25rem; }} .card {{ padding:18px; }}
+    .dimensions {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin:14px 0 24px; }}
+    .dimension,.judge {{ background:var(--paper); border:1px solid var(--line); border-radius:8px; padding:10px; }}
+    .dimension strong {{ display:block; font-size:.76rem; text-transform:uppercase; color:var(--muted); }}
+    .judge {{ margin-top:10px; }} .judge p {{ margin:5px 0; }}
+    table {{ width:100%; border-collapse:collapse; margin-top:8px; }} th,td {{ padding:8px; border:1px solid var(--line); text-align:left; vertical-align:top; }}
     .assertion {{ display:grid; grid-template-columns:110px minmax(0,1fr); gap:12px; border-top:1px solid #e6ebe8; padding:10px 0; }}
     .assertion:first-child {{ border-top:0; }} .assertion pre {{ margin:6px 0 0; white-space:pre-wrap; overflow:auto; background:#f0f4f3; padding:10px; border-radius:6px; }}
     .badge {{ display:inline-block; padding:3px 8px; border-radius:999px; font-size:.78rem; font-weight:700; }}
     .passed {{ color:#0f5132; background:#d9f2e3; }} .failed {{ color:#842029; background:#f8d7da; }}
     .unavailable {{ color:#553c00; background:#fff0b3; }} .error {{ color:#664d03; background:#fff3cd; }}
-    @media (max-width:760px) {{ .metrics {{ grid-template-columns:1fr; }} .assertion {{ grid-template-columns:1fr; }} }}
+    @media (max-width:760px) {{ .metrics,.dimensions {{ grid-template-columns:1fr; }} .assertion {{ grid-template-columns:1fr; }} }}
   </style>
 </head>
 <body>
@@ -329,9 +395,10 @@ def render_captured_evaluation_html(result: CapturedEvaluationResultV1) -> str:
       <div class="metric"><strong>{_score(score.score)}</strong><span>Score</span></div>
       <div class="metric"><strong>{len(score.assertions)}</strong><span>Assertions</span></div>
     </div>
+    {_outcome_dimensions_html(presentation.dimensions)}
     <section class="card" aria-labelledby="result-identity">
       <h2 id="result-identity">Immutable result identity</h2>
-      <p>Result <code>{_escape(result.revision)}</code> · origin <code>captured_session</code></p>
+      <p>Result <code>{_escape(result.revision)}</code> · captured score <code>{_escape(presentation.evaluation_revision)}</code> · origin <code>captured_session</code></p>
       <p>Application release <code>{_escape(result.target.application_release_id)}</code></p>
       <p>AppManifest schema <code>{_escape(result.target.app_manifest_schema_version)}</code> · fingerprint <code>{_escape(result.target.app_manifest_fingerprint)}</code></p>
       <p>Corpus <code>{_escape(result.corpus_revision)}</code> · suite <code>{_escape(result.suite_revision)}</code></p>
@@ -398,6 +465,19 @@ def render_corpus_execution_comparison_html(
         "</tr>"
         for regression in comparison.regressions
     )
+    structured_regression_rows = "\n".join(
+        "<tr>"
+        "<td>structured judge</td>"
+        f"<td>{_escape(item.case_id)}</td>"
+        "<td>judgment</td>"
+        f"<td>{_escape(_structured_regression_change(item))}</td>"
+        "</tr>"
+        for item in comparison.structured_judgments
+        if item.regressed
+    )
+    regression_rows = "\n".join(
+        rows for rows in (regression_rows, structured_regression_rows) if rows
+    )
     if not regression_rows:
         message = (
             "No compatible-result regressions."
@@ -418,6 +498,7 @@ def render_corpus_execution_comparison_html(
         case_rows = (
             '<tr><td colspan="4">Case outcomes are omitted for incomparable results.</td></tr>'
         )
+    structured_comparison = _structured_comparison_html(comparison)
     rendered = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -430,7 +511,8 @@ def render_corpus_execution_comparison_html(
     body {{ margin:0; font:15px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:var(--canvas); }}
     .page {{ max-width:1120px; margin:auto; padding:32px 24px 56px; }}
     h1 {{ margin:0 0 6px; font-size:2rem; }} h2 {{ margin:30px 0 12px; }} p {{ color:var(--muted); }} code {{ overflow-wrap:anywhere; }}
-    .notice,table {{ background:var(--paper); border:1px solid var(--line); border-radius:9px; }} .notice {{ padding:14px; }}
+    .notice,.judgment,table {{ background:var(--paper); border:1px solid var(--line); border-radius:9px; }} .notice,.judgment {{ padding:14px; }}
+    .judgment {{ margin-top:12px; }} .judgment p {{ margin:6px 0; }}
     table {{ width:100%; border-collapse:collapse; overflow:hidden; }} th,td {{ padding:10px 12px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }}
     th {{ background:#f0f4f3; font-size:.78rem; text-transform:uppercase; letter-spacing:.04em; }} tr:last-child td {{ border-bottom:0; }}
     .badge {{ display:inline-block; padding:3px 8px; border-radius:999px; font-size:.78rem; font-weight:700; }}
@@ -453,10 +535,15 @@ def render_corpus_execution_comparison_html(
         <tr><td>Current</td><td><code>{_escape(comparison.current.application_release_id)}</code></td><td><code>{_escape(comparison.current.app_manifest_fingerprint)}</code></td><td>{_badge(comparison.current.status)}</td><td>{_score(comparison.current.score)}</td></tr>
       </tbody>
     </table>
+    <section class="notice">
+      <p>Target <code>{_escape(comparison.baseline.target_key)}</code> · corpus <code>{_escape(comparison.baseline.corpus_revision)}</code> · suite <code>{_escape(comparison.baseline.suite_id)}</code> at <code>{_escape(comparison.baseline.suite_revision)}</code></p>
+      <p>Evidence policy <code>{_escape(comparison.baseline.evidence_policy_revision)}</code> · pricing profile <code>{_escape(comparison.baseline.pricing_profile_fingerprint or "not used")}</code> · external target <code>{_escape(comparison.baseline.external_target_revision or "not used")}</code></p>
+    </section>
     <h2>Regressions</h2>
     <table><thead><tr><th>Scope</th><th>Case</th><th>Kind</th><th>Change</th></tr></thead><tbody>{regression_rows}</tbody></table>
     <h2>Cases</h2>
     <table><thead><tr><th>Case</th><th>Baseline</th><th>Current</th><th>Score</th></tr></thead><tbody>{case_rows}</tbody></table>
+    {structured_comparison}
   </main>
 </body>
 </html>
@@ -470,6 +557,139 @@ def render_corpus_execution_comparison_html(
     return rendered
 
 
+def _structured_comparison_html(comparison: CorpusExecutionComparison) -> str:
+    state = comparison.structured_judge_comparison_state
+    state_messages = {
+        "compared": "Exact retained structured-judge observations were compared.",
+        "contract_incompatible": (
+            "Structured judgments were not diffed because the evaluation contracts differ."
+        ),
+        "no_structured_judges": "Neither result contains structured-judge observations.",
+        "observation_identity_mismatch": (
+            "Structured judgments were not paired because retained case/trial/assertion "
+            "identities differ."
+        ),
+        "source_detail_unavailable": (
+            "Structured judgment detail is unavailable in one compact source projection."
+        ),
+    }
+    mismatch_rows = "".join(
+        "<tr>"
+        f"<td><code>{_escape(item.case_id)}</code></td>"
+        f"<td>{_escape(item.trial_number if item.trial_number is not None else 'captured')}</td>"
+        f"<td><code>{_escape(item.assertion_id)}</code></td>"
+        f"<td>{_escape(item.availability)}</td></tr>"
+        for item in comparison.structured_judge_observation_mismatches
+    )
+    mismatch_table = ""
+    if mismatch_rows:
+        mismatch_table = (
+            "<table><thead><tr><th>Case</th><th>Trial</th><th>Assertion</th>"
+            f"<th>Availability</th></tr></thead><tbody>{mismatch_rows}</tbody></table>"
+        )
+    judgments = "".join(
+        _structured_judgment_comparison_html(item) for item in comparison.structured_judgments
+    )
+    return (
+        '<section aria-labelledby="structured-judgments">'
+        '<h2 id="structured-judgments">Structured judge comparison</h2>'
+        f'<div class="notice"><strong><code>{_escape(state)}</code></strong>'
+        f"<p>{_escape(state_messages[state])}</p>{mismatch_table}</div>{judgments}</section>"
+    )
+
+
+def _structured_judgment_comparison_html(
+    item: EvalStructuredJudgeComparisonV1,
+) -> str:
+    baseline_detail = item.baseline.detail
+    current_detail = item.current.detail
+    profile = baseline_detail.judge_profile
+    baseline_criteria = {criterion.criterion_id: criterion for criterion in item.baseline.criteria}
+    current_criteria = {criterion.criterion_id: criterion for criterion in item.current.criteria}
+    criterion_rows = "".join(
+        "<tr>"
+        f"<td><code>{_escape(criterion.criterion_id)}</code></td>"
+        f"<td>{_escape(criterion.weight)}</td>"
+        f"<td>{_escape(criterion.baseline_score)}</td>"
+        f"<td>{_escape(criterion.current_score)}</td>"
+        f"<td>{_escape(criterion.score_delta)}</td>"
+        f"<td>{_escape(criterion.baseline_explanation_state)} → "
+        f"{_escape(criterion.current_explanation_state)}</td>"
+        f"<td>{_escape(baseline_criteria[criterion.criterion_id].explanation or 'Unavailable')}</td>"
+        f"<td>{_escape(current_criteria[criterion.criterion_id].explanation or 'Unavailable')}</td>"
+        "</tr>"
+        for criterion in item.criteria
+    )
+    if not criterion_rows:
+        criterion_rows = (
+            '<tr><td colspan="8">Criterion deltas are unavailable because one or both '
+            "judgments were not recorded.</td></tr>"
+        )
+    reference = baseline_detail.reference
+    reference_text = "none"
+    if reference is not None:
+        reference_text = f"{reference.kind}:{reference.key}@{reference.revision}"
+    trial = item.trial_number if item.trial_number is not None else "captured"
+    return (
+        '<section class="judgment">'
+        f"<h3>Case <code>{_escape(item.case_id)}</code> · trial {_escape(trial)} · "
+        f"assertion <code>{_escape(item.assertion_id)}</code></h3>"
+        f"<p>Outcome {_escape(item.baseline_outcome)} → {_escape(item.current_outcome)} · "
+        f"evaluator {_escape(item.evaluator_change)} · aggregate "
+        f"{_escape(baseline_detail.aggregate_score or 'unavailable')} → "
+        f"{_escape(current_detail.aggregate_score or 'unavailable')} "
+        f"(delta {_escape(item.aggregate_delta or 'unavailable')}, "
+        f"{_escape(item.aggregate_change)})</p>"
+        f"<p>Profile <strong>{_escape(profile.label)}</strong> · "
+        f"<code>{_escape(profile.key)}</code> at "
+        f"<code>{_escape(profile.revision)}</code> · provider/model "
+        f"<code>{_escape(profile.provider_name)}/{_escape(profile.model)}</code> · "
+        f"route <code>{_escape(baseline_detail.candidate_route_relation)}</code></p>"
+        f"<p>Rubric <code>{_escape(baseline_detail.rubric_id)}</code> at "
+        f"<code>{_escape(baseline_detail.rubric_revision)}</code> · reference "
+        f"<code>{_escape(reference_text)}</code></p>"
+        f"<p>Evaluator diagnostic {_escape(baseline_detail.diagnostic)} → "
+        f"{_escape(current_detail.diagnostic)} · observed usage "
+        f"{_escape(_judge_usage_text(item.baseline))} → "
+        f"{_escape(_judge_usage_text(item.current))} · observed cost "
+        f"{_escape(_judge_cost_text(item.baseline))} → "
+        f"{_escape(_judge_cost_text(item.current))}</p>"
+        "<table><thead><tr><th>Criterion</th><th>Weight</th><th>Baseline</th>"
+        "<th>Current</th><th>Delta</th><th>Explanation state</th>"
+        "<th>Baseline explanation</th><th>Current explanation</th></tr></thead>"
+        f"<tbody>{criterion_rows}</tbody></table></section>"
+    )
+
+
+def _structured_regression_change(item: EvalStructuredJudgeComparisonV1) -> str:
+    trial = item.trial_number if item.trial_number is not None else "captured"
+    delta = item.aggregate_delta if item.aggregate_delta is not None else "unavailable"
+    return (
+        f"trial {trial}, assertion {item.assertion_id}: "
+        f"outcome {item.baseline_outcome} → {item.current_outcome}; "
+        f"evaluator {item.evaluator_change}; aggregate {item.aggregate_change} ({delta})"
+    )
+
+
+def _judge_usage_text(judgment: EvalStructuredJudgePresentationV1) -> str:
+    usage = judgment.detail.usage
+    if usage is None:
+        return "unavailable"
+    return (
+        f"{usage.model_steps} step(s), {usage.input_tokens}/{usage.output_tokens}/"
+        f"{usage.total_tokens} input/output/total tokens"
+    )
+
+
+def _judge_cost_text(judgment: EvalStructuredJudgePresentationV1) -> str:
+    cost = judgment.detail.cost
+    if cost is None:
+        return "unavailable (not observed)"
+    if cost.availability == "unavailable":
+        return "unavailable (unpriced)"
+    return f"{cost.estimated_cost} {cost.currency}"
+
+
 def write_corpus_execution_html(
     result: CorpusExecutionResult,
     path: str | Path,
@@ -477,8 +697,11 @@ def write_corpus_execution_html(
     Path(path).write_text(render_corpus_execution_html(result), encoding="utf-8")
 
 
-def _case_section(case: Any) -> str:
-    trials = "\n".join(_trial_section(trial) for trial in case.trials)
+def _case_section(case: Any, presentation: EvalCasePresentationV1) -> str:
+    trials = "\n".join(
+        _trial_section(trial, presented_trial)
+        for trial, presented_trial in zip(case.trials, presentation.trials, strict=True)
+    )
     return (
         f'<section class="case"><h3>Case <code>{_escape(case.case_id)}</code> '
         f"{_badge(case.status)}</h3>"
@@ -487,8 +710,15 @@ def _case_section(case: Any) -> str:
     )
 
 
-def _trial_section(trial: Any) -> str:
-    assertions = "\n".join(_assertion_row(assertion) for assertion in trial.assertions)
+def _trial_section(trial: Any, presentation: EvalTrialPresentationV1) -> str:
+    assertions = "\n".join(
+        _assertion_row(assertion, presented_assertion)
+        for assertion, presented_assertion in zip(
+            trial.assertions,
+            presentation.assertions,
+            strict=True,
+        )
+    )
     usage = "Unavailable"
     if trial.usage is not None:
         usage = (
@@ -522,24 +752,130 @@ def _trial_section(trial: Any) -> str:
         "<p>Full memory-attribution record inspection is unsupported in HTML; "
         "use the JSON result for aliases, fingerprints, source references, and complete "
         "lifecycle transitions.</p>"
+        f"{_outcome_dimensions_html(presentation.dimensions)}"
         f"{output_block}{assertions}</section>"
     )
 
 
-def _assertion_row(assertion: Any) -> str:
-    detail = json.dumps(
-        assertion.detail.model_dump(mode="json"),
-        ensure_ascii=False,
-        indent=2,
-        sort_keys=True,
-    )
+def _assertion_row(
+    assertion: Any,
+    presentation: EvalAssertionPresentationV1,
+) -> str:
+    if presentation.structured_judge is not None:
+        detail = _structured_judge_html(presentation.structured_judge)
+    else:
+        public_detail = json.dumps(
+            assertion.detail.model_dump(mode="json"),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        detail = f"<pre>{_escape(public_detail)}</pre>"
     return (
         '<div class="assertion">'
         f"<div>{_badge(assertion.outcome)}</div>"
         f"<div><strong><code>{_escape(assertion.assertion_id)}</code></strong> "
         f"<span>({_escape(assertion.detail.kind)})</span>"
         f"<p>{_escape(assertion.message)} · score {_score(assertion.score)}</p>"
-        f"<pre>{_escape(detail)}</pre></div></div>"
+        f"{detail}</div></div>"
+    )
+
+
+def _outcome_dimensions_html(dimensions: EvalResultOutcomeDimensionsV1) -> str:
+    values = (
+        ("Candidate", dimensions.candidate),
+        ("Deterministic assertions", dimensions.deterministic_assertions),
+        ("Semantic quality", dimensions.semantic_quality),
+        ("Evaluator health", dimensions.evaluator_health),
+        ("Runtime", dimensions.runtime),
+        ("Evidence", dimensions.evidence),
+    )
+    return (
+        '<section class="dimensions" aria-label="Outcome dimensions">'
+        + "".join(
+            '<div class="dimension">'
+            f"<strong>{_escape(label)}</strong><span>{_escape(value)}</span></div>"
+            for label, value in values
+        )
+        + "</section>"
+    )
+
+
+def _structured_judge_html(judgment: EvalStructuredJudgePresentationV1) -> str:
+    detail = judgment.detail
+    profile = detail.judge_profile
+    reference = detail.reference
+    reference_text = "No evaluator reference"
+    if reference is not None:
+        reference_text = (
+            f"{reference.kind} <code>{_escape(reference.key)}</code> · revision "
+            f"<code>{_escape(reference.revision)}</code> · {_escape(reference.availability)}"
+        )
+        if reference.privacy_policy_key is not None:
+            reference_text += (
+                f" · privacy policy <code>{_escape(reference.privacy_policy_key)}</code> "
+                f"at <code>{_escape(reference.privacy_policy_revision)}</code>"
+            )
+    evidence_parts = ["final output"] if detail.evidence.include_final_output else []
+    if detail.evidence.include_transcript:
+        evidence_parts.append("transcript")
+    evidence_text = ", ".join(evidence_parts) or "none"
+    threshold_state = (
+        "unavailable"
+        if judgment.threshold_passed is None
+        else "passed"
+        if judgment.threshold_passed
+        else "failed"
+    )
+    usage_text = "Unavailable"
+    if detail.usage is not None:
+        usage_text = (
+            f"{detail.usage.model_steps} model step(s), {detail.usage.input_tokens} input, "
+            f"{detail.usage.output_tokens} output, {detail.usage.total_tokens} total token(s)"
+        )
+    cost_text = "Unavailable (not observed)"
+    if detail.cost is not None and detail.cost.availability == "unavailable":
+        cost_text = "Unavailable (unpriced)"
+    elif detail.cost is not None:
+        cost_text = (
+            f"{detail.cost.estimated_cost} {detail.cost.currency} · "
+            f"{detail.cost.priced_model_steps} priced model step(s)"
+        )
+    criterion_rows = "".join(
+        "<tr>"
+        f"<td><code>{_escape(item.criterion_id)}</code></td>"
+        f"<td>{_escape(item.weight)}</td>"
+        f"<td>{_escape(item.score)}</td>"
+        f"<td>{_escape(item.weighted_contribution)}</td>"
+        f"<td>{_escape(item.explanation_state)}</td>"
+        f"<td>{_escape(item.explanation or 'Unavailable')}</td>"
+        "</tr>"
+        for item in judgment.criteria
+    )
+    if not criterion_rows:
+        criterion_rows = '<tr><td colspan="6">No criterion scores were recorded.</td></tr>'
+    evidence_json = json.dumps(
+        detail.evidence.model_dump(mode="json"), ensure_ascii=False, sort_keys=True
+    )
+    return (
+        '<section class="judge">'
+        f"<p><strong>{_escape(profile.label)}</strong> · profile "
+        f"<code>{_escape(profile.key)}</code> at <code>{_escape(profile.revision)}</code></p>"
+        f"<p>Provider/model <code>{_escape(profile.provider_name)}/{_escape(profile.model)}</code> "
+        f"· implementation <code>{_escape(profile.implementation_revision)}</code> · route "
+        f"<code>{_escape(detail.candidate_route_relation)}</code></p>"
+        f"<p>Rubric <code>{_escape(detail.rubric_id)}</code> at "
+        f"<code>{_escape(detail.rubric_revision)}</code></p>"
+        f"<p>{reference_text}</p>"
+        f"<p>Evidence {_escape(evidence_text)} · selection "
+        f"<code>{_escape(evidence_json)}</code></p>"
+        f"<p>Evaluator <code>{_escape(detail.diagnostic)}</code> · aggregate "
+        f"<code>{_escape(detail.aggregate_score or 'unavailable')}</code> against threshold "
+        f"<code>{_escape(detail.threshold)}</code> ({_escape(threshold_state)})</p>"
+        f"<p>Observed usage: {_escape(usage_text)} · observed cost: {_escape(cost_text)}</p>"
+        "<table><thead><tr><th>Criterion</th><th>Weight</th><th>Score</th>"
+        "<th>Contribution</th><th>Explanation state</th><th>Explanation</th></tr></thead>"
+        f"<tbody>{criterion_rows}</tbody></table></section>"
     )
 
 

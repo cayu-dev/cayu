@@ -100,8 +100,7 @@ from cayu.evals.execution import (
 )
 from cayu.evals.execution_comparison import compare_corpus_execution_results, compare_eval_results
 from cayu.evals.execution_reporting import (
-    corpus_execution_result_to_json,
-    eval_result_to_json,
+    eval_result_report_to_json,
     render_corpus_execution_html,
     render_eval_result_html,
 )
@@ -128,6 +127,7 @@ from cayu.evals.promotion import (
     score_captured_evaluation_candidate,
     score_promotion_candidate,
 )
+from cayu.evals.result_presentation import present_eval_result
 from cayu.evals.results import (
     CapturedEvaluationResultV1,
     EvalResultOrigin,
@@ -5245,7 +5245,14 @@ def create_router(
                 suite_id=record.suite_id,
             )
             baseline = await store.load_baseline(key)
-            return EvalResultDetailResponse(record=record, result=result, baseline=baseline)
+            presentation = await asyncio.to_thread(present_eval_result, result)
+            return await asyncio.to_thread(
+                EvalResultDetailResponse,
+                record=record,
+                result=result,
+                presentation=presentation,
+                baseline=baseline,
+            )
 
         @bounded_captured_evaluation_router.get(
             "/evals/results/{result_revision}/report.json",
@@ -5255,7 +5262,7 @@ def create_router(
         )
         async def download_catalog_eval_json_report(result_revision: str) -> Response:
             record, result = await _load_catalog_eval_result(result_revision)
-            report = await asyncio.to_thread(_render_utf8, eval_result_to_json, result)
+            report = await asyncio.to_thread(_render_utf8, eval_result_report_to_json, result)
             filename = f"{record.revision.removeprefix('sha256:')}.eval-result.json"
             return Response(
                 content=report,
@@ -5307,7 +5314,8 @@ def create_router(
                 current,
                 score_tolerance=body.score_tolerance,
             )
-            response = EvalResultComparisonResponse(
+            response = await asyncio.to_thread(
+                EvalResultComparisonResponse,
                 baseline=baseline_record,
                 current=current_record,
                 comparison=comparison,
@@ -8112,10 +8120,12 @@ def create_router(
                         suite_id=run.spec.suite_id,
                     )
                 )
+            presentation = await asyncio.to_thread(present_eval_result, result)
             response = await asyncio.to_thread(
                 EvalResultResponse,
                 run=run,
                 result=result,
+                presentation=presentation,
                 baseline=baseline,
             )
             return await _model_json_response(response, EvalResultResponse)
@@ -8130,7 +8140,7 @@ def create_router(
             _, result = await _load_eval_result(run_id)
             report = await asyncio.to_thread(
                 _render_utf8,
-                corpus_execution_result_to_json,
+                eval_result_report_to_json,
                 result,
             )
             return Response(
@@ -8185,7 +8195,8 @@ def create_router(
                 baseline,
                 current,
             )
-            response = EvalComparisonResponse(
+            response = await asyncio.to_thread(
+                EvalComparisonResponse,
                 baseline=baseline_run,
                 current=current_run,
                 comparison=comparison,

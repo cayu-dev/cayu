@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import StrEnum
 from typing import Literal, cast
 
@@ -10,15 +11,35 @@ from pydantic import (
     Field,
     StrictBool,
     StrictFloat,
+    StrictInt,
     StrictStr,
     field_validator,
     model_validator,
 )
 
-from cayu.evals.corpus import EVAL_CORPUS_MAX_TRIALS, _sha256_revision
+from cayu._validation import json_utf8_size_within_limit
+from cayu.evals.corpus import (
+    EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
+    EVAL_CORPUS_MAX_CASES,
+    EVAL_CORPUS_MAX_JUDGE_CRITERIA,
+    EVAL_CORPUS_MAX_TRIALS,
+    _canonical_decimal_text,
+    _exact_decimal_difference,
+    _ordered_sequence_input,
+    _portable_id,
+    _PortableModel,
+    _sha256_revision,
+)
+from cayu.evals.evidence import _canonical_decimal
 from cayu.evals.execution import CorpusExecutionResult
-from cayu.evals.published import PublishedStatus
+from cayu.evals.published import PublishedModelJudgeDiagnostic, PublishedOutcome, PublishedStatus
 from cayu.evals.result_contract import EvalTrialDiagnosticCode
+from cayu.evals.result_presentation import (
+    EvalAssertionPresentationV1,
+    EvalResultPresentationV1,
+    EvalStructuredJudgePresentationV1,
+    present_eval_result,
+)
 from cayu.evals.results import (
     CapturedEvaluationResultV1,
     EvalResultProjectionV1,
@@ -63,6 +84,316 @@ _STATUS_SEVERITY: dict[PublishedStatus, int] = {
     "unavailable": 2,
     "error": 3,
 }
+
+_EVALUATOR_SEVERITY: dict[PublishedModelJudgeDiagnostic, int] = {
+    "judgment_recorded": 0,
+    "evidence_unavailable": 1,
+    "evaluator_error": 2,
+}
+
+EVAL_STRUCTURED_JUDGE_COMPARISON_MAX_ITEMS = (
+    EVAL_CORPUS_MAX_CASES * EVAL_CORPUS_MAX_TRIALS * EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE
+)
+CORPUS_EXECUTION_COMPARISON_MAX_BYTES = 96 << 20
+
+EvalStructuredJudgeComparisonState = Literal[
+    "compared",
+    "contract_incompatible",
+    "no_structured_judges",
+    "observation_identity_mismatch",
+    "source_detail_unavailable",
+]
+EvalStructuredJudgeAggregateChange = Literal[
+    "improved",
+    "regressed",
+    "unchanged",
+    "unavailable",
+]
+EvalStructuredJudgeEvaluatorChange = Literal["improved", "regressed", "unchanged"]
+
+
+def _canonical_signed_decimal(value: Decimal) -> str:
+    if value == 0:
+        return "0"
+    if value < 0:
+        return f"-{_canonical_decimal(value.copy_abs(), max_chars=64)}"
+    return _canonical_decimal(value, max_chars=64)
+
+
+def _validate_signed_unit_decimal(value: str, field_name: str) -> str:
+    if type(value) is not str or not value:
+        raise ValueError(f"{field_name} must be a canonical decimal string.")
+    negative = value.startswith("-")
+    magnitude = value[1:] if negative else value
+    magnitude = _canonical_decimal_text(magnitude, field_name, max_chars=64)
+    if Decimal(magnitude) > 1:
+        raise ValueError(f"{field_name} must be between -1 and 1.")
+    canonical = f"-{magnitude}" if negative and magnitude != "0" else magnitude
+    if value != canonical:
+        raise ValueError(f"{field_name} must use canonical signed decimal form.")
+    return value
+
+
+class EvalStructuredJudgeCriterionComparisonV1(_PortableModel):
+    """Exact criterion delta for one identity-matched structured judgment."""
+
+    criterion_id: StrictStr
+    weight: StrictStr
+    baseline_score: StrictStr
+    current_score: StrictStr
+    score_delta: StrictStr
+    baseline_explanation_state: Literal["available", "redacted", "unavailable"]
+    current_explanation_state: Literal["available", "redacted", "unavailable"]
+
+    @field_validator("criterion_id")
+    @classmethod
+    def validate_criterion_id(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("weight", "baseline_score", "current_score")
+    @classmethod
+    def validate_unit_decimal(cls, value: str, info) -> str:
+        value = _canonical_decimal_text(value, info.field_name, max_chars=64)
+        if Decimal(value) > 1:
+            raise ValueError(f"{info.field_name} must be between 0 and 1.")
+        return value
+
+    @field_validator("score_delta")
+    @classmethod
+    def validate_score_delta(cls, value: str, info) -> str:
+        return _validate_signed_unit_decimal(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_delta(self) -> EvalStructuredJudgeCriterionComparisonV1:
+        expected = _canonical_signed_decimal(
+            _exact_decimal_difference(
+                Decimal(self.current_score),
+                Decimal(self.baseline_score),
+            )
+        )
+        if self.score_delta != expected:
+            raise ValueError("Criterion score_delta contradicts its retained scores.")
+        return self
+
+
+class EvalStructuredJudgeComparisonV1(_PortableModel):
+    """Explainable comparison of one exact case/trial/assertion observation."""
+
+    case_id: StrictStr
+    trial_number: StrictInt | None = Field(default=None, ge=1, le=EVAL_CORPUS_MAX_TRIALS)
+    assertion_id: StrictStr
+    baseline_outcome: PublishedOutcome
+    current_outcome: PublishedOutcome
+    baseline: EvalStructuredJudgePresentationV1
+    current: EvalStructuredJudgePresentationV1
+    evaluator_change: EvalStructuredJudgeEvaluatorChange
+    aggregate_change: EvalStructuredJudgeAggregateChange
+    aggregate_delta: StrictStr | None
+    regressed: StrictBool
+    criteria: tuple[EvalStructuredJudgeCriterionComparisonV1, ...] = Field(
+        default=(),
+        max_length=EVAL_CORPUS_MAX_JUDGE_CRITERIA,
+    )
+
+    @field_validator("case_id", "assertion_id")
+    @classmethod
+    def validate_ids(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("baseline", "current", mode="before")
+    @classmethod
+    def copy_judgment(cls, value: object) -> object:
+        if type(value) is EvalStructuredJudgePresentationV1:
+            return value.model_dump(mode="python", round_trip=True, warnings="none")
+        if isinstance(value, BaseModel):
+            raise TypeError(
+                "Judgments must be exact EvalStructuredJudgePresentationV1 values or JSON objects."
+            )
+        return value
+
+    @field_validator("criteria", mode="before")
+    @classmethod
+    def validate_criteria_order(cls, value: object, info) -> object:
+        return _ordered_sequence_input(value, info.field_name)
+
+    @field_validator("aggregate_delta")
+    @classmethod
+    def validate_aggregate_delta(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _validate_signed_unit_decimal(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_comparison(self) -> EvalStructuredJudgeComparisonV1:
+        baseline_detail = self.baseline.detail
+        current_detail = self.current.detail
+        if self.baseline_outcome != _structured_judge_outcome(
+            baseline_detail.diagnostic,
+            baseline_detail.aggregate_score,
+            baseline_detail.threshold,
+        ) or self.current_outcome != _structured_judge_outcome(
+            current_detail.diagnostic,
+            current_detail.aggregate_score,
+            current_detail.threshold,
+        ):
+            raise ValueError("Compared outcomes contradict their retained judgments.")
+        static_baseline = (
+            baseline_detail.judge_profile,
+            baseline_detail.candidate_route_relation,
+            baseline_detail.rubric_id,
+            baseline_detail.rubric_revision,
+            baseline_detail.reference,
+            baseline_detail.threshold,
+            baseline_detail.evidence,
+        )
+        static_current = (
+            current_detail.judge_profile,
+            current_detail.candidate_route_relation,
+            current_detail.rubric_id,
+            current_detail.rubric_revision,
+            current_detail.reference,
+            current_detail.threshold,
+            current_detail.evidence,
+        )
+        if static_baseline != static_current:
+            raise ValueError(
+                "Compared structured judgments must have identical admitted contracts."
+            )
+        expected_evaluator_change = _evaluator_change(
+            baseline_detail.diagnostic,
+            current_detail.diagnostic,
+        )
+        if self.evaluator_change != expected_evaluator_change:
+            raise ValueError("evaluator_change contradicts retained judge diagnostics.")
+        expected_criteria = _criterion_comparisons(self.baseline, self.current)
+        if self.criteria != expected_criteria:
+            raise ValueError("Criterion comparisons contradict retained judgments.")
+        expected_delta = _aggregate_delta(self.baseline, self.current)
+        if self.aggregate_delta != expected_delta:
+            raise ValueError("aggregate_delta contradicts retained judgments.")
+        return self
+
+
+class EvalStructuredJudgeObservationMismatchV1(_PortableModel):
+    """One structured observation present on only one side of a comparison."""
+
+    case_id: StrictStr
+    trial_number: StrictInt | None = Field(default=None, ge=1, le=EVAL_CORPUS_MAX_TRIALS)
+    assertion_id: StrictStr
+    availability: Literal["baseline_only", "current_only"]
+
+    @field_validator("case_id", "assertion_id")
+    @classmethod
+    def validate_ids(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+
+def _evaluator_change(
+    baseline: PublishedModelJudgeDiagnostic,
+    current: PublishedModelJudgeDiagnostic,
+) -> EvalStructuredJudgeEvaluatorChange:
+    baseline_severity = _EVALUATOR_SEVERITY[baseline]
+    current_severity = _EVALUATOR_SEVERITY[current]
+    if current_severity > baseline_severity:
+        return "regressed"
+    if current_severity < baseline_severity:
+        return "improved"
+    return "unchanged"
+
+
+def _structured_judge_outcome(
+    diagnostic: PublishedModelJudgeDiagnostic,
+    aggregate_score: str | None,
+    threshold: str,
+) -> PublishedOutcome:
+    if diagnostic == "evidence_unavailable":
+        return "unavailable"
+    if diagnostic == "evaluator_error":
+        return "error"
+    if aggregate_score is None:
+        raise ValueError("Recorded structured judgment requires an aggregate score.")
+    return "passed" if Decimal(aggregate_score) >= Decimal(threshold) else "failed"
+
+
+def _criterion_comparisons(
+    baseline: EvalStructuredJudgePresentationV1,
+    current: EvalStructuredJudgePresentationV1,
+) -> tuple[EvalStructuredJudgeCriterionComparisonV1, ...]:
+    if not baseline.criteria or not current.criteria:
+        return ()
+    baseline_ids = tuple(item.criterion_id for item in baseline.criteria)
+    current_ids = tuple(item.criterion_id for item in current.criteria)
+    if baseline_ids != current_ids:
+        raise ValueError("Compared structured judgment criterion identities do not match.")
+    comparisons: list[EvalStructuredJudgeCriterionComparisonV1] = []
+    for baseline_item, current_item in zip(
+        baseline.criteria,
+        current.criteria,
+        strict=True,
+    ):
+        if baseline_item.weight != current_item.weight:
+            raise ValueError("Compared structured judgment criterion weights do not match.")
+        comparisons.append(
+            EvalStructuredJudgeCriterionComparisonV1(
+                criterion_id=baseline_item.criterion_id,
+                weight=baseline_item.weight,
+                baseline_score=baseline_item.score,
+                current_score=current_item.score,
+                score_delta=_canonical_signed_decimal(
+                    _exact_decimal_difference(
+                        Decimal(current_item.score),
+                        Decimal(baseline_item.score),
+                    )
+                ),
+                baseline_explanation_state=baseline_item.explanation_state,
+                current_explanation_state=current_item.explanation_state,
+            )
+        )
+    return tuple(comparisons)
+
+
+def _aggregate_delta(
+    baseline: EvalStructuredJudgePresentationV1,
+    current: EvalStructuredJudgePresentationV1,
+) -> str | None:
+    baseline_score = baseline.detail.aggregate_score
+    current_score = current.detail.aggregate_score
+    if baseline_score is None or current_score is None:
+        return None
+    return _canonical_signed_decimal(
+        _exact_decimal_difference(Decimal(current_score), Decimal(baseline_score))
+    )
+
+
+def _aggregate_change(
+    baseline: EvalStructuredJudgePresentationV1,
+    current: EvalStructuredJudgePresentationV1,
+    *,
+    tolerance: Decimal,
+) -> EvalStructuredJudgeAggregateChange:
+    delta = _aggregate_delta(baseline, current)
+    if delta is None:
+        return "unavailable"
+    decimal_delta = Decimal(delta)
+    if decimal_delta < tolerance.copy_negate():
+        return "regressed"
+    if decimal_delta > tolerance:
+        return "improved"
+    return "unchanged"
+
+
+def _structured_judge_regressed(
+    *,
+    baseline_outcome: PublishedOutcome,
+    current_outcome: PublishedOutcome,
+    evaluator_change: EvalStructuredJudgeEvaluatorChange,
+    aggregate_change: EvalStructuredJudgeAggregateChange,
+) -> bool:
+    return (
+        evaluator_change == "regressed"
+        or aggregate_change == "regressed"
+        or (baseline_outcome == "passed" and current_outcome == "failed")
+    )
 
 
 class CorpusComparisonCompatibility(BaseModel):
@@ -110,16 +441,37 @@ class CorpusComparisonResultSummary(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
 
     result_revision: StrictStr
+    target_key: StrictStr
     application_release_id: StrictStr = Field(min_length=1, max_length=256)
     app_manifest_fingerprint: StrictStr = Field(min_length=64, max_length=64)
+    external_target_revision: StrictStr | None
+    corpus_revision: StrictStr
+    suite_id: StrictStr
+    suite_revision: StrictStr
+    evidence_policy_revision: StrictStr
+    pricing_profile_fingerprint: StrictStr | None
     memory_attribution_support: Literal["unsupported"] = "unsupported"
     status: PublishedStatus
     score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
 
-    @field_validator("result_revision")
+    @field_validator(
+        "result_revision",
+        "external_target_revision",
+        "corpus_revision",
+        "suite_revision",
+        "evidence_policy_revision",
+        "pricing_profile_fingerprint",
+    )
     @classmethod
-    def validate_result_revision(cls, value: str, info) -> str:
+    def validate_revisions(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
         return _sha256_revision(value, info.field_name)
+
+    @field_validator("target_key", "suite_id")
+    @classmethod
+    def validate_ids(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
 
     @field_validator("application_release_id")
     @classmethod
@@ -238,7 +590,7 @@ class CorpusExecutionComparison(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     compatibility: CorpusComparisonCompatibility
     score_tolerance: StrictFloat = Field(default=0.0, ge=0.0, le=1.0)
     baseline: CorpusComparisonResultSummary
@@ -248,13 +600,33 @@ class CorpusExecutionComparison(BaseModel):
         default_factory=tuple,
         max_length=2_002,
     )
+    structured_judge_comparison_state: EvalStructuredJudgeComparisonState
+    structured_judgments: tuple[EvalStructuredJudgeComparisonV1, ...] = Field(
+        default=(),
+        max_length=EVAL_STRUCTURED_JUDGE_COMPARISON_MAX_ITEMS,
+    )
+    structured_judge_observation_mismatches: tuple[
+        EvalStructuredJudgeObservationMismatchV1, ...
+    ] = Field(
+        default=(),
+        max_length=EVAL_STRUCTURED_JUDGE_COMPARISON_MAX_ITEMS * 2,
+    )
 
     @field_validator("schema_version", mode="before")
     @classmethod
     def validate_schema_version_type(cls, value: object) -> object:
         if type(value) is not int:
-            raise ValueError("schema_version must be the integer 1.")
+            raise ValueError("schema_version must be the integer 2.")
         return value
+
+    @field_validator(
+        "structured_judgments",
+        "structured_judge_observation_mismatches",
+        mode="before",
+    )
+    @classmethod
+    def validate_structured_judgments_order(cls, value: object, info) -> object:
+        return _ordered_sequence_input(value, info.field_name)
 
     @model_validator(mode="after")
     def validate_derived_contract(self) -> CorpusExecutionComparison:
@@ -263,9 +635,18 @@ class CorpusExecutionComparison(BaseModel):
         if self.compatibility.current_result_revision != self.current.result_revision:
             raise ValueError("Current summary does not match compatibility evidence.")
         if not self.compatibility.comparable:
-            if self.cases or self.regressions:
+            if (
+                self.cases
+                or self.regressions
+                or self.structured_judgments
+                or self.structured_judge_observation_mismatches
+            ):
                 raise ValueError("Incomparable results cannot carry outcome comparisons.")
-            return self
+            if self.structured_judge_comparison_state != "contract_incompatible":
+                raise ValueError(
+                    "Incomparable results require the contract_incompatible judge state."
+                )
+            return self._validate_size()
         case_ids = tuple(case.case_id for case in self.cases)
         if not case_ids or case_ids != tuple(sorted(set(case_ids))):
             raise ValueError("Comparable case summaries must be nonempty, unique, and sorted.")
@@ -277,6 +658,54 @@ class CorpusExecutionComparison(BaseModel):
         )
         if self.regressions != expected:
             raise ValueError("Comparison regressions do not match its aggregate outcomes.")
+        if self.structured_judge_comparison_state == "compared":
+            if not self.structured_judgments:
+                raise ValueError("Compared structured judges require retained observations.")
+        elif self.structured_judgments:
+            raise ValueError(
+                "Structured judge observations require the compared presentation state."
+            )
+        if self.structured_judge_comparison_state == "observation_identity_mismatch":
+            if not self.structured_judge_observation_mismatches:
+                raise ValueError("Identity mismatch state requires exact unmatched observations.")
+        elif self.structured_judge_observation_mismatches:
+            raise ValueError("Unmatched observations require the identity mismatch state.")
+        keys = tuple(
+            (item.case_id, item.trial_number, item.assertion_id)
+            for item in self.structured_judgments
+        )
+        if len(keys) != len(set(keys)):
+            raise ValueError("Structured judge comparison identities must be unique.")
+        mismatch_keys = tuple(
+            (item.case_id, item.trial_number, item.assertion_id, item.availability)
+            for item in self.structured_judge_observation_mismatches
+        )
+        if len(mismatch_keys) != len(set(mismatch_keys)):
+            raise ValueError("Structured judge mismatch identities must be unique.")
+        for item in self.structured_judgments:
+            expected_change = _aggregate_change(
+                item.baseline,
+                item.current,
+                tolerance=Decimal(str(self.score_tolerance)),
+            )
+            expected_regressed = _structured_judge_regressed(
+                baseline_outcome=item.baseline_outcome,
+                current_outcome=item.current_outcome,
+                evaluator_change=item.evaluator_change,
+                aggregate_change=expected_change,
+            )
+            if item.aggregate_change != expected_change or item.regressed != expected_regressed:
+                raise ValueError(
+                    "Structured judge change classification contradicts retained observations."
+                )
+        return self._validate_size()
+
+    def _validate_size(self) -> CorpusExecutionComparison:
+        if not json_utf8_size_within_limit(self, CORPUS_EXECUTION_COMPARISON_MAX_BYTES):
+            raise ValueError(
+                "Corpus execution comparison exceeds "
+                f"{CORPUS_EXECUTION_COMPARISON_MAX_BYTES} canonical JSON bytes."
+            )
         return self
 
 
@@ -303,6 +732,126 @@ class _ExecutionProjection:
     assertion_contract: tuple[tuple[str, tuple[tuple[object, ...], ...]], ...]
     summary: CorpusComparisonResultSummary
     cases: tuple[_CaseOutcome, ...]
+
+
+@dataclass(frozen=True)
+class _StructuredObservation:
+    case_id: str
+    trial_number: int | None
+    assertion: EvalAssertionPresentationV1
+
+    @property
+    def key(self) -> tuple[str, int | None, str]:
+        return self.case_id, self.trial_number, self.assertion.assertion_id
+
+
+def _structured_observations(
+    presentation: EvalResultPresentationV1,
+) -> tuple[_StructuredObservation, ...]:
+    observations = tuple(
+        _StructuredObservation(
+            case_id=case.case_id,
+            trial_number=trial.trial_number,
+            assertion=assertion,
+        )
+        for case in presentation.cases
+        for trial in case.trials
+        for assertion in trial.assertions
+        if assertion.structured_judge is not None
+    )
+    keys = tuple(item.key for item in observations)
+    if len(keys) != len(set(keys)):
+        raise ValueError("Structured judge presentation observation identities must be unique.")
+    return observations
+
+
+def _structured_comparison(
+    baseline: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
+    current: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
+    *,
+    comparable: bool,
+    score_tolerance: float,
+) -> tuple[
+    EvalStructuredJudgeComparisonState,
+    tuple[EvalStructuredJudgeComparisonV1, ...],
+    tuple[EvalStructuredJudgeObservationMismatchV1, ...],
+]:
+    if not comparable:
+        return "contract_incompatible", (), ()
+    if type(baseline) is EvalResultProjectionV1 or type(current) is EvalResultProjectionV1:
+        return "source_detail_unavailable", (), ()
+    baseline_presentation = present_eval_result(
+        cast("CorpusExecutionResult | CapturedEvaluationResultV1", baseline)
+    )
+    current_presentation = present_eval_result(
+        cast("CorpusExecutionResult | CapturedEvaluationResultV1", current)
+    )
+    baseline_observations = _structured_observations(baseline_presentation)
+    current_observations = _structured_observations(current_presentation)
+    if not baseline_observations and not current_observations:
+        return "no_structured_judges", (), ()
+    baseline_by_key = {item.key: item for item in baseline_observations}
+    current_by_key = {item.key: item for item in current_observations}
+    if baseline_by_key.keys() != current_by_key.keys():
+        mismatches = tuple(
+            EvalStructuredJudgeObservationMismatchV1(
+                case_id=case_id,
+                trial_number=trial_number,
+                assertion_id=assertion_id,
+                availability="baseline_only",
+            )
+            for case_id, trial_number, assertion_id in baseline_by_key
+            if (case_id, trial_number, assertion_id) not in current_by_key
+        ) + tuple(
+            EvalStructuredJudgeObservationMismatchV1(
+                case_id=case_id,
+                trial_number=trial_number,
+                assertion_id=assertion_id,
+                availability="current_only",
+            )
+            for case_id, trial_number, assertion_id in current_by_key
+            if (case_id, trial_number, assertion_id) not in baseline_by_key
+        )
+        return "observation_identity_mismatch", (), mismatches
+    tolerance = Decimal(str(score_tolerance))
+    comparisons: list[EvalStructuredJudgeComparisonV1] = []
+    for baseline_observation in baseline_observations:
+        current_observation = current_by_key[baseline_observation.key]
+        baseline_judgment = baseline_observation.assertion.structured_judge
+        current_judgment = current_observation.assertion.structured_judge
+        if baseline_judgment is None or current_judgment is None:
+            raise AssertionError("Structured observation lost its judgment presentation.")
+        aggregate_change = _aggregate_change(
+            baseline_judgment,
+            current_judgment,
+            tolerance=tolerance,
+        )
+        evaluator_change = _evaluator_change(
+            baseline_judgment.detail.diagnostic,
+            current_judgment.detail.diagnostic,
+        )
+        comparisons.append(
+            EvalStructuredJudgeComparisonV1(
+                case_id=baseline_observation.case_id,
+                trial_number=baseline_observation.trial_number,
+                assertion_id=baseline_observation.assertion.assertion_id,
+                baseline_outcome=baseline_observation.assertion.outcome,
+                current_outcome=current_observation.assertion.outcome,
+                baseline=baseline_judgment,
+                current=current_judgment,
+                evaluator_change=evaluator_change,
+                aggregate_change=aggregate_change,
+                aggregate_delta=_aggregate_delta(baseline_judgment, current_judgment),
+                regressed=_structured_judge_regressed(
+                    baseline_outcome=baseline_observation.assertion.outcome,
+                    current_outcome=current_observation.assertion.outcome,
+                    evaluator_change=evaluator_change,
+                    aggregate_change=aggregate_change,
+                ),
+                criteria=_criterion_comparisons(baseline_judgment, current_judgment),
+            )
+        )
+    return "compared", tuple(comparisons), ()
 
 
 def _validated_projection(
@@ -337,8 +886,15 @@ def _validated_projection(
     )
     summary = CorpusComparisonResultSummary(
         result_revision=projection.result_revision,
+        target_key=projection.target.target_key,
         application_release_id=projection.target.application_release_id,
         app_manifest_fingerprint=projection.target.app_manifest_fingerprint,
+        external_target_revision=projection.external_target_revision,
+        corpus_revision=projection.corpus_revision,
+        suite_id=projection.suite_id,
+        suite_revision=projection.suite_revision,
+        evidence_policy_revision=projection.evidence_policy_revision,
+        pricing_profile_fingerprint=projection.pricing_profile_fingerprint,
         memory_attribution_support=projection.memory_attribution_support,
         status=projection.status,
         score=projection.score,
@@ -514,12 +1070,21 @@ def _compare_projected_results(
     baseline_summary = baseline_projection.summary
     current_summary = current_projection.summary
     tolerance = float(score_tolerance)
+    structured_state, structured_judgments, structured_mismatches = _structured_comparison(
+        baseline,
+        current,
+        comparable=compatibility.comparable,
+        score_tolerance=tolerance,
+    )
     if not compatibility.comparable:
         return CorpusExecutionComparison(
             compatibility=compatibility,
             score_tolerance=tolerance,
             baseline=baseline_summary,
             current=current_summary,
+            structured_judge_comparison_state=structured_state,
+            structured_judgments=structured_judgments,
+            structured_judge_observation_mismatches=structured_mismatches,
         )
     cases = tuple(
         CorpusCaseComparison(
@@ -550,6 +1115,9 @@ def _compare_projected_results(
         current=current_summary,
         cases=cases,
         regressions=regressions,
+        structured_judge_comparison_state=structured_state,
+        structured_judgments=structured_judgments,
+        structured_judge_observation_mismatches=structured_mismatches,
     )
 
 

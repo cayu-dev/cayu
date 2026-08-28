@@ -1559,7 +1559,7 @@ async def _exercise_captured_evaluation(
     await expect(page.get_by_role("tab", name="Results", exact=True)).to_have_attribute(
         "aria-selected", "true"
     )
-    await expect(page.get_by_text("Immutable score evidence", exact=True)).to_be_visible()
+    await expect(page.get_by_text("Explainable result", exact=True)).to_be_visible()
     await expect(page.get_by_text("Baseline", exact=True)).to_be_visible()
 
     await page.get_by_role("tab", name="Runs", exact=True).click()
@@ -1602,9 +1602,9 @@ async def _exercise_captured_evaluation(
         "the downloaded scenario result must be readable by the installed CLI",
     )
     scenario_result_path = Path(scenario_result_path_text)
-    scenario_result = json.loads(scenario_result_path.read_text(encoding="utf-8"))
+    scenario_report = json.loads(scenario_result_path.read_text(encoding="utf-8"))
     require_equal(
-        scenario_result["run"]["status"],
+        scenario_report["result"]["run"]["status"],
         "passed",
         "the queued-input and fresh-approval scenario must publish an ordinary passing result",
     )
@@ -1785,6 +1785,81 @@ async def _exercise_captured_evaluation(
         page.locator('[data-slot="card-title"]').filter(has_text="Published result")
     ).to_be_visible()
     await expect(page.get_by_text("root_status", exact=True)).to_be_visible()
+    await expect(page.get_by_text("Dashboard quality judge", exact=False)).to_be_visible()
+    await expect(page.get_by_text("same model · explicitly allowed", exact=True)).to_be_visible()
+    await expect(page.get_by_text("correctness", exact=True)).to_be_visible()
+    await expect(
+        page.get_by_text("The known output satisfies the fixed task.", exact=True)
+    ).to_be_visible()
+    authored_result_response = await page.request.get(
+        f"{base_url}/api/evals/runs/{authored_run_id}/result"
+    )
+    require_equal(
+        authored_result_response.status,
+        200,
+        "the authored structured run must publish an explainable result",
+    )
+    authored_result_body = await authored_result_response.json()
+    authored_presentation = authored_result_body["presentation"]
+    require_equal(
+        authored_presentation["dimensions"]["evaluator_health"],
+        "healthy",
+        "the canonical result presentation must keep evaluator health distinct",
+    )
+    authored_judgment = authored_presentation["cases"][0]["trials"][0]["assertions"][1][
+        "structured_judge"
+    ]
+    require_equal(
+        authored_judgment["criteria"][0]["weighted_contribution"],
+        "1",
+        "the canonical presentation must expose Cayu's exact criterion contribution",
+    )
+    authored_comparison_response = await page.request.post(
+        f"{base_url}/api/evals/result-comparisons",
+        data={
+            "baseline_result_revision": authored_presentation["result_revision"],
+            "current_result_revision": authored_presentation["result_revision"],
+            "score_tolerance": 0,
+        },
+    )
+    require_equal(
+        authored_comparison_response.status,
+        200,
+        "the protected comparison route must accept exact structured result identities",
+    )
+    authored_comparison = (await authored_comparison_response.json())["comparison"]
+    require_equal(
+        authored_comparison["structured_judge_comparison_state"],
+        "compared",
+        "structured comparison must pair exact retained trial identity",
+    )
+    require_equal(
+        authored_comparison["structured_judgments"][0]["criteria"][0]["score_delta"],
+        "0",
+        "structured comparison must expose exact criterion deltas",
+    )
+    async with page.expect_download() as authored_json_download_info:
+        await page.get_by_role("button", name="JSON", exact=True).click()
+    authored_result_path_text = await (await authored_json_download_info.value).path()
+    require(
+        authored_result_path_text is not None,
+        "the explainable authored-result JSON report must be readable",
+    )
+    authored_result_path = Path(authored_result_path_text)
+    async with page.expect_download() as authored_html_download_info:
+        await page.get_by_role("button", name="HTML", exact=True).click()
+    authored_html_path = await (await authored_html_download_info.value).path()
+    require(
+        authored_html_path is not None,
+        "the explainable authored-result HTML report must be readable",
+    )
+    authored_html = Path(authored_html_path).read_text(encoding="utf-8")
+    require(
+        "The known output satisfies the fixed task." in authored_html
+        and "weighted_contribution" not in authored_html
+        and "judge_output" not in authored_html,
+        "HTML must render readable structured evidence without raw judge payload fields",
+    )
 
     await page.get_by_test_id("new-evaluation").click()
     authoring = page.get_by_test_id("eval-suite-authoring-sheet")
@@ -2084,8 +2159,8 @@ async def _exercise_captured_evaluation(
         json_result_path is not None,
         "the dashboard eval JSON download must produce a readable local file",
     )
-    baseline_result = json.loads(Path(json_result_path).read_text(encoding="utf-8"))
-    baseline_result_revision = baseline_result["revision"]
+    baseline_report = json.loads(Path(json_result_path).read_text(encoding="utf-8"))
+    baseline_result_revision = baseline_report["result"]["revision"]
     async with page.expect_download() as html_download_info:
         await page.get_by_role("button", name="HTML", exact=True).click()
     html_download = await html_download_info.value
@@ -2110,6 +2185,7 @@ async def _exercise_captured_evaluation(
         corpus=corpus,
         dashboard_result_path=Path(json_result_path),
         scenario_result_path=scenario_result_path,
+        authored_result_path=authored_result_path,
     )
 
     await reopen_catalog()
@@ -2199,6 +2275,7 @@ async def _exercise_local_eval_acceptance(
     corpus: dict[str, object],
     dashboard_result_path: Path,
     scenario_result_path: Path,
+    authored_result_path: Path,
 ) -> None:
     """Prove that dashboard exports are the exact local reporting and CI inputs."""
 
@@ -2234,6 +2311,8 @@ async def _exercise_local_eval_acceptance(
         dashboard_report_path = output_root / "dashboard-report.html"
         scenario_report_path = output_root / "scenario-report.html"
         scenario_comparison_path = output_root / "scenario-comparison.json"
+        authored_report_path = output_root / "authored-report.html"
+        authored_comparison_path = output_root / "authored-comparison.json"
         comparison_path = output_root / "comparison.json"
         target = "dashboard_behavior_live:build_release_acceptance_eval_plan"
 
@@ -2270,6 +2349,21 @@ async def _exercise_local_eval_acceptance(
         )
         await asyncio.to_thread(
             run_command,
+            ["report", str(authored_result_path), "--output", str(authored_report_path)],
+        )
+        await asyncio.to_thread(
+            run_command,
+            [
+                "compare",
+                str(authored_result_path),
+                str(authored_result_path),
+                "--json",
+                "--output",
+                str(authored_comparison_path),
+            ],
+        )
+        await asyncio.to_thread(
+            run_command,
             [
                 "compare",
                 str(scenario_result_path),
@@ -2294,6 +2388,7 @@ async def _exercise_local_eval_acceptance(
         inspection = json.loads(inspection_path.read_text(encoding="utf-8"))
         comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
         scenario_comparison = json.loads(scenario_comparison_path.read_text(encoding="utf-8"))
+        authored_comparison = json.loads(authored_comparison_path.read_text(encoding="utf-8"))
         require_equal(
             inspection["target_key"],
             "dashboard.regressions",
@@ -2321,6 +2416,17 @@ async def _exercise_local_eval_acceptance(
         require(
             "Cayu Eval Report" in scenario_report_path.read_text(encoding="utf-8"),
             "the local CLI must render a downloaded scenario result",
+        )
+        authored_report = authored_report_path.read_text(encoding="utf-8")
+        require(
+            "The known output satisfies the fixed task." in authored_report
+            and "judge_output" not in authored_report,
+            "the installed CLI must render explainable structured evidence without raw output",
+        )
+        require_equal(
+            authored_comparison["structured_judge_comparison_state"],
+            "compared",
+            "the installed CLI must preserve exact structured-comparison semantics",
         )
         require_equal(
             scenario_comparison["regressions"],

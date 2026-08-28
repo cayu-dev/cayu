@@ -249,6 +249,13 @@ def _exact_weighted_decimal(
         )
 
 
+def _exact_decimal_difference(left: Decimal, right: Decimal) -> Decimal:
+    """Subtract bounded structured decimals without ambient-context rounding."""
+
+    with localcontext(_STRUCTURED_JUDGE_DECIMAL_CONTEXT):
+        return left - right
+
+
 def _ordered_sequence_input(
     value: object,
     field_name: str,

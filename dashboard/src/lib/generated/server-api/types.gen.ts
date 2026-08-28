@@ -3736,9 +3736,25 @@ export type CorpusComparisonResultSummary = {
      */
     application_release_id: string;
     /**
+     * Corpus Revision
+     */
+    corpus_revision: string;
+    /**
+     * Evidence Policy Revision
+     */
+    evidence_policy_revision: string;
+    /**
+     * External Target Revision
+     */
+    external_target_revision: string | null;
+    /**
      * Memory Attribution Support
      */
     memory_attribution_support?: 'unsupported';
+    /**
+     * Pricing Profile Fingerprint
+     */
+    pricing_profile_fingerprint: string | null;
     /**
      * Result Revision
      */
@@ -3751,6 +3767,18 @@ export type CorpusComparisonResultSummary = {
      * Status
      */
     status: 'passed' | 'failed' | 'unavailable' | 'error';
+    /**
+     * Suite Id
+     */
+    suite_id: string;
+    /**
+     * Suite Revision
+     */
+    suite_revision: string;
+    /**
+     * Target Key
+     */
+    target_key: string;
 };
 
 /**
@@ -3773,11 +3801,23 @@ export type CorpusExecutionComparison = {
     /**
      * Schema Version
      */
-    schema_version?: 1;
+    schema_version?: 2;
     /**
      * Score Tolerance
      */
     score_tolerance?: number;
+    /**
+     * Structured Judge Comparison State
+     */
+    structured_judge_comparison_state: 'compared' | 'contract_incompatible' | 'no_structured_judges' | 'observation_identity_mismatch' | 'source_detail_unavailable';
+    /**
+     * Structured Judge Observation Mismatches
+     */
+    structured_judge_observation_mismatches?: Array<EvalStructuredJudgeObservationMismatchV1>;
+    /**
+     * Structured Judgments
+     */
+    structured_judgments?: Array<EvalStructuredJudgeComparisonV1>;
 };
 
 /**
@@ -4443,6 +4483,37 @@ export type EnvironmentsResponse = {
 };
 
 /**
+ * EvalAssertionPresentationV1
+ */
+export type EvalAssertionPresentationV1 = {
+    /**
+     * Assertion Id
+     */
+    assertion_id: string;
+    /**
+     * Assertion Revision
+     */
+    assertion_revision: string;
+    /**
+     * Category
+     */
+    category: 'deterministic' | 'semantic';
+    /**
+     * Kind
+     */
+    kind: string;
+    /**
+     * Outcome
+     */
+    outcome: 'passed' | 'failed' | 'unavailable' | 'error';
+    /**
+     * Score
+     */
+    score?: number | null;
+    structured_judge?: EvalStructuredJudgePresentationV1 | null;
+};
+
+/**
  * EvalAuthoredSuiteAdmittedRun
  */
 export type EvalAuthoredSuiteAdmittedRun = {
@@ -4953,6 +5024,33 @@ export type EvalCaseDraftV2 = {
     } & EvalSimpleInputStimulusV1) | ({
         kind: 'scenario';
     } & EvalScenarioStimulusV1);
+};
+
+/**
+ * EvalCasePresentationV1
+ */
+export type EvalCasePresentationV1 = {
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Case Revision
+     */
+    case_revision: string;
+    dimensions: EvalResultOutcomeDimensionsV1;
+    /**
+     * Score
+     */
+    score?: number | null;
+    /**
+     * Status
+     */
+    status: 'passed' | 'failed' | 'unavailable' | 'error';
+    /**
+     * Trials
+     */
+    trials: Array<EvalTrialPresentationV1>;
 };
 
 /**
@@ -5871,6 +5969,7 @@ export type EvalResultComparisonResponse = {
  */
 export type EvalResultDetailResponse = {
     baseline?: EvalBaselineRecord | null;
+    presentation: EvalResultPresentationV1;
     record: EvalResultRecord;
     /**
      * Result
@@ -5884,6 +5983,38 @@ export type EvalResultDetailResponse = {
  * How one immutable published result was produced.
  */
 export type EvalResultOrigin = 'captured_session' | 'fresh_execution';
+
+/**
+ * EvalResultOutcomeDimensionsV1
+ *
+ * Orthogonal result states that must not be collapsed into one opaque status.
+ */
+export type EvalResultOutcomeDimensionsV1 = {
+    /**
+     * Candidate
+     */
+    candidate: 'passed' | 'failed' | 'not_scored';
+    /**
+     * Deterministic Assertions
+     */
+    deterministic_assertions: 'passed' | 'failed' | 'unavailable' | 'error' | 'not_used';
+    /**
+     * Evaluator Health
+     */
+    evaluator_health: 'healthy' | 'unavailable' | 'error' | 'not_used';
+    /**
+     * Evidence
+     */
+    evidence: 'complete' | 'incomplete' | 'unavailable';
+    /**
+     * Runtime
+     */
+    runtime: 'completed' | 'failed' | 'unavailable' | 'not_executed';
+    /**
+     * Semantic Quality
+     */
+    semantic_quality: 'passed' | 'failed' | 'unavailable' | 'error' | 'not_used';
+};
 
 /**
  * EvalResultPage
@@ -5901,6 +6032,72 @@ export type EvalResultPage = {
      * Next Cursor
      */
     next_cursor?: string | null;
+};
+
+/**
+ * EvalResultPresentationV1
+ *
+ * Canonical explainable projection for one immutable public eval result.
+ */
+export type EvalResultPresentationV1 = {
+    /**
+     * App Manifest Fingerprint
+     */
+    app_manifest_fingerprint: string;
+    /**
+     * Application Release Id
+     */
+    application_release_id: string;
+    /**
+     * Cases
+     */
+    cases: Array<EvalCasePresentationV1>;
+    /**
+     * Corpus Revision
+     */
+    corpus_revision: string;
+    dimensions: EvalResultOutcomeDimensionsV1;
+    /**
+     * Evaluation Revision
+     */
+    evaluation_revision: string;
+    /**
+     * Evidence Policy Revision
+     */
+    evidence_policy_revision: string;
+    origin: EvalResultOrigin;
+    /**
+     * Pricing Profile Fingerprint
+     */
+    pricing_profile_fingerprint: string | null;
+    /**
+     * Result Revision
+     */
+    result_revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Score
+     */
+    score?: number | null;
+    /**
+     * Status
+     */
+    status: 'passed' | 'failed' | 'unavailable' | 'error';
+    /**
+     * Suite Id
+     */
+    suite_id: string;
+    /**
+     * Suite Revision
+     */
+    suite_revision: string;
+    /**
+     * Target Key
+     */
+    target_key: string;
 };
 
 /**
@@ -5950,6 +6147,7 @@ export type EvalResultRecord = {
  */
 export type EvalResultResponse = {
     baseline?: EvalBaselineRecord | null;
+    presentation: EvalResultPresentationV1;
     result: CorpusExecutionResult;
     run: EvalRunRecord;
 };
@@ -6683,6 +6881,163 @@ export type EvalSimpleInputStimulusV1 = {
 };
 
 /**
+ * EvalStructuredJudgeComparisonV1
+ *
+ * Explainable comparison of one exact case/trial/assertion observation.
+ */
+export type EvalStructuredJudgeComparisonV1 = {
+    /**
+     * Aggregate Change
+     */
+    aggregate_change: 'improved' | 'regressed' | 'unchanged' | 'unavailable';
+    /**
+     * Aggregate Delta
+     */
+    aggregate_delta: string | null;
+    /**
+     * Assertion Id
+     */
+    assertion_id: string;
+    baseline: EvalStructuredJudgePresentationV1;
+    /**
+     * Baseline Outcome
+     */
+    baseline_outcome: 'passed' | 'failed' | 'unavailable' | 'error';
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Criteria
+     */
+    criteria?: Array<EvalStructuredJudgeCriterionComparisonV1>;
+    current: EvalStructuredJudgePresentationV1;
+    /**
+     * Current Outcome
+     */
+    current_outcome: 'passed' | 'failed' | 'unavailable' | 'error';
+    /**
+     * Evaluator Change
+     */
+    evaluator_change: 'improved' | 'regressed' | 'unchanged';
+    /**
+     * Regressed
+     */
+    regressed: boolean;
+    /**
+     * Trial Number
+     */
+    trial_number?: number | null;
+};
+
+/**
+ * EvalStructuredJudgeCriterionComparisonV1
+ *
+ * Exact criterion delta for one identity-matched structured judgment.
+ */
+export type EvalStructuredJudgeCriterionComparisonV1 = {
+    /**
+     * Baseline Explanation State
+     */
+    baseline_explanation_state: 'available' | 'redacted' | 'unavailable';
+    /**
+     * Baseline Score
+     */
+    baseline_score: string;
+    /**
+     * Criterion Id
+     */
+    criterion_id: string;
+    /**
+     * Current Explanation State
+     */
+    current_explanation_state: 'available' | 'redacted' | 'unavailable';
+    /**
+     * Current Score
+     */
+    current_score: string;
+    /**
+     * Score Delta
+     */
+    score_delta: string;
+    /**
+     * Weight
+     */
+    weight: string;
+};
+
+/**
+ * EvalStructuredJudgeCriterionPresentationV1
+ */
+export type EvalStructuredJudgeCriterionPresentationV1 = {
+    /**
+     * Criterion Id
+     */
+    criterion_id: string;
+    /**
+     * Explanation
+     */
+    explanation: string | null;
+    /**
+     * Explanation State
+     */
+    explanation_state: 'available' | 'redacted' | 'unavailable';
+    /**
+     * Score
+     */
+    score: string;
+    /**
+     * Weight
+     */
+    weight: string;
+    /**
+     * Weighted Contribution
+     */
+    weighted_contribution: string;
+};
+
+/**
+ * EvalStructuredJudgeObservationMismatchV1
+ *
+ * One structured observation present on only one side of a comparison.
+ */
+export type EvalStructuredJudgeObservationMismatchV1 = {
+    /**
+     * Assertion Id
+     */
+    assertion_id: string;
+    /**
+     * Availability
+     */
+    availability: 'baseline_only' | 'current_only';
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Trial Number
+     */
+    trial_number?: number | null;
+};
+
+/**
+ * EvalStructuredJudgePresentationV1
+ *
+ * Decision-useful safe view of one admitted structured judgment.
+ */
+export type EvalStructuredJudgePresentationV1 = {
+    /**
+     * Criteria
+     */
+    criteria?: Array<EvalStructuredJudgeCriterionPresentationV1>;
+    detail: PublishedStructuredModelJudgeDetail;
+    /**
+     * Threshold Passed
+     */
+    threshold_passed: boolean | null;
+};
+
+/**
  * EvalSuiteAuthoringDiagnostic
  */
 export type EvalSuiteAuthoringDiagnostic = {
@@ -7134,6 +7489,30 @@ export type EvalTrialOutputPreviewV1 = {
      * Text
      */
     text?: string;
+};
+
+/**
+ * EvalTrialPresentationV1
+ */
+export type EvalTrialPresentationV1 = {
+    /**
+     * Assertions
+     */
+    assertions: Array<EvalAssertionPresentationV1>;
+    diagnostic_code?: EvalTrialDiagnosticCode | null;
+    dimensions: EvalResultOutcomeDimensionsV1;
+    /**
+     * Score
+     */
+    score?: number | null;
+    /**
+     * Status
+     */
+    status: 'passed' | 'failed' | 'unavailable' | 'error';
+    /**
+     * Trial Number
+     */
+    trial_number?: number | null;
 };
 
 /**

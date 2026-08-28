@@ -192,9 +192,16 @@ def captured_result_for_corpus(
         "score": fresh_result.run.cases[0].score,
         "assertions": [item.model_dump(mode="json") for item in assertions],
     }
-    score = CapturedRunScoreV1(
-        revision=_content_revision(score_document, "captured run score"),
-        **score_document,
+    score = CapturedRunScoreV1.model_validate_json(
+        json.dumps(
+            {
+                "revision": _content_revision(score_document, "captured run score"),
+                **score_document,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
     )
     return CapturedEvaluationResultV1.create(
         corpus=corpus,

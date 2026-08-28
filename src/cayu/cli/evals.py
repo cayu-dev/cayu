@@ -14,6 +14,7 @@ from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.cli.project import project_context, resolve_eval_project
 from cayu.evals import (
     CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES,
+    EVAL_RESULT_REPORT_MAX_BYTES,
     MEMORY_EXPERIMENT_REPORT_MAX_BYTES,
     CapturedEvaluationResultV1,
     CorpusExecutionResult,
@@ -32,7 +33,8 @@ from cayu.evals import (
     corpus_execution_comparison_to_json,
     corpus_execution_result_to_json,
     eval_corpus_inspection_to_json,
-    eval_result_to_json,
+    eval_result_report_from_json,
+    eval_result_report_to_json,
     eval_run_to_json,
     inspect_eval_corpus,
     load_corpus_execution_result,
@@ -42,6 +44,7 @@ from cayu.evals import (
     memory_experiment_report_to_json,
     memory_experiment_request_from_json,
     merge_eval_corpus_files,
+    present_eval_result,
     render_comparison_html,
     render_corpus_execution_comparison_html,
     render_corpus_execution_html,
@@ -308,7 +311,7 @@ def _report(args: argparse.Namespace) -> int:
     result = _load_saved_eval_result(args.input)
     if type(result) is CapturedEvaluationResultV1:
         output = (
-            eval_result_to_json(result)
+            eval_result_report_to_json(result)
             if args.output_format == "json"
             else render_eval_result_html(result)
         )
@@ -316,7 +319,7 @@ def _report(args: argparse.Namespace) -> int:
         return 0
     if type(result) is CorpusExecutionResult:
         output = (
-            corpus_execution_result_to_json(result)
+            eval_result_report_to_json(result)
             if args.output_format == "json"
             else render_corpus_execution_html(result)
         )
@@ -380,12 +383,29 @@ def _compare(args: argparse.Namespace) -> int:
         _write_or_print(output, args.output)
         if not comparison.compatibility.comparable:
             return 2
+        if comparison.structured_judge_comparison_state in {
+            "observation_identity_mismatch",
+            "source_detail_unavailable",
+        }:
+            return 2
         if _status_exit_code(comparison.baseline.status) == 2:
             return 2
         current_exit = _status_exit_code(comparison.current.status)
         if current_exit == 2:
             return 2
-        if current_exit == 1 or comparison.regressions:
+        for published_result in (baseline_result, current_result):
+            dimensions = present_eval_result(published_result).dimensions
+            if (
+                dimensions.evaluator_health in {"error", "unavailable"}
+                or dimensions.runtime in {"failed", "unavailable"}
+                or dimensions.evidence in {"incomplete", "unavailable"}
+            ):
+                return 2
+        if (
+            current_exit == 1
+            or comparison.regressions
+            or any(item.regressed for item in comparison.structured_judgments)
+        ):
             return 1
         return 0
 
@@ -431,17 +451,19 @@ def _load_saved_eval_result(
 ) -> EvalRun | CorpusExecutionResult | CapturedEvaluationResultV1 | MemoryExperimentReport:
     result_path = Path(path)
     with result_path.open("rb") as handle:
-        raw = handle.read(CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES + 1)
-    if len(raw) > CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES:
-        raise ValueError(
-            f"Eval result JSON exceeds {CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES} bytes."
+        raw = handle.read(
+            max(CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES, EVAL_RESULT_REPORT_MAX_BYTES) + 1
         )
+    if len(raw) > EVAL_RESULT_REPORT_MAX_BYTES:
+        raise ValueError(f"Eval result JSON exceeds {EVAL_RESULT_REPORT_MAX_BYTES} bytes.")
     try:
         document = json.loads(raw.decode("utf-8"))
     except UnicodeDecodeError as exc:
         raise ValueError("Eval result JSON must be UTF-8.") from exc
     if not isinstance(document, dict):
         raise ValueError("Eval result JSON must be an object.")
+    if document.get("record_type") == "cayu.eval-result-report":
+        return eval_result_report_from_json(raw).result
     if document.get("origin") == "captured_session":
         return captured_evaluation_result_from_json(raw.decode("utf-8"))
     if document.get("record_type") == "cayu.memory-experiment-report":
