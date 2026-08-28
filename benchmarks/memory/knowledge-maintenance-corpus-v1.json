@@ -1,0 +1,252 @@
+{
+  "schema_version": "cayu.knowledge_maintenance_evaluation_corpus.v1",
+  "corpus_revision": "knowledge-maintenance-reference-v1",
+  "origin": "hermetic_public",
+  "cases": [
+    {
+      "id": "duplicate-merge",
+      "scenario": "duplicate_merge",
+      "entries": [
+        {
+          "id": "duplicate-merge:a",
+          "text": "Atlas API requests time out after 30 seconds. DUPLICATE_TIMEOUT_30"
+        },
+        {
+          "id": "duplicate-merge:b",
+          "text": "The Atlas API request timeout is 30 seconds. DUPLICATE_TIMEOUT_30"
+        },
+        {
+          "id": "duplicate-merge:distractor",
+          "text": "Atlas upload retention is 14 days. UPLOAD_RETENTION_14"
+        }
+      ],
+      "source_entry_ids": ["duplicate-merge:a", "duplicate-merge:b"],
+      "signal_kind": "duplicate_hint",
+      "expected_routed_entry_ids": ["duplicate-merge:a", "duplicate-merge:b"],
+      "replacement_title": "Atlas API timeout",
+      "replacement_text": "Atlas API requests time out after 30 seconds. DUPLICATE_TIMEOUT_30",
+      "claims": [
+        {
+          "id": "duplicate_timeout",
+          "text": "Atlas API requests time out after 30 seconds.",
+          "source_entry_ids": ["duplicate-merge:a", "duplicate-merge:b"]
+        }
+      ],
+      "dispositions": [
+        {"source_entry_id": "duplicate-merge:a", "relation_kind": "supersedes"},
+        {"source_entry_id": "duplicate-merge:b", "relation_kind": "supersedes"}
+      ],
+      "evaluator_verdict": "accepted",
+      "review_decision": "approve",
+      "advance_source_before_review": null,
+      "recall_query": "DUPLICATE_TIMEOUT_30"
+    },
+    {
+      "id": "authoritative-supersession",
+      "scenario": "authoritative_supersession",
+      "entries": [
+        {
+          "id": "authoritative-supersession:old",
+          "text": "The retired Atlas endpoint was /v1. ENDPOINT_HISTORY_V1"
+        },
+        {
+          "id": "authoritative-supersession:authority",
+          "text": "The supported Atlas endpoint is /v2. ENDPOINT_CURRENT_V2"
+        },
+        {
+          "id": "authoritative-supersession:distractor",
+          "text": "Atlas webhooks use HMAC signatures. WEBHOOK_HMAC"
+        }
+      ],
+      "source_entry_ids": [
+        "authoritative-supersession:old",
+        "authoritative-supersession:authority"
+      ],
+      "signal_kind": "exact_reference",
+      "expected_routed_entry_ids": [
+        "authoritative-supersession:old",
+        "authoritative-supersession:authority"
+      ],
+      "replacement_title": "Atlas endpoint policy",
+      "replacement_text": "The supported Atlas endpoint is /v2. ENDPOINT_CURRENT_V2 The retired Atlas endpoint was /v1. ENDPOINT_HISTORY_V1",
+      "claims": [
+        {
+          "id": "endpoint_current",
+          "text": "The supported Atlas endpoint is /v2.",
+          "source_entry_ids": ["authoritative-supersession:authority"]
+        },
+        {
+          "id": "endpoint_history",
+          "text": "The retired Atlas endpoint was /v1.",
+          "source_entry_ids": ["authoritative-supersession:old"]
+        }
+      ],
+      "dispositions": [
+        {"source_entry_id": "authoritative-supersession:old", "relation_kind": "supersedes"},
+        {"source_entry_id": "authoritative-supersession:authority", "relation_kind": "supersedes"}
+      ],
+      "evaluator_verdict": "accepted",
+      "review_decision": "approve",
+      "advance_source_before_review": null,
+      "recall_query": "ENDPOINT_CURRENT_V2"
+    },
+    {
+      "id": "unresolved-contradiction",
+      "scenario": "unresolved_contradiction",
+      "entries": [
+        {
+          "id": "unresolved-contradiction:eight",
+          "text": "The North window opens at 08:00. NORTH_WINDOW_SCHEDULE"
+        },
+        {
+          "id": "unresolved-contradiction:nine",
+          "text": "The North window opens at 09:00. NORTH_WINDOW_SCHEDULE"
+        },
+        {
+          "id": "unresolved-contradiction:distractor",
+          "text": "The South window closes at 18:00. SOUTH_WINDOW_SCHEDULE"
+        }
+      ],
+      "source_entry_ids": [
+        "unresolved-contradiction:eight",
+        "unresolved-contradiction:nine"
+      ],
+      "signal_kind": "contradiction",
+      "expected_routed_entry_ids": [
+        "unresolved-contradiction:eight",
+        "unresolved-contradiction:nine"
+      ],
+      "replacement_title": "Unresolved North window schedule",
+      "replacement_text": "The North window opens at 08:00. The North window opens at 09:00. NORTH_WINDOW_SCHEDULE remains unresolved.",
+      "claims": [
+        {
+          "id": "north_window_eight",
+          "text": "The North window opens at 08:00.",
+          "source_entry_ids": ["unresolved-contradiction:eight"]
+        },
+        {
+          "id": "north_window_nine",
+          "text": "The North window opens at 09:00.",
+          "source_entry_ids": ["unresolved-contradiction:nine"]
+        }
+      ],
+      "dispositions": [
+        {"source_entry_id": "unresolved-contradiction:eight", "relation_kind": "contradicts"},
+        {"source_entry_id": "unresolved-contradiction:nine", "relation_kind": "contradicts"}
+      ],
+      "evaluator_verdict": "rejected",
+      "review_decision": null,
+      "advance_source_before_review": null,
+      "recall_query": "NORTH_WINDOW_SCHEDULE"
+    },
+    {
+      "id": "stale-proposal",
+      "scenario": "stale_proposal",
+      "entries": [
+        {
+          "id": "stale-proposal:a",
+          "text": "Atlas cache entries live for 60 seconds. CACHE_TTL_60"
+        },
+        {
+          "id": "stale-proposal:b",
+          "text": "The Atlas cache TTL is 60 seconds. CACHE_TTL_60"
+        },
+        {
+          "id": "stale-proposal:distractor",
+          "text": "Atlas log retention is 30 days. LOG_RETENTION_30"
+        }
+      ],
+      "source_entry_ids": ["stale-proposal:a", "stale-proposal:b"],
+      "signal_kind": "duplicate_hint",
+      "expected_routed_entry_ids": ["stale-proposal:a", "stale-proposal:b"],
+      "replacement_title": "Atlas cache TTL",
+      "replacement_text": "Atlas cache entries live for 60 seconds. CACHE_TTL_60",
+      "claims": [
+        {
+          "id": "cache_ttl",
+          "text": "Atlas cache entries live for 60 seconds.",
+          "source_entry_ids": ["stale-proposal:a", "stale-proposal:b"]
+        }
+      ],
+      "dispositions": [
+        {"source_entry_id": "stale-proposal:a", "relation_kind": "supersedes"},
+        {"source_entry_id": "stale-proposal:b", "relation_kind": "supersedes"}
+      ],
+      "evaluator_verdict": "accepted",
+      "review_decision": "approve",
+      "advance_source_before_review": "stale-proposal:a",
+      "recall_query": "CACHE_TTL_60"
+    },
+    {
+      "id": "reviewer-rejection",
+      "scenario": "reviewer_rejection",
+      "entries": [
+        {
+          "id": "reviewer-rejection:a",
+          "text": "Atlas exports default to CSV. EXPORT_FORMAT_CSV"
+        },
+        {
+          "id": "reviewer-rejection:b",
+          "text": "The default Atlas export format is CSV. EXPORT_FORMAT_CSV"
+        },
+        {
+          "id": "reviewer-rejection:distractor",
+          "text": "Atlas imports accept JSON. IMPORT_FORMAT_JSON"
+        }
+      ],
+      "source_entry_ids": ["reviewer-rejection:a", "reviewer-rejection:b"],
+      "signal_kind": "duplicate_hint",
+      "expected_routed_entry_ids": ["reviewer-rejection:a", "reviewer-rejection:b"],
+      "replacement_title": "Atlas export format",
+      "replacement_text": "Atlas exports default to CSV. EXPORT_FORMAT_CSV",
+      "claims": [
+        {
+          "id": "export_csv",
+          "text": "Atlas exports default to CSV.",
+          "source_entry_ids": ["reviewer-rejection:a", "reviewer-rejection:b"]
+        }
+      ],
+      "dispositions": [
+        {"source_entry_id": "reviewer-rejection:a", "relation_kind": "supersedes"},
+        {"source_entry_id": "reviewer-rejection:b", "relation_kind": "supersedes"}
+      ],
+      "evaluator_verdict": "accepted",
+      "review_decision": "reject",
+      "advance_source_before_review": null,
+      "recall_query": "EXPORT_FORMAT_CSV"
+    },
+    {
+      "id": "historical-lineage",
+      "scenario": "historical_lineage",
+      "entries": [
+        {
+          "id": "historical-lineage:source",
+          "text": "Atlas releases require two approvals. RELEASE_APPROVALS_TWO"
+        },
+        {
+          "id": "historical-lineage:distractor",
+          "text": "Atlas deployments use rolling updates. DEPLOYMENT_ROLLING"
+        }
+      ],
+      "source_entry_ids": ["historical-lineage:source"],
+      "signal_kind": "exact_reference",
+      "expected_routed_entry_ids": ["historical-lineage:source"],
+      "replacement_title": "Atlas release approvals",
+      "replacement_text": "Atlas releases require two approvals. RELEASE_APPROVALS_TWO",
+      "claims": [
+        {
+          "id": "release_approvals",
+          "text": "Atlas releases require two approvals.",
+          "source_entry_ids": ["historical-lineage:source"]
+        }
+      ],
+      "dispositions": [
+        {"source_entry_id": "historical-lineage:source", "relation_kind": "supersedes"}
+      ],
+      "evaluator_verdict": "accepted",
+      "review_decision": "approve",
+      "advance_source_before_review": null,
+      "recall_query": "RELEASE_APPROVALS_TWO"
+    }
+  ]
+}

@@ -4239,6 +4239,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             stored_proposal, stored_plan, receipt = existing_record
             validate_knowledge_maintenance_proposal_publication_replay(
                 receipt,
+                operation_id=operation_id,
                 proposal=copied_proposal,
                 accepted_plan=copied_plan,
                 entry=copied_entry,

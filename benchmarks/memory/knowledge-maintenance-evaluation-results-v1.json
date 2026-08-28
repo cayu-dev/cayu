@@ -1,0 +1,336 @@
+{
+  "corpus_revision": "knowledge-maintenance-reference-v1",
+  "results": [
+    {
+      "backend": "memory",
+      "cases": [
+        {
+          "case_id": "duplicate-merge",
+          "evidence_retention": 1.0,
+          "information_retention": 1.0,
+          "latency_ms": 38.410209,
+          "lifecycle_correct": true,
+          "lineage_correct": true,
+          "model_call_count": 0,
+          "planning_outcome": "accepted",
+          "recalled_entry_ids": [
+            "maintenance-replacement-9c15c9ef7c9d1b4ec0a77f98056a088d1c370652bc32b5567e7fe58e49158f74"
+          ],
+          "routed_entry_ids": [
+            "duplicate-merge:a",
+            "duplicate-merge:b"
+          ],
+          "routing_precision": 1.0,
+          "routing_recall": 1.0,
+          "scenario": "duplicate_merge",
+          "storage_outcome": "applied",
+          "unsafe_acceptance_count": 0
+        },
+        {
+          "case_id": "authoritative-supersession",
+          "evidence_retention": 1.0,
+          "information_retention": 1.0,
+          "latency_ms": 40.075792,
+          "lifecycle_correct": true,
+          "lineage_correct": true,
+          "model_call_count": 0,
+          "planning_outcome": "accepted",
+          "recalled_entry_ids": [
+            "maintenance-replacement-d90096d4168f6834b863721e3a60caed39bd4f6d91c7c577709d8bc9c2b4f454"
+          ],
+          "routed_entry_ids": [
+            "authoritative-supersession:authority",
+            "authoritative-supersession:old"
+          ],
+          "routing_precision": 1.0,
+          "routing_recall": 1.0,
+          "scenario": "authoritative_supersession",
+          "storage_outcome": "applied",
+          "unsafe_acceptance_count": 0
+        },
+        {
+          "case_id": "unresolved-contradiction",
+          "evidence_retention": null,
+          "information_retention": 1.0,
+          "latency_ms": 18.056541,
+          "lifecycle_correct": true,
+          "lineage_correct": true,
+          "model_call_count": 0,
+          "planning_outcome": "evaluator_rejected",
+          "recalled_entry_ids": [
+            "unresolved-contradiction:eight",
+            "unresolved-contradiction:nine"
+          ],
+          "routed_entry_ids": [
+            "unresolved-contradiction:eight",
+            "unresolved-contradiction:nine"
+          ],
+          "routing_precision": 1.0,
+          "routing_recall": 1.0,
+          "scenario": "unresolved_contradiction",
+          "storage_outcome": "not_published",
+          "unsafe_acceptance_count": 0
+        },
+        {
+          "case_id": "stale-proposal",
+          "evidence_retention": 1.0,
+          "information_retention": 1.0,
+          "latency_ms": 36.691208,
+          "lifecycle_correct": true,
+          "lineage_correct": true,
+          "model_call_count": 0,
+          "planning_outcome": "accepted",
+          "recalled_entry_ids": [
+            "stale-proposal:a",
+            "stale-proposal:b"
+          ],
+          "routed_entry_ids": [
+            "stale-proposal:a",
+            "stale-proposal:b"
+          ],
+          "routing_precision": 1.0,
+          "routing_recall": 1.0,
+          "scenario": "stale_proposal",
+          "storage_outcome": "stale",
+          "unsafe_acceptance_count": 0
+        },
+        {
+          "case_id": "reviewer-rejection",
+          "evidence_retention": 1.0,
+          "information_retention": 1.0,
+          "latency_ms": 34.626167,
+          "lifecycle_correct": true,
+          "lineage_correct": true,
+          "model_call_count": 0,
+          "planning_outcome": "accepted",
+          "recalled_entry_ids": [
+            "reviewer-rejection:a",
+            "reviewer-rejection:b"
+          ],
+          "routed_entry_ids": [
+            "reviewer-rejection:a",
+            "reviewer-rejection:b"
+          ],
+          "routing_precision": 1.0,
+          "routing_recall": 1.0,
+          "scenario": "reviewer_rejection",
+          "storage_outcome": "rejected",
+          "unsafe_acceptance_count": 0
+        },
+        {
+          "case_id": "historical-lineage",
+          "evidence_retention": 1.0,
+          "information_retention": 1.0,
+          "latency_ms": 27.8605,
+          "lifecycle_correct": true,
+          "lineage_correct": true,
+          "model_call_count": 0,
+          "planning_outcome": "accepted",
+          "recalled_entry_ids": [
+            "maintenance-replacement-47868a93b58b3a1a9255702d75a66d55a0864727e06f6cd7a6f6cce883636100"
+          ],
+          "routed_entry_ids": [
+            "historical-lineage:source"
+          ],
+          "routing_precision": 1.0,
+          "routing_recall": 1.0,
+          "scenario": "historical_lineage",
+          "storage_outcome": "applied",
+          "unsafe_acceptance_count": 0
+        }
+      ],
+      "configuration": {
+        "fixture_clock": "2026-01-01T12:00:00+00:00",
+        "lineage_limit": 50,
+        "lineage_max_bytes": 64000,
+        "model_call_budget": 0,
+        "provider_calls": false
+      },
+      "corpus_origin": "hermetic_public",
+      "corpus_revision": "knowledge-maintenance-reference-v1",
+      "evaluator_identity": "cayu.knowledge-maintenance-evaluation-fixture-evaluator.v1",
+      "execution_mode": "deterministic_fixture",
+      "metrics": {
+        "case_count": 6,
+        "evidence_retention": 1.0,
+        "information_retention": 1.0,
+        "latency_p50_ms": 34.626167,
+        "latency_p95_ms": 40.075792,
+        "lifecycle_correctness": 1.0,
+        "lineage_correctness": 1.0,
+        "model_call_count": 0,
+        "routing_precision": 1.0,
+        "routing_recall": 1.0,
+        "unsafe_acceptance_rate": 0.0
+      },
+      "planner_identity": "cayu.knowledge-maintenance-evaluation-fixture-planner.v1",
+      "schema_version": "cayu.knowledge_maintenance_evaluation_result.v1"
+    },
+    {
+      "backend": "sqlite",
+      "cases": [
+        {
+          "case_id": "duplicate-merge",
+          "evidence_retention": 1.0,
+          "information_retention": 1.0,
+          "latency_ms": 56.750958,
+          "lifecycle_correct": true,
+          "lineage_correct": true,
+          "model_call_count": 0,
+          "planning_outcome": "accepted",
+          "recalled_entry_ids": [
+            "maintenance-replacement-9c15c9ef7c9d1b4ec0a77f98056a088d1c370652bc32b5567e7fe58e49158f74"
+          ],
+          "routed_entry_ids": [
+            "duplicate-merge:a",
+            "duplicate-merge:b"
+          ],
+          "routing_precision": 1.0,
+          "routing_recall": 1.0,
+          "scenario": "duplicate_merge",
+          "storage_outcome": "applied",
+          "unsafe_acceptance_count": 0
+        },
+        {
+          "case_id": "authoritative-supersession",
+          "evidence_retention": 1.0,
+          "information_retention": 1.0,
+          "latency_ms": 57.558083,
+          "lifecycle_correct": true,
+          "lineage_correct": true,
+          "model_call_count": 0,
+          "planning_outcome": "accepted",
+          "recalled_entry_ids": [
+            "maintenance-replacement-d90096d4168f6834b863721e3a60caed39bd4f6d91c7c577709d8bc9c2b4f454"
+          ],
+          "routed_entry_ids": [
+            "authoritative-supersession:authority",
+            "authoritative-supersession:old"
+          ],
+          "routing_precision": 1.0,
+          "routing_recall": 1.0,
+          "scenario": "authoritative_supersession",
+          "storage_outcome": "applied",
+          "unsafe_acceptance_count": 0
+        },
+        {
+          "case_id": "unresolved-contradiction",
+          "evidence_retention": null,
+          "information_retention": 1.0,
+          "latency_ms": 22.140208,
+          "lifecycle_correct": true,
+          "lineage_correct": true,
+          "model_call_count": 0,
+          "planning_outcome": "evaluator_rejected",
+          "recalled_entry_ids": [
+            "unresolved-contradiction:eight",
+            "unresolved-contradiction:nine"
+          ],
+          "routed_entry_ids": [
+            "unresolved-contradiction:eight",
+            "unresolved-contradiction:nine"
+          ],
+          "routing_precision": 1.0,
+          "routing_recall": 1.0,
+          "scenario": "unresolved_contradiction",
+          "storage_outcome": "not_published",
+          "unsafe_acceptance_count": 0
+        },
+        {
+          "case_id": "stale-proposal",
+          "evidence_retention": 1.0,
+          "information_retention": 1.0,
+          "latency_ms": 48.372209,
+          "lifecycle_correct": true,
+          "lineage_correct": true,
+          "model_call_count": 0,
+          "planning_outcome": "accepted",
+          "recalled_entry_ids": [
+            "stale-proposal:a",
+            "stale-proposal:b"
+          ],
+          "routed_entry_ids": [
+            "stale-proposal:a",
+            "stale-proposal:b"
+          ],
+          "routing_precision": 1.0,
+          "routing_recall": 1.0,
+          "scenario": "stale_proposal",
+          "storage_outcome": "stale",
+          "unsafe_acceptance_count": 0
+        },
+        {
+          "case_id": "reviewer-rejection",
+          "evidence_retention": 1.0,
+          "information_retention": 1.0,
+          "latency_ms": 50.947166,
+          "lifecycle_correct": true,
+          "lineage_correct": true,
+          "model_call_count": 0,
+          "planning_outcome": "accepted",
+          "recalled_entry_ids": [
+            "reviewer-rejection:a",
+            "reviewer-rejection:b"
+          ],
+          "routed_entry_ids": [
+            "reviewer-rejection:a",
+            "reviewer-rejection:b"
+          ],
+          "routing_precision": 1.0,
+          "routing_recall": 1.0,
+          "scenario": "reviewer_rejection",
+          "storage_outcome": "rejected",
+          "unsafe_acceptance_count": 0
+        },
+        {
+          "case_id": "historical-lineage",
+          "evidence_retention": 1.0,
+          "information_retention": 1.0,
+          "latency_ms": 38.4915,
+          "lifecycle_correct": true,
+          "lineage_correct": true,
+          "model_call_count": 0,
+          "planning_outcome": "accepted",
+          "recalled_entry_ids": [
+            "maintenance-replacement-47868a93b58b3a1a9255702d75a66d55a0864727e06f6cd7a6f6cce883636100"
+          ],
+          "routed_entry_ids": [
+            "historical-lineage:source"
+          ],
+          "routing_precision": 1.0,
+          "routing_recall": 1.0,
+          "scenario": "historical_lineage",
+          "storage_outcome": "applied",
+          "unsafe_acceptance_count": 0
+        }
+      ],
+      "configuration": {
+        "fixture_clock": "2026-01-01T12:00:00+00:00",
+        "lineage_limit": 50,
+        "lineage_max_bytes": 64000,
+        "model_call_budget": 0,
+        "provider_calls": false
+      },
+      "corpus_origin": "hermetic_public",
+      "corpus_revision": "knowledge-maintenance-reference-v1",
+      "evaluator_identity": "cayu.knowledge-maintenance-evaluation-fixture-evaluator.v1",
+      "execution_mode": "deterministic_fixture",
+      "metrics": {
+        "case_count": 6,
+        "evidence_retention": 1.0,
+        "information_retention": 1.0,
+        "latency_p50_ms": 48.372209,
+        "latency_p95_ms": 57.558083,
+        "lifecycle_correctness": 1.0,
+        "lineage_correctness": 1.0,
+        "model_call_count": 0,
+        "routing_precision": 1.0,
+        "routing_recall": 1.0,
+        "unsafe_acceptance_rate": 0.0
+      },
+      "planner_identity": "cayu.knowledge-maintenance-evaluation-fixture-planner.v1",
+      "schema_version": "cayu.knowledge_maintenance_evaluation_result.v1"
+    }
+  ],
+  "schema_version": "cayu.knowledge_maintenance_evaluation_matrix.v1"
+}

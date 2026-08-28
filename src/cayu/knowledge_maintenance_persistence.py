@@ -570,19 +570,32 @@ class KnowledgeMaintenanceProposalPublisher:
             replacement=indexed.entry,
             proposed_at=proposed_at,
         )
-        receipt = await self._store.publish_maintenance_proposal(
+        request_sha256 = _proposal_publication_request_sha256(
+            operation_id,
             indexed.entry,
             indexed.chunks,
-            evidence=evidence,
+            evidence,
+            proposal,
+            accepted_plan,
+        )
+        receipt = copy_knowledge_maintenance_proposal_publication_receipt(
+            await self._store.publish_maintenance_proposal(
+                indexed.entry,
+                indexed.chunks,
+                evidence=evidence,
+                proposal=proposal,
+                accepted_plan=accepted_plan,
+                operation_id=operation_id,
+                access_scope=self._access_scope,
+            )
+        )
+        validate_knowledge_maintenance_proposal_publication_replay(
+            receipt,
+            operation_id=operation_id,
             proposal=proposal,
             accepted_plan=accepted_plan,
-            operation_id=operation_id,
-            access_scope=self._access_scope,
-        )
-        outcome = (
-            KnowledgeMaintenanceProposalPublicationOutcome.PENDING_PERSISTED
-            if not receipt.replayed
-            else KnowledgeMaintenanceProposalPublicationOutcome.EXISTING_PENDING
+            entry=indexed.entry,
+            request_sha256=request_sha256,
         )
         if receipt.replayed:
             loaded = await self._store.load_maintenance_proposal_publication(
@@ -591,13 +604,29 @@ class KnowledgeMaintenanceProposalPublisher:
             )
             if loaded is None:
                 raise RuntimeError("Proposal replay receipt exists without its durable artifact.")
+            replay_receipt = copy_knowledge_maintenance_proposal_publication_receipt(
+                receipt,
+                replayed=True,
+            )
+            if (
+                loaded.proposal != proposal
+                or loaded.accepted_plan != accepted_plan
+                or loaded.replacement != indexed.entry
+                or loaded.receipt != replay_receipt
+            ):
+                raise KnowledgeMaintenanceProposalPublicationConflict("malformed_receipt")
+            if loaded.outcome not in {
+                KnowledgeMaintenanceProposalPublicationOutcome.EXISTING_PENDING,
+                KnowledgeMaintenanceProposalPublicationOutcome.EXISTING_DECIDED,
+            }:
+                raise KnowledgeMaintenanceProposalPublicationConflict("malformed_receipt")
             return loaded
         return KnowledgeMaintenanceProposalPublication(
             proposal=proposal,
             accepted_plan=accepted_plan,
             replacement=indexed.entry,
             receipt=receipt,
-            outcome=outcome,
+            outcome=KnowledgeMaintenanceProposalPublicationOutcome.PENDING_PERSISTED,
         )
 
     async def load(self, proposal_id: str) -> KnowledgeMaintenanceProposalPublication | None:
@@ -950,6 +979,33 @@ def _build_source_evidence(
     return result
 
 
+def _proposal_publication_request_sha256(
+    operation_id: str,
+    entry: KnowledgeEntry,
+    chunks: list[KnowledgeChunk],
+    evidence: list[KnowledgeEvidence],
+    proposal: KnowledgeMaintenanceProposal,
+    accepted_plan: KnowledgeMaintenanceAcceptedPlan,
+) -> str:
+    return _fingerprint(
+        {
+            "contract": "cayu.knowledge-maintenance-proposal-publication.v1",
+            "operation_id": operation_id,
+            "entry": entry.model_dump(mode="json"),
+            "chunks": [
+                chunk.model_dump(mode="json")
+                for chunk in sorted(chunks, key=lambda item: item.chunk_index)
+            ],
+            "evidence": [
+                item.model_dump(mode="json") for item in sorted(evidence, key=lambda item: item.id)
+            ],
+            "proposal": proposal.model_dump(mode="json"),
+            "accepted_plan": accepted_plan.model_dump(mode="json"),
+        },
+        "knowledge maintenance proposal publication request",
+    )
+
+
 def prepare_knowledge_maintenance_proposal_publication(
     entry: KnowledgeEntry,
     chunks: list[KnowledgeChunk],
@@ -1055,17 +1111,13 @@ def prepare_knowledge_maintenance_proposal_publication(
         seen_drafts.add(draft_id)
     if seen_drafts != set(draft_by_id):
         raise ValueError("The maintenance proposal omits a planned relation.")
-    request_sha256 = _fingerprint(
-        {
-            "contract": "cayu.knowledge-maintenance-proposal-publication.v1",
-            "operation_id": operation_id,
-            "entry": copied_entry.model_dump(mode="json"),
-            "chunks": [chunk.model_dump(mode="json") for chunk in copied_chunks],
-            "evidence": [item.model_dump(mode="json") for item in copied_evidence],
-            "proposal": copied_proposal.model_dump(mode="json"),
-            "accepted_plan": copied_plan.model_dump(mode="json"),
-        },
-        "knowledge maintenance proposal publication request",
+    request_sha256 = _proposal_publication_request_sha256(
+        operation_id,
+        copied_entry,
+        copied_chunks,
+        copied_evidence,
+        copied_proposal,
+        copied_plan,
     )
     return (
         operation_id,
@@ -1081,15 +1133,17 @@ def prepare_knowledge_maintenance_proposal_publication(
 def validate_knowledge_maintenance_proposal_publication_replay(
     receipt: KnowledgeMaintenanceProposalPublicationReceipt,
     *,
+    operation_id: str,
     proposal: KnowledgeMaintenanceProposal,
     accepted_plan: KnowledgeMaintenanceAcceptedPlan,
     entry: KnowledgeEntry,
     request_sha256: str,
 ) -> None:
-    """Reject an operation-id replay carrying different material."""
+    """Reject a publication receipt carrying different request material."""
 
     if (
-        receipt.proposal_id != proposal.id
+        receipt.operation_id != operation_id
+        or receipt.proposal_id != proposal.id
         or receipt.proposal_fingerprint != proposal.fingerprint
         or receipt.accepted_plan_fingerprint != accepted_plan.fingerprint
         or receipt.replacement != KnowledgeRevisionRef(entry_id=entry.id, revision=entry.revision)

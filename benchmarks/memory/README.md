@@ -118,3 +118,37 @@ applying maintenance; it is not a historical binary comparison. The applied lane
 measures canonical proposal/decision preparation, atomic activation plus archival
 and relation publication, exact replay, receipt loading, and steady-state SQLite
 bytes. It makes no provider calls.
+
+## Reviewed knowledge-maintenance reference evaluation
+
+`knowledge-maintenance-corpus-v1.json` and
+`knowledge-maintenance-evaluation-results-v1.json` exercise the full reviewed
+maintenance path rather than another isolated component benchmark. Run the checked
+in-memory/SQLite matrix with:
+
+```bash
+PYTHONPATH=src python scripts/run_knowledge_maintenance_evaluation.py
+```
+
+The six workflows cover duplicate merge, authoritative supersession, an unresolved
+contradiction that must fail before publication, a proposal made stale before review,
+explicit reviewer rejection, and normal recall plus historical lineage after approval.
+The report records routing precision/recall, exact claim-to-source retention, durable
+source-revision evidence retention after the terminal review attempt, unsafe acceptance,
+exact lifecycle preservation, lineage correctness, model-call count, and end-to-end
+latency. PostgreSQL runs the same corpus in its store parity test. A case may contain up
+to 100 entries, of which at most 50 can be maintenance sources; recall and historical
+inspection use that same full source bound. Each recall query is limited to the recall
+primitive's executable 8,192-byte boundary, so every accepted corpus can run without a
+later input-validation failure.
+
+This is deliberately an orchestration and safety evaluation. Its fixture planner and
+independent fixture evaluator are deterministic and configured with a zero-model-call
+budget, so a green result proves that Cayu preserves and enforces a known plan across
+its boundaries. It does not claim that an arbitrary model will discover duplicates,
+resolve truth, or write a high-quality replacement. Evaluate provider-backed components
+separately with a private production-shaped corpus, and do not commit that corpus or its
+report. The loader accepts the same schema with `origin="external_private"`, bounded to
+4 MiB of canonical corpus input, 64 KiB of recorded configuration, and a 16 MiB result.
+Lifecycle, evidence, and lineage scores bind returned store results to the exact requested
+entry revisions and relation identities rather than accepting matching logical IDs alone.

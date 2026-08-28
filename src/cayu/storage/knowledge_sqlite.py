@@ -1057,6 +1057,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     stored_proposal, stored_plan, receipt, _ = existing
                     validate_knowledge_maintenance_proposal_publication_replay(
                         receipt,
+                        operation_id=operation_id,
                         proposal=copied_proposal,
                         accepted_plan=copied_plan,
                         entry=copied_entry,

@@ -1055,6 +1055,44 @@ separate decision about what active memory enters model context. See the credent
 [`reviewed_knowledge_curator.py`](../examples/reviewed_knowledge_curator.py) example for a
 completed-session-to-pending-to-approved-to-later-recall path.
 
+## End-to-end reviewed-maintenance evaluation
+
+The provider-free `run_knowledge_maintenance_evaluation(...)` contract connects the
+maintenance router, planner/evaluator boundary, pending-proposal publisher, explicit
+review transaction, active recall, and exact historical lineage in one reusable corpus
+runner. Its public corpus contains six reference outcomes: duplicate merge,
+authoritative supersession, unresolved contradiction, stale proposal, reviewer
+rejection, and historical lineage after approval. In-memory and SQLite results are
+checked into the repository; PostgreSQL executes the same correctness corpus in its
+store parity suite.
+
+The runner measures exact routed-set precision and recall, replacement claim retention
+with its exact source mappings, exact source-revision evidence retained after review,
+unsafe acceptance, exact lifecycle preservation, lineage correctness, and end-to-end
+latency. Historical correctness requires both the archived exact-revision read and its
+typed replacement lineage. It requires an empty store so pre-existing records cannot
+hide leakage or change the expected lifecycle. Every case has a separate namespace and
+application-owned access scope. Corpus validation applies the executable 50-source
+maintenance bound and the recall primitive's 8,192-byte query bound, and recall inspects
+that complete permitted lineage set. Receipt, evidence, lifecycle, and lineage checks bind
+the full returned contracts to the proposal-derived entry revisions, relation identities,
+and requested result queries; a matching logical entry ID is not sufficient.
+
+The fixture planner and evaluator are separate components with explicit identities, but
+both have a hard zero-model-call and zero-cost budget. This intentionally separates the
+framework question—whether Cayu safely carries a known semantic decision through all
+boundaries—from the provider-dependent question of whether a particular model produces
+good semantic decisions. The evaluation does not discover signals, judge real-world
+truth, change `ContextExposure`, or decide what memory enters agent context. Private
+production-shaped corpora use the same bounded schema with
+`origin="external_private"` and remain outside the public repository.
+
+Run the public backend matrix from the repository root:
+
+```bash
+PYTHONPATH=src python scripts/run_knowledge_maintenance_evaluation.py
+```
+
 ## Derived-index identity and readiness
 
 Every comparable durable embedding uses one immutable
