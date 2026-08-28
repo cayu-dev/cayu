@@ -68,8 +68,78 @@ ordering; `updated_at` is attributable event time and is not used as concurrency
 authority because distributed worker clocks may skew.
 Checkpoint advancement happens only after processing, so a crash or
 cancellation beforehand leaves the prior frontier available for an idempotent
-retry. This release stores those facts only; it does not run the future
-full-index/delta coordinator or wake an idle agent.
+retry.
+
+`AgentRecallProcessor` is the provider-neutral coordinator over those facts.
+Given one exact agent, durable work context, namespace, access scope, prior
+checkpoint, and `RecallSituation`, it selects one of three explicit paths:
+
+- no checkpoint or a changed work context runs full-index knowledge recall;
+- an unchanged context with newer source frontiers runs bounded delta recall;
+- an unchanged context with no newer frontier returns an explicit no-work
+  result without running retrieval.
+
+The request requires an exact single-namespace `KnowledgeAccessScope` matching
+the checkpoint namespace. A multi-namespace or privileged scope would couple
+independent namespace frontiers and make unrelated changes trigger empty delta
+work; callers must derive the narrow principal-authorized scope first.
+
+Full-index recall is also evaluated inside the captured store frontier. Current
+revisions materialized after its knowledge high-water mark, semantic projections
+published after its readiness high-water mark, and relation lineage published
+after the knowledge frontier are excluded from that result and remain eligible
+for the next delta. Attached lineage resolves endpoint revision, lifecycle
+status, and currentness at that same knowledge frontier while still requiring
+live endpoint authorization, so a concurrent revision can neither leak future
+metadata nor bypass a later access revocation. The processor does not
+approximate this boundary with wall clock time or move the high-water read after
+retrieval, either of which could cross or skip a concurrent commit.
+
+Delta recall derives exact current revision references from only the bounded
+change/readiness pages it processed. `KnowledgeStore.search_revisions()`
+enforces that identity set together with the captured knowledge and readiness
+frontiers inside in-memory, SQLite, and PostgreSQL ranking, including their
+embedding variants. It never performs an unrestricted global top-k search and
+filters afterward, so a relevant changed revision cannot be hidden by
+higher-ranked unchanged records. The paired frontier also excludes semantic
+readiness and attached relations published after capture. Its knowledge bound
+uses the revision's latest materialization event, so deleting and recreating an
+entry with the same ID and revision number cannot impersonate the captured
+generation. Stale, retired, deleted, expired, or unauthorized referenced
+revisions are omitted by the store's currentness and access boundary. A
+relation-only change evaluates its canonical subject revision; a later endpoint
+revision remains independently eligible through its own knowledge change.
+
+Every processing result carries the exact work-context identity, captured and
+safely processed frontiers, source events, deduplicated eligible revisions,
+bounded recall diagnostics, and an optional `AgentRecallCheckpoint` proposal.
+The processor never calls `advance_recall_checkpoint()`: the caller must first
+finish any application-owned staging and then apply the proposal with the
+checkpoint store's compare-and-swap fence. A truncated event page advances only
+through its returned ordered prefix. If a retired entry makes an old readiness
+event disappear from the current access view, the checkpoint's already proven
+high-water mark remains the monotonic floor. A semantic timeout/failure leaves
+the readiness cursor retryable even when the lexical knowledge cursor can
+safely advance. A failed full-index semantic lane proposes no checkpoint, so a
+new or changed work-context basis must retry the complete scan. A delta may
+propose only lexical progress when an unfinished readiness frontier still
+guarantees another attempt; if no such frontier remains, it likewise withholds
+the proposal. Supplying the previously returned `AgentRecallFrontier` for an
+unchanged-context delta keeps later observable source events outside that
+retry. Exact currentness is deliberately reevaluated: if a referenced revision
+became stale, it is omitted and its newer revision remains eligible through the
+later change event. Durable replay of an already materialized delivery belongs
+to the subsequent staging/delivery layer.
+
+Operational failures from either required freshness read are normalized to an
+`AgentRecallProcessingError` with a bounded change/readiness failure code and
+the backend exception retained as its cause. Cancellation still propagates
+unchanged, and no failure path constructs a checkpoint proposal.
+
+This primitive does not wake agents, inject provider context, claim
+`ContextExposure`, acknowledge notifications, or change the public knowledge
+tools. Those remain separate scheduling, composition, exposure, and delivery
+responsibilities.
 
 The nearby context concepts have different lifetimes and owners:
 
@@ -93,6 +163,15 @@ measures current-runtime zero-record store construction, indexed current reads,
 CAS revision appends, CAS checkpoint advances, and incremental SQLite storage
 without provider calls. Its runner and fixed regression ceilings are documented
 with the other hermetic memory benchmarks.
+
+The checked [checkpoint-recall performance baseline](../benchmarks/memory/checkpoint-recall-performance-v1.json)
+measures full-index, one-revision delta, maximum 250-reference delta (249
+knowledge changes plus one ready index projection), and no-work processing over
+500 existing records with 50 samples per in-memory and SQLite backend. It makes
+no provider calls. PostgreSQL and pgvector use behavioral integration tests,
+including a query-plan regression proving that frontier-filtered semantic recall
+retains the partial HNSW index; exact scanning remains the bounded-revision,
+negative-filter, oversized-vector, and filtered-underfill fallback.
 
 ## Bounded cross-source recall
 
@@ -1245,10 +1324,21 @@ can distinguish that result from a complete semantic search.
 PostgreSQL materializes the complete readiness identity as typed columns for
 bounded coverage and rebuild scans. Each vector row also records the exact
 pending readiness sequence and attempt that accepted it, so a stale batch
-cannot masquerade as the current write. HNSW indexes are partial to one complete
-compatible projection space; vectors from different models, generators,
-preprocessing versions, dimensions, or index representations never share an
-ANN graph. Schema validation rejects a cross-space HNSW index.
+cannot masquerade as the current write. Projection attempts are append-only
+within an identity. Current search resolves the newest accepted vector no later
+than the current READY event, while frontier search resolves the newest accepted
+vector no later than the READY event at its captured sequence. A newer refresh
+therefore cannot replace or hide the projection selected by an older frontier,
+including across a crash between vector commit and READY publication. HNSW
+indexes are partial to one complete compatible projection space, with separate
+current-projection and historical-frontier graphs so retained attempts cannot
+degrade ordinary current-search candidate budgets. Vectors from different
+models, generators, preprocessing versions, dimensions, or index representations
+never share an ANN graph. Schema validation rejects a cross-space HNSW index.
+Projection publication locks the corresponding readiness-current rows before
+acceptance and activation. New attempts enter as historical rows, and a partial
+unique index enforces at most one current projection per complete identity even
+under concurrent refresh and readiness publication.
 
 Breaking schema revision 44 historically added the readiness event log and
 current pointer while preserving revision-43 canonical state. Pre-identity

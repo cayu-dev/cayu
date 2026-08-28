@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
@@ -148,6 +148,7 @@ from cayu.storage.memory import (
     _validate_knowledge_publication_replay,
     _validate_knowledge_relation_publication_replay,
     _validate_knowledge_revision,
+    _validate_knowledge_search_frontier,
     _validate_revision_append,
     _validate_revision_successor,
     copy_knowledge_access_scope,
@@ -166,6 +167,7 @@ from cayu.storage.memory import (
     copy_knowledge_query,
     copy_knowledge_relation_publication_receipt,
     copy_knowledge_relation_query,
+    copy_knowledge_revision_refs,
     knowledge_entry_payload_bytes,
     prepare_knowledge_maintenance_decision,
     prepare_knowledge_publication,
@@ -174,6 +176,8 @@ from cayu.storage.memory import (
 
 _SEARCH_TOKEN_RE = re.compile(r"\w+")
 _SEARCH_PAGE_SIZE = 500
+_KNOWLEDGE_FTS_TABLE = "cayu_knowledge_chunks_fts"
+_EXACT_REVISION_FTS_TABLE = "cayu_knowledge_exact_revision_fts"
 _CHUNK_ID_LOOKUP_BATCH_SIZE = 400
 _EVIDENCE_ID_LOOKUP_BATCH_SIZE = 400
 _MAINTENANCE_REJECTED_REPLACEMENT_RETIREMENT_TRANSITIONS = frozenset(
@@ -218,6 +222,18 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 self._connection,
                 schema_mode,
                 app_min_supported=_SQLITE_MIN_REQUIRED_REVISION,
+            )
+            self._connection.execute(
+                f"""
+                CREATE VIRTUAL TABLE temp.{_EXACT_REVISION_FTS_TABLE}
+                USING fts5(
+                    entry_id UNINDEXED,
+                    entry_revision UNINDEXED,
+                    chunk_id UNINDEXED,
+                    title,
+                    text
+                )
+                """
             )
         except BaseException:
             self._connection.close()
@@ -900,9 +916,40 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeLineageResult | None:
+        return await self._inspect_lineage(
+            query,
+            access_scope=access_scope,
+            through_sequence=None,
+        )
+
+    async def _inspect_lineage_at_change_sequence(
+        self,
+        query: KnowledgeLineageQuery,
+        *,
+        through_sequence: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeLineageResult | None:
+        _validate_knowledge_change_sequence(through_sequence, "through_sequence")
+        return await self._inspect_lineage(
+            query,
+            access_scope=access_scope,
+            through_sequence=through_sequence,
+        )
+
+    async def _inspect_lineage(
+        self,
+        query: KnowledgeLineageQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None,
+        through_sequence: int | None,
+    ) -> KnowledgeLineageResult | None:
         scope = self._operation_access_scope(access_scope)
         query = copy_knowledge_lineage_query(query)
-        fingerprint = _knowledge_lineage_query_fingerprint(query, scope)
+        fingerprint = _knowledge_lineage_query_fingerprint(
+            query,
+            scope,
+            through_change_sequence=through_sequence,
+        )
         cursor = _decode_knowledge_lineage_cursor(query.cursor, fingerprint=fingerprint)
         async with self._lock:
             with sqlite_support._transaction(self._connection, begin_immediate=False):
@@ -911,10 +958,25 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     query.reference.entry_id,
                     revision=query.reference.revision,
                 )
-                reference_current = self._load_entry_unlocked(query.reference.entry_id)
+                reference_live = self._load_entry_unlocked(query.reference.entry_id)
+                reference_current = (
+                    reference_live
+                    if through_sequence is None
+                    else self._load_entry_at_change_sequence_unlocked(
+                        query.reference.entry_id,
+                        through_sequence=through_sequence,
+                    )
+                )
                 if (
                     reference_exact is None
+                    or reference_live is None
                     or reference_current is None
+                    or not _knowledge_scope_allows_lineage_endpoint(
+                        scope,
+                        reference_exact,
+                        reference_live,
+                        now=access_now,
+                    )
                     or not _knowledge_scope_allows_lineage_endpoint(
                         scope,
                         reference_exact,
@@ -929,6 +991,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     scope,
                     allow_archived_current=True,
                     now=access_now,
+                    through_change_sequence=through_sequence,
                 )
                 cursor_sql = ""
                 cursor_params: list[object] = []
@@ -939,6 +1002,72 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     )
                     created_at = sqlite_support.format_datetime(cursor.created_at)
                     cursor_params.extend([created_at, created_at, cursor.relation_id])
+                frontier_sql = ""
+                frontier_params: list[object] = []
+                current_join_sql = """
+                    JOIN cayu_knowledge_current_entries AS subject_current
+                      ON subject_current.id = relation.subject_entry_id
+                    JOIN cayu_knowledge_current_entries AS object_current
+                      ON object_current.id = relation.object_entry_id
+                """
+                current_join_params: list[object] = []
+                if through_sequence is not None:
+                    frontier_sql = """
+                        AND EXISTS (
+                            SELECT 1
+                            FROM cayu_knowledge_changes AS boundary_change
+                            WHERE boundary_change.relation_id = relation.id
+                              AND boundary_change.sequence <= ?
+                        )
+                    """
+                    frontier_params.append(through_sequence)
+                    current_join_sql = """
+                        JOIN cayu_knowledge_changes AS subject_current_change
+                          ON subject_current_change.entry_id = relation.subject_entry_id
+                         AND subject_current_change.kind <> 'relation_published'
+                         AND subject_current_change.sequence = (
+                             SELECT MAX(subject_boundary.sequence)
+                             FROM cayu_knowledge_changes AS subject_boundary
+                             WHERE subject_boundary.entry_id = relation.subject_entry_id
+                               AND subject_boundary.kind <> 'relation_published'
+                               AND subject_boundary.sequence <= ?
+                         )
+                         AND subject_current_change.sequence = (
+                             SELECT MAX(subject_materialization.sequence)
+                             FROM cayu_knowledge_changes AS subject_materialization
+                             WHERE subject_materialization.entry_id =
+                                       subject_current_change.entry_id
+                               AND subject_materialization.entry_revision =
+                                       subject_current_change.entry_revision
+                               AND subject_materialization.kind <> 'relation_published'
+                         )
+                        JOIN cayu_knowledge_revisions AS subject_current
+                          ON subject_current.entry_id = subject_current_change.entry_id
+                         AND subject_current.revision = subject_current_change.entry_revision
+                        JOIN cayu_knowledge_changes AS object_current_change
+                          ON object_current_change.entry_id = relation.object_entry_id
+                         AND object_current_change.kind <> 'relation_published'
+                         AND object_current_change.sequence = (
+                             SELECT MAX(object_boundary.sequence)
+                             FROM cayu_knowledge_changes AS object_boundary
+                             WHERE object_boundary.entry_id = relation.object_entry_id
+                               AND object_boundary.kind <> 'relation_published'
+                               AND object_boundary.sequence <= ?
+                         )
+                         AND object_current_change.sequence = (
+                             SELECT MAX(object_materialization.sequence)
+                             FROM cayu_knowledge_changes AS object_materialization
+                             WHERE object_materialization.entry_id =
+                                       object_current_change.entry_id
+                               AND object_materialization.entry_revision =
+                                       object_current_change.entry_revision
+                               AND object_materialization.kind <> 'relation_published'
+                         )
+                        JOIN cayu_knowledge_revisions AS object_current
+                          ON object_current.entry_id = object_current_change.entry_id
+                         AND object_current.revision = object_current_change.entry_revision
+                    """
+                    current_join_params.extend((through_sequence, through_sequence))
                 rows = self._connection.execute(
                     f"""
                     SELECT relation.id, relation.subject_entry_id,
@@ -950,22 +1079,22 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                            object_current.revision AS object_current_revision,
                            object_current.status AS object_current_status
                     FROM cayu_knowledge_relations AS relation
-                    JOIN cayu_knowledge_current_entries AS subject_current
-                      ON subject_current.id = relation.subject_entry_id
-                    JOIN cayu_knowledge_current_entries AS object_current
-                      ON object_current.id = relation.object_entry_id
+                    {current_join_sql}
                     WHERE 1 = 1
                     {relation_sql}
                     {lineage_sql}
                     {cursor_sql}
+                    {frontier_sql}
                     {access_sql}
                     ORDER BY relation.created_at ASC, relation.id COLLATE BINARY ASC
                     LIMIT ?
                     """,
                     (
+                        *current_join_params,
                         *relation_params,
                         *lineage_params,
                         *cursor_params,
+                        *frontier_params,
                         *access_params,
                         query.limit + 1,
                     ),
@@ -2023,11 +2152,13 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         )
         accessible_from = """
             FROM cayu_knowledge_index_readiness_events AS event
-            JOIN cayu_knowledge_entries AS logical
-              ON logical.id = event.entry_id
-            JOIN cayu_knowledge_revisions AS e
-              ON e.entry_id = event.entry_id
-             AND e.revision = event.entry_revision
+            JOIN (
+                SELECT logical.id, logical.namespace, revision.*
+                FROM cayu_knowledge_entries AS logical
+                JOIN cayu_knowledge_revisions AS revision
+                  ON revision.entry_id = logical.id
+            ) AS e
+              ON e.id = event.entry_id AND e.revision = event.entry_revision
             JOIN cayu_knowledge_current_entries AS current_entry
               ON current_entry.id = event.entry_id
             WHERE TRUE
@@ -2170,11 +2301,97 @@ class SQLiteKnowledgeStore(KnowledgeStore):
     ) -> KnowledgeSearchResult:
         scope = self._operation_access_scope(access_scope)
         knowledge_query = copy_knowledge_query(query)
+        return await self._search(
+            knowledge_query,
+            scope,
+            revision_refs=None,
+            through_change_sequence=None,
+        )
+
+    async def search_at_frontier(
+        self,
+        query: KnowledgeQuery,
+        *,
+        knowledge_sequence: int,
+        index_readiness_sequence: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSearchResult:
+        scope = self._operation_access_scope(access_scope)
+        knowledge_query = copy_knowledge_query(query)
+        _validate_knowledge_change_sequence(knowledge_sequence, "knowledge_sequence")
+        _validate_knowledge_index_sequence(
+            index_readiness_sequence,
+            "index_readiness_sequence",
+        )
+        return await self._search(
+            knowledge_query,
+            scope,
+            revision_refs=None,
+            through_change_sequence=knowledge_sequence,
+        )
+
+    async def search_revisions(
+        self,
+        query: KnowledgeQuery,
+        revision_refs: Sequence[KnowledgeRevisionRef],
+        *,
+        knowledge_sequence: int | None = None,
+        index_readiness_sequence: int | None = None,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSearchResult:
+        scope = self._operation_access_scope(access_scope)
+        knowledge_query = copy_knowledge_query(query)
+        references = copy_knowledge_revision_refs(revision_refs)
+        _validate_knowledge_search_frontier(
+            knowledge_sequence,
+            index_readiness_sequence,
+        )
+        return await self._search(
+            knowledge_query,
+            scope,
+            revision_refs=references,
+            through_change_sequence=knowledge_sequence,
+        )
+
+    async def _search(
+        self,
+        knowledge_query: KnowledgeQuery,
+        scope: KnowledgeAccessScope,
+        *,
+        revision_refs: tuple[KnowledgeRevisionRef, ...] | None,
+        through_change_sequence: int | None,
+    ) -> KnowledgeSearchResult:
         if knowledge_query.mode not in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}:
             raise ValueError("SQLiteKnowledgeStore supports only auto and keyword search modes.")
         fts_query, preview_terms = _sqlite_knowledge_fts_query(knowledge_query)
         none_fts_query = _sqlite_knowledge_none_fts_query(knowledge_query)
+        if revision_refs is not None:
+            async with self._lock:
+                with sqlite_support._transaction(
+                    self._connection,
+                    begin_immediate=False,
+                ):
+                    return self._search_exact_revisions_unlocked(
+                        knowledge_query,
+                        scope,
+                        revision_refs,
+                        through_change_sequence=through_change_sequence,
+                        fts_query=fts_query,
+                        none_fts_query=none_fts_query,
+                        preview_terms=preview_terms,
+                    )
         where_sql, params = _knowledge_filter_sql(knowledge_query)
+        if through_change_sequence is not None:
+            where_sql += """
+                AND (
+                    SELECT MAX(boundary_change.sequence)
+                    FROM cayu_knowledge_changes AS boundary_change
+                    WHERE boundary_change.entry_id = e.id
+                      AND boundary_change.entry_revision = e.revision
+                      AND boundary_change.kind <> 'relation_published'
+                ) <= ?
+            """
+            params.append(through_change_sequence)
         access_sql, access_params = _knowledge_access_scope_filter_sql(scope)
         where_sql += access_sql
         params.extend(access_params)
@@ -2208,6 +2425,147 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             limit=knowledge_query.limit,
             max_bytes=knowledge_query.max_bytes,
             total_hits_known=total_hits_known,
+        )
+
+    def _search_exact_revisions_unlocked(
+        self,
+        knowledge_query: KnowledgeQuery,
+        scope: KnowledgeAccessScope,
+        revision_refs: tuple[KnowledgeRevisionRef, ...],
+        *,
+        through_change_sequence: int | None,
+        fts_query: str,
+        none_fts_query: str | None,
+        preview_terms: list[str],
+    ) -> KnowledgeSearchResult:
+        """Search only caller-authorized current entries from the bounded exact set.
+
+        A connection-local FTS5 table preserves the durable index's tokenizer and
+        query semantics without making delta cost depend on the complete corpus.
+        """
+
+        entry_ids = sorted({reference.entry_id for reference in revision_refs})
+        access_now = datetime.now(UTC)
+        entries = self._load_entries_unlocked(
+            entry_ids,
+            access_scope=scope,
+            access_now=access_now,
+        )
+        materialization_sequences = (
+            self._load_revision_materialization_sequences_unlocked(revision_refs)
+            if through_change_sequence is not None
+            else None
+        )
+        current_refs_list: list[KnowledgeRevisionRef] = []
+        for reference in revision_refs:
+            entry = entries.get(reference.entry_id)
+            if entry is None or entry.revision != reference.revision:
+                continue
+            if through_change_sequence is not None:
+                assert materialization_sequences is not None
+                sequence = materialization_sequences.get((reference.entry_id, reference.revision))
+                if sequence is None or sequence > through_change_sequence:
+                    continue
+            current_refs_list.append(reference)
+        current_refs = tuple(current_refs_list)
+        chunks_by_revision = self._load_chunks_for_revision_refs_unlocked(current_refs)
+        fts_rows = [
+            (
+                entry.id,
+                entry.revision,
+                chunk.id,
+                entry.title or "",
+                _fts_text_for_entry_chunk(entry, chunk),
+            )
+            for reference in current_refs
+            if (entry := entries.get(reference.entry_id)) is not None
+            for chunk in chunks_by_revision.get((entry.id, entry.revision), [])
+        ]
+        if not fts_rows:
+            return KnowledgeSearchResult(
+                query=knowledge_query,
+                hits=[],
+                truncated=False,
+                limit=knowledge_query.limit,
+                max_bytes=knowledge_query.max_bytes,
+                total_hits_known=0,
+            )
+
+        table = _EXACT_REVISION_FTS_TABLE
+        self._connection.execute(f"DELETE FROM temp.{table}")
+        try:
+            self._connection.executemany(
+                f"""
+                INSERT INTO temp.{table} (
+                    entry_id, entry_revision, chunk_id, title, text
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                fts_rows,
+            )
+            where_sql, params = _knowledge_filter_sql(knowledge_query)
+            total_hits_known = self._count_exact_search_hits_unlocked(
+                fts_query,
+                none_fts_query,
+                where_sql,
+                params,
+            )
+            unique_rows = self._search_exact_unique_rows_unlocked(
+                fts_query=fts_query,
+                none_fts_query=none_fts_query,
+                where_sql=where_sql,
+                params=params,
+                limit=knowledge_query.limit,
+            )
+            hits, byte_truncated = self._hits_from_search_rows_unlocked(
+                unique_rows,
+                knowledge_query,
+                preview_terms,
+            )
+        finally:
+            self._connection.execute(f"DELETE FROM temp.{table}")
+        return KnowledgeSearchResult(
+            query=knowledge_query,
+            hits=hits,
+            truncated=byte_truncated or len(hits) < total_hits_known,
+            limit=knowledge_query.limit,
+            max_bytes=knowledge_query.max_bytes,
+            total_hits_known=total_hits_known,
+        )
+
+    def _count_exact_search_hits_unlocked(
+        self,
+        fts_query: str,
+        none_fts_query: str | None,
+        where_sql: str,
+        params: list[object],
+    ) -> int:
+        return self._count_search_hits_unlocked(
+            fts_query,
+            none_fts_query,
+            where_sql,
+            params,
+            fts_table=_EXACT_REVISION_FTS_TABLE,
+            temporary_fts=True,
+        )
+
+    def _search_exact_unique_rows_unlocked(
+        self,
+        *,
+        fts_query: str,
+        none_fts_query: str | None,
+        where_sql: str,
+        params: list[object],
+        limit: int,
+    ) -> list[sqlite3.Row]:
+        return self._search_unique_rows_unlocked(
+            fts_query=fts_query,
+            none_fts_query=none_fts_query,
+            where_sql=where_sql,
+            params=params,
+            limit=limit,
+            fts_table=_EXACT_REVISION_FTS_TABLE,
+            temporary_fts=True,
         )
 
     async def list_entries(
@@ -2272,17 +2630,27 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         none_fts_query: str | None,
         where_sql: str,
         params: list[object],
+        *,
+        fts_table: str = _KNOWLEDGE_FTS_TABLE,
+        temporary_fts: bool = False,
     ) -> int:
-        none_sql, none_params = _sqlite_knowledge_none_filter_sql(none_fts_query)
+        from_table = f"temp.{fts_table}" if temporary_fts else fts_table
+        none_sql, none_params = _sqlite_knowledge_none_filter_sql(
+            none_fts_query,
+            fts_table=fts_table,
+            temporary_fts=temporary_fts,
+        )
         row = self._connection.execute(
             f"""
             SELECT COUNT(DISTINCT e.id)
-            FROM cayu_knowledge_chunks_fts
+            FROM {from_table}
             JOIN cayu_knowledge_chunks AS c
-                ON c.fts_rowid = cayu_knowledge_chunks_fts.rowid
+              ON c.id = {fts_table}.chunk_id
+             AND c.entry_id = {fts_table}.entry_id
+             AND c.entry_revision = {fts_table}.entry_revision
             JOIN cayu_knowledge_current_entries AS e
                 ON e.id = c.entry_id AND e.revision = c.entry_revision
-            WHERE cayu_knowledge_chunks_fts MATCH ?
+            WHERE {fts_table} MATCH ?
             {none_sql}
             {where_sql}
             """,
@@ -2298,8 +2666,15 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         where_sql: str,
         params: list[object],
         limit: int,
+        fts_table: str = _KNOWLEDGE_FTS_TABLE,
+        temporary_fts: bool = False,
     ) -> list[sqlite3.Row]:
-        none_sql, none_params = _sqlite_knowledge_none_filter_sql(none_fts_query)
+        from_table = f"temp.{fts_table}" if temporary_fts else fts_table
+        none_sql, none_params = _sqlite_knowledge_none_filter_sql(
+            none_fts_query,
+            fts_table=fts_table,
+            temporary_fts=temporary_fts,
+        )
         unique_rows: list[sqlite3.Row] = []
         seen_entry_ids: set[str] = set()
         offset = 0
@@ -2309,13 +2684,15 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 SELECT
                     e.id AS entry_id,
                     c.id AS chunk_id,
-                    bm25(cayu_knowledge_chunks_fts) AS fts_score
-                FROM cayu_knowledge_chunks_fts
+                    bm25({fts_table}) AS fts_score
+                FROM {from_table}
                 JOIN cayu_knowledge_chunks AS c
-                    ON c.fts_rowid = cayu_knowledge_chunks_fts.rowid
+                  ON c.id = {fts_table}.chunk_id
+                 AND c.entry_id = {fts_table}.entry_id
+                 AND c.entry_revision = {fts_table}.entry_revision
                 JOIN cayu_knowledge_current_entries AS e
                     ON e.id = c.entry_id AND e.revision = c.entry_revision
-                WHERE cayu_knowledge_chunks_fts MATCH ?
+                WHERE {fts_table} MATCH ?
                 {none_sql}
                 {where_sql}
                 ORDER BY fts_score ASC,
@@ -3940,6 +4317,38 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             impact_targets=self._load_impact_targets_unlocked(entry_id, selected_revision),
         )
 
+    def _load_entry_at_change_sequence_unlocked(
+        self,
+        entry_id: str,
+        *,
+        through_sequence: int,
+    ) -> KnowledgeEntry | None:
+        row = self._connection.execute(
+            """
+            SELECT candidate.entry_revision
+            FROM cayu_knowledge_changes AS candidate
+            WHERE candidate.entry_id = ?
+              AND candidate.kind <> 'relation_published'
+              AND candidate.sequence <= ?
+              AND candidate.sequence = (
+                  SELECT MAX(materialization.sequence)
+                  FROM cayu_knowledge_changes AS materialization
+                  WHERE materialization.entry_id = candidate.entry_id
+                    AND materialization.entry_revision = candidate.entry_revision
+                    AND materialization.kind <> 'relation_published'
+              )
+            ORDER BY candidate.sequence DESC
+            LIMIT 1
+            """,
+            (entry_id, through_sequence),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._load_entry_unlocked(
+            entry_id,
+            revision=int(row["entry_revision"]),
+        )
+
     def _load_entry_in_scope_unlocked(
         self,
         entry_id: str,
@@ -4106,18 +4515,91 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         ).fetchall()
         return [_chunk_from_row(row) for row in rows]
 
-    def _load_entries_unlocked(self, entry_ids: list[str]) -> dict[str, KnowledgeEntry]:
+    def _load_chunks_for_revision_refs_unlocked(
+        self,
+        revision_refs: tuple[KnowledgeRevisionRef, ...],
+    ) -> dict[tuple[str, int], list[KnowledgeChunk]]:
+        if not revision_refs:
+            return {}
+        values = ", ".join("(?, ?)" for _ in revision_refs)
+        params: list[object] = []
+        for reference in revision_refs:
+            params.extend((reference.entry_id, reference.revision))
+        rows = self._connection.execute(
+            f"""
+            SELECT chunk.*
+            FROM cayu_knowledge_chunks AS chunk
+            WHERE (chunk.entry_id, chunk.entry_revision) IN (VALUES {values})
+            ORDER BY chunk.entry_id ASC,
+                     chunk.entry_revision ASC,
+                     chunk.chunk_index ASC
+            """,
+            params,
+        ).fetchall()
+        chunks_by_revision: dict[tuple[str, int], list[KnowledgeChunk]] = {}
+        for row in rows:
+            key = (str(row["entry_id"]), int(row["entry_revision"]))
+            chunks_by_revision.setdefault(key, []).append(_chunk_from_row(row))
+        return chunks_by_revision
+
+    def _load_revision_materialization_sequences_unlocked(
+        self,
+        revision_refs: tuple[KnowledgeRevisionRef, ...],
+    ) -> dict[tuple[str, int], int]:
+        if not revision_refs:
+            return {}
+        values = ", ".join("(?, ?)" for _ in revision_refs)
+        params: list[object] = []
+        for reference in revision_refs:
+            params.extend((reference.entry_id, reference.revision))
+        rows = self._connection.execute(
+            f"""
+            SELECT
+                change_record.entry_id,
+                change_record.entry_revision,
+                MAX(change_record.sequence) AS materialization_sequence
+            FROM cayu_knowledge_changes AS change_record
+            WHERE change_record.kind <> 'relation_published'
+              AND (change_record.entry_id, change_record.entry_revision)
+                  IN (VALUES {values})
+            GROUP BY change_record.entry_id, change_record.entry_revision
+            """,
+            params,
+        ).fetchall()
+        return {
+            (str(row["entry_id"]), int(row["entry_revision"])): int(row["materialization_sequence"])
+            for row in rows
+        }
+
+    def _load_entries_unlocked(
+        self,
+        entry_ids: list[str],
+        *,
+        access_scope: KnowledgeAccessScope | None = None,
+        access_now: datetime | None = None,
+    ) -> dict[str, KnowledgeEntry]:
         unique_ids = list(dict.fromkeys(entry_ids))
         if not unique_ids:
             return {}
         placeholders = ", ".join("?" for _ in unique_ids)
+        access_sql, access_params = (
+            ("", [])
+            if access_scope is None
+            else _knowledge_access_scope_filter_sql(access_scope, now=access_now)
+        )
         rows = self._connection.execute(
-            f"SELECT * FROM cayu_knowledge_current_entries WHERE id IN ({placeholders})",
-            unique_ids,
+            f"""
+            SELECT e.*
+            FROM cayu_knowledge_current_entries AS e
+            WHERE e.id IN ({placeholders})
+            {access_sql}
+            """,
+            [*unique_ids, *access_params],
         ).fetchall()
-        labels = self._load_labels_for_entries_unlocked(unique_ids)
-        aspects = self._load_aspects_for_entries_unlocked(unique_ids)
-        impact_targets = self._load_impact_targets_for_entries_unlocked(unique_ids)
+        loaded_ids = [str(row["id"]) for row in rows]
+        labels = self._load_labels_for_entries_unlocked(loaded_ids)
+        aspects = self._load_aspects_for_entries_unlocked(loaded_ids)
+        impact_targets = self._load_impact_targets_for_entries_unlocked(loaded_ids)
         return {
             row["id"]: _entry_from_row(
                 row,
@@ -4497,18 +4979,22 @@ def _sqlite_knowledge_none_fts_query(query: KnowledgeQuery) -> str | None:
 
 def _sqlite_knowledge_none_filter_sql(
     none_fts_query: str | None,
+    *,
+    fts_table: str = _KNOWLEDGE_FTS_TABLE,
+    temporary_fts: bool = False,
 ) -> tuple[str, list[object]]:
     if none_fts_query is None:
         return "", []
+    from_table = f"temp.{fts_table}" if temporary_fts else fts_table
     return (
-        """
+        f"""
         AND e.id NOT IN (
-            SELECT DISTINCT cayu_knowledge_chunks_fts.entry_id
-            FROM cayu_knowledge_chunks_fts
+            SELECT DISTINCT {fts_table}.entry_id
+            FROM {from_table}
             JOIN cayu_knowledge_current_entries AS negative_entry
-              ON negative_entry.id = cayu_knowledge_chunks_fts.entry_id
-             AND negative_entry.revision = cayu_knowledge_chunks_fts.entry_revision
-            WHERE cayu_knowledge_chunks_fts MATCH ?
+              ON negative_entry.id = {fts_table}.entry_id
+             AND negative_entry.revision = {fts_table}.entry_revision
+            WHERE {fts_table} MATCH ?
         )
         """,
         [none_fts_query],
@@ -4916,6 +5402,7 @@ def _sqlite_relation_access_scope_filter_sql(
     *,
     allow_archived_current: bool = False,
     now: datetime | None = None,
+    through_change_sequence: int | None = None,
 ) -> tuple[str, list[object]]:
     clauses: list[str] = []
     params: list[object] = []
@@ -4980,6 +5467,50 @@ def _sqlite_relation_access_scope_filter_sql(
             """
         )
         params.extend(current_access_params)
+        if through_change_sequence is not None:
+            clauses.append(
+                f"""
+                EXISTS (
+                    SELECT 1
+                    FROM (
+                        SELECT
+                            logical.id AS id,
+                            stored.revision AS revision,
+                            logical.namespace AS namespace,
+                            stored.visibility AS visibility,
+                            stored.status AS status,
+                            stored.source_type AS source_type,
+                            stored.source_id AS source_id,
+                            stored.expires_at AS expires_at
+                        FROM cayu_knowledge_entries AS logical
+                        JOIN cayu_knowledge_changes AS current_change
+                          ON current_change.entry_id = logical.id
+                         AND current_change.kind <> 'relation_published'
+                         AND current_change.sequence = (
+                             SELECT MAX(boundary_change.sequence)
+                             FROM cayu_knowledge_changes AS boundary_change
+                             WHERE boundary_change.entry_id = logical.id
+                               AND boundary_change.kind <> 'relation_published'
+                               AND boundary_change.sequence <= ?
+                         )
+                         AND current_change.sequence = (
+                             SELECT MAX(materialization.sequence)
+                             FROM cayu_knowledge_changes AS materialization
+                             WHERE materialization.entry_id = current_change.entry_id
+                               AND materialization.entry_revision =
+                                       current_change.entry_revision
+                               AND materialization.kind <> 'relation_published'
+                         )
+                        JOIN cayu_knowledge_revisions AS stored
+                          ON stored.entry_id = current_change.entry_id
+                         AND stored.revision = current_change.entry_revision
+                    ) AS e
+                    WHERE e.id = relation.{entry_column}
+                    {current_access_sql}
+                )
+                """
+            )
+            params.extend((through_change_sequence, *current_access_params))
     return " AND " + " AND ".join(clauses), params
 
 

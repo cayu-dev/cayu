@@ -207,8 +207,8 @@ retain immutable exact revisions across restarts. Semantic no-change publication
 does not fabricate a revision, while exact operation receipts and
 compare-and-swap current pointers make retry and concurrent writers
 deterministic. A narrow `AgentWorkContextStore` has copy-safe in-memory, SQLite,
-and PostgreSQL implementations without expanding `TaskStore` or
-`KnowledgeStore`.
+and PostgreSQL implementations without folding work-context ownership into
+`TaskStore` or `KnowledgeStore`.
 
 `AgentRecallCheckpoint` independently records the captured knowledge-change
 and semantic-index-readiness high-water marks plus the frontiers processed by
@@ -221,14 +221,58 @@ delta cursor from making older knowledge permanently ineligible. CAS revisions
 and processed sequences—not caller wall-clock timestamps—order progress, so
 clock skew cannot strand a valid checkpoint.
 Checkpoints do not claim provider exposure, notification consumption,
-relevance, or task completion; runtime recall coordination remains a later
-layer.
+relevance, or task completion; they record only bounded freshness processing.
+
+Checkpoint-aware recall now turns those facts into bounded work without taking
+over checkpoint persistence. `AgentRecallProcessor` selects full-index recall
+for a missing/changed work context, exact-revision delta recall for newer
+knowledge/readiness frontiers, or an explicit no-work result. It returns an
+immutable checkpoint proposal; callers retain compare-and-swap advancement and
+staging authority. Requests use one exact namespace scope, and results retain
+their work-context identity, captured/processed frontiers, and source-event
+provenance even when no proposal can safely be made. Transient semantic failure
+cannot commit a new full-index work-context basis or consume a final delta retry.
+A partial delta advances lexical progress during a semantic failure only when
+retained READY events can reconstruct every eligible revision on the next
+attempt; otherwise it withholds the complete proposal instead of checkpointing
+past failed work.
+Full-index candidates, semantic readiness, and attached lineage are constrained
+inside the captured store frontier, so a concurrent commit remains for the next
+delta instead of leaking into a result whose checkpoint predates it. Lineage
+endpoint revision, status, and currentness come from that frontier while live
+authorization still applies. Embedding attempts are retained independently, so
+a captured readiness frontier resolves both the readiness event and the newest
+accepted vector at or before that event rather than aliasing a later refresh.
+PostgreSQL frontier-filtered semantic search keeps the HNSW fast path and falls
+back to an exact scan only when bounded identity or post-filter completeness
+requires it. Operational freshness-read failures use the typed processing error
+boundary while preserving their backend cause and cancellation behavior.
+Delta ranking is restricted inside every built-in knowledge backend before
+top-k selection, including PostgreSQL/pgvector, so unchanged global winners
+cannot hide a relevant changed revision. Exact-revision delta search carries
+the same captured knowledge/readiness pair through ranking and lineage:
+readiness or relations published later stay outside replay, and a same-ID
+delete/recreate generation cannot alias the captured revision. The processor
+does not inject context,
+wake an agent, record exposure, consume notifications, or alter the knowledge
+tools.
 
 Additive storage revision 69 installs only the new empty authoritative tables.
 It performs no task, session, transcript, or knowledge backfill and adds no
 legacy compatibility path. The hermetic performance baseline covers zero-record
 construction, indexed current reads, revision appends, checkpoint advances, and
 incremental SQLite storage.
+
+The rebuildable PostgreSQL `cayu_knowledge_embeddings` table now keys rows by
+identity and accepted readiness sequence so multiple projection attempts remain
+available to captured-frontier replay. This is an intentional derived-index
+schema break, not an authoritative-data migration: drop the old embeddings
+table before startup and rebuild projections from canonical entries. No
+authoritative-data backfill or legacy read path is provided.
+Projection writes serialize against readiness publication and activate a new
+attempt only after its historical row is durable inside the same transaction.
+A partial unique index prevents concurrent writers from leaving more than one
+attempt current for an identity.
 
 ### Evals add structured, bounded model-judge contracts
 

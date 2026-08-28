@@ -82,6 +82,7 @@ from cayu.storage import (
     KnowledgeSearchMode,
     KnowledgeStatus,
     KnowledgeVisibility,
+    knowledge_chunk_embedding_identity,
 )
 from cayu.storage import migrations as schema_migrations
 from cayu.storage.memory import (
@@ -966,6 +967,376 @@ def test_postgres_embedding_store_passes_projection_conformance(postgres_dsn: st
     asyncio.run(run())
 
 
+def test_postgres_embedding_exact_revision_search_restricts_semantic_candidates(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        provider = KeywordEmbeddingProvider()
+        store = _new_embedding_store(postgres_dsn, provider)
+
+        async def create(entry_id: str, *, importance: float) -> None:
+            text = "GitHub credential proxy policy."
+            await store.create_entry(
+                KnowledgeEntry(id=entry_id, text=text, importance=importance),
+                [
+                    KnowledgeChunk(
+                        id=f"{entry_id}-chunk",
+                        entry_id=entry_id,
+                        text=text,
+                        chunk_index=0,
+                    )
+                ],
+            )
+
+        try:
+            empty = await store.search_revisions(
+                KnowledgeQuery(
+                    text="GitHub credential proxy",
+                    mode=KnowledgeSearchMode.SEMANTIC,
+                    limit=1,
+                ),
+                (),
+            )
+            assert empty.hits == []
+            assert empty.index_coverage[0].eligible_records == 0
+            assert provider.calls == []
+
+            await create("semantic-global-winner", importance=1.0)
+            await create("semantic-selected", importance=0.1)
+            worker = await store.process_embedding_changes("exact-semantic", "worker")
+            assert worker.acknowledged_changes == 2
+            query = KnowledgeQuery(
+                text="GitHub credential proxy",
+                mode=KnowledgeSearchMode.SEMANTIC,
+                limit=1,
+            )
+            global_result = await store.search(query)
+            restricted = await store.search_revisions(
+                query,
+                (KnowledgeRevisionRef(entry_id="semantic-selected", revision=1),),
+            )
+
+            assert [hit.entry.id for hit in global_result.hits] == ["semantic-global-winner"]
+            assert [hit.entry.id for hit in restricted.hits] == ["semantic-selected"]
+            assert restricted.index_coverage[0].eligible_records == 1
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_postgres_embedding_exact_revision_search_skips_provider_without_ready_candidates(
+    postgres_dsn: str,
+) -> None:
+    class FailIfCalledEmbeddingProvider(TextEmbeddingProvider):
+        name = "fail-if-called-test"
+
+        def __init__(self) -> None:
+            self.call_count = 0
+
+        async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
+            self.call_count += 1
+            raise AssertionError("query embedding must not run without a READY exact candidate")
+
+    async def run() -> None:
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        provider = FailIfCalledEmbeddingProvider()
+        store = _new_embedding_store(postgres_dsn, provider)
+        text = "GitHub credential proxy policy."
+        try:
+            await store.create_entry(
+                KnowledgeEntry(id="semantic-pending", text=text),
+                [
+                    KnowledgeChunk(
+                        id="semantic-pending-chunk",
+                        entry_id="semantic-pending",
+                        text=text,
+                        chunk_index=0,
+                    )
+                ],
+            )
+            reference = (KnowledgeRevisionRef(entry_id="semantic-pending", revision=1),)
+            semantic = await store.search_revisions(
+                KnowledgeQuery(
+                    text="GitHub credential proxy",
+                    mode=KnowledgeSearchMode.SEMANTIC,
+                    limit=1,
+                ),
+                reference,
+            )
+            hybrid = await store.search_revisions(
+                KnowledgeQuery(
+                    text="GitHub credential proxy",
+                    mode=KnowledgeSearchMode.HYBRID,
+                    limit=1,
+                ),
+                reference,
+            )
+
+            assert semantic.hits == []
+            assert semantic.index_coverage[0].eligible_records == 1
+            assert semantic.index_coverage[0].pending_records == 1
+            assert [hit.entry.id for hit in hybrid.hits] == ["semantic-pending"]
+            assert hybrid.index_coverage == semantic.index_coverage
+            assert provider.call_count == 0
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_postgres_embedding_frontier_search_excludes_later_readiness(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        provider = KeywordEmbeddingProvider()
+        store = _new_embedding_store(postgres_dsn, provider)
+        text = "GitHub credential proxy policy."
+        try:
+            await store.create_entry(
+                KnowledgeEntry(id="semantic-frontier", text=text),
+                [
+                    KnowledgeChunk(
+                        id="semantic-frontier-chunk",
+                        entry_id="semantic-frontier",
+                        text=text,
+                        chunk_index=0,
+                    )
+                ],
+            )
+            knowledge_frontier = (await store.read_changes()).high_water_sequence
+            worker = await store.process_embedding_changes("semantic-frontier", "worker")
+            assert worker.acknowledged_changes == 1
+            readiness_frontier = (await store.read_index_readiness()).high_water_sequence
+            query = KnowledgeQuery(
+                text="GitHub credential proxy",
+                mode=KnowledgeSearchMode.SEMANTIC,
+                limit=10,
+            )
+            calls_after_indexing = len(provider.calls)
+
+            before_readiness = await store.search_revisions(
+                query,
+                (KnowledgeRevisionRef(entry_id="semantic-frontier", revision=1),),
+                knowledge_sequence=knowledge_frontier,
+                index_readiness_sequence=0,
+            )
+            assert len(provider.calls) == calls_after_indexing
+            after_readiness = await store.search_at_frontier(
+                query,
+                knowledge_sequence=knowledge_frontier,
+                index_readiness_sequence=readiness_frontier,
+            )
+
+            assert before_readiness.hits == []
+            assert before_readiness.index_coverage[0].pending_records == 1
+            assert [hit.entry.id for hit in after_readiness.hits] == ["semantic-frontier"]
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_postgres_embedding_frontier_replays_the_captured_projection_attempt(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        store = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        try:
+            entry = await store.create_entry(
+                KnowledgeEntry(
+                    id="postgres-frontier-projection-attempt",
+                    text="GitHub credential proxy",
+                )
+            )
+            chunk = (await store.read_chunks(entry.id))[0]
+            identity = knowledge_chunk_embedding_identity(
+                chunk,
+                embedding_model="test-embedding",
+                dimensions=3,
+            )
+            first_pending = await store.publish_index_readiness(
+                KnowledgeIndexReadinessUpdate(
+                    identity=identity,
+                    state=KnowledgeIndexState.PENDING,
+                    attempt_id="postgres-frontier-projection-first",
+                ),
+                expected_sequence=None,
+                operation_id="postgres-frontier-projection-first-pending",
+            )
+            await store.store_embedding_projections(
+                [
+                    KnowledgeEmbeddingProjection(
+                        identity=identity,
+                        readiness_sequence=first_pending.sequence,
+                        attempt_id=first_pending.attempt_id,
+                        vector=[1.0, 0.0, 0.0],
+                    )
+                ]
+            )
+            first_ready = await store.publish_index_readiness(
+                KnowledgeIndexReadinessUpdate(
+                    identity=identity,
+                    state=KnowledgeIndexState.READY,
+                    attempt_id=first_pending.attempt_id,
+                ),
+                expected_sequence=first_pending.sequence,
+                operation_id="postgres-frontier-projection-first-ready",
+            )
+            knowledge_frontier = (await store.read_changes()).high_water_sequence
+            query = KnowledgeQuery(
+                text="GitHub credential",
+                mode=KnowledgeSearchMode.SEMANTIC,
+                min_score=0.75,
+            )
+            captured = await store.search_at_frontier(
+                query,
+                knowledge_sequence=knowledge_frontier,
+                index_readiness_sequence=first_ready.sequence,
+            )
+
+            second_pending = await store.publish_index_readiness(
+                KnowledgeIndexReadinessUpdate(
+                    identity=identity,
+                    state=KnowledgeIndexState.PENDING,
+                    attempt_id="postgres-frontier-projection-second",
+                ),
+                expected_sequence=first_ready.sequence,
+                operation_id="postgres-frontier-projection-second-pending",
+            )
+            await store.store_embedding_projections(
+                [
+                    KnowledgeEmbeddingProjection(
+                        identity=identity,
+                        readiness_sequence=second_pending.sequence,
+                        attempt_id=second_pending.attempt_id,
+                        vector=[0.0, 1.0, 0.0],
+                    )
+                ]
+            )
+            await store.publish_index_readiness(
+                KnowledgeIndexReadinessUpdate(
+                    identity=identity,
+                    state=KnowledgeIndexState.READY,
+                    attempt_id=second_pending.attempt_id,
+                ),
+                expected_sequence=second_pending.sequence,
+                operation_id="postgres-frontier-projection-second-ready",
+            )
+
+            current = await store.search(query)
+            replay = await store.search_at_frontier(
+                query,
+                knowledge_sequence=knowledge_frontier,
+                index_readiness_sequence=first_ready.sequence,
+            )
+            assert [hit.entry.id for hit in captured.hits] == [entry.id]
+            assert current.hits == []
+            assert replay == captured
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_postgres_embedding_frontier_search_retains_hnsw_plan(
+    postgres_dsn: str,
+) -> None:
+    class ExplainCursor:
+        def __init__(self, cursor) -> None:
+            self._cursor = cursor
+            self.plan: str | None = None
+
+        async def execute(self, statement, params=None) -> None:
+            rendered = str(statement)
+            if "WITH nearest_chunks AS" in rendered:
+                await self._cursor.execute("EXPLAIN (COSTS OFF) " + rendered, params)
+                self.plan = "\n".join(str(row[0]) for row in await self._cursor.fetchall())
+            await self._cursor.execute(statement, params)
+
+        async def fetchall(self):
+            return await self._cursor.fetchall()
+
+    async def run() -> None:
+        from cayu.storage.postgres import _begin_knowledge_read_snapshot
+
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        store = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        text = "GitHub credential proxy policy."
+        try:
+            await store.create_entry(
+                KnowledgeEntry(id="semantic-frontier-plan", text=text),
+                [
+                    KnowledgeChunk(
+                        id="semantic-frontier-plan-chunk",
+                        entry_id="semantic-frontier-plan",
+                        text=text,
+                        chunk_index=0,
+                    )
+                ],
+            )
+            knowledge_frontier = (await store.read_changes()).high_water_sequence
+            worker = await store.process_embedding_changes(
+                "semantic-frontier-plan",
+                "worker",
+            )
+            assert worker.acknowledged_changes == 1
+            readiness_frontier = (await store.read_index_readiness()).high_water_sequence
+            query = KnowledgeQuery(
+                text="GitHub credential proxy",
+                mode=KnowledgeSearchMode.SEMANTIC,
+                limit=1,
+            )
+
+            async with (
+                store._pool.connection() as connection,
+                connection.transaction(),
+                connection.cursor() as cursor,
+            ):
+                await _begin_knowledge_read_snapshot(cursor)
+                await cursor.execute("ANALYZE cayu_knowledge_embeddings")
+                await cursor.execute("SET LOCAL enable_seqscan = off")
+                await cursor.execute("SET LOCAL enable_sort = off")
+                coverage = await store._index_coverage_in_snapshot(
+                    cursor,
+                    query,
+                    access_scope=_ACCESS_SCOPE,
+                    through_change_sequence=knowledge_frontier,
+                    through_index_readiness_sequence=readiness_frontier,
+                )
+                explain_cursor = ExplainCursor(cursor)
+                rows, _, _ = await store._semantic_search_rows_in_snapshot(
+                    explain_cursor,
+                    query,
+                    _test_embedding_vector(query.text or ""),
+                    access_scope=_ACCESS_SCOPE,
+                    ready_records=coverage.ready_records,
+                    through_change_sequence=knowledge_frontier,
+                    through_index_readiness_sequence=readiness_frontier,
+                )
+
+            assert [entry_id for entry_id, _, _ in rows] == ["semantic-frontier-plan"]
+            assert explain_cursor.plan is not None
+            assert store._embedding_history_hnsw_index_name() in explain_cursor.plan
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
+
+
 def test_postgres_knowledge_store_owned_publication_conformance(postgres_dsn: str) -> None:
     async def run() -> None:
         await _drop_all(postgres_dsn)
@@ -1082,6 +1453,187 @@ def test_postgres_knowledge_access_scope_conformance(postgres_dsn: str) -> None:
         finally:
             await store.close()
             await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_postgres_exact_revision_search_filters_before_ranking(postgres_dsn: str) -> None:
+    async def run() -> None:
+        from cayu import PostgresKnowledgeStore
+
+        await _drop_all(postgres_dsn)
+        scope = KnowledgeAccessScope.for_namespace("project:exact-recall")
+        store = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            access_scope=scope,
+        )
+        query_text = "checkpoint aware delta target phrase memory"
+
+        async def create(entry_id: str, text: str) -> None:
+            await store.create_entry(
+                KnowledgeEntry(
+                    id=entry_id,
+                    namespace="project:exact-recall",
+                    text=text,
+                ),
+                [
+                    KnowledgeChunk(
+                        id=f"{entry_id}-chunk",
+                        entry_id=entry_id,
+                        text=text,
+                        chunk_index=0,
+                    )
+                ],
+                access_scope=scope,
+            )
+
+        try:
+            await create("strong-unselected", " ".join([query_text] * 8))
+            await create("selected", query_text)
+            query = KnowledgeQuery(
+                text=query_text,
+                namespace="project:exact-recall",
+                mode=KnowledgeSearchMode.KEYWORD,
+                limit=1,
+            )
+            global_result = await store.search(query, access_scope=scope)
+            restricted = await store.search_revisions(
+                query,
+                (KnowledgeRevisionRef(entry_id="selected", revision=1),),
+                access_scope=scope,
+            )
+            current = await store.get_entry("selected", access_scope=scope)
+            assert current is not None
+            await store.append_entry_revision(
+                current.model_copy(update={"revision": 2, "text": f"revised {query_text}"}),
+                [
+                    KnowledgeChunk(
+                        id="selected-revision-2-chunk",
+                        entry_id="selected",
+                        entry_revision=2,
+                        text=f"revised {query_text}",
+                        chunk_index=0,
+                    )
+                ],
+                expected_revision=1,
+                access_scope=scope,
+            )
+            stale = await store.search_revisions(
+                query,
+                (KnowledgeRevisionRef(entry_id="selected", revision=1),),
+                access_scope=scope,
+            )
+
+            assert [hit.entry.id for hit in global_result.hits] == ["strong-unselected"]
+            assert [hit.entry.id for hit in restricted.hits] == ["selected"]
+            assert stale.hits == []
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_checkpoint_recall_full_delta_and_no_work_parity(postgres_dsn: str) -> None:
+    async def run() -> None:
+        from cayu import (
+            KNOWLEDGE_LEXICAL_CHANNEL,
+            KNOWLEDGE_SEMANTIC_CHANNEL,
+            AgentRecallProcessingMode,
+            AgentRecallProcessingRequest,
+            AgentRecallProcessor,
+            AgentWorkContext,
+            PostgresKnowledgeStore,
+            RecallSituation,
+            WeightedReciprocalRankFusionConfig,
+        )
+
+        await _drop_all(postgres_dsn)
+        now = datetime(2026, 8, 28, 8, 0, tzinfo=UTC)
+        namespace = "project:checkpoint-recall"
+        scope = KnowledgeAccessScope.for_namespace(namespace)
+        store = PostgresKnowledgeStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            access_scope=scope,
+        )
+        context = AgentWorkContext.create(
+            task_id="postgres-checkpoint-recall",
+            goal="Process PostgreSQL shared-memory changes",
+            revision=1,
+            operation_id="postgres-checkpoint-context",
+            published_by="test-suite",
+            published_at=now,
+        )
+        processor = AgentRecallProcessor(
+            store,
+            fusion_config=WeightedReciprocalRankFusionConfig(
+                configuration_version="postgres-checkpoint-recall-v1",
+                channel_weights={
+                    KNOWLEDGE_LEXICAL_CHANNEL: 1.0,
+                    KNOWLEDGE_SEMANTIC_CHANNEL: 1.0,
+                },
+                max_candidates_per_channel=20,
+                fused_head_limit=20,
+            ),
+        )
+
+        def request(operation_id: str, checkpoint=None) -> AgentRecallProcessingRequest:
+            return AgentRecallProcessingRequest(
+                agent_id="postgres-agent",
+                work_context=context,
+                situation=RecallSituation(
+                    query="checkpoint aware delta target phrase memory",
+                    knowledge_access_scope=scope,
+                    knowledge_namespace=namespace,
+                    current_time=now,
+                ),
+                checkpoint=checkpoint,
+                processing_id=f"processing-{operation_id}",
+                operation_id=operation_id,
+                updated_by="test-suite",
+                updated_at=now,
+            )
+
+        async def create(entry_id: str) -> None:
+            text = "checkpoint aware delta target phrase memory"
+            await store.create_entry(
+                KnowledgeEntry(id=entry_id, namespace=namespace, text=text),
+                [
+                    KnowledgeChunk(
+                        id=f"{entry_id}-chunk",
+                        entry_id=entry_id,
+                        text=text,
+                        chunk_index=0,
+                    )
+                ],
+                access_scope=scope,
+            )
+
+        try:
+            await create("postgres-initial")
+            initial = await processor.process(request("postgres-initial-full"))
+            assert initial.mode is AgentRecallProcessingMode.FULL_INDEX
+            assert initial.proposed_checkpoint is not None
+            unchanged = await processor.process(
+                request("postgres-no-work", initial.proposed_checkpoint)
+            )
+            assert unchanged.mode is AgentRecallProcessingMode.NO_WORK
+            await create("postgres-delta")
+            delta = await processor.process(request("postgres-delta", initial.proposed_checkpoint))
+            assert delta.mode is AgentRecallProcessingMode.DELTA
+            assert [reference.entry_id for reference in delta.eligible_revisions] == [
+                "postgres-delta"
+            ]
+            assert [
+                candidate.record.locator["entry_id"] for candidate in delta.recall.candidates
+            ] == ["postgres-delta"]
+        finally:
+            await store.close()
 
     asyncio.run(run())
 
@@ -2460,7 +3012,13 @@ def test_postgres_embedding_knowledge_store_reports_dimension_mismatch_before_in
             embedding_dimensions=3,
         )
         try:
-            with pytest.raises(RuntimeError, match="embedding schema does not match"):
+            with pytest.raises(
+                RuntimeError,
+                match=(
+                    "Drop the derived cayu_knowledge_embeddings table, restart with "
+                    "schema_mode=CREATE or MIGRATE"
+                ),
+            ):
                 await second._ensure_ready()
         finally:
             await second.close()
@@ -2574,6 +3132,11 @@ def test_postgres_embedding_schema_rejects_missing_declared_constraints(
             "entry_id, entry_revision",
             "entry_revision > 1",
         ),
+        (
+            "idx_cayu_knowledge_embeddings_current_identity",
+            "identity_sha256",
+            "current_projection",
+        ),
     ),
 )
 def test_postgres_embedding_schema_rejects_conflicting_required_indexes(
@@ -2657,6 +3220,92 @@ def test_postgres_embedding_schema_rejects_cross_space_hnsw_index(
         )
         try:
             with pytest.raises(RuntimeError, match="must isolate one complete"):
+                await validated._ensure_ready()
+        finally:
+            await validated.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(ops())
+
+
+@pytest.mark.parametrize(
+    "current_predicate",
+    (
+        "NOT current_projection",
+        "current_projection AND entry_id = 'unexpected-scope'",
+    ),
+)
+def test_postgres_embedding_schema_rejects_restricted_current_hnsw_index(
+    postgres_dsn: str,
+    current_predicate: str,
+) -> None:
+    async def ops() -> None:
+        import psycopg
+        from psycopg import sql
+
+        from cayu import PostgresEmbeddingKnowledgeStore
+        from cayu.storage.memory import (
+            KNOWLEDGE_CHUNK_TEXT_GENERATOR,
+            KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION,
+            KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION,
+            KNOWLEDGE_CHUNK_TEXT_PROJECTION,
+            KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION,
+        )
+
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        created = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        try:
+            await created._ensure_ready()
+            index_name = created._embedding_hnsw_index_name()
+        finally:
+            await created.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+            connection.cursor() as cursor,
+        ):
+            await cursor.execute(sql.SQL("DROP INDEX {}").format(sql.Identifier(index_name)))
+            await cursor.execute(
+                sql.SQL(
+                    """
+                    CREATE INDEX {index}
+                    ON cayu_knowledge_embeddings USING hnsw (embedding vector_cosine_ops)
+                    WHERE {current_predicate}
+                      AND projection_type = {projection_type}
+                      AND embedding_model = {embedding_model}
+                      AND dimensions = {dimensions}
+                      AND preprocessing_version = {preprocessing_version}
+                      AND generator = {generator}
+                      AND generator_version = {generator_version}
+                      AND index_representation_version = {index_representation_version}
+                    """
+                ).format(
+                    index=sql.Identifier(index_name),
+                    current_predicate=sql.SQL(current_predicate),
+                    projection_type=sql.Literal(KNOWLEDGE_CHUNK_TEXT_PROJECTION),
+                    embedding_model=sql.Literal("test-embedding"),
+                    dimensions=sql.Literal(3),
+                    preprocessing_version=sql.Literal(KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION),
+                    generator=sql.Literal(KNOWLEDGE_CHUNK_TEXT_GENERATOR),
+                    generator_version=sql.Literal(KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION),
+                    index_representation_version=sql.Literal(
+                        KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION
+                    ),
+                )
+            )
+            await connection.commit()
+
+        validated = PostgresEmbeddingKnowledgeStore(
+            postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
+            schema_mode=SchemaMode.VALIDATE,
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="embedding HNSW index"):
                 await validated._ensure_ready()
         finally:
             await validated.close()
@@ -3133,6 +3782,184 @@ def test_postgres_concurrent_projection_writers_cannot_replace_one_attempt_vecto
     ]
 
 
+def test_postgres_projection_store_serializes_readiness_and_keeps_one_current_attempt(
+    postgres_dsn: str,
+) -> None:
+    from cayu import PostgresEmbeddingKnowledgeStore
+
+    class BlockingProjectionStore(PostgresEmbeddingKnowledgeStore):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.projection_readiness_locked = asyncio.Event()
+            self.release_projection_write = asyncio.Event()
+
+        async def _lock_embedding_projection_readiness(
+            self,
+            cursor,
+            identity_sha256s,
+        ) -> None:
+            await super()._lock_embedding_projection_readiness(cursor, identity_sha256s)
+            self.projection_readiness_locked.set()
+            await self.release_projection_write.wait()
+
+    async def ops():
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        store = BlockingProjectionStore(
+            postgres_dsn,
+            access_scope=_ACCESS_SCOPE,
+            min_size=1,
+            max_size=4,
+            schema_mode=SchemaMode.CREATE,
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+            semantic_min_score=0.9,
+        )
+        projection_task = None
+        ready_task = None
+        try:
+            await store.create_entry(
+                KnowledgeEntry(id="serialized-projection", text="GitHub proxy.")
+            )
+            chunk = (await store.read_chunks("serialized-projection"))[0]
+            identity = knowledge_chunk_embedding_identity(
+                chunk,
+                embedding_model="test-embedding",
+                dimensions=3,
+            )
+            first_pending = await store.publish_index_readiness(
+                KnowledgeIndexReadinessUpdate(
+                    identity=identity,
+                    state=KnowledgeIndexState.PENDING,
+                    attempt_id="serialized-projection-first",
+                ),
+                expected_sequence=None,
+                operation_id="serialized-projection:first-pending",
+            )
+            first_projection = KnowledgeEmbeddingProjection(
+                identity=identity,
+                readiness_sequence=first_pending.sequence,
+                attempt_id=first_pending.attempt_id,
+                vector=[1.0, 0.0, 0.0],
+            )
+            projection_task = asyncio.create_task(
+                store.store_embedding_projections([first_projection])
+            )
+            await asyncio.wait_for(store.projection_readiness_locked.wait(), timeout=2)
+
+            ready_task = asyncio.create_task(
+                store.publish_index_readiness(
+                    KnowledgeIndexReadinessUpdate(
+                        identity=identity,
+                        state=KnowledgeIndexState.READY,
+                        attempt_id=first_pending.attempt_id,
+                    ),
+                    expected_sequence=first_pending.sequence,
+                    operation_id="serialized-projection:first-ready",
+                )
+            )
+            await asyncio.sleep(0.05)
+            assert not ready_task.done()
+
+            store.release_projection_write.set()
+            first_write = await asyncio.wait_for(projection_task, timeout=2)
+            first_ready = await asyncio.wait_for(ready_task, timeout=2)
+            projection_task = None
+            ready_task = None
+
+            second_pending = await store.publish_index_readiness(
+                KnowledgeIndexReadinessUpdate(
+                    identity=identity,
+                    state=KnowledgeIndexState.PENDING,
+                    attempt_id="serialized-projection-second",
+                ),
+                expected_sequence=first_ready.sequence,
+                operation_id="serialized-projection:second-pending",
+            )
+            second_write = await store.store_embedding_projections(
+                [
+                    KnowledgeEmbeddingProjection(
+                        identity=identity,
+                        readiness_sequence=second_pending.sequence,
+                        attempt_id=second_pending.attempt_id,
+                        vector=[0.0, 1.0, 0.0],
+                    )
+                ]
+            )
+            await store.publish_index_readiness(
+                KnowledgeIndexReadinessUpdate(
+                    identity=identity,
+                    state=KnowledgeIndexState.READY,
+                    attempt_id=second_pending.attempt_id,
+                ),
+                expected_sequence=second_pending.sequence,
+                operation_id="serialized-projection:second-ready",
+            )
+            async with store._pool.connection() as connection, connection.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT readiness_sequence
+                    FROM cayu_knowledge_embeddings
+                    WHERE current_projection
+                    """
+                )
+                current_sequences = [int(row[0]) for row in await cursor.fetchall()]
+                await cursor.execute(
+                    """
+                    SELECT index_state.indisunique,
+                           pg_get_expr(index_state.indpred, index_state.indrelid)
+                    FROM pg_catalog.pg_index AS index_state
+                    JOIN pg_catalog.pg_class AS index_record
+                      ON index_record.oid = index_state.indexrelid
+                    WHERE index_record.relname =
+                          'idx_cayu_knowledge_embeddings_current_identity'
+                    """
+                )
+                current_index = await cursor.fetchone()
+            stale_vector_result = await store.search(
+                KnowledgeQuery(
+                    text="github",
+                    mode=KnowledgeSearchMode.SEMANTIC,
+                    min_score=0.9,
+                )
+            )
+            return (
+                first_write,
+                second_write,
+                second_pending.sequence,
+                current_sequences,
+                current_index,
+                stale_vector_result,
+            )
+        finally:
+            store.release_projection_write.set()
+            for task in (projection_task, ready_task):
+                if task is not None:
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (projection_task, ready_task) if task is not None),
+                return_exceptions=True,
+            )
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    (
+        first_write,
+        second_write,
+        second_sequence,
+        current_sequences,
+        current_index,
+        stale_vector_result,
+    ) = asyncio.run(ops())
+
+    assert len(first_write.stored_identities) == 1
+    assert len(second_write.stored_identities) == 1
+    assert current_sequences == [second_sequence]
+    assert current_index == (True, "current_projection")
+    assert stale_vector_result.hits == []
+
+
 def test_postgres_knowledge_store_defaults_hide_inactive_and_expired(
     postgres_dsn: str,
 ) -> None:
@@ -3404,6 +4231,7 @@ def test_postgres_embedding_none_terms_do_not_consume_semantic_candidate_limit(
                  AND readiness.identity_sha256 = emb.identity_sha256
                  AND readiness.state = 'ready'
                 WHERE emb.projection_type = %s
+                  AND emb.current_projection
                   AND emb.embedding_model = %s
                   AND emb.dimensions = %s
                   AND emb.preprocessing_version = %s
@@ -3440,7 +4268,13 @@ def test_postgres_embedding_none_terms_do_not_consume_semantic_candidate_limit(
                 await cur.execute(hnsw_query, hnsw_params)
                 raw_hnsw_entry_ids = [str(row[0]) for row in await cur.fetchall()]
                 await cur.execute("SET enable_sort = on")
-            assert store._embedding_hnsw_index_name() in plan
+            assert any(
+                index_name in plan
+                for index_name in (
+                    store._embedding_hnsw_index_name(),
+                    store._embedding_history_hnsw_index_name(),
+                )
+            )
             assert raw_hnsw_entry_ids == []
 
             result = await store.search(query)
@@ -4453,8 +5287,10 @@ def test_postgres_embedding_store_segregates_models_until_explicit_reindex(
     assert backfill.indexed_records == 1
     assert [hit.entry.id for hit in after_reindex.hits] == ["doc"]
     assert models_after == ["other-embedding-model", "test-embedding"]
-    assert len(hnsw_indexes) == 2
-    assert len({name for name, _ in hnsw_indexes}) == 2
+    assert len(hnsw_indexes) == 4
+    assert len({name for name, _ in hnsw_indexes}) == 4
+    assert sum("_history_" in name for name, _ in hnsw_indexes) == 2
+    assert sum("current_projection" in predicate for _, predicate in hnsw_indexes) == 2
     assert all(
         "embedding_model =" in predicate
         and "dimensions = 3" in predicate

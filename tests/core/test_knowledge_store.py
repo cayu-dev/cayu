@@ -63,6 +63,7 @@ from cayu.storage import (
     KnowledgeListResult,
     KnowledgeQuery,
     KnowledgeRevisionConflict,
+    KnowledgeRevisionRef,
     KnowledgeSearchMode,
     KnowledgeSearchResult,
     KnowledgeStatus,
@@ -337,6 +338,210 @@ def _test_embedding_vector(text: str) -> list[float]:
         1.0 if any(term in folded for term in ("invoice", "payment", "refund")) else 0.0,
         1.0 if any(term in folded for term in ("sendgrid", "email")) else 0.0,
     ]
+
+
+def test_in_memory_embedding_frontier_replays_the_captured_projection_attempt() -> None:
+    async def run() -> None:
+        store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=_ACCESS_SCOPE,
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+        )
+        entry = await store.create_entry(
+            KnowledgeEntry(id="frontier-projection-attempt", text="GitHub credential proxy")
+        )
+        chunk = (await store.read_chunks(entry.id))[0]
+        identity = knowledge_chunk_embedding_identity(
+            chunk,
+            embedding_model="test-embedding",
+            dimensions=3,
+        )
+        first_pending = await store.publish_index_readiness(
+            KnowledgeIndexReadinessUpdate(
+                identity=identity,
+                state=KnowledgeIndexState.PENDING,
+                attempt_id="frontier-projection-first",
+            ),
+            expected_sequence=None,
+            operation_id="frontier-projection-first-pending",
+        )
+        await store.store_embedding_projections(
+            [
+                KnowledgeEmbeddingProjection(
+                    identity=identity,
+                    readiness_sequence=first_pending.sequence,
+                    attempt_id=first_pending.attempt_id,
+                    vector=[1.0, 0.0, 0.0],
+                )
+            ]
+        )
+        first_ready = await store.publish_index_readiness(
+            KnowledgeIndexReadinessUpdate(
+                identity=identity,
+                state=KnowledgeIndexState.READY,
+                attempt_id=first_pending.attempt_id,
+            ),
+            expected_sequence=first_pending.sequence,
+            operation_id="frontier-projection-first-ready",
+        )
+        knowledge_frontier = (await store.read_changes()).high_water_sequence
+        query = KnowledgeQuery(
+            text="GitHub credential",
+            mode=KnowledgeSearchMode.SEMANTIC,
+            min_score=0.75,
+        )
+        captured = await store.search_at_frontier(
+            query,
+            knowledge_sequence=knowledge_frontier,
+            index_readiness_sequence=first_ready.sequence,
+        )
+
+        second_pending = await store.publish_index_readiness(
+            KnowledgeIndexReadinessUpdate(
+                identity=identity,
+                state=KnowledgeIndexState.PENDING,
+                attempt_id="frontier-projection-second",
+            ),
+            expected_sequence=first_ready.sequence,
+            operation_id="frontier-projection-second-pending",
+        )
+        await store.store_embedding_projections(
+            [
+                KnowledgeEmbeddingProjection(
+                    identity=identity,
+                    readiness_sequence=second_pending.sequence,
+                    attempt_id=second_pending.attempt_id,
+                    vector=[0.0, 1.0, 0.0],
+                )
+            ]
+        )
+        await store.publish_index_readiness(
+            KnowledgeIndexReadinessUpdate(
+                identity=identity,
+                state=KnowledgeIndexState.READY,
+                attempt_id=second_pending.attempt_id,
+            ),
+            expected_sequence=second_pending.sequence,
+            operation_id="frontier-projection-second-ready",
+        )
+
+        current = await store.search(query)
+        replay = await store.search_at_frontier(
+            query,
+            knowledge_sequence=knowledge_frontier,
+            index_readiness_sequence=first_ready.sequence,
+        )
+        return captured, current, replay
+
+    captured, current, replay = asyncio.run(run())
+
+    assert [hit.entry.id for hit in captured.hits] == ["frontier-projection-attempt"]
+    assert current.hits == []
+    assert replay == captured
+
+
+def test_in_memory_embedding_exact_revision_search_restricts_semantic_candidates() -> None:
+    async def run() -> None:
+        store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=_ACCESS_SCOPE,
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+        )
+
+        async def create(entry_id: str, *, importance: float) -> None:
+            text = "GitHub credential proxy policy."
+            await store.create_entry(
+                KnowledgeEntry(id=entry_id, text=text, importance=importance),
+                [
+                    KnowledgeChunk(
+                        id=f"{entry_id}-chunk",
+                        entry_id=entry_id,
+                        text=text,
+                        chunk_index=0,
+                    )
+                ],
+            )
+
+        await create("semantic-global-winner", importance=1.0)
+        await create("semantic-selected", importance=0.1)
+        worker = await store.process_embedding_changes("exact-semantic", "worker")
+        assert worker.acknowledged_changes == 2
+        query = KnowledgeQuery(
+            text="GitHub credential proxy",
+            mode=KnowledgeSearchMode.SEMANTIC,
+            limit=1,
+        )
+        global_result = await store.search(query)
+        exact_entry_reads: list[str] = []
+        current_entry = store._current_entry
+
+        def track_current_entry(entry_id: str):
+            exact_entry_reads.append(entry_id)
+            return current_entry(entry_id)
+
+        store._current_entry = track_current_entry
+        restricted = await store.search_revisions(
+            query,
+            (KnowledgeRevisionRef(entry_id="semantic-selected", revision=1),),
+        )
+
+        assert [hit.entry.id for hit in global_result.hits] == ["semantic-global-winner"]
+        assert [hit.entry.id for hit in restricted.hits] == ["semantic-selected"]
+        assert restricted.index_coverage[0].eligible_records == 1
+        assert set(exact_entry_reads) == {"semantic-selected"}
+
+    asyncio.run(run())
+
+
+def test_in_memory_embedding_frontier_search_excludes_later_readiness() -> None:
+    async def run() -> None:
+        provider = KeywordEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            access_scope=_ACCESS_SCOPE,
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+        )
+        text = "GitHub credential proxy policy."
+        await store.create_entry(
+            KnowledgeEntry(id="semantic-frontier", text=text),
+            [
+                KnowledgeChunk(
+                    id="semantic-frontier-chunk",
+                    entry_id="semantic-frontier",
+                    text=text,
+                    chunk_index=0,
+                )
+            ],
+        )
+        knowledge_frontier = (await store.read_changes()).high_water_sequence
+        worker = await store.process_embedding_changes("semantic-frontier", "worker")
+        assert worker.acknowledged_changes == 1
+        readiness_frontier = (await store.read_index_readiness()).high_water_sequence
+        query = KnowledgeQuery(
+            text="GitHub credential proxy",
+            mode=KnowledgeSearchMode.SEMANTIC,
+            limit=10,
+        )
+
+        before_readiness = await store.search_at_frontier(
+            query,
+            knowledge_sequence=knowledge_frontier,
+            index_readiness_sequence=0,
+        )
+        after_readiness = await store.search_at_frontier(
+            query,
+            knowledge_sequence=knowledge_frontier,
+            index_readiness_sequence=readiness_frontier,
+        )
+
+        assert before_readiness.hits == []
+        assert before_readiness.index_coverage[0].pending_records == 1
+        assert [hit.entry.id for hit in after_readiness.hits] == ["semantic-frontier"]
+
+    asyncio.run(run())
 
 
 def test_knowledge_entry_accepts_extensible_kind_and_core_fields() -> None:

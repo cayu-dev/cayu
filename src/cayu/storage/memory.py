@@ -5,8 +5,9 @@ import binascii
 import json
 import re
 from abc import ABC, abstractmethod
+from bisect import bisect_right
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -57,6 +58,7 @@ MAX_KNOWLEDGE_CHUNK_INDEX = 2**31 - 1
 MAX_KNOWLEDGE_ENTRY_ID_BYTES = 256
 MAX_KNOWLEDGE_ENTRY_PAYLOAD_BYTES = 2**31 - 1
 MAX_KNOWLEDGE_REVISION = 2**31 - 1
+MAX_KNOWLEDGE_REVISION_SEARCH_REFS = 250
 MAX_KNOWLEDGE_EVIDENCE_BYTES = DEFAULT_KNOWLEDGE_MAX_BYTES
 MAX_KNOWLEDGE_EVIDENCE_JSON_BYTES = 16_384
 MAX_KNOWLEDGE_RELATION_BATCH = 100
@@ -942,6 +944,27 @@ class KnowledgeRevisionRef(BaseModel):
     def validate_revision(cls, value: int) -> int:
         _validate_knowledge_revision(value, "revision")
         return value
+
+
+def copy_knowledge_revision_refs(
+    value: Sequence[KnowledgeRevisionRef],
+) -> tuple[KnowledgeRevisionRef, ...]:
+    """Copy, bound, deduplicate, and canonically order exact revision references."""
+
+    if isinstance(value, str | bytes) or not isinstance(value, Sequence):
+        raise TypeError("revision_refs must be a sequence of KnowledgeRevisionRef instances.")
+    if len(value) > MAX_KNOWLEDGE_REVISION_SEARCH_REFS:
+        raise ValueError(
+            "revision_refs cannot contain more than "
+            f"{MAX_KNOWLEDGE_REVISION_SEARCH_REFS} references."
+        )
+    copied: dict[tuple[str, int], KnowledgeRevisionRef] = {}
+    for item in value:
+        if type(item) is not KnowledgeRevisionRef:
+            raise TypeError("revision_refs must contain KnowledgeRevisionRef instances.")
+        reference = item.model_copy(deep=True)
+        copied[(reference.entry_id, reference.revision)] = reference
+    return tuple(copied[key] for key in sorted(copied))
 
 
 class KnowledgeRelation(BaseModel):
@@ -3375,6 +3398,57 @@ class KnowledgeStore(ABC):
     ) -> KnowledgeEntry | None:
         """Load one revision, optionally refusing its content before copying it."""
 
+    async def search_revisions(
+        self,
+        query: KnowledgeQuery,
+        revision_refs: Sequence[KnowledgeRevisionRef],
+        *,
+        knowledge_sequence: int | None = None,
+        index_readiness_sequence: int | None = None,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSearchResult:
+        """Search referenced current revisions, optionally at one captured frontier.
+
+        This narrow operation exists for delta retrieval. Implementations must apply
+        revision eligibility before ranking; searching globally and filtering the
+        returned top-k candidates is not conformant. When frontier sequences are
+        supplied, both must be supplied and neither authoritative materialization nor
+        semantic readiness may cross them.
+        """
+
+        raise NotImplementedError("This KnowledgeStore does not support exact-revision search.")
+
+    async def search_at_frontier(
+        self,
+        query: KnowledgeQuery,
+        *,
+        knowledge_sequence: int,
+        index_readiness_sequence: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSearchResult:
+        """Search current records whose authoritative inputs existed at a captured frontier.
+
+        This narrow operation exists for full-index checkpoint recall. Implementations must
+        exclude current revisions materialized after ``knowledge_sequence`` and semantic
+        readiness published after ``index_readiness_sequence``. Falling back to an ordinary
+        current search is not conformant because it can cross the captured processing frontier.
+        """
+
+        raise NotImplementedError("This KnowledgeStore does not support frontier-bounded search.")
+
+    async def _inspect_lineage_at_change_sequence(
+        self,
+        query: KnowledgeLineageQuery,
+        *,
+        through_sequence: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeLineageResult | None:
+        """Inspect lineage without crossing one captured knowledge-change sequence."""
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support frontier-bounded lineage inspection."
+        )
+
     @abstractmethod
     async def transition_entry_status(
         self,
@@ -3784,6 +3858,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             str, tuple[_KnowledgeRelationAccessSnapshot, ...]
         ] = {}
         self._relation_change_sequences: dict[str, int] = {}
+        self._revision_materialization_sequences: dict[tuple[str, int], int] = {}
         self._maintenance_proposals: dict[str, KnowledgeMaintenanceProposal] = {}
         self._maintenance_proposal_publications: dict[
             str,
@@ -3812,6 +3887,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._acknowledged_change_claims: dict[tuple[str, str], tuple[str, int]] = {}
         self._index_readiness: list[KnowledgeIndexReadiness] = []
         self._index_readiness_by_identity: dict[str, KnowledgeIndexReadiness] = {}
+        self._index_readiness_history_by_identity: dict[str, list[KnowledgeIndexReadiness]] = {}
         self._index_readiness_operations: dict[
             str,
             tuple[str, KnowledgeIndexReadiness],
@@ -4583,6 +4659,10 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         copied = copy_knowledge_change(change)
         self._changes.append(copied)
         self._changes_by_sequence[copied.sequence] = copied
+        if after_entry is not None and copied.kind is not KnowledgeChangeKind.RELATION_PUBLISHED:
+            self._revision_materialization_sequences[(after_entry.id, after_entry.revision)] = (
+                copied.sequence
+            )
         self._change_access[change.sequence] = _knowledge_change_audiences(
             copied,
             before_entry=before_entry,
@@ -4655,6 +4735,22 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         if revision is None:
             return None
         return self._entries[entry_id][revision]
+
+    def _entry_at_change_sequence(
+        self,
+        entry_id: str,
+        through_sequence: int,
+    ) -> KnowledgeEntry | None:
+        """Return the logical current entry at one captured change sequence."""
+
+        candidates = (
+            (sequence, entry)
+            for revision, entry in self._entries.get(entry_id, {}).items()
+            if (sequence := self._revision_materialization_sequences.get((entry_id, revision)))
+            is not None
+            and sequence <= through_sequence
+        )
+        return max(candidates, key=lambda item: item[0], default=(0, None))[1]
 
     def _drop_relations_for_entry(self, entry_id: str) -> None:
         relation_ids: set[str] = set()
@@ -4932,19 +5028,65 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeLineageResult | None:
+        return await self._inspect_lineage(
+            query,
+            access_scope=access_scope,
+            through_sequence=None,
+        )
+
+    async def _inspect_lineage_at_change_sequence(
+        self,
+        query: KnowledgeLineageQuery,
+        *,
+        through_sequence: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeLineageResult | None:
+        _validate_knowledge_change_sequence(through_sequence, "through_sequence")
+        return await self._inspect_lineage(
+            query,
+            access_scope=access_scope,
+            through_sequence=through_sequence,
+        )
+
+    async def _inspect_lineage(
+        self,
+        query: KnowledgeLineageQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None,
+        through_sequence: int | None,
+    ) -> KnowledgeLineageResult | None:
         scope = self._operation_access_scope(access_scope)
         query = copy_knowledge_lineage_query(query)
-        fingerprint = _knowledge_lineage_query_fingerprint(query, scope)
+        fingerprint = _knowledge_lineage_query_fingerprint(
+            query,
+            scope,
+            through_change_sequence=through_sequence,
+        )
         cursor = _decode_knowledge_lineage_cursor(query.cursor, fingerprint=fingerprint)
         access_now = datetime.now(UTC)
         reference_exact = self._entry_revision(
             query.reference.entry_id,
             query.reference.revision,
         )
-        reference_current = self._current_entry(query.reference.entry_id)
+        reference_live = self._current_entry(query.reference.entry_id)
+        reference_current = (
+            reference_live
+            if through_sequence is None
+            else self._entry_at_change_sequence(
+                query.reference.entry_id,
+                through_sequence,
+            )
+        )
         if (
             reference_exact is None
+            or reference_live is None
             or reference_current is None
+            or not _knowledge_scope_allows_lineage_endpoint(
+                scope,
+                reference_exact,
+                reference_live,
+                now=access_now,
+            )
             or not _knowledge_scope_allows_lineage_endpoint(
                 scope,
                 reference_exact,
@@ -4956,6 +5098,11 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         candidates: list[KnowledgeLineageLink] = []
         endpoint = (query.reference.entry_id, query.reference.revision)
         for relation_id in self._relation_ids_by_endpoint.get(endpoint, ()):
+            if through_sequence is not None and (
+                self._relation_change_sequences.get(relation_id) is None
+                or self._relation_change_sequences[relation_id] > through_sequence
+            ):
+                continue
             relation = self._relations.get(relation_id)
             if relation is None:
                 raise RuntimeError("In-memory knowledge relation endpoint index is inconsistent.")
@@ -4970,31 +5117,71 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 relation.subject.entry_id,
                 relation.subject.revision,
             )
-            subject_current = self._current_entry(relation.subject.entry_id)
+            subject_live = self._current_entry(relation.subject.entry_id)
+            subject_current = (
+                subject_live
+                if through_sequence is None
+                else self._entry_at_change_sequence(
+                    relation.subject.entry_id,
+                    through_sequence,
+                )
+            )
             object_exact = self._entry_revision(
                 relation.object.entry_id,
                 relation.object.revision,
             )
-            object_current = self._current_entry(relation.object.entry_id)
+            object_live = self._current_entry(relation.object.entry_id)
+            object_current = (
+                object_live
+                if through_sequence is None
+                else self._entry_at_change_sequence(
+                    relation.object.entry_id,
+                    through_sequence,
+                )
+            )
             if any(
                 item is None
-                for item in (subject_exact, subject_current, object_exact, object_current)
+                for item in (
+                    subject_exact,
+                    subject_live,
+                    subject_current,
+                    object_exact,
+                    object_live,
+                    object_current,
+                )
             ):
                 raise RuntimeError("In-memory knowledge relation endpoint is missing.")
             assert subject_exact is not None
+            assert subject_live is not None
             assert subject_current is not None
             assert object_exact is not None
+            assert object_live is not None
             assert object_current is not None
-            if not _knowledge_scope_allows_lineage_endpoint(
-                scope,
-                subject_exact,
-                subject_current,
-                now=access_now,
-            ) or not _knowledge_scope_allows_lineage_endpoint(
-                scope,
-                object_exact,
-                object_current,
-                now=access_now,
+            if (
+                not _knowledge_scope_allows_lineage_endpoint(
+                    scope,
+                    subject_exact,
+                    subject_live,
+                    now=access_now,
+                )
+                or not _knowledge_scope_allows_lineage_endpoint(
+                    scope,
+                    subject_exact,
+                    subject_current,
+                    now=access_now,
+                )
+                or not _knowledge_scope_allows_lineage_endpoint(
+                    scope,
+                    object_exact,
+                    object_live,
+                    now=access_now,
+                )
+                or not _knowledge_scope_allows_lineage_endpoint(
+                    scope,
+                    object_exact,
+                    object_current,
+                    now=access_now,
+                )
             ):
                 continue
             link = _knowledge_lineage_link(
@@ -5791,6 +5978,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._next_index_readiness_sequence += 1
         self._index_readiness.append(readiness)
         self._index_readiness_by_identity[identity_sha256] = readiness
+        self._index_readiness_history_by_identity.setdefault(identity_sha256, []).append(readiness)
         self._index_readiness_operations[operation_id] = (update_sha256, readiness)
         return copy_knowledge_index_readiness(readiness)
 
@@ -5955,13 +6143,86 @@ class InMemoryKnowledgeStore(KnowledgeStore):
     ) -> KnowledgeSearchResult:
         scope = self._operation_access_scope(access_scope)
         knowledge_query = copy_knowledge_query(query)
+        return self._keyword_search(
+            knowledge_query,
+            scope,
+            revision_keys=None,
+            through_change_sequence=None,
+        )
+
+    async def search_at_frontier(
+        self,
+        query: KnowledgeQuery,
+        *,
+        knowledge_sequence: int,
+        index_readiness_sequence: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSearchResult:
+        scope = self._operation_access_scope(access_scope)
+        knowledge_query = copy_knowledge_query(query)
+        _validate_knowledge_change_sequence(knowledge_sequence, "knowledge_sequence")
+        _validate_knowledge_index_sequence(
+            index_readiness_sequence,
+            "index_readiness_sequence",
+        )
+        return self._keyword_search(
+            knowledge_query,
+            scope,
+            revision_keys=None,
+            through_change_sequence=knowledge_sequence,
+        )
+
+    async def search_revisions(
+        self,
+        query: KnowledgeQuery,
+        revision_refs: Sequence[KnowledgeRevisionRef],
+        *,
+        knowledge_sequence: int | None = None,
+        index_readiness_sequence: int | None = None,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSearchResult:
+        scope = self._operation_access_scope(access_scope)
+        knowledge_query = copy_knowledge_query(query)
+        references = copy_knowledge_revision_refs(revision_refs)
+        _validate_knowledge_search_frontier(
+            knowledge_sequence,
+            index_readiness_sequence,
+        )
+        return self._keyword_search(
+            knowledge_query,
+            scope,
+            revision_keys={(item.entry_id, item.revision) for item in references},
+            through_change_sequence=knowledge_sequence,
+        )
+
+    def _keyword_search(
+        self,
+        knowledge_query: KnowledgeQuery,
+        scope: KnowledgeAccessScope,
+        *,
+        revision_keys: set[tuple[str, int]] | None,
+        through_change_sequence: int | None,
+    ) -> KnowledgeSearchResult:
         if knowledge_query.mode not in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}:
             raise ValueError("InMemoryKnowledgeStore supports only auto and keyword search modes.")
         terms = _knowledge_query_terms(knowledge_query)
         scored: list[tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str]] = []
-        for entry_id in self._entries:
+        entry_ids = (
+            self._entries
+            if revision_keys is None
+            else sorted({entry_id for entry_id, _ in revision_keys})
+        )
+        for entry_id in entry_ids:
             entry = self._current_entry(entry_id)
             if entry is None:  # pragma: no cover - internal invariant
+                continue
+            if revision_keys is not None and (entry.id, entry.revision) not in revision_keys:
+                continue
+            if through_change_sequence is not None and (
+                self._revision_materialization_sequences.get((entry.id, entry.revision)) is None
+                or self._revision_materialization_sequences[(entry.id, entry.revision)]
+                > through_change_sequence
+            ):
                 continue
             if not _knowledge_scope_allows_entry(scope, entry):
                 continue
@@ -5982,43 +6243,10 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 item[1].id,
             )
         )
-        hits: list[KnowledgeHit] = []
-        remaining = knowledge_query.max_bytes
-        truncated = False
-        for rank, (score, entry, chunk, reason, preview_text) in enumerate(
-            scored[: knowledge_query.limit], start=1
-        ):
-            if remaining <= 0:
-                truncated = True
-                break
-            source_bytes = len(preview_text.encode("utf-8"))
-            preview = _truncate_text_to_bytes(preview_text, remaining)
-            if not preview:
-                truncated = True
-                break
-            preview_complete = len(preview.encode("utf-8")) == source_bytes
-            if not preview_complete:
-                truncated = True
-            remaining -= len(preview.encode("utf-8"))
-            hits.append(
-                KnowledgeHit(
-                    entry=entry,
-                    chunk=chunk,
-                    score=score,
-                    score_kind="inmemory_keyword",
-                    rank=rank,
-                    reason=reason,
-                    text_preview=preview,
-                    text_preview_complete=preview_complete,
-                )
-            )
-        return KnowledgeSearchResult(
-            query=knowledge_query,
-            hits=hits,
-            truncated=truncated or len(hits) < len(scored),
-            limit=knowledge_query.limit,
-            max_bytes=knowledge_query.max_bytes,
-            total_hits_known=len(scored),
+        return _keyword_search_result_from_scored(
+            scored,
+            knowledge_query,
+            score_kind="inmemory_keyword",
         )
 
     async def list_entries(
@@ -6119,6 +6347,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             "semantic_min_score",
         )
         self._chunk_embeddings: dict[str, _StoredChunkEmbedding] = {}
+        self._chunk_embedding_history: dict[str, dict[str, _StoredChunkEmbedding]] = {}
         super().__init__(entries, access_scope=access_scope, clock=clock)
 
     def supported_search_modes(self) -> tuple[KnowledgeSearchMode, ...]:
@@ -6424,13 +6653,17 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
                 writes.append((identity_sha256, projection, vector_sha256))
             accepted.append((identity_sha256, projection, vector_sha256))
         for identity_sha256, projection, vector_sha256 in writes:
-            self._chunk_embeddings[identity_sha256] = {
+            stored_embedding: _StoredChunkEmbedding = {
                 "identity": copy_knowledge_embedding_identity(projection.identity),
                 "vector": list(projection.vector),
                 "vector_sha256": vector_sha256,
                 "readiness_sequence": projection.readiness_sequence,
                 "attempt_id": projection.attempt_id,
             }
+            self._chunk_embeddings[identity_sha256] = stored_embedding
+            self._chunk_embedding_history.setdefault(identity_sha256, {})[projection.attempt_id] = (
+                stored_embedding
+            )
         return KnowledgeEmbeddingProjectionWriteResult(
             submitted_records=len(copied),
             stored_identities=[projection.identity for _, projection, _ in accepted],
@@ -6444,8 +6677,77 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
     ) -> KnowledgeSearchResult:
         scope = self._operation_access_scope(access_scope)
         knowledge_query = copy_knowledge_query(query)
+        return await self._embedding_search(
+            knowledge_query,
+            scope,
+            revision_keys=None,
+            knowledge_sequence=None,
+            index_readiness_sequence=None,
+        )
+
+    async def search_at_frontier(
+        self,
+        query: KnowledgeQuery,
+        *,
+        knowledge_sequence: int,
+        index_readiness_sequence: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSearchResult:
+        scope = self._operation_access_scope(access_scope)
+        knowledge_query = copy_knowledge_query(query)
+        _validate_knowledge_change_sequence(knowledge_sequence, "knowledge_sequence")
+        _validate_knowledge_index_sequence(
+            index_readiness_sequence,
+            "index_readiness_sequence",
+        )
+        return await self._embedding_search(
+            knowledge_query,
+            scope,
+            revision_keys=None,
+            knowledge_sequence=knowledge_sequence,
+            index_readiness_sequence=index_readiness_sequence,
+        )
+
+    async def search_revisions(
+        self,
+        query: KnowledgeQuery,
+        revision_refs: Sequence[KnowledgeRevisionRef],
+        *,
+        knowledge_sequence: int | None = None,
+        index_readiness_sequence: int | None = None,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSearchResult:
+        scope = self._operation_access_scope(access_scope)
+        knowledge_query = copy_knowledge_query(query)
+        references = copy_knowledge_revision_refs(revision_refs)
+        _validate_knowledge_search_frontier(
+            knowledge_sequence,
+            index_readiness_sequence,
+        )
+        return await self._embedding_search(
+            knowledge_query,
+            scope,
+            revision_keys={(item.entry_id, item.revision) for item in references},
+            knowledge_sequence=knowledge_sequence,
+            index_readiness_sequence=index_readiness_sequence,
+        )
+
+    async def _embedding_search(
+        self,
+        knowledge_query: KnowledgeQuery,
+        scope: KnowledgeAccessScope,
+        *,
+        revision_keys: set[tuple[str, int]] | None,
+        knowledge_sequence: int | None,
+        index_readiness_sequence: int | None,
+    ) -> KnowledgeSearchResult:
         if knowledge_query.mode is KnowledgeSearchMode.KEYWORD:
-            return await super().search(knowledge_query, access_scope=scope)
+            return self._keyword_search(
+                knowledge_query,
+                scope,
+                revision_keys=revision_keys,
+                through_change_sequence=knowledge_sequence,
+            )
         if knowledge_query.mode not in {
             KnowledgeSearchMode.AUTO,
             KnowledgeSearchMode.SEMANTIC,
@@ -6457,9 +6759,22 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             )
         terms = _knowledge_query_terms(knowledge_query)
         candidates: list[tuple[KnowledgeEntry, list[KnowledgeChunk]]] = []
-        for entry_id in self._entries:
+        entry_ids = (
+            self._entries
+            if revision_keys is None
+            else sorted({entry_id for entry_id, _ in revision_keys})
+        )
+        for entry_id in entry_ids:
             entry = self._current_entry(entry_id)
             if entry is None:  # pragma: no cover - internal invariant
+                continue
+            if revision_keys is not None and (entry.id, entry.revision) not in revision_keys:
+                continue
+            if knowledge_sequence is not None and (
+                self._revision_materialization_sequences.get((entry.id, entry.revision)) is None
+                or self._revision_materialization_sequences[(entry.id, entry.revision)]
+                > knowledge_sequence
+            ):
                 continue
             chunks = self._chunks.get((entry.id, entry.revision), [])
             if not _knowledge_scope_allows_entry(scope, entry):
@@ -6478,6 +6793,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         candidate_embeddings, coverage = self._ready_embeddings_and_coverage(
             candidate_chunks,
             access_scope=scope,
+            through_sequence=index_readiness_sequence,
         )
         if not candidates:
             return KnowledgeSearchResult(
@@ -6732,6 +7048,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         chunks: list[KnowledgeChunk],
         *,
         access_scope: KnowledgeAccessScope,
+        through_sequence: int | None = None,
     ) -> tuple[dict[str, list[float]], KnowledgeIndexCoverage]:
         embeddings: dict[str, list[float]] = {}
         ready = 0
@@ -6745,17 +7062,36 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             )
             identity_sha256 = _knowledge_embedding_identity_sha256(identity)
             eligible_identity_sha256s.add(identity_sha256)
-            readiness = self._index_readiness_by_identity.get(identity_sha256)
-            stored = self._chunk_embeddings.get(identity_sha256)
+            readiness = self._readiness_at_sequence(identity_sha256, through_sequence)
+            stored = (
+                self._chunk_embeddings.get(identity_sha256)
+                if through_sequence is None or readiness is None
+                else max(
+                    (
+                        embedding
+                        for embedding in self._chunk_embedding_history.get(
+                            identity_sha256, {}
+                        ).values()
+                        if embedding["readiness_sequence"] <= readiness.sequence
+                    ),
+                    key=lambda embedding: embedding["readiness_sequence"],
+                    default=None,
+                )
+            )
             if (
                 readiness is not None
+                and (through_sequence is None or readiness.sequence <= through_sequence)
                 and readiness.state is KnowledgeIndexState.READY
                 and stored is not None
                 and stored["identity"] == identity
             ):
                 embeddings[chunk.id] = list(stored["vector"])
                 ready += 1
-            elif readiness is not None and readiness.state is KnowledgeIndexState.FAILED:
+            elif (
+                readiness is not None
+                and (through_sequence is None or readiness.sequence <= through_sequence)
+                and readiness.state is KnowledgeIndexState.FAILED
+            ):
                 failed += 1
         eligible = len(chunks)
         high_water = max(
@@ -6763,6 +7099,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
                 item.sequence
                 for item in self._index_readiness
                 if _knowledge_embedding_identity_sha256(item.identity) in eligible_identity_sha256s
+                and (through_sequence is None or item.sequence <= through_sequence)
                 and self._index_identity_is_accessible(access_scope, item.identity)
             ),
             default=0,
@@ -6783,6 +7120,21 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             high_water_sequence=high_water,
             complete=ready == eligible and pending == 0 and failed == 0,
         )
+
+    def _readiness_at_sequence(
+        self,
+        identity_sha256: str,
+        through_sequence: int | None,
+    ) -> KnowledgeIndexReadiness | None:
+        if through_sequence is None:
+            return self._index_readiness_by_identity.get(identity_sha256)
+        history = self._index_readiness_history_by_identity.get(identity_sha256, [])
+        position = bisect_right(
+            history,
+            through_sequence,
+            key=lambda readiness: readiness.sequence,
+        )
+        return None if position == 0 else history[position - 1]
 
     async def _embed_query(self, query: KnowledgeQuery, text: str) -> list[float]:
         result = copy_text_embedding_result(
@@ -6835,6 +7187,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         selected = stale_ids[:limit]
         for identity_sha256 in selected:
             self._chunk_embeddings.pop(identity_sha256, None)
+            self._chunk_embedding_history.pop(identity_sha256, None)
         return len(selected), len(stale_ids) > limit
 
     def _drop_stale_entry_embeddings(
@@ -6867,6 +7220,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         selected = stale_ids[:limit]
         for identity_sha256 in selected:
             self._chunk_embeddings.pop(identity_sha256, None)
+            self._chunk_embedding_history.pop(identity_sha256, None)
         return len(selected), len(stale_ids) > limit
 
     def _embedding_identity_matches_configuration(
@@ -7019,6 +7373,12 @@ def _knowledge_access_scope_sha256(scope: KnowledgeAccessScope) -> str:
             "knowledge change access scope",
         )
     ).hexdigest()
+
+
+def knowledge_access_scope_sha256(scope: KnowledgeAccessScope) -> str:
+    """Return the canonical public identity of one enforced knowledge access scope."""
+
+    return _knowledge_access_scope_sha256(scope)
 
 
 def _knowledge_change_claim_sha256(claim: KnowledgeChangeClaim) -> str:
@@ -8224,20 +8584,29 @@ def _knowledge_relation_query_fingerprint(
 def _knowledge_lineage_query_fingerprint(
     query: KnowledgeLineageQuery,
     access_scope: KnowledgeAccessScope,
+    *,
+    through_change_sequence: int | None = None,
 ) -> str:
     query = copy_knowledge_lineage_query(query)
+    payload: dict[str, Any] = {
+        "contract": "cayu-knowledge-lineage-query-v1",
+        "reference": query.reference.model_dump(mode="json"),
+        "direction": query.direction.value,
+        "kinds": [kind.value for kind in query.kinds],
+        "currentnesses": [value.value for value in query.currentnesses],
+        "counterpart_statuses": [status.value for status in query.counterpart_statuses],
+        "unresolved_only": query.unresolved_only,
+        "access_scope_sha256": _knowledge_access_scope_sha256(access_scope),
+    }
+    if through_change_sequence is not None:
+        _validate_knowledge_change_sequence(
+            through_change_sequence,
+            "through_change_sequence",
+        )
+        payload["through_change_sequence"] = through_change_sequence
     return sha256(
         canonical_durable_json_bytes(
-            {
-                "contract": "cayu-knowledge-lineage-query-v1",
-                "reference": query.reference.model_dump(mode="json"),
-                "direction": query.direction.value,
-                "kinds": [kind.value for kind in query.kinds],
-                "currentnesses": [value.value for value in query.currentnesses],
-                "counterpart_statuses": [status.value for status in query.counterpart_statuses],
-                "unresolved_only": query.unresolved_only,
-                "access_scope_sha256": _knowledge_access_scope_sha256(access_scope),
-            },
+            payload,
             "knowledge lineage query",
         )
     ).hexdigest()
@@ -8940,14 +9309,12 @@ def _tokens_match_structured_terms(
         return False
     if not all(any(term in token_set for term in group) for group in terms["all"]):
         return False
-    positives = terms["any"] or terms["phrases"]
-    return not positives or (
-        any(term in token_set for term in terms["any"])
-        or any(
-            _tokens_contain_phrase(field, phrase)
-            for phrase in terms["phrases"]
-            for field in phrase_token_fields
-        )
+    if terms["any"] and not any(term in token_set for term in terms["any"]):
+        return False
+    return not terms["phrases"] or any(
+        _tokens_contain_phrase(field, phrase)
+        for phrase in terms["phrases"]
+        for field in phrase_token_fields
     )
 
 
@@ -8983,6 +9350,52 @@ def _entry_matches_none_terms(
     texts.extend(chunk.text for chunk in chunks)
     tokens = {token for text in texts for token in _tokenize_search_text(text)}
     return any(term in tokens for term in terms["none"])
+
+
+def _keyword_search_result_from_scored(
+    scored: list[tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str]],
+    query: KnowledgeQuery,
+    *,
+    score_kind: str,
+) -> KnowledgeSearchResult:
+    hits: list[KnowledgeHit] = []
+    remaining = query.max_bytes
+    truncated = False
+    for rank, (score, entry, chunk, reason, preview_text) in enumerate(
+        scored[: query.limit], start=1
+    ):
+        if remaining <= 0:
+            truncated = True
+            break
+        source_bytes = len(preview_text.encode("utf-8"))
+        preview = _truncate_text_to_bytes(preview_text, remaining)
+        if not preview:
+            truncated = True
+            break
+        preview_complete = len(preview.encode("utf-8")) == source_bytes
+        if not preview_complete:
+            truncated = True
+        remaining -= len(preview.encode("utf-8"))
+        hits.append(
+            KnowledgeHit(
+                entry=entry,
+                chunk=chunk,
+                score=score,
+                score_kind=score_kind,
+                rank=rank,
+                reason=reason,
+                text_preview=preview,
+                text_preview_complete=preview_complete,
+            )
+        )
+    return KnowledgeSearchResult(
+        query=query,
+        hits=hits,
+        truncated=truncated or len(hits) < len(scored),
+        limit=query.limit,
+        max_bytes=query.max_bytes,
+        total_hits_known=len(scored),
+    )
 
 
 def _search_result_from_scored_embeddings(
@@ -9333,6 +9746,24 @@ def _validate_knowledge_index_sequence(
         _validate_positive_int(value, field_name)
     if value > MAX_KNOWLEDGE_CHANGE_SEQUENCE:
         raise ValueError(f"`{field_name}` must be at most {MAX_KNOWLEDGE_CHANGE_SEQUENCE}.")
+
+
+def _validate_knowledge_search_frontier(
+    knowledge_sequence: int | None,
+    index_readiness_sequence: int | None,
+) -> None:
+    if (knowledge_sequence is None) != (index_readiness_sequence is None):
+        raise ValueError(
+            "`knowledge_sequence` and `index_readiness_sequence` must be supplied together."
+        )
+    if knowledge_sequence is None:
+        return
+    assert index_readiness_sequence is not None
+    _validate_knowledge_change_sequence(knowledge_sequence, "knowledge_sequence")
+    _validate_knowledge_index_sequence(
+        index_readiness_sequence,
+        "index_readiness_sequence",
+    )
 
 
 def _validate_knowledge_index_readiness_limit(value: int) -> None:

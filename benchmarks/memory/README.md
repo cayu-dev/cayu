@@ -83,6 +83,25 @@ for the fixed ceilings and interpretation. SQLite persistence enforces a sustain
 median ceiling separately from a wider emergency p95 cap because hosted-runner fsync
 scheduling is not a stable product-tail signal.
 
+## Checkpoint-aware recall overhead
+
+`checkpoint-recall-performance-v1.json` is the provider-free 50-sample baseline
+for full-index, one-revision delta, maximum 250-reference delta (249 changes
+plus one ready index projection), and explicit no-work processing over 500
+existing records. Regenerate it, or check its fixed ceilings, with:
+
+```bash
+PYTHONPATH=src python scripts/run_checkpoint_recall_performance.py \
+  --output benchmarks/memory/checkpoint-recall-performance-v1.json \
+  --check
+```
+
+The benchmark measures the complete processor contract, including accessible
+frontier reads, exact-revision restriction, recall diagnostics, fusion, and
+checkpoint proposal construction. It excludes entry creation and provider
+latency. In-memory and SQLite provide the credential-free timing matrix;
+PostgreSQL and pgvector run behavioral parity in the integration suite.
+
 ## Agent work-context and checkpoint overhead
 
 `agent-work-context-performance-v1.json` is the hermetic 50-sample baseline for

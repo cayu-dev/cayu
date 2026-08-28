@@ -1,0 +1,86 @@
+{
+  "ceiling_findings": [],
+  "ceilings": {
+    "memory_delta_p95_ms": 20.0,
+    "memory_full_index_p95_ms": 100.0,
+    "memory_max_delta_p95_ms": 250.0,
+    "memory_no_work_p95_ms": 5.0,
+    "sqlite_delta_p50_ms": 30.0,
+    "sqlite_delta_p95_ms": 250.0,
+    "sqlite_full_index_p50_ms": 100.0,
+    "sqlite_full_index_p95_ms": 500.0,
+    "sqlite_max_delta_p50_ms": 100.0,
+    "sqlite_max_delta_p95_ms": 500.0,
+    "sqlite_no_work_p50_ms": 15.0,
+    "sqlite_no_work_p95_ms": 100.0
+  },
+  "control": {
+    "historical_pre_feature": false,
+    "kind": "current_checkpoint_recall_with_no_provider_calls"
+  },
+  "environment": {
+    "platform": "macOS-26.3-arm64-arm-64bit",
+    "python": "3.12.13"
+  },
+  "results": [
+    {
+      "backend": "memory",
+      "delta_latency": {
+        "p50_ms": 4.78398,
+        "p95_ms": 5.653834
+      },
+      "existing_record_count": 500,
+      "full_index_latency": {
+        "p50_ms": 26.4335,
+        "p95_ms": 31.818959
+      },
+      "max_delta_latency": {
+        "p50_ms": 33.81725,
+        "p95_ms": 76.397958
+      },
+      "max_delta_record_count": 249,
+      "max_delta_revision_ref_count": 250,
+      "no_work_latency": {
+        "p50_ms": 2.407958,
+        "p95_ms": 2.889667
+      },
+      "sample_count": 50
+    },
+    {
+      "backend": "sqlite",
+      "delta_latency": {
+        "p50_ms": 5.53473,
+        "p95_ms": 5.9965
+      },
+      "existing_record_count": 500,
+      "full_index_latency": {
+        "p50_ms": 20.848312,
+        "p95_ms": 23.036417
+      },
+      "max_delta_latency": {
+        "p50_ms": 54.161125,
+        "p95_ms": 87.744166
+      },
+      "max_delta_record_count": 249,
+      "max_delta_revision_ref_count": 250,
+      "no_work_latency": {
+        "p50_ms": 2.561271,
+        "p95_ms": 2.7435
+      },
+      "sample_count": 50
+    }
+  ],
+  "schema_version": "cayu.checkpoint_recall_performance.v1",
+  "within_ceilings": true,
+  "workload": {
+    "backends": [
+      "memory",
+      "sqlite"
+    ],
+    "existing_records": 500,
+    "max_delta_records": 249,
+    "max_delta_revision_refs": 250,
+    "provider_calls": 0,
+    "samples": 50
+  }
+}

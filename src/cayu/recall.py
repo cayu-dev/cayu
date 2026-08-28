@@ -58,6 +58,7 @@ from cayu.runtime.sessions import (
 )
 from cayu.storage.memory import (
     DEFAULT_KNOWLEDGE_NAMESPACE,
+    MAX_KNOWLEDGE_CHANGE_SEQUENCE,
     MAX_KNOWLEDGE_RELATION_BYTES,
     KnowledgeAccessScope,
     KnowledgeHit,
@@ -71,6 +72,7 @@ from cayu.storage.memory import (
     KnowledgeStatus,
     KnowledgeStore,
     copy_knowledge_access_scope,
+    copy_knowledge_revision_refs,
 )
 
 RECALL_ENGINE_VERSION = "cayu.recall.v1"
@@ -1429,8 +1431,25 @@ class KnowledgeRecallSource(RecallSource):
         self._lineage_candidate_limit = lineage_candidate_limit
         self._lineage_max_bytes = lineage_max_bytes
 
+    async def _search_store(
+        self,
+        query: KnowledgeQuery,
+        *,
+        access_scope: KnowledgeAccessScope,
+    ) -> KnowledgeSearchResult:
+        return await self._store.search(query, access_scope=access_scope)
+
+    async def _inspect_lineage_store(
+        self,
+        query: KnowledgeLineageQuery,
+        *,
+        access_scope: KnowledgeAccessScope,
+    ) -> KnowledgeLineageResult | None:
+        return await self._store.inspect_lineage(query, access_scope=access_scope)
+
     async def retrieve(self, situation: RecallSituation) -> RecallSourceResult:
-        if situation.knowledge_access_scope is None:
+        access_scope = situation.knowledge_access_scope
+        if access_scope is None:
             raise ValueError("Knowledge recall requires an explicit KnowledgeAccessScope.")
         text = situation.retrieval_text()
         lexical_query = KnowledgeQuery(
@@ -1455,9 +1474,9 @@ class KnowledgeRecallSource(RecallSource):
             async def retrieve_semantic() -> tuple[KnowledgeSearchResult | None, str | None]:
                 try:
                     async with asyncio.timeout(self._semantic_timeout_seconds):
-                        result = await self._store.search(
+                        result = await self._search_store(
                             semantic_query,
-                            access_scope=situation.knowledge_access_scope,
+                            access_scope=access_scope,
                         )
                 except TimeoutError:
                     return None, "semantic_timeout"
@@ -1470,9 +1489,9 @@ class KnowledgeRecallSource(RecallSource):
                 name="cayu-knowledge-semantic-recall",
             )
         try:
-            lexical = await self._store.search(
+            lexical = await self._search_store(
                 lexical_query,
-                access_scope=situation.knowledge_access_scope,
+                access_scope=access_scope,
             )
         except BaseException:
             if semantic_task is not None:
@@ -1520,7 +1539,7 @@ class KnowledgeRecallSource(RecallSource):
         await self._attach_lineage(
             records,
             channels=(lexical_channel, semantic_channel),
-            access_scope=situation.knowledge_access_scope,
+            access_scope=access_scope,
         )
         return RecallSourceResult(
             source=self.name,
@@ -1610,7 +1629,7 @@ class KnowledgeRecallSource(RecallSource):
                 limit=self._lineage_limit,
                 max_bytes=self._lineage_max_bytes,
             )
-            raw_result = await self._store.inspect_lineage(
+            raw_result = await self._inspect_lineage_store(
                 requested_query,
                 access_scope=access_scope,
             )
@@ -1653,6 +1672,152 @@ class KnowledgeRecallSource(RecallSource):
                     "lineage": by_reference[reference],
                 }
             )
+
+
+class KnowledgeFrontierRecallSource(KnowledgeRecallSource):
+    """Knowledge recall lane restricted to one captured processing frontier."""
+
+    def __init__(
+        self,
+        store: KnowledgeStore,
+        *,
+        knowledge_sequence: int,
+        index_readiness_sequence: int,
+        required: bool = True,
+        candidate_limit: int = 20,
+        max_bytes: int = 64_000,
+        max_record_bytes: int = 8_000,
+        semantic_timeout_seconds: float = 1.0,
+        lineage_limit: int = 0,
+        lineage_candidate_limit: int = 10,
+        lineage_max_bytes: int = MAX_KNOWLEDGE_RELATION_BYTES,
+    ) -> None:
+        super().__init__(
+            store,
+            required=required,
+            candidate_limit=candidate_limit,
+            max_bytes=max_bytes,
+            max_record_bytes=max_record_bytes,
+            semantic_timeout_seconds=semantic_timeout_seconds,
+            lineage_limit=lineage_limit,
+            lineage_candidate_limit=lineage_candidate_limit,
+            lineage_max_bytes=lineage_max_bytes,
+        )
+        for field_name, value in (
+            ("knowledge_sequence", knowledge_sequence),
+            ("index_readiness_sequence", index_readiness_sequence),
+        ):
+            if type(value) is not int or not 0 <= value <= MAX_KNOWLEDGE_CHANGE_SEQUENCE:
+                raise ValueError(
+                    f"`{field_name}` must be a non-negative knowledge frontier sequence."
+                )
+        self._knowledge_sequence = knowledge_sequence
+        self._index_readiness_sequence = index_readiness_sequence
+
+    async def _search_store(
+        self,
+        query: KnowledgeQuery,
+        *,
+        access_scope: KnowledgeAccessScope,
+    ) -> KnowledgeSearchResult:
+        return await self._store.search_at_frontier(
+            query,
+            knowledge_sequence=self._knowledge_sequence,
+            index_readiness_sequence=self._index_readiness_sequence,
+            access_scope=access_scope,
+        )
+
+    async def _inspect_lineage_store(
+        self,
+        query: KnowledgeLineageQuery,
+        *,
+        access_scope: KnowledgeAccessScope,
+    ) -> KnowledgeLineageResult | None:
+        return await self._store._inspect_lineage_at_change_sequence(
+            query,
+            through_sequence=self._knowledge_sequence,
+            access_scope=access_scope,
+        )
+
+
+class KnowledgeRevisionRecallSource(KnowledgeRecallSource):
+    """Knowledge recall lane restricted to an exact bounded revision set."""
+
+    def __init__(
+        self,
+        store: KnowledgeStore,
+        revision_refs: Sequence[KnowledgeRevisionRef],
+        *,
+        knowledge_sequence: int | None = None,
+        index_readiness_sequence: int | None = None,
+        required: bool = True,
+        candidate_limit: int = 20,
+        max_bytes: int = 64_000,
+        max_record_bytes: int = 8_000,
+        semantic_timeout_seconds: float = 1.0,
+        lineage_limit: int = 0,
+        lineage_candidate_limit: int = 10,
+        lineage_max_bytes: int = MAX_KNOWLEDGE_RELATION_BYTES,
+    ) -> None:
+        super().__init__(
+            store,
+            required=required,
+            candidate_limit=candidate_limit,
+            max_bytes=max_bytes,
+            max_record_bytes=max_record_bytes,
+            semantic_timeout_seconds=semantic_timeout_seconds,
+            lineage_limit=lineage_limit,
+            lineage_candidate_limit=lineage_candidate_limit,
+            lineage_max_bytes=lineage_max_bytes,
+        )
+        self._revision_refs = copy_knowledge_revision_refs(revision_refs)
+        if (knowledge_sequence is None) != (index_readiness_sequence is None):
+            raise ValueError(
+                "`knowledge_sequence` and `index_readiness_sequence` must be supplied together."
+            )
+        for field_name, value in (
+            ("knowledge_sequence", knowledge_sequence),
+            ("index_readiness_sequence", index_readiness_sequence),
+        ):
+            if value is not None and (
+                type(value) is not int or not 0 <= value <= MAX_KNOWLEDGE_CHANGE_SEQUENCE
+            ):
+                raise ValueError(
+                    f"`{field_name}` must be a non-negative knowledge frontier sequence."
+                )
+        self._knowledge_sequence = knowledge_sequence
+        self._index_readiness_sequence = index_readiness_sequence
+
+    async def _search_store(
+        self,
+        query: KnowledgeQuery,
+        *,
+        access_scope: KnowledgeAccessScope,
+    ) -> KnowledgeSearchResult:
+        return await self._store.search_revisions(
+            query,
+            self._revision_refs,
+            knowledge_sequence=self._knowledge_sequence,
+            index_readiness_sequence=self._index_readiness_sequence,
+            access_scope=access_scope,
+        )
+
+    async def _inspect_lineage_store(
+        self,
+        query: KnowledgeLineageQuery,
+        *,
+        access_scope: KnowledgeAccessScope,
+    ) -> KnowledgeLineageResult | None:
+        if self._knowledge_sequence is None:
+            return await super()._inspect_lineage_store(
+                query,
+                access_scope=access_scope,
+            )
+        return await self._store._inspect_lineage_at_change_sequence(
+            query,
+            through_sequence=self._knowledge_sequence,
+            access_scope=access_scope,
+        )
 
 
 class TranscriptRecallSource(RecallSource):
@@ -1923,7 +2088,9 @@ __all__ = [
     "KNOWLEDGE_SEMANTIC_CHANNEL",
     "RECALL_ENGINE_VERSION",
     "TRANSCRIPT_LEXICAL_CHANNEL",
+    "KnowledgeFrontierRecallSource",
     "KnowledgeRecallSource",
+    "KnowledgeRevisionRecallSource",
     "RecallCandidate",
     "RecallEngine",
     "RecallEngineConfig",

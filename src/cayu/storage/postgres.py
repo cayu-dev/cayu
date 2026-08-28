@@ -758,6 +758,7 @@ from cayu.storage.memory import (
     _validate_knowledge_publication_replay,
     _validate_knowledge_relation_publication_replay,
     _validate_knowledge_revision,
+    _validate_knowledge_search_frontier,
     _validate_nonnegative_float,
     _validate_positive_int,
     _validate_revision_append,
@@ -779,6 +780,7 @@ from cayu.storage.memory import (
     copy_knowledge_query,
     copy_knowledge_relation_publication_receipt,
     copy_knowledge_relation_query,
+    copy_knowledge_revision_refs,
     knowledge_chunk_embedding_identity,
     knowledge_entry_payload_bytes,
     prepare_knowledge_maintenance_decision,
@@ -12168,9 +12170,40 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         *,
         access_scope: KnowledgeAccessScope | None = None,
     ) -> KnowledgeLineageResult | None:
+        return await self._inspect_lineage(
+            query,
+            access_scope=access_scope,
+            through_sequence=None,
+        )
+
+    async def _inspect_lineage_at_change_sequence(
+        self,
+        query: KnowledgeLineageQuery,
+        *,
+        through_sequence: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeLineageResult | None:
+        _validate_knowledge_change_sequence(through_sequence, "through_sequence")
+        return await self._inspect_lineage(
+            query,
+            access_scope=access_scope,
+            through_sequence=through_sequence,
+        )
+
+    async def _inspect_lineage(
+        self,
+        query: KnowledgeLineageQuery,
+        *,
+        access_scope: KnowledgeAccessScope | None,
+        through_sequence: int | None,
+    ) -> KnowledgeLineageResult | None:
         scope = self._operation_access_scope(access_scope)
         query = copy_knowledge_lineage_query(query)
-        fingerprint = _knowledge_lineage_query_fingerprint(query, scope)
+        fingerprint = _knowledge_lineage_query_fingerprint(
+            query,
+            scope,
+            through_change_sequence=through_sequence,
+        )
         cursor = _decode_knowledge_lineage_cursor(query.cursor, fingerprint=fingerprint)
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
@@ -12181,10 +12214,26 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 query.reference.entry_id,
                 revision=query.reference.revision,
             )
-            reference_current = await self._load_entry(cur, query.reference.entry_id)
+            reference_live = await self._load_entry(cur, query.reference.entry_id)
+            reference_current = (
+                reference_live
+                if through_sequence is None
+                else await self._load_entry_at_change_sequence(
+                    cur,
+                    query.reference.entry_id,
+                    through_sequence=through_sequence,
+                )
+            )
             if (
                 reference_exact is None
+                or reference_live is None
                 or reference_current is None
+                or not _knowledge_scope_allows_lineage_endpoint(
+                    scope,
+                    reference_exact,
+                    reference_live,
+                    now=access_now,
+                )
                 or not _knowledge_scope_allows_lineage_endpoint(
                     scope,
                     reference_exact,
@@ -12199,12 +12248,78 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 scope,
                 allow_archived_current=True,
                 now=access_now,
+                through_change_sequence=through_sequence,
             )
             cursor_sql = ""
             cursor_params: list[object] = []
             if cursor is not None:
                 cursor_sql = ' AND (relation.created_at, relation.id COLLATE "C") > (%s, %s)'
                 cursor_params.extend([cursor.created_at, cursor.relation_id])
+            frontier_sql = ""
+            frontier_params: list[object] = []
+            current_join_sql = """
+                JOIN cayu_knowledge_current_entries AS subject_current
+                  ON subject_current.id = relation.subject_entry_id
+                JOIN cayu_knowledge_current_entries AS object_current
+                  ON object_current.id = relation.object_entry_id
+            """
+            current_join_params: list[object] = []
+            if through_sequence is not None:
+                frontier_sql = """
+                    AND EXISTS (
+                        SELECT 1
+                        FROM cayu_knowledge_changes AS boundary_change
+                        WHERE boundary_change.relation_id = relation.id
+                          AND boundary_change.sequence <= %s
+                    )
+                """
+                frontier_params.append(through_sequence)
+                current_join_sql = """
+                    JOIN cayu_knowledge_changes AS subject_current_change
+                      ON subject_current_change.entry_id = relation.subject_entry_id
+                     AND subject_current_change.kind <> 'relation_published'
+                     AND subject_current_change.sequence = (
+                         SELECT MAX(subject_boundary.sequence)
+                         FROM cayu_knowledge_changes AS subject_boundary
+                         WHERE subject_boundary.entry_id = relation.subject_entry_id
+                           AND subject_boundary.kind <> 'relation_published'
+                           AND subject_boundary.sequence <= %s
+                     )
+                     AND subject_current_change.sequence = (
+                         SELECT MAX(subject_materialization.sequence)
+                         FROM cayu_knowledge_changes AS subject_materialization
+                         WHERE subject_materialization.entry_id =
+                                   subject_current_change.entry_id
+                           AND subject_materialization.entry_revision =
+                                   subject_current_change.entry_revision
+                           AND subject_materialization.kind <> 'relation_published'
+                     )
+                    JOIN cayu_knowledge_revisions AS subject_current
+                      ON subject_current.entry_id = subject_current_change.entry_id
+                     AND subject_current.revision = subject_current_change.entry_revision
+                    JOIN cayu_knowledge_changes AS object_current_change
+                      ON object_current_change.entry_id = relation.object_entry_id
+                     AND object_current_change.kind <> 'relation_published'
+                     AND object_current_change.sequence = (
+                         SELECT MAX(object_boundary.sequence)
+                         FROM cayu_knowledge_changes AS object_boundary
+                         WHERE object_boundary.entry_id = relation.object_entry_id
+                           AND object_boundary.kind <> 'relation_published'
+                           AND object_boundary.sequence <= %s
+                     )
+                     AND object_current_change.sequence = (
+                         SELECT MAX(object_materialization.sequence)
+                         FROM cayu_knowledge_changes AS object_materialization
+                         WHERE object_materialization.entry_id = object_current_change.entry_id
+                           AND object_materialization.entry_revision =
+                                   object_current_change.entry_revision
+                           AND object_materialization.kind <> 'relation_published'
+                     )
+                    JOIN cayu_knowledge_revisions AS object_current
+                      ON object_current.entry_id = object_current_change.entry_id
+                     AND object_current.revision = object_current_change.entry_revision
+                """
+                current_join_params.extend((through_sequence, through_sequence))
             await cur.execute(
                 cast(
                     "LiteralString",
@@ -12216,22 +12331,24 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                            subject_current.revision, subject_current.status,
                            object_current.revision, object_current.status
                     FROM cayu_knowledge_relations AS relation
-                    JOIN cayu_knowledge_current_entries AS subject_current
-                      ON subject_current.id = relation.subject_entry_id
-                    JOIN cayu_knowledge_current_entries AS object_current
-                      ON object_current.id = relation.object_entry_id
+                    """
+                    + current_join_sql
+                    + """
                     WHERE TRUE
                     """
                     + relation_sql
                     + lineage_sql
                     + cursor_sql
+                    + frontier_sql
                     + access_sql
                     + ' ORDER BY relation.created_at, relation.id COLLATE "C" LIMIT %s',
                 ),
                 (
+                    *current_join_params,
                     *relation_params,
                     *lineage_params,
                     *cursor_params,
+                    *frontier_params,
                     *access_params,
                     query.limit + 1,
                 ),
@@ -13571,11 +13688,13 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         )
         accessible_from = """
             FROM cayu_knowledge_index_readiness_events AS event
-            JOIN cayu_knowledge_entries AS logical
-              ON logical.id = event.entry_id
-            JOIN cayu_knowledge_revisions AS e
-              ON e.entry_id = event.entry_id
-             AND e.revision = event.entry_revision
+            JOIN (
+                SELECT logical.id, logical.namespace, revision.*
+                FROM cayu_knowledge_entries AS logical
+                JOIN cayu_knowledge_revisions AS revision
+                  ON revision.entry_id = logical.id
+            ) AS e
+              ON e.id = event.entry_id AND e.revision = event.entry_revision
             JOIN cayu_knowledge_current_entries AS current_entry
               ON current_entry.id = event.entry_id
             WHERE TRUE
@@ -13729,7 +13848,70 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         await self._ensure_ready()
         async with self._pool.connection() as conn, conn.cursor() as cur:
             await _begin_knowledge_read_snapshot(cur)
-            return await self._keyword_search_in_snapshot(cur, query, access_scope=scope)
+            return await self._keyword_search_in_snapshot(
+                cur,
+                query,
+                access_scope=scope,
+                revision_refs=None,
+                through_change_sequence=None,
+            )
+
+    async def search_at_frontier(
+        self,
+        query: KnowledgeQuery,
+        *,
+        knowledge_sequence: int,
+        index_readiness_sequence: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSearchResult:
+        scope = self._operation_access_scope(access_scope)
+        query = copy_knowledge_query(query)
+        _validate_knowledge_change_sequence(knowledge_sequence, "knowledge_sequence")
+        _validate_knowledge_index_sequence(
+            index_readiness_sequence,
+            "index_readiness_sequence",
+        )
+        if query.mode not in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}:
+            raise ValueError("PostgresKnowledgeStore supports only auto and keyword search modes.")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await _begin_knowledge_read_snapshot(cur)
+            return await self._keyword_search_in_snapshot(
+                cur,
+                query,
+                access_scope=scope,
+                revision_refs=None,
+                through_change_sequence=knowledge_sequence,
+            )
+
+    async def search_revisions(
+        self,
+        query: KnowledgeQuery,
+        revision_refs: Sequence[KnowledgeRevisionRef],
+        *,
+        knowledge_sequence: int | None = None,
+        index_readiness_sequence: int | None = None,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSearchResult:
+        scope = self._operation_access_scope(access_scope)
+        query = copy_knowledge_query(query)
+        references = copy_knowledge_revision_refs(revision_refs)
+        _validate_knowledge_search_frontier(
+            knowledge_sequence,
+            index_readiness_sequence,
+        )
+        if query.mode not in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}:
+            raise ValueError("PostgresKnowledgeStore supports only auto and keyword search modes.")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await _begin_knowledge_read_snapshot(cur)
+            return await self._keyword_search_in_snapshot(
+                cur,
+                query,
+                access_scope=scope,
+                revision_refs=references,
+                through_change_sequence=knowledge_sequence,
+            )
 
     async def _keyword_search_in_snapshot(
         self,
@@ -13737,6 +13919,8 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         query: KnowledgeQuery,
         *,
         access_scope: KnowledgeAccessScope,
+        revision_refs: tuple[KnowledgeRevisionRef, ...] | None = None,
+        through_change_sequence: int | None = None,
     ) -> KnowledgeSearchResult:
         """Run keyword retrieval inside a caller-owned read snapshot."""
 
@@ -13746,6 +13930,14 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
         access_sql, access_params = _postgres_knowledge_access_scope_filter_sql(access_scope)
         where_sql += access_sql
         params.extend(access_params)
+        revision_sql, revision_params = _postgres_knowledge_revision_refs_filter_sql(revision_refs)
+        where_sql += revision_sql
+        params.extend(revision_params)
+        frontier_sql, frontier_params = _postgres_knowledge_frontier_filter_sql(
+            through_change_sequence
+        )
+        where_sql += frontier_sql
+        params.extend(frontier_params)
         total_hits_known = await self._count_search_hits(
             cur,
             search_filter_sql,
@@ -15327,6 +15519,37 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             ),
         )
 
+    async def _load_entry_at_change_sequence(
+        self,
+        cur: Any,
+        entry_id: str,
+        *,
+        through_sequence: int,
+    ) -> KnowledgeEntry | None:
+        await cur.execute(
+            """
+            SELECT candidate.entry_revision
+            FROM cayu_knowledge_changes AS candidate
+            WHERE candidate.entry_id = %s
+              AND candidate.kind <> 'relation_published'
+              AND candidate.sequence <= %s
+              AND candidate.sequence = (
+                  SELECT MAX(materialization.sequence)
+                  FROM cayu_knowledge_changes AS materialization
+                  WHERE materialization.entry_id = candidate.entry_id
+                    AND materialization.entry_revision = candidate.entry_revision
+                    AND materialization.kind <> 'relation_published'
+              )
+            ORDER BY candidate.sequence DESC
+            LIMIT 1
+            """,
+            (entry_id, through_sequence),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return await self._load_entry(cur, entry_id, revision=int(row[0]))
+
     async def _load_entry_in_scope(
         self,
         cur: Any,
@@ -16183,7 +16406,87 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
     ) -> KnowledgeSearchResult:
         scope = self._operation_access_scope(access_scope)
         query = copy_knowledge_query(query)
+        return await self._embedding_search(
+            query,
+            scope,
+            revision_refs=None,
+            knowledge_sequence=None,
+            index_readiness_sequence=None,
+        )
+
+    async def search_at_frontier(
+        self,
+        query: KnowledgeQuery,
+        *,
+        knowledge_sequence: int,
+        index_readiness_sequence: int,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSearchResult:
+        scope = self._operation_access_scope(access_scope)
+        query = copy_knowledge_query(query)
+        _validate_knowledge_change_sequence(knowledge_sequence, "knowledge_sequence")
+        _validate_knowledge_index_sequence(
+            index_readiness_sequence,
+            "index_readiness_sequence",
+        )
+        return await self._embedding_search(
+            query,
+            scope,
+            revision_refs=None,
+            knowledge_sequence=knowledge_sequence,
+            index_readiness_sequence=index_readiness_sequence,
+        )
+
+    async def search_revisions(
+        self,
+        query: KnowledgeQuery,
+        revision_refs: Sequence[KnowledgeRevisionRef],
+        *,
+        knowledge_sequence: int | None = None,
+        index_readiness_sequence: int | None = None,
+        access_scope: KnowledgeAccessScope | None = None,
+    ) -> KnowledgeSearchResult:
+        scope = self._operation_access_scope(access_scope)
+        query = copy_knowledge_query(query)
+        references = copy_knowledge_revision_refs(revision_refs)
+        _validate_knowledge_search_frontier(
+            knowledge_sequence,
+            index_readiness_sequence,
+        )
+        return await self._embedding_search(
+            query,
+            scope,
+            revision_refs=references,
+            knowledge_sequence=knowledge_sequence,
+            index_readiness_sequence=index_readiness_sequence,
+        )
+
+    async def _embedding_search(
+        self,
+        query: KnowledgeQuery,
+        scope: KnowledgeAccessScope,
+        *,
+        revision_refs: tuple[KnowledgeRevisionRef, ...] | None,
+        knowledge_sequence: int | None,
+        index_readiness_sequence: int | None,
+    ) -> KnowledgeSearchResult:
         if query.mode is KnowledgeSearchMode.KEYWORD:
+            if revision_refs is not None:
+                return await super().search_revisions(
+                    query,
+                    revision_refs,
+                    knowledge_sequence=knowledge_sequence,
+                    index_readiness_sequence=index_readiness_sequence,
+                    access_scope=scope,
+                )
+            if knowledge_sequence is not None:
+                assert index_readiness_sequence is not None
+                return await super().search_at_frontier(
+                    query,
+                    knowledge_sequence=knowledge_sequence,
+                    index_readiness_sequence=index_readiness_sequence,
+                    access_scope=scope,
+                )
             return await super().search(query, access_scope=scope)
         if query.mode not in {
             KnowledgeSearchMode.AUTO,
@@ -16195,6 +16498,44 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 "and hybrid search modes."
             )
         await self._ensure_ready()
+        if revision_refs == ():
+            return KnowledgeSearchResult(
+                query=query,
+                hits=[],
+                truncated=False,
+                limit=query.limit,
+                max_bytes=query.max_bytes,
+                total_hits_known=0,
+                index_coverage=[
+                    KnowledgeIndexCoverage(
+                        projection_type=KNOWLEDGE_CHUNK_TEXT_PROJECTION,
+                        embedding_model=self.embedding_model,
+                        dimensions=self.embedding_dimensions,
+                        preprocessing_version=KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION,
+                        generator=KNOWLEDGE_CHUNK_TEXT_GENERATOR,
+                        generator_version=KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION,
+                        index_representation_version=(
+                            KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION
+                        ),
+                        eligible_records=0,
+                        ready_records=0,
+                        pending_records=0,
+                        failed_records=0,
+                        high_water_sequence=0,
+                        complete=True,
+                    )
+                ],
+            )
+        if revision_refs is not None or knowledge_sequence is not None:
+            no_ready_result = await self._exact_search_without_ready_semantic_candidates(
+                query,
+                scope,
+                revision_refs,
+                knowledge_sequence=knowledge_sequence,
+                index_readiness_sequence=index_readiness_sequence,
+            )
+            if no_ready_result is not None:
+                return no_ready_result
         semantic_query_text = _semantic_query_text(query)
         query_vector = await self._embed_query(query, semantic_query_text)
         keyword_result: KnowledgeSearchResult | None = None
@@ -16208,6 +16549,9 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 cur,
                 query,
                 access_scope=scope,
+                revision_refs=revision_refs,
+                through_change_sequence=knowledge_sequence,
+                through_index_readiness_sequence=index_readiness_sequence,
             )
             (
                 rows,
@@ -16219,6 +16563,9 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 query_vector,
                 access_scope=scope,
                 ready_records=coverage.ready_records,
+                revision_refs=revision_refs,
+                through_change_sequence=knowledge_sequence,
+                through_index_readiness_sequence=index_readiness_sequence,
             )
             scored, byte_truncated = await self._scored_semantic_rows(
                 cur,
@@ -16232,7 +16579,78 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                     cur,
                     keyword_query,
                     access_scope=scope,
+                    revision_refs=revision_refs,
+                    through_change_sequence=knowledge_sequence,
                 )
+        return self._finalize_embedding_search(
+            query,
+            coverage=coverage,
+            scored=scored,
+            keyword_result=keyword_result,
+            byte_truncated=byte_truncated,
+            candidate_limit_reached=candidate_limit_reached,
+            semantic_total_hits_known_floor=semantic_total_hits_known_floor,
+        )
+
+    async def _exact_search_without_ready_semantic_candidates(
+        self,
+        query: KnowledgeQuery,
+        scope: KnowledgeAccessScope,
+        revision_refs: tuple[KnowledgeRevisionRef, ...] | None,
+        *,
+        knowledge_sequence: int | None,
+        index_readiness_sequence: int | None,
+    ) -> KnowledgeSearchResult | None:
+        """Return a bounded result without a provider call when no vector is searchable."""
+
+        async with (
+            self._pool.connection() as conn,
+            conn.transaction(),
+            conn.cursor() as cur,
+        ):
+            await _begin_knowledge_read_snapshot(cur)
+            coverage = await self._index_coverage_in_snapshot(
+                cur,
+                query,
+                access_scope=scope,
+                revision_refs=revision_refs,
+                through_change_sequence=knowledge_sequence,
+                through_index_readiness_sequence=index_readiness_sequence,
+            )
+            if coverage.ready_records > 0:
+                return None
+            keyword_result: KnowledgeSearchResult | None = None
+            if query.mode in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.HYBRID}:
+                keyword_result = await self._keyword_search_in_snapshot(
+                    cur,
+                    query.model_copy(update={"mode": KnowledgeSearchMode.KEYWORD}),
+                    access_scope=scope,
+                    revision_refs=revision_refs,
+                    through_change_sequence=knowledge_sequence,
+                )
+        return self._finalize_embedding_search(
+            query,
+            coverage=coverage,
+            scored=[],
+            keyword_result=keyword_result,
+            byte_truncated=False,
+            candidate_limit_reached=False,
+            semantic_total_hits_known_floor=0,
+        )
+
+    def _finalize_embedding_search(
+        self,
+        query: KnowledgeQuery,
+        *,
+        coverage: KnowledgeIndexCoverage,
+        scored: list[
+            tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None, bool]
+        ],
+        keyword_result: KnowledgeSearchResult | None,
+        byte_truncated: bool,
+        candidate_limit_reached: bool,
+        semantic_total_hits_known_floor: int,
+    ) -> KnowledgeSearchResult:
         total_hits_known_floor = len(scored)
         if query.mode is KnowledgeSearchMode.SEMANTIC:
             total_hits_known_floor = max(
@@ -16294,7 +16712,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                             "LiteralString",
                             f"""
                             CREATE TABLE IF NOT EXISTS cayu_knowledge_embeddings (
-                                identity_sha256 TEXT PRIMARY KEY
+                                identity_sha256 TEXT NOT NULL
                                     CHECK (identity_sha256 ~ '^[0-9a-f]{{64}}$'),
                                 entry_id TEXT NOT NULL,
                                 entry_revision INTEGER NOT NULL
@@ -16311,11 +16729,14 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                                 readiness_sequence BIGINT NOT NULL
                                     CHECK (readiness_sequence > 0),
                                 attempt_id TEXT NOT NULL,
+                                current_projection BOOLEAN NOT NULL,
                                 embedding_sha256 TEXT NOT NULL
                                     CHECK (embedding_sha256 ~ '^[0-9a-f]{{64}}$'),
                                 embedding vector({self.embedding_dimensions}) NOT NULL,
                                 created_at TIMESTAMPTZ NOT NULL,
                                 updated_at TIMESTAMPTZ NOT NULL,
+                                PRIMARY KEY (identity_sha256, readiness_sequence),
+                                UNIQUE (identity_sha256, attempt_id),
                                 FOREIGN KEY (chunk_id, entry_id, entry_revision)
                                     REFERENCES cayu_knowledge_chunks(
                                         id, entry_id, entry_revision
@@ -16337,11 +16758,20 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                         ON cayu_knowledge_embeddings(embedding_model, dimensions)
                         """
                     )
+                    await cur.execute(
+                        """
+                        CREATE UNIQUE INDEX IF NOT EXISTS
+                            idx_cayu_knowledge_embeddings_current_identity
+                        ON cayu_knowledge_embeddings(identity_sha256)
+                        WHERE current_projection
+                        """
+                    )
                     # HNSW tops out at 2000 dims; above the cap no index is built and semantic search
                     # falls back to an exact brute-force scan (the constructor warns — see
                     # _warn_if_embedding_dims_exceed_hnsw).
                     if self.embedding_dimensions <= _PGVECTOR_HNSW_VECTOR_MAX_DIMENSIONS:
                         await self._create_embedding_hnsw_index(cur)
+                        await self._create_embedding_history_hnsw_index(cur)
                 elif mode is schema.SchemaMode.VALIDATE:
                     await cur.execute(
                         "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')"
@@ -16395,6 +16825,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             ("index_representation_version", "text", True),
             ("readiness_sequence", "bigint", True),
             ("attempt_id", "text", True),
+            ("current_projection", "boolean", True),
             ("embedding_sha256", "text", True),
             ("embedding", f"vector({self.embedding_dimensions})", True),
             ("created_at", "timestamp with time zone", True),
@@ -16422,7 +16853,8 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             for kind, validated, definition in await cur.fetchall()
         ]
         required_constraints = (
-            ("p", ("primary key (identity_sha256)",)),
+            ("p", ("primary key (identity_sha256, readiness_sequence)",)),
+            ("u", ("unique (identity_sha256, attempt_id)",)),
             ("c", ("identity_sha256", "[0-9a-f]{64}")),
             ("c", ("entry_revision > 0", "entry_revision <= 2147483647")),
             ("c", ("readiness_sequence > 0",)),
@@ -16451,10 +16883,20 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             "idx_cayu_knowledge_embeddings_entry": (
                 "cayu_knowledge_embeddings",
                 "using btree (entry_id, entry_revision)",
+                False,
+                None,
             ),
             "idx_cayu_knowledge_embeddings_model_dims": (
                 "cayu_knowledge_embeddings",
                 "using btree (embedding_model, dimensions)",
+                False,
+                None,
+            ),
+            "idx_cayu_knowledge_embeddings_current_identity": (
+                "cayu_knowledge_embeddings",
+                "using btree (identity_sha256)",
+                True,
+                "current_projection",
             ),
         }
         await cur.execute(
@@ -16462,7 +16904,8 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             SELECT table_record.relname, index_record.relname,
                    index_state.indisvalid, index_state.indisready,
                    index_state.indisunique, index_state.indpred IS NULL,
-                   pg_get_indexdef(index_record.oid)
+                   pg_get_indexdef(index_record.oid),
+                   pg_get_expr(index_state.indpred, index_state.indrelid)
             FROM pg_catalog.pg_index AS index_state
             JOIN pg_catalog.pg_class AS index_record
               ON index_record.oid = index_state.indexrelid
@@ -16483,19 +16926,23 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 bool(unique),
                 bool(unqualified),
                 " ".join(str(definition).lower().split()),
+                " ".join(str(predicate or "").lower().split()),
             )
-            for table, index, valid, ready, unique, unqualified, definition in await cur.fetchall()
+            for table, index, valid, ready, unique, unqualified, definition, predicate in (
+                await cur.fetchall()
+            )
         }
-        for name, (table, definition) in expected_indexes.items():
+        for name, (table, definition, unique, predicate) in expected_indexes.items():
             value = indexes.get(name)
             if (
                 value is None
                 or value[0] != table
                 or not value[1]
                 or not value[2]
-                or value[3]
-                or not value[4]
+                or value[3] != unique
+                or value[4] != (predicate is None)
                 or definition not in value[5]
+                or value[6] != ("" if predicate is None else predicate)
             ):
                 self._raise_embedding_schema_error(name)
 
@@ -16503,8 +16950,9 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
     def _raise_embedding_schema_error(name: str) -> NoReturn:
         raise RuntimeError(
             "Postgres knowledge embedding schema does not match Cayu's "
-            f"revision-bound projection contract at {name!r}. Recreate the derived "
-            "embedding table and indexes with schema_mode=CREATE or MIGRATE."
+            f"revision-bound projection contract at {name!r}. Drop the derived "
+            "cayu_knowledge_embeddings table, restart with schema_mode=CREATE or MIGRATE, "
+            "and rebuild its projections from canonical knowledge entries."
         )
 
     def _embedding_hnsw_index_name(self) -> str:
@@ -16522,7 +16970,40 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         suffix = sha256(identity.encode("utf-8")).hexdigest()[:28]
         return f"idx_cayu_knowledge_embeddings_hnsw_{suffix}"
 
+    def _embedding_history_hnsw_index_name(self) -> str:
+        suffix = self._embedding_hnsw_index_name().rsplit("_", 1)[-1]
+        return f"idx_cayu_knowledge_embeddings_history_{suffix[:24]}"
+
     async def _create_embedding_hnsw_index(self, cur: Any) -> None:
+        await cur.execute(
+            sql.SQL(
+                """
+                CREATE INDEX IF NOT EXISTS {index}
+                ON cayu_knowledge_embeddings USING hnsw (embedding vector_cosine_ops)
+                WHERE current_projection
+                  AND projection_type = {projection_type}
+                  AND embedding_model = {embedding_model}
+                  AND dimensions = {dimensions}
+                  AND preprocessing_version = {preprocessing_version}
+                  AND generator = {generator}
+                  AND generator_version = {generator_version}
+                  AND index_representation_version = {index_representation_version}
+                """
+            ).format(
+                index=sql.Identifier(self._embedding_hnsw_index_name()),
+                projection_type=sql.Literal(KNOWLEDGE_CHUNK_TEXT_PROJECTION),
+                embedding_model=sql.Literal(self.embedding_model),
+                dimensions=sql.Literal(self.embedding_dimensions),
+                preprocessing_version=sql.Literal(KNOWLEDGE_CHUNK_TEXT_PREPROCESSING_VERSION),
+                generator=sql.Literal(KNOWLEDGE_CHUNK_TEXT_GENERATOR),
+                generator_version=sql.Literal(KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION),
+                index_representation_version=sql.Literal(
+                    KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION
+                ),
+            )
+        )
+
+    async def _create_embedding_history_hnsw_index(self, cur: Any) -> None:
         await cur.execute(
             sql.SQL(
                 """
@@ -16537,7 +17018,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                   AND index_representation_version = {index_representation_version}
                 """
             ).format(
-                index=sql.Identifier(self._embedding_hnsw_index_name()),
+                index=sql.Identifier(self._embedding_history_hnsw_index_name()),
                 projection_type=sql.Literal(KNOWLEDGE_CHUNK_TEXT_PROJECTION),
                 embedding_model=sql.Literal(self.embedding_model),
                 dimensions=sql.Literal(self.embedding_dimensions),
@@ -16592,8 +17073,11 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             "generator_version",
             "index_representation_version",
         )
-        expected_name = self._embedding_hnsw_index_name()
-        expected_found = self.embedding_dimensions > _PGVECTOR_HNSW_VECTOR_MAX_DIMENSIONS
+        expected_names = {
+            self._embedding_hnsw_index_name(): True,
+            self._embedding_history_hnsw_index_name(): False,
+        }
+        expected_found: set[str] = set()
         for row in rows:
             name = str(row[0])
             definition = " ".join(str(row[3]).lower().split())
@@ -16609,13 +17093,15 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 )
                 or re.search(r"\bor\b", predicate_shape) is not None
                 or re.search(r"\bany\s*\(", predicate_shape) is not None
+                or re.search(r"\bnot\b", predicate_shape) is not None
             ):
                 raise RuntimeError(
                     "Postgres knowledge embedding HNSW indexes must isolate one "
-                    "complete compatible projection space. Recreate the derived "
-                    "embedding indexes with schema_mode=CREATE or MIGRATE."
+                    "complete compatible projection space. Drop the conflicting derived "
+                    "embedding index before restarting with schema_mode=CREATE or MIGRATE."
                 )
-            if name != expected_name:
+            current_only = expected_names.get(name)
+            if current_only is None:
                 continue
             expected_fragments = (
                 f"projection_type = {str(row[5]).lower()}::text",
@@ -16626,17 +17112,44 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 f"generator_version = {str(row[9]).lower()}::text",
                 f"index_representation_version = {str(row[10]).lower()}::text",
             )
-            if any(fragment not in predicate for fragment in expected_fragments):
+            remaining_predicate = predicate
+            exact_projection_space = True
+            for fragment in expected_fragments:
+                if remaining_predicate.count(fragment) != 1:
+                    exact_projection_space = False
+                    break
+                remaining_predicate = remaining_predicate.replace(fragment, "", 1)
+            current_projection_occurrences = len(
+                re.findall(r"\bcurrent_projection\b", remaining_predicate)
+            )
+            if current_only:
+                if current_projection_occurrences != 1:
+                    exact_projection_space = False
+                else:
+                    remaining_predicate = re.sub(
+                        r"\bcurrent_projection\b",
+                        "",
+                        remaining_predicate,
+                        count=1,
+                    )
+            elif current_projection_occurrences != 0:
+                exact_projection_space = False
+            remaining_predicate = re.sub(r"\band\b", "", remaining_predicate)
+            remaining_predicate = re.sub(r"[\s()]", "", remaining_predicate)
+            if not exact_projection_space or remaining_predicate:
                 raise RuntimeError(
                     "Postgres knowledge embedding HNSW index conflicts with the "
-                    "configured projection space. Recreate the derived embedding "
-                    "indexes with schema_mode=CREATE or MIGRATE."
+                    "configured projection space. Drop the conflicting derived embedding "
+                    "index before restarting with schema_mode=CREATE or MIGRATE."
                 )
-            expected_found = True
-        if not expected_found:
+            expected_found.add(name)
+        if (
+            self.embedding_dimensions <= _PGVECTOR_HNSW_VECTOR_MAX_DIMENSIONS
+            and expected_found != set(expected_names)
+        ):
             raise RuntimeError(
                 "Missing Postgres knowledge embedding HNSW index for the configured "
-                "projection space. Run with schema_mode=CREATE or MIGRATE."
+                "projection space. Restart with schema_mode=CREATE or MIGRATE."
             )
 
     async def _semantic_search_rows(
@@ -16674,12 +17187,55 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         access_scope: KnowledgeAccessScope,
         ready_records: int,
         force_exact: bool = False,
+        revision_refs: tuple[KnowledgeRevisionRef, ...] | None = None,
+        through_change_sequence: int | None = None,
+        through_index_readiness_sequence: int | None = None,
     ) -> tuple[list[tuple[str, str, float]], bool, int]:
         where_sql, params = _postgres_knowledge_filter_sql(query)
         access_sql, access_params = _postgres_knowledge_access_scope_filter_sql(access_scope)
         where_sql += access_sql
         params.extend(access_params)
+        revision_sql, revision_params = _postgres_knowledge_revision_refs_filter_sql(revision_refs)
+        where_sql += revision_sql
+        params.extend(revision_params)
+        frontier_sql, frontier_params = _postgres_knowledge_frontier_filter_sql(
+            through_change_sequence
+        )
+        where_sql += frontier_sql
+        params.extend(frontier_params)
         none_sql, none_params = _postgres_knowledge_none_filter_sql(query)
+        if through_index_readiness_sequence is None:
+            readiness_join_sql = """
+                JOIN cayu_knowledge_index_readiness_current AS readiness_current
+                  ON readiness_current.identity_sha256 = emb.identity_sha256
+                JOIN cayu_knowledge_index_readiness_events AS readiness
+                  ON readiness.sequence = readiness_current.sequence
+                 AND readiness.identity_sha256 = emb.identity_sha256
+                 AND readiness.state = 'ready'
+            """
+            readiness_join_params: list[object] = []
+            projection_selection_sql = " AND emb.current_projection"
+        else:
+            readiness_join_sql = """
+                JOIN cayu_knowledge_index_readiness_events AS readiness
+                  ON readiness.identity_sha256 = emb.identity_sha256
+                 AND readiness.state = 'ready'
+                 AND readiness.sequence = (
+                     SELECT MAX(boundary.sequence)
+                     FROM cayu_knowledge_index_readiness_events AS boundary
+                     WHERE boundary.identity_sha256 = emb.identity_sha256
+                       AND boundary.sequence <= %s
+                 )
+            """
+            readiness_join_params = [through_index_readiness_sequence]
+            projection_selection_sql = """
+                AND emb.readiness_sequence = (
+                    SELECT MAX(projection.readiness_sequence)
+                    FROM cayu_knowledge_embeddings AS projection
+                    WHERE projection.identity_sha256 = emb.identity_sha256
+                      AND projection.readiness_sequence <= readiness.sequence
+                )
+            """
         vector_literal = _postgres_vector_literal(query_vector)
         candidate_limit = max(
             query.limit,
@@ -16698,6 +17254,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         )
         exact_scan = (
             force_exact
+            or revision_refs is not None
             or bool(query.none_terms)
             or self.embedding_dimensions > _PGVECTOR_HNSW_VECTOR_MAX_DIMENSIONS
         )
@@ -16706,8 +17263,11 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             # HNSW scan. A dense set of nearer excluded entries could
             # therefore consume the complete ANN candidate budget before a
             # valid lower-ranked entry is visited. Use an exact vector scan
-            # for entry-wide negative filters so the indexed lexical
-            # anti-filter is authoritative before Cayu's candidate limit.
+            # for bounded exact-revision sets and entry-wide negative filters
+            # so those predicates are authoritative before Cayu's candidate
+            # limit. Frontier predicates retain HNSW and use the underfill
+            # fallback below; forcing them exact would make every initial or
+            # changed-context checkpoint recall scan the complete vector table.
             # These settings are transaction-local so ordinary semantic
             # searches retain HNSW and pooled connections cannot leak the
             # exact-search policy to later requests.
@@ -16739,12 +17299,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                      AND c.entry_revision = emb.entry_revision
                     JOIN cayu_knowledge_current_entries AS e
                       ON e.id = emb.entry_id AND e.revision = c.entry_revision
-                    JOIN cayu_knowledge_index_readiness_current AS readiness_current
-                      ON readiness_current.identity_sha256 = emb.identity_sha256
-                    JOIN cayu_knowledge_index_readiness_events AS readiness
-                      ON readiness.sequence = readiness_current.sequence
-                     AND readiness.identity_sha256 = emb.identity_sha256
-                     AND readiness.state = 'ready'
+                    {readiness_join_sql}
                     WHERE emb.projection_type = %s
                       AND emb.projection_content_hash =
                           'sha256:' || encode(sha256(convert_to(c.text, 'UTF8')), 'hex')
@@ -16754,6 +17309,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                       AND emb.generator = %s
                       AND emb.generator_version = %s
                       AND emb.index_representation_version = %s
+                    {projection_selection_sql}
                     {where_sql}
                     {none_sql}
                     ORDER BY emb.embedding <=> %s::vector
@@ -16791,6 +17347,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             [
                 vector_literal,
                 vector_literal,
+                *readiness_join_params,
                 KNOWLEDGE_CHUNK_TEXT_PROJECTION,
                 self.embedding_model,
                 self.embedding_dimensions,
@@ -16823,6 +17380,9 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 access_scope=access_scope,
                 ready_records=ready_records,
                 force_exact=True,
+                revision_refs=revision_refs,
+                through_change_sequence=through_change_sequence,
+                through_index_readiness_sequence=through_index_readiness_sequence,
             )
         candidate_limit_reached = candidate_chunk_count >= candidate_limit
         return (
@@ -16837,12 +17397,46 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         query: KnowledgeQuery,
         *,
         access_scope: KnowledgeAccessScope,
+        revision_refs: tuple[KnowledgeRevisionRef, ...] | None = None,
+        through_change_sequence: int | None = None,
+        through_index_readiness_sequence: int | None = None,
     ) -> KnowledgeIndexCoverage:
         where_sql, params = _postgres_knowledge_filter_sql(query)
         access_sql, access_params = _postgres_knowledge_access_scope_filter_sql(access_scope)
         where_sql += access_sql
         params.extend(access_params)
+        revision_sql, revision_params = _postgres_knowledge_revision_refs_filter_sql(revision_refs)
+        where_sql += revision_sql
+        params.extend(revision_params)
+        frontier_sql, frontier_params = _postgres_knowledge_frontier_filter_sql(
+            through_change_sequence
+        )
+        where_sql += frontier_sql
+        params.extend(frontier_params)
         none_sql, none_params = _postgres_knowledge_none_filter_sql(query)
+        if through_index_readiness_sequence is None:
+            readiness_current_join_sql = """
+                JOIN cayu_knowledge_index_readiness_current AS current
+                  ON current.identity_sha256 = event.identity_sha256
+                 AND current.sequence = event.sequence
+            """
+            readiness_frontier_sql = ""
+            readiness_order_sql = ""
+            readiness_frontier_params: list[object] = []
+            embedding_selection_sql = " AND embedding.current_projection"
+        else:
+            readiness_current_join_sql = ""
+            readiness_frontier_sql = " AND event.sequence <= %s"
+            readiness_order_sql = "ORDER BY event.sequence DESC"
+            readiness_frontier_params = [through_index_readiness_sequence]
+            embedding_selection_sql = """
+                AND embedding.readiness_sequence = (
+                    SELECT MAX(projection.readiness_sequence)
+                    FROM cayu_knowledge_embeddings AS projection
+                    WHERE projection.identity_sha256 = readiness.identity_sha256
+                      AND projection.readiness_sequence <= readiness.sequence
+                )
+            """
         await cur.execute(
             cast(
                 "LiteralString",
@@ -16868,9 +17462,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                     LEFT JOIN LATERAL (
                         SELECT event.*
                         FROM cayu_knowledge_index_readiness_events AS event
-                        JOIN cayu_knowledge_index_readiness_current AS current
-                          ON current.identity_sha256 = event.identity_sha256
-                         AND current.sequence = event.sequence
+                        {readiness_current_join_sql}
                         WHERE event.entry_id = c.entry_id
                           AND event.entry_revision = c.entry_revision
                           AND event.chunk_id = c.id
@@ -16883,6 +17475,8 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                           AND event.generator = %s
                           AND event.generator_version = %s
                           AND event.index_representation_version = %s
+                        {readiness_frontier_sql}
+                        {readiness_order_sql}
                         LIMIT 1
                     ) AS readiness ON TRUE
                     LEFT JOIN cayu_knowledge_embeddings AS embedding
@@ -16900,6 +17494,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                      AND embedding.generator_version = readiness.generator_version
                      AND embedding.index_representation_version =
                          readiness.index_representation_version
+                    {embedding_selection_sql}
                 )
                 SELECT
                     COUNT(*),
@@ -16920,6 +17515,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 KNOWLEDGE_CHUNK_TEXT_GENERATOR,
                 KNOWLEDGE_CHUNK_TEXT_GENERATOR_VERSION,
                 KNOWLEDGE_VECTOR_INDEX_REPRESENTATION_VERSION,
+                *readiness_frontier_params,
             ],
         )
         row = await cur.fetchone()
@@ -16998,6 +17594,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                      AND embedding.generator_version = readiness.generator_version
                      AND embedding.index_representation_version =
                          readiness.index_representation_version
+                     AND embedding.current_projection
                     WHERE readiness.entry_id = c.entry_id
                       AND readiness.entry_revision = c.entry_revision
                       AND readiness.chunk_id = c.id
@@ -17164,6 +17761,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                            AND embedding.generator_version = readiness.generator_version
                            AND embedding.index_representation_version =
                                readiness.index_representation_version
+                           AND embedding.current_projection
                           WHERE readiness.entry_id = c.entry_id
                             AND readiness.entry_revision = c.entry_revision
                             AND readiness.chunk_id = c.id
@@ -17519,6 +18117,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                     identity.index_representation_version,
                     projection.readiness_sequence,
                     projection.attempt_id,
+                    False,
                     vector_sha256,
                     _postgres_vector_literal(projection.vector),
                     now,
@@ -17534,6 +18133,14 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 )
             )
         async with self._pool.connection() as conn, conn.cursor() as cur:
+            # Keep the readiness pointer stable while accepting and activating
+            # projection attempts. Readiness publication updates the same rows,
+            # so this ordered row lock serializes a batch without adding a
+            # second lock namespace or one advisory-lock round trip per vector.
+            await self._lock_embedding_projection_readiness(
+                cur,
+                list(identity_by_sha256),
+            )
             await cur.executemany(
                 cast(
                     "LiteralString",
@@ -17553,6 +18160,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                     index_representation_version,
                     readiness_sequence,
                     attempt_id,
+                    current_projection,
                     embedding_sha256,
                     embedding,
                     created_at,
@@ -17560,7 +18168,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 )
                 SELECT
                     %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s::vector, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, %s, %s
                 FROM cayu_knowledge_chunks AS c
                 JOIN cayu_knowledge_current_entries AS e
                   ON e.id = c.entry_id
@@ -17578,36 +18186,58 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                   AND c.entry_revision = %s
                   AND 'sha256:' || encode(sha256(convert_to(c.text, 'UTF8')), 'hex') = %s
                   {access_sql}
-                ON CONFLICT (identity_sha256) DO UPDATE SET
-                    embedding_sha256 = excluded.embedding_sha256,
-                    embedding = excluded.embedding,
-                    readiness_sequence = excluded.readiness_sequence,
-                    attempt_id = excluded.attempt_id,
-                    updated_at = excluded.updated_at
-                WHERE cayu_knowledge_embeddings.entry_id = excluded.entry_id
-                  AND cayu_knowledge_embeddings.entry_revision = excluded.entry_revision
-                  AND cayu_knowledge_embeddings.chunk_id = excluded.chunk_id
-                  AND cayu_knowledge_embeddings.projection_type = excluded.projection_type
-                  AND cayu_knowledge_embeddings.projection_content_hash =
-                      excluded.projection_content_hash
-                  AND cayu_knowledge_embeddings.embedding_model = excluded.embedding_model
-                  AND cayu_knowledge_embeddings.dimensions = excluded.dimensions
-                  AND cayu_knowledge_embeddings.preprocessing_version =
-                      excluded.preprocessing_version
-                  AND cayu_knowledge_embeddings.generator = excluded.generator
-                  AND cayu_knowledge_embeddings.generator_version =
-                      excluded.generator_version
-                  AND cayu_knowledge_embeddings.index_representation_version =
-                      excluded.index_representation_version
-                  AND (
-                      cayu_knowledge_embeddings.readiness_sequence <>
-                          excluded.readiness_sequence
-                      OR cayu_knowledge_embeddings.attempt_id <> excluded.attempt_id
-                  )
+                ON CONFLICT (identity_sha256, readiness_sequence) DO NOTHING
                 """,
                 ),
                 rows,
             )
+            await cur.execute(
+                """
+                WITH latest AS (
+                    SELECT identity_sha256, MAX(readiness_sequence) AS readiness_sequence
+                    FROM cayu_knowledge_embeddings
+                    WHERE identity_sha256 = ANY(%s)
+                    GROUP BY identity_sha256
+                )
+                SELECT latest.identity_sha256, latest.readiness_sequence
+                FROM latest
+                LEFT JOIN cayu_knowledge_embeddings AS current
+                  ON current.identity_sha256 = latest.identity_sha256
+                 AND current.current_projection
+                WHERE current.readiness_sequence IS DISTINCT FROM latest.readiness_sequence
+                ORDER BY latest.identity_sha256
+                """,
+                (list(identity_by_sha256),),
+            )
+            activation_rows = await cur.fetchall()
+            if activation_rows:
+                activation_identity_sha256s = [str(row[0]) for row in activation_rows]
+                activation_sequences = [int(row[1]) for row in activation_rows]
+                await cur.execute(
+                    """
+                    UPDATE cayu_knowledge_embeddings
+                    SET current_projection = FALSE
+                    WHERE identity_sha256 = ANY(%s)
+                      AND current_projection
+                    """,
+                    (activation_identity_sha256s,),
+                )
+                await cur.execute(
+                    """
+                    UPDATE cayu_knowledge_embeddings AS embedding
+                    SET current_projection = TRUE
+                    FROM unnest(%s::text[], %s::bigint[])
+                         AS target(identity_sha256, readiness_sequence)
+                    WHERE embedding.identity_sha256 = target.identity_sha256
+                      AND embedding.readiness_sequence = target.readiness_sequence
+                      AND NOT embedding.current_projection
+                    """,
+                    (activation_identity_sha256s, activation_sequences),
+                )
+                if cur.rowcount != len(activation_rows):
+                    raise RuntimeError(
+                        "Postgres embedding projection activation lost a selected identity."
+                    )
             await cur.execute(
                 cast(
                     "LiteralString",
@@ -17663,6 +18293,23 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 if identity_sha256 in accepted_sha256s
             ],
         )
+
+    @staticmethod
+    async def _lock_embedding_projection_readiness(
+        cur: Any,
+        identity_sha256s: list[str],
+    ) -> None:
+        await cur.execute(
+            """
+            SELECT identity_sha256
+            FROM cayu_knowledge_index_readiness_current
+            WHERE identity_sha256 = ANY(%s)
+            ORDER BY identity_sha256
+            FOR UPDATE
+            """,
+            (identity_sha256s,),
+        )
+        await cur.fetchall()
 
     def _embedding_identity_matches_configuration(
         self,
@@ -17781,7 +18428,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         async with self._pool.connection() as conn, conn.cursor() as cur:
             await cur.execute(
                 """
-                SELECT embedding.identity_sha256
+                SELECT DISTINCT embedding.identity_sha256
                 FROM cayu_knowledge_embeddings AS embedding
                 WHERE embedding.entry_id = %s
                   AND NOT EXISTS (
@@ -17820,7 +18467,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                     """,
                     (selected, entry_id),
                 )
-                removed = max(cur.rowcount, 0)
+                removed = len(selected)
             else:
                 removed = 0
             await conn.commit()
@@ -17839,7 +18486,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             if expected_deleted_revision is None:
                 await cur.execute(
                     """
-                    SELECT embedding.identity_sha256
+                    SELECT DISTINCT embedding.identity_sha256
                     FROM cayu_knowledge_embeddings AS embedding
                     WHERE embedding.entry_id = %s
                       AND NOT EXISTS (
@@ -17855,7 +18502,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             else:
                 await cur.execute(
                     """
-                    SELECT embedding.identity_sha256
+                    SELECT DISTINCT embedding.identity_sha256
                     FROM cayu_knowledge_embeddings AS embedding
                     WHERE embedding.entry_id = %s
                       AND EXISTS (
@@ -17909,7 +18556,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                         """,
                         (selected, entry_id, expected_deleted_revision),
                     )
-                removed = max(cur.rowcount, 0)
+                removed = len(selected)
             else:
                 removed = 0
             await conn.commit()
@@ -32210,6 +32857,39 @@ def _postgres_knowledge_filter_sql(query: KnowledgeQuery) -> tuple[str, list[obj
     )
 
 
+def _postgres_knowledge_revision_refs_filter_sql(
+    revision_refs: tuple[KnowledgeRevisionRef, ...] | None,
+) -> tuple[str, list[object]]:
+    if revision_refs is None:
+        return "", []
+    if not revision_refs:
+        return " AND FALSE", []
+    values = ", ".join("(%s, %s)" for _ in revision_refs)
+    params: list[object] = []
+    for reference in revision_refs:
+        params.extend((reference.entry_id, reference.revision))
+    return f" AND (e.id, e.revision) IN ({values})", params
+
+
+def _postgres_knowledge_frontier_filter_sql(
+    through_change_sequence: int | None,
+) -> tuple[str, list[object]]:
+    if through_change_sequence is None:
+        return "", []
+    return (
+        """
+        AND (
+            SELECT MAX(boundary_change.sequence)
+            FROM cayu_knowledge_changes AS boundary_change
+            WHERE boundary_change.entry_id = e.id
+              AND boundary_change.entry_revision = e.revision
+              AND boundary_change.kind <> 'relation_published'
+        ) <= %s
+        """,
+        [through_change_sequence],
+    )
+
+
 def _postgres_knowledge_list_filter_sql(
     query: KnowledgeListQuery,
 ) -> tuple[str, list[object]]:
@@ -32314,6 +32994,7 @@ def _postgres_relation_access_scope_filter_sql(
     *,
     allow_archived_current: bool = False,
     now: datetime | None = None,
+    through_change_sequence: int | None = None,
 ) -> tuple[str, list[object]]:
     clauses: list[str] = []
     params: list[object] = []
@@ -32378,6 +33059,50 @@ def _postgres_relation_access_scope_filter_sql(
             """
         )
         params.extend(current_access_params)
+        if through_change_sequence is not None:
+            clauses.append(
+                f"""
+                EXISTS (
+                    SELECT 1
+                    FROM (
+                        SELECT
+                            logical.id AS id,
+                            stored.revision AS revision,
+                            logical.namespace AS namespace,
+                            stored.visibility AS visibility,
+                            stored.status AS status,
+                            stored.source_type AS source_type,
+                            stored.source_id AS source_id,
+                            stored.expires_at AS expires_at
+                        FROM cayu_knowledge_entries AS logical
+                        JOIN cayu_knowledge_changes AS current_change
+                          ON current_change.entry_id = logical.id
+                         AND current_change.kind <> 'relation_published'
+                         AND current_change.sequence = (
+                             SELECT MAX(boundary_change.sequence)
+                             FROM cayu_knowledge_changes AS boundary_change
+                             WHERE boundary_change.entry_id = logical.id
+                               AND boundary_change.kind <> 'relation_published'
+                               AND boundary_change.sequence <= %s
+                         )
+                         AND current_change.sequence = (
+                             SELECT MAX(materialization.sequence)
+                             FROM cayu_knowledge_changes AS materialization
+                             WHERE materialization.entry_id = current_change.entry_id
+                               AND materialization.entry_revision =
+                                       current_change.entry_revision
+                               AND materialization.kind <> 'relation_published'
+                         )
+                        JOIN cayu_knowledge_revisions AS stored
+                          ON stored.entry_id = current_change.entry_id
+                         AND stored.revision = current_change.entry_revision
+                    ) AS e
+                    WHERE e.id = relation.{entry_column}
+                    {current_access_sql}
+                )
+                """
+            )
+            params.extend((through_change_sequence, *current_access_params))
     return " AND " + " AND ".join(clauses), params
 
 

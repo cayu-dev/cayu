@@ -45,11 +45,17 @@ from cayu.storage import (
     KnowledgeEvidenceConflict,
     KnowledgeEvidenceDisposition,
     KnowledgeEvidenceRole,
+    KnowledgeLineageCurrentness,
+    KnowledgeLineageQuery,
     KnowledgeListQuery,
     KnowledgePublicationConflict,
     KnowledgeQuery,
+    KnowledgeRelation,
+    KnowledgeRelationKind,
     KnowledgeRevisionConflict,
+    KnowledgeRevisionRef,
     KnowledgeStatus,
+    KnowledgeVisibility,
     PostgresKnowledgeStore,
     SQLiteKnowledgeStore,
 )
@@ -1546,6 +1552,422 @@ def test_knowledge_store_shared_cas_has_one_winner(knowledge_store_case) -> None
             assert conflicts[0].actual_revision == 2
             assert await store.get_entry(original.id) == winners[0]
             assert await store.get_entry(original.id, revision=1) == original
+        finally:
+            await _close_store(store)
+            await _reset_case(knowledge_store_case)
+
+    asyncio.run(run())
+
+
+def test_knowledge_store_exact_revision_search_preserves_structured_query_semantics(
+    knowledge_store_case,
+) -> None:
+    async def run() -> None:
+        await _reset_case(knowledge_store_case)
+        store = await _open_store(knowledge_store_case)
+        try:
+            entries = (
+                KnowledgeEntry(id="shared-exact-term-only", text="alpha"),
+                KnowledgeEntry(id="shared-exact-phrase-only", text="missing phrase"),
+                KnowledgeEntry(id="shared-exact-both", text="alpha missing phrase"),
+            )
+            for entry in entries:
+                await store.create_entry(entry)
+            query = KnowledgeQuery(
+                text="alpha",
+                phrases=["missing phrase"],
+                limit=10,
+            )
+            references = tuple(
+                KnowledgeRevisionRef(entry_id=entry.id, revision=1) for entry in entries
+            )
+
+            global_result = await store.search(query)
+            exact_result = await store.search_revisions(query, references)
+
+            assert [hit.entry.id for hit in global_result.hits] == ["shared-exact-both"]
+            assert [hit.entry.id for hit in exact_result.hits] == ["shared-exact-both"]
+            assert exact_result.total_hits_known == global_result.total_hits_known == 1
+        finally:
+            await _close_store(store)
+            await _reset_case(knowledge_store_case)
+
+    asyncio.run(run())
+
+
+def test_knowledge_store_exact_revision_search_preserves_backend_tokenizer_semantics(
+    knowledge_store_case,
+) -> None:
+    async def run() -> None:
+        await _reset_case(knowledge_store_case)
+        store = await _open_store(knowledge_store_case)
+        try:
+            entries = (
+                KnowledgeEntry(id="shared-exact-underscore", text="foo_bar"),
+                KnowledgeEntry(id="shared-exact-accent", text="café policy"),
+            )
+            for entry in entries:
+                await store.create_entry(entry)
+            references = tuple(
+                KnowledgeRevisionRef(entry_id=entry.id, revision=1) for entry in entries
+            )
+            cases = (
+                (KnowledgeQuery(text="foo", limit=10), ["shared-exact-underscore"]),
+                (KnowledgeQuery(text="cafe", limit=10), ["shared-exact-accent"]),
+                (KnowledgeQuery(text="policy", none_terms=["cafe"], limit=10), []),
+            )
+
+            for query, sqlite_expected_ids in cases:
+                global_result = await store.search(query)
+                exact_result = await store.search_revisions(query, references)
+
+                assert [hit.entry.id for hit in exact_result.hits] == [
+                    hit.entry.id for hit in global_result.hits
+                ]
+                assert exact_result.total_hits_known == global_result.total_hits_known
+                if knowledge_store_case.name == "sqlite":
+                    assert [hit.entry.id for hit in exact_result.hits] == sqlite_expected_ids
+        finally:
+            await _close_store(store)
+            await _reset_case(knowledge_store_case)
+
+    asyncio.run(run())
+
+
+def test_knowledge_store_frontier_search_excludes_later_current_revisions(
+    knowledge_store_case,
+) -> None:
+    async def run() -> None:
+        await _reset_case(knowledge_store_case)
+        store = await _open_store(knowledge_store_case)
+        try:
+            stable = await store.create_entry(
+                KnowledgeEntry(id="frontier-stable", text="captured frontier target")
+            )
+            revised = await store.create_entry(
+                KnowledgeEntry(id="frontier-revised", text="captured frontier target")
+            )
+            republished = await store.create_entry(
+                KnowledgeEntry(id="frontier-republished", text="captured frontier target")
+            )
+            captured = await store.read_changes()
+            await store.append_entry_revision(
+                revised.model_copy(
+                    update={"revision": 2, "text": "captured frontier target revised"}
+                ),
+                [
+                    KnowledgeChunk(
+                        id="frontier-revised-r2-chunk",
+                        entry_id=revised.id,
+                        entry_revision=2,
+                        text="captured frontier target revised",
+                        chunk_index=0,
+                    )
+                ],
+                expected_revision=1,
+            )
+            await store.create_entry(
+                KnowledgeEntry(id="frontier-created-later", text="captured frontier target")
+            )
+            await store.delete_entry(
+                republished.id,
+                expected_revision=republished.revision,
+                hard=True,
+            )
+            await store.create_entry(
+                KnowledgeEntry(id=republished.id, text="captured frontier target republished")
+            )
+
+            result = await store.search_at_frontier(
+                KnowledgeQuery(text="captured frontier target", limit=10),
+                knowledge_sequence=captured.high_water_sequence,
+                index_readiness_sequence=0,
+            )
+
+            assert [(hit.entry.id, hit.entry.revision) for hit in result.hits] == [
+                (stable.id, stable.revision)
+            ]
+        finally:
+            await _close_store(store)
+            await _reset_case(knowledge_store_case)
+
+    asyncio.run(run())
+
+
+def test_knowledge_store_exact_revision_frontier_rejects_same_id_republication(
+    knowledge_store_case,
+) -> None:
+    async def run() -> None:
+        await _reset_case(knowledge_store_case)
+        store = await _open_store(knowledge_store_case)
+        try:
+            original = await store.create_entry(
+                KnowledgeEntry(id="exact-frontier-republished", text="captured exact target")
+            )
+            captured = await store.read_changes()
+            reference = KnowledgeRevisionRef(entry_id=original.id, revision=original.revision)
+            await store.delete_entry(
+                original.id,
+                expected_revision=original.revision,
+                hard=True,
+            )
+            await store.create_entry(
+                KnowledgeEntry(id=original.id, text="captured exact target republished")
+            )
+            query = KnowledgeQuery(text="captured exact target", limit=10)
+
+            bounded = await store.search_revisions(
+                query,
+                (reference,),
+                knowledge_sequence=captured.high_water_sequence,
+                index_readiness_sequence=0,
+            )
+            current = await store.search_revisions(query, (reference,))
+
+            assert bounded.hits == []
+            assert [hit.entry.id for hit in current.hits] == [original.id]
+            with pytest.raises(ValueError, match="must be supplied together"):
+                await store.search_revisions(
+                    query,
+                    (reference,),
+                    knowledge_sequence=captured.high_water_sequence,
+                )
+        finally:
+            await _close_store(store)
+            await _reset_case(knowledge_store_case)
+
+    asyncio.run(run())
+
+
+def test_knowledge_store_frontier_lineage_preserves_captured_endpoint_state(
+    knowledge_store_case,
+) -> None:
+    async def run() -> None:
+        await _reset_case(knowledge_store_case)
+        store = await _open_store(knowledge_store_case)
+        try:
+            subject = await store.create_entry(
+                KnowledgeEntry(id="frontier-lineage-subject", text="subject")
+            )
+            object_ = await store.create_entry(
+                KnowledgeEntry(id="frontier-lineage-object", text="object")
+            )
+            captured = await store.read_changes()
+            relation = KnowledgeRelation(
+                id="frontier-lineage-relation",
+                subject=KnowledgeRevisionRef(
+                    entry_id=subject.id,
+                    revision=subject.revision,
+                ),
+                object=KnowledgeRevisionRef(
+                    entry_id=object_.id,
+                    revision=object_.revision,
+                ),
+                kind=KnowledgeRelationKind.DERIVED_FROM,
+            )
+            await store.publish_relations(
+                [relation],
+                operation_id="frontier-lineage-publication",
+            )
+            relation_sequence = captured.high_water_sequence + 1
+            await store.append_entry_revision(
+                subject.model_copy(
+                    update={
+                        "revision": 2,
+                        "text": "subject revised after frontier",
+                        "updated_at": datetime.now(UTC),
+                    }
+                ),
+                [
+                    KnowledgeChunk(
+                        id="frontier-lineage-subject-r2",
+                        entry_id=subject.id,
+                        entry_revision=2,
+                        text="subject revised after frontier",
+                        chunk_index=0,
+                    )
+                ],
+                expected_revision=1,
+            )
+            await store.transition_entry_status(
+                object_.id,
+                expected_revision=1,
+                from_status=KnowledgeStatus.ACTIVE,
+                to_status=KnowledgeStatus.ARCHIVED,
+            )
+            query = KnowledgeLineageQuery(reference=relation.subject)
+
+            bounded = await store._inspect_lineage_at_change_sequence(
+                query,
+                through_sequence=captured.high_water_sequence,
+            )
+            inclusive = await store._inspect_lineage_at_change_sequence(
+                query,
+                through_sequence=relation_sequence,
+            )
+
+            assert bounded is not None
+            assert bounded.links == []
+            assert inclusive is not None
+            assert inclusive.reference_current == relation.subject
+            assert inclusive.reference_status is KnowledgeStatus.ACTIVE
+            assert [link.relation_id for link in inclusive.links] == [relation.id]
+            assert inclusive.links[0].counterpart_current == relation.object
+            assert inclusive.links[0].counterpart_status is KnowledgeStatus.ACTIVE
+            assert inclusive.links[0].currentness is KnowledgeLineageCurrentness.CURRENT
+        finally:
+            await _close_store(store)
+            await _reset_case(knowledge_store_case)
+
+    asyncio.run(run())
+
+
+def test_knowledge_store_frontier_lineage_enforces_captured_endpoint_access(
+    knowledge_store_case,
+) -> None:
+    async def run() -> None:
+        await _reset_case(knowledge_store_case)
+        store = await _open_store(knowledge_store_case, access_scope=None)
+        try:
+            subject = await store.create_entry(
+                KnowledgeEntry(id="frontier-lineage-access-subject", text="subject"),
+                access_scope=_ACCESS_SCOPE,
+            )
+            object_ = await store.create_entry(
+                KnowledgeEntry(id="frontier-lineage-access-object", text="object"),
+                access_scope=_ACCESS_SCOPE,
+            )
+            relation = KnowledgeRelation(
+                id="frontier-lineage-access-relation",
+                subject=KnowledgeRevisionRef(
+                    entry_id=subject.id,
+                    revision=subject.revision,
+                ),
+                object=KnowledgeRevisionRef(
+                    entry_id=object_.id,
+                    revision=object_.revision,
+                ),
+                kind=KnowledgeRelationKind.DERIVED_FROM,
+            )
+            await store.publish_relations(
+                [relation],
+                operation_id="frontier-lineage-access-publication",
+                access_scope=_ACCESS_SCOPE,
+            )
+            hidden = await store.append_entry_revision(
+                object_.model_copy(
+                    update={
+                        "revision": 2,
+                        "text": "workspace-only object at frontier",
+                        "visibility": KnowledgeVisibility.WORKSPACE,
+                        "updated_at": datetime.now(UTC),
+                    }
+                ),
+                [
+                    KnowledgeChunk(
+                        id="frontier-lineage-access-object-r2",
+                        entry_id=object_.id,
+                        entry_revision=2,
+                        text="workspace-only object at frontier",
+                        chunk_index=0,
+                    )
+                ],
+                expected_revision=1,
+                access_scope=_ACCESS_SCOPE,
+            )
+            captured = await store.read_changes(access_scope=_ACCESS_SCOPE)
+            await store.append_entry_revision(
+                hidden.model_copy(
+                    update={
+                        "revision": 3,
+                        "text": "global object after frontier",
+                        "visibility": KnowledgeVisibility.GLOBAL,
+                        "updated_at": datetime.now(UTC),
+                    }
+                ),
+                [
+                    KnowledgeChunk(
+                        id="frontier-lineage-access-object-r3",
+                        entry_id=object_.id,
+                        entry_revision=3,
+                        text="global object after frontier",
+                        chunk_index=0,
+                    )
+                ],
+                expected_revision=2,
+                access_scope=_ACCESS_SCOPE,
+            )
+            query = KnowledgeLineageQuery(reference=relation.subject)
+
+            restricted = await store._inspect_lineage_at_change_sequence(
+                query,
+                through_sequence=captured.high_water_sequence,
+                access_scope=KnowledgeAccessScope.for_namespace("default"),
+            )
+            privileged = await store._inspect_lineage_at_change_sequence(
+                query,
+                through_sequence=captured.high_water_sequence,
+                access_scope=_ACCESS_SCOPE,
+            )
+
+            assert restricted is not None
+            assert restricted.links == []
+            assert privileged is not None
+            assert [link.counterpart_current for link in privileged.links] == [
+                KnowledgeRevisionRef(entry_id=object_.id, revision=2)
+            ]
+        finally:
+            await _close_store(store)
+            await _reset_case(knowledge_store_case)
+
+    asyncio.run(run())
+
+
+def test_knowledge_store_frontier_lineage_rejects_same_id_republication(
+    knowledge_store_case,
+) -> None:
+    async def run() -> None:
+        await _reset_case(knowledge_store_case)
+        store = await _open_store(knowledge_store_case)
+        try:
+            subject = await store.create_entry(
+                KnowledgeEntry(id="frontier-lineage-republished", text="original subject")
+            )
+            object_ = await store.create_entry(
+                KnowledgeEntry(id="frontier-lineage-republished-object", text="object")
+            )
+            relation = KnowledgeRelation(
+                id="frontier-lineage-republished-relation",
+                subject=KnowledgeRevisionRef(
+                    entry_id=subject.id,
+                    revision=subject.revision,
+                ),
+                object=KnowledgeRevisionRef(
+                    entry_id=object_.id,
+                    revision=object_.revision,
+                ),
+                kind=KnowledgeRelationKind.DERIVED_FROM,
+            )
+            await store.publish_relations(
+                [relation],
+                operation_id="frontier-lineage-republished-publication",
+            )
+            captured = await store.read_changes()
+            await store.delete_entry(
+                subject.id,
+                expected_revision=subject.revision,
+                hard=True,
+            )
+            await store.create_entry(
+                KnowledgeEntry(id=subject.id, text="new generation with reused revision one")
+            )
+
+            result = await store._inspect_lineage_at_change_sequence(
+                KnowledgeLineageQuery(reference=relation.subject),
+                through_sequence=captured.high_water_sequence,
+            )
+
+            assert result is None
         finally:
             await _close_store(store)
             await _reset_case(knowledge_store_case)
