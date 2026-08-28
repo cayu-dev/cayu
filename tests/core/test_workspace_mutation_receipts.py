@@ -90,6 +90,7 @@ from cayu.runtime.workspace_observation_recovery import (
     WorkspaceObservationLifecycle,
     _admit_workspace_observation_intent,
     _project_workspace_observation_authority,
+    is_workspace_observation_recovery_rejected,
     publish_workspace_observation_transition,
     retain_workspace_observation_pending_cancellation_requests,
     workspace_observation_event_digest,
@@ -8759,10 +8760,11 @@ def test_workspace_observation_recovery_rejects_foreign_authority_before_artifac
             AgentSpec(name="assistant", model="scripted-model"),
             tools=[_BulkWriteTool()],
         )
-        with pytest.raises(RuntimeError, match=expected_error):
+        with pytest.raises(RuntimeError, match=expected_error) as rejection:
             await recovery_app.recover_incomplete_session(
                 IncompleteSessionRecoveryRequest(session_id=session_id)
             )
+        assert is_workspace_observation_recovery_rejected(rejection.value)
         durable = await store.query_events(EventQuery(session_id=session_id))
         checkpoint = await store.load_checkpoint(session_id)
         return (

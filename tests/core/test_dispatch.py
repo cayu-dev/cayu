@@ -104,6 +104,9 @@ from cayu.runtime.sessions import (
     _checkpoint_with_session_run_operation,
 )
 from cayu.runtime.tasks import task_create_with_runtime_invocation
+from cayu.runtime.workspace_observation_recovery import (
+    workspace_observation_recovery_rejected,
+)
 from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
@@ -1426,6 +1429,118 @@ def test_stalled_recovery_log_redacts_workload_secret(
     assert result.metadata.get("requeued") is True
     assert secret not in caplog.text
     assert REDACTED_SECRET in caplog.text
+
+
+def test_permanent_workspace_recovery_rejection_settles_across_restart(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[DispatchStatus, TaskStatus, object, int]:
+        session_path = tmp_path / "permanent-recovery-sessions.sqlite"
+        task_path = tmp_path / "permanent-recovery-tasks.sqlite"
+        producer_sessions = SQLiteSessionStore(session_path)
+        producer_tasks = SQLiteTaskStore(task_path)
+        producer_dispatcher = TaskStoreDispatcher(
+            producer_tasks,
+            recover_stalled_sessions_after_seconds=0,
+        )
+        producer = _configured_app(
+            session_store=producer_sessions,
+            task_store=producer_tasks,
+            dispatcher=producer_dispatcher,
+            provider=FakeProvider([_batch("initial")]),
+        )
+        session_id = "sess_permanent_workspace_recovery_rejection"
+        try:
+            async for _ in producer.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "initial")],
+                )
+            ):
+                pass
+            submitted = await producer.dispatch(
+                _dispatch_request(
+                    session_id,
+                    "d_permanent_workspace_recovery_rejection",
+                )
+            )
+            await producer_sessions.transition_status(
+                session_id,
+                from_statuses={SessionStatus.COMPLETED},
+                to_status=SessionStatus.RUNNING,
+            )
+        finally:
+            await producer_sessions.close()
+            await producer_tasks.close()
+
+        worker_sessions = SQLiteSessionStore(session_path)
+        worker_tasks = SQLiteTaskStore(task_path)
+        worker_dispatcher = TaskStoreDispatcher(
+            worker_tasks,
+            recover_stalled_sessions_after_seconds=0,
+        )
+        worker_provider = FakeProvider([])
+        worker = _configured_app(
+            session_store=worker_sessions,
+            task_store=worker_tasks,
+            dispatcher=worker_dispatcher,
+            provider=worker_provider,
+        )
+
+        async def reject_recovery(request):
+            del request
+            raise workspace_observation_recovery_rejected(
+                "Workspace observation conflicts with its pending tool round."
+            )
+
+        monkeypatch.setattr(worker, "recover_incomplete_session", reject_recovery)
+        try:
+            result = await worker_dispatcher.process_next(
+                worker,
+                worker_id="permanent-recovery-worker",
+            )
+            assert result is not None
+            terminal_task = await worker_tasks.load_task(submitted.metadata["queue_task_id"])
+            assert terminal_task is not None
+        finally:
+            await worker_sessions.close()
+            await worker_tasks.close()
+
+        restarted_sessions = SQLiteSessionStore(session_path)
+        restarted_tasks = SQLiteTaskStore(task_path)
+        restarted_dispatcher = TaskStoreDispatcher(restarted_tasks)
+        restarted_provider = FakeProvider([])
+        restarted = _configured_app(
+            session_store=restarted_sessions,
+            task_store=restarted_tasks,
+            dispatcher=restarted_dispatcher,
+            provider=restarted_provider,
+        )
+        try:
+            replay = await restarted_dispatcher.process_next(
+                restarted,
+                worker_id="permanent-recovery-restarted-worker",
+            )
+            persisted_task = await restarted_tasks.load_task(submitted.metadata["queue_task_id"])
+            assert persisted_task is not None
+            return (
+                result.status,
+                persisted_task.status,
+                replay,
+                len(restarted_provider.requests),
+            )
+        finally:
+            await restarted_sessions.close()
+            await restarted_tasks.close()
+
+    status, task_status, replay, provider_requests = asyncio.run(scenario())
+
+    assert status is DispatchStatus.FAILED
+    assert task_status is TaskStatus.FAILED
+    assert replay is None
+    assert provider_requests == 0
 
 
 def test_process_next_claims_runs_and_completes() -> None:
@@ -3477,7 +3592,7 @@ def test_queue_terminalization_uses_exact_session_event_status() -> None:
         envelope = _QueuedDispatchEnvelope.model_validate(claimed.input["dispatch"])
         handle = await dispatcher._terminalize(
             runtime,
-            task_id,
+            claimed,
             "worker_terminal_status",
             request,
             DispatchStatus.FAILED,
@@ -4397,7 +4512,7 @@ def test_terminalize_does_not_clobber_a_reclaimed_task() -> None:
 
         handle = await h.dispatcher._terminalize(
             _SecretFreeDispatchRuntime(),
-            task.id,
+            task,
             "worker_a",
             request,
             DispatchStatus.COMPLETED,

@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
+from weakref import WeakKeyDictionary
 
 from pydantic import BaseModel, ConfigDict, StrictInt, field_validator, model_validator
 
@@ -78,6 +79,42 @@ _WORKSPACE_OBSERVATION_PENDING_CANCELLATION_ATTRIBUTE = (
     "_cayu_workspace_observation_pending_cancellation"
 )
 _WORKSPACE_OBSERVATION_PENDING_CANCELLATION_AUTHORITY = object()
+_WORKSPACE_OBSERVATION_RECOVERY_REJECTED_AUTHORITY = object()
+
+
+class _WorkspaceObservationRecoveryRejected(RuntimeError):
+    """Private proof that durable observation authority cannot be recovered."""
+
+    def __init__(self, message: str, *, _authority: object) -> None:
+        if _authority is not _WORKSPACE_OBSERVATION_RECOVERY_REJECTED_AUTHORITY:
+            raise TypeError("Workspace observation recovery rejection is runtime-owned.")
+        super().__init__(require_clean_nonblank(message, "message"))
+
+
+_WORKSPACE_OBSERVATION_RECOVERY_REJECTION_PROVENANCE: WeakKeyDictionary[
+    _WorkspaceObservationRecoveryRejected,
+    bool,
+] = WeakKeyDictionary()
+
+
+def workspace_observation_recovery_rejected(message: str) -> RuntimeError:
+    """Create authenticated evidence that deterministic recovery must stop retrying."""
+
+    signal = _WorkspaceObservationRecoveryRejected(
+        message,
+        _authority=_WORKSPACE_OBSERVATION_RECOVERY_REJECTED_AUTHORITY,
+    )
+    _WORKSPACE_OBSERVATION_RECOVERY_REJECTION_PROVENANCE[signal] = True
+    return signal
+
+
+def is_workspace_observation_recovery_rejected(error: BaseException) -> bool:
+    """Recognize only runtime-created permanent observation recovery rejection."""
+
+    return (
+        type(error) is _WorkspaceObservationRecoveryRejected
+        and error in _WORKSPACE_OBSERVATION_RECOVERY_REJECTION_PROVENANCE
+    )
 
 
 def restore_workspace_observation_cancellation_requests(count: int) -> None:

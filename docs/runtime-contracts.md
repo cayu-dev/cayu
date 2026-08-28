@@ -2633,6 +2633,13 @@ after exact terminal event publication and is removed only after that run epoch
 has released its trailing ownership and the exact task outcome is durable. A
 newer invocation does not become the settlement gate for an older receipt or
 for an exact retry of an already acknowledged terminal dispatch.
+If stalled-session recovery finds runtime-authenticated, deterministic corruption
+in a durable workspace-observation authority tuple, the dispatcher terminally
+fails the claimed queue task. It does not release that task for an unbounded
+claim/recovery loop, and a fresh worker observes the same terminal result without
+provider or tool redispatch. Ordinary operational recovery failures, including
+store availability and acknowledgement failures, remain retryable and release the
+task for later reclamation.
 `DispatchHandle.metadata`, the durable queue envelope, and task terminal
 evidence expose `dispatch_operation_id`,
 `session_instance_fingerprint`,

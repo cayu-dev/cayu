@@ -340,6 +340,7 @@ from cayu.runtime.workspace_observation_recovery import (
     workspace_observation_checkpoint_value,
     workspace_observation_event_digest,
     workspace_observation_observer_authority_matches,
+    workspace_observation_recovery_rejected,
     workspace_observation_terminal_from_delta_status,
     workspace_observations_from_checkpoint,
 )
@@ -13444,16 +13445,18 @@ class RecoveryCoordinator:
         if not observations:
             return True
         if pending_round is None:
-            raise RuntimeError("Workspace observation has no authoritative pending tool round.")
+            raise workspace_observation_recovery_rejected(
+                "Workspace observation has no authoritative pending tool round."
+            )
         if execution_profile_snapshot is None:
-            raise RuntimeError(
+            raise workspace_observation_recovery_rejected(
                 "Workspace observation has no authoritative active invocation profile."
             )
         if (
             pending_round.source_run_epoch is None
             or pending_round.execution_profile_fingerprint is None
         ):
-            raise RuntimeError(
+            raise workspace_observation_recovery_rejected(
                 "Workspace observation pending tool round has incomplete execution authority."
             )
         if (
@@ -13464,7 +13467,7 @@ class RecoveryCoordinator:
                 and pending_round.interaction_id != execution_profile_snapshot.interaction_id
             )
         ):
-            raise RuntimeError(
+            raise workspace_observation_recovery_rejected(
                 "Workspace observation conflicts with its active invocation profile."
             )
         pending_identity = tool_round_recovery.pending_tool_round_identity(pending_round)
@@ -13503,23 +13506,29 @@ class RecoveryCoordinator:
                     if artifact_store_id is None
                     else require_clean_nonblank(artifact_store_id, "artifact_store.id")
                 )
-            except Exception:
-                raise RuntimeError(
+            except (AttributeError, TypeError, ValueError):
+                raise workspace_observation_recovery_rejected(
                     "Workspace observation current environment authority is invalid."
                 ) from None
         claimed_tool_calls: set[tuple[str, str]] = set()
         for lifecycle in observations.values():
             if lifecycle.session_id != session.id:
-                raise RuntimeError("Workspace observation belongs to a different session.")
+                raise workspace_observation_recovery_rejected(
+                    "Workspace observation belongs to a different session."
+                )
             if (
                 lifecycle.agent_name != session.agent_name
                 or lifecycle.agent_name != pending_round.agent_name
                 or lifecycle.environment_name != session.environment_name
                 or lifecycle.environment_name != pending_round.environment_name
             ):
-                raise RuntimeError("Workspace observation conflicts with its invocation scope.")
+                raise workspace_observation_recovery_rejected(
+                    "Workspace observation conflicts with its invocation scope."
+                )
             if lifecycle.source_run_epoch > session.run_epoch:
-                raise RuntimeError("Workspace observation belongs to a future run epoch.")
+                raise workspace_observation_recovery_rejected(
+                    "Workspace observation belongs to a future run epoch."
+                )
             # ``binding_generation_id`` identifies the historical concrete
             # in-process binding that owned the observation window. A fresh
             # worker necessarily registers a new generation, so equality with
@@ -13561,11 +13570,11 @@ class RecoveryCoordinator:
                     )
                 )
             ):
-                raise RuntimeError(
+                raise workspace_observation_recovery_rejected(
                     "Workspace observation conflicts with its registered environment authority."
                 )
             if lifecycle.interaction_id != execution_profile_snapshot.interaction_id:
-                raise RuntimeError(
+                raise workspace_observation_recovery_rejected(
                     "Workspace observation conflicts with its active invocation profile."
                 )
             # Recovery leases may rebind the active invocation profile to a
@@ -13575,20 +13584,26 @@ class RecoveryCoordinator:
             # while the checks above independently authenticate the round to
             # the current immutable invocation profile.
             if lifecycle.source_run_epoch != pending_round.source_run_epoch:
-                raise RuntimeError("Workspace observation conflicts with its pending tool round.")
+                raise workspace_observation_recovery_rejected(
+                    "Workspace observation conflicts with its pending tool round."
+                )
             if (
                 lifecycle.model_step_id != pending_identity.model_step_id
                 or lifecycle.model_attempt_id != pending_identity.model_attempt_id
                 or lifecycle.tool_round_id != pending_identity.tool_round_id
                 or lifecycle.model_step != pending_round.model_step
             ):
-                raise RuntimeError("Workspace observation conflicts with its pending tool round.")
+                raise workspace_observation_recovery_rejected(
+                    "Workspace observation conflicts with its pending tool round."
+                )
             pending_call = pending_calls.get(lifecycle.tool_call_id)
             if pending_call is None or pending_call.tool_name != lifecycle.tool_name:
-                raise RuntimeError("Workspace observation conflicts with its pending tool call.")
+                raise workspace_observation_recovery_rejected(
+                    "Workspace observation conflicts with its pending tool call."
+                )
             tool_call_owner = (lifecycle.tool_round_id, lifecycle.tool_call_id)
             if tool_call_owner in claimed_tool_calls:
-                raise RuntimeError(
+                raise workspace_observation_recovery_rejected(
                     "Workspace observation has duplicate active lifecycles for one tool call."
                 )
             claimed_tool_calls.add(tool_call_owner)
@@ -13636,14 +13651,16 @@ class RecoveryCoordinator:
         if not matches:
             return None
         if len(matches) != 1:
-            raise RuntimeError("Workspace observation has duplicate staged tool outcomes.")
+            raise workspace_observation_recovery_rejected(
+                "Workspace observation has duplicate staged tool outcomes."
+            )
         staged_event = self._validated_workspace_observation_tool_outcome(
             matches[0].event,
             lifecycle=lifecycle,
             require_bound_identity=False,
         )
         if staged_event is None:
-            raise RuntimeError(
+            raise workspace_observation_recovery_rejected(
                 "Workspace observation staged tool outcome conflicts with its owner."
             )
         return WorkspaceObservationLifecycle.model_validate(
@@ -13690,9 +13707,11 @@ class RecoveryCoordinator:
                 if item.tool_call_id == lifecycle.tool_call_id
             ]
         if len(matching_raw_stages) > 1 or len(matching_safe_stages) > 1:
-            raise RuntimeError("Workspace observation has duplicate staged tool outcomes.")
+            raise workspace_observation_recovery_rejected(
+                "Workspace observation has duplicate staged tool outcomes."
+            )
         if bool(matching_raw_stages) != bool(matching_safe_stages):
-            raise RuntimeError(
+            raise workspace_observation_recovery_rejected(
                 "Workspace observation staged tool outcome projection is incomplete."
             )
         if not matching_raw_stages:
@@ -13720,14 +13739,18 @@ class RecoveryCoordinator:
             lifecycle=lifecycle,
         )
         if authenticated_event is None:
-            raise RuntimeError("Workspace observation tool outcome conflicts with its stage.")
+            raise workspace_observation_recovery_rejected(
+                "Workspace observation tool outcome conflicts with its stage."
+            )
         staged_event = self._validated_workspace_observation_tool_outcome(
             matching_safe_stages[0].event,
             lifecycle=lifecycle,
             require_bound_identity=False,
         )
         if staged_event is None or staged_event.id != authenticated_event.id:
-            raise RuntimeError("Workspace observation safe tool outcome conflicts with its stage.")
+            raise workspace_observation_recovery_rejected(
+                "Workspace observation safe tool outcome conflicts with its stage."
+            )
         identity = ToolRoundIdentity(
             model_step_id=lifecycle.model_step_id,
             model_attempt_id=lifecycle.model_attempt_id,
@@ -13755,17 +13778,26 @@ class RecoveryCoordinator:
             current_session: Session,
             current_checkpoint: dict[str, Any] | None,
         ) -> dict[str, Any]:
+            # A peer recovery may validly advance the epoch or lifecycle after
+            # this worker's read. Losing that race is retryable; it is not proof
+            # that the durable authority tuple itself is corrupt.
             if current_session.run_epoch != session.run_epoch:
-                raise RuntimeError("Workspace observation recovery ownership changed.")
+                raise _IncompleteRecoveryClaimLost(
+                    "Workspace observation recovery ownership changed."
+                )
             current = workspace_observations_from_checkpoint(current_checkpoint).get(
                 durable_lifecycle.window_id
             )
             if current != durable_lifecycle:
-                raise RuntimeError("Workspace observation changed before stage repair.")
+                raise _IncompleteRecoveryClaimLost(
+                    "Workspace observation changed before stage repair."
+                )
             updated_checkpoint = stage_transform(current_session, current_checkpoint)
             observations = workspace_observations_from_checkpoint(updated_checkpoint)
             if observations.get(durable_lifecycle.window_id) != durable_lifecycle:
-                raise RuntimeError("Workspace observation changed during stage repair.")
+                raise workspace_observation_recovery_rejected(
+                    "Workspace observation changed during stage repair."
+                )
             observations[durable_lifecycle.window_id] = projected_lifecycle
             updated_checkpoint[WORKSPACE_OBSERVATIONS_CHECKPOINT_KEY] = (
                 workspace_observation_checkpoint_value(observations)
@@ -13862,9 +13894,11 @@ class RecoveryCoordinator:
             ]
         )
         if len(matching_raw_stages) > 1 or len(matching_safe_stages) > 1:
-            raise RuntimeError("Workspace observation has duplicate staged tool outcomes.")
+            raise workspace_observation_recovery_rejected(
+                "Workspace observation has duplicate staged tool outcomes."
+            )
         if bool(matching_raw_stages) != bool(matching_safe_stages):
-            raise RuntimeError(
+            raise workspace_observation_recovery_rejected(
                 "Workspace observation staged tool outcome projection is incomplete."
             )
         if matching_raw_stages:
@@ -13875,7 +13909,9 @@ class RecoveryCoordinator:
                 )
                 is None
             ):
-                raise RuntimeError("Workspace observation tool outcome conflicts with its stage.")
+                raise workspace_observation_recovery_rejected(
+                    "Workspace observation tool outcome conflicts with its stage."
+                )
             if (
                 self._validated_workspace_observation_tool_outcome(
                     matching_safe_stages[0].event,
@@ -13884,7 +13920,7 @@ class RecoveryCoordinator:
                 )
                 is None
             ):
-                raise RuntimeError(
+                raise workspace_observation_recovery_rejected(
                     "Workspace observation safe tool outcome conflicts with its stage."
                 )
             return True
@@ -13923,7 +13959,9 @@ class RecoveryCoordinator:
         """Classify exact durable delta evidence before artifact reconciliation."""
 
         if lifecycle.mutation_event_id is None or lifecycle.mutation_event_digest is None:
-            raise RuntimeError("Published workspace delta lost its event identity.")
+            raise workspace_observation_recovery_rejected(
+                "Published workspace delta lost its event identity."
+            )
         records = await await_workspace_observation_store_read(
             lambda: self._session_store.query_events(
                 EventQuery(

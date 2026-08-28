@@ -75,6 +75,9 @@ from cayu.runtime.tasks import (
     _terminalize_claimed_task_or_detect_peer_winner,
     task_create_with_runtime_invocation,
 )
+from cayu.runtime.workspace_observation_recovery import (
+    is_workspace_observation_recovery_rejected,
+)
 from cayu.vaults import SecretRedactor
 
 logger = logging.getLogger(__name__)
@@ -277,6 +280,26 @@ class _QueuedDispatchSettlement:
 
 class _QueuedDispatchAuthorityRejected(RuntimeError):
     """Permanent rejection proven by the runtime-owned dispatch boundary."""
+
+
+@dataclass(frozen=True, slots=True)
+class _StalledSessionRecovery:
+    """Outcome of one dispatcher-owned incomplete-session recovery attempt."""
+
+    recovered: bool = False
+    permanent_rejection: BaseException | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.recovered) is not bool:
+            raise TypeError("recovered must be a bool.")
+        if self.permanent_rejection is not None and not (
+            is_workspace_observation_recovery_rejected(self.permanent_rejection)
+        ):
+            raise TypeError(
+                "permanent_rejection must be runtime-owned workspace recovery evidence."
+            )
+        if self.recovered and self.permanent_rejection is not None:
+            raise ValueError("Recovered sessions cannot also retain permanent rejection.")
 
 
 class _PreparedSubagentAlreadyAdmitted(RuntimeError):
@@ -965,7 +988,7 @@ class TaskStoreDispatcher(Dispatcher):
             try:
                 return await self._terminalize(
                     durable_runtime,
-                    task.id,
+                    task,
                     worker_id,
                     request,
                     status,
@@ -994,10 +1017,18 @@ class TaskStoreDispatcher(Dispatcher):
                 # The same rule applies while terminal hooks or trailing cleanup retain the
                 # prior invocation's profile fence. After a worker crash, recover stale
                 # session ownership so the requeued dispatch can proceed.
-                recovered = await self._recover_stalled_session(
+                recovery = await self._recover_stalled_session(
                     durable_runtime,
                     request,
                 )
+                if recovery.permanent_rejection is not None:
+                    return await self._reject_claimed_dispatch(
+                        durable_runtime,
+                        task=task,
+                        worker_id=worker_id,
+                        error=recovery.permanent_rejection,
+                        envelope=envelope,
+                    )
                 try:
                     await self._tasks.release_task(task.id, worker_id)
                 except TaskClaimLost:
@@ -1011,7 +1042,7 @@ class TaskStoreDispatcher(Dispatcher):
                         queue_task_id=task.id,
                         envelope=envelope,
                         reclaimed=True,
-                        recovered_session=recovered,
+                        recovered_session=recovery.recovered,
                     )
                 return self._handle(
                     request,
@@ -1019,7 +1050,7 @@ class TaskStoreDispatcher(Dispatcher):
                     queue_task_id=task.id,
                     envelope=envelope,
                     requeued=True,
-                    recovered_session=recovered,
+                    recovered_session=recovery.recovered,
                 )
             except (
                 ExecutionProfileMismatchError,
@@ -1129,7 +1160,7 @@ class TaskStoreDispatcher(Dispatcher):
                     raise
                 return await self._terminalize(
                     durable_runtime,
-                    task.id,
+                    task,
                     worker_id,
                     request,
                     DispatchStatus.FAILED,
@@ -1145,7 +1176,7 @@ class TaskStoreDispatcher(Dispatcher):
             # a failed task so failure queries and retries see it, not a COMPLETED one.
             return await self._terminalize(
                 durable_runtime,
-                task.id,
+                task,
                 worker_id,
                 request,
                 status,
@@ -1276,7 +1307,7 @@ class TaskStoreDispatcher(Dispatcher):
     async def _terminalize(
         self,
         runtime: _ProfiledDispatchRuntime,
-        task_id: str,
+        task: Task,
         worker_id: str,
         request: DispatchRequest,
         status: DispatchStatus,
@@ -1300,9 +1331,20 @@ class TaskStoreDispatcher(Dispatcher):
             settlement_state is _QueuedDispatchSettlementState.NOT_ADMITTED
             and status is not DispatchStatus.FAILED
         ):
-            recovered = await self._recover_stalled_session(runtime, request)
+            recovery = await self._recover_stalled_session(runtime, request)
+            if recovery.permanent_rejection is not None:
+                rejected = await self._reject_claimed_dispatch(
+                    runtime,
+                    task=task,
+                    worker_id=worker_id,
+                    error=recovery.permanent_rejection,
+                    envelope=envelope,
+                )
+                if rejected is None:
+                    raise AssertionError("Authenticated dispatch rejection lost its envelope.")
+                return rejected
             try:
-                await self._tasks.release_task(task_id, worker_id)
+                await self._tasks.release_task(task.id, worker_id)
             except TaskClaimLost:
                 logger.warning(
                     "dispatch %s lost its lease while retaining incomplete terminal evidence",
@@ -1311,18 +1353,18 @@ class TaskStoreDispatcher(Dispatcher):
                 return self._handle(
                     request,
                     DispatchStatus.SUBMITTED,
-                    queue_task_id=task_id,
+                    queue_task_id=task.id,
                     envelope=envelope,
                     reclaimed=True,
-                    recovered_session=recovered,
+                    recovered_session=recovery.recovered,
                 )
             return self._handle(
                 request,
                 DispatchStatus.SUBMITTED,
-                queue_task_id=task_id,
+                queue_task_id=task.id,
                 envelope=envelope,
                 requeued=True,
-                recovered_session=recovered,
+                recovered_session=recovery.recovered,
             )
         if settlement_state is _QueuedDispatchSettlementState.TERMINAL_EVIDENCE_DURABLE:
             assert settlement.terminal_status is not None
@@ -1336,12 +1378,12 @@ class TaskStoreDispatcher(Dispatcher):
             )
             self._arm_terminal_receipt_reconciliation()
             peer_terminalization_won = await self._commit_task_terminal(
-                task_id=task_id,
+                task_id=task.id,
                 worker_id=worker_id,
                 kind=kind,
                 payload=payload,
             )
-            terminal_task = await self._tasks.load_task(task_id)
+            terminal_task = await self._tasks.load_task(task.id)
             if terminal_task is None:
                 raise RuntimeError(
                     "Queued dispatch task disappeared after terminalization committed."
@@ -1360,7 +1402,7 @@ class TaskStoreDispatcher(Dispatcher):
                 return self._handle(
                     request,
                     authoritative_status,
-                    queue_task_id=task_id,
+                    queue_task_id=task.id,
                     envelope=envelope,
                     reclaimed=True,
                 )
@@ -1375,14 +1417,14 @@ class TaskStoreDispatcher(Dispatcher):
             return self._handle(
                 request,
                 status,
-                queue_task_id=task_id,
+                queue_task_id=task.id,
                 envelope=envelope,
                 reclaimed=True,
             )
         return self._handle(
             request,
             authoritative_status,
-            queue_task_id=task_id,
+            queue_task_id=task.id,
             envelope=envelope,
         )
 
@@ -1414,18 +1456,19 @@ class TaskStoreDispatcher(Dispatcher):
         self,
         runtime: _DurableDispatchRuntime,
         request: DispatchRequest,
-    ) -> bool:
+    ) -> _StalledSessionRecovery:
         """Best-effort finalization of a session stranded in a live status by a crashed worker.
 
         Uses the runtime's incomplete-session recovery when available while the
         durable redaction capabilities remain mandatory. The store atomically checks the
         durable activity horizon and increments the run epoch before recovery, so a
         genuinely live run is left alone and an evicted worker cannot write after the
-        decision. Returns True when the session was recovered out of its stranded status.
+        decision. Permanent runtime-authenticated observation corruption is returned
+        separately so the queue task can settle instead of being reclaimed forever.
         """
         recover = getattr(runtime, "recover_incomplete_session", None)
         if recover is None:
-            return False
+            return _StalledSessionRecovery()
         try:
             inactive_before = datetime.now(UTC) - timedelta(
                 seconds=self._recover_stalled_after_seconds
@@ -1439,6 +1482,7 @@ class TaskStoreDispatcher(Dispatcher):
                 )
             )
         except Exception as exc:
+            permanent_rejection = exc if is_workspace_observation_recovery_rejected(exc) else None
             logger.warning(
                 "dispatch %s could not recover stalled session %s: error_type=%s error=%s",
                 request.dispatch_id,
@@ -1446,8 +1490,10 @@ class TaskStoreDispatcher(Dispatcher):
                 type(exc).__name__,
                 _safe_runtime_text(runtime, str(exc)),
             )
-            return False
-        return bool(_STALLED_RECOVERED_ACTIONS & set(result.actions))
+            return _StalledSessionRecovery(permanent_rejection=permanent_rejection)
+        return _StalledSessionRecovery(
+            recovered=bool(_STALLED_RECOVERED_ACTIONS & set(result.actions))
+        )
 
     async def _heartbeat(
         self,
