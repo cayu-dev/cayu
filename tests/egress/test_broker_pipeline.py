@@ -675,6 +675,35 @@ def test_browser_policy_revalidates_custom_upstream_response_contract(
     assert result.headers[CAYU_EGRESS_ERROR_HEADER] == expected_error
 
 
+def test_browser_policy_uses_configured_response_limit_for_custom_upstream() -> None:
+    body = b"larger than the default fixture limit"
+    broker = TransparentEgressBroker(
+        registry=VirtualCredentialRegistry(),
+        resolver=None,
+        policies={
+            "browser": BrowserEgressPolicy(
+                name="browser",
+                allowed_hosts=["files.example.com"],
+            )
+        },
+        approved_destinations=[
+            ApprovedEgressDestination(
+                destination="files.example.com",
+                policy_name="browser",
+            )
+        ],
+        upstream=_FakeUpstream(CapturedResponse(status_code=200, body=body)),
+        browser_max_response_bytes=len(body),
+    )
+
+    result = asyncio.run(
+        broker.handle_request(CapturedRequest(method="GET", host="files.example.com", path="/"))
+    )
+
+    assert result.status_code == 200
+    assert result.body == body
+
+
 def test_broker_rejects_announced_upstream_response_over_byte_limit_before_read() -> None:
     body_started = False
 

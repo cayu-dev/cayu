@@ -1392,6 +1392,34 @@ def test_factory_requires_a_credential() -> None:
         )
 
 
+def test_factory_accepts_a_configured_browser_response_limit() -> None:
+    factory = _virtual_factory(
+        runner_kind="docker",
+        browser_max_response_bytes=16 * 1024 * 1024,
+    )
+
+    assert factory._browser_max_response_bytes == 16 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    ("value", "error_type"),
+    [
+        (True, TypeError),
+        (0, ValueError),
+        (64 * 1024 * 1024 + 1, ValueError),
+    ],
+)
+def test_factory_rejects_invalid_browser_response_limits(
+    value: object,
+    error_type: type[Exception],
+) -> None:
+    with pytest.raises(error_type, match="max_response_bytes"):
+        _virtual_factory(
+            runner_kind="docker",
+            browser_max_response_bytes=value,
+        )
+
+
 def test_factory_copies_an_application_execution_profile_identity() -> None:
     identity = ExecutionProfileBehaviorIdentity(
         name="tests:virtual-egress",

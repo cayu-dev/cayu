@@ -384,6 +384,7 @@ class TransparentEgressBroker:
         upstream: EgressUpstream | None = None,
         audit: Callable[[EgressDecision], None] | None = None,
         require_test_mode_credentials: bool = True,
+        browser_max_response_bytes: int | None = None,
     ) -> None:
         if resolver is not None:
             validate_secret_resolver(resolver, "resolver")
@@ -398,6 +399,11 @@ class TransparentEgressBroker:
         self._upstream = upstream or HttpxUpstream()
         self._audit = audit
         self._require_test_mode = require_test_mode_credentials
+        self._browser_max_response_bytes = _bounded_response_bytes(
+            DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES
+            if browser_max_response_bytes is None
+            else browser_max_response_bytes
+        )
 
     @property
     def registry(self) -> VirtualCredentialRegistry:
@@ -736,7 +742,7 @@ class TransparentEgressBroker:
                     authorization_kind=authorization.authorization_kind,
                     error_code="unsupported_content",
                 )
-            if len(response.body) > DEFAULT_EGRESS_UPSTREAM_MAX_RESPONSE_BYTES:
+            if len(response.body) > self._browser_max_response_bytes:
                 return self._deny(
                     request,
                     authorization.grant_id,

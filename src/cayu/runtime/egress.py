@@ -84,6 +84,7 @@ from cayu.egress.adapter import (
     _await_bounded_cleanup_task,
 )
 from cayu.egress.authority import _copy_egress_authority_identity
+from cayu.egress.broker import _bounded_response_bytes
 from cayu.egress.credential_kinds import validate_credential_kind
 from cayu.egress.destinations import normalize_egress_hostname, validate_approved_destinations
 from cayu.environments.admission import (
@@ -496,6 +497,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         event_emitter: EventEmitter | None = None,
         upstream: EgressUpstream | None = None,
         require_test_mode_credentials: bool = True,
+        browser_max_response_bytes: int | None = None,
         execution_profile_identity: ExecutionProfileBehaviorIdentity | None = None,
         egress_authority_generation: int = 1,
         egress_authority_source: str | None = None,
@@ -612,6 +614,11 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
         self._emitter = event_emitter
         self._upstream = upstream
         self._require_test_mode = require_test_mode_credentials
+        self._browser_max_response_bytes = (
+            None
+            if browser_max_response_bytes is None
+            else _bounded_response_bytes(browser_max_response_bytes)
+        )
         self._execution_profile_identity = copy_execution_profile_behavior_identity(
             execution_profile_identity
         )
@@ -775,6 +782,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             upstream=self._upstream,
             audit=audit,
             require_test_mode_credentials=self._require_test_mode,
+            browser_max_response_bytes=self._browser_max_response_bytes,
         )
         revoker = _EgressAuthorityRevoker(grants=grants, broker=broker)
         target_credential_env = {grant.env_name: grant.presented_value for grant in grants}
@@ -1070,6 +1078,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             upstream=self._upstream,
             audit=audit,
             require_test_mode_credentials=self._require_test_mode,
+            browser_max_response_bytes=self._browser_max_response_bytes,
         )
         authority_revoker = _EgressAuthorityRevoker(
             grants=grants,
