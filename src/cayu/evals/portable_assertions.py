@@ -20,6 +20,8 @@ from cayu.evals.corpus import (
     PublicJudgeReferenceV1,
     RootStatusAssertionSpec,
     StructuredModelJudgeAssertionSpec,
+    ToolArgumentsContainAssertionSpec,
+    ToolResultContainsAssertionSpec,
     _bounded_durable_text,
     _content_revision,
     _model_python_input,
@@ -923,6 +925,17 @@ def compile_assertion_spec(
     if trusted_pricing is not None and type(trusted_pricing) is not PriceBook:
         raise TypeError("trusted_pricing must be an exact PriceBook or None.")
     validated_spec = _validated_assertion_spec(spec)
+    validated_policy = _validated_policy(evidence_policy)
+    if (
+        type(validated_spec) is ToolArgumentsContainAssertionSpec
+        and not validated_policy.include_tool_arguments
+    ):
+        raise ValueError("Tool-argument assertions require published argument evidence.")
+    if (
+        type(validated_spec) is ToolResultContainsAssertionSpec
+        and not validated_policy.include_tool_results
+    ):
+        raise ValueError("Tool-result assertions require explicitly retained result evidence.")
     if type(validated_spec) in {
         ModelJudgeAssertionSpec,
         StructuredModelJudgeAssertionSpec,
@@ -936,7 +949,7 @@ def compile_assertion_spec(
     return _CompiledPortableAssertion(
         validated_spec,
         app=app,
-        evidence_policy=evidence_policy,
+        evidence_policy=validated_policy,
         pricing_binding=pricing_binding,
     )
 
@@ -971,6 +984,15 @@ def _compile_corpus_assertion_specs(
         )
 
     validated_specs = tuple(_validated_assertion_spec(spec) for spec in specs)
+    validated_policy = _validated_policy(evidence_policy)
+    if any(type(spec) is ToolArgumentsContainAssertionSpec for spec in validated_specs) and not (
+        validated_policy.include_tool_arguments
+    ):
+        raise ValueError("Tool-argument assertions require published argument evidence.")
+    if any(type(spec) is ToolResultContainsAssertionSpec for spec in validated_specs) and not (
+        validated_policy.include_tool_results
+    ):
+        raise ValueError("Tool-result assertions require explicitly retained result evidence.")
     model_judge_bindings: dict[str, _TrustedModelJudgeBinding] = {}
     for binding in trusted_model_judges:
         if type(binding) is not _TrustedModelJudgeBinding:
@@ -1008,7 +1030,7 @@ def _compile_corpus_assertion_specs(
                     spec,
                     binding=binding,
                     app=app,
-                    evidence_policy=evidence_policy,
+                    evidence_policy=validated_policy,
                 )
             )
         elif type(spec) is StructuredModelJudgeAssertionSpec:
@@ -1022,7 +1044,7 @@ def _compile_corpus_assertion_specs(
                     spec,
                     binding=binding,
                     app=app,
-                    evidence_policy=evidence_policy,
+                    evidence_policy=validated_policy,
                 )
             )
         else:
@@ -1030,7 +1052,7 @@ def _compile_corpus_assertion_specs(
                 _CompiledPortableAssertion(
                     spec,
                     app=app,
-                    evidence_policy=evidence_policy,
+                    evidence_policy=validated_policy,
                     pricing_binding=pricing_binding,
                 )
             )

@@ -33,6 +33,7 @@ from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_RESULTS,
     EVAL_CORPUS_MAX_TOOL_NAMES,
     EVAL_CORPUS_MAX_TRIALS,
+    EVAL_TOOL_CALL_EVIDENCE_MAX_CALLS,
     EVIDENCE_MAX_CHILD_SESSIONS,
     EVIDENCE_MAX_MODEL_STEPS,
     EVIDENCE_MAX_TOOL_CALLS,
@@ -54,7 +55,9 @@ from cayu.evals.corpus import (
     PublicJudgeReferenceV1,
     RootStatusAssertionSpec,
     StructuredModelJudgeAssertionSpec,
+    ToolArgumentsContainAssertionSpec,
     ToolCalledAssertionSpec,
+    ToolResultContainsAssertionSpec,
     ToolsCalledInOrderAssertionSpec,
     UsageRecordedAssertionSpec,
     _bounded_durable_text,
@@ -72,6 +75,11 @@ from cayu.evals.corpus import (
     eval_run_contract_for_corpus,
 )
 from cayu.evals.evidence import _canonical_decimal
+from cayu.evals.json_subset import (
+    JsonSubsetOutcome,
+    compare_json_subset,
+    copy_eval_tool_json_object,
+)
 from cayu.evals.memory_attribution import (
     EVAL_MEMORY_ATTRIBUTION_RESULT_BUDGET_BYTES,
     EvalMemoryAttributionEvidenceV1,
@@ -91,7 +99,7 @@ from cayu.evals.result_contract import (
 from cayu.evals.revisions import eval_trial_result_revision
 from cayu.runtime.usage import AggregateCount, aggregate_usage_metrics_from_durable_payload
 
-PUBLISHED_EVAL_SCHEMA_VERSION = 5
+PUBLISHED_EVAL_SCHEMA_VERSION = 6
 PUBLISHED_EVAL_MAX_BYTES = 32 << 20
 PUBLISHED_EVAL_MAX_DURATION_MS = 2**63 - 1
 
@@ -244,6 +252,91 @@ class PublishedToolCalledDetail(_PublishedAssertionDetail):
         if self.max_count is not None and self.max_count < self.min_count:
             raise ValueError("max_count must be greater than or equal to min_count.")
         return self
+
+
+ToolJsonObservationState = Literal[
+    "available",
+    "absent",
+    "unavailable",
+    "unsupported",
+    "malformed",
+    "incompatible",
+    "limit_exceeded",
+    "truncated",
+    "redacted",
+]
+
+
+class _PublishedToolJsonSubsetDetail(_PublishedAssertionDetail):
+    tool_name: StrictStr
+    occurrence: StrictInt = Field(ge=1, le=EVAL_TOOL_CALL_EVIDENCE_MAX_CALLS)
+    expected_subset: dict[str, Any]
+    observation_state: ToolJsonObservationState
+    invocation_index: StrictInt | None = Field(
+        default=None,
+        ge=1,
+        le=EVAL_TOOL_CALL_EVIDENCE_MAX_CALLS,
+    )
+    invocation_revision: StrictStr | None = None
+    actual: dict[str, Any] | None = None
+    matched: StrictBool | None = None
+
+    @field_validator("tool_name")
+    @classmethod
+    def validate_tool_name(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=256,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("expected_subset", "actual", mode="before")
+    @classmethod
+    def validate_json_object(cls, value: object, info) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        return copy_eval_tool_json_object(value, info.field_name)
+
+    @field_validator("invocation_revision")
+    @classmethod
+    def validate_invocation_revision(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _sha256_revision(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_observation(self) -> _PublishedToolJsonSubsetDetail:
+        has_identity = self.invocation_index is not None and self.invocation_revision is not None
+        if (self.invocation_index is None) != (self.invocation_revision is None):
+            raise ValueError("Tool JSON observations require complete invocation identity.")
+        if self.observation_state == "available":
+            if not has_identity or self.actual is None or self.matched is None:
+                raise ValueError("Available tool JSON evidence requires identity and comparison.")
+            comparison = compare_json_subset(self.expected_subset, self.actual)
+            if comparison is JsonSubsetOutcome.REDACTED:
+                raise ValueError(
+                    "Available tool JSON evidence cannot be redacted on an expected path."
+                )
+            if self.matched is not (comparison is JsonSubsetOutcome.MATCHED):
+                raise ValueError(
+                    "Available tool JSON comparison contradicts its retained evidence."
+                )
+        elif self.observation_state == "absent":
+            if has_identity or self.actual is not None or self.matched is not False:
+                raise ValueError("Absent tool JSON evidence requires one conclusive mismatch.")
+        elif self.actual is not None or self.matched is not None:
+            raise ValueError("Incomplete tool JSON evidence cannot carry a comparison.")
+        return self
+
+
+class PublishedToolArgumentsContainDetail(_PublishedToolJsonSubsetDetail):
+    kind: Literal["tool_arguments_contain"] = "tool_arguments_contain"
+
+
+class PublishedToolResultContainsDetail(_PublishedToolJsonSubsetDetail):
+    kind: Literal["tool_result_contains"] = "tool_result_contains"
 
 
 class PublishedToolsCalledInOrderDetail(_PublishedAssertionDetail):
@@ -658,6 +751,8 @@ PublishedAssertionDetail: TypeAlias = Annotated[
     | PublishedFinalOutputEqualsDetail
     | PublishedFinalOutputContainsDetail
     | PublishedToolCalledDetail
+    | PublishedToolArgumentsContainDetail
+    | PublishedToolResultContainsDetail
     | PublishedToolsCalledInOrderDetail
     | PublishedMaxToolCallsDetail
     | PublishedMaxModelStepsDetail
@@ -879,7 +974,7 @@ class PublishedEvalCaseResult(_PortableModel):
 
 
 class PublishedEvalRun(_PortableModel):
-    schema_version: Literal[5]
+    schema_version: Literal[6]
     revision: StrictStr
     corpus_revision: StrictStr
     target_key: StrictStr
@@ -1114,6 +1209,11 @@ def _detail_has_observation(detail: PublishedAssertionDetail) -> bool:
         return detail.actual_count is not None and detail.matched is not None
     if isinstance(
         detail,
+        (PublishedToolArgumentsContainDetail, PublishedToolResultContainsDetail),
+    ):
+        return detail.observation_state in {"available", "absent"}
+    if isinstance(
+        detail,
         (
             PublishedMaxToolCallsDetail,
             PublishedMaxModelStepsDetail,
@@ -1143,6 +1243,11 @@ def _detail_expected_pass(detail: PublishedAssertionDetail) -> bool | None:
         return detail.matching_count >= detail.min_count and (
             detail.max_count is None or detail.matching_count <= detail.max_count
         )
+    if isinstance(
+        detail,
+        (PublishedToolArgumentsContainDetail, PublishedToolResultContainsDetail),
+    ):
+        return detail.matched
     if isinstance(detail, PublishedMaxToolCallsDetail):
         return None if detail.actual is None else detail.actual <= detail.maximum
     if isinstance(detail, PublishedMaxModelStepsDetail):
@@ -1180,6 +1285,10 @@ def _detail_evidence_area(detail: PublishedAssertionDetail) -> str:
         ),
     ):
         return "tool"
+    if isinstance(detail, PublishedToolArgumentsContainDetail):
+        return "tool-arguments"
+    if isinstance(detail, PublishedToolResultContainsDetail):
+        return "tool-result"
     if isinstance(detail, PublishedMaxModelStepsDetail):
         return "model-step"
     if isinstance(detail, (PublishedUsageRecordedDetail, PublishedMaxTotalTokensDetail)):
@@ -1233,6 +1342,16 @@ def _assertion_contract(assertion: PublishedAssertionResult) -> tuple[object, ..
         static_detail = (detail.kind,)
     elif isinstance(detail, PublishedToolCalledDetail):
         static_detail = (detail.kind, detail.tool_name, detail.min_count, detail.max_count)
+    elif isinstance(
+        detail,
+        (PublishedToolArgumentsContainDetail, PublishedToolResultContainsDetail),
+    ):
+        static_detail = (
+            detail.kind,
+            detail.tool_name,
+            detail.occurrence,
+            detail.expected_subset,
+        )
     elif isinstance(detail, PublishedToolsCalledInOrderDetail):
         static_detail = (detail.kind, detail.expected_count)
     elif isinstance(detail, (PublishedMaxToolCallsDetail, PublishedMaxModelStepsDetail)):
@@ -1285,6 +1404,17 @@ def _assertion_spec_contract(spec: AssertionSpec) -> tuple[object, ...]:
         return base
     if type(spec) is ToolCalledAssertionSpec:
         return (*base, spec.tool_name, spec.min_count, spec.max_count)
+    if type(spec) in {ToolArgumentsContainAssertionSpec, ToolResultContainsAssertionSpec}:
+        tool_json_spec = cast(
+            "ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec",
+            spec,
+        )
+        return (
+            *base,
+            tool_json_spec.tool_name,
+            tool_json_spec.occurrence,
+            tool_json_spec.expected_subset,
+        )
     if type(spec) is ToolsCalledInOrderAssertionSpec:
         return (*base, len(spec.tool_names))
     if isinstance(spec, (MaxToolCallsAssertionSpec, MaxModelStepsAssertionSpec)):
@@ -1576,6 +1706,16 @@ def _safe_metadata_decimal(result: EvalAssertionResult, key: str) -> str | None:
         return None
 
 
+def _safe_metadata_json_object(result: EvalAssertionResult, key: str) -> dict[str, Any] | None:
+    value = result.metadata.get(key)
+    if value is None:
+        return None
+    try:
+        return copy_eval_tool_json_object(value, key)
+    except (TypeError, ValueError):
+        return None
+
+
 def _published_detail(
     spec: AssertionSpec,
     result: EvalAssertionResult,
@@ -1607,6 +1747,48 @@ def _published_detail(
             min_count=spec.min_count,
             max_count=spec.max_count,
             matching_count=_safe_metadata_int(result, "count"),
+        )
+    if type(spec) in {ToolArgumentsContainAssertionSpec, ToolResultContainsAssertionSpec}:
+        tool_json_spec = cast(
+            "ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec",
+            spec,
+        )
+        raw_state = result.metadata.get("observation_state")
+        observation_state: ToolJsonObservationState = (
+            raw_state
+            if type(raw_state) is str
+            and raw_state
+            in {
+                "available",
+                "absent",
+                "unavailable",
+                "unsupported",
+                "malformed",
+                "incompatible",
+                "limit_exceeded",
+                "truncated",
+                "redacted",
+            }
+            else "unavailable"
+        )
+        detail_type = (
+            PublishedToolArgumentsContainDetail
+            if type(tool_json_spec) is ToolArgumentsContainAssertionSpec
+            else PublishedToolResultContainsDetail
+        )
+        return detail_type(
+            tool_name=tool_json_spec.tool_name,
+            occurrence=tool_json_spec.occurrence,
+            expected_subset=tool_json_spec.expected_subset,
+            observation_state=observation_state,
+            invocation_index=_safe_metadata_int(result, "invocation_index"),
+            invocation_revision=_safe_metadata_text(
+                result,
+                "invocation_revision",
+                max_chars=71,
+            ),
+            actual=_safe_metadata_json_object(result, "actual"),
+            matched=_safe_metadata_bool(result, "matched"),
         )
     if type(spec) is ToolsCalledInOrderAssertionSpec:
         actual = result.metadata.get("actual")

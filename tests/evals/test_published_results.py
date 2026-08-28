@@ -234,8 +234,8 @@ def test_published_graph_preserves_trials_and_reproducible_aggregates_only():
     run = _run()
     published = publish_eval_run(corpus, run)
 
-    assert PUBLISHED_EVAL_SCHEMA_VERSION == 5
-    assert published.schema_version == 5
+    assert PUBLISHED_EVAL_SCHEMA_VERSION == 6
+    assert published.schema_version == 6
     assert published.corpus_revision == corpus.revision
     assert published.status == "unavailable"
     assert published.score is None
@@ -299,7 +299,7 @@ def test_published_eval_run_rejects_v1_before_validating_its_obsolete_shape():
     with pytest.raises(ValidationError, match="other versions are unsupported"):
         PublishedEvalRun.model_validate(document)
 
-    with pytest.raises(ValidationError, match="schema_version must be the integer 5"):
+    with pytest.raises(ValidationError, match="schema_version must be the integer 6"):
         PublishedEvalRun.model_validate(
             {**published.model_dump(mode="json"), "schema_version": "2"}
         )

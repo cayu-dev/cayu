@@ -19,9 +19,12 @@ from fastapi.testclient import TestClient
 from cayu import ModelStreamEvent, ScriptedModelProvider
 from cayu.evals.corpus import (
     CorpusUserMessageSpec,
+    EvaluationEvidencePolicySpec,
     FinalOutputContainsAssertionSpec,
     RootStatusAssertionSpec,
     RunInputSpec,
+    ToolArgumentsContainAssertionSpec,
+    ToolResultContainsAssertionSpec,
 )
 from cayu.evals.suite_authoring import (
     EvalCaseDraftV1,
@@ -54,6 +57,82 @@ def _draft(*cases: EvalCaseDraftV1) -> EvalSuiteDraftV1:
         name="Refund regressions",
         cases=cases or (_simple_case(),),
     )
+
+
+def test_authored_suite_run_preview_explains_missing_tool_evidence_authority(tmp_path) -> None:
+    target, _, _ = _target(tmp_path)
+    target = target.model_copy(
+        update={
+            "evidence_policy": EvaluationEvidencePolicySpec.create(include_tool_arguments=False)
+        }
+    )
+    store = SQLiteEvalStore(tmp_path / "evals.db")
+    result_case = _simple_case().model_copy(
+        update={
+            "assertions": (
+                RootStatusAssertionSpec(id="completed", expected="completed"),
+                ToolArgumentsContainAssertionSpec(
+                    id="lookup-arguments",
+                    tool_name="lookup",
+                    expected_subset={"query": "cayu"},
+                ),
+                ToolResultContainsAssertionSpec(
+                    id="lookup-result",
+                    tool_name="lookup",
+                    expected_subset={"structured": {"status": "ok"}},
+                ),
+            )
+        }
+    )
+    try:
+        with TestClient(_server(target, store)) as client:
+            preview = client.post(
+                "/api/evals/suites/preview",
+                headers=_AUTH_HEADERS,
+                json={"draft": _draft(result_case).model_dump(mode="json")},
+            )
+            assert preview.status_code == 200
+            suite = EvalSuiteDocumentV1.model_validate(preview.json()["suite"])
+            saved = client.post(
+                "/api/evals/suites",
+                headers=_AUTH_HEADERS,
+                json={
+                    "expected_suite_revision": suite.revision,
+                    "suite": suite.model_dump(mode="json"),
+                },
+            )
+            assert saved.status_code == 201
+
+            launch_preview = client.post(
+                f"/api/evals/suites/{suite.revision}/runs/preview",
+                headers=_AUTH_HEADERS,
+                json={},
+            )
+
+            assert launch_preview.status_code == 200
+            assert launch_preview.json()["ready"] is False
+            assert launch_preview.json()["diagnostics"] == [
+                {
+                    "code": "tool_result_evidence_unavailable",
+                    "case_id": result_case.id,
+                    "message": (
+                        "This case requires retained public-safe tool results, but the selected "
+                        "target does not publish result evidence. Choose a target profile with "
+                        "result retention or remove the result assertion."
+                    ),
+                },
+                {
+                    "code": "tool_argument_evidence_unavailable",
+                    "case_id": result_case.id,
+                    "message": (
+                        "This case requires public tool arguments, but the selected target does "
+                        "not publish argument evidence. Choose a compatible target profile or "
+                        "remove the argument assertion."
+                    ),
+                },
+            ]
+    finally:
+        asyncio.run(store.close())
 
 
 def test_suite_preview_save_catalog_and_download_are_target_scoped(tmp_path) -> None:

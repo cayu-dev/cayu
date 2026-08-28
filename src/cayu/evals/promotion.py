@@ -32,6 +32,8 @@ from cayu.evals.corpus import (
     PricingProfileIdentityV1,
     RootStatusAssertionSpec,
     RunInputSpec,
+    ToolArgumentsContainAssertionSpec,
+    ToolResultContainsAssertionSpec,
     TrialRequestSpec,
     _bounded_durable_text,
     _content_revision,
@@ -177,6 +179,22 @@ def _corpus_case(case: PromotionCaseV1) -> EvalCaseSpec:
     return EvalCaseSpec.model_validate(_model_python_input(case))
 
 
+def _validate_tool_assertion_evidence_policy(
+    case: PromotionCaseV1,
+    policy: EvaluationEvidencePolicySpec,
+) -> None:
+    if (
+        any(type(assertion) is ToolArgumentsContainAssertionSpec for assertion in case.assertions)
+        and not policy.include_tool_arguments
+    ):
+        raise ValueError("Tool-argument assertions require published argument evidence.")
+    if (
+        any(type(assertion) is ToolResultContainsAssertionSpec for assertion in case.assertions)
+        and not policy.include_tool_results
+    ):
+        raise ValueError("Tool-result assertions require explicitly retained result evidence.")
+
+
 class PromotionSourceV1(_SchemaV1PortableModel):
     """Safe diagnostic capture provenance without executable or session authority."""
 
@@ -318,6 +336,7 @@ class PromotionCandidateV1(_SchemaV1PortableModel):
             raise ValueError("Promotion case source does not match candidate provenance.")
         if self.case.suite_id != self.suite.id:
             raise ValueError("Promotion case must reference the candidate suite.")
+        _validate_tool_assertion_evidence_policy(self.case, self.evidence_policy)
         expected_warnings = _promotion_warnings(self.source, self.evidence)
         if self.warnings != expected_warnings:
             raise ValueError("Promotion warnings do not match captured source facts.")
@@ -519,6 +538,7 @@ class CapturedEvaluationCandidateV1(_SchemaV1PortableModel):
             raise ValueError("Captured case source does not match candidate provenance.")
         if self.case.suite_id != self.suite.id:
             raise ValueError("Captured case must reference the candidate suite.")
+        _validate_tool_assertion_evidence_policy(self.case, self.evidence_policy)
         if self.case.input is not None:
             raise ValueError("A captured-only evaluation candidate cannot carry runnable input.")
         expected_warnings = (

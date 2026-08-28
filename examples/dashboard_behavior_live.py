@@ -33,6 +33,7 @@ from cayu import (
     CayuApp,
     CorpusTarget,
     EvalPlan,
+    EvaluationEvidencePolicySpec,
     Event,
     EventType,
     InMemoryTaskStore,
@@ -53,6 +54,7 @@ from cayu import (
     ToolContext,
     ToolEffect,
     ToolResult,
+    ToolResultPart,
     ToolSpec,
 )
 from cayu._server_contract_version import SERVER_CONTRACT_VERSION
@@ -231,6 +233,18 @@ class DashboardContractProvider(ModelProvider):
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
             return
         if "exercise one fresh control plane-authored evaluation" in request_text.lower():
+            if not any(
+                isinstance(part, ToolResultPart)
+                for message in request.messages
+                for part in message.content
+            ):
+                yield ModelStreamEvent.tool_call(
+                    id="dashboard-eval-search-call",
+                    name="dashboard_eval_search",
+                    arguments={"query": "cayu", "limit": 5},
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
             yield ModelStreamEvent.text_delta("dashboard authored evaluation output")
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
             return
@@ -276,6 +290,29 @@ class DashboardContractTool(Tool):
         return ToolResult(
             content=f"Dashboard contract operation {args['operation']} completed.",
             structured={"agent": ctx.agent_name},
+        )
+
+
+class DashboardEvalSearchTool(Tool):
+    spec = ToolSpec(
+        name="dashboard_eval_search",
+        description="Return deterministic public facts for the installed Evals contract.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["query", "limit"],
+        },
+        effect=ToolEffect.NONE,
+    )
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del ctx
+        return ToolResult(
+            content=f"Found public results for {args['query']}.",
+            structured={"status": "ok", "count": min(args["limit"], 2)},
         )
 
 
@@ -451,6 +488,7 @@ async def main() -> None:
                     target_key="dashboard.regressions",
                     source_agent_name=AGENT_NAME,
                     application_release_id="dashboard-browser-contract",
+                    evidence_policy=EvaluationEvidencePolicySpec.create(include_tool_results=True),
                 ),
                 evals=EvalsConfig(
                     target=CorpusTarget(
@@ -460,6 +498,9 @@ async def main() -> None:
                         application_release_id="dashboard-browser-contract",
                         price_book=price_book,
                         model_judges=(judge,),
+                        evidence_policy=EvaluationEvidencePolicySpec.create(
+                            include_tool_results=True
+                        ),
                     ),
                     store=eval_store,
                     poll_interval_seconds=0.05,
@@ -597,11 +638,11 @@ async def _seed_app() -> tuple[
     app.register_agent(AgentSpec(name="assistant", model=MODEL_NAME))
     app.register_agent(
         AgentSpec(name=AGENT_NAME, model=MODEL_NAME),
-        tools=[DashboardContractTool()],
+        tools=[DashboardContractTool(), DashboardEvalSearchTool()],
         tool_policy=AlwaysRequireApprovalToolPolicy(tools=["dashboard_contract_tool"]),
     )
     contract_tool_capability_ceiling = ToolCapabilityCeiling(
-        tool_names=(DashboardContractTool.spec.name,)
+        tool_names=(DashboardContractTool.spec.name, DashboardEvalSearchTool.spec.name)
     )
     contract_session_identity = _profiled_session_identity(
         app,
@@ -1068,7 +1109,7 @@ def build_release_acceptance_eval_plan() -> EvalPlan:
     app.register_provider(DashboardContractProvider(), default=True)
     app.register_agent(
         AgentSpec(name=AGENT_NAME, model=MODEL_NAME),
-        tools=[DashboardContractTool()],
+        tools=[DashboardContractTool(), DashboardEvalSearchTool()],
         tool_policy=AlwaysRequireApprovalToolPolicy(tools=["dashboard_contract_tool"]),
     )
     return EvalPlan(
@@ -1078,6 +1119,7 @@ def build_release_acceptance_eval_plan() -> EvalPlan:
             request_base=RunRequest(agent_name=AGENT_NAME, messages=[]),
             application_release_id="dashboard-local-ci-contract",
             price_book=_dashboard_price_book(),
+            evidence_policy=EvaluationEvidencePolicySpec.create(include_tool_results=True),
         )
     )
 
@@ -1633,6 +1675,23 @@ async def _exercise_captured_evaluation(
     await expect(authoring.get_by_test_id("judge-profile-summary")).to_contain_text(
         re.compile(r"same model as candidate", re.IGNORECASE)
     )
+    assertion_kind = authoring.get_by_label("Assertion quick-add type", exact=True)
+    await assertion_kind.select_option("tool_arguments_contain")
+    await authoring.get_by_role("button", name="Add expectation", exact=True).click()
+    argument_assertion = authoring.get_by_test_id("promotion-assertion").last
+    await argument_assertion.get_by_label("Tool name", exact=True).fill("dashboard_eval_search")
+    await argument_assertion.get_by_label(
+        "Expected argument JSON subset",
+        exact=True,
+    ).fill('{"query":"cayu"}')
+    await assertion_kind.select_option("tool_result_contains")
+    await authoring.get_by_role("button", name="Add expectation", exact=True).click()
+    result_assertion = authoring.get_by_test_id("promotion-assertion").last
+    await result_assertion.get_by_label("Tool name", exact=True).fill("dashboard_eval_search")
+    await result_assertion.get_by_label(
+        "Expected result JSON subset",
+        exact=True,
+    ).fill('{"structured":{"status":"ok"}}')
     await authoring.get_by_role("button", name="Add case", exact=True).click()
     case_list = authoring.get_by_test_id("authored-suite-cases")
     case_id_input = authoring.get_by_test_id("authored-case-id")
@@ -1668,6 +1727,26 @@ async def _exercise_captured_evaluation(
     await expect(
         authoring.get_by_text(re.compile(r"Saved scenario .+ for authored-scenario\."))
     ).to_be_visible()
+    await assertion_kind.select_option("tool_arguments_contain")
+    await authoring.get_by_role("button", name="Add expectation", exact=True).click()
+    scenario_argument_assertion = authoring.get_by_test_id("promotion-assertion").last
+    await scenario_argument_assertion.get_by_label("Tool name", exact=True).fill(
+        "dashboard_contract_tool"
+    )
+    await scenario_argument_assertion.get_by_label(
+        "Expected argument JSON subset",
+        exact=True,
+    ).fill('{"operation":"verify-scenario"}')
+    await assertion_kind.select_option("tool_result_contains")
+    await authoring.get_by_role("button", name="Add expectation", exact=True).click()
+    scenario_result_assertion = authoring.get_by_test_id("promotion-assertion").last
+    await scenario_result_assertion.get_by_label("Tool name", exact=True).fill(
+        "dashboard_contract_tool"
+    )
+    await scenario_result_assertion.get_by_label(
+        "Expected result JSON subset",
+        exact=True,
+    ).fill('{"structured":{"agent":"dashboard-contract-agent"}}')
     await authoring.get_by_label("Select Case 2 for launch", exact=True).uncheck()
     await authoring.get_by_test_id("authored-suite-preview").click()
     await expect(authoring.get_by_text("Suite is ready to save", exact=True)).to_be_visible()
@@ -1785,6 +1864,8 @@ async def _exercise_captured_evaluation(
         page.locator('[data-slot="card-title"]').filter(has_text="Published result")
     ).to_be_visible()
     await expect(page.get_by_text("root_status", exact=True)).to_be_visible()
+    await expect(page.get_by_text("tool_arguments_contain", exact=True)).to_be_visible()
+    await expect(page.get_by_text("tool_result_contains", exact=True)).to_be_visible()
     await expect(page.get_by_text("Dashboard quality judge", exact=False)).to_be_visible()
     await expect(page.get_by_text("same model · explicitly allowed", exact=True)).to_be_visible()
     await expect(page.get_by_text("correctness", exact=True)).to_be_visible()
@@ -1800,15 +1881,47 @@ async def _exercise_captured_evaluation(
         "the authored structured run must publish an explainable result",
     )
     authored_result_body = await authored_result_response.json()
+    authored_assertions = authored_result_body["result"]["run"]["cases"][0]["trials"][0][
+        "assertions"
+    ]
+    authored_tool_assertions = {
+        item["detail"]["kind"]: item
+        for item in authored_assertions
+        if "tool_" in item["detail"]["kind"]
+    }
+    require_equal(
+        sorted(authored_tool_assertions),
+        ["tool_arguments_contain", "tool_result_contains"],
+        "fresh authoring must publish both tool JSON assertion details",
+    )
+    require_equal(
+        [item["outcome"] for item in authored_tool_assertions.values()],
+        ["passed", "passed"],
+        "fresh tool JSON assertions must pass through the canonical evaluator",
+    )
     authored_presentation = authored_result_body["presentation"]
+    authored_tool_presentations = [
+        item["tool_json"]
+        for item in authored_presentation["cases"][0]["trials"][0]["assertions"]
+        if item.get("tool_json") is not None
+    ]
+    require_equal(
+        [item["observation_state"] for item in authored_tool_presentations],
+        ["available", "available"],
+        "the canonical presentation must retain safe tool JSON detail",
+    )
+    await expect(page.get_by_test_id("eval-tool-json-detail")).to_have_count(2)
+    await expect(page.get_by_text("Observed safe value", exact=True)).to_have_count(2)
     require_equal(
         authored_presentation["dimensions"]["evaluator_health"],
         "healthy",
         "the canonical result presentation must keep evaluator health distinct",
     )
-    authored_judgment = authored_presentation["cases"][0]["trials"][0]["assertions"][1][
-        "structured_judge"
-    ]
+    authored_judgment = next(
+        item["structured_judge"]
+        for item in authored_presentation["cases"][0]["trials"][0]["assertions"]
+        if item["kind"] == "structured_model_judge"
+    )
     require_equal(
         authored_judgment["criteria"][0]["weighted_contribution"],
         "1",
@@ -1837,6 +1950,16 @@ async def _exercise_captured_evaluation(
         authored_comparison["structured_judgments"][0]["criteria"][0]["score_delta"],
         "0",
         "structured comparison must expose exact criterion deltas",
+    )
+    require_equal(
+        authored_comparison["tool_json_comparison_state"],
+        "compared",
+        "tool JSON comparison must pair exact retained trial identity",
+    )
+    require_equal(
+        [item["observed_value_change"] for item in authored_comparison["tool_json_assertions"]],
+        ["unchanged", "unchanged"],
+        "tool JSON comparison must preserve bounded observed values",
     )
     async with page.expect_download() as authored_json_download_info:
         await page.get_by_role("button", name="JSON", exact=True).click()

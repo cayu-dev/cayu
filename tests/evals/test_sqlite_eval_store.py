@@ -15,7 +15,13 @@ from tests.evals.eval_store_conformance import (
     assert_scenario_progress_conformance,
     captured_result_for_corpus,
 )
-from tests.evals.test_corpus_execution import _corpus, _provider, _target
+from tests.evals.test_corpus_execution import (
+    _corpus,
+    _provider,
+    _target,
+    _tool_json_corpus,
+    _tool_json_target,
+)
 from tests.evals.test_judge_calibration import _calibration_report
 
 import cayu.storage.evals_sqlite as evals_sqlite_module
@@ -88,7 +94,20 @@ def test_sqlite_eval_store_shared_conformance(tmp_path) -> None:
             corpus.suites[0].id,
             max_concurrency=1,
         )
-        store = SQLiteEvalStore(tmp_path / "evals.db")
+        path = tmp_path / "evals.db"
+        store = SQLiteEvalStore(path)
+        tool_corpus = _tool_json_corpus(target_key="tool-json-agent")
+        tool_result = await run_corpus_suite(
+            _tool_json_target(
+                query="cayu",
+                limit=5,
+                count=2,
+                application_release_id="release-tool-store",
+                target_key=tool_corpus.target_key,
+            ),
+            tool_corpus,
+            tool_corpus.suites[0].id,
+        )
         try:
             await assert_eval_store_conformance(store, corpus=corpus, result=result)
             await assert_captured_eval_store_conformance(
@@ -101,8 +120,25 @@ def test_sqlite_eval_store_shared_conformance(tmp_path) -> None:
                 store,
                 report=await _calibration_report(),
             )
+            await _save_corpus(store, tool_corpus)
+            tool_request = _request(
+                tool_corpus,
+                run_id="tool-json-restart",
+                idempotency_digit="0",
+            )
+            await _admit_run(store, tool_request)
+            tool_lease = await store.claim_run(target_key=tool_corpus.target_key)
+            assert tool_lease is not None
+            await _publish_result(store, tool_lease.claim, tool_result)
         finally:
             await store.close()
+
+        restarted = SQLiteEvalStore(path)
+        try:
+            assert await restarted.load_corpus(tool_corpus.revision) == tool_corpus
+            assert await restarted.load_result("tool-json-restart") == tool_result
+        finally:
+            await restarted.close()
 
     asyncio.run(exercise())
 

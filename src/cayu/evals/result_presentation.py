@@ -46,6 +46,8 @@ from cayu.evals.published import (
     PublishedOutcome,
     PublishedStatus,
     PublishedStructuredModelJudgeDetail,
+    PublishedToolArgumentsContainDetail,
+    PublishedToolResultContainsDetail,
     _published_score,
     _published_status_from_outcomes,
     _published_status_from_statuses,
@@ -189,6 +191,23 @@ class EvalAssertionPresentationV1(_PortableModel):
     outcome: PublishedOutcome
     score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
     structured_judge: EvalStructuredJudgePresentationV1 | None = None
+    tool_json: PublishedToolArgumentsContainDetail | PublishedToolResultContainsDetail | None = None
+
+    @field_validator("tool_json", mode="before")
+    @classmethod
+    def copy_tool_json(cls, value: object) -> object:
+        if type(value) in {
+            PublishedToolArgumentsContainDetail,
+            PublishedToolResultContainsDetail,
+        }:
+            detail = cast(
+                "PublishedToolArgumentsContainDetail | PublishedToolResultContainsDetail",
+                value,
+            )
+            return detail.model_dump(mode="python", round_trip=True, warnings="none")
+        if isinstance(value, BaseModel):
+            raise TypeError("tool_json must be an exact published tool-JSON detail or JSON object.")
+        return value
 
     @field_validator("assertion_id")
     @classmethod
@@ -218,6 +237,11 @@ class EvalAssertionPresentationV1(_PortableModel):
             raise ValueError("Assertion category contradicts its public kind.")
         if (self.kind == "structured_model_judge") != (self.structured_judge is not None):
             raise ValueError("Only structured-model-judge assertions carry structured detail.")
+        tool_json_kind = self.kind in {"tool_arguments_contain", "tool_result_contains"}
+        if tool_json_kind != (self.tool_json is not None):
+            raise ValueError("Only tool-JSON assertions carry safe tool-JSON detail.")
+        if self.tool_json is not None and self.tool_json.kind != self.kind:
+            raise ValueError("Tool-JSON presentation kind contradicts its retained detail.")
         if self.structured_judge is None:
             return self
         detail = self.structured_judge.detail
@@ -626,6 +650,14 @@ def _present_assertion(assertion: PublishedAssertionResult) -> EvalAssertionPres
     )
     detail = validated.detail
     semantic = isinstance(detail, _SEMANTIC_DETAIL_TYPES)
+    tool_json = (
+        cast(
+            "PublishedToolArgumentsContainDetail | PublishedToolResultContainsDetail",
+            detail,
+        )
+        if type(detail) in {PublishedToolArgumentsContainDetail, PublishedToolResultContainsDetail}
+        else None
+    )
     return EvalAssertionPresentationV1(
         assertion_id=validated.assertion_id,
         assertion_revision=validated.assertion_revision,
@@ -638,6 +670,7 @@ def _present_assertion(assertion: PublishedAssertionResult) -> EvalAssertionPres
             if type(detail) is PublishedStructuredModelJudgeDetail
             else None
         ),
+        tool_json=tool_json,
     )
 
 

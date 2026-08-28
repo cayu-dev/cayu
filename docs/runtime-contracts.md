@@ -9994,8 +9994,8 @@ distinct from a recall-off spec, a no-match receipt, and `truncated`,
 `unavailable`, `redacted`, or `contradictory` attribution.
 
 Runtime-native Evals carry that attribution across both fresh and captured
-publication. `AssertionEvidenceView.schema_version == 2`,
-`EvalRun.schema_version == 8`, `PublishedEvalRun.schema_version == 5`, and
+publication. `AssertionEvidenceView.schema_version == 3`,
+`EvalRun.schema_version == 8`, `PublishedEvalRun.schema_version == 6`, and
 `CorpusExecutionResult.schema_version == 3` each require the same nested
 `EvalMemoryAttributionEvidenceV1`. The nested section is independently
 versioned and content-addressed. It binds a fixed capture-policy revision,

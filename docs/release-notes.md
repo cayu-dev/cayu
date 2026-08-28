@@ -89,6 +89,26 @@ guard.
 
 ## Unreleased
 
+### Evals can assert bounded public tool arguments and retained results
+
+Control Plane and the portable SDK/HTTP suite contracts now support exact
+tool-occurrence assertions over recursive JSON subsets. Finalized public tool
+arguments are available under the standard evidence policy; public-safe tool
+results remain an explicit trusted-target opt-in. Both paths apply workload
+secret redaction and independent size, depth, node, and call-count limits before
+evidence reaches storage, APIs, reports, or the browser.
+
+Missing calls and value mismatches remain failures, while unsupported capture,
+unavailable data, malformed retention, incompatible identity, overflow,
+truncation, and selected-path redaction remain distinct unavailable states.
+Fresh, scenario, and captured-session evaluation use the same matcher. JSON and
+HTML reports and schema-version-3 comparisons preserve safe actual values,
+evidence-state changes, and observed-value changes without raw payload fallback.
+Published eval results advance to schema version 6, assertion evidence to schema
+version 3, and the server/dashboard contract from version 34 to 35. Upgrade
+servers, generated clients, and dashboards together. No storage migration is
+required.
+
 ### Evals results are explainable across the Control Plane, SDK, CLI, and reports
 
 Captured and fresh immutable results now expose one bounded

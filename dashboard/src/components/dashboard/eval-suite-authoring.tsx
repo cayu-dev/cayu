@@ -988,6 +988,7 @@ export function EvalSuiteAuthoringAction({
                     <ExpectedBehaviorEditor
                       assertions={activeDeterministicAssertions}
                       evidence={undefined}
+                      evidencePolicy={target?.execution_profile?.evidence_policy}
                       onChange={(assertions) =>
                         editDraft((next) => {
                           const current = next.cases[activeCaseIndex]

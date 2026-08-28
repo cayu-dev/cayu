@@ -1722,6 +1722,8 @@ class EvalAuthoredSuiteLaunchDiagnostic(ApiBaseModel):
         "one_trial_required",
         "execution_profile_unavailable",
         "execution_profile_changed",
+        "tool_argument_evidence_unavailable",
+        "tool_result_evidence_unavailable",
         "simple_launch_not_ready",
         "scenario_execution_unavailable",
         "scenario_launch_not_ready",

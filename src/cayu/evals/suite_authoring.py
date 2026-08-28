@@ -42,7 +42,9 @@ from cayu.evals.corpus import (
     StructuredModelJudgeAssertionSpec,
     StructuredRubricCriterionV1,
     StructuredRubricV1,
+    ToolArgumentsContainAssertionSpec,
     ToolCalledAssertionSpec,
+    ToolResultContainsAssertionSpec,
     ToolsCalledInOrderAssertionSpec,
     TrialRequestSpec,
     UsageRecordedAssertionSpec,
@@ -77,6 +79,8 @@ EvalSuiteAuthoringAssertionSpecV1: TypeAlias = Annotated[
     | FinalOutputEqualsAssertionSpec
     | FinalOutputContainsAssertionSpec
     | ToolCalledAssertionSpec
+    | ToolArgumentsContainAssertionSpec
+    | ToolResultContainsAssertionSpec
     | ToolsCalledInOrderAssertionSpec
     | MaxToolCallsAssertionSpec
     | MaxModelStepsAssertionSpec
@@ -93,6 +97,8 @@ EvalSuiteAuthoringAssertionSpecV2: TypeAlias = Annotated[
     | FinalOutputEqualsAssertionSpec
     | FinalOutputContainsAssertionSpec
     | ToolCalledAssertionSpec
+    | ToolArgumentsContainAssertionSpec
+    | ToolResultContainsAssertionSpec
     | ToolsCalledInOrderAssertionSpec
     | MaxToolCallsAssertionSpec
     | MaxModelStepsAssertionSpec
@@ -314,6 +320,8 @@ EvalSuiteAuthoringAssertionDraftSpecV2: TypeAlias = Annotated[
     | FinalOutputEqualsAssertionSpec
     | FinalOutputContainsAssertionSpec
     | ToolCalledAssertionSpec
+    | ToolArgumentsContainAssertionSpec
+    | ToolResultContainsAssertionSpec
     | ToolsCalledInOrderAssertionSpec
     | MaxToolCallsAssertionSpec
     | MaxModelStepsAssertionSpec

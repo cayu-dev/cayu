@@ -10,7 +10,7 @@ from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import suppress
 from decimal import Context, Decimal, localcontext
-from functools import partial
+from functools import lru_cache, partial
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeAlias, TypeVar
 
@@ -39,6 +39,7 @@ from cayu._validation import (
     require_durable_text,
 )
 from cayu.evals.external import OpaqueExternalCaseRefV1
+from cayu.evals.json_subset import copy_eval_tool_json_object
 from cayu.evals.models import EvalCaseContractV1, EvalRunContractV1
 from cayu.runtime.costs import PriceBook
 
@@ -80,6 +81,7 @@ EVAL_CORPUS_MAX_JUDGE_REFERENCE_FACTS = 64
 EVAL_CORPUS_MAX_JUDGE_REFERENCE_FACT_CHARS = 2_048
 EVAL_CORPUS_MAX_PUBLISHED_JUDGE_EXPLANATION_CHARS = 2 << 20
 EVAL_CORPUS_MAX_TOOL_NAMES = 256
+EVAL_TOOL_CALL_EVIDENCE_MAX_CALLS = 256
 EVAL_CORPUS_MAX_TRIALS = 100
 EVAL_CORPUS_MAX_TIMEOUT_SECONDS = 3_600
 EVAL_CORPUS_MAX_MERGE_INPUTS = 256
@@ -474,6 +476,53 @@ class ToolCalledAssertionSpec(_AssertionSpecBase):
     def validate_count_range(self) -> ToolCalledAssertionSpec:
         if self.max_count is not None and self.max_count < self.min_count:
             raise ValueError("max_count must be greater than or equal to min_count.")
+        return self
+
+
+class _ToolJsonSubsetAssertionSpec(_AssertionSpecBase):
+    tool_name: StrictStr
+    occurrence: StrictInt = Field(default=1, ge=1, le=EVAL_TOOL_CALL_EVIDENCE_MAX_CALLS)
+    expected_subset: dict[str, Any]
+
+    @field_validator("tool_name")
+    @classmethod
+    def validate_tool_name(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=256,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("expected_subset", mode="before")
+    @classmethod
+    def validate_expected_subset(cls, value: object, info) -> dict[str, Any]:
+        return copy_eval_tool_json_object(value, info.field_name)
+
+
+class ToolArgumentsContainAssertionSpec(_ToolJsonSubsetAssertionSpec):
+    """Require one started invocation's public arguments to contain bounded JSON."""
+
+    kind: Literal["tool_arguments_contain"] = "tool_arguments_contain"
+
+
+class ToolResultContainsAssertionSpec(_ToolJsonSubsetAssertionSpec):
+    """Require one explicitly retained public-safe result to contain bounded JSON."""
+
+    kind: Literal["tool_result_contains"] = "tool_result_contains"
+
+    @model_validator(mode="after")
+    def validate_result_root(self) -> ToolResultContainsAssertionSpec:
+        unsupported = sorted(set(self.expected_subset) - {"content", "structured", "is_error"})
+        if unsupported:
+            raise ValueError(
+                "Tool-result subsets support only content, structured, and is_error; got: "
+                + ", ".join(unsupported)
+                + "."
+            )
+        if not self.expected_subset:
+            raise ValueError("Tool-result subsets must select at least one public result field.")
         return self
 
 
@@ -1010,6 +1059,8 @@ AssertionSpec: TypeAlias = Annotated[
     | FinalOutputEqualsAssertionSpec
     | FinalOutputContainsAssertionSpec
     | ToolCalledAssertionSpec
+    | ToolArgumentsContainAssertionSpec
+    | ToolResultContainsAssertionSpec
     | ToolsCalledInOrderAssertionSpec
     | MaxToolCallsAssertionSpec
     | MaxModelStepsAssertionSpec
@@ -1027,6 +1078,8 @@ _ASSERTION_SPEC_TYPES = (
     FinalOutputEqualsAssertionSpec,
     FinalOutputContainsAssertionSpec,
     ToolCalledAssertionSpec,
+    ToolArgumentsContainAssertionSpec,
+    ToolResultContainsAssertionSpec,
     ToolsCalledInOrderAssertionSpec,
     MaxToolCallsAssertionSpec,
     MaxModelStepsAssertionSpec,
@@ -1231,15 +1284,15 @@ def _pricing_profile_identity_from_validated_price_book(
 
 
 class EvaluationEvidencePolicySpec(_SchemaV1PortableModel):
-    """Complete v1 omission, redaction, and cardinality behavior."""
+    """Complete v1 redaction, tool retention, and cardinality behavior."""
 
     schema_version: Literal[1] = EVALUATION_EVIDENCE_POLICY_SCHEMA_VERSION
     revision: StrictStr
     event_projection: Literal["runtime_public_alias_free_v1"] = "runtime_public_alias_free_v1"
     include_event_payloads: Literal[False] = False
     include_transcript_text: Literal[False] = False
-    include_tool_arguments: Literal[False] = False
-    include_tool_results: Literal[False] = False
+    include_tool_arguments: StrictBool = True
+    include_tool_results: StrictBool = False
     max_final_output_chars: Literal[65536] = EVIDENCE_MAX_FINAL_OUTPUT_CHARS
     max_child_sessions: Literal[500] = EVIDENCE_MAX_CHILD_SESSIONS
     max_tool_calls: Literal[4096] = EVIDENCE_MAX_TOOL_CALLS
@@ -1249,14 +1302,19 @@ class EvaluationEvidencePolicySpec(_SchemaV1PortableModel):
     @field_validator(
         "include_event_payloads",
         "include_transcript_text",
-        "include_tool_arguments",
-        "include_tool_results",
         mode="before",
     )
     @classmethod
     def validate_omission_flag_types(cls, value: object, info) -> object:
         if type(value) is not bool:
             raise ValueError(f"{info.field_name} must be false.")
+        return value
+
+    @field_validator("include_tool_arguments", "include_tool_results", mode="before")
+    @classmethod
+    def validate_tool_evidence_flag_types(cls, value: object, info) -> object:
+        if type(value) is not bool:
+            raise ValueError(f"{info.field_name} must be a boolean.")
         return value
 
     @field_validator("revision")
@@ -1272,14 +1330,23 @@ class EvaluationEvidencePolicySpec(_SchemaV1PortableModel):
         return self
 
     @classmethod
-    def standard(cls) -> EvaluationEvidencePolicySpec:
+    def create(
+        cls,
+        *,
+        include_tool_arguments: bool = True,
+        include_tool_results: bool = False,
+    ) -> EvaluationEvidencePolicySpec:
+        if type(include_tool_arguments) is not bool:
+            raise TypeError("include_tool_arguments must be a bool.")
+        if type(include_tool_results) is not bool:
+            raise TypeError("include_tool_results must be a bool.")
         document = {
             "schema_version": EVALUATION_EVIDENCE_POLICY_SCHEMA_VERSION,
             "event_projection": "runtime_public_alias_free_v1",
             "include_event_payloads": False,
             "include_transcript_text": False,
-            "include_tool_arguments": False,
-            "include_tool_results": False,
+            "include_tool_arguments": include_tool_arguments,
+            "include_tool_results": include_tool_results,
             "max_final_output_chars": EVIDENCE_MAX_FINAL_OUTPUT_CHARS,
             "max_child_sessions": EVIDENCE_MAX_CHILD_SESSIONS,
             "max_tool_calls": EVIDENCE_MAX_TOOL_CALLS,
@@ -1292,6 +1359,42 @@ class EvaluationEvidencePolicySpec(_SchemaV1PortableModel):
                 **document,
             }
         )
+
+    @classmethod
+    def standard(cls) -> EvaluationEvidencePolicySpec:
+        """Default policy: existing public arguments, but no result retention."""
+
+        return cls.create()
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def _supported_policies(cls) -> tuple[EvaluationEvidencePolicySpec, ...]:
+        return tuple(
+            cls.create(
+                include_tool_arguments=include_arguments,
+                include_tool_results=include_results,
+            )
+            for include_arguments in (False, True)
+            for include_results in (False, True)
+        )
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def supported_revisions(cls) -> frozenset[str]:
+        """Every fixed policy combination understood by this wire generation."""
+
+        return frozenset(policy.revision for policy in cls._supported_policies())
+
+    @classmethod
+    def policy_for_revision(cls, revision: str) -> EvaluationEvidencePolicySpec:
+        """Resolve one supported revision to the exact retention policy it identifies."""
+
+        if type(revision) is not str:
+            raise TypeError("revision must be a string.")
+        for policy in cls._supported_policies():
+            if policy.revision == revision:
+                return policy
+        raise ValueError("Evaluation evidence policy revision is not supported.")
 
 
 class EvalSuiteSpec(_PortableModel):
@@ -1568,6 +1671,26 @@ class EvalCorpusDocument(_SchemaV2PortableModel):
             for assertion in case.assertions
             if isinstance(assertion, MaxEstimatedCostAssertionSpec)
         }
+        requires_tool_arguments = any(
+            type(assertion) is ToolArgumentsContainAssertionSpec
+            for case in self.cases
+            for assertion in case.assertions
+        )
+        requires_tool_results = any(
+            type(assertion) is ToolResultContainsAssertionSpec
+            for case in self.cases
+            for assertion in case.assertions
+        )
+        if requires_tool_arguments and not self.evidence_policy.include_tool_arguments:
+            raise ValueError(
+                "Tool-argument assertions require a target evidence policy that publishes "
+                "tool arguments."
+            )
+        if requires_tool_results and not self.evidence_policy.include_tool_results:
+            raise ValueError(
+                "Tool-result assertions require a target evidence policy that explicitly "
+                "retains public-safe tool results."
+            )
         if cost_currencies and self.pricing_profile is None:
             raise ValueError("Cost assertions require a pricing profile identity.")
         if self.pricing_profile is not None:

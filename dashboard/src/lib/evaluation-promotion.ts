@@ -19,6 +19,8 @@ export const PROMOTION_ASSERTION_KINDS = [
   "final_output_equals",
   "final_output_contains",
   "tool_called",
+  "tool_arguments_contain",
+  "tool_result_contains",
   "tools_called_in_order",
   "max_tool_calls",
   "max_model_steps",
@@ -38,6 +40,8 @@ export const PROMOTION_ASSERTION_LABELS: Record<PromotionAssertionKind, string> 
   final_output_equals: "Final output equals",
   final_output_contains: "Final output contains",
   tool_called: "Tool called",
+  tool_arguments_contain: "Tool arguments contain JSON",
+  tool_result_contains: "Tool result contains JSON",
   tools_called_in_order: "Tools called in order",
   max_tool_calls: "Maximum tool calls",
   max_model_steps: "Maximum model steps",
@@ -258,6 +262,22 @@ function validateAssertion(assertion: PromotionAssertion): void {
       requireBoundedCleanText(assertion.tool_name, "Tool name", 256)
       requireRange(assertion.min_count ?? 1, assertion.max_count, "Tool count", 4_096)
       return
+    case "tool_arguments_contain":
+      requireBoundedCleanText(assertion.tool_name, "Tool name", 256)
+      requireInteger(assertion.occurrence ?? 1, "Tool occurrence", 1, 256)
+      validateToolJsonSubset(assertion.expected_subset, "Expected argument subset")
+      return
+    case "tool_result_contains": {
+      requireBoundedCleanText(assertion.tool_name, "Tool name", 256)
+      requireInteger(assertion.occurrence ?? 1, "Tool occurrence", 1, 256)
+      const subset = validateToolJsonSubset(assertion.expected_subset, "Expected result subset")
+      const keys = Object.keys(subset)
+      if (keys.length === 0) throw new Error("Expected result subset cannot be empty.")
+      if (keys.some((key) => !["content", "structured", "is_error"].includes(key))) {
+        throw new Error("Expected result subset can select only content, structured, and is_error.")
+      }
+      return
+    }
     case "tools_called_in_order":
       if (assertion.tool_names.length > 256) {
         throw new Error("Tool order cannot contain more than 256 names.")
@@ -310,6 +330,16 @@ export function createPromotionAssertion(
       return { id, kind, expected: "expected text" }
     case "tool_called":
       return { id, kind, tool_name: "tool", min_count: 1, max_count: null }
+    case "tool_arguments_contain":
+      return { id, kind, tool_name: "tool", occurrence: 1, expected_subset: { key: "value" } }
+    case "tool_result_contains":
+      return {
+        id,
+        kind,
+        tool_name: "tool",
+        occurrence: 1,
+        expected_subset: { structured: { status: "ok" } },
+      }
     case "tools_called_in_order":
       return { id, kind, tool_names: ["tool"] }
     case "max_tool_calls":
@@ -352,6 +382,28 @@ export function createCapturedEvaluationAssertion(
       if (toolName === undefined) return assertion
       const count = evidence.started_tool_names.filter((name) => name === toolName).length
       return { ...assertion, tool_name: toolName, min_count: count, max_count: count }
+    }
+    case "tool_arguments_contain": {
+      const call = evidence.tool_calls.find((item) => item.arguments.state === "available")
+      return call?.arguments.value == null
+        ? assertion
+        : {
+            ...assertion,
+            tool_name: call.tool_name,
+            occurrence: call.occurrence,
+            expected_subset: structuredClone(call.arguments.value),
+          }
+    }
+    case "tool_result_contains": {
+      const call = evidence.tool_calls.find((item) => item.result.state === "available")
+      return call?.result.value == null
+        ? assertion
+        : {
+            ...assertion,
+            tool_name: call.tool_name,
+            occurrence: call.occurrence,
+            expected_subset: structuredClone(call.result.value),
+          }
     }
     case "tools_called_in_order":
       return { ...assertion, tool_names: [...evidence.requested_tool_names] }
@@ -430,6 +482,45 @@ function requireInteger(value: number, label: string, minimum: number, maximum: 
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
     throw new Error(`${label} must be a whole number from ${minimum} to ${maximum}.`)
   }
+}
+
+function validateToolJsonSubset(value: unknown, label: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`${label} must be a JSON object.`)
+  }
+  const pending: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }]
+  let nodes = 0
+  while (pending.length > 0) {
+    const current = pending.pop()
+    if (current === undefined) break
+    nodes += 1
+    if (nodes > 128) throw new Error(`${label} cannot contain more than 128 JSON values.`)
+    if (current.depth >= 12 && typeof current.value === "object" && current.value !== null) {
+      throw new Error(`${label} cannot exceed 12 nested JSON containers.`)
+    }
+    if (typeof current.value === "string") {
+      durableTextLength(current.value, label)
+    } else if (typeof current.value === "number") {
+      if (!Number.isFinite(current.value)) throw new Error(`${label} requires finite numbers.`)
+      if (Number.isInteger(current.value) && !Number.isSafeInteger(current.value)) {
+        throw new Error(`${label} integers must be exactly representable in the browser.`)
+      }
+    } else if (Array.isArray(current.value)) {
+      for (const item of current.value) pending.push({ value: item, depth: current.depth + 1 })
+    } else if (typeof current.value === "object" && current.value !== null) {
+      for (const [key, item] of Object.entries(current.value)) {
+        durableTextLength(key, label)
+        pending.push({ value: item, depth: current.depth + 1 })
+      }
+    } else if (current.value !== null && typeof current.value !== "boolean") {
+      throw new Error(`${label} contains a non-JSON value.`)
+    }
+  }
+  const encoded = JSON.stringify(value)
+  if (new TextEncoder().encode(encoded).byteLength > 4_096) {
+    throw new Error(`${label} cannot exceed 4,096 encoded JSON bytes.`)
+  }
+  return value as Record<string, unknown>
 }
 
 function requireTerminalStatus(value: string): void {

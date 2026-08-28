@@ -45,7 +45,9 @@ from cayu.evals.corpus import (
     ModelJudgeAssertionSpec,
     RootStatusAssertionSpec,
     RunInputSpec,
+    ToolArgumentsContainAssertionSpec,
     ToolCalledAssertionSpec,
+    ToolResultContainsAssertionSpec,
     TrialRequestSpec,
     _content_revision,
     pricing_profile_identity,
@@ -79,6 +81,7 @@ from cayu.evals.execution_reporting import (
     write_corpus_execution_result,
 )
 from cayu.evals.result_contract import EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES
+from cayu.evals.result_presentation import present_eval_result
 from cayu.evals.runner import EvalPlan, run_eval_plan
 from cayu.memory import AutomaticRecallPolicy
 from cayu.memory_evidence import ContextExposureState
@@ -336,6 +339,111 @@ class _NamedRecordingTool(Tool):
         return ToolResult(content="ok")
 
 
+class _SearchEvidenceTool(Tool):
+    def __init__(self, *, count: int, oversized: bool = False) -> None:
+        super().__init__(
+            ToolSpec(
+                name="search",
+                description="Return deterministic public search facts.",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "limit": {"type": "integer"},
+                    },
+                    "required": ["query"],
+                },
+            )
+        )
+        self.count = count
+        self.oversized = oversized
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        del ctx, args
+        return ToolResult(
+            content="Search completed.",
+            structured={
+                "status": "ok",
+                "count": self.count,
+                **({"payload": "x" * 5000} if self.oversized else {}),
+            },
+        )
+
+
+def _tool_json_target(
+    *,
+    query: str,
+    limit: int,
+    count: int,
+    application_release_id: str,
+    oversized_result: bool = False,
+    target_key: str = "refund-agent",
+) -> CorpusTarget:
+    provider = ScriptedModelProvider(
+        [
+            (
+                ModelStreamEvent.tool_call(
+                    id="search-call",
+                    name="search",
+                    arguments={"query": query, "limit": limit},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ),
+            (
+                ModelStreamEvent.text_delta("Approved"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ),
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="agent", model="fixture-model"),
+        tools=[_SearchEvidenceTool(count=count, oversized=oversized_result)],
+    )
+    return CorpusTarget(
+        key=target_key,
+        app=app,
+        request_base=RunRequest(agent_name="agent", messages=[], max_steps=2),
+        application_release_id=application_release_id,
+        evidence_policy=EvaluationEvidencePolicySpec.create(include_tool_results=True),
+        limits=CorpusExecutionLimits(),
+    )
+
+
+def _tool_json_corpus(*, target_key: str = "refund-agent") -> EvalCorpusDocument:
+    suite = EvalSuiteSpec.create(
+        id="tool-contract",
+        name="Tool contract",
+        trial_request=TrialRequestSpec(trials=1, timeout_seconds=30),
+    )
+    case = EvalCaseSpec.create(
+        id="search-case",
+        suite_id=suite.id,
+        name="Search",
+        source=_source(),
+        input=RunInputSpec(messages=(CorpusUserMessageSpec(text="Search Cayu."),)),
+        assertions=(
+            ToolArgumentsContainAssertionSpec(
+                id="search-arguments",
+                tool_name="search",
+                expected_subset={"query": "cayu"},
+            ),
+            ToolResultContainsAssertionSpec(
+                id="search-result",
+                tool_name="search",
+                expected_subset={"structured": {"status": "ok"}},
+            ),
+        ),
+    )
+    return EvalCorpusDocument.create(
+        target_key=target_key,
+        evidence_policy=EvaluationEvidencePolicySpec.create(include_tool_results=True),
+        suites=(suite,),
+        cases=(case,),
+    )
+
+
 class _AskModeReorderProvider(ModelProvider):
     name = "ask-mode-reorder"
 
@@ -421,7 +529,7 @@ def test_run_corpus_suite_retains_every_trial_and_fresh_target_identity():
 
     assert result.target == evaluation_target_identity(target)
     assert result.schema_version == 3
-    assert result.run.schema_version == 5
+    assert result.run.schema_version == 6
     assert result.target.application_release_id == "release-2026-08-06"
     assert result.target.app_manifest_fingerprint == target.app.describe().fingerprint
     assert result.run.corpus_revision == corpus.revision
@@ -1428,6 +1536,94 @@ def test_contract_aware_comparison_reports_typed_regressions_across_releases():
         CorpusRegressionKind.STATUS,
         CorpusRegressionKind.STATUS,
     ]
+
+
+def test_tool_json_comparison_distinguishes_observed_values_from_evidence_state():
+    corpus = _tool_json_corpus()
+    baseline = asyncio.run(
+        run_corpus_suite(
+            _tool_json_target(
+                query="cayu",
+                limit=5,
+                count=2,
+                application_release_id="release-tool-baseline",
+            ),
+            corpus,
+            "tool-contract",
+        )
+    )
+    current = asyncio.run(
+        run_corpus_suite(
+            _tool_json_target(
+                query="cayu",
+                limit=10,
+                count=3,
+                application_release_id="release-tool-current",
+            ),
+            corpus,
+            "tool-contract",
+        )
+    )
+
+    comparison = compare_corpus_execution_results(baseline, current)
+    presentation = present_eval_result(baseline)
+
+    assert comparison.schema_version == 3
+    assert [
+        assertion.tool_json.actual
+        for assertion in presentation.cases[0].trials[0].assertions
+        if assertion.tool_json is not None
+    ] == [
+        {"query": "cayu", "limit": 5},
+        {
+            "content": "Search completed.",
+            "structured": {"status": "ok", "count": 2},
+            "is_error": False,
+        },
+    ]
+    forged_presentation = presentation.model_dump(mode="python", round_trip=True, warnings="none")
+    forged_presentation["cases"][0]["trials"][0]["assertions"][0]["tool_json"]["actual"] = None
+    with pytest.raises(ValidationError, match="Available tool JSON evidence"):
+        type(presentation).model_validate(forged_presentation)
+    assert comparison.tool_json_comparison_state == "compared"
+    assert [item.assertion_id for item in comparison.tool_json_assertions] == [
+        "search-arguments",
+        "search-result",
+    ]
+    assert all(item.observed_value_change == "changed" for item in comparison.tool_json_assertions)
+    assert all(not item.evidence_state_changed for item in comparison.tool_json_assertions)
+    assert all(not item.outcome_changed for item in comparison.tool_json_assertions)
+    assert all(not item.regressed for item in comparison.tool_json_assertions)
+    rendered = render_corpus_execution_comparison_html(comparison)
+    assert "Exact bounded tool-JSON observations were compared." in rendered
+    assert "&quot;count&quot;:2" in rendered
+    assert "&quot;count&quot;:3" in rendered
+
+    forged = comparison.model_dump(mode="python", round_trip=True, warnings="none")
+    forged["tool_json_assertions"][0]["observed_value_change"] = "unchanged"
+    with pytest.raises(ValidationError, match="observed_value_change contradicts"):
+        type(comparison).model_validate(forged)
+
+    unavailable = asyncio.run(
+        run_corpus_suite(
+            _tool_json_target(
+                query="cayu",
+                limit=5,
+                count=2,
+                application_release_id="release-tool-unavailable",
+                oversized_result=True,
+            ),
+            corpus,
+            "tool-contract",
+        )
+    )
+    evidence_change = compare_corpus_execution_results(baseline, unavailable)
+    result_assertion = evidence_change.tool_json_assertions[1]
+    assert result_assertion.baseline.observation_state == "available"
+    assert result_assertion.current.observation_state == "truncated"
+    assert result_assertion.evidence_state_changed is True
+    assert result_assertion.observed_value_change == "unavailable"
+    assert result_assertion.regressed is True
 
 
 def test_contract_aware_comparison_never_diffs_incomparable_results():

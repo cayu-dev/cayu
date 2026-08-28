@@ -11,6 +11,8 @@ from cayu.evals.corpus import (
     RootStatusAssertionSpec,
     RunInputSpec,
     StructuredRubricCriterionV1,
+    ToolArgumentsContainAssertionSpec,
+    ToolResultContainsAssertionSpec,
     TrialRequestSpec,
 )
 from cayu.evals.suite_authoring import (
@@ -85,6 +87,43 @@ def test_suite_draft_compiles_to_canonical_immutable_revisions() -> None:
 
     restored = eval_suite_document_from_json(eval_suite_document_to_json(first))
     assert restored == first
+
+
+def test_tool_json_assertions_survive_authoring_round_trip_duplicate_and_revision() -> None:
+    tool_case = EvalCaseDraftV1(
+        id="tool-contract",
+        name="Tool contract",
+        stimulus=EvalSimpleInputStimulusV1(
+            input=RunInputSpec(messages=(CorpusUserMessageSpec(text="Search Cayu."),))
+        ),
+        assertions=(
+            ToolArgumentsContainAssertionSpec(
+                id="arguments",
+                tool_name="search",
+                occurrence=2,
+                expected_subset={"query": "cayu", "filters": {"team": "runtime"}},
+            ),
+            ToolResultContainsAssertionSpec(
+                id="result",
+                tool_name="search",
+                occurrence=2,
+                expected_subset={"structured": {"status": "ok"}},
+            ),
+        ),
+    )
+    document = compile_eval_suite_draft(_draft(tool_case))
+    restored = eval_suite_document_from_json(eval_suite_document_to_json(document))
+    duplicated = duplicate_eval_case(
+        restored,
+        "tool-contract",
+        new_case_id="tool-contract-copy",
+        new_name="Tool contract copy",
+    )
+
+    assert restored == document
+    assert duplicated.cases[0].assertions == document.cases[0].assertions
+    assert duplicated.cases[1].assertions == document.cases[0].assertions
+    assert duplicated.cases[1].revision != document.cases[0].revision
 
 
 def test_v2_structured_judge_draft_compiles_server_owned_nested_revisions_and_round_trips() -> None:

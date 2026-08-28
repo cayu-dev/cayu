@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from decimal import Decimal
+from typing import cast
 
 from cayu.evals.corpus import (
     AssertionSpec,
@@ -15,7 +16,9 @@ from cayu.evals.corpus import (
     ModelJudgeAssertionSpec,
     RootStatusAssertionSpec,
     StructuredModelJudgeAssertionSpec,
+    ToolArgumentsContainAssertionSpec,
     ToolCalledAssertionSpec,
+    ToolResultContainsAssertionSpec,
     ToolsCalledInOrderAssertionSpec,
     UsageRecordedAssertionSpec,
     _validated_assertion_spec,
@@ -25,8 +28,11 @@ from cayu.evals.evidence import (
     AssertionCostEvidenceV1,
     AssertionEvidenceView,
     EvidenceState,
+    ToolCallEvidenceState,
+    ToolCallEvidenceV1,
     _canonical_decimal,
 )
+from cayu.evals.json_subset import JsonSubsetOutcome, compare_json_subset
 from cayu.evals.models import EvalAssertionResult, EvalOutcome
 
 
@@ -46,7 +52,11 @@ def _result(
     )
 
 
-def _unavailable(name: str, evidence_area: str, state: EvidenceState) -> EvalAssertionResult:
+def _unavailable(
+    name: str,
+    evidence_area: str,
+    state: EvidenceState | ToolCallEvidenceState,
+) -> EvalAssertionResult:
     message = (
         "Usage evidence is unavailable because no usage summary was recorded."
         if evidence_area == "usage" and state == "unavailable"
@@ -161,6 +171,95 @@ def _evaluate_tool_called(
             "count": count,
             "minimum": minimum,
             "maximum": maximum,
+        },
+    )
+
+
+def _evaluate_tool_json_subset(
+    *,
+    name: str,
+    tool_name: str,
+    occurrence: int,
+    expected_subset: dict,
+    tool_calls: Sequence[ToolCallEvidenceV1],
+    state: ToolCallEvidenceState,
+    area: str,
+) -> EvalAssertionResult:
+    call = next(
+        (
+            item
+            for item in tool_calls
+            if item.tool_name == tool_name and item.occurrence == occurrence
+        ),
+        None,
+    )
+    if call is None:
+        if state != "complete":
+            result = _unavailable(name, "tool call", state)
+            return result.model_copy(
+                update={
+                    "metadata": {
+                        **result.metadata,
+                        "tool_name": tool_name,
+                        "occurrence": occurrence,
+                        "observation_state": state,
+                    }
+                }
+            )
+        return _result(
+            name,
+            EvalOutcome.FAILED,
+            f"Tool {tool_name} occurrence {occurrence} did not start.",
+            metadata={
+                "tool_name": tool_name,
+                "occurrence": occurrence,
+                "observation_state": "absent",
+                "matched": False,
+            },
+        )
+    value_evidence = call.arguments if area == "arguments" else call.result
+    base_metadata = {
+        "tool_name": tool_name,
+        "occurrence": occurrence,
+        "invocation_index": call.invocation_index,
+        "invocation_revision": call.invocation_revision,
+        "observation_state": value_evidence.state,
+    }
+    if value_evidence.state != "available" or value_evidence.value is None:
+        return EvalAssertionResult(
+            name=name,
+            outcome=EvalOutcome.UNAVAILABLE,
+            message=f"Tool {area} evidence is {value_evidence.state.replace('_', ' ')}.",
+            metadata={
+                "evidence_area": f"tool {area}",
+                "evidence_state": value_evidence.state,
+                **base_metadata,
+            },
+        )
+    comparison = compare_json_subset(expected_subset, value_evidence.value)
+    if comparison is JsonSubsetOutcome.REDACTED:
+        return EvalAssertionResult(
+            name=name,
+            outcome=EvalOutcome.UNAVAILABLE,
+            message=f"Tool {area} evidence is redacted on an expected path.",
+            metadata={
+                **base_metadata,
+                "observation_state": "redacted",
+            },
+        )
+    matched = comparison is JsonSubsetOutcome.MATCHED
+    return _result(
+        name,
+        EvalOutcome.PASSED if matched else EvalOutcome.FAILED,
+        (
+            f"Tool {tool_name} occurrence {occurrence} {area} contained the expected JSON."
+            if matched
+            else f"Tool {tool_name} occurrence {occurrence} {area} did not contain the expected JSON."
+        ),
+        metadata={
+            **base_metadata,
+            "actual": value_evidence.value,
+            "matched": matched,
         },
     )
 
@@ -327,6 +426,27 @@ def _evaluate_validated_assertion_outcome(
             state=evidence.tool_evidence_state,
             minimum=validated_spec.min_count,
             maximum=validated_spec.max_count,
+        )
+    if type(validated_spec) in {
+        ToolArgumentsContainAssertionSpec,
+        ToolResultContainsAssertionSpec,
+    }:
+        tool_json_spec = cast(
+            "ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec",
+            validated_spec,
+        )
+        return _evaluate_tool_json_subset(
+            name=tool_json_spec.id,
+            tool_name=tool_json_spec.tool_name,
+            occurrence=tool_json_spec.occurrence,
+            expected_subset=tool_json_spec.expected_subset,
+            tool_calls=evidence.tool_calls,
+            state=evidence.tool_call_evidence_state,
+            area=(
+                "arguments"
+                if type(tool_json_spec) is ToolArgumentsContainAssertionSpec
+                else "result"
+            ),
         )
     if type(validated_spec) is ToolsCalledInOrderAssertionSpec:
         return _evaluate_tools_in_order(

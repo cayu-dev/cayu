@@ -388,6 +388,11 @@ def _compare(args: argparse.Namespace) -> int:
             "source_detail_unavailable",
         }:
             return 2
+        if comparison.tool_json_comparison_state in {
+            "observation_identity_mismatch",
+            "source_detail_unavailable",
+        }:
+            return 2
         if _status_exit_code(comparison.baseline.status) == 2:
             return 2
         current_exit = _status_exit_code(comparison.current.status)
@@ -405,6 +410,7 @@ def _compare(args: argparse.Namespace) -> int:
             current_exit == 1
             or comparison.regressions
             or any(item.regressed for item in comparison.structured_judgments)
+            or any(item.regressed for item in comparison.tool_json_assertions)
         ):
             return 1
         return 0

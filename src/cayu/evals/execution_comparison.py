@@ -32,7 +32,15 @@ from cayu.evals.corpus import (
 )
 from cayu.evals.evidence import _canonical_decimal
 from cayu.evals.execution import CorpusExecutionResult
-from cayu.evals.published import PublishedModelJudgeDiagnostic, PublishedOutcome, PublishedStatus
+from cayu.evals.json_subset import equal_json_values
+from cayu.evals.published import (
+    PublishedAssertionResult,
+    PublishedModelJudgeDiagnostic,
+    PublishedOutcome,
+    PublishedStatus,
+    PublishedToolArgumentsContainDetail,
+    PublishedToolResultContainsDetail,
+)
 from cayu.evals.result_contract import EvalTrialDiagnosticCode
 from cayu.evals.result_presentation import (
     EvalAssertionPresentationV1,
@@ -110,6 +118,14 @@ EvalStructuredJudgeAggregateChange = Literal[
     "unavailable",
 ]
 EvalStructuredJudgeEvaluatorChange = Literal["improved", "regressed", "unchanged"]
+EvalToolJsonComparisonState = Literal[
+    "compared",
+    "contract_incompatible",
+    "no_tool_json_assertions",
+    "observation_identity_mismatch",
+    "source_detail_unavailable",
+]
+EvalToolJsonObservedValueChange = Literal["changed", "unchanged", "unavailable"]
 
 
 def _canonical_signed_decimal(value: Decimal) -> str:
@@ -286,6 +302,136 @@ class EvalStructuredJudgeObservationMismatchV1(_PortableModel):
     @classmethod
     def validate_ids(cls, value: str, info) -> str:
         return _portable_id(value, info.field_name)
+
+
+class EvalToolJsonAssertionComparisonV1(_PortableModel):
+    """Exact comparison of one safe retained tool-JSON observation."""
+
+    case_id: StrictStr
+    trial_number: StrictInt | None = Field(default=None, ge=1, le=EVAL_CORPUS_MAX_TRIALS)
+    assertion_id: StrictStr
+    baseline_outcome: PublishedOutcome
+    current_outcome: PublishedOutcome
+    baseline: PublishedToolArgumentsContainDetail | PublishedToolResultContainsDetail
+    current: PublishedToolArgumentsContainDetail | PublishedToolResultContainsDetail
+    evidence_state_changed: StrictBool
+    observed_value_change: EvalToolJsonObservedValueChange
+    outcome_changed: StrictBool
+    regressed: StrictBool
+
+    @field_validator("case_id", "assertion_id")
+    @classmethod
+    def validate_ids(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("baseline", "current", mode="before")
+    @classmethod
+    def copy_detail(cls, value: object) -> object:
+        if type(value) in {
+            PublishedToolArgumentsContainDetail,
+            PublishedToolResultContainsDetail,
+        }:
+            detail = cast(
+                "PublishedToolArgumentsContainDetail | PublishedToolResultContainsDetail",
+                value,
+            )
+            return detail.model_dump(mode="python", round_trip=True, warnings="none")
+        if isinstance(value, BaseModel):
+            raise TypeError(
+                "Tool JSON details must be exact published tool-JSON detail values or JSON objects."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_comparison(self) -> EvalToolJsonAssertionComparisonV1:
+        baseline_contract = (
+            self.baseline.kind,
+            self.baseline.tool_name,
+            self.baseline.occurrence,
+            self.baseline.expected_subset,
+        )
+        current_contract = (
+            self.current.kind,
+            self.current.tool_name,
+            self.current.occurrence,
+            self.current.expected_subset,
+        )
+        if baseline_contract != current_contract:
+            raise ValueError("Compared tool JSON observations must share one assertion contract.")
+        baseline_expected_outcome = _tool_json_outcome(self.baseline)
+        current_expected_outcome = _tool_json_outcome(self.current)
+        if (
+            baseline_expected_outcome is not None
+            and self.baseline_outcome != baseline_expected_outcome
+        ) or (
+            current_expected_outcome is not None
+            and self.current_outcome != current_expected_outcome
+        ):
+            raise ValueError("Compared outcomes contradict their retained tool JSON evidence.")
+        if (
+            baseline_expected_outcome is None
+            and self.baseline_outcome not in {"unavailable", "error"}
+        ) or (
+            current_expected_outcome is None
+            and self.current_outcome not in {"unavailable", "error"}
+        ):
+            raise ValueError("Incomplete tool JSON evidence cannot have a scored outcome.")
+        if self.evidence_state_changed != (
+            self.baseline.observation_state != self.current.observation_state
+        ):
+            raise ValueError("evidence_state_changed contradicts retained observations.")
+        expected_value_change = _tool_json_observed_value_change(
+            self.baseline,
+            self.current,
+        )
+        if self.observed_value_change != expected_value_change:
+            raise ValueError("observed_value_change contradicts retained observations.")
+        if self.outcome_changed != (self.baseline_outcome != self.current_outcome):
+            raise ValueError("outcome_changed contradicts retained outcomes.")
+        if self.regressed != (
+            _STATUS_SEVERITY[self.current_outcome] > _STATUS_SEVERITY[self.baseline_outcome]
+        ):
+            raise ValueError("regressed contradicts retained outcomes.")
+        return self
+
+
+class EvalToolJsonObservationMismatchV1(_PortableModel):
+    """One safe tool-JSON observation present on only one comparison side."""
+
+    case_id: StrictStr
+    trial_number: StrictInt | None = Field(default=None, ge=1, le=EVAL_CORPUS_MAX_TRIALS)
+    assertion_id: StrictStr
+    availability: Literal["baseline_only", "current_only"]
+
+    @field_validator("case_id", "assertion_id")
+    @classmethod
+    def validate_ids(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+
+def _tool_json_outcome(
+    detail: PublishedToolArgumentsContainDetail | PublishedToolResultContainsDetail,
+) -> PublishedOutcome | None:
+    if detail.observation_state in {
+        "unavailable",
+        "unsupported",
+        "malformed",
+        "incompatible",
+        "limit_exceeded",
+        "truncated",
+        "redacted",
+    }:
+        return None
+    return "passed" if detail.matched else "failed"
+
+
+def _tool_json_observed_value_change(
+    baseline: PublishedToolArgumentsContainDetail | PublishedToolResultContainsDetail,
+    current: PublishedToolArgumentsContainDetail | PublishedToolResultContainsDetail,
+) -> EvalToolJsonObservedValueChange:
+    if baseline.actual is None or current.actual is None:
+        return "unavailable"
+    return "unchanged" if equal_json_values(baseline.actual, current.actual) else "changed"
 
 
 def _evaluator_change(
@@ -590,7 +736,7 @@ class CorpusExecutionComparison(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     compatibility: CorpusComparisonCompatibility
     score_tolerance: StrictFloat = Field(default=0.0, ge=0.0, le=1.0)
     baseline: CorpusComparisonResultSummary
@@ -611,17 +757,28 @@ class CorpusExecutionComparison(BaseModel):
         default=(),
         max_length=EVAL_STRUCTURED_JUDGE_COMPARISON_MAX_ITEMS * 2,
     )
+    tool_json_comparison_state: EvalToolJsonComparisonState
+    tool_json_assertions: tuple[EvalToolJsonAssertionComparisonV1, ...] = Field(
+        default=(),
+        max_length=EVAL_STRUCTURED_JUDGE_COMPARISON_MAX_ITEMS,
+    )
+    tool_json_observation_mismatches: tuple[EvalToolJsonObservationMismatchV1, ...] = Field(
+        default=(),
+        max_length=EVAL_STRUCTURED_JUDGE_COMPARISON_MAX_ITEMS * 2,
+    )
 
     @field_validator("schema_version", mode="before")
     @classmethod
     def validate_schema_version_type(cls, value: object) -> object:
         if type(value) is not int:
-            raise ValueError("schema_version must be the integer 2.")
+            raise ValueError("schema_version must be the integer 3.")
         return value
 
     @field_validator(
         "structured_judgments",
         "structured_judge_observation_mismatches",
+        "tool_json_assertions",
+        "tool_json_observation_mismatches",
         mode="before",
     )
     @classmethod
@@ -640,11 +797,17 @@ class CorpusExecutionComparison(BaseModel):
                 or self.regressions
                 or self.structured_judgments
                 or self.structured_judge_observation_mismatches
+                or self.tool_json_assertions
+                or self.tool_json_observation_mismatches
             ):
                 raise ValueError("Incomparable results cannot carry outcome comparisons.")
             if self.structured_judge_comparison_state != "contract_incompatible":
                 raise ValueError(
                     "Incomparable results require the contract_incompatible judge state."
+                )
+            if self.tool_json_comparison_state != "contract_incompatible":
+                raise ValueError(
+                    "Incomparable results require the contract_incompatible tool JSON state."
                 )
             return self._validate_size()
         case_ids = tuple(case.case_id for case in self.cases)
@@ -682,6 +845,32 @@ class CorpusExecutionComparison(BaseModel):
         )
         if len(mismatch_keys) != len(set(mismatch_keys)):
             raise ValueError("Structured judge mismatch identities must be unique.")
+        if self.tool_json_comparison_state == "compared":
+            if not self.tool_json_assertions:
+                raise ValueError("Compared tool JSON assertions require retained observations.")
+        elif self.tool_json_assertions:
+            raise ValueError("Tool JSON observations require the compared presentation state.")
+        if self.tool_json_comparison_state == "observation_identity_mismatch":
+            if not self.tool_json_observation_mismatches:
+                raise ValueError(
+                    "Tool JSON identity mismatch state requires exact unmatched observations."
+                )
+        elif self.tool_json_observation_mismatches:
+            raise ValueError(
+                "Unmatched tool JSON observations require the identity mismatch state."
+            )
+        tool_json_keys = tuple(
+            (item.case_id, item.trial_number, item.assertion_id)
+            for item in self.tool_json_assertions
+        )
+        if len(tool_json_keys) != len(set(tool_json_keys)):
+            raise ValueError("Tool JSON comparison identities must be unique.")
+        tool_json_mismatch_keys = tuple(
+            (item.case_id, item.trial_number, item.assertion_id, item.availability)
+            for item in self.tool_json_observation_mismatches
+        )
+        if len(tool_json_mismatch_keys) != len(set(tool_json_mismatch_keys)):
+            raise ValueError("Tool JSON mismatch identities must be unique.")
         for item in self.structured_judgments:
             expected_change = _aggregate_change(
                 item.baseline,
@@ -739,6 +928,17 @@ class _StructuredObservation:
     case_id: str
     trial_number: int | None
     assertion: EvalAssertionPresentationV1
+
+    @property
+    def key(self) -> tuple[str, int | None, str]:
+        return self.case_id, self.trial_number, self.assertion.assertion_id
+
+
+@dataclass(frozen=True)
+class _ToolJsonObservation:
+    case_id: str
+    trial_number: int | None
+    assertion: PublishedAssertionResult
 
     @property
     def key(self) -> tuple[str, int | None, str]:
@@ -849,6 +1049,129 @@ def _structured_comparison(
                     aggregate_change=aggregate_change,
                 ),
                 criteria=_criterion_comparisons(baseline_judgment, current_judgment),
+            )
+        )
+    return "compared", tuple(comparisons), ()
+
+
+def _tool_json_observations(
+    result: CorpusExecutionResult | CapturedEvaluationResultV1,
+) -> tuple[_ToolJsonObservation, ...]:
+    if type(result) is CorpusExecutionResult:
+        observations = tuple(
+            _ToolJsonObservation(
+                case_id=case.case_id,
+                trial_number=trial.trial_number,
+                assertion=assertion,
+            )
+            for case in result.run.cases
+            for trial in case.trials
+            for assertion in trial.assertions
+            if isinstance(
+                assertion.detail,
+                (PublishedToolArgumentsContainDetail, PublishedToolResultContainsDetail),
+            )
+        )
+    elif type(result) is CapturedEvaluationResultV1:
+        observations = tuple(
+            _ToolJsonObservation(
+                case_id=result.score.case_id,
+                trial_number=None,
+                assertion=assertion,
+            )
+            for assertion in result.score.assertions
+            if isinstance(
+                assertion.detail,
+                (PublishedToolArgumentsContainDetail, PublishedToolResultContainsDetail),
+            )
+        )
+    else:  # pragma: no cover - closed by the public caller's exact-type checks
+        raise TypeError("result must be a fresh or captured evaluation result.")
+    keys = tuple(item.key for item in observations)
+    if len(keys) != len(set(keys)):
+        raise ValueError("Tool JSON observation identities must be unique.")
+    return observations
+
+
+def _tool_json_comparison(
+    baseline: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
+    current: CorpusExecutionResult | CapturedEvaluationResultV1 | EvalResultProjectionV1,
+    *,
+    comparable: bool,
+) -> tuple[
+    EvalToolJsonComparisonState,
+    tuple[EvalToolJsonAssertionComparisonV1, ...],
+    tuple[EvalToolJsonObservationMismatchV1, ...],
+]:
+    if not comparable:
+        return "contract_incompatible", (), ()
+    if type(baseline) is EvalResultProjectionV1 or type(current) is EvalResultProjectionV1:
+        return "source_detail_unavailable", (), ()
+    validated_baseline = cast("CorpusExecutionResult | CapturedEvaluationResultV1", baseline)
+    validated_current = cast("CorpusExecutionResult | CapturedEvaluationResultV1", current)
+    baseline_observations = _tool_json_observations(validated_baseline)
+    current_observations = _tool_json_observations(validated_current)
+    if not baseline_observations and not current_observations:
+        return "no_tool_json_assertions", (), ()
+    baseline_by_key = {item.key: item for item in baseline_observations}
+    current_by_key = {item.key: item for item in current_observations}
+    if baseline_by_key.keys() != current_by_key.keys():
+        mismatches = tuple(
+            EvalToolJsonObservationMismatchV1(
+                case_id=case_id,
+                trial_number=trial_number,
+                assertion_id=assertion_id,
+                availability="baseline_only",
+            )
+            for case_id, trial_number, assertion_id in baseline_by_key
+            if (case_id, trial_number, assertion_id) not in current_by_key
+        ) + tuple(
+            EvalToolJsonObservationMismatchV1(
+                case_id=case_id,
+                trial_number=trial_number,
+                assertion_id=assertion_id,
+                availability="current_only",
+            )
+            for case_id, trial_number, assertion_id in current_by_key
+            if (case_id, trial_number, assertion_id) not in baseline_by_key
+        )
+        return "observation_identity_mismatch", (), mismatches
+    comparisons: list[EvalToolJsonAssertionComparisonV1] = []
+    for baseline_observation in baseline_observations:
+        current_observation = current_by_key[baseline_observation.key]
+        baseline_detail = baseline_observation.assertion.detail
+        current_detail = current_observation.assertion.detail
+        if not isinstance(
+            baseline_detail,
+            (PublishedToolArgumentsContainDetail, PublishedToolResultContainsDetail),
+        ) or not isinstance(
+            current_detail,
+            (PublishedToolArgumentsContainDetail, PublishedToolResultContainsDetail),
+        ):
+            raise AssertionError("Tool JSON observation lost its published detail.")
+        comparisons.append(
+            EvalToolJsonAssertionComparisonV1(
+                case_id=baseline_observation.case_id,
+                trial_number=baseline_observation.trial_number,
+                assertion_id=baseline_observation.assertion.assertion_id,
+                baseline_outcome=baseline_observation.assertion.outcome,
+                current_outcome=current_observation.assertion.outcome,
+                baseline=baseline_detail,
+                current=current_detail,
+                evidence_state_changed=(
+                    baseline_detail.observation_state != current_detail.observation_state
+                ),
+                observed_value_change=_tool_json_observed_value_change(
+                    baseline_detail,
+                    current_detail,
+                ),
+                outcome_changed=(
+                    baseline_observation.assertion.outcome != current_observation.assertion.outcome
+                ),
+                regressed=(
+                    _STATUS_SEVERITY[current_observation.assertion.outcome]
+                    > _STATUS_SEVERITY[baseline_observation.assertion.outcome]
+                ),
             )
         )
     return "compared", tuple(comparisons), ()
@@ -1076,6 +1399,11 @@ def _compare_projected_results(
         comparable=compatibility.comparable,
         score_tolerance=tolerance,
     )
+    tool_json_state, tool_json_assertions, tool_json_mismatches = _tool_json_comparison(
+        baseline,
+        current,
+        comparable=compatibility.comparable,
+    )
     if not compatibility.comparable:
         return CorpusExecutionComparison(
             compatibility=compatibility,
@@ -1085,6 +1413,9 @@ def _compare_projected_results(
             structured_judge_comparison_state=structured_state,
             structured_judgments=structured_judgments,
             structured_judge_observation_mismatches=structured_mismatches,
+            tool_json_comparison_state=tool_json_state,
+            tool_json_assertions=tool_json_assertions,
+            tool_json_observation_mismatches=tool_json_mismatches,
         )
     cases = tuple(
         CorpusCaseComparison(
@@ -1118,6 +1449,9 @@ def _compare_projected_results(
         structured_judge_comparison_state=structured_state,
         structured_judgments=structured_judgments,
         structured_judge_observation_mismatches=structured_mismatches,
+        tool_json_comparison_state=tool_json_state,
+        tool_json_assertions=tool_json_assertions,
+        tool_json_observation_mismatches=tool_json_mismatches,
     )
 
 

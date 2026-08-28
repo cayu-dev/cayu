@@ -86,6 +86,8 @@ from cayu.evals.corpus import (
     EvalSuiteSpec,
     PrivateJudgeReferenceV1,
     StructuredModelJudgeAssertionSpec,
+    ToolArgumentsContainAssertionSpec,
+    ToolResultContainsAssertionSpec,
     _canonical_decimal_text,
     eval_corpus_to_json,
 )
@@ -6359,6 +6361,43 @@ def create_router(
             if registration is None:
                 raise HTTPException(status_code=404, detail="Authored eval suite not found.")
             execution_target = registration.execution_target()
+            for case in selected_cases:
+                if (
+                    any(
+                        type(assertion) is ToolResultContainsAssertionSpec
+                        for assertion in case.assertions
+                    )
+                    and not execution_target.evidence_policy.include_tool_results
+                ):
+                    diagnostics.append(
+                        EvalAuthoredSuiteLaunchDiagnostic(
+                            code="tool_result_evidence_unavailable",
+                            case_id=case.id,
+                            message=(
+                                "This case requires retained public-safe tool results, but the "
+                                "selected target does not publish result evidence. Choose a target "
+                                "profile with result retention or remove the result assertion."
+                            ),
+                        )
+                    )
+                if (
+                    any(
+                        type(assertion) is ToolArgumentsContainAssertionSpec
+                        for assertion in case.assertions
+                    )
+                    and not execution_target.evidence_policy.include_tool_arguments
+                ):
+                    diagnostics.append(
+                        EvalAuthoredSuiteLaunchDiagnostic(
+                            code="tool_argument_evidence_unavailable",
+                            case_id=case.id,
+                            message=(
+                                "This case requires public tool arguments, but the selected target "
+                                "does not publish argument evidence. Choose a compatible target "
+                                "profile or remove the argument assertion."
+                            ),
+                        )
+                    )
             if simple_cases and not diagnostics:
                 try:
                     simple_selection = eval_suite_selection(

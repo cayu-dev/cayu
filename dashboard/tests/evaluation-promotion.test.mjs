@@ -68,9 +68,23 @@ function capturedCandidate() {
     final_output_state: "complete",
     final_output: "Observed answer",
     tool_evidence_state: "complete",
+    tool_call_evidence_state: "complete",
     requested_tool_names: ["search", "read"],
     started_tool_names: ["search"],
     tool_calls_started: 2,
+    tool_calls: [
+      {
+        invocation_index: 1,
+        invocation_revision: `sha256:${"5".repeat(64)}`,
+        tool_name: "search",
+        occurrence: 1,
+        arguments: { state: "available", value: { query: "refund", limit: 5 } },
+        result: {
+          state: "available",
+          value: { content: "found", structured: { status: "ok" }, is_error: false },
+        },
+      },
+    ],
     model_step_evidence_state: "complete",
     model_steps: 3,
     usage_evidence_state: "complete",
@@ -172,6 +186,58 @@ test("captured drafts omit replay input and quick-add assertions use observed fa
       currency: "USD",
     },
   )
+  assert.deepEqual(
+    assertions.find((item) => item.kind === "tool_arguments_contain"),
+    {
+      id: "tool_arguments_contain",
+      kind: "tool_arguments_contain",
+      tool_name: "search",
+      occurrence: 1,
+      expected_subset: { query: "refund", limit: 5 },
+    },
+  )
+  assert.deepEqual(
+    assertions.find((item) => item.kind === "tool_result_contains"),
+    {
+      id: "tool_result_contains",
+      kind: "tool_result_contains",
+      tool_name: "search",
+      occurrence: 1,
+      expected_subset: { content: "found", structured: { status: "ok" }, is_error: false },
+    },
+  )
+})
+
+test("tool JSON assertion validation is bounded and result fields are closed", () => {
+  const valid = draftFromCandidate()
+  valid.case.assertions = [
+    {
+      id: "arguments",
+      kind: "tool_arguments_contain",
+      tool_name: "search",
+      occurrence: 2,
+      expected_subset: { query: "refund", filters: { status: ["open"] } },
+    },
+    {
+      id: "result",
+      kind: "tool_result_contains",
+      tool_name: "search",
+      expected_subset: { structured: { status: "ok" }, is_error: false },
+    },
+  ]
+  assert.deepEqual(validatePromotionDraft(valid), { ok: true, draft: valid })
+
+  const arrayRoot = structuredClone(valid)
+  arrayRoot.case.assertions[0].expected_subset = []
+  assert.match(validatePromotionDraft(arrayRoot).error, /must be a JSON object/)
+
+  const artifacts = structuredClone(valid)
+  artifacts.case.assertions[1].expected_subset = { artifacts: [] }
+  assert.match(validatePromotionDraft(artifacts).error, /content, structured, and is_error/)
+
+  const oversized = structuredClone(valid)
+  oversized.case.assertions[0].expected_subset = { query: "x".repeat(4_096) }
+  assert.match(validatePromotionDraft(oversized).error, /4,096 encoded JSON bytes/)
 })
 
 test("draft validation rejects nonportable placement, duplicate assertions, and lossy counters", () => {

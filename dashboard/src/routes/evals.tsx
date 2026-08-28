@@ -112,6 +112,7 @@ import type {
   EvalStructuredJudgeComparisonV1,
   EvalStructuredJudgePresentationV1,
   EvalsReadiness,
+  EvalToolJsonAssertionComparisonV1,
 } from "@/lib/generated/server-api"
 
 const PAGE_LIMIT = 25
@@ -2419,6 +2420,8 @@ function ResultInspector({
                             className="mt-3"
                             judgment={presentedAssertion.structured_judge}
                           />
+                        ) : presentedAssertion?.tool_json ? (
+                          <ToolJsonDetails className="mt-3" detail={presentedAssertion.tool_json} />
                         ) : (
                           <details className="mt-2 text-xs">
                             <summary className="cursor-pointer text-primary">
@@ -2587,8 +2590,59 @@ function PresentedAssertions({ assertions }: { assertions: Array<EvalAssertionPr
           {assertion.structured_judge && (
             <StructuredJudgeDetails className="mt-3" judgment={assertion.structured_judge} />
           )}
+          {assertion.tool_json && <ToolJsonDetails className="mt-3" detail={assertion.tool_json} />}
         </div>
       ))}
+    </div>
+  )
+}
+
+function ToolJsonDetails({
+  detail,
+  className,
+}: {
+  detail: NonNullable<EvalAssertionPresentationV1["tool_json"]>
+  className?: string
+}) {
+  return (
+    <div
+      className={`space-y-3 rounded-lg border border-border bg-muted/20 p-3 ${className ?? ""}`}
+      data-testid="eval-tool-json-detail"
+    >
+      <div className="grid gap-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
+        <RunFact label="Tool" value={detail.tool_name} />
+        <RunFact label="Occurrence" value={String(detail.occurrence)} />
+        <RunFact label="Evidence" value={detail.observation_state.replaceAll("_", " ")} />
+        <RunFact
+          label="Match"
+          value={detail.matched == null ? "unavailable" : detail.matched ? "matched" : "mismatch"}
+        />
+        <RunFact
+          label="Invocation"
+          value={
+            detail.invocation_index == null || detail.invocation_revision == null
+              ? "unavailable"
+              : `#${detail.invocation_index} · ${shortEvalIdentity(detail.invocation_revision)}`
+          }
+          title={detail.invocation_revision ?? undefined}
+        />
+      </div>
+      <div className="grid gap-3 md:grid-cols-2">
+        <div>
+          <div className="mb-1 text-xs font-medium text-muted-foreground">Expected subset</div>
+          <PayloadViewer value={detail.expected_subset} maxHeight="max-h-40" />
+        </div>
+        <div>
+          <div className="mb-1 text-xs font-medium text-muted-foreground">Observed safe value</div>
+          {detail.actual == null ? (
+            <StateMessage className="rounded-md border border-border py-4">
+              No safe observed value is available.
+            </StateMessage>
+          ) : (
+            <PayloadViewer value={detail.actual} maxHeight="max-h-40" />
+          )}
+        </div>
+      </div>
     </div>
   )
 }
@@ -2831,7 +2885,10 @@ function ComparisonSummary({ comparison }: { comparison: EvalResultComparison })
   const regressions = resultComparison.regressions ?? []
   const structuredJudgments = resultComparison.structured_judgments ?? []
   const structuredRegressions = structuredJudgments.filter((item) => item.regressed)
-  const regressionCount = regressions.length + structuredRegressions.length
+  const toolJsonAssertions = resultComparison.tool_json_assertions ?? []
+  const toolJsonRegressions = toolJsonAssertions.filter((item) => item.regressed)
+  const regressionCount =
+    regressions.length + structuredRegressions.length + toolJsonRegressions.length
   const reasons = compatibility.reasons ?? []
   return (
     <div className="space-y-4 p-4">
@@ -2908,9 +2965,25 @@ function ComparisonSummary({ comparison }: { comparison: EvalResultComparison })
               ))}
             </ul>
           )}
+          {toolJsonRegressions.length > 0 && (
+            <ul className="mt-2 list-disc space-y-1 pl-5">
+              {toolJsonRegressions.map((item) => (
+                <li
+                  key={[item.case_id, item.trial_number ?? "captured", item.assertion_id].join(":")}
+                >
+                  Case {item.case_id},{" "}
+                  {item.trial_number ? `trial ${item.trial_number}` : "captured evidence"},
+                  assertion {item.assertion_id}: outcome {item.baseline_outcome} →{" "}
+                  {item.current_outcome}; evidence {item.baseline.observation_state} →{" "}
+                  {item.current.observation_state}; observed value {item.observed_value_change}.
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
       <StructuredJudgeComparison comparison={resultComparison} />
+      <ToolJsonComparison comparison={resultComparison} />
       <div className="grid gap-4 rounded-lg border border-border bg-muted/20 p-3 text-xs sm:grid-cols-2">
         <RunFact
           label="Baseline result revision"
@@ -2920,6 +2993,114 @@ function ComparisonSummary({ comparison }: { comparison: EvalResultComparison })
           label="Current result revision"
           value={shortEvalIdentity(compatibility.current_result_revision)}
         />
+      </div>
+    </div>
+  )
+}
+
+function ToolJsonComparison({ comparison }: { comparison: EvalResultComparison["comparison"] }) {
+  const state = comparison.tool_json_comparison_state
+  const stateText = {
+    compared: "Exact bounded tool-JSON observations were compared.",
+    contract_incompatible:
+      "Tool-JSON observations were not diffed because the immutable evaluation contracts differ.",
+    no_tool_json_assertions: "Neither result contains tool-JSON assertions.",
+    observation_identity_mismatch:
+      "Tool-JSON observations were not paired because retained observation identities differ.",
+    source_detail_unavailable:
+      "One compact result projection does not retain tool-JSON observation detail.",
+  }[state]
+  const mismatches = comparison.tool_json_observation_mismatches ?? []
+  const assertions = comparison.tool_json_assertions ?? []
+  return (
+    <div className="space-y-3" data-testid="eval-tool-json-comparison">
+      <div>
+        <div className="font-medium">Tool JSON assertion comparison</div>
+        <div className="mt-1 text-xs text-muted-foreground">
+          {stateText} State: {state.replaceAll("_", " ")}.
+        </div>
+      </div>
+      {mismatches.length > 0 && (
+        <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm">
+          <div className="font-medium">Unmatched retained observations</div>
+          <ul className="mt-2 list-disc space-y-1 pl-5">
+            {mismatches.map((item) => (
+              <li
+                key={[
+                  item.availability,
+                  item.case_id,
+                  item.trial_number ?? "captured",
+                  item.assertion_id,
+                ].join(":")}
+              >
+                {item.case_id} ·{" "}
+                {item.trial_number ? `trial ${item.trial_number}` : "captured evidence"} ·{" "}
+                {item.assertion_id}: {item.availability.replaceAll("_", " ")}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {assertions.map((item) => (
+        <ToolJsonComparisonDetails
+          key={[item.case_id, item.trial_number ?? "captured", item.assertion_id].join(":")}
+          item={item}
+        />
+      ))}
+    </div>
+  )
+}
+
+function ToolJsonComparisonDetails({ item }: { item: EvalToolJsonAssertionComparisonV1 }) {
+  return (
+    <div
+      className={
+        item.regressed
+          ? "rounded-lg border border-destructive/30 bg-destructive/5 p-3"
+          : "rounded-lg border border-border p-3"
+      }
+    >
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <div className="font-medium">
+            {item.case_id} ·{" "}
+            {item.trial_number ? `trial ${item.trial_number}` : "captured evidence"} ·{" "}
+            {item.assertion_id}
+          </div>
+          <div className="mt-1 text-xs text-muted-foreground">
+            {(item.baseline.kind ?? "tool JSON").replaceAll("_", " ")} · {item.baseline.tool_name} ·
+            occurrence {item.baseline.occurrence}
+          </div>
+        </div>
+        <Badge variant={item.regressed ? "destructive" : "outline"}>
+          {item.regressed ? "regressed" : item.observed_value_change}
+        </Badge>
+      </div>
+      <div className="mt-3 grid gap-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
+        <RunFact label="Outcome" value={`${item.baseline_outcome} → ${item.current_outcome}`} />
+        <RunFact
+          label="Evidence"
+          value={`${item.baseline.observation_state} → ${item.current.observation_state}`}
+        />
+        <RunFact label="Observed value" value={item.observed_value_change} />
+        <RunFact
+          label="Evidence state changed"
+          value={item.evidence_state_changed ? "yes" : "no"}
+        />
+      </div>
+      <div className="mt-3 grid gap-3 lg:grid-cols-3">
+        <div>
+          <div className="mb-1 text-xs font-medium text-muted-foreground">Expected subset</div>
+          <PayloadViewer value={item.baseline.expected_subset} maxHeight="max-h-40" />
+        </div>
+        <div>
+          <div className="mb-1 text-xs font-medium text-muted-foreground">Baseline safe value</div>
+          <PayloadViewer value={item.baseline.actual ?? "unavailable"} maxHeight="max-h-40" />
+        </div>
+        <div>
+          <div className="mb-1 text-xs font-medium text-muted-foreground">Current safe value</div>
+          <PayloadViewer value={item.current.actual ?? "unavailable"} maxHeight="max-h-40" />
+        </div>
       </div>
     </div>
   )

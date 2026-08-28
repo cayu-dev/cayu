@@ -4847,8 +4847,8 @@
             "title": "Root Status"
           },
           "schema_version": {
-            "const": 2,
-            "default": 2,
+            "const": 3,
+            "default": 3,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -4858,6 +4858,24 @@
             },
             "maxItems": 4096,
             "title": "Started Tool Names",
+            "type": "array"
+          },
+          "tool_call_evidence_state": {
+            "enum": [
+              "complete",
+              "unavailable",
+              "limit_exceeded",
+              "incompatible"
+            ],
+            "title": "Tool Call Evidence State",
+            "type": "string"
+          },
+          "tool_calls": {
+            "items": {
+              "$ref": "#/components/schemas/ToolCallEvidenceV1"
+            },
+            "maxItems": 256,
+            "title": "Tool Calls",
             "type": "array"
           },
           "tool_calls_started": {
@@ -4916,6 +4934,8 @@
           "requested_tool_names",
           "started_tool_names",
           "tool_evidence_state",
+          "tool_calls",
+          "tool_call_evidence_state",
           "model_step_evidence_state",
           "usage_evidence_state",
           "costs",
@@ -5299,7 +5319,9 @@
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
                   "root_status": "#/components/schemas/RootStatusAssertionSpec",
+                  "tool_arguments_contain": "#/components/schemas/ToolArgumentsContainAssertionSpec",
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
+                  "tool_result_contains": "#/components/schemas/ToolResultContainsAssertionSpec",
                   "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
                   "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
                 },
@@ -5320,6 +5342,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ToolCalledAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolArgumentsContainAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolResultContainsAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
@@ -7618,8 +7646,8 @@
             "type": "array"
           },
           "schema_version": {
-            "const": 2,
-            "default": 2,
+            "const": 3,
+            "default": 3,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -7658,13 +7686,43 @@
             "maxItems": 6400000,
             "title": "Structured Judgments",
             "type": "array"
+          },
+          "tool_json_assertions": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalToolJsonAssertionComparisonV1"
+            },
+            "maxItems": 6400000,
+            "title": "Tool Json Assertions",
+            "type": "array"
+          },
+          "tool_json_comparison_state": {
+            "enum": [
+              "compared",
+              "contract_incompatible",
+              "no_tool_json_assertions",
+              "observation_identity_mismatch",
+              "source_detail_unavailable"
+            ],
+            "title": "Tool Json Comparison State",
+            "type": "string"
+          },
+          "tool_json_observation_mismatches": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalToolJsonObservationMismatchV1"
+            },
+            "maxItems": 12800000,
+            "title": "Tool Json Observation Mismatches",
+            "type": "array"
           }
         },
         "required": [
           "compatibility",
           "baseline",
           "current",
-          "structured_judge_comparison_state"
+          "structured_judge_comparison_state",
+          "tool_json_comparison_state"
         ],
         "title": "CorpusExecutionComparison",
         "type": "object"
@@ -8988,6 +9046,20 @@
                 "type": "null"
               }
             ]
+          },
+          "tool_json": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublishedToolArgumentsContainDetail"
+              },
+              {
+                "$ref": "#/components/schemas/PublishedToolResultContainsDetail"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Json"
           }
         },
         "required": [
@@ -9222,6 +9294,8 @@
               "one_trial_required",
               "execution_profile_unavailable",
               "execution_profile_changed",
+              "tool_argument_evidence_unavailable",
+              "tool_result_evidence_unavailable",
               "simple_launch_not_ready",
               "scenario_execution_unavailable",
               "scenario_launch_not_ready"
@@ -9708,7 +9782,9 @@
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
                   "root_status": "#/components/schemas/RootStatusAssertionSpec",
+                  "tool_arguments_contain": "#/components/schemas/ToolArgumentsContainAssertionSpec",
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
+                  "tool_result_contains": "#/components/schemas/ToolResultContainsAssertionSpec",
                   "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
                   "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
                 },
@@ -9729,6 +9805,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ToolCalledAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolArgumentsContainAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolResultContainsAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
@@ -9838,7 +9920,9 @@
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
                   "root_status": "#/components/schemas/RootStatusAssertionSpec",
                   "structured_model_judge": "#/components/schemas/StructuredModelJudgeAssertionSpec",
+                  "tool_arguments_contain": "#/components/schemas/ToolArgumentsContainAssertionSpec",
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
+                  "tool_result_contains": "#/components/schemas/ToolResultContainsAssertionSpec",
                   "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
                   "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
                 },
@@ -9859,6 +9943,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ToolCalledAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolArgumentsContainAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolResultContainsAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
@@ -9970,7 +10060,9 @@
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
                   "root_status": "#/components/schemas/RootStatusAssertionSpec",
+                  "tool_arguments_contain": "#/components/schemas/ToolArgumentsContainAssertionSpec",
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
+                  "tool_result_contains": "#/components/schemas/ToolResultContainsAssertionSpec",
                   "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
                   "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
                 },
@@ -9991,6 +10083,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ToolCalledAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolArgumentsContainAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolResultContainsAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
@@ -10095,7 +10193,9 @@
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
                   "root_status": "#/components/schemas/RootStatusAssertionSpec",
                   "structured_model_judge": "#/components/schemas/StructuredModelJudgeAssertionDraftV1",
+                  "tool_arguments_contain": "#/components/schemas/ToolArgumentsContainAssertionSpec",
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
+                  "tool_result_contains": "#/components/schemas/ToolResultContainsAssertionSpec",
                   "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
                   "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
                 },
@@ -10116,6 +10216,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ToolCalledAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolArgumentsContainAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolResultContainsAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
@@ -10280,7 +10386,9 @@
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
                   "root_status": "#/components/schemas/RootStatusAssertionSpec",
                   "structured_model_judge": "#/components/schemas/StructuredModelJudgeAssertionSpec",
+                  "tool_arguments_contain": "#/components/schemas/ToolArgumentsContainAssertionSpec",
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
+                  "tool_result_contains": "#/components/schemas/ToolResultContainsAssertionSpec",
                   "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
                   "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
                 },
@@ -10301,6 +10409,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ToolCalledAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolArgumentsContainAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolResultContainsAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
@@ -14822,6 +14936,152 @@
         "title": "EvalTargetCatalogResponse",
         "type": "object"
       },
+      "EvalToolJsonAssertionComparisonV1": {
+        "additionalProperties": false,
+        "description": "Exact comparison of one safe retained tool-JSON observation.",
+        "properties": {
+          "assertion_id": {
+            "title": "Assertion Id",
+            "type": "string"
+          },
+          "baseline": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublishedToolArgumentsContainDetail"
+              },
+              {
+                "$ref": "#/components/schemas/PublishedToolResultContainsDetail"
+              }
+            ],
+            "title": "Baseline"
+          },
+          "baseline_outcome": {
+            "enum": [
+              "passed",
+              "failed",
+              "unavailable",
+              "error"
+            ],
+            "title": "Baseline Outcome",
+            "type": "string"
+          },
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "current": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublishedToolArgumentsContainDetail"
+              },
+              {
+                "$ref": "#/components/schemas/PublishedToolResultContainsDetail"
+              }
+            ],
+            "title": "Current"
+          },
+          "current_outcome": {
+            "enum": [
+              "passed",
+              "failed",
+              "unavailable",
+              "error"
+            ],
+            "title": "Current Outcome",
+            "type": "string"
+          },
+          "evidence_state_changed": {
+            "title": "Evidence State Changed",
+            "type": "boolean"
+          },
+          "observed_value_change": {
+            "enum": [
+              "changed",
+              "unchanged",
+              "unavailable"
+            ],
+            "title": "Observed Value Change",
+            "type": "string"
+          },
+          "outcome_changed": {
+            "title": "Outcome Changed",
+            "type": "boolean"
+          },
+          "regressed": {
+            "title": "Regressed",
+            "type": "boolean"
+          },
+          "trial_number": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trial Number"
+          }
+        },
+        "required": [
+          "case_id",
+          "assertion_id",
+          "baseline_outcome",
+          "current_outcome",
+          "baseline",
+          "current",
+          "evidence_state_changed",
+          "observed_value_change",
+          "outcome_changed",
+          "regressed"
+        ],
+        "title": "EvalToolJsonAssertionComparisonV1",
+        "type": "object"
+      },
+      "EvalToolJsonObservationMismatchV1": {
+        "additionalProperties": false,
+        "description": "One safe tool-JSON observation present on only one comparison side.",
+        "properties": {
+          "assertion_id": {
+            "title": "Assertion Id",
+            "type": "string"
+          },
+          "availability": {
+            "enum": [
+              "baseline_only",
+              "current_only"
+            ],
+            "title": "Availability",
+            "type": "string"
+          },
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "trial_number": {
+            "anyOf": [
+              {
+                "maximum": 100.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trial Number"
+          }
+        },
+        "required": [
+          "case_id",
+          "assertion_id",
+          "availability"
+        ],
+        "title": "EvalToolJsonObservationMismatchV1",
+        "type": "object"
+      },
       "EvalTrialDiagnosticCode": {
         "description": "Stable, non-secret reason for one fresh trial's terminal outcome.",
         "enum": [
@@ -15067,7 +15327,7 @@
       },
       "EvaluationEvidencePolicySpec": {
         "additionalProperties": false,
-        "description": "Complete v1 omission, redaction, and cardinality behavior.",
+        "description": "Complete v1 redaction, tool retention, and cardinality behavior.",
         "properties": {
           "event_projection": {
             "const": "runtime_public_alias_free_v1",
@@ -15082,13 +15342,11 @@
             "type": "boolean"
           },
           "include_tool_arguments": {
-            "const": false,
-            "default": false,
+            "default": true,
             "title": "Include Tool Arguments",
             "type": "boolean"
           },
           "include_tool_results": {
-            "const": false,
             "default": false,
             "title": "Include Tool Results",
             "type": "boolean"
@@ -15163,7 +15421,9 @@
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
                   "root_status": "#/components/schemas/RootStatusAssertionSpec",
+                  "tool_arguments_contain": "#/components/schemas/ToolArgumentsContainAssertionSpec",
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
+                  "tool_result_contains": "#/components/schemas/ToolResultContainsAssertionSpec",
                   "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
                   "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
                 },
@@ -15184,6 +15444,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ToolCalledAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolArgumentsContainAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolResultContainsAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
@@ -21915,7 +22181,9 @@
                   "max_total_tokens": "#/components/schemas/MaxTotalTokensAssertionSpec",
                   "model_judge": "#/components/schemas/ModelJudgeAssertionSpec",
                   "root_status": "#/components/schemas/RootStatusAssertionSpec",
+                  "tool_arguments_contain": "#/components/schemas/ToolArgumentsContainAssertionSpec",
                   "tool_called": "#/components/schemas/ToolCalledAssertionSpec",
+                  "tool_result_contains": "#/components/schemas/ToolResultContainsAssertionSpec",
                   "tools_called_in_order": "#/components/schemas/ToolsCalledInOrderAssertionSpec",
                   "usage_recorded": "#/components/schemas/UsageRecordedAssertionSpec"
                 },
@@ -21936,6 +22204,12 @@
                 },
                 {
                   "$ref": "#/components/schemas/ToolCalledAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolArgumentsContainAssertionSpec"
+                },
+                {
+                  "$ref": "#/components/schemas/ToolResultContainsAssertionSpec"
                 },
                 {
                   "$ref": "#/components/schemas/ToolsCalledInOrderAssertionSpec"
@@ -22408,7 +22682,9 @@
                 "model_judge": "#/components/schemas/PublishedModelJudgeDetail",
                 "root_status": "#/components/schemas/PublishedRootStatusDetail",
                 "structured_model_judge": "#/components/schemas/PublishedStructuredModelJudgeDetail",
+                "tool_arguments_contain": "#/components/schemas/PublishedToolArgumentsContainDetail",
                 "tool_called": "#/components/schemas/PublishedToolCalledDetail",
+                "tool_result_contains": "#/components/schemas/PublishedToolResultContainsDetail",
                 "tools_called_in_order": "#/components/schemas/PublishedToolsCalledInOrderDetail",
                 "usage_recorded": "#/components/schemas/PublishedUsageRecordedDetail"
               },
@@ -22429,6 +22705,12 @@
               },
               {
                 "$ref": "#/components/schemas/PublishedToolCalledDetail"
+              },
+              {
+                "$ref": "#/components/schemas/PublishedToolArgumentsContainDetail"
+              },
+              {
+                "$ref": "#/components/schemas/PublishedToolResultContainsDetail"
               },
               {
                 "$ref": "#/components/schemas/PublishedToolsCalledInOrderDetail"
@@ -22655,7 +22937,7 @@
             "type": "string"
           },
           "schema_version": {
-            "const": 5,
+            "const": 6,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -23428,6 +23710,102 @@
         "title": "PublishedStructuredModelJudgeDetail",
         "type": "object"
       },
+      "PublishedToolArgumentsContainDetail": {
+        "additionalProperties": false,
+        "properties": {
+          "actual": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actual"
+          },
+          "expected_subset": {
+            "additionalProperties": true,
+            "title": "Expected Subset",
+            "type": "object"
+          },
+          "invocation_index": {
+            "anyOf": [
+              {
+                "maximum": 256.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invocation Index"
+          },
+          "invocation_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invocation Revision"
+          },
+          "kind": {
+            "const": "tool_arguments_contain",
+            "default": "tool_arguments_contain",
+            "title": "Kind",
+            "type": "string"
+          },
+          "matched": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Matched"
+          },
+          "observation_state": {
+            "enum": [
+              "available",
+              "absent",
+              "unavailable",
+              "unsupported",
+              "malformed",
+              "incompatible",
+              "limit_exceeded",
+              "truncated",
+              "redacted"
+            ],
+            "title": "Observation State",
+            "type": "string"
+          },
+          "occurrence": {
+            "maximum": 256.0,
+            "minimum": 1.0,
+            "title": "Occurrence",
+            "type": "integer"
+          },
+          "tool_name": {
+            "title": "Tool Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool_name",
+          "occurrence",
+          "expected_subset",
+          "observation_state"
+        ],
+        "title": "PublishedToolArgumentsContainDetail",
+        "type": "object"
+      },
       "PublishedToolCalledDetail": {
         "additionalProperties": false,
         "properties": {
@@ -23479,6 +23857,102 @@
           "min_count"
         ],
         "title": "PublishedToolCalledDetail",
+        "type": "object"
+      },
+      "PublishedToolResultContainsDetail": {
+        "additionalProperties": false,
+        "properties": {
+          "actual": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actual"
+          },
+          "expected_subset": {
+            "additionalProperties": true,
+            "title": "Expected Subset",
+            "type": "object"
+          },
+          "invocation_index": {
+            "anyOf": [
+              {
+                "maximum": 256.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invocation Index"
+          },
+          "invocation_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invocation Revision"
+          },
+          "kind": {
+            "const": "tool_result_contains",
+            "default": "tool_result_contains",
+            "title": "Kind",
+            "type": "string"
+          },
+          "matched": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Matched"
+          },
+          "observation_state": {
+            "enum": [
+              "available",
+              "absent",
+              "unavailable",
+              "unsupported",
+              "malformed",
+              "incompatible",
+              "limit_exceeded",
+              "truncated",
+              "redacted"
+            ],
+            "title": "Observation State",
+            "type": "string"
+          },
+          "occurrence": {
+            "maximum": 256.0,
+            "minimum": 1.0,
+            "title": "Occurrence",
+            "type": "integer"
+          },
+          "tool_name": {
+            "title": "Tool Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool_name",
+          "occurrence",
+          "expected_subset",
+          "observation_state"
+        ],
+        "title": "PublishedToolResultContainsDetail",
         "type": "object"
       },
       "PublishedToolsCalledInOrderDetail": {
@@ -25275,7 +25749,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "34",
+            "default": "35",
             "title": "Contract Version",
             "type": "string"
           },
@@ -27517,6 +27991,98 @@
         "title": "ToolApprovalRecoveryOutcome",
         "type": "string"
       },
+      "ToolArgumentsContainAssertionSpec": {
+        "additionalProperties": false,
+        "description": "Require one started invocation's public arguments to contain bounded JSON.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "expected_subset": {
+            "additionalProperties": true,
+            "title": "Expected Subset",
+            "type": "object"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "tool_arguments_contain",
+            "default": "tool_arguments_contain",
+            "title": "Kind",
+            "type": "string"
+          },
+          "occurrence": {
+            "default": 1,
+            "maximum": 256.0,
+            "minimum": 1.0,
+            "title": "Occurrence",
+            "type": "integer"
+          },
+          "tool_name": {
+            "title": "Tool Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tool_name",
+          "expected_subset"
+        ],
+        "title": "ToolArgumentsContainAssertionSpec",
+        "type": "object"
+      },
+      "ToolCallEvidenceV1": {
+        "additionalProperties": false,
+        "description": "Stable ordered identity plus bounded argument and result observations.",
+        "properties": {
+          "arguments": {
+            "$ref": "#/components/schemas/ToolCallValueEvidenceV1"
+          },
+          "invocation_index": {
+            "maximum": 256.0,
+            "minimum": 1.0,
+            "title": "Invocation Index",
+            "type": "integer"
+          },
+          "invocation_revision": {
+            "title": "Invocation Revision",
+            "type": "string"
+          },
+          "occurrence": {
+            "maximum": 256.0,
+            "minimum": 1.0,
+            "title": "Occurrence",
+            "type": "integer"
+          },
+          "result": {
+            "$ref": "#/components/schemas/ToolCallValueEvidenceV1"
+          },
+          "tool_name": {
+            "title": "Tool Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "invocation_index",
+          "invocation_revision",
+          "tool_name",
+          "occurrence",
+          "arguments",
+          "result"
+        ],
+        "title": "ToolCallEvidenceV1",
+        "type": "object"
+      },
       "ToolCallPart": {
         "additionalProperties": false,
         "properties": {
@@ -27578,6 +28144,41 @@
           "tool_name"
         ],
         "title": "ToolCallPart",
+        "type": "object"
+      },
+      "ToolCallValueEvidenceV1": {
+        "additionalProperties": false,
+        "description": "One bounded public value or an exact reason no comparison is possible.",
+        "properties": {
+          "state": {
+            "enum": [
+              "available",
+              "unavailable",
+              "unsupported",
+              "malformed",
+              "truncated",
+              "incompatible"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "ToolCallValueEvidenceV1",
         "type": "object"
       },
       "ToolCalledAssertionSpec": {
@@ -27885,6 +28486,56 @@
           "implementation_provenance"
         ],
         "title": "ToolManifest",
+        "type": "object"
+      },
+      "ToolResultContainsAssertionSpec": {
+        "additionalProperties": false,
+        "description": "Require one explicitly retained public-safe result to contain bounded JSON.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "expected_subset": {
+            "additionalProperties": true,
+            "title": "Expected Subset",
+            "type": "object"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "tool_result_contains",
+            "default": "tool_result_contains",
+            "title": "Kind",
+            "type": "string"
+          },
+          "occurrence": {
+            "default": 1,
+            "maximum": 256.0,
+            "minimum": 1.0,
+            "title": "Occurrence",
+            "type": "integer"
+          },
+          "tool_name": {
+            "title": "Tool Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tool_name",
+          "expected_subset"
+        ],
+        "title": "ToolResultContainsAssertionSpec",
         "type": "object"
       },
       "ToolResultPart": {
@@ -29589,7 +30240,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "34",
+            "default": "35",
             "title": "Contract Version",
             "type": "string"
           }

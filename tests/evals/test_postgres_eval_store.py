@@ -14,7 +14,13 @@ from tests.evals.eval_store_conformance import (
     assert_scenario_progress_conformance,
     captured_result_for_corpus,
 )
-from tests.evals.test_corpus_execution import _corpus, _provider, _target
+from tests.evals.test_corpus_execution import (
+    _corpus,
+    _provider,
+    _target,
+    _tool_json_corpus,
+    _tool_json_target,
+)
 from tests.evals.test_judge_calibration import _calibration_report
 
 from cayu.evals.execution import run_corpus_suite
@@ -95,6 +101,18 @@ def test_postgres_eval_store_shared_conformance(postgres_dsn) -> None:
             corpus.suites[0].id,
             max_concurrency=1,
         )
+        tool_corpus = _tool_json_corpus(target_key="tool-json-agent")
+        tool_result = await run_corpus_suite(
+            _tool_json_target(
+                query="cayu",
+                limit=5,
+                count=2,
+                application_release_id="release-tool-store",
+                target_key=tool_corpus.target_key,
+            ),
+            tool_corpus,
+            tool_corpus.suites[0].id,
+        )
         store = PostgresEvalStore(
             postgres_dsn,
             min_size=1,
@@ -113,8 +131,29 @@ def test_postgres_eval_store_shared_conformance(postgres_dsn) -> None:
                 store,
                 report=await _calibration_report(),
             )
+            await _save_corpus(store, tool_corpus)
+            tool_request = EvalRunRequest(
+                run_id="tool-json-restart",
+                idempotency_key="sha256:" + "0" * 64,
+                corpus_revision=tool_corpus.revision,
+                target_key=tool_corpus.target_key,
+                suite_id=tool_corpus.suites[0].id,
+                suite_revision=tool_corpus.suites[0].revision,
+                max_concurrency=1,
+            )
+            await _admit_run(store, tool_request)
+            tool_lease = await store.claim_run(target_key=tool_corpus.target_key)
+            assert tool_lease is not None
+            await _publish_result(store, tool_lease.claim, tool_result)
         finally:
             await store.close()
+
+        restarted = PostgresEvalStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
+        try:
+            assert await restarted.load_corpus(tool_corpus.revision) == tool_corpus
+            assert await restarted.load_result("tool-json-restart") == tool_result
+        finally:
+            await restarted.close()
 
     asyncio.run(exercise())
 

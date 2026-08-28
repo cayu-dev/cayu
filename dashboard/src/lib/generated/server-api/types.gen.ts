@@ -2428,11 +2428,19 @@ export type AssertionEvidenceView = {
     /**
      * Schema Version
      */
-    schema_version?: 2;
+    schema_version?: 3;
     /**
      * Started Tool Names
      */
     started_tool_names: Array<string>;
+    /**
+     * Tool Call Evidence State
+     */
+    tool_call_evidence_state: 'complete' | 'unavailable' | 'limit_exceeded' | 'incompatible';
+    /**
+     * Tool Calls
+     */
+    tool_calls: Array<ToolCallEvidenceV1>;
     /**
      * Tool Calls Started
      */
@@ -2656,7 +2664,7 @@ export type CapturedEvaluationCaseDraft = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -3801,7 +3809,7 @@ export type CorpusExecutionComparison = {
     /**
      * Schema Version
      */
-    schema_version?: 2;
+    schema_version?: 3;
     /**
      * Score Tolerance
      */
@@ -3818,6 +3826,18 @@ export type CorpusExecutionComparison = {
      * Structured Judgments
      */
     structured_judgments?: Array<EvalStructuredJudgeComparisonV1>;
+    /**
+     * Tool Json Assertions
+     */
+    tool_json_assertions?: Array<EvalToolJsonAssertionComparisonV1>;
+    /**
+     * Tool Json Comparison State
+     */
+    tool_json_comparison_state: 'compared' | 'contract_incompatible' | 'no_tool_json_assertions' | 'observation_identity_mismatch' | 'source_detail_unavailable';
+    /**
+     * Tool Json Observation Mismatches
+     */
+    tool_json_observation_mismatches?: Array<EvalToolJsonObservationMismatchV1>;
 };
 
 /**
@@ -4511,6 +4531,10 @@ export type EvalAssertionPresentationV1 = {
      */
     score?: number | null;
     structured_judge?: EvalStructuredJudgePresentationV1 | null;
+    /**
+     * Tool Json
+     */
+    tool_json?: PublishedToolArgumentsContainDetail | PublishedToolResultContainsDetail | null;
 };
 
 /**
@@ -4635,7 +4659,7 @@ export type EvalAuthoredSuiteLaunchDiagnostic = {
     /**
      * Code
      */
-    code: 'one_trial_required' | 'execution_profile_unavailable' | 'execution_profile_changed' | 'simple_launch_not_ready' | 'scenario_execution_unavailable' | 'scenario_launch_not_ready';
+    code: 'one_trial_required' | 'execution_profile_unavailable' | 'execution_profile_changed' | 'tool_argument_evidence_unavailable' | 'tool_result_evidence_unavailable' | 'simple_launch_not_ready' | 'scenario_execution_unavailable' | 'scenario_launch_not_ready';
     /**
      * Message
      */
@@ -4895,7 +4919,7 @@ export type EvalCaseDefinitionV1 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -4932,7 +4956,7 @@ export type EvalCaseDefinitionV2 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -4969,7 +4993,7 @@ export type EvalCaseDraftV1 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -5002,7 +5026,7 @@ export type EvalCaseDraftV2 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionDraftV1>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionDraftV1>;
     /**
      * Description
      */
@@ -5067,7 +5091,7 @@ export type EvalCaseSpec = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec | StructuredModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -7449,6 +7473,82 @@ export type EvalTargetCatalogResponse = {
 };
 
 /**
+ * EvalToolJsonAssertionComparisonV1
+ *
+ * Exact comparison of one safe retained tool-JSON observation.
+ */
+export type EvalToolJsonAssertionComparisonV1 = {
+    /**
+     * Assertion Id
+     */
+    assertion_id: string;
+    /**
+     * Baseline
+     */
+    baseline: PublishedToolArgumentsContainDetail | PublishedToolResultContainsDetail;
+    /**
+     * Baseline Outcome
+     */
+    baseline_outcome: 'passed' | 'failed' | 'unavailable' | 'error';
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Current
+     */
+    current: PublishedToolArgumentsContainDetail | PublishedToolResultContainsDetail;
+    /**
+     * Current Outcome
+     */
+    current_outcome: 'passed' | 'failed' | 'unavailable' | 'error';
+    /**
+     * Evidence State Changed
+     */
+    evidence_state_changed: boolean;
+    /**
+     * Observed Value Change
+     */
+    observed_value_change: 'changed' | 'unchanged' | 'unavailable';
+    /**
+     * Outcome Changed
+     */
+    outcome_changed: boolean;
+    /**
+     * Regressed
+     */
+    regressed: boolean;
+    /**
+     * Trial Number
+     */
+    trial_number?: number | null;
+};
+
+/**
+ * EvalToolJsonObservationMismatchV1
+ *
+ * One safe tool-JSON observation present on only one comparison side.
+ */
+export type EvalToolJsonObservationMismatchV1 = {
+    /**
+     * Assertion Id
+     */
+    assertion_id: string;
+    /**
+     * Availability
+     */
+    availability: 'baseline_only' | 'current_only';
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Trial Number
+     */
+    trial_number?: number | null;
+};
+
+/**
  * EvalTrialDiagnosticCode
  *
  * Stable, non-secret reason for one fresh trial's terminal outcome.
@@ -7555,7 +7655,7 @@ export type EvalsReadiness = {
 /**
  * EvaluationEvidencePolicySpec
  *
- * Complete v1 omission, redaction, and cardinality behavior.
+ * Complete v1 redaction, tool retention, and cardinality behavior.
  */
 export type EvaluationEvidencePolicySpec = {
     /**
@@ -7569,11 +7669,11 @@ export type EvaluationEvidencePolicySpec = {
     /**
      * Include Tool Arguments
      */
-    include_tool_arguments?: false;
+    include_tool_arguments?: boolean;
     /**
      * Include Tool Results
      */
-    include_tool_results?: false;
+    include_tool_results?: boolean;
     /**
      * Include Transcript Text
      */
@@ -7617,7 +7717,7 @@ export type EvaluationPromotionCaseDraft = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -11162,7 +11262,7 @@ export type PromotionCaseV1 = {
     /**
      * Assertions
      */
-    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolArgumentsContainAssertionSpec | ToolResultContainsAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec | ModelJudgeAssertionSpec>;
     /**
      * Description
      */
@@ -11447,6 +11547,10 @@ export type PublishedAssertionResult = {
     } & PublishedFinalOutputContainsDetail) | ({
         kind: 'tool_called';
     } & PublishedToolCalledDetail) | ({
+        kind: 'tool_arguments_contain';
+    } & PublishedToolArgumentsContainDetail) | ({
+        kind: 'tool_result_contains';
+    } & PublishedToolResultContainsDetail) | ({
         kind: 'tools_called_in_order';
     } & PublishedToolsCalledInOrderDetail) | ({
         kind: 'max_tool_calls';
@@ -11564,7 +11668,7 @@ export type PublishedEvalRun = {
     /**
      * Schema Version
      */
-    schema_version: 5;
+    schema_version: 6;
     /**
      * Score
      */
@@ -11951,6 +12055,52 @@ export type PublishedStructuredModelJudgeDetail = {
 };
 
 /**
+ * PublishedToolArgumentsContainDetail
+ */
+export type PublishedToolArgumentsContainDetail = {
+    /**
+     * Actual
+     */
+    actual?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * Expected Subset
+     */
+    expected_subset: {
+        [key: string]: unknown;
+    };
+    /**
+     * Invocation Index
+     */
+    invocation_index?: number | null;
+    /**
+     * Invocation Revision
+     */
+    invocation_revision?: string | null;
+    /**
+     * Kind
+     */
+    kind?: 'tool_arguments_contain';
+    /**
+     * Matched
+     */
+    matched?: boolean | null;
+    /**
+     * Observation State
+     */
+    observation_state: 'available' | 'absent' | 'unavailable' | 'unsupported' | 'malformed' | 'incompatible' | 'limit_exceeded' | 'truncated' | 'redacted';
+    /**
+     * Occurrence
+     */
+    occurrence: number;
+    /**
+     * Tool Name
+     */
+    tool_name: string;
+};
+
+/**
  * PublishedToolCalledDetail
  */
 export type PublishedToolCalledDetail = {
@@ -11970,6 +12120,52 @@ export type PublishedToolCalledDetail = {
      * Min Count
      */
     min_count: number;
+    /**
+     * Tool Name
+     */
+    tool_name: string;
+};
+
+/**
+ * PublishedToolResultContainsDetail
+ */
+export type PublishedToolResultContainsDetail = {
+    /**
+     * Actual
+     */
+    actual?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * Expected Subset
+     */
+    expected_subset: {
+        [key: string]: unknown;
+    };
+    /**
+     * Invocation Index
+     */
+    invocation_index?: number | null;
+    /**
+     * Invocation Revision
+     */
+    invocation_revision?: string | null;
+    /**
+     * Kind
+     */
+    kind?: 'tool_result_contains';
+    /**
+     * Matched
+     */
+    matched?: boolean | null;
+    /**
+     * Observation State
+     */
+    observation_state: 'available' | 'absent' | 'unavailable' | 'unsupported' | 'malformed' | 'incompatible' | 'limit_exceeded' | 'truncated' | 'redacted';
+    /**
+     * Occurrence
+     */
+    occurrence: number;
     /**
      * Tool Name
      */
@@ -14176,6 +14372,66 @@ export type ToolApprovalRecoveryBody = {
 export type ToolApprovalRecoveryOutcome = 'completed' | 'failed';
 
 /**
+ * ToolArgumentsContainAssertionSpec
+ *
+ * Require one started invocation's public arguments to contain bounded JSON.
+ */
+export type ToolArgumentsContainAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Expected Subset
+     */
+    expected_subset: {
+        [key: string]: unknown;
+    };
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'tool_arguments_contain';
+    /**
+     * Occurrence
+     */
+    occurrence?: number;
+    /**
+     * Tool Name
+     */
+    tool_name: string;
+};
+
+/**
+ * ToolCallEvidenceV1
+ *
+ * Stable ordered identity plus bounded argument and result observations.
+ */
+export type ToolCallEvidenceV1 = {
+    arguments: ToolCallValueEvidenceV1;
+    /**
+     * Invocation Index
+     */
+    invocation_index: number;
+    /**
+     * Invocation Revision
+     */
+    invocation_revision: string;
+    /**
+     * Occurrence
+     */
+    occurrence: number;
+    result: ToolCallValueEvidenceV1;
+    /**
+     * Tool Name
+     */
+    tool_name: string;
+};
+
+/**
  * ToolCallPart
  */
 export type ToolCallPart = {
@@ -14209,6 +14465,24 @@ export type ToolCallPart = {
      * Type
      */
     type?: 'tool_call';
+};
+
+/**
+ * ToolCallValueEvidenceV1
+ *
+ * One bounded public value or an exact reason no comparison is possible.
+ */
+export type ToolCallValueEvidenceV1 = {
+    /**
+     * State
+     */
+    state: 'available' | 'unavailable' | 'unsupported' | 'malformed' | 'truncated' | 'incompatible';
+    /**
+     * Value
+     */
+    value?: {
+        [key: string]: unknown;
+    } | null;
 };
 
 /**
@@ -14391,6 +14665,40 @@ export type ToolManifest = {
      * Workspace Mutation
      */
     workspace_mutation?: boolean;
+};
+
+/**
+ * ToolResultContainsAssertionSpec
+ *
+ * Require one explicitly retained public-safe result to contain bounded JSON.
+ */
+export type ToolResultContainsAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Expected Subset
+     */
+    expected_subset: {
+        [key: string]: unknown;
+    };
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'tool_result_contains';
+    /**
+     * Occurrence
+     */
+    occurrence?: number;
+    /**
+     * Tool Name
+     */
+    tool_name: string;
 };
 
 /**

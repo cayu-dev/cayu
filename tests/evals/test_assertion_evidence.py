@@ -114,6 +114,16 @@ def _trajectory(
                 "tool_call_id": "private-tool-call",
             },
         ),
+        Event(
+            type=EventType.TOOL_CALL_COMPLETED,
+            session_id=session_id,
+            tool_name="lookup-secret-token",
+            payload={
+                "arguments_state": "finalized",
+                "effective_arguments": {"customer": "secret-token"},
+                "tool_call_id": "private-tool-call",
+            },
+        ),
         _terminal_event(session_id, SessionStatus.COMPLETED),
     )
     transcript = (
@@ -263,10 +273,11 @@ def test_public_evidence_is_redacted_alias_free_and_cost_bounded():
         '"provider_name"',
         '"model"',
         '"payload"',
-        '"arguments"',
         '"session_id"',
     ):
         assert forbidden not in encoded
+    assert view.tool_calls[0].arguments.value == {"customer": REDACTED_SECRET}
+    assert view.tool_calls[0].result.state == "unsupported"
 
 
 def test_evidence_revision_covers_policy_content_and_pricing():
@@ -461,7 +472,7 @@ def test_evidence_rejects_stale_revision_and_numeric_schema_version():
 
     wrong_version = view.model_dump(mode="python")
     wrong_version["schema_version"] = True
-    with pytest.raises(ValidationError, match="integer 2"):
+    with pytest.raises(ValidationError, match="integer 3"):
         type(view).model_validate(wrong_version)
 
     unknown_policy = view.model_dump(mode="python")

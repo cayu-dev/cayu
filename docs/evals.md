@@ -314,7 +314,8 @@ provider/model/environment selection, import path, callback, raw session ID, or
 runtime event payload.
 
 Portable corpus schema version 2 covers root and child terminal
-status, final-output equality/containment, tool presence/order/count, model-step
+status, final-output equality/containment, tool presence/order/count, bounded
+tool-argument/result JSON subsets, model-step
 and token limits, recorded usage, estimated-cost limits, and trusted model
 judgments. Cost assertions require a `PricingProfileIdentityV1`; the identity
 fingerprints trusted pricing used elsewhere and never embeds or authorizes a
@@ -358,6 +359,60 @@ independently; inspection reports the complete corpus-wide count without
 materializing result graphs.
 Unknown fields and assertion kinds fail closed; schema version 2 has no
 prior-version compatibility loader.
+
+### Safe tool argument and result assertions
+
+`ToolArgumentsContainAssertionSpec` selects one call by exact registered tool
+name and one-based `occurrence`, then checks that its finalized public arguments
+contain a bounded expected JSON object. `ToolResultContainsAssertionSpec` uses
+the same stable selection but is admitted only when the trusted target enables
+public-safe result retention. In Control Plane these are **Tool arguments
+contain JSON** and **Tool result contains JSON**; they are available in new
+evaluations, suite edits and duplication, and captured-session promotion.
+
+```python
+from cayu import ToolArgumentsContainAssertionSpec, ToolResultContainsAssertionSpec
+
+arguments = ToolArgumentsContainAssertionSpec(
+    id="search-query",
+    tool_name="search",
+    occurrence=1,
+    expected_subset={"query": "cayu", "filters": {"team": "runtime"}},
+)
+result = ToolResultContainsAssertionSpec(
+    id="search-succeeded",
+    tool_name="search",
+    occurrence=1,
+    expected_subset={"structured": {"status": "ok"}, "is_error": False},
+)
+```
+
+Object matching is recursive subset matching: extra actual object keys are
+ignored. Arrays are positional and require equal length. Strings, booleans,
+and null compare by exact JSON kind and value; finite JSON numbers compare by
+their exact decimal value, so `1` and `1.0` match but `true` and `1` do not.
+There is no regex, JSONPath, executable predicate, schema evaluator, or
+unbounded deep equality. Expected and retained values are limited independently
+to 4 KiB, 12 levels, and 128 nodes; each trial retains at most 256 ordered call
+identities. Tool-result subsets may select only `content`, `structured`, and
+`is_error` and must select at least one of them.
+
+The standard policy retains finalized tool arguments because they already cross
+Cayu's public runtime event boundary. It does not retain tool results. A trusted
+application owner may opt into public-safe result evidence with
+`EvaluationEvidencePolicySpec.create(include_tool_results=True)` on the target;
+HTTP and browser callers cannot grant that authority. Cayu applies the
+application secret-redaction boundary before either value becomes portable and
+never falls back to raw transcript arguments or unrestricted runtime results.
+
+Outcomes keep the reason exact. A missing selected occurrence is a conclusive
+`failed`; a present value that does not contain the subset is also `failed`.
+Unsupported capture, unavailable terminal evidence, malformed retained data,
+incompatible call identity, cardinality overflow, truncation, and redaction on
+an expected path are distinct `unavailable` observation states. Redaction on an
+unselected extra field does not prevent a safe comparison. These states and the
+bounded safe actual value are the same in SDK/HTTP results, Control Plane
+drill-down, CLI, and JSON/HTML reports.
 
 ### Trusted corpus execution
 
@@ -800,7 +855,10 @@ boundary; the compiler-supplied app is used for offline replay. Existing built-i
 assertions and compiled specs share the same decision functions, so a missing or
 bounded-away observation is `unavailable`, while a complete observed negative is
 `failed`. Tool-order assertions use model-requested transcript order;
-tool-presence/count assertions use calls that actually started.
+tool-presence/count assertions use calls that actually started. Tool JSON
+assertions select the same canonical started-call order, but read arguments
+only from the matching finalized terminal event and results only from an
+explicitly enabled public-safe result projection.
 
 A portable model judge is intentionally online rather than part of that pure
 evidence adapter. It receives the candidate task and complete bounded final
@@ -820,7 +878,7 @@ credentials.
 
 `publish_eval_run(...)` is the only public result projection for a portable
 corpus run. It matches the complete internal suite result back to the corpus and
-produces a content-addressed schema-version-5 `PublishedEvalRun` containing
+produces a content-addressed schema-version-6 `PublishedEvalRun` containing
 every case, trial, exact source-trial revision, assertion outcome, safe
 structural detail, duration, and identity-free aggregate usage. Every trial also
 retains the exact bounded memory-attribution section used during evaluation, so
@@ -1035,13 +1093,17 @@ remain valid inputs to `cayu eval report` and `cayu eval compare`; Cayu unwraps
 and revalidates the binding instead of guessing the format. HTML renders the
 same explainable facts for portable review.
 
-`compare_eval_results(...)` pairs structured judgments only when the immutable
-evaluation contract and exact `(case_id, trial_number, assertion_id)` identity
-match. It reports criterion and aggregate deltas, evaluator recovery/regression,
-observed usage/cost, explanation state, and exact unmatched identities. It
-never pairs a captured observation with a fresh trial heuristically and never
-diffs incompatible contracts. The protected comparison API, Control Plane,
-CLI JSON, and HTML comparison all consume this same comparison document.
+`compare_eval_results(...)` pairs structured judgments and tool JSON
+observations only when the immutable evaluation contract and exact
+`(case_id, trial_number, assertion_id)` identity match. Structured comparisons
+report criterion and aggregate deltas, evaluator recovery/regression, observed
+usage/cost, explanation state, and exact unmatched identities. Tool JSON
+comparisons separately report assertion-contract incompatibility, evidence-state
+changes, safe observed-value changes, and outcome regressions. They do not
+mistake a changed extra value for an assertion change. Cayu never pairs a
+captured observation with a fresh trial heuristically and never diffs
+incompatible contracts. The protected comparison API, Control Plane, CLI JSON,
+and HTML comparison all consume this same schema-version-3 comparison document.
 
 `run_eval_case(..., trials=N)` executes trials sequentially with a fresh concrete
 session ID each time. `EvalCaseResult.trials` is an ordered tuple of

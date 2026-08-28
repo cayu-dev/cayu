@@ -65,6 +65,7 @@ import {
   capturedEvaluationDraftFromCandidate as promotionDraftFromCandidate,
   validateCapturedEvaluationDraft as validatePromotionDraft,
 } from "@/lib/evaluation-promotion"
+import type { EvaluationEvidencePolicySpec } from "@/lib/generated/server-api"
 import { useServerContract } from "./server-contract"
 
 const SELECT_CLASS =
@@ -521,6 +522,7 @@ export function EvaluationPromotionAction({
                   <ExpectedBehaviorEditor
                     assertions={draft.case.assertions}
                     evidence={preview?.candidate.evidence}
+                    evidencePolicy={preview?.candidate.evidence_policy}
                     onChange={(assertions) =>
                       editDraft((next) => {
                         next.case.assertions = assertions
@@ -693,7 +695,7 @@ function PromotionEvidenceSummary({
           {current ? "Preview current" : "Preview out of date"}
         </Badge>
       </CardHeader>
-      <CardContent className="grid gap-3 text-xs sm:grid-cols-2 lg:grid-cols-4">
+      <CardContent className="grid gap-3 text-xs sm:grid-cols-2 lg:grid-cols-3">
         <EvidenceFact label="Root status" value={evidence.root_status ?? "unavailable"} />
         <EvidenceFact label="Final output" value={evidence.final_output_state} />
         <EvidenceFact
@@ -707,6 +709,14 @@ function PromotionEvidenceSummary({
         <EvidenceFact
           label="Total tokens"
           value={evidence.total_tokens ?? evidence.usage_evidence_state}
+        />
+        <EvidenceFact
+          label="Tool arguments"
+          value={toolValueEvidenceSummary(evidence.tool_calls, "arguments")}
+        />
+        <EvidenceFact
+          label="Tool results"
+          value={toolValueEvidenceSummary(evidence.tool_calls, "result")}
         />
       </CardContent>
       {candidate.warnings.length > 0 && (
@@ -758,6 +768,16 @@ function EvidenceFact({ label, value }: { label: string; value: string }) {
       <div className="mt-0.5 truncate font-medium text-foreground">{value}</div>
     </div>
   )
+}
+
+function toolValueEvidenceSummary(
+  calls: EvaluationPromotionPreview["candidate"]["evidence"]["tool_calls"],
+  field: "arguments" | "result",
+): string {
+  const available = calls.filter((call) => call[field].state === "available").length
+  if (available > 0) return `${available} available`
+  if (calls.some((call) => call[field].state === "truncated")) return "truncated"
+  return calls.length > 0 ? "not retained" : "unavailable"
 }
 
 type FreshLaunchRequest = Omit<
@@ -1094,10 +1114,12 @@ function PromotionIdentityEditor({ draft, editDraft }: PromotionEditorProps) {
 export function ExpectedBehaviorEditor({
   assertions,
   evidence,
+  evidencePolicy,
   onChange,
 }: {
   assertions: PromotionAssertion[]
   evidence: EvaluationPromotionPreview["candidate"]["evidence"] | undefined
+  evidencePolicy?: EvaluationEvidencePolicySpec
   onChange: (assertions: PromotionAssertion[]) => void
 }) {
   const [quickKind, setQuickKind] = useState<PromotionAssertionKind>("root_status")
@@ -1114,6 +1136,7 @@ export function ExpectedBehaviorEditor({
           : createPromotionAssertion(quickKind, next),
       )
     })
+  const quickKindUnavailable = assertionKindUnavailable(quickKind, evidencePolicy)
   return (
     <Card size="sm">
       <CardHeader className="grid-cols-[1fr_auto]">
@@ -1133,15 +1156,20 @@ export function ExpectedBehaviorEditor({
             onChange={(event) => setQuickKind(event.target.value as PromotionAssertionKind)}
           >
             {PROMOTION_ASSERTION_KINDS.map((kind) => (
-              <option key={kind} value={kind}>
+              <option
+                key={kind}
+                value={kind}
+                disabled={assertionKindUnavailable(kind, evidencePolicy)}
+              >
                 {PROMOTION_ASSERTION_LABELS[kind]}
+                {assertionKindUnavailable(kind, evidencePolicy) ? " (target unavailable)" : ""}
               </option>
             ))}
           </select>
           <Button
             size="xs"
             variant="outline"
-            disabled={assertions.length >= 64}
+            disabled={assertions.length >= 64 || quickKindUnavailable}
             onClick={addAssertion}
           >
             <Plus /> {evidence ? "Add observed" : "Add expectation"}
@@ -1157,6 +1185,7 @@ export function ExpectedBehaviorEditor({
             index={index}
             assertions={assertions}
             evidence={evidence}
+            evidencePolicy={evidencePolicy}
             update={(updated) =>
               editAssertions((next) => {
                 next[index] = updated
@@ -1175,6 +1204,7 @@ function AssertionEditor({
   index,
   assertions,
   evidence,
+  evidencePolicy,
   update,
   remove,
 }: {
@@ -1182,6 +1212,7 @@ function AssertionEditor({
   index: number
   assertions: PromotionAssertion[]
   evidence: EvaluationPromotionPreview["candidate"]["evidence"] | undefined
+  evidencePolicy?: EvaluationEvidencePolicySpec
   update: (assertion: PromotionAssertion) => void
   remove: () => void
 }) {
@@ -1212,8 +1243,13 @@ function AssertionEditor({
             onChange={(event) => replaceKind(event.target.value as PromotionAssertionKind)}
           >
             {PROMOTION_ASSERTION_KINDS.map((kind) => (
-              <option key={kind} value={kind}>
+              <option
+                key={kind}
+                value={kind}
+                disabled={assertionKindUnavailable(kind, evidencePolicy)}
+              >
                 {PROMOTION_ASSERTION_LABELS[kind]}
+                {assertionKindUnavailable(kind, evidencePolicy) ? " (target unavailable)" : ""}
               </option>
             ))}
           </select>
@@ -1325,6 +1361,52 @@ function AssertionFields({
             value={assertion.max_count}
             onChange={(max_count) => update({ ...assertion, max_count })}
           />
+        </div>
+      )
+    case "tool_arguments_contain":
+    case "tool_result_contains":
+      return (
+        <div className="space-y-3">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <PromotionField label="Tool name" id={id("tool-name")}>
+              <Input
+                id={id("tool-name")}
+                value={assertion.tool_name}
+                onChange={(event) => update({ ...assertion, tool_name: event.target.value })}
+              />
+            </PromotionField>
+            <IntegerField
+              label="Occurrence"
+              id={id("occurrence")}
+              value={assertion.occurrence ?? 1}
+              onChange={(occurrence) => update({ ...assertion, occurrence })}
+            />
+          </div>
+          <PromotionField
+            label={
+              assertion.kind === "tool_arguments_contain"
+                ? "Expected argument JSON subset"
+                : "Expected result JSON subset"
+            }
+            id={id("expected-subset")}
+          >
+            <Textarea
+              id={id("expected-subset")}
+              className="min-h-32 font-mono"
+              spellCheck={false}
+              value={jsonSubsetEditorText(assertion.expected_subset)}
+              onChange={(event) =>
+                update({
+                  ...assertion,
+                  expected_subset: editedJsonSubset(event.target.value),
+                })
+              }
+            />
+          </PromotionField>
+          <p className="text-xs text-muted-foreground">
+            Object keys are matched recursively. Arrays use exact length and order. Values are
+            bounded to 4,096 encoded bytes.
+          </p>
         </div>
       )
     case "tools_called_in_order":
@@ -1442,6 +1524,31 @@ function AssertionFields({
           </PromotionField>
         </div>
       )
+  }
+}
+
+function assertionKindUnavailable(
+  kind: PromotionAssertionKind,
+  policy: EvaluationEvidencePolicySpec | undefined,
+): boolean {
+  if (kind === "tool_arguments_contain") return policy?.include_tool_arguments !== true
+  if (kind === "tool_result_contains") return policy?.include_tool_results !== true
+  return false
+}
+
+function jsonSubsetEditorText(value: unknown): string {
+  return typeof value === "object" && value !== null
+    ? JSON.stringify(value, null, 2)
+    : String(value ?? "")
+}
+
+function editedJsonSubset(source: string): Record<string, unknown> {
+  try {
+    return JSON.parse(source) as Record<string, unknown>
+  } catch {
+    // Preserve transient invalid text in editor state. Shared draft validation
+    // blocks preview/save until the text becomes one bounded JSON object.
+    return source as unknown as Record<string, unknown>
   }
 }
 

@@ -23,6 +23,7 @@ from cayu.evals.execution_comparison import (
     CorpusExecutionRegression,
     CorpusRegressionKind,
     EvalStructuredJudgeComparisonV1,
+    EvalToolJsonAssertionComparisonV1,
 )
 from cayu.evals.memory_attribution import eval_memory_attribution_summary
 from cayu.evals.result_presentation import (
@@ -475,8 +476,24 @@ def render_corpus_execution_comparison_html(
         for item in comparison.structured_judgments
         if item.regressed
     )
+    tool_json_regression_rows = "\n".join(
+        "<tr>"
+        f"<td>{_escape(item.baseline.kind)}</td>"
+        f"<td>{_escape(item.case_id)}</td>"
+        "<td>tool JSON assertion</td>"
+        f"<td>{_escape(_tool_json_regression_change(item))}</td>"
+        "</tr>"
+        for item in comparison.tool_json_assertions
+        if item.regressed
+    )
     regression_rows = "\n".join(
-        rows for rows in (regression_rows, structured_regression_rows) if rows
+        rows
+        for rows in (
+            regression_rows,
+            structured_regression_rows,
+            tool_json_regression_rows,
+        )
+        if rows
     )
     if not regression_rows:
         message = (
@@ -499,6 +516,7 @@ def render_corpus_execution_comparison_html(
             '<tr><td colspan="4">Case outcomes are omitted for incomparable results.</td></tr>'
         )
     structured_comparison = _structured_comparison_html(comparison)
+    tool_json_comparison = _tool_json_comparison_html(comparison)
     rendered = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -544,6 +562,7 @@ def render_corpus_execution_comparison_html(
     <h2>Cases</h2>
     <table><thead><tr><th>Case</th><th>Baseline</th><th>Current</th><th>Score</th></tr></thead><tbody>{case_rows}</tbody></table>
     {structured_comparison}
+    {tool_json_comparison}
   </main>
 </body>
 </html>
@@ -596,6 +615,75 @@ def _structured_comparison_html(comparison: CorpusExecutionComparison) -> str:
         f'<div class="notice"><strong><code>{_escape(state)}</code></strong>'
         f"<p>{_escape(state_messages[state])}</p>{mismatch_table}</div>{judgments}</section>"
     )
+
+
+def _tool_json_comparison_html(comparison: CorpusExecutionComparison) -> str:
+    state = comparison.tool_json_comparison_state
+    state_messages = {
+        "compared": "Exact bounded tool-JSON observations were compared.",
+        "contract_incompatible": (
+            "Tool-JSON observations were not diffed because the evaluation contracts differ."
+        ),
+        "no_tool_json_assertions": "Neither result contains tool-JSON assertions.",
+        "observation_identity_mismatch": (
+            "Tool-JSON observations were not paired because retained "
+            "case/trial/assertion identities differ."
+        ),
+        "source_detail_unavailable": (
+            "Tool-JSON detail is unavailable in one compact source projection."
+        ),
+    }
+    mismatch_rows = "".join(
+        "<tr>"
+        f"<td><code>{_escape(item.case_id)}</code></td>"
+        f"<td>{_escape(item.trial_number if item.trial_number is not None else 'captured')}</td>"
+        f"<td><code>{_escape(item.assertion_id)}</code></td>"
+        f"<td>{_escape(item.availability)}</td></tr>"
+        for item in comparison.tool_json_observation_mismatches
+    )
+    mismatch_table = ""
+    if mismatch_rows:
+        mismatch_table = (
+            "<table><thead><tr><th>Case</th><th>Trial</th><th>Assertion</th>"
+            f"<th>Availability</th></tr></thead><tbody>{mismatch_rows}</tbody></table>"
+        )
+    observations = "".join(
+        _tool_json_assertion_comparison_html(item) for item in comparison.tool_json_assertions
+    )
+    return (
+        '<section aria-labelledby="tool-json-assertions">'
+        '<h2 id="tool-json-assertions">Tool JSON assertion comparison</h2>'
+        f'<div class="notice"><strong><code>{_escape(state)}</code></strong>'
+        f"<p>{_escape(state_messages[state])}</p>{mismatch_table}</div>{observations}</section>"
+    )
+
+
+def _tool_json_assertion_comparison_html(item: EvalToolJsonAssertionComparisonV1) -> str:
+    trial = item.trial_number if item.trial_number is not None else "captured"
+    baseline_actual = _bounded_json_text(item.baseline.actual)
+    current_actual = _bounded_json_text(item.current.actual)
+    expected = _bounded_json_text(item.baseline.expected_subset)
+    return (
+        '<section class="judgment">'
+        f"<h3>Case <code>{_escape(item.case_id)}</code> · trial {_escape(trial)} · "
+        f"assertion <code>{_escape(item.assertion_id)}</code></h3>"
+        f"<p><code>{_escape(item.baseline.kind)}</code> · tool "
+        f"<code>{_escape(item.baseline.tool_name)}</code> · occurrence "
+        f"{_escape(item.baseline.occurrence)}</p>"
+        f"<p>Outcome {_escape(item.baseline_outcome)} → {_escape(item.current_outcome)} · "
+        f"evidence {_escape(item.baseline.observation_state)} → "
+        f"{_escape(item.current.observation_state)} · observed value "
+        f"{_escape(item.observed_value_change)}</p>"
+        f"<p>Expected subset <code>{_escape(expected)}</code></p>"
+        f"<p>Observed <code>{_escape(baseline_actual)}</code> → "
+        f"<code>{_escape(current_actual)}</code></p></section>"
+    )
+
+
+def _bounded_json_text(value: object) -> str:
+    if value is None:
+        return "unavailable"
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
 def _structured_judgment_comparison_html(
@@ -668,6 +756,16 @@ def _structured_regression_change(item: EvalStructuredJudgeComparisonV1) -> str:
         f"trial {trial}, assertion {item.assertion_id}: "
         f"outcome {item.baseline_outcome} → {item.current_outcome}; "
         f"evaluator {item.evaluator_change}; aggregate {item.aggregate_change} ({delta})"
+    )
+
+
+def _tool_json_regression_change(item: EvalToolJsonAssertionComparisonV1) -> str:
+    trial = item.trial_number if item.trial_number is not None else "captured"
+    return (
+        f"trial {trial}, assertion {item.assertion_id}: "
+        f"outcome {item.baseline_outcome} → {item.current_outcome}; "
+        f"evidence {item.baseline.observation_state} → {item.current.observation_state}; "
+        f"observed value {item.observed_value_change}"
     )
 
 
