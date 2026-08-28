@@ -79,6 +79,7 @@ from cayu.evals.memory_attribution import (
 from cayu.evals.models import (
     EvalAssertionResult,
     EvalRun,
+    EvalTrialResult,
     _model_instance_python_input,
 )
 from cayu.evals.result_contract import (
@@ -87,9 +88,10 @@ from cayu.evals.result_contract import (
     EvalTrialOutputPreviewV1,
     _EvalTrialPublicData,
 )
+from cayu.evals.revisions import eval_trial_result_revision
 from cayu.runtime.usage import AggregateCount, aggregate_usage_metrics_from_durable_payload
 
-PUBLISHED_EVAL_SCHEMA_VERSION = 4
+PUBLISHED_EVAL_SCHEMA_VERSION = 5
 PUBLISHED_EVAL_MAX_BYTES = 32 << 20
 PUBLISHED_EVAL_MAX_DURATION_MS = 2**63 - 1
 
@@ -756,6 +758,7 @@ class PublishedUsageSummaryV1(_PortableModel):
 
 class PublishedEvalTrialResult(_PortableModel):
     trial_number: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
+    source_trial_revision: StrictStr = Field(min_length=64, max_length=64)
     status: PublishedStatus
     score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
     assertions: tuple[PublishedAssertionResult, ...] = Field(
@@ -774,6 +777,13 @@ class PublishedEvalTrialResult(_PortableModel):
     @classmethod
     def validate_assertions_are_ordered(cls, value: object, info) -> object:
         return _ordered_sequence_input(value, info.field_name)
+
+    @field_validator("source_trial_revision")
+    @classmethod
+    def validate_source_trial_revision(cls, value: str) -> str:
+        if any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("source_trial_revision must be lowercase SHA-256 hex.")
+        return value
 
     @field_validator("output", mode="before")
     @classmethod
@@ -869,7 +879,7 @@ class PublishedEvalCaseResult(_PortableModel):
 
 
 class PublishedEvalRun(_PortableModel):
-    schema_version: Literal[4]
+    schema_version: Literal[5]
     revision: StrictStr
     corpus_revision: StrictStr
     target_key: StrictStr
@@ -1877,6 +1887,11 @@ def _published_case(
         trials.append(
             PublishedEvalTrialResult(
                 trial_number=trial.trial_number,
+                source_trial_revision=eval_trial_result_revision(
+                    EvalTrialResult.model_validate(
+                        trial.model_dump(mode="python", round_trip=True, warnings="none")
+                    )
+                ),
                 status=status,
                 score=trial.score,
                 assertions=assertions,

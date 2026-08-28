@@ -22,6 +22,7 @@ from tests.evals.test_corpus_execution import (
     _provider,
     _target,
 )
+from tests.evals.test_memory_reporting import _report_fixture
 
 import cayu.evals.execution as execution_module
 import cayu.server.evals_worker as evals_worker_module
@@ -39,6 +40,10 @@ from cayu import (
 )
 from cayu.evals.corpus import EvalCaseSpec, EvalCorpusDocument
 from cayu.evals.execution import run_corpus_suite
+from cayu.evals.memory_reporting import (
+    MemoryExperimentReportRequest,
+    build_memory_experiment_report,
+)
 from cayu.evals.store import (
     EvalRunInvocation,
     EvalRunRequest,
@@ -118,7 +123,13 @@ async def _bound_eval_invocation(
         target.key,
         effective_target=effective_target,
     )
-    return invocation.model_copy(update={"execution_profile": prepared.binding}, deep=True)
+    return invocation.model_copy(
+        update={
+            "execution_profile": prepared.binding,
+            "execution_profile_snapshot": prepared.snapshot,
+        },
+        deep=True,
+    )
 
 
 def _server(target, store, *, execution_profile_policy=None):
@@ -572,6 +583,7 @@ def test_evals_api_imports_executes_compares_and_exports_deterministically(
             assert admitted.status_code == 202
             invocation = admitted.json()["spec"]["invocation"]
             execution_profile = invocation.pop("execution_profile")
+            execution_profile_snapshot = invocation.pop("execution_profile_snapshot")
             admission_request_revision = invocation.pop("admission_request_revision")
             assert invocation == {
                 "schema_version": 1,
@@ -595,6 +607,7 @@ def test_evals_api_imports_executes_compares_and_exports_deterministically(
             assert execution_profile["schema_version"] == 1
             assert execution_profile["profile_revision"].startswith("sha256:")
             assert execution_profile["runtime_execution_profile"]["fingerprint"]
+            assert execution_profile_snapshot["revision"] == execution_profile["profile_revision"]
             assert admission_request_revision.startswith("sha256:")
             run_id = admitted.json()["spec"]["run_id"]
             replayed = client.post(
@@ -772,7 +785,7 @@ def test_evals_api_compares_compatible_releases_and_returns_typed_regressions(tm
                     "current_run_id": current_run_id,
                 },
             )
-            assert response.status_code == 200
+            assert response.status_code == 200, response.text
             comparison = response.json()["comparison"]
             assert comparison["compatibility"]["comparable"] is True
             assert comparison["baseline"]["application_release_id"] == "baseline-release"
@@ -851,6 +864,176 @@ def test_eval_result_refreshes_run_after_concurrent_publication(tmp_path, monkey
         assert body["run"] == completed_record.model_dump(mode="json")
         assert body["run"]["status"] == "completed"
         assert body["result"]["run"]["status"] == "passed"
+    finally:
+        asyncio.run(store.close())
+
+
+def test_memory_report_routes_require_exact_stored_results_and_render_both_formats(
+    tmp_path,
+) -> None:
+    report_request, target, corpus = asyncio.run(_report_fixture())
+    store = SQLiteEvalStore(tmp_path / "memory-reports.db")
+
+    async def seed_results() -> None:
+        await store.save_corpus(corpus, redact_json=target.app.redact_json)
+        variants = {item.variant_id: item for item in report_request.variants}
+        for index, evidence in enumerate(report_request.published_results, start=1):
+            trial = next(
+                item
+                for item in report_request.trials
+                if item.published_result_revision == evidence.result.revision
+            )
+            variant = variants[trial.variant_id]
+            published = evidence.result.run
+            request = EvalRunRequest(
+                run_id=evidence.run_id,
+                idempotency_key="sha256:" + str(index) * 64,
+                corpus_revision=published.corpus_revision,
+                target_key=evidence.result.target.target_key,
+                suite_id=published.suite_id,
+                suite_revision=published.suite_revision,
+                max_concurrency=1,
+                invocation=EvalRunInvocation(
+                    execution_profile=variant.execution_profile_binding,
+                    execution_profile_snapshot=variant.execution_profile,
+                ),
+            )
+            await store.admit_run(request, redact_json=target.app.redact_json)
+            lease = await store.claim_run(target_key=target.key, lease_seconds=300)
+            assert lease is not None
+            assert lease.run.id == evidence.run_id
+            await store.publish_result(
+                lease.claim,
+                evidence.result,
+                redact_json=target.app.redact_json,
+            )
+
+    asyncio.run(seed_results())
+    try:
+        server = _server(target, store)
+        schema = server.openapi()
+        expected_request_schema = {"$ref": "#/components/schemas/MemoryExperimentReportRequest"}
+        for path in (
+            "/api/evals/memory-reports",
+            "/api/evals/memory-reports/report.html",
+        ):
+            assert (
+                schema["paths"][path]["post"]["requestBody"]["content"]["application/json"][
+                    "schema"
+                ]
+                == expected_request_schema
+            )
+        assert "MemoryExperimentReportRequest" in schema["components"]["schemas"]
+
+        with TestClient(server) as client:
+            payload = report_request.model_dump(mode="json")
+            assert (
+                build_memory_experiment_report(
+                    MemoryExperimentReportRequest.model_validate(payload)
+                ).selected_variant_id
+                == "candidate"
+            )
+            unauthorized = client.post("/api/evals/memory-reports", json=payload)
+            assert unauthorized.status_code == 401
+
+            for malformed_result in ("invalid", [], 1, True):
+                malformed = json.loads(json.dumps(payload))
+                malformed["published_results"][0]["result"] = malformed_result
+                rejected_malformed = client.post(
+                    "/api/evals/memory-reports",
+                    headers=_AUTH_HEADERS,
+                    json=malformed,
+                )
+                assert rejected_malformed.status_code == 422
+                assert rejected_malformed.json() == {
+                    "detail": "Invalid memory experiment report request."
+                }
+
+            aliased_metrics = json.loads(json.dumps(payload))
+            task_quality = next(
+                item
+                for item in aliased_metrics["metric_bindings"]
+                if item["role"] == "task_quality"
+            )
+            safety = next(
+                item for item in aliased_metrics["metric_bindings"] if item["role"] == "safety"
+            )
+            safety["assertion_id"] = task_quality["assertion_id"]
+            safety["assertion_revision"] = task_quality["assertion_revision"]
+            rejected_alias = client.post(
+                "/api/evals/memory-reports",
+                headers=_AUTH_HEADERS,
+                json=aliased_metrics,
+            )
+            assert rejected_alias.status_code == 422
+            assert rejected_alias.json() == {"detail": "Invalid memory experiment report request."}
+
+            response = client.post(
+                "/api/evals/memory-reports",
+                headers=_AUTH_HEADERS,
+                json=payload,
+            )
+            assert response.status_code == 200, response.text
+            assert response.json()["selected_variant_id"] == "candidate"
+            assert len(response.json()["rows"]) == 4
+
+            rendered = client.post(
+                "/api/evals/memory-reports/report.html",
+                headers=_AUTH_HEADERS,
+                json=payload,
+            )
+            assert rendered.status_code == 200
+            assert rendered.headers["content-type"].startswith("text/html")
+            assert "Complete trial matrix" in rendered.text
+
+            resultless_trials = tuple(
+                trial.model_copy(update={"published_result_revision": None})
+                if trial.variant_id == "candidate"
+                else trial
+                for trial in report_request.trials
+            )
+            referenced_revisions = {
+                trial.published_result_revision
+                for trial in resultless_trials
+                if trial.published_result_revision is not None
+            }
+            resultless_request = MemoryExperimentReportRequest.model_validate(
+                report_request.model_copy(
+                    update={
+                        "published_results": tuple(
+                            evidence
+                            for evidence in report_request.published_results
+                            if evidence.result.revision in referenced_revisions
+                        ),
+                        "trials": resultless_trials,
+                    }
+                ).model_dump(mode="python")
+            )
+            resultless = client.post(
+                "/api/evals/memory-reports",
+                headers=_AUTH_HEADERS,
+                json=resultless_request.model_dump(mode="json"),
+            )
+            assert resultless.status_code == 200, resultless.text
+            assert {
+                row["availability"]
+                for row in resultless.json()["rows"]
+                if row["variant_id"] == "candidate"
+            } == {"unmatched"}
+
+            forged = json.loads(json.dumps(payload))
+            first_run_id = forged["published_results"][0]["run_id"]
+            forged["published_results"][0]["run_id"] = forged["published_results"][1]["run_id"]
+            forged["published_results"][1]["run_id"] = first_run_id
+            rejected = client.post(
+                "/api/evals/memory-reports",
+                headers=_AUTH_HEADERS,
+                json=forged,
+            )
+            assert rejected.status_code == 409
+            assert rejected.json()["detail"] == (
+                "Memory report eval run evidence changed during readback."
+            )
     finally:
         asyncio.run(store.close())
 

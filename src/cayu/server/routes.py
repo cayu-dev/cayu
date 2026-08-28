@@ -19,8 +19,10 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.params import Body
 from fastapi.responses import JSONResponse, Response
 from fastapi.routing import APIRoute
+from fastapi.utils import create_model_field
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -83,6 +85,13 @@ from cayu.evals.execution_reporting import (
     eval_result_to_json,
     render_corpus_execution_html,
     render_eval_result_html,
+)
+from cayu.evals.memory_reporting import (
+    MEMORY_EXPERIMENT_REPORT_MAX_BYTES,
+    MemoryExperimentReport,
+    MemoryExperimentReportRequest,
+    build_memory_experiment_report,
+    render_memory_experiment_report_html,
 )
 from cayu.evals.models import Trajectory
 from cayu.evals.promotion import (
@@ -928,11 +937,44 @@ class _BoundedEvalsRoute(_BoundedPrivateJsonBodyRoute):
     reject_duplicate_json_keys = True
 
 
+class _BoundedMemoryReportRoute(_BoundedPrivateJsonBodyRoute):
+    """Bound complete memory-report evidence before parsing or store reads."""
+
+    max_request_bytes = MEMORY_EXPERIMENT_REPORT_MAX_BYTES
+    invalid_request_detail = "Invalid memory experiment report request."
+    oversized_request_detail = "Memory experiment report request exceeds the server byte limit."
+    reject_duplicate_json_keys = True
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        if self.body_field is not None:
+            raise RuntimeError("Memory report routes must retain private body parsing ownership.")
+        # APIRoute already captured the runtime handler with no FastAPI body field.
+        # Publish a validation-only field afterward so OpenAPI emits one reusable
+        # request component without moving parsing ahead of the bounded, redacted
+        # private-body boundary.
+        self.body_field = create_model_field(
+            name=f"Body_{self.unique_id}",
+            type_=MemoryExperimentReportRequest,
+            field_info=Body(annotation=MemoryExperimentReportRequest),
+            mode="validation",
+        )
+
+
 def _bounded_evals_route_class(auth: AuthDependency) -> type[_BoundedEvalsRoute]:
     class _AuthenticatedBoundedEvalsRoute(_BoundedEvalsRoute):
         preparse_auth = staticmethod(auth)
 
     return _AuthenticatedBoundedEvalsRoute
+
+
+def _bounded_memory_report_route_class(
+    auth: AuthDependency,
+) -> type[_BoundedMemoryReportRoute]:
+    class _AuthenticatedBoundedMemoryReportRoute(_BoundedMemoryReportRoute):
+        preparse_auth = staticmethod(auth)
+
+    return _AuthenticatedBoundedMemoryReportRoute
 
 
 class _BoundedUsageRollupRoute(_BoundedPrivateJsonBodyRoute):
@@ -4127,6 +4169,11 @@ def create_router(
     bounded_evals_router = APIRouter(
         route_class=(_BoundedEvalsRoute if auth is None else _bounded_evals_route_class(auth))
     )
+    bounded_memory_report_router = APIRouter(
+        route_class=(
+            _BoundedMemoryReportRoute if auth is None else _bounded_memory_report_route_class(auth)
+        )
+    )
     auth_context_openapi_schema = AuthContext.model_json_schema()
     capability_snapshot = inspect_control_plane_capabilities(
         dashboard_configured=dashboard_configured,
@@ -5241,6 +5288,110 @@ def create_router(
             )
             return await _model_json_response(response, EvalResultComparisonResponse)
 
+        async def _build_stored_memory_experiment_report(
+            body: MemoryExperimentReportRequest,
+        ) -> MemoryExperimentReport:
+            store = captured_eval_store
+            if store is None:
+                raise HTTPException(status_code=409, detail="Eval result storage is unavailable.")
+            runs_by_result_revision: dict[str, EvalRunRecord] = {}
+            for evidence in body.published_results:
+                try:
+                    run = await store.load_run(evidence.run_id)
+                    stored = await store.load_result(evidence.run_id)
+                    current_run = await store.load_run(evidence.run_id)
+                except EvalStoreResultTooLarge as exc:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Eval result is too large.",
+                    ) from exc
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Invalid memory experiment result identity.",
+                    ) from exc
+                if run is None or current_run is None or stored is None:
+                    raise HTTPException(status_code=404, detail="Eval result not found.")
+                if (
+                    current_run.status is not EvalRunStatus.COMPLETED
+                    or current_run.result is None
+                    or current_run.result.revision != evidence.result.revision
+                    or run != current_run
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Memory report eval run evidence changed during readback.",
+                    )
+                if active_eval_registry.get(current_run.spec.target_key) is None:
+                    raise HTTPException(status_code=404, detail="Eval result not found.")
+                if type(stored) is not CorpusExecutionResult:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Memory reports require fresh corpus execution results.",
+                    )
+                if stored != evidence.result:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=("Memory report evidence does not match the exact stored result."),
+                    )
+                runs_by_result_revision[evidence.result.revision] = current_run
+            variants = {item.variant_id: item for item in body.variants}
+            for trial in body.trials:
+                revision = trial.published_result_revision
+                if revision is None:
+                    continue
+                run = runs_by_result_revision[revision]
+                variant = variants[trial.variant_id]
+                invocation = run.spec.invocation
+                if (
+                    invocation.execution_profile != variant.execution_profile_binding
+                    or invocation.execution_profile_snapshot != variant.execution_profile
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Memory report profile evidence does not match the exact eval run."
+                        ),
+                    )
+            try:
+                return await asyncio.to_thread(build_memory_experiment_report, body)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid memory experiment report request.",
+                ) from exc
+
+        @bounded_memory_report_router.post(
+            "/evals/memory-reports",
+            response_model=MemoryExperimentReport,
+            responses=CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def build_stored_memory_report(request: Request) -> Response:
+            body = await _validated_private_json_body(
+                request,
+                MemoryExperimentReportRequest,
+                invalid_detail="Invalid memory experiment report request.",
+            )
+            report = await _build_stored_memory_experiment_report(body)
+            return await _model_json_response(report, MemoryExperimentReport)
+
+        @bounded_memory_report_router.post(
+            "/evals/memory-reports/report.html",
+            response_class=Response,
+            responses=CAPTURED_EVALUATION_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def build_stored_memory_report_html(request: Request) -> Response:
+            body = await _validated_private_json_body(
+                request,
+                MemoryExperimentReportRequest,
+                invalid_detail="Invalid memory experiment report request.",
+            )
+            report = await _build_stored_memory_experiment_report(body)
+            rendered = await asyncio.to_thread(render_memory_experiment_report_html, report)
+            return Response(content=rendered, media_type="text/html")
+
         @bounded_captured_evaluation_router.post(
             "/evals/results/{result_revision}/baseline",
             response_model=EvalBaselineSelectionResponse,
@@ -5586,7 +5737,10 @@ def create_router(
                         ),
                     )
                 invocation = invocation.model_copy(
-                    update={"execution_profile": prepared_profile.binding},
+                    update={
+                        "execution_profile": prepared_profile.binding,
+                        "execution_profile_snapshot": prepared_profile.snapshot,
+                    },
                     deep=True,
                 )
                 if published_profile_revision is not None:
@@ -10613,4 +10767,5 @@ def create_router(
     router.include_router(bounded_evaluation_promotion_router)
     router.include_router(bounded_captured_evaluation_router)
     router.include_router(bounded_evals_router)
+    router.include_router(bounded_memory_report_router)
     return router

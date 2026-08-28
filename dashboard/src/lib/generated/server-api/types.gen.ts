@@ -86,6 +86,121 @@ export type AgentManifest = {
 };
 
 /**
+ * AgentSnapshotResultBinding
+ */
+export type AgentSnapshotResultBinding = {
+    /**
+     * Cost Fingerprint
+     */
+    cost_fingerprint?: string | null;
+    /**
+     * Eval Result Revision
+     */
+    eval_result_revision: string;
+    /**
+     * Fingerprint
+     */
+    fingerprint: string;
+    /**
+     * Memory Evidence Fingerprint
+     */
+    memory_evidence_fingerprint?: string | null;
+    /**
+     * Record Type
+     */
+    record_type?: 'cayu.agent-snapshot-result';
+    /**
+     * Recorded At
+     */
+    recorded_at: string;
+    /**
+     * Runtime Evidence Fingerprint
+     */
+    runtime_evidence_fingerprint: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    terminal_disposition: AgentSnapshotTerminalDisposition;
+    /**
+     * Trial Fingerprint
+     */
+    trial_fingerprint: string;
+    /**
+     * Usage Fingerprint
+     */
+    usage_fingerprint?: string | null;
+};
+
+/**
+ * AgentSnapshotTerminalDisposition
+ */
+export type AgentSnapshotTerminalDisposition = 'completed' | 'failed' | 'cancelled' | 'timed_out' | 'outcome_unknown';
+
+/**
+ * AgentSnapshotTrialBinding
+ */
+export type AgentSnapshotTrialBinding = {
+    /**
+     * Candidate Id
+     */
+    candidate_id: string;
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Evaluator Fingerprint
+     */
+    evaluator_fingerprint: string;
+    /**
+     * Fingerprint
+     */
+    fingerprint: string;
+    /**
+     * Materialization Fingerprint
+     */
+    materialization_fingerprint: string;
+    /**
+     * Memory Overlay Fingerprint
+     */
+    memory_overlay_fingerprint?: string | null;
+    /**
+     * Record Type
+     */
+    record_type?: 'cayu.agent-snapshot-trial';
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Snapshot Fingerprint
+     */
+    snapshot_fingerprint: string;
+    /**
+     * Trial Id
+     */
+    trial_id: string;
+    /**
+     * Workspace Overlay Fingerprint
+     */
+    workspace_overlay_fingerprint?: string | null;
+};
+
+/**
+ * AgentSnapshotTrialStateMode
+ */
+export type AgentSnapshotTrialStateMode = 'reset_each_trial' | 'accumulate_within_candidate';
+
+/**
  * AgentsResponse
  */
 export type AgentsResponse = {
@@ -2337,6 +2452,11 @@ export type AssertionEvidenceView = {
 };
 
 /**
+ * AutomaticRecallMode
+ */
+export type AutomaticRecallMode = 'off' | 'offer' | 'strong_matches' | 'offer_and_strong_matches';
+
+/**
  * BillingIdentity
  *
  * Provider-neutral commercial identity and possible pricing contexts.
@@ -3127,6 +3247,328 @@ export type CompactSessionBody = {
 };
 
 /**
+ * ComparableGenerationSettings
+ *
+ * Opaque identity of the output-affecting settings declared for one side.
+ */
+export type ComparableGenerationSettings = {
+    /**
+     * Revision
+     */
+    revision: string;
+};
+
+/**
+ * ComparableOutputBudget
+ *
+ * The final-output envelope that must match across a verified pair.
+ */
+export type ComparableOutputBudget = {
+    /**
+     * Max Output Tokens
+     */
+    max_output_tokens: number;
+    /**
+     * Output Mode
+     */
+    output_mode?: 'text' | 'structured';
+};
+
+/**
+ * ComparisonCostLineItem
+ *
+ * Bounded, safe accounting projection of one runtime cost line item.
+ */
+export type ComparisonCostLineItemInput = {
+    /**
+     * Cache Read Input Cost
+     */
+    cache_read_input_cost: number | string;
+    /**
+     * Cache Read Input Tokens
+     */
+    cache_read_input_tokens: number;
+    /**
+     * Cache Write 1H Input Tokens
+     */
+    cache_write_1h_input_tokens?: number;
+    /**
+     * Cache Write 5M Input Tokens
+     */
+    cache_write_5m_input_tokens?: number;
+    /**
+     * Cache Write Input Cost
+     */
+    cache_write_input_cost: number | string;
+    /**
+     * Cache Write Input Tokens
+     */
+    cache_write_input_tokens: number;
+    /**
+     * Cache Write Unknown Ttl Input Tokens
+     */
+    cache_write_unknown_ttl_input_tokens?: number;
+    /**
+     * Currency
+     */
+    currency: string;
+    /**
+     * Execution Profile Fingerprint
+     */
+    execution_profile_fingerprint?: string | null;
+    /**
+     * Input Cost
+     */
+    input_cost: number | string;
+    /**
+     * Input Tokens
+     */
+    input_tokens: number;
+    /**
+     * Missing Pricing Reason
+     */
+    missing_pricing_reason?: string | null;
+    /**
+     * Model
+     */
+    model?: string | null;
+    /**
+     * Model Step
+     */
+    model_step: number;
+    /**
+     * Output Cost
+     */
+    output_cost: number | string;
+    /**
+     * Output Tokens
+     */
+    output_tokens: number;
+    /**
+     * Priced
+     */
+    priced: boolean;
+    /**
+     * Pricing Effective From
+     */
+    pricing_effective_from?: string | null;
+    /**
+     * Pricing Effective Through
+     */
+    pricing_effective_through?: string | null;
+    /**
+     * Pricing Match
+     */
+    pricing_match?: 'exact' | 'prefix' | 'resource_mapping' | null;
+    /**
+     * Pricing Model
+     */
+    pricing_model?: string | null;
+    pricing_provenance?: ComparisonPricingProvenance | null;
+    /**
+     * Pricing Provider Name
+     */
+    pricing_provider_name?: string | null;
+    /**
+     * Pricing Tier Max Input Tokens
+     */
+    pricing_tier_max_input_tokens?: number | null;
+    /**
+     * Provider Name
+     */
+    provider_name?: string | null;
+    /**
+     * Requested Model
+     */
+    requested_model?: string | null;
+    /**
+     * Total Cost
+     */
+    total_cost: number | string;
+    /**
+     * Uncached Input Tokens
+     */
+    uncached_input_tokens: number;
+    /**
+     * Web Search Calls
+     */
+    web_search_calls?: number;
+    /**
+     * Web Search Cost
+     */
+    web_search_cost?: number | string;
+    /**
+     * Web Search Outcome Unknown
+     */
+    web_search_outcome_unknown?: number;
+};
+
+/**
+ * ComparisonCostLineItem
+ *
+ * Bounded, safe accounting projection of one runtime cost line item.
+ */
+export type ComparisonCostLineItemOutput = {
+    /**
+     * Cache Read Input Cost
+     */
+    cache_read_input_cost: string;
+    /**
+     * Cache Read Input Tokens
+     */
+    cache_read_input_tokens: number;
+    /**
+     * Cache Write 1H Input Tokens
+     */
+    cache_write_1h_input_tokens?: number;
+    /**
+     * Cache Write 5M Input Tokens
+     */
+    cache_write_5m_input_tokens?: number;
+    /**
+     * Cache Write Input Cost
+     */
+    cache_write_input_cost: string;
+    /**
+     * Cache Write Input Tokens
+     */
+    cache_write_input_tokens: number;
+    /**
+     * Cache Write Unknown Ttl Input Tokens
+     */
+    cache_write_unknown_ttl_input_tokens?: number;
+    /**
+     * Currency
+     */
+    currency: string;
+    /**
+     * Execution Profile Fingerprint
+     */
+    execution_profile_fingerprint?: string | null;
+    /**
+     * Input Cost
+     */
+    input_cost: string;
+    /**
+     * Input Tokens
+     */
+    input_tokens: number;
+    /**
+     * Missing Pricing Reason
+     */
+    missing_pricing_reason?: string | null;
+    /**
+     * Model
+     */
+    model?: string | null;
+    /**
+     * Model Step
+     */
+    model_step: number;
+    /**
+     * Output Cost
+     */
+    output_cost: string;
+    /**
+     * Output Tokens
+     */
+    output_tokens: number;
+    /**
+     * Priced
+     */
+    priced: boolean;
+    /**
+     * Pricing Effective From
+     */
+    pricing_effective_from?: string | null;
+    /**
+     * Pricing Effective Through
+     */
+    pricing_effective_through?: string | null;
+    /**
+     * Pricing Match
+     */
+    pricing_match?: 'exact' | 'prefix' | 'resource_mapping' | null;
+    /**
+     * Pricing Model
+     */
+    pricing_model?: string | null;
+    pricing_provenance?: ComparisonPricingProvenance | null;
+    /**
+     * Pricing Provider Name
+     */
+    pricing_provider_name?: string | null;
+    /**
+     * Pricing Tier Max Input Tokens
+     */
+    pricing_tier_max_input_tokens?: number | null;
+    /**
+     * Provider Name
+     */
+    provider_name?: string | null;
+    /**
+     * Requested Model
+     */
+    requested_model?: string | null;
+    /**
+     * Total Cost
+     */
+    total_cost: string;
+    /**
+     * Uncached Input Tokens
+     */
+    uncached_input_tokens: number;
+    /**
+     * Web Search Calls
+     */
+    web_search_calls?: number;
+    /**
+     * Web Search Cost
+     */
+    web_search_cost?: string;
+    /**
+     * Web Search Outcome Unknown
+     */
+    web_search_outcome_unknown?: number;
+};
+
+/**
+ * ComparisonPricingCatalog
+ *
+ * Identity of the application-selected price book used for one side.
+ */
+export type ComparisonPricingCatalog = {
+    /**
+     * Generated At
+     */
+    generated_at: string;
+    /**
+     * Price Book Version
+     */
+    price_book_version: string;
+};
+
+/**
+ * ComparisonPricingProvenance
+ *
+ * Bounded, allowlisted pricing source retained in comparison reports.
+ */
+export type ComparisonPricingProvenance = {
+    /**
+     * As Of
+     */
+    as_of: string;
+    /**
+     * Source
+     */
+    source: string;
+    /**
+     * Url
+     */
+    url: string;
+};
+
+/**
  * ContextExposureEvidenceKind
  */
 export type ContextExposureEvidenceKind = 'composition_planned' | 'request_prepared' | 'dispatch_intent_committed' | 'provider_acknowledgement' | 'recovery_acknowledgement' | 'provider_completion' | 'recovery_completion' | 'conclusive_failure' | 'conclusive_cancellation' | 'ambiguous_transport' | 'recovery_indeterminate';
@@ -3386,7 +3828,7 @@ export type CorpusExecutionResult = {
     /**
      * Schema Version
      */
-    schema_version?: 2;
+    schema_version?: 3;
     target: EvaluationTargetIdentity;
 };
 
@@ -3419,6 +3861,104 @@ export type CorpusUserMessageSpec = {
      */
     text: string;
 };
+
+/**
+ * CostAccountingTotals
+ *
+ * Recomputed usage and priced subtotals for one evidence scope.
+ */
+export type CostAccountingTotals = {
+    /**
+     * Attempt Count
+     */
+    attempt_count: number;
+    /**
+     * Cache Read Input Tokens
+     */
+    cache_read_input_tokens: number;
+    /**
+     * Cache Write Input Tokens
+     */
+    cache_write_input_tokens: number;
+    /**
+     * Currencies
+     */
+    currencies?: Array<CostCurrencyTotal>;
+    /**
+     * First Attempt Count
+     */
+    first_attempt_count: number;
+    /**
+     * Input Tokens
+     */
+    input_tokens: number;
+    /**
+     * Missing Usage Attempt Count
+     */
+    missing_usage_attempt_count: number;
+    /**
+     * Output Tokens
+     */
+    output_tokens: number;
+    /**
+     * Priced Attempt Count
+     */
+    priced_attempt_count: number;
+    /**
+     * Retry Attempt Count
+     */
+    retry_attempt_count: number;
+    /**
+     * Uncached Input Tokens
+     */
+    uncached_input_tokens: number;
+    /**
+     * Unpriced Attempt Count
+     */
+    unpriced_attempt_count: number;
+    /**
+     * Web Search Calls
+     */
+    web_search_calls?: number;
+    /**
+     * Web Search Outcome Unknown
+     */
+    web_search_outcome_unknown?: number;
+};
+
+/**
+ * CostBranchTotals
+ */
+export type CostBranchTotals = {
+    /**
+     * Branch Id
+     */
+    branch_id: string;
+    totals: CostAccountingTotals;
+};
+
+/**
+ * CostCurrencyTotal
+ *
+ * Priced subtotal in one currency; currencies are never combined.
+ */
+export type CostCurrencyTotal = {
+    /**
+     * Currency
+     */
+    currency: string;
+    /**
+     * Priced Cost
+     */
+    priced_cost: string;
+};
+
+/**
+ * CostDirection
+ *
+ * Observed direction of candidate cost relative to baseline cost.
+ */
+export type CostDirection = 'savings' | 'break_even' | 'increased_cost' | 'unavailable';
 
 /**
  * CostLineItem
@@ -3548,6 +4088,127 @@ export type CostLineItem = {
      * Web Search Outcome Unknown
      */
     web_search_outcome_unknown?: number;
+};
+
+/**
+ * CostOperationTotals
+ */
+export type CostOperationTotals = {
+    operation: CostQualityAttemptOperation;
+    totals: CostAccountingTotals;
+};
+
+/**
+ * CostQualityAggregateReport
+ *
+ * Verified-pair arithmetic plus every typed exclusion.
+ */
+export type CostQualityAggregateReport = {
+    /**
+     * Baseline Cost
+     */
+    baseline_cost: string | null;
+    /**
+     * Candidate Cost
+     */
+    candidate_cost: string | null;
+    cost_direction: CostDirection;
+    /**
+     * Currency
+     */
+    currency: string | null;
+    /**
+     * Eligible Pair Ids
+     */
+    eligible_pair_ids: Array<string>;
+    /**
+     * Exclusions
+     */
+    exclusions: Array<CostQualityPairExclusion>;
+    /**
+     * Findings
+     */
+    findings: Array<CostQualityFinding>;
+    /**
+     * Pair Count
+     */
+    pair_count: number;
+    /**
+     * Savings
+     */
+    savings: string | null;
+    /**
+     * Savings Percentage
+     */
+    savings_percentage: string | null;
+    savings_percentage_state: SavingsPercentageState;
+    status: CostQualityComparisonStatus;
+};
+
+/**
+ * CostQualityAttemptOperation
+ *
+ * Why one provider attempt was made.
+ */
+export type CostQualityAttemptOperation = 'agent_step' | 'compaction' | 'structured_output_repair' | 'evaluation' | 'repair' | 'comparison_control';
+
+/**
+ * CostQualityComparisonStatus
+ *
+ * Strength of the cost-and-quality claim supported by retained evidence.
+ */
+export type CostQualityComparisonStatus = 'verified' | 'measured_unmatched' | 'unpriced' | 'unavailable';
+
+/**
+ * CostQualityFinding
+ *
+ * One typed, bounded explanation of proof loss.
+ */
+export type CostQualityFinding = {
+    code: CostQualityFindingCode;
+    /**
+     * Detail
+     */
+    detail: string;
+    /**
+     * Field
+     */
+    field: string;
+};
+
+/**
+ * CostQualityFindingCode
+ *
+ * Stable reason a pair or aggregate cannot make a stronger claim.
+ */
+export type CostQualityFindingCode = 'missing_side' | 'workload_mismatch' | 'task_mismatch' | 'source_mismatch' | 'source_checkpoint_mismatch' | 'role_mismatch' | 'output_budget_mismatch' | 'generation_settings_mismatch' | 'missing_attempts' | 'duplicate_attempt' | 'attempt_sequence_invalid' | 'missing_attempt_identity' | 'missing_usage' | 'contradictory_usage' | 'missing_pricing_provenance' | 'pricing_catalog_mismatch' | 'pricing_provenance_mismatch' | 'mixed_currency' | 'unpriced_attempt' | 'quality_evidence_missing' | 'quality_contract_mismatch' | 'quality_evidence_invalid' | 'quality_gate_failed' | 'quality_gate_unavailable' | 'aggregate_cohort_mismatch';
+
+/**
+ * CostQualityPairExclusion
+ *
+ * Why one pair does not contribute to the verified aggregate percentage.
+ */
+export type CostQualityPairExclusion = {
+    /**
+     * Findings
+     */
+    findings: Array<CostQualityFinding>;
+    /**
+     * Pair Id
+     */
+    pair_id: string;
+    status: CostQualityComparisonStatus;
+};
+
+/**
+ * CostSessionTotals
+ */
+export type CostSessionTotals = {
+    /**
+     * Session Id
+     */
+    session_id: string;
+    totals: CostAccountingTotals;
 };
 
 /**
@@ -4958,6 +5619,7 @@ export type EvalRunInvocation = {
     authored_suite_selection_revision?: string | null;
     cost_budget?: EvalRunCostBudgetOutput | null;
     execution_profile?: EvalExecutionProfileBindingV1 | null;
+    execution_profile_snapshot?: EvalExecutionProfileV1 | null;
     limits?: RunLimits | null;
     /**
      * Max Steps
@@ -7054,6 +7716,48 @@ export type MemoryAttributionStatus = 'complete' | 'truncated' | 'unavailable' |
 export type MemoryAttributionUnavailableReason = 'store_unsupported' | 'evidence_read_failed' | 'alias_key_unavailable' | 'contradictory_evidence';
 
 /**
+ * MemoryCaseComparison
+ */
+export type MemoryCaseComparison = {
+    /**
+     * Candidate Variant Id
+     */
+    candidate_variant_id: string;
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Case Revision
+     */
+    case_revision: string;
+    /**
+     * Distributions
+     */
+    distributions: Array<MemoryMetricDistribution>;
+    /**
+     * Metric Roles
+     */
+    metric_roles: Array<MemoryMetricRole>;
+    /**
+     * Operational Distributions
+     */
+    operational_distributions: Array<MemoryOperationalDistribution>;
+    /**
+     * Pairs
+     */
+    pairs: Array<MemoryTrialPairComparison>;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+};
+
+/**
  * MemoryContextExposureAttribution
  *
  * Secret-free structural and lifecycle facts from one context exposure.
@@ -7145,6 +7849,249 @@ export type MemoryEvidenceAlias = {
 };
 
 /**
+ * MemoryExperimentCase
+ */
+export type MemoryExperimentCase = {
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Case Revision
+     */
+    case_revision: string;
+};
+
+/**
+ * MemoryExperimentGatePolicy
+ */
+export type MemoryExperimentGatePolicyInput = {
+    /**
+     * Cost Currency
+     */
+    cost_currency?: string | null;
+    /**
+     * Maximum Candidate Cost
+     */
+    maximum_candidate_cost?: number | string | null;
+    /**
+     * Metric Gates
+     */
+    metric_gates?: Array<MemoryMetricGate>;
+    /**
+     * Minimum Comparable Pairs
+     */
+    minimum_comparable_pairs?: number;
+    /**
+     * Require Priced Cost
+     */
+    require_priced_cost?: boolean;
+    /**
+     * Required Metric Roles
+     */
+    required_metric_roles?: Array<MemoryMetricRole>;
+};
+
+/**
+ * MemoryExperimentGatePolicy
+ */
+export type MemoryExperimentGatePolicyOutput = {
+    /**
+     * Cost Currency
+     */
+    cost_currency?: string | null;
+    /**
+     * Maximum Candidate Cost
+     */
+    maximum_candidate_cost?: string | null;
+    /**
+     * Metric Gates
+     */
+    metric_gates?: Array<MemoryMetricGate>;
+    /**
+     * Minimum Comparable Pairs
+     */
+    minimum_comparable_pairs?: number;
+    /**
+     * Require Priced Cost
+     */
+    require_priced_cost?: boolean;
+    /**
+     * Required Metric Roles
+     */
+    required_metric_roles?: Array<MemoryMetricRole>;
+};
+
+/**
+ * MemoryExperimentReport
+ */
+export type MemoryExperimentReport = {
+    /**
+     * Baseline Variant Id
+     */
+    baseline_variant_id: string;
+    /**
+     * Cases
+     */
+    cases: Array<MemoryExperimentCase>;
+    /**
+     * Comparisons
+     */
+    comparisons: Array<MemoryCaseComparison>;
+    /**
+     * Cost Quality
+     */
+    cost_quality: Array<MemoryVariantCostQualityReport>;
+    /**
+     * Dispositions
+     */
+    dispositions: Array<MemoryVariantDisposition>;
+    /**
+     * Experiment Id
+     */
+    experiment_id: string;
+    gates: MemoryExperimentGatePolicyOutput;
+    /**
+     * Metric Bindings
+     */
+    metric_bindings: Array<MemoryMetricBinding>;
+    /**
+     * Operational Summary
+     */
+    operational_summary: Array<MemoryVariantOperationalReport>;
+    /**
+     * Ranking
+     */
+    ranking: Array<MemoryRankingTerm>;
+    /**
+     * Record Type
+     */
+    record_type?: 'cayu.memory-experiment-report';
+    /**
+     * Repetitions
+     */
+    repetitions: number;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Rows
+     */
+    rows: Array<MemoryTrialReportRow>;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Selected Variant Id
+     */
+    selected_variant_id: string;
+    /**
+     * Variants
+     */
+    variants: Array<MemoryExperimentVariant>;
+};
+
+/**
+ * MemoryExperimentReportRequest
+ */
+export type MemoryExperimentReportRequest = {
+    /**
+     * Baseline Variant Id
+     */
+    baseline_variant_id: string;
+    /**
+     * Cases
+     */
+    cases: Array<MemoryExperimentCase>;
+    /**
+     * Experiment Id
+     */
+    experiment_id: string;
+    gates?: MemoryExperimentGatePolicyInput;
+    /**
+     * Metric Bindings
+     */
+    metric_bindings?: Array<MemoryMetricBinding>;
+    /**
+     * Published Results
+     */
+    published_results?: Array<MemoryPublishedResultEvidence>;
+    /**
+     * Ranking
+     */
+    ranking?: Array<MemoryRankingTerm>;
+    /**
+     * Repetitions
+     */
+    repetitions: number;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Trials
+     */
+    trials?: Array<MemoryExperimentTrialEvidence>;
+    /**
+     * Variants
+     */
+    variants: Array<MemoryExperimentVariant>;
+};
+
+/**
+ * MemoryExperimentTrialEvidence
+ */
+export type MemoryExperimentTrialEvidence = {
+    accounting_side?: PairedCostQualitySideInput | null;
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Case Revision
+     */
+    case_revision: string;
+    execution: MemoryInterventionExecutionRecord;
+    intervention_binding?: MemoryInterventionTrialBinding | null;
+    memory_overhead?: MemoryPreparationOverheadEvidence | null;
+    /**
+     * Published Result Revision
+     */
+    published_result_revision?: string | null;
+    /**
+     * Repetition
+     */
+    repetition: number;
+    /**
+     * Variant Id
+     */
+    variant_id: string;
+};
+
+/**
+ * MemoryExperimentVariant
+ */
+export type MemoryExperimentVariant = {
+    /**
+     * Candidate Id
+     */
+    candidate_id: string;
+    /**
+     * Evaluator Fingerprint
+     */
+    evaluator_fingerprint: string;
+    execution_profile: EvalExecutionProfileV1;
+    execution_profile_binding: EvalExecutionProfileBindingV1;
+    spec: MemoryInterventionSpec;
+    /**
+     * Variant Id
+     */
+    variant_id: string;
+};
+
+/**
  * MemoryExposureItemAttribution
  */
 export type MemoryExposureItemAttribution = {
@@ -7176,6 +8123,841 @@ export type MemoryExposureTransitionAttribution = {
      */
     revision: number;
     state: ContextExposureState;
+};
+
+/**
+ * MemoryInterventionBounds
+ *
+ * Precommitted upper bounds for one memory-only intervention.
+ */
+export type MemoryInterventionBounds = {
+    /**
+     * Max Changed Items
+     */
+    max_changed_items: number;
+    /**
+     * Max Effect Receipts
+     */
+    max_effect_receipts?: number;
+    /**
+     * Max Fixture Bytes
+     */
+    max_fixture_bytes: number;
+};
+
+/**
+ * MemoryInterventionChangeKind
+ */
+export type MemoryInterventionChangeKind = 'omit' | 'replace' | 'inject_negative_control';
+
+/**
+ * MemoryInterventionEffectReceiptRef
+ *
+ * Bounded identity of one application-owned effect receipt.
+ */
+export type MemoryInterventionEffectReceiptRef = {
+    /**
+     * Effect Fingerprint
+     */
+    effect_fingerprint: string;
+    /**
+     * Owner Id
+     */
+    owner_id: string;
+    /**
+     * Receipt Fingerprint
+     */
+    receipt_fingerprint: string;
+};
+
+/**
+ * MemoryInterventionEffectStatus
+ */
+export type MemoryInterventionEffectStatus = 'verified_no_change' | 'applied' | 'matched_no_items' | 'indeterminate' | 'conflicting';
+
+/**
+ * MemoryInterventionExecutionPhase
+ */
+export type MemoryInterventionExecutionPhase = 'prepared' | 'trial_bound' | 'effect_resolved' | 'session_bound' | 'runtime_terminal' | 'evaluated' | 'finalized';
+
+/**
+ * MemoryInterventionExecutionRecord
+ *
+ * One CAS-owned durable execution journal row.
+ */
+export type MemoryInterventionExecutionRecord = {
+    /**
+     * Candidate Id
+     */
+    candidate_id: string;
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Case Revision
+     */
+    case_revision: string;
+    /**
+     * Causal Budget Id
+     */
+    causal_budget_id: string;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Eval Result Revision
+     */
+    eval_result_revision?: string | null;
+    /**
+     * Evaluator Fingerprint
+     */
+    evaluator_fingerprint: string;
+    /**
+     * Execution Id
+     */
+    execution_id: string;
+    /**
+     * Failure Code
+     */
+    failure_code?: 'intervention_conflicting' | 'intervention_indeterminate' | 'runtime_cancelled' | 'runtime_failed' | 'runtime_outcome_unknown' | 'runtime_timed_out' | null;
+    /**
+     * Final Binding Fingerprint
+     */
+    final_binding_fingerprint?: string | null;
+    /**
+     * Materialization Fingerprint
+     */
+    materialization_fingerprint?: string | null;
+    /**
+     * Operation Fingerprint
+     */
+    operation_fingerprint?: string | null;
+    /**
+     * Overlay Provider Fingerprint
+     */
+    overlay_provider_fingerprint: string;
+    /**
+     * Overlay Provider Id
+     */
+    overlay_provider_id: string;
+    phase: MemoryInterventionExecutionPhase;
+    /**
+     * Receipt Fingerprint
+     */
+    receipt_fingerprint?: string | null;
+    /**
+     * Record Type
+     */
+    record_type?: 'cayu.memory-intervention-execution';
+    /**
+     * Request Fingerprint
+     */
+    request_fingerprint: string;
+    /**
+     * Request Key Id
+     */
+    request_key_id: string;
+    /**
+     * Required Execution Profile Fingerprint
+     */
+    required_execution_profile_fingerprint: string;
+    /**
+     * Revision
+     */
+    revision: number;
+    /**
+     * Runtime Cancellation Observed
+     */
+    runtime_cancellation_observed?: boolean;
+    /**
+     * Runtime Deadline At
+     */
+    runtime_deadline_at?: string | null;
+    /**
+     * Runtime Dispatch Lease Expires At
+     */
+    runtime_dispatch_lease_expires_at?: string | null;
+    /**
+     * Runtime Dispatch Owner Id
+     */
+    runtime_dispatch_owner_id?: string | null;
+    /**
+     * Runtime Evidence Fingerprint
+     */
+    runtime_evidence_fingerprint?: string | null;
+    /**
+     * Runtime Execution Profile Fingerprint
+     */
+    runtime_execution_profile_fingerprint: string;
+    /**
+     * Runtime Result Fingerprint
+     */
+    runtime_result_fingerprint?: string | null;
+    /**
+     * Runtime Result Payload
+     */
+    runtime_result_payload?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * Runtime Runner Fingerprint
+     */
+    runtime_runner_fingerprint: string;
+    /**
+     * Runtime Session Claim Id
+     */
+    runtime_session_claim_id?: string | null;
+    /**
+     * Runtime Timeout Observed
+     */
+    runtime_timeout_observed?: boolean;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Snapshot Result Fingerprint
+     */
+    snapshot_result_fingerprint?: string | null;
+    /**
+     * Spec Fingerprint
+     */
+    spec_fingerprint: string;
+    status?: MemoryInterventionExecutionStatus;
+    /**
+     * Trial Binding Fingerprint
+     */
+    trial_binding_fingerprint?: string | null;
+    /**
+     * Trial Id
+     */
+    trial_id: string;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+};
+
+/**
+ * MemoryInterventionExecutionStatus
+ */
+export type MemoryInterventionExecutionStatus = 'active' | 'completed' | 'failed' | 'cancelled' | 'timed_out' | 'outcome_unknown' | 'conflicting' | 'indeterminate';
+
+/**
+ * MemoryInterventionFixtureRef
+ *
+ * Content-addressed evaluation input; never a store location or memory text.
+ */
+export type MemoryInterventionFixtureRef = {
+    /**
+     * Fixture Fingerprint
+     */
+    fixture_fingerprint: string;
+    /**
+     * Fixture Id
+     */
+    fixture_id: string;
+    /**
+     * Representation Fingerprint
+     */
+    representation_fingerprint: string;
+    /**
+     * Size Bytes
+     */
+    size_bytes: number;
+};
+
+/**
+ * MemoryInterventionItemChange
+ *
+ * One bounded omission, replacement, or control-fixture injection.
+ */
+export type MemoryInterventionItemChange = {
+    fixture?: MemoryInterventionFixtureRef | null;
+    kind: MemoryInterventionChangeKind;
+    source_item?: MemoryInterventionItemIdentity | null;
+};
+
+/**
+ * MemoryInterventionItemIdentity
+ *
+ * One exact revision-bound item identity without retained memory text.
+ */
+export type MemoryInterventionItemIdentity = {
+    alias?: MemoryEvidenceAlias | null;
+    /**
+     * Item Fingerprint
+     */
+    item_fingerprint?: string | null;
+    kind: MemoryInterventionItemIdentityKind;
+    /**
+     * Revision Fingerprint
+     */
+    revision_fingerprint: string;
+};
+
+/**
+ * MemoryInterventionItemIdentityKind
+ */
+export type MemoryInterventionItemIdentityKind = 'alias' | 'fingerprint';
+
+/**
+ * MemoryInterventionKind
+ */
+export type MemoryInterventionKind = 'as_declared' | 'automatic_recall_off' | 'omit_items' | 'replace_items' | 'negative_control';
+
+/**
+ * MemoryInterventionOperation
+ *
+ * Precommitment binding one spec to one isolated materialization and trial.
+ */
+export type MemoryInterventionOperation = {
+    /**
+     * Candidate Id
+     */
+    candidate_id: string;
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Fingerprint
+     */
+    fingerprint: string;
+    intervention_kind: MemoryInterventionKind;
+    /**
+     * Materialization Fingerprint
+     */
+    materialization_fingerprint: string;
+    /**
+     * Memory Overlay Fingerprint
+     */
+    memory_overlay_fingerprint: string;
+    /**
+     * Memory State Fingerprint
+     */
+    memory_state_fingerprint: string;
+    /**
+     * Record Type
+     */
+    record_type?: 'cayu.memory-intervention-operation';
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Snapshot Fingerprint
+     */
+    snapshot_fingerprint: string;
+    /**
+     * Spec Fingerprint
+     */
+    spec_fingerprint: string;
+    /**
+     * State Scope Id
+     */
+    state_scope_id: string;
+    /**
+     * Trial Binding Fingerprint
+     */
+    trial_binding_fingerprint: string;
+    /**
+     * Trial Id
+     */
+    trial_id: string;
+    trial_state_mode: AgentSnapshotTrialStateMode;
+};
+
+/**
+ * MemoryInterventionReceipt
+ *
+ * Deterministic evidence of the exact outcome of one precommitted operation.
+ */
+export type MemoryInterventionReceipt = {
+    /**
+     * Application Effect Receipts
+     */
+    application_effect_receipts?: Array<MemoryInterventionEffectReceiptRef>;
+    /**
+     * Changed Item Revision Fingerprints
+     */
+    changed_item_revision_fingerprints?: Array<string>;
+    /**
+     * Effect Fingerprints
+     */
+    effect_fingerprints?: Array<string>;
+    /**
+     * Evidence Only
+     */
+    evidence_only?: true;
+    /**
+     * Fingerprint
+     */
+    fingerprint: string;
+    intervention_kind: MemoryInterventionKind;
+    /**
+     * Matched Item Count
+     */
+    matched_item_count: number;
+    /**
+     * Materialization Fingerprint
+     */
+    materialization_fingerprint: string;
+    /**
+     * Memory Overlay Fingerprint
+     */
+    memory_overlay_fingerprint: string;
+    /**
+     * Operation Fingerprint
+     */
+    operation_fingerprint: string;
+    /**
+     * Production Mutation Allowed
+     */
+    production_mutation_allowed?: false;
+    /**
+     * Record Type
+     */
+    record_type?: 'cayu.memory-intervention-receipt';
+    /**
+     * Result Memory State Fingerprint
+     */
+    result_memory_state_fingerprint?: string | null;
+    /**
+     * Result Recall Policy Fingerprint
+     */
+    result_recall_policy_fingerprint?: string | null;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Snapshot Fingerprint
+     */
+    snapshot_fingerprint: string;
+    /**
+     * Spec Fingerprint
+     */
+    spec_fingerprint: string;
+    /**
+     * Starting Memory State Fingerprint
+     */
+    starting_memory_state_fingerprint: string;
+    /**
+     * State Scope Id
+     */
+    state_scope_id: string;
+    status: MemoryInterventionEffectStatus;
+};
+
+/**
+ * MemoryInterventionSpec
+ *
+ * Immutable declaration of one fixed intervention over a snapshot memory frontier.
+ */
+export type MemoryInterventionSpec = {
+    /**
+     * Authority Scope Fingerprint
+     */
+    authority_scope_fingerprint: string;
+    bounds: MemoryInterventionBounds;
+    /**
+     * Changes
+     */
+    changes?: Array<MemoryInterventionItemChange>;
+    /**
+     * Evidence Only
+     */
+    evidence_only?: true;
+    /**
+     * Execution Profile Fingerprint
+     */
+    execution_profile_fingerprint: string;
+    /**
+     * Fingerprint
+     */
+    fingerprint: string;
+    kind: MemoryInterventionKind;
+    /**
+     * Memory State Fingerprint
+     */
+    memory_state_fingerprint: string;
+    negative_control_kind?: MemoryNegativeControlKind | null;
+    /**
+     * Production Mutation Allowed
+     */
+    production_mutation_allowed?: false;
+    /**
+     * Proposer Fingerprint
+     */
+    proposer_fingerprint?: string | null;
+    /**
+     * Reason
+     */
+    reason?: string | null;
+    /**
+     * Recall Policy Ref Fingerprint
+     */
+    recall_policy_ref_fingerprint: string;
+    /**
+     * Record Type
+     */
+    record_type?: 'cayu.memory-intervention-spec';
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Snapshot Fingerprint
+     */
+    snapshot_fingerprint: string;
+    /**
+     * Source Fingerprint
+     */
+    source_fingerprint?: string | null;
+    /**
+     * Spec Id
+     */
+    spec_id: string;
+    starting_recall_mode: AutomaticRecallMode;
+    /**
+     * Starting Recall Policy Fingerprint
+     */
+    starting_recall_policy_fingerprint: string;
+    trial_recall_mode: AutomaticRecallMode;
+    /**
+     * Trial Recall Policy Fingerprint
+     */
+    trial_recall_policy_fingerprint: string;
+    trial_state_mode: AgentSnapshotTrialStateMode;
+};
+
+/**
+ * MemoryInterventionTrialBinding
+ *
+ * Bind one intervention effect to Cayu trial, result, and attribution records.
+ */
+export type MemoryInterventionTrialBinding = {
+    attribution: MemoryAttribution;
+    /**
+     * Attribution Fingerprint
+     */
+    attribution_fingerprint: string;
+    /**
+     * Expected Exposure Count
+     */
+    expected_exposure_count?: number | null;
+    /**
+     * Expected Receipt Count
+     */
+    expected_receipt_count?: number | null;
+    /**
+     * Fingerprint
+     */
+    fingerprint: string;
+    operation: MemoryInterventionOperation;
+    receipt: MemoryInterventionReceipt;
+    /**
+     * Record Type
+     */
+    record_type?: 'cayu.memory-intervention-trial';
+    result: AgentSnapshotResultBinding;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    spec: MemoryInterventionSpec;
+    /**
+     * Terminal Evidence Available
+     */
+    terminal_evidence_available?: boolean;
+    trial: AgentSnapshotTrialBinding;
+};
+
+/**
+ * MemoryMetricAvailability
+ */
+export type MemoryMetricAvailability = 'available' | 'unavailable' | 'error';
+
+/**
+ * MemoryMetricBinding
+ */
+export type MemoryMetricBinding = {
+    /**
+     * Assertion Id
+     */
+    assertion_id: string;
+    /**
+     * Assertion Revision
+     */
+    assertion_revision: string;
+    direction?: MemoryMetricDirection;
+    role: MemoryMetricRole;
+};
+
+/**
+ * MemoryMetricDelta
+ */
+export type MemoryMetricDelta = {
+    /**
+     * Baseline
+     */
+    baseline: number;
+    /**
+     * Candidate
+     */
+    candidate: number;
+    /**
+     * Delta
+     */
+    delta: number;
+    role: MemoryMetricRole;
+};
+
+/**
+ * MemoryMetricDirection
+ */
+export type MemoryMetricDirection = 'higher_is_better' | 'lower_is_better';
+
+/**
+ * MemoryMetricDistribution
+ */
+export type MemoryMetricDistribution = {
+    /**
+     * Available Count
+     */
+    available_count: number;
+    /**
+     * Baseline Values
+     */
+    baseline_values?: Array<number>;
+    /**
+     * Candidate Values
+     */
+    candidate_values?: Array<number>;
+    /**
+     * Deltas
+     */
+    deltas?: Array<number>;
+    /**
+     * Incomparable Count
+     */
+    incomparable_count: number;
+    /**
+     * Mean Delta
+     */
+    mean_delta?: number | null;
+    /**
+     * Median Delta
+     */
+    median_delta?: number | null;
+    /**
+     * Pair Count
+     */
+    pair_count: number;
+    role: MemoryMetricRole;
+    /**
+     * Unavailable Count
+     */
+    unavailable_count: number;
+};
+
+/**
+ * MemoryMetricGate
+ */
+export type MemoryMetricGate = {
+    /**
+     * Maximum
+     */
+    maximum?: number | null;
+    /**
+     * Minimum
+     */
+    minimum?: number | null;
+    role: MemoryMetricRole;
+};
+
+/**
+ * MemoryMetricObservation
+ */
+export type MemoryMetricObservation = {
+    /**
+     * Assertion Id
+     */
+    assertion_id: string;
+    /**
+     * Assertion Revision
+     */
+    assertion_revision: string;
+    availability: MemoryMetricAvailability;
+    /**
+     * Evaluator Implementation Revision
+     */
+    evaluator_implementation_revision?: string | null;
+    /**
+     * Evaluator Key
+     */
+    evaluator_key?: string | null;
+    /**
+     * Outcome
+     */
+    outcome?: 'passed' | 'failed' | 'unavailable' | 'error' | null;
+    role: MemoryMetricRole;
+    /**
+     * Value
+     */
+    value?: number | null;
+};
+
+/**
+ * MemoryMetricRole
+ */
+export type MemoryMetricRole = 'task_quality' | 'factual_support' | 'hallucination_avoidance' | 'safety' | 'privacy' | 'stale_exposure_avoidance' | 'false_exposure_avoidance' | 'unauthorized_exposure_avoidance';
+
+/**
+ * MemoryNegativeControlKind
+ */
+export type MemoryNegativeControlKind = 'irrelevant' | 'stale' | 'conflicting' | 'adversarial';
+
+/**
+ * MemoryOperationalDelta
+ */
+export type MemoryOperationalDelta = {
+    /**
+     * Baseline
+     */
+    baseline: string;
+    /**
+     * Candidate
+     */
+    candidate: string;
+    /**
+     * Delta
+     */
+    delta: string;
+    dimension: MemoryOperationalDimension;
+};
+
+/**
+ * MemoryOperationalDimension
+ */
+export type MemoryOperationalDimension = 'latency_ms' | 'total_tokens' | 'memory_preparation_duration_ms' | 'memory_context_tokens' | 'memory_context_bytes';
+
+/**
+ * MemoryOperationalDistribution
+ */
+export type MemoryOperationalDistribution = {
+    /**
+     * Available Count
+     */
+    available_count: number;
+    /**
+     * Baseline Values
+     */
+    baseline_values?: Array<string>;
+    /**
+     * Candidate Values
+     */
+    candidate_values?: Array<string>;
+    /**
+     * Deltas
+     */
+    deltas?: Array<string>;
+    dimension: MemoryOperationalDimension;
+    /**
+     * Incomparable Count
+     */
+    incomparable_count: number;
+    /**
+     * Mean Delta
+     */
+    mean_delta?: number | null;
+    /**
+     * Median Delta
+     */
+    median_delta?: number | null;
+    /**
+     * Pair Count
+     */
+    pair_count: number;
+    /**
+     * Unavailable Count
+     */
+    unavailable_count: number;
+};
+
+/**
+ * MemoryPairStatus
+ */
+export type MemoryPairStatus = 'comparable' | 'incomparable' | 'unavailable';
+
+/**
+ * MemoryPreparationOverheadEvidence
+ */
+export type MemoryPreparationOverheadEvidence = {
+    /**
+     * Context Bytes
+     */
+    context_bytes?: number | null;
+    /**
+     * Context Tokens
+     */
+    context_tokens?: number | null;
+    /**
+     * Evidence Revision
+     */
+    evidence_revision: string;
+    /**
+     * Preparation Duration Ms
+     */
+    preparation_duration_ms?: number | null;
+};
+
+/**
+ * MemoryPublishedResultEvidence
+ *
+ * One complete content-addressed EvalStore result available to report rows.
+ */
+export type MemoryPublishedResultEvidence = {
+    /**
+     * CorpusExecutionResult
+     *
+     * Safe published run plus the fresh target identity used to produce it.
+     */
+    result: {
+        /**
+         * External Trials
+         */
+        external_trials?: Array<ExternalTrialIdentityV1>;
+        /**
+         * Revision
+         */
+        revision: string;
+        run: PublishedEvalRun;
+        /**
+         * Schema Version
+         */
+        schema_version?: 3;
+        target: EvaluationTargetIdentity;
+    };
+    /**
+     * Run Id
+     */
+    run_id: string;
+};
+
+/**
+ * MemoryRankingTerm
+ */
+export type MemoryRankingTerm = {
+    direction: MemoryMetricDirection;
+    role: MemoryMetricRole;
 };
 
 /**
@@ -7267,6 +9049,266 @@ export type MemoryRecallItemAttribution = {
      */
     ordinal: number;
     selection_reason: RecallItemSelectionReason;
+};
+
+/**
+ * MemoryTrialAvailability
+ */
+export type MemoryTrialAvailability = 'available' | 'unavailable' | 'missing' | 'unmatched' | 'failed' | 'cancelled' | 'timed_out' | 'outcome_unknown' | 'conflicting' | 'indeterminate';
+
+/**
+ * MemoryTrialPairComparison
+ */
+export type MemoryTrialPairComparison = {
+    accounting_pair?: PairedCostQualityPairReport | null;
+    /**
+     * Baseline Row Id
+     */
+    baseline_row_id: string;
+    /**
+     * Baseline Variant Id
+     */
+    baseline_variant_id: string;
+    /**
+     * Candidate Row Id
+     */
+    candidate_row_id: string;
+    /**
+     * Candidate Variant Id
+     */
+    candidate_variant_id: string;
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Case Revision
+     */
+    case_revision: string;
+    /**
+     * Memory Comparability Fingerprint
+     */
+    memory_comparability_fingerprint?: string | null;
+    /**
+     * Metric Deltas
+     */
+    metric_deltas?: Array<MemoryMetricDelta>;
+    /**
+     * Operational Deltas
+     */
+    operational_deltas?: Array<MemoryOperationalDelta>;
+    /**
+     * Pair Id
+     */
+    pair_id: string;
+    /**
+     * Reasons
+     */
+    reasons?: Array<string>;
+    /**
+     * Repetition
+     */
+    repetition: number;
+    status: MemoryPairStatus;
+};
+
+/**
+ * MemoryTrialReportRow
+ */
+export type MemoryTrialReportRow = {
+    accounting_side?: PairedCostQualitySideOutput | null;
+    /**
+     * Attribution Evidence Revision
+     */
+    attribution_evidence_revision?: string | null;
+    attribution_status?: EvalMemoryEvidenceCompleteness | null;
+    availability: MemoryTrialAvailability;
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Case Revision
+     */
+    case_revision: string;
+    /**
+     * Corpus Revision
+     */
+    corpus_revision?: string | null;
+    /**
+     * Duration Ms
+     */
+    duration_ms?: number | null;
+    /**
+     * Evaluator Fingerprint
+     */
+    evaluator_fingerprint: string;
+    /**
+     * Evidence Policy Revision
+     */
+    evidence_policy_revision?: string | null;
+    /**
+     * Execution Binding Lineage Revision
+     */
+    execution_binding_lineage_revision?: string | null;
+    /**
+     * Execution Id
+     */
+    execution_id?: string | null;
+    /**
+     * Execution Profile Revision
+     */
+    execution_profile_revision: string;
+    /**
+     * Execution Revision
+     */
+    execution_revision?: number | null;
+    execution_status?: MemoryInterventionExecutionStatus | null;
+    /**
+     * Final Binding Fingerprint
+     */
+    final_binding_fingerprint?: string | null;
+    /**
+     * Intervention Attribution Fingerprint
+     */
+    intervention_attribution_fingerprint?: string | null;
+    intervention_binding?: MemoryInterventionTrialBinding | null;
+    /**
+     * Intervention Spec Fingerprint
+     */
+    intervention_spec_fingerprint: string;
+    memory_overhead?: MemoryPreparationOverheadEvidence | null;
+    /**
+     * Metrics
+     */
+    metrics?: Array<MemoryMetricObservation>;
+    /**
+     * Model
+     */
+    model: string;
+    /**
+     * Pricing Profile Fingerprint
+     */
+    pricing_profile_fingerprint?: string | null;
+    /**
+     * Provider Name
+     */
+    provider_name: string;
+    /**
+     * Published Result Revision
+     */
+    published_result_revision?: string | null;
+    /**
+     * Published Run Id
+     */
+    published_run_id?: string | null;
+    /**
+     * Published Status
+     */
+    published_status?: 'passed' | 'failed' | 'unavailable' | 'error' | null;
+    /**
+     * Repetition
+     */
+    repetition: number;
+    /**
+     * Row Id
+     */
+    row_id: string;
+    /**
+     * Runtime Execution Profile Fingerprint
+     */
+    runtime_execution_profile_fingerprint: string;
+    /**
+     * Snapshot Fingerprint
+     */
+    snapshot_fingerprint: string;
+    /**
+     * Source Trial Revision
+     */
+    source_trial_revision?: string | null;
+    /**
+     * Suite Id
+     */
+    suite_id?: string | null;
+    /**
+     * Suite Revision
+     */
+    suite_revision?: string | null;
+    /**
+     * Total Tokens
+     */
+    total_tokens?: string | null;
+    /**
+     * Trial Id
+     */
+    trial_id?: string | null;
+    /**
+     * Variant Id
+     */
+    variant_id: string;
+};
+
+/**
+ * MemoryVariantCostQualityReport
+ *
+ * Canonical #300 evidence scoped to one candidate versus the baseline.
+ */
+export type MemoryVariantCostQualityReport = {
+    /**
+     * Candidate Variant Id
+     */
+    candidate_variant_id: string;
+    report?: PairedCostQualityComparisonReport | null;
+};
+
+/**
+ * MemoryVariantDisposition
+ */
+export type MemoryVariantDisposition = {
+    /**
+     * Comparable Pair Count
+     */
+    comparable_pair_count: number;
+    /**
+     * Incomparable Pair Count
+     */
+    incomparable_pair_count: number;
+    /**
+     * Ranking Values
+     */
+    ranking_values?: Array<number | null>;
+    /**
+     * Reasons
+     */
+    reasons: Array<string>;
+    status: MemoryVariantDispositionStatus;
+    /**
+     * Unavailable Pair Count
+     */
+    unavailable_pair_count: number;
+    /**
+     * Variant Id
+     */
+    variant_id: string;
+};
+
+/**
+ * MemoryVariantDispositionStatus
+ */
+export type MemoryVariantDispositionStatus = 'selected' | 'baseline_superseded' | 'eligible_not_selected' | 'rejected' | 'incomparable' | 'unavailable' | 'not_better_than_baseline';
+
+/**
+ * MemoryVariantOperationalReport
+ */
+export type MemoryVariantOperationalReport = {
+    /**
+     * Candidate Variant Id
+     */
+    candidate_variant_id: string;
+    /**
+     * Distributions
+     */
+    distributions: Array<MemoryOperationalDistribution>;
 };
 
 /**
@@ -7453,6 +9495,360 @@ export type OptionalSurfaceCapability = {
     configured: boolean;
     mutate: CapabilityOperation;
     read: CapabilityOperation;
+};
+
+/**
+ * PairedCostAttempt
+ *
+ * One attributable provider attempt and its provider-reported cost evidence.
+ */
+export type PairedCostAttemptInput = {
+    /**
+     * Attempt Id
+     */
+    attempt_id: string;
+    /**
+     * Attempt Ordinal
+     */
+    attempt_ordinal: number;
+    /**
+     * Branch Id
+     */
+    branch_id?: string | null;
+    cost?: ComparisonCostLineItemInput | null;
+    /**
+     * Model
+     */
+    model?: string | null;
+    operation: CostQualityAttemptOperation;
+    /**
+     * Operation Id
+     */
+    operation_id: string;
+    /**
+     * Provider Name
+     */
+    provider_name?: string | null;
+    /**
+     * Role
+     */
+    role: string;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Source Checkpoint Id
+     */
+    source_checkpoint_id?: string | null;
+    /**
+     * Usage Unavailable Reason
+     */
+    usage_unavailable_reason?: string | null;
+};
+
+/**
+ * PairedCostAttempt
+ *
+ * One attributable provider attempt and its provider-reported cost evidence.
+ */
+export type PairedCostAttemptOutput = {
+    /**
+     * Attempt Id
+     */
+    attempt_id: string;
+    /**
+     * Attempt Ordinal
+     */
+    attempt_ordinal: number;
+    /**
+     * Branch Id
+     */
+    branch_id?: string | null;
+    cost?: ComparisonCostLineItemOutput | null;
+    /**
+     * Model
+     */
+    model?: string | null;
+    operation: CostQualityAttemptOperation;
+    /**
+     * Operation Id
+     */
+    operation_id: string;
+    /**
+     * Provider Name
+     */
+    provider_name?: string | null;
+    /**
+     * Role
+     */
+    role: string;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Source Checkpoint Id
+     */
+    source_checkpoint_id?: string | null;
+    /**
+     * Usage Unavailable Reason
+     */
+    usage_unavailable_reason?: string | null;
+};
+
+/**
+ * PairedCostQualityComparisonReport
+ *
+ * Versioned, serialization-safe result of one pure comparison.
+ */
+export type PairedCostQualityComparisonReport = {
+    aggregate: CostQualityAggregateReport;
+    /**
+     * Pairs
+     */
+    pairs: Array<PairedCostQualityPairReport>;
+    /**
+     * Schema Version
+     */
+    schema_version?: 3;
+    status: CostQualityComparisonStatus;
+};
+
+/**
+ * PairedCostQualityPairReport
+ *
+ * One pair's raw accounting and strongest supportable claim.
+ */
+export type PairedCostQualityPairReport = {
+    baseline: PairedCostQualitySideReport | null;
+    /**
+     * Baseline Cost
+     */
+    baseline_cost: string | null;
+    candidate: PairedCostQualitySideReport | null;
+    /**
+     * Candidate Cost
+     */
+    candidate_cost: string | null;
+    cost_direction: CostDirection;
+    /**
+     * Currency
+     */
+    currency: string | null;
+    /**
+     * Eligible For Verified Aggregate
+     */
+    eligible_for_verified_aggregate: boolean;
+    /**
+     * Findings
+     */
+    findings: Array<CostQualityFinding>;
+    /**
+     * Pair Id
+     */
+    pair_id: string;
+    /**
+     * Savings
+     */
+    savings: string | null;
+    /**
+     * Savings Percentage
+     */
+    savings_percentage: string | null;
+    savings_percentage_state: SavingsPercentageState;
+    status: CostQualityComparisonStatus;
+};
+
+/**
+ * PairedCostQualitySide
+ *
+ * One baseline or candidate strategy under a matched comparison contract.
+ */
+export type PairedCostQualitySideInput = {
+    /**
+     * Attempts
+     */
+    attempts?: Array<PairedCostAttemptInput>;
+    generation_settings: ComparableGenerationSettings;
+    output_budget: ComparableOutputBudget;
+    pricing_catalog?: ComparisonPricingCatalog | null;
+    quality?: PairedQualityEvidenceInput | null;
+    /**
+     * Role
+     */
+    role: string;
+    /**
+     * Source Id
+     */
+    source_id: string;
+    /**
+     * Strategy Id
+     */
+    strategy_id: string;
+    /**
+     * Task Id
+     */
+    task_id: string;
+    /**
+     * Workload Id
+     */
+    workload_id: string;
+};
+
+/**
+ * PairedCostQualitySide
+ *
+ * One baseline or candidate strategy under a matched comparison contract.
+ */
+export type PairedCostQualitySideOutput = {
+    /**
+     * Attempts
+     */
+    attempts?: Array<PairedCostAttemptOutput>;
+    generation_settings: ComparableGenerationSettings;
+    output_budget: ComparableOutputBudget;
+    pricing_catalog?: ComparisonPricingCatalog | null;
+    quality?: PairedQualityEvidenceOutput | null;
+    /**
+     * Role
+     */
+    role: string;
+    /**
+     * Source Id
+     */
+    source_id: string;
+    /**
+     * Strategy Id
+     */
+    strategy_id: string;
+    /**
+     * Task Id
+     */
+    task_id: string;
+    /**
+     * Workload Id
+     */
+    workload_id: string;
+};
+
+/**
+ * PairedCostQualitySideReport
+ *
+ * Safe, deterministic accounting projection for one supplied side.
+ */
+export type PairedCostQualitySideReport = {
+    /**
+     * Attempts
+     */
+    attempts: Array<PairedCostAttemptOutput>;
+    /**
+     * Branches
+     */
+    branches: Array<CostBranchTotals>;
+    generation_settings: ComparableGenerationSettings;
+    /**
+     * Operations
+     */
+    operations: Array<CostOperationTotals>;
+    output_budget: ComparableOutputBudget;
+    pricing_catalog: ComparisonPricingCatalog | null;
+    /**
+     * Pricing Provenance
+     */
+    pricing_provenance: Array<ComparisonPricingProvenance>;
+    quality: PairedQualityEvidenceOutput | null;
+    /**
+     * Role
+     */
+    role: string;
+    /**
+     * Sessions
+     */
+    sessions: Array<CostSessionTotals>;
+    /**
+     * Source Id
+     */
+    source_id: string;
+    /**
+     * Strategy Id
+     */
+    strategy_id: string;
+    /**
+     * Task Id
+     */
+    task_id: string;
+    whole_harness: CostAccountingTotals;
+    /**
+     * Workload Id
+     */
+    workload_id: string;
+};
+
+/**
+ * PairedQualityEvidence
+ *
+ * Application-owned result from one declared quality contract.
+ */
+export type PairedQualityEvidenceInput = {
+    /**
+     * Contract Name
+     */
+    contract_name: string;
+    /**
+     * Contract Version
+     */
+    contract_version: string;
+    /**
+     * References
+     */
+    references?: Array<QualityEvidenceReference>;
+    /**
+     * Role
+     */
+    role: string;
+    /**
+     * Score
+     */
+    score?: number | string | null;
+    status: QualityEvidenceStatus;
+    /**
+     * Threshold
+     */
+    threshold: number | string;
+};
+
+/**
+ * PairedQualityEvidence
+ *
+ * Application-owned result from one declared quality contract.
+ */
+export type PairedQualityEvidenceOutput = {
+    /**
+     * Contract Name
+     */
+    contract_name: string;
+    /**
+     * Contract Version
+     */
+    contract_version: string;
+    /**
+     * References
+     */
+    references?: Array<QualityEvidenceReference>;
+    /**
+     * Role
+     */
+    role: string;
+    /**
+     * Score
+     */
+    score?: string | null;
+    status: QualityEvidenceStatus;
+    /**
+     * Threshold
+     */
+    threshold: string;
 };
 
 /**
@@ -8254,7 +10650,7 @@ export type PublishedEvalRun = {
     /**
      * Schema Version
      */
-    schema_version: 4;
+    schema_version: 5;
     /**
      * Score
      */
@@ -8304,6 +10700,10 @@ export type PublishedEvalTrialResult = {
      * Score
      */
     score?: number | null;
+    /**
+     * Source Trial Revision
+     */
+    source_trial_revision: string;
     /**
      * Status
      */
@@ -8721,6 +11121,29 @@ export type PublishedUsageSummaryV1 = {
 };
 
 /**
+ * QualityEvidenceReference
+ *
+ * Opaque, non-secret identifier for application-owned quality evidence.
+ */
+export type QualityEvidenceReference = {
+    /**
+     * Kind
+     */
+    kind: string;
+    /**
+     * Reference
+     */
+    reference: string;
+};
+
+/**
+ * QualityEvidenceStatus
+ *
+ * Outcome of one application-owned quality gate.
+ */
+export type QualityEvidenceStatus = 'passed' | 'failed' | 'unavailable';
+
+/**
  * RecallItemAdmission
  */
 export type RecallItemAdmission = 'admitted' | 'offered';
@@ -9080,6 +11503,13 @@ export type RuntimeManifest = {
      */
     tool_timeout_seconds: number | null;
 };
+
+/**
+ * SavingsPercentageState
+ *
+ * Why a savings percentage is present or absent.
+ */
+export type SavingsPercentageState = 'computed' | 'zero_baseline' | 'unavailable';
 
 /**
  * ScenarioApprovalCheckpointEventV2
@@ -12694,6 +15124,82 @@ export type ListEvalCasesApiEvalsCorporaCorpusRevisionSuitesSuiteIdCasesGetRespo
 };
 
 export type ListEvalCasesApiEvalsCorporaCorpusRevisionSuitesSuiteIdCasesGetResponse = ListEvalCasesApiEvalsCorporaCorpusRevisionSuitesSuiteIdCasesGetResponses[keyof ListEvalCasesApiEvalsCorporaCorpusRevisionSuitesSuiteIdCasesGetResponses];
+
+export type BuildStoredMemoryReportApiEvalsMemoryReportsPostData = {
+    body: MemoryExperimentReportRequest;
+    path?: never;
+    query?: never;
+    url: '/api/evals/memory-reports';
+};
+
+export type BuildStoredMemoryReportApiEvalsMemoryReportsPostErrors = {
+    /**
+     * The edited captured evaluation is invalid or unsafe.
+     */
+    400: unknown;
+    /**
+     * The requested session or evaluation resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The captured evidence or compare-and-swap baseline changed.
+     */
+    409: unknown;
+    /**
+     * The bounded captured evidence or result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type BuildStoredMemoryReportApiEvalsMemoryReportsPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: MemoryExperimentReport;
+};
+
+export type BuildStoredMemoryReportApiEvalsMemoryReportsPostResponse = BuildStoredMemoryReportApiEvalsMemoryReportsPostResponses[keyof BuildStoredMemoryReportApiEvalsMemoryReportsPostResponses];
+
+export type BuildStoredMemoryReportHtmlApiEvalsMemoryReportsReportHtmlPostData = {
+    body: MemoryExperimentReportRequest;
+    path?: never;
+    query?: never;
+    url: '/api/evals/memory-reports/report.html';
+};
+
+export type BuildStoredMemoryReportHtmlApiEvalsMemoryReportsReportHtmlPostErrors = {
+    /**
+     * The edited captured evaluation is invalid or unsafe.
+     */
+    400: unknown;
+    /**
+     * The requested session or evaluation resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The captured evidence or compare-and-swap baseline changed.
+     */
+    409: unknown;
+    /**
+     * The bounded captured evidence or result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type BuildStoredMemoryReportHtmlApiEvalsMemoryReportsReportHtmlPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
 
 export type ExportEvaluationPromotionApiEvalsPromotionSessionsSessionIdExportPostData = {
     body: EvaluationPromotionExportRequest;

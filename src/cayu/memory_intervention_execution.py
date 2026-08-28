@@ -82,6 +82,7 @@ from cayu.evals.models import (
     EvalTrialResult,
     _memory_source_expected_counts,
 )
+from cayu.evals.revisions import eval_trial_result_revision
 from cayu.memory import AutomaticRecallPolicy
 from cayu.memory_attribution import (
     MemoryAttribution,
@@ -3342,12 +3343,9 @@ def _terminal_effect_status(
 
 
 def memory_intervention_eval_result_revision(result: EvalTrialResult) -> str:
-    if type(result) is not EvalTrialResult:
-        raise TypeError("result must be an exact EvalTrialResult.")
-    return _content_sha256(
-        result.model_dump(mode="json"),
-        "memory intervention eval trial result",
-    )
+    """Compatibility name for the canonical eval trial-result identity."""
+
+    return eval_trial_result_revision(result)
 
 
 def memory_intervention_request_key(

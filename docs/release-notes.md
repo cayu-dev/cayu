@@ -95,17 +95,44 @@ Portable corpus schema V2 can pin a server-published judge profile and evaluate
 one to eight stable weighted rubric criteria against optional evaluator-only
 public or private reference truth. Cayu strictly decodes each criterion,
 computes the weighted score and threshold itself, and publishes only typed,
-redacted criterion evidence under published-result schema V4. Private reference
+redacted criterion evidence under published-result schema V5. Private reference
 content, raw judge prompts/output, credentials, and provider options never enter
 the corpus or result. Judge calls are tool-free, use an isolated process-local
 session store, and are bounded by explicit timeout, token, and optional
 priced-cost ceilings; profile/reference/privacy drift, public-reference secret
 conflicts, unrepresentable threshold boundaries, and judge failures produce no
 candidate score. Successful judgments retain observed judge token usage and an
-exact priced cost or explicit unavailable cost state. The server contract advances to 31
+exact priced cost or explicit unavailable cost state. The server contract advances to 32
 so target catalogs can expose safe `judge_profiles`. Suite-authoring V1 remains
 unchanged; Control Plane rubric authoring follows in its separately versioned
 contract.
+
+### Repeated memory experiments publish exact paired reports
+
+`MemoryExperimentReport` now turns fixed memory-intervention executions and
+their published Evals evidence into one complete baseline/candidate repetition
+matrix. It retains failed, timed-out, cancelled, unavailable, unmatched,
+indeterminate, and missing rows; binds case, snapshot, execution-profile,
+provider/model, evaluator, and attribution identities; and computes quality
+deltas only for comparable pairs. Latency, total-token, memory-preparation, and
+memory-context observations receive the same paired, case, and experiment
+availability-aware distributions without entering ranking. Canonical cost,
+usage, retry/repair, and pricing classifications are embedded from the existing
+paired cost-quality contract. Declared safety/privacy and evidence gates run
+before deterministic fixed-candidate ranking, so unavailable evidence cannot
+become a zero or a survivor-filtered recommendation. Typed dispositions retain
+separate incomparable/unavailable counts and distinguish superseded baselines
+from eligible candidates that were not selected.
+
+The SDK, `cayu eval memory-report`, deterministic JSON/HTML, and protected
+Control Plane report routes expose the same schema. Control Plane construction
+authenticates each supplied published graph and its associated execution-profile
+snapshot against its exact `EvalStore` run; result-less rows retain declared
+experiment-contract profile authority without claiming stored-run provenance.
+Published eval runs advance to schema 5 and corpus execution results to schema 3
+to retain the canonical source-trial revision. The additive report routes
+advance the server contract to version 32; regenerate and deploy
+server clients together.
 
 ### Evals launches are pinned to server-published execution profiles
 

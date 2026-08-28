@@ -265,13 +265,16 @@ class EvalRunCoordinator:
                 lease.run.spec.invocation,
             )
             expected_profile = lease.run.spec.invocation.execution_profile
+            expected_snapshot = lease.run.spec.invocation.execution_profile_snapshot
             if expected_profile is None:
                 return EvalRunFailureCode.TARGET_UNAVAILABLE
             prepared_profile = await self._config.registry.prepare_execution_profile(
                 target.key,
                 effective_target=target,
             )
-            if prepared_profile.binding != expected_profile:
+            if prepared_profile.binding != expected_profile or (
+                expected_snapshot is not None and prepared_profile.snapshot != expected_snapshot
+            ):
                 return EvalRunFailureCode.TARGET_UNAVAILABLE
         except asyncio.CancelledError:
             raise

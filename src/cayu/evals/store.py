@@ -26,7 +26,11 @@ from pydantic import (
     model_validator,
 )
 
-from cayu._validation import canonical_durable_json_bytes, json_utf8_size_within_limit
+from cayu._validation import (
+    canonical_durable_json_bytes,
+    json_utf8_size_within_limit,
+    revalidate_model_input,
+)
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_BYTES,
@@ -51,7 +55,10 @@ from cayu.evals.execution import (
     CORPUS_EXECUTION_RESULT_MAX_BYTES,
     CorpusExecutionResult,
 )
-from cayu.evals.execution_profiles import EvalExecutionProfileBindingV1
+from cayu.evals.execution_profiles import (
+    EvalExecutionProfileBindingV1,
+    EvalExecutionProfileV1,
+)
 from cayu.evals.published import _validate_published_eval_run_for_corpus
 from cayu.evals.results import (
     CAPTURED_EVALUATION_RESULT_MAX_BYTES,
@@ -107,6 +114,7 @@ class _EvalStoreModel(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
         frozen=True,
+        hide_input_in_errors=True,
         protected_namespaces=(),
         revalidate_instances="always",
     )
@@ -1455,6 +1463,10 @@ class EvalRunInvocation(_EvalStoreModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    execution_profile_snapshot: EvalExecutionProfileV1 | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     admission_request_revision: StrictStr | None = Field(
         default=None,
         description=(
@@ -1512,9 +1524,12 @@ class EvalRunInvocation(_EvalStoreModel):
     @field_validator("execution_profile", mode="before")
     @classmethod
     def copy_execution_profile(cls, value: object) -> object:
-        if type(value) is EvalExecutionProfileBindingV1:
-            return value.model_dump(mode="python")
-        return value
+        return revalidate_model_input(value, EvalExecutionProfileBindingV1)
+
+    @field_validator("execution_profile_snapshot", mode="before")
+    @classmethod
+    def copy_execution_profile_snapshot(cls, value: object) -> object:
+        return revalidate_model_input(value, EvalExecutionProfileV1)
 
     @field_validator("scenario", mode="before")
     @classmethod
@@ -1550,6 +1565,21 @@ class EvalRunInvocation(_EvalStoreModel):
             raise ValueError("Eval run origins require server-verified HTTP provenance.")
         if self.limits is not None and self.limits.scope != "run":
             raise ValueError("Eval run invocation limits must use run scope.")
+        if self.execution_profile_snapshot is not None and self.execution_profile is None:
+            raise ValueError("An eval execution-profile snapshot requires its durable binding.")
+        if self.execution_profile_snapshot is not None:
+            assert self.execution_profile is not None
+            runtime_profile = self.execution_profile.runtime_execution_profile
+            candidate = self.execution_profile_snapshot.candidate
+            if (
+                self.execution_profile_snapshot.revision != self.execution_profile.profile_revision
+                or candidate.runtime_execution_profile_schema_version
+                != runtime_profile.schema_version
+                or candidate.runtime_execution_profile_fingerprint != runtime_profile.fingerprint
+            ):
+                raise ValueError(
+                    "Eval execution-profile snapshot conflicts with its durable binding."
+                )
         if (self.authored_suite_revision is None) != (
             self.authored_suite_selection_revision is None
         ):

@@ -487,9 +487,15 @@ class EvalTargetRegistry:
             app_manifest_fingerprint=registration.catalog_entry.app_manifest_fingerprint,
             policy=registration.execution_profile_policy,
         )
-        durable_binding = EvalRunInvocation(execution_profile=prepared.binding).execution_profile
+        durable_invocation = EvalRunInvocation(
+            execution_profile=prepared.binding,
+            execution_profile_snapshot=prepared.snapshot,
+        )
+        durable_binding = durable_invocation.execution_profile
         if durable_binding != prepared.binding:
             raise RuntimeError("Eval execution profile binding did not round-trip durably.")
+        if durable_invocation.execution_profile_snapshot != prepared.snapshot:
+            raise RuntimeError("Eval execution profile snapshot did not round-trip durably.")
         identity_after = evaluation_target_identity(
             target,
             project_root=registration.manifest_project_root,

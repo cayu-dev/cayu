@@ -4,6 +4,7 @@ import json
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -58,6 +59,7 @@ from cayu.evals.result_contract import (
     PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES,
     EvalTrialOutputPreviewV1,
 )
+from cayu.evals.revisions import eval_trial_result_revision
 from cayu.runtime.costs import CostLineItem, SessionCostSummary
 from cayu.runtime.usage import (
     SessionUsageSummary,
@@ -232,8 +234,8 @@ def test_published_graph_preserves_trials_and_reproducible_aggregates_only():
     run = _run()
     published = publish_eval_run(corpus, run)
 
-    assert PUBLISHED_EVAL_SCHEMA_VERSION == 4
-    assert published.schema_version == 4
+    assert PUBLISHED_EVAL_SCHEMA_VERSION == 5
+    assert published.schema_version == 5
     assert published.corpus_revision == corpus.revision
     assert published.status == "unavailable"
     assert published.score is None
@@ -241,6 +243,9 @@ def test_published_graph_preserves_trials_and_reproducible_aggregates_only():
     assert [trial.status for trial in published.cases[0].trials] == [
         "passed",
         "unavailable",
+    ]
+    assert [trial.source_trial_revision for trial in published.cases[0].trials] == [
+        eval_trial_result_revision(trial) for trial in run.cases[0].trials
     ]
     assert published.cases[0].trials[0].usage is not None
     assert published.cases[0].trials[0].usage.total_tokens == 15
@@ -294,7 +299,7 @@ def test_published_eval_run_rejects_v1_before_validating_its_obsolete_shape():
     with pytest.raises(ValidationError, match="other versions are unsupported"):
         PublishedEvalRun.model_validate(document)
 
-    with pytest.raises(ValidationError, match="schema_version must be the integer 4"):
+    with pytest.raises(ValidationError, match="schema_version must be the integer 5"):
         PublishedEvalRun.model_validate(
             {**published.model_dump(mode="json"), "schema_version": "2"}
         )
@@ -303,6 +308,12 @@ def test_published_eval_run_rejects_v1_before_validating_its_obsolete_shape():
     versionless.pop("schema_version")
     with pytest.raises(ValidationError, match="schema_version is required"):
         PublishedEvalRun.model_validate(versionless)
+
+
+def test_eval_guide_tracks_published_eval_schema_version():
+    guide = (Path(__file__).resolve().parents[2] / "docs" / "evals.md").read_text(encoding="utf-8")
+
+    assert f"schema-version-{PUBLISHED_EVAL_SCHEMA_VERSION} `PublishedEvalRun`" in guide
 
 
 def test_output_preview_rejects_forged_size_digest_and_truncation_metadata():

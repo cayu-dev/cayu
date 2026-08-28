@@ -177,6 +177,202 @@
         "title": "AgentManifest",
         "type": "object"
       },
+      "AgentSnapshotResultBinding": {
+        "additionalProperties": false,
+        "properties": {
+          "cost_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Fingerprint"
+          },
+          "eval_result_revision": {
+            "title": "Eval Result Revision",
+            "type": "string"
+          },
+          "fingerprint": {
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "memory_evidence_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Evidence Fingerprint"
+          },
+          "record_type": {
+            "const": "cayu.agent-snapshot-result",
+            "default": "cayu.agent-snapshot-result",
+            "title": "Record Type",
+            "type": "string"
+          },
+          "recorded_at": {
+            "format": "date-time",
+            "title": "Recorded At",
+            "type": "string"
+          },
+          "runtime_evidence_fingerprint": {
+            "title": "Runtime Evidence Fingerprint",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "session_id": {
+            "maxLength": 512,
+            "title": "Session Id",
+            "type": "string"
+          },
+          "terminal_disposition": {
+            "$ref": "#/components/schemas/AgentSnapshotTerminalDisposition"
+          },
+          "trial_fingerprint": {
+            "title": "Trial Fingerprint",
+            "type": "string"
+          },
+          "usage_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Usage Fingerprint"
+          }
+        },
+        "required": [
+          "fingerprint",
+          "trial_fingerprint",
+          "session_id",
+          "terminal_disposition",
+          "runtime_evidence_fingerprint",
+          "eval_result_revision",
+          "recorded_at"
+        ],
+        "title": "AgentSnapshotResultBinding",
+        "type": "object"
+      },
+      "AgentSnapshotTerminalDisposition": {
+        "enum": [
+          "completed",
+          "failed",
+          "cancelled",
+          "timed_out",
+          "outcome_unknown"
+        ],
+        "title": "AgentSnapshotTerminalDisposition",
+        "type": "string"
+      },
+      "AgentSnapshotTrialBinding": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate_id": {
+            "maxLength": 256,
+            "title": "Candidate Id",
+            "type": "string"
+          },
+          "case_id": {
+            "maxLength": 256,
+            "title": "Case Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "evaluator_fingerprint": {
+            "title": "Evaluator Fingerprint",
+            "type": "string"
+          },
+          "fingerprint": {
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "materialization_fingerprint": {
+            "title": "Materialization Fingerprint",
+            "type": "string"
+          },
+          "memory_overlay_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Overlay Fingerprint"
+          },
+          "record_type": {
+            "const": "cayu.agent-snapshot-trial",
+            "default": "cayu.agent-snapshot-trial",
+            "title": "Record Type",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "snapshot_fingerprint": {
+            "title": "Snapshot Fingerprint",
+            "type": "string"
+          },
+          "trial_id": {
+            "maxLength": 256,
+            "title": "Trial Id",
+            "type": "string"
+          },
+          "workspace_overlay_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace Overlay Fingerprint"
+          }
+        },
+        "required": [
+          "fingerprint",
+          "snapshot_fingerprint",
+          "materialization_fingerprint",
+          "candidate_id",
+          "case_id",
+          "trial_id",
+          "evaluator_fingerprint",
+          "created_at"
+        ],
+        "title": "AgentSnapshotTrialBinding",
+        "type": "object"
+      },
+      "AgentSnapshotTrialStateMode": {
+        "enum": [
+          "reset_each_trial",
+          "accumulate_within_candidate"
+        ],
+        "title": "AgentSnapshotTrialStateMode",
+        "type": "string"
+      },
       "AgentsResponse": {
         "additionalProperties": false,
         "properties": {
@@ -4728,6 +4924,16 @@
         "title": "AssertionEvidenceView",
         "type": "object"
       },
+      "AutomaticRecallMode": {
+        "enum": [
+          "off",
+          "offer",
+          "strong_matches",
+          "offer_and_strong_matches"
+        ],
+        "title": "AutomaticRecallMode",
+        "type": "string"
+      },
       "BillingIdentity": {
         "additionalProperties": false,
         "description": "Provider-neutral commercial identity and possible pricing contexts.\n\nProviders own the meaning of their evidence. Core preserves it durably and\nenforces that completion cannot rewrite request evidence or widen the set of\npricing outcomes established before dispatch.",
@@ -6220,6 +6426,714 @@
         "title": "CompactSessionBody",
         "type": "object"
       },
+      "ComparableGenerationSettings": {
+        "additionalProperties": false,
+        "description": "Opaque identity of the output-affecting settings declared for one side.",
+        "properties": {
+          "revision": {
+            "maxLength": 71,
+            "title": "Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision"
+        ],
+        "title": "ComparableGenerationSettings",
+        "type": "object"
+      },
+      "ComparableOutputBudget": {
+        "additionalProperties": false,
+        "description": "The final-output envelope that must match across a verified pair.",
+        "properties": {
+          "max_output_tokens": {
+            "exclusiveMinimum": 0.0,
+            "maximum": 9.223372036854776e+18,
+            "title": "Max Output Tokens",
+            "type": "integer"
+          },
+          "output_mode": {
+            "default": "text",
+            "enum": [
+              "text",
+              "structured"
+            ],
+            "title": "Output Mode",
+            "type": "string"
+          }
+        },
+        "required": [
+          "max_output_tokens"
+        ],
+        "title": "ComparableOutputBudget",
+        "type": "object"
+      },
+      "ComparisonCostLineItem-Input": {
+        "additionalProperties": false,
+        "description": "Bounded, safe accounting projection of one runtime cost line item.",
+        "properties": {
+          "cache_read_input_cost": {
+            "anyOf": [
+              {
+                "maximum": 9.223372036854776e+18,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "title": "Cache Read Input Cost"
+          },
+          "cache_read_input_tokens": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Cache Read Input Tokens",
+            "type": "integer"
+          },
+          "cache_write_1h_input_tokens": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Cache Write 1H Input Tokens",
+            "type": "integer"
+          },
+          "cache_write_5m_input_tokens": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Cache Write 5M Input Tokens",
+            "type": "integer"
+          },
+          "cache_write_input_cost": {
+            "anyOf": [
+              {
+                "maximum": 9.223372036854776e+18,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "title": "Cache Write Input Cost"
+          },
+          "cache_write_input_tokens": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Cache Write Input Tokens",
+            "type": "integer"
+          },
+          "cache_write_unknown_ttl_input_tokens": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Cache Write Unknown Ttl Input Tokens",
+            "type": "integer"
+          },
+          "currency": {
+            "maxLength": 512,
+            "title": "Currency",
+            "type": "string"
+          },
+          "execution_profile_fingerprint": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Profile Fingerprint"
+          },
+          "input_cost": {
+            "anyOf": [
+              {
+                "maximum": 9.223372036854776e+18,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "title": "Input Cost"
+          },
+          "input_tokens": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Input Tokens",
+            "type": "integer"
+          },
+          "missing_pricing_reason": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Missing Pricing Reason"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "model_step": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Model Step",
+            "type": "integer"
+          },
+          "output_cost": {
+            "anyOf": [
+              {
+                "maximum": 9.223372036854776e+18,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "title": "Output Cost"
+          },
+          "output_tokens": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Output Tokens",
+            "type": "integer"
+          },
+          "priced": {
+            "title": "Priced",
+            "type": "boolean"
+          },
+          "pricing_effective_from": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Effective From"
+          },
+          "pricing_effective_through": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Effective Through"
+          },
+          "pricing_match": {
+            "anyOf": [
+              {
+                "enum": [
+                  "exact",
+                  "prefix",
+                  "resource_mapping"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Match"
+          },
+          "pricing_model": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Model"
+          },
+          "pricing_provenance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ComparisonPricingProvenance"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pricing_provider_name": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Provider Name"
+          },
+          "pricing_tier_max_input_tokens": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 9.223372036854776e+18,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Tier Max Input Tokens"
+          },
+          "provider_name": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Name"
+          },
+          "requested_model": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested Model"
+          },
+          "total_cost": {
+            "anyOf": [
+              {
+                "maximum": 9.223372036854776e+18,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "title": "Total Cost"
+          },
+          "uncached_input_tokens": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Uncached Input Tokens",
+            "type": "integer"
+          },
+          "web_search_calls": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Web Search Calls",
+            "type": "integer"
+          },
+          "web_search_cost": {
+            "anyOf": [
+              {
+                "maximum": 9.223372036854776e+18,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "default": "0",
+            "title": "Web Search Cost"
+          },
+          "web_search_outcome_unknown": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Web Search Outcome Unknown",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "model_step",
+          "priced",
+          "currency",
+          "input_tokens",
+          "output_tokens",
+          "cache_read_input_tokens",
+          "cache_write_input_tokens",
+          "uncached_input_tokens",
+          "input_cost",
+          "output_cost",
+          "cache_read_input_cost",
+          "cache_write_input_cost",
+          "total_cost"
+        ],
+        "title": "ComparisonCostLineItem",
+        "type": "object"
+      },
+      "ComparisonCostLineItem-Output": {
+        "additionalProperties": false,
+        "description": "Bounded, safe accounting projection of one runtime cost line item.",
+        "properties": {
+          "cache_read_input_cost": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Cache Read Input Cost",
+            "type": "string"
+          },
+          "cache_read_input_tokens": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Cache Read Input Tokens",
+            "type": "integer"
+          },
+          "cache_write_1h_input_tokens": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Cache Write 1H Input Tokens",
+            "type": "integer"
+          },
+          "cache_write_5m_input_tokens": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Cache Write 5M Input Tokens",
+            "type": "integer"
+          },
+          "cache_write_input_cost": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Cache Write Input Cost",
+            "type": "string"
+          },
+          "cache_write_input_tokens": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Cache Write Input Tokens",
+            "type": "integer"
+          },
+          "cache_write_unknown_ttl_input_tokens": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Cache Write Unknown Ttl Input Tokens",
+            "type": "integer"
+          },
+          "currency": {
+            "maxLength": 512,
+            "title": "Currency",
+            "type": "string"
+          },
+          "execution_profile_fingerprint": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Profile Fingerprint"
+          },
+          "input_cost": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Input Cost",
+            "type": "string"
+          },
+          "input_tokens": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Input Tokens",
+            "type": "integer"
+          },
+          "missing_pricing_reason": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Missing Pricing Reason"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "model_step": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Model Step",
+            "type": "integer"
+          },
+          "output_cost": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Output Cost",
+            "type": "string"
+          },
+          "output_tokens": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Output Tokens",
+            "type": "integer"
+          },
+          "priced": {
+            "title": "Priced",
+            "type": "boolean"
+          },
+          "pricing_effective_from": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Effective From"
+          },
+          "pricing_effective_through": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Effective Through"
+          },
+          "pricing_match": {
+            "anyOf": [
+              {
+                "enum": [
+                  "exact",
+                  "prefix",
+                  "resource_mapping"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Match"
+          },
+          "pricing_model": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Model"
+          },
+          "pricing_provenance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ComparisonPricingProvenance"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pricing_provider_name": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Provider Name"
+          },
+          "pricing_tier_max_input_tokens": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 9.223372036854776e+18,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Tier Max Input Tokens"
+          },
+          "provider_name": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Name"
+          },
+          "requested_model": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested Model"
+          },
+          "total_cost": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Total Cost",
+            "type": "string"
+          },
+          "uncached_input_tokens": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Uncached Input Tokens",
+            "type": "integer"
+          },
+          "web_search_calls": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Web Search Calls",
+            "type": "integer"
+          },
+          "web_search_cost": {
+            "default": "0",
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Web Search Cost",
+            "type": "string"
+          },
+          "web_search_outcome_unknown": {
+            "default": 0,
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Web Search Outcome Unknown",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "model_step",
+          "priced",
+          "currency",
+          "input_tokens",
+          "output_tokens",
+          "cache_read_input_tokens",
+          "cache_write_input_tokens",
+          "uncached_input_tokens",
+          "input_cost",
+          "output_cost",
+          "cache_read_input_cost",
+          "cache_write_input_cost",
+          "total_cost"
+        ],
+        "title": "ComparisonCostLineItem",
+        "type": "object"
+      },
+      "ComparisonPricingCatalog": {
+        "additionalProperties": false,
+        "description": "Identity of the application-selected price book used for one side.",
+        "properties": {
+          "generated_at": {
+            "maxLength": 512,
+            "title": "Generated At",
+            "type": "string"
+          },
+          "price_book_version": {
+            "maxLength": 512,
+            "title": "Price Book Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "price_book_version",
+          "generated_at"
+        ],
+        "title": "ComparisonPricingCatalog",
+        "type": "object"
+      },
+      "ComparisonPricingProvenance": {
+        "additionalProperties": false,
+        "description": "Bounded, allowlisted pricing source retained in comparison reports.",
+        "properties": {
+          "as_of": {
+            "maxLength": 512,
+            "title": "As Of",
+            "type": "string"
+          },
+          "source": {
+            "maxLength": 2048,
+            "title": "Source",
+            "type": "string"
+          },
+          "url": {
+            "maxLength": 2048,
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "url",
+          "as_of"
+        ],
+        "title": "ComparisonPricingProvenance",
+        "type": "object"
+      },
       "ContextExposureEvidenceKind": {
         "enum": [
           "composition_planned",
@@ -6788,8 +7702,8 @@
             "$ref": "#/components/schemas/PublishedEvalRun"
           },
           "schema_version": {
-            "const": 2,
-            "default": 2,
+            "const": 3,
+            "default": 3,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -6843,6 +7757,153 @@
         ],
         "title": "CorpusUserMessageSpec",
         "type": "object"
+      },
+      "CostAccountingTotals": {
+        "additionalProperties": false,
+        "description": "Recomputed usage and priced subtotals for one evidence scope.",
+        "properties": {
+          "attempt_count": {
+            "minimum": 0.0,
+            "title": "Attempt Count",
+            "type": "integer"
+          },
+          "cache_read_input_tokens": {
+            "minimum": 0.0,
+            "title": "Cache Read Input Tokens",
+            "type": "integer"
+          },
+          "cache_write_input_tokens": {
+            "minimum": 0.0,
+            "title": "Cache Write Input Tokens",
+            "type": "integer"
+          },
+          "currencies": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/CostCurrencyTotal"
+            },
+            "title": "Currencies",
+            "type": "array"
+          },
+          "first_attempt_count": {
+            "minimum": 0.0,
+            "title": "First Attempt Count",
+            "type": "integer"
+          },
+          "input_tokens": {
+            "minimum": 0.0,
+            "title": "Input Tokens",
+            "type": "integer"
+          },
+          "missing_usage_attempt_count": {
+            "minimum": 0.0,
+            "title": "Missing Usage Attempt Count",
+            "type": "integer"
+          },
+          "output_tokens": {
+            "minimum": 0.0,
+            "title": "Output Tokens",
+            "type": "integer"
+          },
+          "priced_attempt_count": {
+            "minimum": 0.0,
+            "title": "Priced Attempt Count",
+            "type": "integer"
+          },
+          "retry_attempt_count": {
+            "minimum": 0.0,
+            "title": "Retry Attempt Count",
+            "type": "integer"
+          },
+          "uncached_input_tokens": {
+            "minimum": 0.0,
+            "title": "Uncached Input Tokens",
+            "type": "integer"
+          },
+          "unpriced_attempt_count": {
+            "minimum": 0.0,
+            "title": "Unpriced Attempt Count",
+            "type": "integer"
+          },
+          "web_search_calls": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Web Search Calls",
+            "type": "integer"
+          },
+          "web_search_outcome_unknown": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Web Search Outcome Unknown",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "attempt_count",
+          "first_attempt_count",
+          "retry_attempt_count",
+          "priced_attempt_count",
+          "unpriced_attempt_count",
+          "missing_usage_attempt_count",
+          "input_tokens",
+          "output_tokens",
+          "cache_read_input_tokens",
+          "cache_write_input_tokens",
+          "uncached_input_tokens"
+        ],
+        "title": "CostAccountingTotals",
+        "type": "object"
+      },
+      "CostBranchTotals": {
+        "additionalProperties": false,
+        "properties": {
+          "branch_id": {
+            "title": "Branch Id",
+            "type": "string"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/CostAccountingTotals"
+          }
+        },
+        "required": [
+          "branch_id",
+          "totals"
+        ],
+        "title": "CostBranchTotals",
+        "type": "object"
+      },
+      "CostCurrencyTotal": {
+        "additionalProperties": false,
+        "description": "Priced subtotal in one currency; currencies are never combined.",
+        "properties": {
+          "currency": {
+            "maxLength": 512,
+            "title": "Currency",
+            "type": "string"
+          },
+          "priced_cost": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Priced Cost",
+            "type": "string"
+          }
+        },
+        "required": [
+          "currency",
+          "priced_cost"
+        ],
+        "title": "CostCurrencyTotal",
+        "type": "object"
+      },
+      "CostDirection": {
+        "description": "Observed direction of candidate cost relative to baseline cost.",
+        "enum": [
+          "savings",
+          "break_even",
+          "increased_cost",
+          "unavailable"
+        ],
+        "title": "CostDirection",
+        "type": "string"
       },
       "CostLineItem": {
         "additionalProperties": false,
@@ -7113,6 +8174,266 @@
           "total_cost"
         ],
         "title": "CostLineItem",
+        "type": "object"
+      },
+      "CostOperationTotals": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "$ref": "#/components/schemas/CostQualityAttemptOperation"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/CostAccountingTotals"
+          }
+        },
+        "required": [
+          "operation",
+          "totals"
+        ],
+        "title": "CostOperationTotals",
+        "type": "object"
+      },
+      "CostQualityAggregateReport": {
+        "additionalProperties": false,
+        "description": "Verified-pair arithmetic plus every typed exclusion.",
+        "properties": {
+          "baseline_cost": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Baseline Cost"
+          },
+          "candidate_cost": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Cost"
+          },
+          "cost_direction": {
+            "$ref": "#/components/schemas/CostDirection"
+          },
+          "currency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Currency"
+          },
+          "eligible_pair_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Eligible Pair Ids",
+            "type": "array"
+          },
+          "exclusions": {
+            "items": {
+              "$ref": "#/components/schemas/CostQualityPairExclusion"
+            },
+            "title": "Exclusions",
+            "type": "array"
+          },
+          "findings": {
+            "items": {
+              "$ref": "#/components/schemas/CostQualityFinding"
+            },
+            "title": "Findings",
+            "type": "array"
+          },
+          "pair_count": {
+            "minimum": 1.0,
+            "title": "Pair Count",
+            "type": "integer"
+          },
+          "savings": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Savings"
+          },
+          "savings_percentage": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Savings Percentage"
+          },
+          "savings_percentage_state": {
+            "$ref": "#/components/schemas/SavingsPercentageState"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CostQualityComparisonStatus"
+          }
+        },
+        "required": [
+          "status",
+          "pair_count",
+          "eligible_pair_ids",
+          "exclusions",
+          "findings",
+          "currency",
+          "baseline_cost",
+          "candidate_cost",
+          "savings",
+          "savings_percentage",
+          "savings_percentage_state",
+          "cost_direction"
+        ],
+        "title": "CostQualityAggregateReport",
+        "type": "object"
+      },
+      "CostQualityAttemptOperation": {
+        "description": "Why one provider attempt was made.",
+        "enum": [
+          "agent_step",
+          "compaction",
+          "structured_output_repair",
+          "evaluation",
+          "repair",
+          "comparison_control"
+        ],
+        "title": "CostQualityAttemptOperation",
+        "type": "string"
+      },
+      "CostQualityComparisonStatus": {
+        "description": "Strength of the cost-and-quality claim supported by retained evidence.",
+        "enum": [
+          "verified",
+          "measured_unmatched",
+          "unpriced",
+          "unavailable"
+        ],
+        "title": "CostQualityComparisonStatus",
+        "type": "string"
+      },
+      "CostQualityFinding": {
+        "additionalProperties": false,
+        "description": "One typed, bounded explanation of proof loss.",
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/CostQualityFindingCode"
+          },
+          "detail": {
+            "maxLength": 2048,
+            "title": "Detail",
+            "type": "string"
+          },
+          "field": {
+            "maxLength": 512,
+            "title": "Field",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "field",
+          "detail"
+        ],
+        "title": "CostQualityFinding",
+        "type": "object"
+      },
+      "CostQualityFindingCode": {
+        "description": "Stable reason a pair or aggregate cannot make a stronger claim.",
+        "enum": [
+          "missing_side",
+          "workload_mismatch",
+          "task_mismatch",
+          "source_mismatch",
+          "source_checkpoint_mismatch",
+          "role_mismatch",
+          "output_budget_mismatch",
+          "generation_settings_mismatch",
+          "missing_attempts",
+          "duplicate_attempt",
+          "attempt_sequence_invalid",
+          "missing_attempt_identity",
+          "missing_usage",
+          "contradictory_usage",
+          "missing_pricing_provenance",
+          "pricing_catalog_mismatch",
+          "pricing_provenance_mismatch",
+          "mixed_currency",
+          "unpriced_attempt",
+          "quality_evidence_missing",
+          "quality_contract_mismatch",
+          "quality_evidence_invalid",
+          "quality_gate_failed",
+          "quality_gate_unavailable",
+          "aggregate_cohort_mismatch"
+        ],
+        "title": "CostQualityFindingCode",
+        "type": "string"
+      },
+      "CostQualityPairExclusion": {
+        "additionalProperties": false,
+        "description": "Why one pair does not contribute to the verified aggregate percentage.",
+        "properties": {
+          "findings": {
+            "items": {
+              "$ref": "#/components/schemas/CostQualityFinding"
+            },
+            "title": "Findings",
+            "type": "array"
+          },
+          "pair_id": {
+            "title": "Pair Id",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CostQualityComparisonStatus"
+          }
+        },
+        "required": [
+          "pair_id",
+          "status",
+          "findings"
+        ],
+        "title": "CostQualityPairExclusion",
+        "type": "object"
+      },
+      "CostSessionTotals": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "totals": {
+            "$ref": "#/components/schemas/CostAccountingTotals"
+          }
+        },
+        "required": [
+          "session_id",
+          "totals"
+        ],
+        "title": "CostSessionTotals",
         "type": "object"
       },
       "EgressAuthorityBindingIdentity": {
@@ -9864,6 +11185,16 @@
             "anyOf": [
               {
                 "$ref": "#/components/schemas/EvalExecutionProfileBindingV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "execution_profile_snapshot": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalExecutionProfileV1"
               },
               {
                 "type": "null"
@@ -13795,6 +15126,75 @@
         "title": "MemoryAttributionUnavailableReason",
         "type": "string"
       },
+      "MemoryCaseComparison": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate_variant_id": {
+            "title": "Candidate Variant Id",
+            "type": "string"
+          },
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "case_revision": {
+            "title": "Case Revision",
+            "type": "string"
+          },
+          "distributions": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryMetricDistribution"
+            },
+            "title": "Distributions",
+            "type": "array"
+          },
+          "metric_roles": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryMetricRole"
+            },
+            "title": "Metric Roles",
+            "type": "array"
+          },
+          "operational_distributions": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryOperationalDistribution"
+            },
+            "title": "Operational Distributions",
+            "type": "array"
+          },
+          "pairs": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryTrialPairComparison"
+            },
+            "title": "Pairs",
+            "type": "array"
+          },
+          "revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "case_id",
+          "case_revision",
+          "candidate_variant_id",
+          "pairs",
+          "metric_roles",
+          "distributions",
+          "operational_distributions"
+        ],
+        "title": "MemoryCaseComparison",
+        "type": "object"
+      },
       "MemoryContextExposureAttribution": {
         "additionalProperties": false,
         "description": "Secret-free structural and lifecycle facts from one context exposure.",
@@ -13952,6 +15352,490 @@
         "title": "MemoryEvidenceAlias",
         "type": "object"
       },
+      "MemoryExperimentCase": {
+        "additionalProperties": false,
+        "properties": {
+          "case_id": {
+            "maxLength": 128,
+            "title": "Case Id",
+            "type": "string"
+          },
+          "case_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "title": "Case Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "case_id",
+          "case_revision"
+        ],
+        "title": "MemoryExperimentCase",
+        "type": "object"
+      },
+      "MemoryExperimentGatePolicy-Input": {
+        "additionalProperties": false,
+        "properties": {
+          "cost_currency": {
+            "anyOf": [
+              {
+                "maxLength": 16,
+                "minLength": 3,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Currency"
+          },
+          "maximum_candidate_cost": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maximum Candidate Cost"
+          },
+          "metric_gates": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryMetricGate"
+            },
+            "title": "Metric Gates",
+            "type": "array"
+          },
+          "minimum_comparable_pairs": {
+            "default": 1,
+            "minimum": 1.0,
+            "title": "Minimum Comparable Pairs",
+            "type": "integer"
+          },
+          "require_priced_cost": {
+            "default": false,
+            "title": "Require Priced Cost",
+            "type": "boolean"
+          },
+          "required_metric_roles": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryMetricRole"
+            },
+            "title": "Required Metric Roles",
+            "type": "array"
+          }
+        },
+        "title": "MemoryExperimentGatePolicy",
+        "type": "object"
+      },
+      "MemoryExperimentGatePolicy-Output": {
+        "additionalProperties": false,
+        "properties": {
+          "cost_currency": {
+            "anyOf": [
+              {
+                "maxLength": 16,
+                "minLength": 3,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cost Currency"
+          },
+          "maximum_candidate_cost": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maximum Candidate Cost"
+          },
+          "metric_gates": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryMetricGate"
+            },
+            "title": "Metric Gates",
+            "type": "array"
+          },
+          "minimum_comparable_pairs": {
+            "default": 1,
+            "minimum": 1.0,
+            "title": "Minimum Comparable Pairs",
+            "type": "integer"
+          },
+          "require_priced_cost": {
+            "default": false,
+            "title": "Require Priced Cost",
+            "type": "boolean"
+          },
+          "required_metric_roles": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryMetricRole"
+            },
+            "title": "Required Metric Roles",
+            "type": "array"
+          }
+        },
+        "title": "MemoryExperimentGatePolicy",
+        "type": "object"
+      },
+      "MemoryExperimentReport": {
+        "additionalProperties": false,
+        "properties": {
+          "baseline_variant_id": {
+            "title": "Baseline Variant Id",
+            "type": "string"
+          },
+          "cases": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryExperimentCase"
+            },
+            "title": "Cases",
+            "type": "array"
+          },
+          "comparisons": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryCaseComparison"
+            },
+            "title": "Comparisons",
+            "type": "array"
+          },
+          "cost_quality": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryVariantCostQualityReport"
+            },
+            "title": "Cost Quality",
+            "type": "array"
+          },
+          "dispositions": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryVariantDisposition"
+            },
+            "title": "Dispositions",
+            "type": "array"
+          },
+          "experiment_id": {
+            "title": "Experiment Id",
+            "type": "string"
+          },
+          "gates": {
+            "$ref": "#/components/schemas/MemoryExperimentGatePolicy-Output"
+          },
+          "metric_bindings": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryMetricBinding"
+            },
+            "title": "Metric Bindings",
+            "type": "array"
+          },
+          "operational_summary": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryVariantOperationalReport"
+            },
+            "title": "Operational Summary",
+            "type": "array"
+          },
+          "ranking": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryRankingTerm"
+            },
+            "title": "Ranking",
+            "type": "array"
+          },
+          "record_type": {
+            "const": "cayu.memory-experiment-report",
+            "default": "cayu.memory-experiment-report",
+            "title": "Record Type",
+            "type": "string"
+          },
+          "repetitions": {
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Repetitions",
+            "type": "integer"
+          },
+          "revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "title": "Revision",
+            "type": "string"
+          },
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryTrialReportRow"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "selected_variant_id": {
+            "title": "Selected Variant Id",
+            "type": "string"
+          },
+          "variants": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryExperimentVariant"
+            },
+            "title": "Variants",
+            "type": "array"
+          }
+        },
+        "required": [
+          "revision",
+          "experiment_id",
+          "baseline_variant_id",
+          "repetitions",
+          "cases",
+          "variants",
+          "metric_bindings",
+          "ranking",
+          "gates",
+          "rows",
+          "comparisons",
+          "operational_summary",
+          "cost_quality",
+          "selected_variant_id",
+          "dispositions"
+        ],
+        "title": "MemoryExperimentReport",
+        "type": "object"
+      },
+      "MemoryExperimentReportRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "baseline_variant_id": {
+            "maxLength": 128,
+            "title": "Baseline Variant Id",
+            "type": "string"
+          },
+          "cases": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryExperimentCase"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Cases",
+            "type": "array"
+          },
+          "experiment_id": {
+            "maxLength": 128,
+            "title": "Experiment Id",
+            "type": "string"
+          },
+          "gates": {
+            "$ref": "#/components/schemas/MemoryExperimentGatePolicy-Input"
+          },
+          "metric_bindings": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryMetricBinding"
+            },
+            "maxItems": 32,
+            "title": "Metric Bindings",
+            "type": "array"
+          },
+          "published_results": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryPublishedResultEvidence"
+            },
+            "maxItems": 100000,
+            "title": "Published Results",
+            "type": "array"
+          },
+          "ranking": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryRankingTerm"
+            },
+            "maxItems": 32,
+            "title": "Ranking",
+            "type": "array"
+          },
+          "repetitions": {
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Repetitions",
+            "type": "integer"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "trials": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryExperimentTrialEvidence"
+            },
+            "maxItems": 100000,
+            "title": "Trials",
+            "type": "array"
+          },
+          "variants": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryExperimentVariant"
+            },
+            "maxItems": 128,
+            "minItems": 2,
+            "title": "Variants",
+            "type": "array"
+          }
+        },
+        "required": [
+          "experiment_id",
+          "cases",
+          "repetitions",
+          "baseline_variant_id",
+          "variants"
+        ],
+        "title": "MemoryExperimentReportRequest",
+        "type": "object"
+      },
+      "MemoryExperimentTrialEvidence": {
+        "additionalProperties": false,
+        "properties": {
+          "accounting_side": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PairedCostQualitySide-Input"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "case_id": {
+            "maxLength": 128,
+            "title": "Case Id",
+            "type": "string"
+          },
+          "case_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "title": "Case Revision",
+            "type": "string"
+          },
+          "execution": {
+            "$ref": "#/components/schemas/MemoryInterventionExecutionRecord"
+          },
+          "intervention_binding": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryInterventionTrialBinding"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "memory_overhead": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryPreparationOverheadEvidence"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "published_result_revision": {
+            "anyOf": [
+              {
+                "maxLength": 71,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Published Result Revision"
+          },
+          "repetition": {
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Repetition",
+            "type": "integer"
+          },
+          "variant_id": {
+            "maxLength": 128,
+            "title": "Variant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "case_id",
+          "case_revision",
+          "repetition",
+          "variant_id",
+          "execution"
+        ],
+        "title": "MemoryExperimentTrialEvidence",
+        "type": "object"
+      },
+      "MemoryExperimentVariant": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate_id": {
+            "maxLength": 256,
+            "title": "Candidate Id",
+            "type": "string"
+          },
+          "evaluator_fingerprint": {
+            "maxLength": 64,
+            "minLength": 64,
+            "title": "Evaluator Fingerprint",
+            "type": "string"
+          },
+          "execution_profile": {
+            "$ref": "#/components/schemas/EvalExecutionProfileV1"
+          },
+          "execution_profile_binding": {
+            "$ref": "#/components/schemas/EvalExecutionProfileBindingV1"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/MemoryInterventionSpec"
+          },
+          "variant_id": {
+            "maxLength": 128,
+            "title": "Variant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "variant_id",
+          "candidate_id",
+          "spec",
+          "execution_profile",
+          "execution_profile_binding",
+          "evaluator_fingerprint"
+        ],
+        "title": "MemoryExperimentVariant",
+        "type": "object"
+      },
       "MemoryExposureItemAttribution": {
         "additionalProperties": false,
         "properties": {
@@ -14019,6 +15903,1580 @@
           "evidence_kind"
         ],
         "title": "MemoryExposureTransitionAttribution",
+        "type": "object"
+      },
+      "MemoryInterventionBounds": {
+        "additionalProperties": false,
+        "description": "Precommitted upper bounds for one memory-only intervention.",
+        "properties": {
+          "max_changed_items": {
+            "maximum": 128.0,
+            "minimum": 0.0,
+            "title": "Max Changed Items",
+            "type": "integer"
+          },
+          "max_effect_receipts": {
+            "default": 128,
+            "maximum": 128.0,
+            "minimum": 1.0,
+            "title": "Max Effect Receipts",
+            "type": "integer"
+          },
+          "max_fixture_bytes": {
+            "maximum": 16777216.0,
+            "minimum": 0.0,
+            "title": "Max Fixture Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "max_changed_items",
+          "max_fixture_bytes"
+        ],
+        "title": "MemoryInterventionBounds",
+        "type": "object"
+      },
+      "MemoryInterventionChangeKind": {
+        "enum": [
+          "omit",
+          "replace",
+          "inject_negative_control"
+        ],
+        "title": "MemoryInterventionChangeKind",
+        "type": "string"
+      },
+      "MemoryInterventionEffectReceiptRef": {
+        "additionalProperties": false,
+        "description": "Bounded identity of one application-owned effect receipt.",
+        "properties": {
+          "effect_fingerprint": {
+            "title": "Effect Fingerprint",
+            "type": "string"
+          },
+          "owner_id": {
+            "title": "Owner Id",
+            "type": "string"
+          },
+          "receipt_fingerprint": {
+            "title": "Receipt Fingerprint",
+            "type": "string"
+          }
+        },
+        "required": [
+          "owner_id",
+          "receipt_fingerprint",
+          "effect_fingerprint"
+        ],
+        "title": "MemoryInterventionEffectReceiptRef",
+        "type": "object"
+      },
+      "MemoryInterventionEffectStatus": {
+        "enum": [
+          "verified_no_change",
+          "applied",
+          "matched_no_items",
+          "indeterminate",
+          "conflicting"
+        ],
+        "title": "MemoryInterventionEffectStatus",
+        "type": "string"
+      },
+      "MemoryInterventionExecutionPhase": {
+        "enum": [
+          "prepared",
+          "trial_bound",
+          "effect_resolved",
+          "session_bound",
+          "runtime_terminal",
+          "evaluated",
+          "finalized"
+        ],
+        "title": "MemoryInterventionExecutionPhase",
+        "type": "string"
+      },
+      "MemoryInterventionExecutionRecord": {
+        "additionalProperties": false,
+        "description": "One CAS-owned durable execution journal row.",
+        "properties": {
+          "candidate_id": {
+            "maxLength": 256,
+            "title": "Candidate Id",
+            "type": "string"
+          },
+          "case_id": {
+            "maxLength": 256,
+            "title": "Case Id",
+            "type": "string"
+          },
+          "case_revision": {
+            "title": "Case Revision",
+            "type": "string"
+          },
+          "causal_budget_id": {
+            "maxLength": 512,
+            "title": "Causal Budget Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "eval_result_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eval Result Revision"
+          },
+          "evaluator_fingerprint": {
+            "title": "Evaluator Fingerprint",
+            "type": "string"
+          },
+          "execution_id": {
+            "title": "Execution Id",
+            "type": "string"
+          },
+          "failure_code": {
+            "anyOf": [
+              {
+                "enum": [
+                  "intervention_conflicting",
+                  "intervention_indeterminate",
+                  "runtime_cancelled",
+                  "runtime_failed",
+                  "runtime_outcome_unknown",
+                  "runtime_timed_out"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Code"
+          },
+          "final_binding_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Final Binding Fingerprint"
+          },
+          "materialization_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Materialization Fingerprint"
+          },
+          "operation_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Fingerprint"
+          },
+          "overlay_provider_fingerprint": {
+            "title": "Overlay Provider Fingerprint",
+            "type": "string"
+          },
+          "overlay_provider_id": {
+            "maxLength": 256,
+            "title": "Overlay Provider Id",
+            "type": "string"
+          },
+          "phase": {
+            "$ref": "#/components/schemas/MemoryInterventionExecutionPhase"
+          },
+          "receipt_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Receipt Fingerprint"
+          },
+          "record_type": {
+            "const": "cayu.memory-intervention-execution",
+            "default": "cayu.memory-intervention-execution",
+            "title": "Record Type",
+            "type": "string"
+          },
+          "request_fingerprint": {
+            "title": "Request Fingerprint",
+            "type": "string"
+          },
+          "request_key_id": {
+            "maxLength": 256,
+            "title": "Request Key Id",
+            "type": "string"
+          },
+          "required_execution_profile_fingerprint": {
+            "title": "Required Execution Profile Fingerprint",
+            "type": "string"
+          },
+          "revision": {
+            "minimum": 0.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "runtime_cancellation_observed": {
+            "default": false,
+            "title": "Runtime Cancellation Observed",
+            "type": "boolean"
+          },
+          "runtime_deadline_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Deadline At"
+          },
+          "runtime_dispatch_lease_expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Dispatch Lease Expires At"
+          },
+          "runtime_dispatch_owner_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Dispatch Owner Id"
+          },
+          "runtime_evidence_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Evidence Fingerprint"
+          },
+          "runtime_execution_profile_fingerprint": {
+            "title": "Runtime Execution Profile Fingerprint",
+            "type": "string"
+          },
+          "runtime_result_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Result Fingerprint"
+          },
+          "runtime_result_payload": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Result Payload"
+          },
+          "runtime_runner_fingerprint": {
+            "title": "Runtime Runner Fingerprint",
+            "type": "string"
+          },
+          "runtime_session_claim_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Session Claim Id"
+          },
+          "runtime_timeout_observed": {
+            "default": false,
+            "title": "Runtime Timeout Observed",
+            "type": "boolean"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "session_id": {
+            "maxLength": 512,
+            "title": "Session Id",
+            "type": "string"
+          },
+          "snapshot_result_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Result Fingerprint"
+          },
+          "spec_fingerprint": {
+            "title": "Spec Fingerprint",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MemoryInterventionExecutionStatus",
+            "default": "active"
+          },
+          "trial_binding_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trial Binding Fingerprint"
+          },
+          "trial_id": {
+            "maxLength": 256,
+            "title": "Trial Id",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "execution_id",
+          "request_key_id",
+          "request_fingerprint",
+          "spec_fingerprint",
+          "candidate_id",
+          "trial_id",
+          "case_id",
+          "case_revision",
+          "required_execution_profile_fingerprint",
+          "runtime_execution_profile_fingerprint",
+          "overlay_provider_id",
+          "overlay_provider_fingerprint",
+          "runtime_runner_fingerprint",
+          "evaluator_fingerprint",
+          "session_id",
+          "causal_budget_id",
+          "phase",
+          "revision",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "MemoryInterventionExecutionRecord",
+        "type": "object"
+      },
+      "MemoryInterventionExecutionStatus": {
+        "enum": [
+          "active",
+          "completed",
+          "failed",
+          "cancelled",
+          "timed_out",
+          "outcome_unknown",
+          "conflicting",
+          "indeterminate"
+        ],
+        "title": "MemoryInterventionExecutionStatus",
+        "type": "string"
+      },
+      "MemoryInterventionFixtureRef": {
+        "additionalProperties": false,
+        "description": "Content-addressed evaluation input; never a store location or memory text.",
+        "properties": {
+          "fixture_fingerprint": {
+            "title": "Fixture Fingerprint",
+            "type": "string"
+          },
+          "fixture_id": {
+            "title": "Fixture Id",
+            "type": "string"
+          },
+          "representation_fingerprint": {
+            "title": "Representation Fingerprint",
+            "type": "string"
+          },
+          "size_bytes": {
+            "maximum": 16777216.0,
+            "minimum": 0.0,
+            "title": "Size Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "fixture_id",
+          "fixture_fingerprint",
+          "representation_fingerprint",
+          "size_bytes"
+        ],
+        "title": "MemoryInterventionFixtureRef",
+        "type": "object"
+      },
+      "MemoryInterventionItemChange": {
+        "additionalProperties": false,
+        "description": "One bounded omission, replacement, or control-fixture injection.",
+        "properties": {
+          "fixture": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryInterventionFixtureRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/MemoryInterventionChangeKind"
+          },
+          "source_item": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryInterventionItemIdentity"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "MemoryInterventionItemChange",
+        "type": "object"
+      },
+      "MemoryInterventionItemIdentity": {
+        "additionalProperties": false,
+        "description": "One exact revision-bound item identity without retained memory text.",
+        "properties": {
+          "alias": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryEvidenceAlias"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "item_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Item Fingerprint"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/MemoryInterventionItemIdentityKind"
+          },
+          "revision_fingerprint": {
+            "title": "Revision Fingerprint",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "revision_fingerprint"
+        ],
+        "title": "MemoryInterventionItemIdentity",
+        "type": "object"
+      },
+      "MemoryInterventionItemIdentityKind": {
+        "enum": [
+          "alias",
+          "fingerprint"
+        ],
+        "title": "MemoryInterventionItemIdentityKind",
+        "type": "string"
+      },
+      "MemoryInterventionKind": {
+        "enum": [
+          "as_declared",
+          "automatic_recall_off",
+          "omit_items",
+          "replace_items",
+          "negative_control"
+        ],
+        "title": "MemoryInterventionKind",
+        "type": "string"
+      },
+      "MemoryInterventionOperation": {
+        "additionalProperties": false,
+        "description": "Precommitment binding one spec to one isolated materialization and trial.",
+        "properties": {
+          "candidate_id": {
+            "title": "Candidate Id",
+            "type": "string"
+          },
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "fingerprint": {
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "intervention_kind": {
+            "$ref": "#/components/schemas/MemoryInterventionKind"
+          },
+          "materialization_fingerprint": {
+            "title": "Materialization Fingerprint",
+            "type": "string"
+          },
+          "memory_overlay_fingerprint": {
+            "title": "Memory Overlay Fingerprint",
+            "type": "string"
+          },
+          "memory_state_fingerprint": {
+            "title": "Memory State Fingerprint",
+            "type": "string"
+          },
+          "record_type": {
+            "const": "cayu.memory-intervention-operation",
+            "default": "cayu.memory-intervention-operation",
+            "title": "Record Type",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "snapshot_fingerprint": {
+            "title": "Snapshot Fingerprint",
+            "type": "string"
+          },
+          "spec_fingerprint": {
+            "title": "Spec Fingerprint",
+            "type": "string"
+          },
+          "state_scope_id": {
+            "title": "State Scope Id",
+            "type": "string"
+          },
+          "trial_binding_fingerprint": {
+            "title": "Trial Binding Fingerprint",
+            "type": "string"
+          },
+          "trial_id": {
+            "title": "Trial Id",
+            "type": "string"
+          },
+          "trial_state_mode": {
+            "$ref": "#/components/schemas/AgentSnapshotTrialStateMode"
+          }
+        },
+        "required": [
+          "fingerprint",
+          "spec_fingerprint",
+          "intervention_kind",
+          "candidate_id",
+          "snapshot_fingerprint",
+          "memory_state_fingerprint",
+          "materialization_fingerprint",
+          "memory_overlay_fingerprint",
+          "state_scope_id",
+          "trial_state_mode",
+          "trial_binding_fingerprint",
+          "case_id",
+          "trial_id"
+        ],
+        "title": "MemoryInterventionOperation",
+        "type": "object"
+      },
+      "MemoryInterventionReceipt": {
+        "additionalProperties": false,
+        "description": "Deterministic evidence of the exact outcome of one precommitted operation.",
+        "properties": {
+          "application_effect_receipts": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryInterventionEffectReceiptRef"
+            },
+            "maxItems": 128,
+            "title": "Application Effect Receipts",
+            "type": "array"
+          },
+          "changed_item_revision_fingerprints": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 128,
+            "title": "Changed Item Revision Fingerprints",
+            "type": "array"
+          },
+          "effect_fingerprints": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 128,
+            "title": "Effect Fingerprints",
+            "type": "array"
+          },
+          "evidence_only": {
+            "const": true,
+            "default": true,
+            "title": "Evidence Only",
+            "type": "boolean"
+          },
+          "fingerprint": {
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "intervention_kind": {
+            "$ref": "#/components/schemas/MemoryInterventionKind"
+          },
+          "matched_item_count": {
+            "maximum": 128.0,
+            "minimum": 0.0,
+            "title": "Matched Item Count",
+            "type": "integer"
+          },
+          "materialization_fingerprint": {
+            "title": "Materialization Fingerprint",
+            "type": "string"
+          },
+          "memory_overlay_fingerprint": {
+            "title": "Memory Overlay Fingerprint",
+            "type": "string"
+          },
+          "operation_fingerprint": {
+            "title": "Operation Fingerprint",
+            "type": "string"
+          },
+          "production_mutation_allowed": {
+            "const": false,
+            "default": false,
+            "title": "Production Mutation Allowed",
+            "type": "boolean"
+          },
+          "record_type": {
+            "const": "cayu.memory-intervention-receipt",
+            "default": "cayu.memory-intervention-receipt",
+            "title": "Record Type",
+            "type": "string"
+          },
+          "result_memory_state_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result Memory State Fingerprint"
+          },
+          "result_recall_policy_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result Recall Policy Fingerprint"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "snapshot_fingerprint": {
+            "title": "Snapshot Fingerprint",
+            "type": "string"
+          },
+          "spec_fingerprint": {
+            "title": "Spec Fingerprint",
+            "type": "string"
+          },
+          "starting_memory_state_fingerprint": {
+            "title": "Starting Memory State Fingerprint",
+            "type": "string"
+          },
+          "state_scope_id": {
+            "title": "State Scope Id",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MemoryInterventionEffectStatus"
+          }
+        },
+        "required": [
+          "fingerprint",
+          "spec_fingerprint",
+          "operation_fingerprint",
+          "intervention_kind",
+          "snapshot_fingerprint",
+          "starting_memory_state_fingerprint",
+          "materialization_fingerprint",
+          "memory_overlay_fingerprint",
+          "state_scope_id",
+          "status",
+          "matched_item_count"
+        ],
+        "title": "MemoryInterventionReceipt",
+        "type": "object"
+      },
+      "MemoryInterventionSpec": {
+        "additionalProperties": false,
+        "description": "Immutable declaration of one fixed intervention over a snapshot memory frontier.",
+        "properties": {
+          "authority_scope_fingerprint": {
+            "title": "Authority Scope Fingerprint",
+            "type": "string"
+          },
+          "bounds": {
+            "$ref": "#/components/schemas/MemoryInterventionBounds"
+          },
+          "changes": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryInterventionItemChange"
+            },
+            "maxItems": 128,
+            "title": "Changes",
+            "type": "array"
+          },
+          "evidence_only": {
+            "const": true,
+            "default": true,
+            "title": "Evidence Only",
+            "type": "boolean"
+          },
+          "execution_profile_fingerprint": {
+            "title": "Execution Profile Fingerprint",
+            "type": "string"
+          },
+          "fingerprint": {
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/MemoryInterventionKind"
+          },
+          "memory_state_fingerprint": {
+            "title": "Memory State Fingerprint",
+            "type": "string"
+          },
+          "negative_control_kind": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryNegativeControlKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "production_mutation_allowed": {
+            "const": false,
+            "default": false,
+            "title": "Production Mutation Allowed",
+            "type": "boolean"
+          },
+          "proposer_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proposer Fingerprint"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "recall_policy_ref_fingerprint": {
+            "title": "Recall Policy Ref Fingerprint",
+            "type": "string"
+          },
+          "record_type": {
+            "const": "cayu.memory-intervention-spec",
+            "default": "cayu.memory-intervention-spec",
+            "title": "Record Type",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "snapshot_fingerprint": {
+            "title": "Snapshot Fingerprint",
+            "type": "string"
+          },
+          "source_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Fingerprint"
+          },
+          "spec_id": {
+            "title": "Spec Id",
+            "type": "string"
+          },
+          "starting_recall_mode": {
+            "$ref": "#/components/schemas/AutomaticRecallMode"
+          },
+          "starting_recall_policy_fingerprint": {
+            "title": "Starting Recall Policy Fingerprint",
+            "type": "string"
+          },
+          "trial_recall_mode": {
+            "$ref": "#/components/schemas/AutomaticRecallMode"
+          },
+          "trial_recall_policy_fingerprint": {
+            "title": "Trial Recall Policy Fingerprint",
+            "type": "string"
+          },
+          "trial_state_mode": {
+            "$ref": "#/components/schemas/AgentSnapshotTrialStateMode"
+          }
+        },
+        "required": [
+          "fingerprint",
+          "spec_id",
+          "snapshot_fingerprint",
+          "memory_state_fingerprint",
+          "execution_profile_fingerprint",
+          "recall_policy_ref_fingerprint",
+          "starting_recall_policy_fingerprint",
+          "trial_recall_policy_fingerprint",
+          "starting_recall_mode",
+          "trial_recall_mode",
+          "trial_state_mode",
+          "authority_scope_fingerprint",
+          "kind",
+          "bounds"
+        ],
+        "title": "MemoryInterventionSpec",
+        "type": "object"
+      },
+      "MemoryInterventionTrialBinding": {
+        "additionalProperties": false,
+        "description": "Bind one intervention effect to Cayu trial, result, and attribution records.",
+        "properties": {
+          "attribution": {
+            "$ref": "#/components/schemas/MemoryAttribution"
+          },
+          "attribution_fingerprint": {
+            "title": "Attribution Fingerprint",
+            "type": "string"
+          },
+          "expected_exposure_count": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Exposure Count"
+          },
+          "expected_receipt_count": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Receipt Count"
+          },
+          "fingerprint": {
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "operation": {
+            "$ref": "#/components/schemas/MemoryInterventionOperation"
+          },
+          "receipt": {
+            "$ref": "#/components/schemas/MemoryInterventionReceipt"
+          },
+          "record_type": {
+            "const": "cayu.memory-intervention-trial",
+            "default": "cayu.memory-intervention-trial",
+            "title": "Record Type",
+            "type": "string"
+          },
+          "result": {
+            "$ref": "#/components/schemas/AgentSnapshotResultBinding"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/MemoryInterventionSpec"
+          },
+          "terminal_evidence_available": {
+            "default": false,
+            "title": "Terminal Evidence Available",
+            "type": "boolean"
+          },
+          "trial": {
+            "$ref": "#/components/schemas/AgentSnapshotTrialBinding"
+          }
+        },
+        "required": [
+          "fingerprint",
+          "spec",
+          "operation",
+          "receipt",
+          "trial",
+          "result",
+          "attribution",
+          "attribution_fingerprint"
+        ],
+        "title": "MemoryInterventionTrialBinding",
+        "type": "object"
+      },
+      "MemoryMetricAvailability": {
+        "enum": [
+          "available",
+          "unavailable",
+          "error"
+        ],
+        "title": "MemoryMetricAvailability",
+        "type": "string"
+      },
+      "MemoryMetricBinding": {
+        "additionalProperties": false,
+        "properties": {
+          "assertion_id": {
+            "maxLength": 128,
+            "title": "Assertion Id",
+            "type": "string"
+          },
+          "assertion_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "title": "Assertion Revision",
+            "type": "string"
+          },
+          "direction": {
+            "$ref": "#/components/schemas/MemoryMetricDirection",
+            "default": "higher_is_better"
+          },
+          "role": {
+            "$ref": "#/components/schemas/MemoryMetricRole"
+          }
+        },
+        "required": [
+          "role",
+          "assertion_id",
+          "assertion_revision"
+        ],
+        "title": "MemoryMetricBinding",
+        "type": "object"
+      },
+      "MemoryMetricDelta": {
+        "additionalProperties": false,
+        "properties": {
+          "baseline": {
+            "title": "Baseline",
+            "type": "number"
+          },
+          "candidate": {
+            "title": "Candidate",
+            "type": "number"
+          },
+          "delta": {
+            "title": "Delta",
+            "type": "number"
+          },
+          "role": {
+            "$ref": "#/components/schemas/MemoryMetricRole"
+          }
+        },
+        "required": [
+          "role",
+          "baseline",
+          "candidate",
+          "delta"
+        ],
+        "title": "MemoryMetricDelta",
+        "type": "object"
+      },
+      "MemoryMetricDirection": {
+        "enum": [
+          "higher_is_better",
+          "lower_is_better"
+        ],
+        "title": "MemoryMetricDirection",
+        "type": "string"
+      },
+      "MemoryMetricDistribution": {
+        "additionalProperties": false,
+        "properties": {
+          "available_count": {
+            "minimum": 0.0,
+            "title": "Available Count",
+            "type": "integer"
+          },
+          "baseline_values": {
+            "default": [],
+            "items": {
+              "type": "number"
+            },
+            "title": "Baseline Values",
+            "type": "array"
+          },
+          "candidate_values": {
+            "default": [],
+            "items": {
+              "type": "number"
+            },
+            "title": "Candidate Values",
+            "type": "array"
+          },
+          "deltas": {
+            "default": [],
+            "items": {
+              "type": "number"
+            },
+            "title": "Deltas",
+            "type": "array"
+          },
+          "incomparable_count": {
+            "minimum": 0.0,
+            "title": "Incomparable Count",
+            "type": "integer"
+          },
+          "mean_delta": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mean Delta"
+          },
+          "median_delta": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Median Delta"
+          },
+          "pair_count": {
+            "minimum": 0.0,
+            "title": "Pair Count",
+            "type": "integer"
+          },
+          "role": {
+            "$ref": "#/components/schemas/MemoryMetricRole"
+          },
+          "unavailable_count": {
+            "minimum": 0.0,
+            "title": "Unavailable Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "role",
+          "pair_count",
+          "available_count",
+          "unavailable_count",
+          "incomparable_count"
+        ],
+        "title": "MemoryMetricDistribution",
+        "type": "object"
+      },
+      "MemoryMetricGate": {
+        "additionalProperties": false,
+        "properties": {
+          "maximum": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maximum"
+          },
+          "minimum": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Minimum"
+          },
+          "role": {
+            "$ref": "#/components/schemas/MemoryMetricRole"
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "title": "MemoryMetricGate",
+        "type": "object"
+      },
+      "MemoryMetricObservation": {
+        "additionalProperties": false,
+        "properties": {
+          "assertion_id": {
+            "title": "Assertion Id",
+            "type": "string"
+          },
+          "assertion_revision": {
+            "title": "Assertion Revision",
+            "type": "string"
+          },
+          "availability": {
+            "$ref": "#/components/schemas/MemoryMetricAvailability"
+          },
+          "evaluator_implementation_revision": {
+            "anyOf": [
+              {
+                "maxLength": 71,
+                "minLength": 71,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evaluator Implementation Revision"
+          },
+          "evaluator_key": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evaluator Key"
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "enum": [
+                  "passed",
+                  "failed",
+                  "unavailable",
+                  "error"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outcome"
+          },
+          "role": {
+            "$ref": "#/components/schemas/MemoryMetricRole"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "role",
+          "assertion_id",
+          "assertion_revision",
+          "availability"
+        ],
+        "title": "MemoryMetricObservation",
+        "type": "object"
+      },
+      "MemoryMetricRole": {
+        "enum": [
+          "task_quality",
+          "factual_support",
+          "hallucination_avoidance",
+          "safety",
+          "privacy",
+          "stale_exposure_avoidance",
+          "false_exposure_avoidance",
+          "unauthorized_exposure_avoidance"
+        ],
+        "title": "MemoryMetricRole",
+        "type": "string"
+      },
+      "MemoryNegativeControlKind": {
+        "enum": [
+          "irrelevant",
+          "stale",
+          "conflicting",
+          "adversarial"
+        ],
+        "title": "MemoryNegativeControlKind",
+        "type": "string"
+      },
+      "MemoryOperationalDelta": {
+        "additionalProperties": false,
+        "properties": {
+          "baseline": {
+            "pattern": "^(0|[1-9]\\d*)$",
+            "title": "Baseline",
+            "type": "string"
+          },
+          "candidate": {
+            "pattern": "^(0|[1-9]\\d*)$",
+            "title": "Candidate",
+            "type": "string"
+          },
+          "delta": {
+            "pattern": "^(0|[1-9]\\d*|-[1-9]\\d*)$",
+            "title": "Delta",
+            "type": "string"
+          },
+          "dimension": {
+            "$ref": "#/components/schemas/MemoryOperationalDimension"
+          }
+        },
+        "required": [
+          "dimension",
+          "baseline",
+          "candidate",
+          "delta"
+        ],
+        "title": "MemoryOperationalDelta",
+        "type": "object"
+      },
+      "MemoryOperationalDimension": {
+        "enum": [
+          "latency_ms",
+          "total_tokens",
+          "memory_preparation_duration_ms",
+          "memory_context_tokens",
+          "memory_context_bytes"
+        ],
+        "title": "MemoryOperationalDimension",
+        "type": "string"
+      },
+      "MemoryOperationalDistribution": {
+        "additionalProperties": false,
+        "properties": {
+          "available_count": {
+            "minimum": 0.0,
+            "title": "Available Count",
+            "type": "integer"
+          },
+          "baseline_values": {
+            "default": [],
+            "items": {
+              "pattern": "^(0|[1-9]\\d*)$",
+              "type": "string"
+            },
+            "title": "Baseline Values",
+            "type": "array"
+          },
+          "candidate_values": {
+            "default": [],
+            "items": {
+              "pattern": "^(0|[1-9]\\d*)$",
+              "type": "string"
+            },
+            "title": "Candidate Values",
+            "type": "array"
+          },
+          "deltas": {
+            "default": [],
+            "items": {
+              "pattern": "^(0|[1-9]\\d*|-[1-9]\\d*)$",
+              "type": "string"
+            },
+            "title": "Deltas",
+            "type": "array"
+          },
+          "dimension": {
+            "$ref": "#/components/schemas/MemoryOperationalDimension"
+          },
+          "incomparable_count": {
+            "minimum": 0.0,
+            "title": "Incomparable Count",
+            "type": "integer"
+          },
+          "mean_delta": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mean Delta"
+          },
+          "median_delta": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Median Delta"
+          },
+          "pair_count": {
+            "minimum": 0.0,
+            "title": "Pair Count",
+            "type": "integer"
+          },
+          "unavailable_count": {
+            "minimum": 0.0,
+            "title": "Unavailable Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "dimension",
+          "pair_count",
+          "available_count",
+          "unavailable_count",
+          "incomparable_count"
+        ],
+        "title": "MemoryOperationalDistribution",
+        "type": "object"
+      },
+      "MemoryPairStatus": {
+        "enum": [
+          "comparable",
+          "incomparable",
+          "unavailable"
+        ],
+        "title": "MemoryPairStatus",
+        "type": "string"
+      },
+      "MemoryPreparationOverheadEvidence": {
+        "additionalProperties": false,
+        "properties": {
+          "context_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Bytes"
+          },
+          "context_tokens": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Tokens"
+          },
+          "evidence_revision": {
+            "maxLength": 71,
+            "minLength": 71,
+            "title": "Evidence Revision",
+            "type": "string"
+          },
+          "preparation_duration_ms": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preparation Duration Ms"
+          }
+        },
+        "required": [
+          "evidence_revision"
+        ],
+        "title": "MemoryPreparationOverheadEvidence",
+        "type": "object"
+      },
+      "MemoryPublishedResultEvidence": {
+        "additionalProperties": false,
+        "description": "One complete content-addressed EvalStore result available to report rows.",
+        "properties": {
+          "result": {
+            "additionalProperties": false,
+            "description": "Safe published run plus the fresh target identity used to produce it.",
+            "properties": {
+              "external_trials": {
+                "default": [],
+                "items": {
+                  "$ref": "#/components/schemas/ExternalTrialIdentityV1"
+                },
+                "maxItems": 100000,
+                "title": "External Trials",
+                "type": "array"
+              },
+              "revision": {
+                "title": "Revision",
+                "type": "string"
+              },
+              "run": {
+                "$ref": "#/components/schemas/PublishedEvalRun"
+              },
+              "schema_version": {
+                "const": 3,
+                "default": 3,
+                "title": "Schema Version",
+                "type": "integer"
+              },
+              "target": {
+                "$ref": "#/components/schemas/EvaluationTargetIdentity"
+              }
+            },
+            "required": [
+              "revision",
+              "target",
+              "run"
+            ],
+            "title": "CorpusExecutionResult",
+            "type": "object"
+          },
+          "run_id": {
+            "maxLength": 512,
+            "title": "Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "result"
+        ],
+        "title": "MemoryPublishedResultEvidence",
+        "type": "object"
+      },
+      "MemoryRankingTerm": {
+        "additionalProperties": false,
+        "properties": {
+          "direction": {
+            "$ref": "#/components/schemas/MemoryMetricDirection"
+          },
+          "role": {
+            "$ref": "#/components/schemas/MemoryMetricRole"
+          }
+        },
+        "required": [
+          "role",
+          "direction"
+        ],
+        "title": "MemoryRankingTerm",
         "type": "object"
       },
       "MemoryRecallAttribution": {
@@ -14180,6 +17638,586 @@
           "selection_reason"
         ],
         "title": "MemoryRecallItemAttribution",
+        "type": "object"
+      },
+      "MemoryTrialAvailability": {
+        "enum": [
+          "available",
+          "unavailable",
+          "missing",
+          "unmatched",
+          "failed",
+          "cancelled",
+          "timed_out",
+          "outcome_unknown",
+          "conflicting",
+          "indeterminate"
+        ],
+        "title": "MemoryTrialAvailability",
+        "type": "string"
+      },
+      "MemoryTrialPairComparison": {
+        "additionalProperties": false,
+        "properties": {
+          "accounting_pair": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PairedCostQualityPairReport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "baseline_row_id": {
+            "title": "Baseline Row Id",
+            "type": "string"
+          },
+          "baseline_variant_id": {
+            "title": "Baseline Variant Id",
+            "type": "string"
+          },
+          "candidate_row_id": {
+            "title": "Candidate Row Id",
+            "type": "string"
+          },
+          "candidate_variant_id": {
+            "title": "Candidate Variant Id",
+            "type": "string"
+          },
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "case_revision": {
+            "title": "Case Revision",
+            "type": "string"
+          },
+          "memory_comparability_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Comparability Fingerprint"
+          },
+          "metric_deltas": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryMetricDelta"
+            },
+            "title": "Metric Deltas",
+            "type": "array"
+          },
+          "operational_deltas": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryOperationalDelta"
+            },
+            "title": "Operational Deltas",
+            "type": "array"
+          },
+          "pair_id": {
+            "maxLength": 71,
+            "minLength": 71,
+            "title": "Pair Id",
+            "type": "string"
+          },
+          "reasons": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Reasons",
+            "type": "array"
+          },
+          "repetition": {
+            "title": "Repetition",
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MemoryPairStatus"
+          }
+        },
+        "required": [
+          "pair_id",
+          "case_id",
+          "case_revision",
+          "repetition",
+          "baseline_variant_id",
+          "candidate_variant_id",
+          "baseline_row_id",
+          "candidate_row_id",
+          "status"
+        ],
+        "title": "MemoryTrialPairComparison",
+        "type": "object"
+      },
+      "MemoryTrialReportRow": {
+        "additionalProperties": false,
+        "properties": {
+          "accounting_side": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PairedCostQualitySide-Output"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "attribution_evidence_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attribution Evidence Revision"
+          },
+          "attribution_status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalMemoryEvidenceCompleteness"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "availability": {
+            "$ref": "#/components/schemas/MemoryTrialAvailability"
+          },
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "case_revision": {
+            "title": "Case Revision",
+            "type": "string"
+          },
+          "corpus_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Corpus Revision"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms"
+          },
+          "evaluator_fingerprint": {
+            "title": "Evaluator Fingerprint",
+            "type": "string"
+          },
+          "evidence_policy_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evidence Policy Revision"
+          },
+          "execution_binding_lineage_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Binding Lineage Revision"
+          },
+          "execution_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Id"
+          },
+          "execution_profile_revision": {
+            "title": "Execution Profile Revision",
+            "type": "string"
+          },
+          "execution_revision": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Revision"
+          },
+          "execution_status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryInterventionExecutionStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "final_binding_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Final Binding Fingerprint"
+          },
+          "intervention_attribution_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intervention Attribution Fingerprint"
+          },
+          "intervention_binding": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryInterventionTrialBinding"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "intervention_spec_fingerprint": {
+            "title": "Intervention Spec Fingerprint",
+            "type": "string"
+          },
+          "memory_overhead": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MemoryPreparationOverheadEvidence"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "metrics": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/MemoryMetricObservation"
+            },
+            "title": "Metrics",
+            "type": "array"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "pricing_profile_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Profile Fingerprint"
+          },
+          "provider_name": {
+            "title": "Provider Name",
+            "type": "string"
+          },
+          "published_result_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Published Result Revision"
+          },
+          "published_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Published Run Id"
+          },
+          "published_status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "passed",
+                  "failed",
+                  "unavailable",
+                  "error"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Published Status"
+          },
+          "repetition": {
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Repetition",
+            "type": "integer"
+          },
+          "row_id": {
+            "maxLength": 71,
+            "minLength": 71,
+            "title": "Row Id",
+            "type": "string"
+          },
+          "runtime_execution_profile_fingerprint": {
+            "title": "Runtime Execution Profile Fingerprint",
+            "type": "string"
+          },
+          "snapshot_fingerprint": {
+            "title": "Snapshot Fingerprint",
+            "type": "string"
+          },
+          "source_trial_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Trial Revision"
+          },
+          "suite_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Suite Id"
+          },
+          "suite_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Suite Revision"
+          },
+          "total_tokens": {
+            "anyOf": [
+              {
+                "ge": 0,
+                "pattern": "^(0|[1-9]\\d*)$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Tokens"
+          },
+          "trial_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trial Id"
+          },
+          "variant_id": {
+            "title": "Variant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "row_id",
+          "case_id",
+          "case_revision",
+          "repetition",
+          "variant_id",
+          "intervention_spec_fingerprint",
+          "snapshot_fingerprint",
+          "execution_profile_revision",
+          "runtime_execution_profile_fingerprint",
+          "provider_name",
+          "model",
+          "evaluator_fingerprint",
+          "availability"
+        ],
+        "title": "MemoryTrialReportRow",
+        "type": "object"
+      },
+      "MemoryVariantCostQualityReport": {
+        "additionalProperties": false,
+        "description": "Canonical #300 evidence scoped to one candidate versus the baseline.",
+        "properties": {
+          "candidate_variant_id": {
+            "maxLength": 128,
+            "title": "Candidate Variant Id",
+            "type": "string"
+          },
+          "report": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PairedCostQualityComparisonReport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "candidate_variant_id"
+        ],
+        "title": "MemoryVariantCostQualityReport",
+        "type": "object"
+      },
+      "MemoryVariantDisposition": {
+        "additionalProperties": false,
+        "properties": {
+          "comparable_pair_count": {
+            "minimum": 0.0,
+            "title": "Comparable Pair Count",
+            "type": "integer"
+          },
+          "incomparable_pair_count": {
+            "minimum": 0.0,
+            "title": "Incomparable Pair Count",
+            "type": "integer"
+          },
+          "ranking_values": {
+            "default": [],
+            "items": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": "Ranking Values",
+            "type": "array"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Reasons",
+            "type": "array"
+          },
+          "status": {
+            "$ref": "#/components/schemas/MemoryVariantDispositionStatus"
+          },
+          "unavailable_pair_count": {
+            "minimum": 0.0,
+            "title": "Unavailable Pair Count",
+            "type": "integer"
+          },
+          "variant_id": {
+            "title": "Variant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "variant_id",
+          "status",
+          "reasons",
+          "comparable_pair_count",
+          "unavailable_pair_count",
+          "incomparable_pair_count"
+        ],
+        "title": "MemoryVariantDisposition",
+        "type": "object"
+      },
+      "MemoryVariantDispositionStatus": {
+        "enum": [
+          "selected",
+          "baseline_superseded",
+          "eligible_not_selected",
+          "rejected",
+          "incomparable",
+          "unavailable",
+          "not_better_than_baseline"
+        ],
+        "title": "MemoryVariantDispositionStatus",
+        "type": "string"
+      },
+      "MemoryVariantOperationalReport": {
+        "additionalProperties": false,
+        "properties": {
+          "candidate_variant_id": {
+            "maxLength": 128,
+            "title": "Candidate Variant Id",
+            "type": "string"
+          },
+          "distributions": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryOperationalDistribution"
+            },
+            "title": "Distributions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "candidate_variant_id",
+          "distributions"
+        ],
+        "title": "MemoryVariantOperationalReport",
         "type": "object"
       },
       "Message": {
@@ -14506,6 +18544,785 @@
           "mutate"
         ],
         "title": "OptionalSurfaceCapability",
+        "type": "object"
+      },
+      "PairedCostAttempt-Input": {
+        "additionalProperties": false,
+        "description": "One attributable provider attempt and its provider-reported cost evidence.",
+        "properties": {
+          "attempt_id": {
+            "maxLength": 512,
+            "title": "Attempt Id",
+            "type": "string"
+          },
+          "attempt_ordinal": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Attempt Ordinal",
+            "type": "integer"
+          },
+          "branch_id": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Branch Id"
+          },
+          "cost": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ComparisonCostLineItem-Input"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "operation": {
+            "$ref": "#/components/schemas/CostQualityAttemptOperation"
+          },
+          "operation_id": {
+            "maxLength": 512,
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "provider_name": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Name"
+          },
+          "role": {
+            "maxLength": 512,
+            "title": "Role",
+            "type": "string"
+          },
+          "session_id": {
+            "maxLength": 512,
+            "title": "Session Id",
+            "type": "string"
+          },
+          "source_checkpoint_id": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Checkpoint Id"
+          },
+          "usage_unavailable_reason": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Usage Unavailable Reason"
+          }
+        },
+        "required": [
+          "attempt_id",
+          "operation_id",
+          "session_id",
+          "role",
+          "operation",
+          "attempt_ordinal"
+        ],
+        "title": "PairedCostAttempt",
+        "type": "object"
+      },
+      "PairedCostAttempt-Output": {
+        "additionalProperties": false,
+        "description": "One attributable provider attempt and its provider-reported cost evidence.",
+        "properties": {
+          "attempt_id": {
+            "maxLength": 512,
+            "title": "Attempt Id",
+            "type": "string"
+          },
+          "attempt_ordinal": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Attempt Ordinal",
+            "type": "integer"
+          },
+          "branch_id": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Branch Id"
+          },
+          "cost": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ComparisonCostLineItem-Output"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "operation": {
+            "$ref": "#/components/schemas/CostQualityAttemptOperation"
+          },
+          "operation_id": {
+            "maxLength": 512,
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "provider_name": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Name"
+          },
+          "role": {
+            "maxLength": 512,
+            "title": "Role",
+            "type": "string"
+          },
+          "session_id": {
+            "maxLength": 512,
+            "title": "Session Id",
+            "type": "string"
+          },
+          "source_checkpoint_id": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Checkpoint Id"
+          },
+          "usage_unavailable_reason": {
+            "anyOf": [
+              {
+                "maxLength": 2048,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Usage Unavailable Reason"
+          }
+        },
+        "required": [
+          "attempt_id",
+          "operation_id",
+          "session_id",
+          "role",
+          "operation",
+          "attempt_ordinal"
+        ],
+        "title": "PairedCostAttempt",
+        "type": "object"
+      },
+      "PairedCostQualityComparisonReport": {
+        "additionalProperties": false,
+        "description": "Versioned, serialization-safe result of one pure comparison.",
+        "properties": {
+          "aggregate": {
+            "$ref": "#/components/schemas/CostQualityAggregateReport"
+          },
+          "pairs": {
+            "items": {
+              "$ref": "#/components/schemas/PairedCostQualityPairReport"
+            },
+            "title": "Pairs",
+            "type": "array"
+          },
+          "schema_version": {
+            "const": 3,
+            "default": 3,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CostQualityComparisonStatus"
+          }
+        },
+        "required": [
+          "status",
+          "pairs",
+          "aggregate"
+        ],
+        "title": "PairedCostQualityComparisonReport",
+        "type": "object"
+      },
+      "PairedCostQualityPairReport": {
+        "additionalProperties": false,
+        "description": "One pair's raw accounting and strongest supportable claim.",
+        "properties": {
+          "baseline": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PairedCostQualitySideReport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "baseline_cost": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Baseline Cost"
+          },
+          "candidate": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PairedCostQualitySideReport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "candidate_cost": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Cost"
+          },
+          "cost_direction": {
+            "$ref": "#/components/schemas/CostDirection"
+          },
+          "currency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Currency"
+          },
+          "eligible_for_verified_aggregate": {
+            "title": "Eligible For Verified Aggregate",
+            "type": "boolean"
+          },
+          "findings": {
+            "items": {
+              "$ref": "#/components/schemas/CostQualityFinding"
+            },
+            "title": "Findings",
+            "type": "array"
+          },
+          "pair_id": {
+            "title": "Pair Id",
+            "type": "string"
+          },
+          "savings": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Savings"
+          },
+          "savings_percentage": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Savings Percentage"
+          },
+          "savings_percentage_state": {
+            "$ref": "#/components/schemas/SavingsPercentageState"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CostQualityComparisonStatus"
+          }
+        },
+        "required": [
+          "pair_id",
+          "status",
+          "findings",
+          "baseline",
+          "candidate",
+          "eligible_for_verified_aggregate",
+          "currency",
+          "baseline_cost",
+          "candidate_cost",
+          "savings",
+          "savings_percentage",
+          "savings_percentage_state",
+          "cost_direction"
+        ],
+        "title": "PairedCostQualityPairReport",
+        "type": "object"
+      },
+      "PairedCostQualitySide-Input": {
+        "additionalProperties": false,
+        "description": "One baseline or candidate strategy under a matched comparison contract.",
+        "properties": {
+          "attempts": {
+            "items": {
+              "$ref": "#/components/schemas/PairedCostAttempt-Input"
+            },
+            "maxItems": 2048,
+            "title": "Attempts",
+            "type": "array"
+          },
+          "generation_settings": {
+            "$ref": "#/components/schemas/ComparableGenerationSettings"
+          },
+          "output_budget": {
+            "$ref": "#/components/schemas/ComparableOutputBudget"
+          },
+          "pricing_catalog": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ComparisonPricingCatalog"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "quality": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PairedQualityEvidence-Input"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "role": {
+            "maxLength": 512,
+            "title": "Role",
+            "type": "string"
+          },
+          "source_id": {
+            "maxLength": 512,
+            "title": "Source Id",
+            "type": "string"
+          },
+          "strategy_id": {
+            "maxLength": 512,
+            "title": "Strategy Id",
+            "type": "string"
+          },
+          "task_id": {
+            "maxLength": 512,
+            "title": "Task Id",
+            "type": "string"
+          },
+          "workload_id": {
+            "maxLength": 512,
+            "title": "Workload Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_id",
+          "workload_id",
+          "task_id",
+          "source_id",
+          "role",
+          "output_budget",
+          "generation_settings"
+        ],
+        "title": "PairedCostQualitySide",
+        "type": "object"
+      },
+      "PairedCostQualitySide-Output": {
+        "additionalProperties": false,
+        "description": "One baseline or candidate strategy under a matched comparison contract.",
+        "properties": {
+          "attempts": {
+            "items": {
+              "$ref": "#/components/schemas/PairedCostAttempt-Output"
+            },
+            "maxItems": 2048,
+            "title": "Attempts",
+            "type": "array"
+          },
+          "generation_settings": {
+            "$ref": "#/components/schemas/ComparableGenerationSettings"
+          },
+          "output_budget": {
+            "$ref": "#/components/schemas/ComparableOutputBudget"
+          },
+          "pricing_catalog": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ComparisonPricingCatalog"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "quality": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PairedQualityEvidence-Output"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "role": {
+            "maxLength": 512,
+            "title": "Role",
+            "type": "string"
+          },
+          "source_id": {
+            "maxLength": 512,
+            "title": "Source Id",
+            "type": "string"
+          },
+          "strategy_id": {
+            "maxLength": 512,
+            "title": "Strategy Id",
+            "type": "string"
+          },
+          "task_id": {
+            "maxLength": 512,
+            "title": "Task Id",
+            "type": "string"
+          },
+          "workload_id": {
+            "maxLength": 512,
+            "title": "Workload Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_id",
+          "workload_id",
+          "task_id",
+          "source_id",
+          "role",
+          "output_budget",
+          "generation_settings"
+        ],
+        "title": "PairedCostQualitySide",
+        "type": "object"
+      },
+      "PairedCostQualitySideReport": {
+        "additionalProperties": false,
+        "description": "Safe, deterministic accounting projection for one supplied side.",
+        "properties": {
+          "attempts": {
+            "items": {
+              "$ref": "#/components/schemas/PairedCostAttempt-Output"
+            },
+            "title": "Attempts",
+            "type": "array"
+          },
+          "branches": {
+            "items": {
+              "$ref": "#/components/schemas/CostBranchTotals"
+            },
+            "title": "Branches",
+            "type": "array"
+          },
+          "generation_settings": {
+            "$ref": "#/components/schemas/ComparableGenerationSettings"
+          },
+          "operations": {
+            "items": {
+              "$ref": "#/components/schemas/CostOperationTotals"
+            },
+            "title": "Operations",
+            "type": "array"
+          },
+          "output_budget": {
+            "$ref": "#/components/schemas/ComparableOutputBudget"
+          },
+          "pricing_catalog": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ComparisonPricingCatalog"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pricing_provenance": {
+            "items": {
+              "$ref": "#/components/schemas/ComparisonPricingProvenance"
+            },
+            "title": "Pricing Provenance",
+            "type": "array"
+          },
+          "quality": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PairedQualityEvidence-Output"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          },
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/CostSessionTotals"
+            },
+            "title": "Sessions",
+            "type": "array"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "strategy_id": {
+            "title": "Strategy Id",
+            "type": "string"
+          },
+          "task_id": {
+            "title": "Task Id",
+            "type": "string"
+          },
+          "whole_harness": {
+            "$ref": "#/components/schemas/CostAccountingTotals"
+          },
+          "workload_id": {
+            "title": "Workload Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "strategy_id",
+          "workload_id",
+          "task_id",
+          "source_id",
+          "role",
+          "output_budget",
+          "generation_settings",
+          "pricing_catalog",
+          "pricing_provenance",
+          "quality",
+          "attempts",
+          "whole_harness",
+          "operations",
+          "sessions",
+          "branches"
+        ],
+        "title": "PairedCostQualitySideReport",
+        "type": "object"
+      },
+      "PairedQualityEvidence-Input": {
+        "additionalProperties": false,
+        "description": "Application-owned result from one declared quality contract.",
+        "properties": {
+          "contract_name": {
+            "maxLength": 512,
+            "title": "Contract Name",
+            "type": "string"
+          },
+          "contract_version": {
+            "maxLength": 512,
+            "title": "Contract Version",
+            "type": "string"
+          },
+          "references": {
+            "items": {
+              "$ref": "#/components/schemas/QualityEvidenceReference"
+            },
+            "maxItems": 64,
+            "title": "References",
+            "type": "array"
+          },
+          "role": {
+            "maxLength": 512,
+            "title": "Role",
+            "type": "string"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
+          "status": {
+            "$ref": "#/components/schemas/QualityEvidenceStatus"
+          },
+          "threshold": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "title": "Threshold"
+          }
+        },
+        "required": [
+          "contract_name",
+          "contract_version",
+          "threshold",
+          "role",
+          "status"
+        ],
+        "title": "PairedQualityEvidence",
+        "type": "object"
+      },
+      "PairedQualityEvidence-Output": {
+        "additionalProperties": false,
+        "description": "Application-owned result from one declared quality contract.",
+        "properties": {
+          "contract_name": {
+            "maxLength": 512,
+            "title": "Contract Name",
+            "type": "string"
+          },
+          "contract_version": {
+            "maxLength": 512,
+            "title": "Contract Version",
+            "type": "string"
+          },
+          "references": {
+            "items": {
+              "$ref": "#/components/schemas/QualityEvidenceReference"
+            },
+            "maxItems": 64,
+            "title": "References",
+            "type": "array"
+          },
+          "role": {
+            "maxLength": 512,
+            "title": "Role",
+            "type": "string"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
+          "status": {
+            "$ref": "#/components/schemas/QualityEvidenceStatus"
+          },
+          "threshold": {
+            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+            "title": "Threshold",
+            "type": "string"
+          }
+        },
+        "required": [
+          "contract_name",
+          "contract_version",
+          "threshold",
+          "role",
+          "status"
+        ],
+        "title": "PairedQualityEvidence",
         "type": "object"
       },
       "PendingActionKind": {
@@ -15984,7 +20801,7 @@
             "type": "string"
           },
           "schema_version": {
-            "const": 4,
+            "const": 5,
             "title": "Schema Version",
             "type": "integer"
           },
@@ -16087,6 +20904,12 @@
             ],
             "title": "Score"
           },
+          "source_trial_revision": {
+            "maxLength": 64,
+            "minLength": 64,
+            "title": "Source Trial Revision",
+            "type": "string"
+          },
           "status": {
             "enum": [
               "passed",
@@ -16116,6 +20939,7 @@
         },
         "required": [
           "trial_number",
+          "source_trial_revision",
           "status",
           "assertions",
           "evidence_complete",
@@ -16913,6 +21737,38 @@
         "title": "PublishedUsageSummaryV1",
         "type": "object"
       },
+      "QualityEvidenceReference": {
+        "additionalProperties": false,
+        "description": "Opaque, non-secret identifier for application-owned quality evidence.",
+        "properties": {
+          "kind": {
+            "maxLength": 128,
+            "title": "Kind",
+            "type": "string"
+          },
+          "reference": {
+            "maxLength": 71,
+            "title": "Reference",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "reference"
+        ],
+        "title": "QualityEvidenceReference",
+        "type": "object"
+      },
+      "QualityEvidenceStatus": {
+        "description": "Outcome of one application-owned quality gate.",
+        "enum": [
+          "passed",
+          "failed",
+          "unavailable"
+        ],
+        "title": "QualityEvidenceStatus",
+        "type": "string"
+      },
       "RecallItemAdmission": {
         "enum": [
           "admitted",
@@ -17611,6 +22467,16 @@
         ],
         "title": "RuntimeManifest",
         "type": "object"
+      },
+      "SavingsPercentageState": {
+        "description": "Why a savings percentage is present or absent.",
+        "enum": [
+          "computed",
+          "zero_baseline",
+          "unavailable"
+        ],
+        "title": "SavingsPercentageState",
+        "type": "string"
       },
       "ScenarioApprovalCheckpointEventV2": {
         "additionalProperties": false,
@@ -18555,7 +23421,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "31",
+            "default": "32",
             "title": "Contract Version",
             "type": "string"
           },
@@ -22759,7 +27625,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "31",
+            "default": "32",
             "title": "Contract Version",
             "type": "string"
           }
@@ -24118,6 +28984,85 @@
           }
         },
         "summary": "List Eval Cases"
+      }
+    },
+    "/api/evals/memory-reports": {
+      "post": {
+        "operationId": "build_stored_memory_report_api_evals_memory_reports_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryExperimentReportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryExperimentReport"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The edited captured evaluation is invalid or unsafe."
+          },
+          "404": {
+            "description": "The requested session or evaluation resource does not exist."
+          },
+          "409": {
+            "description": "The captured evidence or compare-and-swap baseline changed."
+          },
+          "413": {
+            "description": "The bounded captured evidence or result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Build Stored Memory Report"
+      }
+    },
+    "/api/evals/memory-reports/report.html": {
+      "post": {
+        "operationId": "build_stored_memory_report_html_api_evals_memory_reports_report_html_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemoryExperimentReportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The edited captured evaluation is invalid or unsafe."
+          },
+          "404": {
+            "description": "The requested session or evaluation resource does not exist."
+          },
+          "409": {
+            "description": "The captured evidence or compare-and-swap baseline changed."
+          },
+          "413": {
+            "description": "The bounded captured evidence or result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Build Stored Memory Report Html"
       }
     },
     "/api/evals/promotion/sessions/{session_id}/export": {

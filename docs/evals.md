@@ -769,12 +769,13 @@ credentials.
 
 `publish_eval_run(...)` is the only public result projection for a portable
 corpus run. It matches the complete internal suite result back to the corpus and
-produces a content-addressed schema-version-4 `PublishedEvalRun` containing
-every case, trial, assertion outcome, safe structural detail, duration, and
-identity-free aggregate usage. Every trial also retains the exact bounded
-memory-attribution section used during evaluation, so JSON, SDK, CLI, HTML, and
-Control Plane readers do not need raw runtime events to distinguish complete,
-truncated, and unavailable evidence. Captured-session scoring embeds the same
+produces a content-addressed schema-version-5 `PublishedEvalRun` containing
+every case, trial, exact source-trial revision, assertion outcome, safe
+structural detail, duration, and identity-free aggregate usage. Every trial also
+retains the exact bounded memory-attribution section used during evaluation, so
+JSON, SDK, CLI, HTML, and Control Plane readers do not need raw runtime events
+to distinguish complete, truncated, and unavailable evidence. Captured-session
+scoring embeds the same
 section in `CapturedRunScoreV1`; fresh and captured publications therefore use
 one memory evidence model and revision contract. CLI JSON and Control Plane
 schemas preserve the complete section. HTML reports retain its bounded
@@ -951,6 +952,47 @@ precedence is `error` → `unavailable` → `failed` → `skipped` → `passed`.
 Unavailable and error results have `score = null`; aggregation never converts
 them to zero or drops them from an average. A score is emitted only when every
 contributing result is scored.
+
+For fixed memory-intervention experiments, build a
+`MemoryExperimentReportRequest` from exact intervention execution records,
+published corpus results, execution profiles, and optional canonical
+cost/overhead evidence, then call `build_memory_experiment_report(...)`. The
+result preserves the complete baseline/candidate repetition matrix, including
+missing and non-success outcomes, and calculates deltas only for comparable
+paired rows. It reports per-pair, per-case, and per-experiment absolute and delta
+distributions for latency, total tokens, memory-preparation duration, and memory
+context tokens/bytes without adding them to ranking. Safety, privacy,
+factual-support, hallucination, stale-memory,
+false-memory, and unauthorized-memory gates run before declared task-quality
+ranking. Each published assertion identity may populate exactly one declared
+metric role, so a task-quality score cannot also stand in for independent
+safety or evidence-gate authority. Canonical cost-quality evidence is scoped independently to each
+candidate so a shared baseline is never counted twice in one aggregate. Safety
+and evidence dimensions are gates, not ranking terms. Each baseline/candidate
+accounting side uses `memory_experiment_accounting_task_id(experiment_id)` as its
+shared paired cost-quality cohort identity, so the canonical aggregate covers all
+cases and repetitions. Each side also uses
+`memory_experiment_accounting_source_id(case_revision, repetition)` so row and
+pair authority prevents evidence from moving between repetitions.
+There is no universal aggregate score: the report recommends one fixed candidate
+only when its complete evidence passes the configured gates and beats the
+baseline under the declared deterministic ranking. Dispositions distinguish an
+unavailable pair from an incomparable one, a baseline superseded by a selected
+candidate, and an improving candidate that remained eligible but was not
+selected.
+
+Use `cayu eval memory-report REQUEST.json --format json|html` for local report
+construction. A configured Control Plane exposes the equivalent protected
+`POST /api/evals/memory-reports` and
+`POST /api/evals/memory-reports/report.html` entrances. Those routes prove that
+each supplied published result and its associated profile snapshot belongs to
+the exact stored eval run. A result-less row retains its declared profile as
+experiment-contract authority; it does not claim stored-run provenance. JSON is
+the complete machine-readable contract. HTML renders a deterministic
+human-readable summary of the primary identities, rows, pair classifications,
+distributions, canonical accounting aggregates, gates, and recommendation
+without launching another trial; consumers that require complete retained
+authority use JSON.
 
 ## Capturing terminal session evidence
 

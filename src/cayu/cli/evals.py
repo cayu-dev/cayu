@@ -14,6 +14,7 @@ from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.cli.project import project_context, resolve_eval_project
 from cayu.evals import (
     CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES,
+    MEMORY_EXPERIMENT_REPORT_MAX_BYTES,
     CapturedEvaluationResultV1,
     CorpusExecutionResult,
     CorpusTarget,
@@ -22,6 +23,8 @@ from cayu.evals import (
     EvalRun,
     EvalStatus,
     EvalSuite,
+    MemoryExperimentReport,
+    build_memory_experiment_report,
     captured_evaluation_result_from_json,
     compare_eval_results,
     compare_eval_runs,
@@ -35,12 +38,16 @@ from cayu.evals import (
     load_corpus_execution_result,
     load_eval_corpus,
     load_eval_run,
+    memory_experiment_report_from_json,
+    memory_experiment_report_to_json,
+    memory_experiment_request_from_json,
     merge_eval_corpus_files,
     render_comparison_html,
     render_corpus_execution_comparison_html,
     render_corpus_execution_html,
     render_eval_result_html,
     render_html_report,
+    render_memory_experiment_report_html,
     run_eval_plan,
 )
 from cayu.runtime.app import CayuApp
@@ -111,6 +118,21 @@ def add_eval_parser(subparsers: Any) -> None:
     report.add_argument("input", metavar="RESULTS_JSON", help="Eval JSON results file.")
     add_output_options(report, formats=("html", "json"), default="html")
 
+    memory_report = inner.add_parser(
+        "memory-report",
+        help="Build a paired repeated-trial memory experiment report.",
+        description=(
+            "Validate an exact memory experiment request and build its deterministic "
+            "fixed-candidate report without launching additional work."
+        ),
+    )
+    memory_report.add_argument(
+        "input",
+        metavar="REQUEST_JSON",
+        help="Memory experiment report request JSON file.",
+    )
+    add_output_options(memory_report, formats=("html", "json"), default="json")
+
     compare = inner.add_parser(
         "compare",
         help="Compare baseline and current eval results.",
@@ -174,6 +196,8 @@ def run_eval_command(args: argparse.Namespace) -> int:
             return asyncio.run(_run(args))
         if args.eval_command == "report":
             return _report(args)
+        if args.eval_command == "memory-report":
+            return _memory_report(args)
         if args.eval_command == "compare":
             return _compare(args)
         if args.eval_command == "validate":
@@ -298,10 +322,33 @@ def _report(args: argparse.Namespace) -> int:
         )
         _write_or_print(output, args.output)
         return 0
+    if type(result) is MemoryExperimentReport:
+        output = (
+            memory_experiment_report_to_json(result)
+            if args.output_format == "json"
+            else render_memory_experiment_report_html(result)
+        )
+        _write_or_print(output, args.output)
+        return 0
     if type(result) is not EvalRun:
         raise TypeError("Unsupported eval result document type.")
     output = (
         eval_run_to_json(result) if args.output_format == "json" else render_html_report(result)
+    )
+    _write_or_print(output, args.output)
+    return 0
+
+
+def _memory_report(args: argparse.Namespace) -> int:
+    with Path(args.input).open("rb") as handle:
+        request = memory_experiment_request_from_json(
+            handle.read(MEMORY_EXPERIMENT_REPORT_MAX_BYTES + 1)
+        )
+    report = build_memory_experiment_report(request)
+    output = (
+        memory_experiment_report_to_json(report)
+        if args.output_format == "json"
+        else render_memory_experiment_report_html(report)
     )
     _write_or_print(output, args.output)
     return 0
@@ -381,7 +428,7 @@ def _status_exit_code(status: EvalStatus | str) -> int:
 
 def _load_saved_eval_result(
     path: str,
-) -> EvalRun | CorpusExecutionResult | CapturedEvaluationResultV1:
+) -> EvalRun | CorpusExecutionResult | CapturedEvaluationResultV1 | MemoryExperimentReport:
     result_path = Path(path)
     with result_path.open("rb") as handle:
         raw = handle.read(CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES + 1)
@@ -397,6 +444,8 @@ def _load_saved_eval_result(
         raise ValueError("Eval result JSON must be an object.")
     if document.get("origin") == "captured_session":
         return captured_evaluation_result_from_json(raw.decode("utf-8"))
+    if document.get("record_type") == "cayu.memory-experiment-report":
+        return memory_experiment_report_from_json(raw)
     if document.get("schema_version") == 1 or {"target", "run"} <= set(document):
         return load_corpus_execution_result(result_path)
     return load_eval_run(result_path)

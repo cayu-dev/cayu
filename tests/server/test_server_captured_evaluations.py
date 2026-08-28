@@ -537,6 +537,7 @@ def test_reviewed_simple_session_launches_one_fresh_trial_with_http_operator_pro
         assert body["captured"]["result"]["score"]["candidate_revision"] != candidate["revision"]
         invocation = body["run"]["spec"]["invocation"]
         execution_profile = invocation.pop("execution_profile")
+        execution_profile_snapshot = invocation.pop("execution_profile_snapshot")
         admission_request_revision = invocation.pop("admission_request_revision")
         assert invocation == {
             "schema_version": 1,
@@ -558,6 +559,7 @@ def test_reviewed_simple_session_launches_one_fresh_trial_with_http_operator_pro
             "cost_budget": None,
         }
         assert execution_profile["profile_revision"].startswith("sha256:")
+        assert execution_profile_snapshot["revision"] == execution_profile["profile_revision"]
         assert admission_request_revision.startswith("sha256:")
         captured_result_revision = body["captured"]["record"]["revision"]
         selected_baseline = client.post(

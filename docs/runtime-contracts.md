@@ -9923,8 +9923,8 @@ distinct from a recall-off spec, a no-match receipt, and `truncated`,
 
 Runtime-native Evals carry that attribution across both fresh and captured
 publication. `AssertionEvidenceView.schema_version == 2`,
-`EvalRun.schema_version == 8`, `PublishedEvalRun.schema_version == 4`, and
-`CorpusExecutionResult.schema_version == 2` each require the same nested
+`EvalRun.schema_version == 8`, `PublishedEvalRun.schema_version == 5`, and
+`CorpusExecutionResult.schema_version == 3` each require the same nested
 `EvalMemoryAttributionEvidenceV1`. The nested section is independently
 versioned and content-addressed. It binds a fixed capture-policy revision,
 effective runtime, retained-source, and serialized-document bounds, deterministic
@@ -9982,6 +9982,63 @@ budget, cohort, gate, or selection differences. Higher layers attach cost and
 quality evidence using the existing `PairedCostQualityComparisonRequest` and
 `PairedCostQualityComparisonReport`; the intervention records clone none of
 their attempt, usage, price, retry, quality, or aggregate fields.
+
+`MemoryExperimentReportRequest` and `MemoryExperimentReport` add the bounded
+reporting layer for repeated fixed-candidate experiments. The request declares
+an exact case/repetition/variant matrix and binds every observed row to its
+intervention spec, snapshot, complete eval execution-profile snapshot and
+runtime binding, intervention evaluator, published trial, model-judge
+implementation where applicable, provider/model, attribution projection, and
+optional preparation-overhead evidence. `PublishedEvalTrialResult` therefore
+retains the canonical source `EvalTrialResult` revision; the public result
+revision transitively binds it. Missing, unmatched, failed, cancelled,
+timed-out, outcome-unknown, conflicting, indeterminate, and unavailable rows
+remain in the matrix and denominator rather than becoming zero scores or being
+silently filtered.
+
+Pair deltas exist only when memory, generic experiment, evaluator, and
+attribution identities are comparable and both absolute observations are
+available. This applies separately to declared assertion metrics and to the
+observed latency, total-token, memory-preparation-duration, memory-context-token,
+and memory-context-byte dimensions. One published assertion identity may bind
+to exactly one declared metric role; task-quality evidence cannot be reused as
+safety or evidence-gate authority. Every versioned case comparison binds its
+complete declared metric-role set and every closed operational dimension, so
+reconstruction cannot silently omit unavailable or incomparable evidence. Case and experiment distributions retain
+available, unavailable, and incomparable counts for each operational dimension;
+those dimensions remain observational and do not enter gates or ranking.
+Absolute observations remain present when no delta can be formed.
+Canonical attempt, usage, retry/repair, price, unpriced, unavailable, and cost
+evidence comes from `PairedCostQualityComparisonReport`; the memory report does
+not create a second accounting path. Each candidate receives an independent
+canonical report so shared baseline attempts are not duplicated inside one
+aggregate. Both sides use
+`memory_experiment_accounting_task_id(experiment_id)` as the shared paired
+cost-quality cohort identity across every case and repetition. Stable row and pair
+identities, including
+`memory_experiment_accounting_source_id(case_revision, repetition)`, retain each
+repeated pair's exact evidence. Safety and
+evidence dimensions are gate-only; deterministic ranking uses the declared
+task-quality metric, and no universal blended score is emitted. If
+no candidate has complete comparable evidence, passes every declared gate, and
+improves the declared ranking tuple, the exact baseline remains selected with
+typed reasons. When a candidate is selected, the baseline is reported as
+superseded; another improving candidate is reported as eligible but not selected,
+including whether deterministic variant-ID tie-breaking or a lower declared
+task-quality rank decided the result. Incomparable and unavailable pair counts
+remain separate in every disposition.
+
+The SDK builder launches no work. Deterministic JSON is the complete retained
+authority contract; HTML is a human-readable summary of its primary versioned
+statuses, identities, distributions, decisions, and report revision.
+`cayu eval memory-report` accepts the bounded request document. Protected
+Control Plane `POST /api/evals/memory-reports` and
+`POST /api/evals/memory-reports/report.html` additionally require each supplied
+published graph and its associated execution-profile snapshot to match the exact
+current `EvalStore` run before building the report. Result-less rows retain their
+declared profiles as experiment-contract authority without claiming stored-run
+provenance. The report builder does not replace `EvalStore`, memory-intervention
+execution storage, runtime usage, or pricing ledgers.
 
 A provider-neutral caller maps its own declarations as follows:
 
