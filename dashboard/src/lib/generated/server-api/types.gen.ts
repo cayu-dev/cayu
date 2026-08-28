@@ -3223,6 +3223,10 @@ export type CorpusCaseComparison = {
      */
     baseline_status: 'passed' | 'failed' | 'unavailable' | 'error';
     /**
+     * Baseline Trial Diagnostic Codes
+     */
+    baseline_trial_diagnostic_codes?: Array<EvalTrialDiagnosticCode>;
+    /**
      * Case Id
      */
     case_id: string;
@@ -3234,6 +3238,10 @@ export type CorpusCaseComparison = {
      * Current Status
      */
     current_status: 'passed' | 'failed' | 'unavailable' | 'error';
+    /**
+     * Current Trial Diagnostic Codes
+     */
+    current_trial_diagnostic_codes?: Array<EvalTrialDiagnosticCode>;
 };
 
 /**
@@ -3269,7 +3277,7 @@ export type CorpusComparisonCompatibility = {
  *
  * Stable reason that two published executions cannot be compared as one contract.
  */
-export type CorpusComparisonReason = 'target_key_mismatch' | 'corpus_revision_mismatch' | 'suite_id_mismatch' | 'suite_revision_mismatch' | 'evidence_policy_revision_mismatch' | 'pricing_profile_fingerprint_mismatch' | 'case_contract_mismatch' | 'assertion_contract_mismatch';
+export type CorpusComparisonReason = 'target_key_mismatch' | 'external_target_revision_mismatch' | 'corpus_revision_mismatch' | 'suite_id_mismatch' | 'suite_revision_mismatch' | 'evidence_policy_revision_mismatch' | 'pricing_profile_fingerprint_mismatch' | 'case_contract_mismatch' | 'assertion_contract_mismatch';
 
 /**
  * CorpusComparisonResultSummary
@@ -3366,6 +3374,10 @@ export type CorpusExecutionRegression = {
  * Safe published run plus the fresh target identity used to produce it.
  */
 export type CorpusExecutionResult = {
+    /**
+     * External Trials
+     */
+    external_trials?: Array<ExternalTrialIdentityV1>;
     /**
      * Revision
      */
@@ -5917,7 +5929,7 @@ export type EvalTargetCatalogResponse = {
  *
  * Stable, non-secret reason for one fresh trial's terminal outcome.
  */
-export type EvalTrialDiagnosticCode = 'passed' | 'assertion_failed' | 'assertion_evidence_unavailable' | 'terminal_evidence_unavailable' | 'interrupted_evidence_unavailable' | 'child_evidence_unavailable' | 'execution_failed' | 'session_failed' | 'terminal_evidence_failed' | 'evidence_preparation_failed' | 'assertion_evaluation_failed' | 'case_timeout';
+export type EvalTrialDiagnosticCode = 'passed' | 'assertion_failed' | 'assertion_evidence_unavailable' | 'terminal_evidence_unavailable' | 'interrupted_evidence_unavailable' | 'child_evidence_unavailable' | 'external_target_unavailable' | 'external_target_cancelled' | 'external_target_unknown' | 'external_target_incomplete' | 'external_target_identity_mismatch' | 'external_target_failed' | 'execution_failed' | 'session_failed' | 'terminal_evidence_failed' | 'evidence_preparation_failed' | 'assertion_evaluation_failed' | 'case_timeout';
 
 /**
  * EvalTrialOutputPreviewV1
@@ -6181,6 +6193,7 @@ export type EvaluationTargetIdentity = {
      * Application Release Id
      */
     application_release_id: string;
+    external_process?: ExternalProcessTargetIdentityV1 | null;
     /**
      * Schema Version
      */
@@ -6330,6 +6343,139 @@ export type ExecutionRequirements = {
      * Real Secret Visibility
      */
     real_secret_visibility?: 'allowed' | 'non_possession';
+};
+
+/**
+ * ExternalBodyReleaseV1
+ *
+ * Content identity and launch contract for one immutable packaged body.
+ *
+ * ``content_revision`` commits the complete multi-file body.  The private
+ * runtime and launch protocol are named independently so replacing the bundled
+ * runtime cannot hide behind an otherwise unchanged target identity.
+ */
+export type ExternalBodyReleaseV1 = {
+    /**
+     * Content Revision
+     */
+    content_revision: string;
+    /**
+     * Entrypoint
+     */
+    entrypoint: Array<string>;
+    /**
+     * Launch Protocol Revision
+     */
+    launch_protocol_revision: string;
+    /**
+     * Private Runtime Path
+     */
+    private_runtime_path: string;
+    /**
+     * Private Runtime Revision
+     */
+    private_runtime_revision: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+};
+
+/**
+ * ExternalProcessTargetIdentityV1
+ *
+ * Independently pinned identities for one trusted external target.
+ */
+export type ExternalProcessTargetIdentityV1 = {
+    body: ExternalBodyReleaseV1;
+    /**
+     * Environment Revision
+     */
+    environment_revision: string;
+    /**
+     * Evaluator Runtime Revision
+     */
+    evaluator_runtime_revision: string;
+    /**
+     * Evidence Policy Revision
+     */
+    evidence_policy_revision: string;
+    /**
+     * Reset Contract Revision
+     */
+    reset_contract_revision: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Runner Revision
+     */
+    runner_revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Target Implementation Revision
+     */
+    target_implementation_revision: string;
+};
+
+/**
+ * ExternalTrialIdentityV1
+ *
+ * Exact native run/corpus/suite/case/trial identity fixed before dispatch.
+ */
+export type ExternalTrialIdentityV1 = {
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Case Revision
+     */
+    case_revision: string;
+    /**
+     * Corpus Revision
+     */
+    corpus_revision: string;
+    /**
+     * Native Run Id
+     */
+    native_run_id: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Suite Id
+     */
+    suite_id: string;
+    /**
+     * Suite Revision
+     */
+    suite_revision: string;
+    /**
+     * Target Key
+     */
+    target_key: string;
+    /**
+     * Target Revision
+     */
+    target_revision: string;
+    /**
+     * Trial Number
+     */
+    trial_number: number;
 };
 
 /**
@@ -7241,6 +7387,26 @@ export type ModelTarget = {
      * Provider Name
      */
     provider_name: string;
+};
+
+/**
+ * OpaqueExternalCaseRefV1
+ *
+ * Authority-free alias for case material retained by a trusted adapter.
+ */
+export type OpaqueExternalCaseRefV1 = {
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
 };
 
 /**
@@ -8805,7 +8971,8 @@ export type RunInputSpec = {
     /**
      * Messages
      */
-    messages: Array<CorpusUserMessageSpec>;
+    messages?: Array<CorpusUserMessageSpec>;
+    opaque_external_case_ref?: OpaqueExternalCaseRefV1 | null;
 };
 
 /**

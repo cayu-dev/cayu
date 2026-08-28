@@ -15,9 +15,10 @@ from pydantic import (
     model_validator,
 )
 
-from cayu.evals.corpus import _sha256_revision
+from cayu.evals.corpus import EVAL_CORPUS_MAX_TRIALS, _sha256_revision
 from cayu.evals.execution import CorpusExecutionResult
 from cayu.evals.published import PublishedStatus
+from cayu.evals.result_contract import EvalTrialDiagnosticCode
 from cayu.evals.results import (
     CapturedEvaluationResultV1,
     EvalResultProjectionV1,
@@ -29,6 +30,7 @@ class CorpusComparisonReason(StrEnum):
     """Stable reason that two published executions cannot be compared as one contract."""
 
     TARGET_KEY_MISMATCH = "target_key_mismatch"
+    EXTERNAL_TARGET_REVISION_MISMATCH = "external_target_revision_mismatch"
     CORPUS_REVISION_MISMATCH = "corpus_revision_mismatch"
     SUITE_ID_MISMATCH = "suite_id_mismatch"
     SUITE_REVISION_MISMATCH = "suite_revision_mismatch"
@@ -150,12 +152,33 @@ class CorpusCaseComparison(BaseModel):
     current_status: PublishedStatus
     baseline_score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
     current_score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
+    baseline_trial_diagnostic_codes: tuple[EvalTrialDiagnosticCode, ...] = Field(
+        default=(),
+        max_length=EVAL_CORPUS_MAX_TRIALS,
+        exclude_if=lambda value: not value,
+    )
+    current_trial_diagnostic_codes: tuple[EvalTrialDiagnosticCode, ...] = Field(
+        default=(),
+        max_length=EVAL_CORPUS_MAX_TRIALS,
+        exclude_if=lambda value: not value,
+    )
 
     @field_validator("case_id")
     @classmethod
     def validate_case_id(cls, value: str) -> str:
         if value != value.strip() or not value.isprintable():
             raise ValueError("case_id must be clean nonblank text.")
+        return value
+
+    @field_validator(
+        "baseline_trial_diagnostic_codes",
+        "current_trial_diagnostic_codes",
+        mode="before",
+    )
+    @classmethod
+    def validate_diagnostic_sequence(cls, value: object) -> object:
+        if not isinstance(value, list | tuple):
+            raise ValueError("Trial diagnostic codes must be an ordered array.")
         return value
 
     @model_validator(mode="after")
@@ -262,12 +285,14 @@ class _CaseOutcome:
     case_id: str
     status: PublishedStatus
     score: float | None
+    trial_diagnostic_codes: tuple[EvalTrialDiagnosticCode, ...]
 
 
 @dataclass(frozen=True)
 class _ExecutionProjection:
     result_revision: str
     target_key: str
+    external_target_revision: str | None
     corpus_revision: str
     suite_id: str
     suite_revision: str
@@ -319,12 +344,18 @@ def _validated_projection(
         score=projection.score,
     )
     cases = tuple(
-        _CaseOutcome(case_id=case.case_id, status=case.status, score=case.score)
+        _CaseOutcome(
+            case_id=case.case_id,
+            status=case.status,
+            score=case.score,
+            trial_diagnostic_codes=case.trial_diagnostic_codes,
+        )
         for case in projection.cases
     )
     return _ExecutionProjection(
         result_revision=projection.result_revision,
         target_key=projection.target.target_key,
+        external_target_revision=projection.external_target_revision,
         corpus_revision=projection.corpus_revision,
         suite_id=projection.suite_id,
         suite_revision=projection.suite_revision,
@@ -345,6 +376,8 @@ def _compatibility_from_projections(
     reasons: set[CorpusComparisonReason] = set()
     if baseline.target_key != current.target_key:
         reasons.add(CorpusComparisonReason.TARGET_KEY_MISMATCH)
+    if baseline.external_target_revision != current.external_target_revision:
+        reasons.add(CorpusComparisonReason.EXTERNAL_TARGET_REVISION_MISMATCH)
     if baseline.corpus_revision != current.corpus_revision:
         reasons.add(CorpusComparisonReason.CORPUS_REVISION_MISMATCH)
     if baseline.suite_id != current.suite_id:
@@ -495,6 +528,8 @@ def _compare_projected_results(
             current_status=current_case.status,
             baseline_score=baseline_case.score,
             current_score=current_case.score,
+            baseline_trial_diagnostic_codes=baseline_case.trial_diagnostic_codes,
+            current_trial_diagnostic_codes=current_case.trial_diagnostic_codes,
         )
         for baseline_case, current_case in zip(
             baseline_projection.cases,

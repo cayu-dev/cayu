@@ -57,8 +57,14 @@ export function promotionDraftFromCandidate(
   candidate: PromotionCandidateV1,
   baselineRevision: string,
 ): EvaluationPromotionDraft {
-  if (candidate.case.input == null) {
+  const input = candidate.case.input
+  if (input == null) {
     throw new Error("A runnable promotion candidate must contain eval input.")
+  }
+  if (input.opaque_external_case_ref != null || input.messages === undefined) {
+    throw new Error(
+      "A runtime-owned opaque external input cannot be edited as a promotion candidate.",
+    )
   }
   return structuredClone({
     expected_baseline_revision: baselineRevision,
@@ -73,7 +79,7 @@ export function promotionDraftFromCandidate(
       suite_id: candidate.case.suite_id,
       name: candidate.case.name,
       description: candidate.case.description ?? null,
-      input: candidate.case.input,
+      input,
       assertions: candidate.case.assertions,
     },
   })
@@ -181,7 +187,13 @@ function validateDraft(draft: EvaluationPromotionDraft): void {
   }
   requireBoundedCleanText(draft.case.name, "Case name", 256)
   requireOptionalCleanText(draft.case.description, "Case description", 2_048)
+  if (draft.case.input.opaque_external_case_ref != null) {
+    throw new Error("A promotion candidate cannot contain runtime-owned opaque external input.")
+  }
   const messages = draft.case.input.messages
+  if (messages === undefined) {
+    throw new Error("A promotion candidate must contain eval input messages.")
+  }
   if (messages.length < 1 || messages.length > 16) {
     throw new Error("Eval input must contain between 1 and 16 user messages.")
   }

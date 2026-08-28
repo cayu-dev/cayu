@@ -110,6 +110,8 @@ from cayu.tools._operation_boundary import (
     retained_invocation_operation_outcome_if_done,
 )
 
+TrialRequestTransform = Callable[[str, str, int, RunRequest], RunRequest]
+
 if TYPE_CHECKING:
     from cayu.evals.corpus import EvalCorpusDocument
     from cayu.evals.evidence import AssertionEvidenceView
@@ -717,6 +719,8 @@ async def _run_eval_suite_with_public_projection(
     trials: int,
     output_preview_bytes: int,
     run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None = None,
+    run_id: str | None = None,
+    trial_request_transform: TrialRequestTransform | None = None,
 ) -> tuple[EvalRun, dict[str, tuple[_EvalTrialPublicData, ...]]]:
     """Run a corpus suite and return its separate runner-owned public sidecar."""
 
@@ -730,6 +734,8 @@ async def _run_eval_suite_with_public_projection(
         trials=trials,
         public_output_preview_bytes=output_preview_bytes,
         run_stream=run_stream,
+        run_id=run_id,
+        trial_request_transform=trial_request_transform,
     )
     if public_data is None:
         raise RuntimeError("Corpus execution lost its runner-owned public projection.")
@@ -747,6 +753,8 @@ async def _run_eval_suite(
     trials: int,
     public_output_preview_bytes: int | None,
     run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None = None,
+    run_id: str | None = None,
+    trial_request_transform: TrialRequestTransform | None = None,
 ) -> tuple[EvalRun, dict[str, tuple[_EvalTrialPublicData, ...]] | None]:
     if not isinstance(app, CayuApp):
         raise TypeError("run_eval_suite requires a CayuApp.")
@@ -769,7 +777,9 @@ async def _run_eval_suite(
     )
     _validate_trials(trials, "run_eval_suite trials")
     _validate_timeout_seconds(case_timeout_seconds, "run_eval_suite case_timeout_seconds")
-    run_id = str(uuid4())
+    run_id = str(uuid4()) if run_id is None else require_durable_clean_nonblank(run_id, "run_id")
+    if trial_request_transform is not None and not callable(trial_request_transform):
+        raise TypeError("trial_request_transform must be callable or None.")
     started_at = datetime.now(UTC)
     trial_count = len(suite.cases) * trials
     memory_attribution_bounds = eval_memory_attribution_bounds_for_trial_count(trial_count)
@@ -795,6 +805,7 @@ async def _run_eval_suite(
             memory_attribution_max_bytes=memory_attribution_max_bytes,
             memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
             run_stream=run_stream,
+            trial_request_transform=trial_request_transform,
         )
     completed_at = datetime.now(UTC)
     status = aggregate_eval_status(result.status for result in results)
@@ -875,6 +886,7 @@ async def _run_suite_cases(
     memory_attribution_max_bytes: int,
     memory_attribution_read_lifecycle: _FreshMemoryAttributionReadLifecycle,
     run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None,
+    trial_request_transform: TrialRequestTransform | None,
 ) -> tuple[
     list[EvalCaseResult],
     dict[str, tuple[_EvalTrialPublicData, ...]] | None,
@@ -895,6 +907,7 @@ async def _run_suite_cases(
                 memory_attribution_max_bytes=memory_attribution_max_bytes,
                 memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
                 run_stream=run_stream,
+                trial_request_transform=trial_request_transform,
             )
             for case in suite.cases
         ]
@@ -908,47 +921,67 @@ async def _run_suite_cases(
             public_data_by_case[case.id] = public_data
         return results, public_data_by_case
 
-    # Fill a positional slot per case so results keep suite order regardless of
-    # completion order. run_eval_case never raises for a failed run (it records an
-    # ERROR result), so a TaskGroup abort only happens on a genuine programming error.
-    slots: list[tuple[EvalCaseResult, tuple[_EvalTrialPublicData, ...] | None] | None] = [
-        None
-    ] * len(suite.cases)
+    # Schedule concrete trials, not whole cases, so one repeated case can consume
+    # the configured concurrency. Positional slots preserve authored case order
+    # and numeric trial order regardless of completion order.
+    slots: list[list[tuple[EvalTrialResult, _EvalTrialPublicData | None] | None]] = [
+        [None] * trials for _ in suite.cases
+    ]
+    case_started_at: list[datetime | None] = [None] * len(suite.cases)
+    case_completed_at: list[datetime | None] = [None] * len(suite.cases)
     semaphore = asyncio.Semaphore(max_concurrency)
 
-    async def _run_slot(index: int, case: EvalCase) -> None:
+    async def _run_slot(index: int, case: EvalCase, trial_number: int) -> None:
         async with semaphore:
-            slots[index] = await _run_eval_case(
+            if case_started_at[index] is None:
+                case_started_at[index] = datetime.now(UTC)
+            slots[index][trial_number - 1] = await _run_case_once_with_public_projection(
                 app,
                 case,
+                trial_number=trial_number,
                 suite_id=suite.id,
                 retain_trajectory=retain_trajectory,
                 retain_final_output=retain_final_output,
                 timeout_seconds=case_timeout_seconds,
-                trials=trials,
                 public_output_preview_bytes=public_output_preview_bytes,
                 memory_attribution_bounds=memory_attribution_bounds,
                 memory_attribution_source_limit=memory_attribution_source_limit,
                 memory_attribution_max_bytes=memory_attribution_max_bytes,
                 memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
                 run_stream=run_stream,
+                trial_request_transform=trial_request_transform,
             )
+            case_completed_at[index] = datetime.now(UTC)
 
     async with asyncio.TaskGroup() as group:
         for index, case in enumerate(suite.cases):
-            group.create_task(_run_slot(index, case))
-    executions = [execution for execution in slots if execution is not None]
-    if len(executions) != len(slots):
-        raise RuntimeError("Concurrent eval execution lost a case result.")
-    results = [result for result, _ in executions]
-    if public_output_preview_bytes is None:
-        return results, None
-    public_data_by_case = {}
-    for case, (_, public_data) in zip(suite.cases, executions, strict=True):
-        if public_data is None:
-            raise RuntimeError("Corpus case execution lost its public projection.")
-        public_data_by_case[case.id] = public_data
-    return results, public_data_by_case
+            for trial_number in range(1, trials + 1):
+                group.create_task(_run_slot(index, case, trial_number))
+
+    results: list[EvalCaseResult] = []
+    public_data_by_case: dict[str, tuple[_EvalTrialPublicData, ...]] = {}
+    for index, case in enumerate(suite.cases):
+        executions = [execution for execution in slots[index] if execution is not None]
+        started_at = case_started_at[index]
+        completed_at = case_completed_at[index]
+        if len(executions) != trials or started_at is None or completed_at is None:
+            raise RuntimeError("Concurrent eval execution lost a trial result.")
+        results.append(
+            _aggregate_trials(
+                case,
+                [result for result, _ in executions],
+                started_at=started_at,
+                completed_at=completed_at,
+            )
+        )
+        if public_output_preview_bytes is not None:
+            retained_public_data: list[_EvalTrialPublicData] = []
+            for _, public_data in executions:
+                if public_data is None:
+                    raise RuntimeError("Corpus trial execution lost its public projection.")
+                retained_public_data.append(public_data)
+            public_data_by_case[case.id] = tuple(retained_public_data)
+    return results, None if public_output_preview_bytes is None else public_data_by_case
 
 
 async def run_eval_case(
@@ -1007,6 +1040,7 @@ async def _run_eval_case(
     memory_attribution_max_bytes: int,
     memory_attribution_read_lifecycle: _FreshMemoryAttributionReadLifecycle,
     run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None = None,
+    trial_request_transform: TrialRequestTransform | None = None,
 ) -> tuple[EvalCaseResult, tuple[_EvalTrialPublicData, ...] | None]:
     if type(retain_final_output) is not bool:
         raise TypeError("run_eval_case retain_final_output must be a bool.")
@@ -1036,6 +1070,7 @@ async def _run_eval_case(
             memory_attribution_max_bytes=memory_attribution_max_bytes,
             memory_attribution_read_lifecycle=memory_attribution_read_lifecycle,
             run_stream=run_stream,
+            trial_request_transform=trial_request_transform,
         )
         for trial_number in range(1, trials + 1)
     ]
@@ -1113,6 +1148,7 @@ async def _run_case_once_with_public_projection(
     timeout_seconds: float | None = None,
     public_output_preview_bytes: int | None = None,
     run_stream: Callable[[RunRequest], AsyncIterator[Event]] | None = None,
+    trial_request_transform: TrialRequestTransform | None = None,
     memory_attribution_bounds: MemoryAttributionBounds | None = None,
     memory_attribution_source_limit: int | None = None,
     memory_attribution_max_bytes: int | None = None,
@@ -1120,6 +1156,16 @@ async def _run_case_once_with_public_projection(
 ) -> tuple[EvalTrialResult, _EvalTrialPublicData | None]:
     started_at = datetime.now(UTC)
     trial_request = _isolated_trial_request(case.request)
+    if trial_request_transform is not None:
+        transformed = trial_request_transform(
+            suite_id,
+            case.id,
+            trial_number,
+            trial_request,
+        )
+        if type(transformed) is not RunRequest:
+            raise TypeError("trial_request_transform must return an exact RunRequest.")
+        trial_request = copy_run_request(transformed)
     emitted_root_events: list[RunnerObservedEventIdentity] = []
     emitted_root_events_truncated = False
     observed_session_id: str | None = None
@@ -1301,8 +1347,17 @@ async def _run_case_once_with_public_projection(
                                 "EvalAssertion.evaluates_failed_session must return bool."
                             )
                         if not any(failed_session_flags):
-                            run_error = _session_failure_reason(events)
-                            diagnostic_code = EvalTrialDiagnosticCode.SESSION_FAILED
+                            external_diagnostic = _external_target_diagnostic(events)
+                            failure_reason = _session_failure_reason(events)
+                            if external_diagnostic in _EXTERNAL_UNAVAILABLE_DIAGNOSTICS:
+                                unavailable_reason = failure_reason
+                            else:
+                                run_error = failure_reason
+                            diagnostic_code = (
+                                EvalTrialDiagnosticCode.SESSION_FAILED
+                                if external_diagnostic is None
+                                else external_diagnostic
+                            )
                     final_output = final_output_text(transcript)
                     probe_requirements = _collect_probe_requirements(case.assertions)
                     probes = await _capture_probes(app, session, probe_requirements)
@@ -2044,6 +2099,40 @@ def _session_failure_reason(events: Iterable[Event]) -> str:
                 return f"Session failed: {error}"
             return "Session failed."
     return "Session ended in a failed state."
+
+
+_EXTERNAL_TARGET_DIAGNOSTIC_BY_PROVIDER_CODE = {
+    "external_container_unavailable": EvalTrialDiagnosticCode.EXTERNAL_TARGET_UNAVAILABLE,
+    "external_container_cancelled": EvalTrialDiagnosticCode.EXTERNAL_TARGET_CANCELLED,
+    "external_container_unknown": EvalTrialDiagnosticCode.EXTERNAL_TARGET_UNKNOWN,
+    "external_container_incomplete": EvalTrialDiagnosticCode.EXTERNAL_TARGET_INCOMPLETE,
+    "external_container_identity_mismatch": (
+        EvalTrialDiagnosticCode.EXTERNAL_TARGET_IDENTITY_MISMATCH
+    ),
+    "external_container_failed": EvalTrialDiagnosticCode.EXTERNAL_TARGET_FAILED,
+    "external_container_oom_killed": EvalTrialDiagnosticCode.EXTERNAL_TARGET_FAILED,
+}
+_EXTERNAL_UNAVAILABLE_DIAGNOSTICS = frozenset(
+    {
+        EvalTrialDiagnosticCode.EXTERNAL_TARGET_UNAVAILABLE,
+        EvalTrialDiagnosticCode.EXTERNAL_TARGET_CANCELLED,
+        EvalTrialDiagnosticCode.EXTERNAL_TARGET_UNKNOWN,
+        EvalTrialDiagnosticCode.EXTERNAL_TARGET_INCOMPLETE,
+        EvalTrialDiagnosticCode.EXTERNAL_TARGET_IDENTITY_MISMATCH,
+    }
+)
+
+
+def _external_target_diagnostic(events: Iterable[Event]) -> EvalTrialDiagnosticCode | None:
+    for event in reversed(tuple(events)):
+        if event.type != EventType.MODEL_ERROR:
+            continue
+        code = event.payload.get("provider_error_code")
+        if type(code) is str:
+            diagnostic = _EXTERNAL_TARGET_DIAGNOSTIC_BY_PROVIDER_CODE.get(code)
+            if diagnostic is not None:
+                return diagnostic
+    return None
 
 
 def _trial_status(

@@ -1075,6 +1075,16 @@ function SimpleInputEditor({
 }) {
   if (!("input" in evalCase.stimulus)) return null
   const messages = evalCase.stimulus.input.messages
+  if (messages === undefined) {
+    return (
+      <Card size="sm" data-testid="authored-simple-input">
+        <CardContent className="text-sm text-muted-foreground">
+          This case uses runtime-owned opaque external input and cannot be edited in Control Plane
+          suite authoring.
+        </CardContent>
+      </Card>
+    )
+  }
   const updateMessages = (nextMessages: typeof messages) => {
     edit({
       ...evalCase,

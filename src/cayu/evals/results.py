@@ -26,6 +26,7 @@ from cayu._validation import (
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_CASES,
+    EVAL_CORPUS_MAX_TRIALS,
     EvalCorpusDocument,
     _bounded_durable_text,
     _content_revision,
@@ -47,6 +48,7 @@ from cayu.evals.published import (
     _published_score,
     _published_status_from_statuses,
 )
+from cayu.evals.result_contract import EvalTrialDiagnosticCode
 
 CAPTURED_EVALUATION_RESULT_SCHEMA_VERSION = 1
 CAPTURED_EVALUATION_RESULT_MAX_BYTES = 4 << 20
@@ -257,6 +259,11 @@ class EvalResultCaseProjectionV1(_SchemaV1PortableModel):
         min_length=1,
         max_length=EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     )
+    trial_diagnostic_codes: tuple[EvalTrialDiagnosticCode, ...] = Field(
+        default=(),
+        max_length=EVAL_CORPUS_MAX_TRIALS,
+        exclude_if=lambda value: not value,
+    )
 
     @field_validator("case_id")
     @classmethod
@@ -268,7 +275,7 @@ class EvalResultCaseProjectionV1(_SchemaV1PortableModel):
     def validate_case_revision(cls, value: str, info) -> str:
         return _sha256_revision(value, info.field_name)
 
-    @field_validator("assertions", mode="before")
+    @field_validator("assertions", "trial_diagnostic_codes", mode="before")
     @classmethod
     def validate_assertion_order(cls, value: object, info) -> object:
         return _ordered_sequence_input(value, info.field_name)
@@ -290,6 +297,7 @@ class EvalResultProjectionV1(_SchemaV1PortableModel):
     result_revision: StrictStr
     origin: EvalResultOrigin
     target: EvalResultTargetIdentityV1
+    external_target_revision: StrictStr | None = None
     corpus_revision: StrictStr
     suite_id: StrictStr
     suite_revision: StrictStr
@@ -306,6 +314,7 @@ class EvalResultProjectionV1(_SchemaV1PortableModel):
 
     @field_validator(
         "result_revision",
+        "external_target_revision",
         "corpus_revision",
         "suite_revision",
         "evidence_policy_revision",
@@ -434,6 +443,7 @@ def eval_result_projection(
                 status=case.status,
                 score=case.score,
                 assertions=_assertion_identities(case.trials[0].assertions),
+                trial_diagnostic_codes=tuple(trial.code for trial in case.trials),
             )
             for case in run.cases
         )
@@ -441,6 +451,11 @@ def eval_result_projection(
             result_revision=validated_fresh.revision,
             origin=EvalResultOrigin.FRESH_EXECUTION,
             target=EvalResultTargetIdentityV1.from_fresh_target(validated_fresh.target),
+            external_target_revision=(
+                None
+                if validated_fresh.target.external_process is None
+                else validated_fresh.target.external_process.revision
+            ),
             corpus_revision=run.corpus_revision,
             suite_id=run.suite_id,
             suite_revision=run.suite_revision,
@@ -465,6 +480,14 @@ def eval_result_projection(
             status=score.status,
             score=score.score,
             assertions=_assertion_identities(score.assertions),
+            trial_diagnostic_codes=(
+                {
+                    "passed": EvalTrialDiagnosticCode.PASSED,
+                    "failed": EvalTrialDiagnosticCode.ASSERTION_FAILED,
+                    "unavailable": EvalTrialDiagnosticCode.ASSERTION_EVIDENCE_UNAVAILABLE,
+                    "error": EvalTrialDiagnosticCode.EXECUTION_FAILED,
+                }[score.status],
+            ),
         )
         return EvalResultProjectionV1(
             result_revision=validated_captured.revision,

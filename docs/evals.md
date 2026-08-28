@@ -17,6 +17,8 @@ transcripts, tool calls, usage, workspaces, and artifacts.
 ```python
 from cayu import (
     AgentSpec,
+    EXTERNAL_CONTAINER_RESET_CONTRACT_REVISION,
+    EXTERNAL_CONTAINER_RUNNER_REVISION,
     CayuApp,
     EvalCase,
     EvalSuite,
@@ -390,6 +392,124 @@ used by `compile_assertion_spec(...)`; there is no second evaluator. All cost
 assertions in the selected suite share one
 compile-time pricing binding, so the trusted PriceBook is validated and
 fingerprinted once for the suite rather than once per assertion.
+
+### External process targets
+
+An external process target runs an immutable multi-file candidate body through
+the same corpus, scenario, assertion, usage, publication, comparison, and
+durable-worker paths as an ordinary Cayu agent. It is a generic runtime seam;
+benchmark selection, hidden evaluator truth, promotion policy, and baseline
+policy remain outside Cayu.
+
+`ExternalBodyReleaseV1.from_directory(...)` content-addresses every relative
+regular file and executable bit, the canonical private-runtime path and file,
+launch protocol, and entrypoint.
+Symbolic links, special files, more than 512 files, and bodies larger than 32
+MiB fail before execution. `ExternalProcessTargetIdentityV1` independently pins
+that body, the evaluator runtime, target implementation, runner, environment,
+fresh-reset contract, and evidence policy. Changing any one produces a new
+target revision. `ExternalTrialIdentityV1` then binds the native eval run,
+target, corpus, suite, case, and trial number before dispatch. These identities
+are published in `CorpusExecutionResult.external_trials`; comparison validates
+their order and exact contract instead of inferring lineage from a container or
+session name.
+
+```python
+from cayu import (
+    AgentSpec,
+    ExternalBodyReleaseV1,
+    ExternalContainerOperationAdapter,
+    ExternalProcessModelProvider,
+    ExternalProcessTargetIdentityV1,
+    external_container_environment_revision,
+)
+
+image = "registry.example/candidate@sha256:" + image_digest
+body = ExternalBodyReleaseV1.from_directory(
+    candidate_root,
+    private_runtime_path="private_runtime.py",
+    launch_protocol_revision=launch_protocol_revision,
+    entrypoint=(
+        "python3",
+        "{body}/private_runtime.py",
+        "{body}/agent.py",
+        "{request}",
+    ),
+)
+identity = ExternalProcessTargetIdentityV1.create(
+    body=body,
+    evaluator_runtime_revision=evaluator_runtime_revision,
+    target_implementation_revision=target_implementation_revision,
+    runner_revision=EXTERNAL_CONTAINER_RUNNER_REVISION,
+    environment_revision=external_container_environment_revision(
+        image=image,
+        runtime="runsc",
+    ),
+    reset_contract_revision=EXTERNAL_CONTAINER_RESET_CONTRACT_REVISION,
+    evidence_policy_revision=evidence_policy.revision,
+)
+operations = ExternalContainerOperationAdapter(
+    identity=identity,
+    body_root=candidate_root,
+    state_root=external_state_root,
+    image=image,
+    runtime="runsc",
+)
+app.register_provider(
+    ExternalProcessModelProvider(identity=identity, operations=operations),
+    default=True,
+)
+app.register_agent(AgentSpec(name="external-candidate", model="cayu.external-process.v1"))
+# Set CorpusTarget.external_process=identity and use this agent in request_base.
+```
+
+The reference adapter admits only digest-pinned images on Docker with `runsc`
+or Kata. Each trial receives a fresh non-root container with no network, no
+mounts, no Linux capabilities, a read-only root, bounded tmpfs, CPU, memory,
+PID, input, output, and daemon-log limits, and no inherited host environment.
+The body and sealed request are copied while the container is stopped. Runtime
+resolved attachments remain digest-attested in that bounded request. Structured
+scenario JSON and files cross the existing typed provider boundary; corpus
+assertions, expected answers, judge references, evaluator credentials, and
+private evaluator state do not.
+
+`RunInputSpec.opaque_external_case_ref` provides a bounded, revisioned alias for
+a private evaluator case. It is accepted only for a target with an exact
+`external_process` identity. A candidate may receive that alias in the private
+launch envelope, but Cayu neither resolves it nor treats it as evaluator truth.
+Ordinary corpus targets reject opaque references before provider dispatch.
+
+The container name and external-effect key derive from the exact trial revision,
+not from a retry-specific provider attempt. The canonical resolved launch request
+has a separate digest committed into the operation authority, recovery alias,
+container labels, provider state, and terminal receipt. Reusing a trial identity
+with a different request fails before another effect can be adopted. Provider
+start keys are atomic aliases to that bound effect, and the recoverable preparation
+phase is retained before an alias becomes visible. A local phase journal and
+identity labels reconcile process loss before create, after create/copy, after
+start, and after completion; identity drift and ambiguous daemon state fail
+closed. The reference adapter does not silently rerun a completed exact trial.
+After a proven completed, failed, OOM, or cancelled state, it atomically retains
+the bounded identity-bound terminal receipt and removes the container; exact
+recovery validates the retained authority and request before using that receipt.
+Cancellation targets the same operation, and terminal states remain distinct as
+`failed`, `unavailable`, `cancelled`, `unknown`, `incomplete`, or
+`identity_mismatch` through native publication and comparison. Output previews
+remain bounded while the trusted assertion path consumes the complete bounded
+candidate output. Candidate-private usage is retained only as explicitly
+untrusted diagnostic output; it does not enter Cayu's native usage, cost, or
+budget accounting. A trusted outer adapter must provide authoritative accounting
+evidence through a separately owned contract when that evidence is available.
+
+Trial scheduling is the normal work-conserving corpus scheduler: repeated trials
+from one case can occupy every configured concurrency slot while published
+ordering stays deterministic. Use `SQLiteEvalStore` for restart-durable embedded
+admission/publication and a durable runtime `SessionStore` for production
+session recovery. The reference container state directory must also survive a
+worker restart. SQLite fencing controls publication; exact trial-keyed container
+reconciliation controls this external effect. Custom adapters must provide an
+equivalent durable idempotency and reconciliation contract before claiming
+restart-safe external execution.
 
 Portable model judges deepen that same compiler rather than introducing a
 scorer or plugin registry. `ModelJudgeTarget` binds one portable evaluator key

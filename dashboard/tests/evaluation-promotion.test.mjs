@@ -42,6 +42,18 @@ function draftFromCandidate(source = candidate()) {
   return promotionDraftFromCandidate(source, source.revision)
 }
 
+test("promotion authoring rejects runtime-owned opaque external input", () => {
+  const source = candidate()
+  source.case.input = {
+    opaque_external_case_ref: { id: "private-case", revision: `sha256:${"9".repeat(64)}` },
+  }
+
+  assert.throws(
+    () => promotionDraftFromCandidate(source, source.revision),
+    /runtime-owned opaque external input/,
+  )
+})
+
 function capturedCandidate() {
   const source = candidate()
   source.case.input = null

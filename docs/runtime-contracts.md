@@ -1277,6 +1277,48 @@ Cayu's judge semantics, the app manifest, and the exact secret-redacted agent
 specification (including system prompt, provider options, and thinking config).
 Changing any of that authority changes the implementation revision and makes
 results incomparable; corpus data never supplies an app or provider handle.
+
+An external process eval target preserves that authority split. Its public
+identity independently content-addresses the complete regular-file body,
+private launch runtime, launch protocol and entrypoint, evaluator runtime,
+target implementation, runner, environment, fresh-reset contract, and evidence
+policy. The exact native run, target, corpus, suite, case, and trial number form
+one `ExternalTrialIdentityV1` before provider dispatch. A bounded opaque case
+reference may be carried only by such a target; it is an alias for an external
+evaluator and never grants Cayu access to hidden truth. Candidate input is the
+ordinary bounded message/structured/file provider projection after the trusted
+trial envelope is removed. Assertion specifications, expected values, judge
+references, evaluator credentials, and evaluator-private state do not cross
+that candidate boundary.
+
+The hardened reference adapter creates one fresh digest-pinned Docker container
+under `runsc` or Kata for each exact trial. It has no network, mounts,
+capabilities, host environment, or writable root, runs as a fixed non-root user,
+and applies bounded CPU, memory, PID, tmpfs, input, output, and retained-log
+limits. The trial revision—not a provider-attempt key—is the external-effect
+idempotency identity and deterministic container name. A separate digest of the
+canonical resolved launch request binds the exact envelope, candidate input, and
+runtime-resolved attachments to that effect. Attempt start keys are atomic
+aliases to the complete target/trial/environment/effect/request authority, and
+the recoverable preparation phase is written before an alias becomes visible. A
+destination-local phase journal plus matching container labels reconcile loss
+before create, after create/copy, after start, and after completion. A matching
+completed effect is returned without rerun; request reuse under a different
+identity, missing or malformed state, contradictory receipts, and label drift
+fail closed. The adapter keeps failed, unavailable, cancelled, unknown,
+incomplete, identity-mismatch, and OOM outcomes distinct and non-retryable
+through provider, trial, publication, and comparison contracts. For a proven
+completed, failed, OOM, or cancelled outcome it atomically writes the bounded
+destination-owned terminal receipt with the complete authority identity before
+removing the container; exact recovery validates its retained request and
+provider state before replay and never recreates the effect. Candidate-private
+usage remains explicitly untrusted diagnostic output and is excluded from native
+usage, cost, and budget accounting unless a separately owned trusted outer
+contract supplies authoritative accounting evidence.
+SQLite eval claims still fence only execution ownership and publication; the
+adapter's exact trial-keyed reconciliation is what prevents this external
+effect from being duplicated across worker redispatch.
+
 Corpus schema V2 adds `StructuredModelJudgeAssertionSpec`: one to eight stable
 criterion IDs with canonical decimal weights totaling exactly one, an exact
 public `JudgeProfileIdentityV1` revision, optional evaluator-only public/private

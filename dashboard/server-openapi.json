@@ -6455,6 +6455,15 @@
             "title": "Baseline Status",
             "type": "string"
           },
+          "baseline_trial_diagnostic_codes": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalTrialDiagnosticCode"
+            },
+            "maxItems": 100,
+            "title": "Baseline Trial Diagnostic Codes",
+            "type": "array"
+          },
           "case_id": {
             "maxLength": 128,
             "minLength": 1,
@@ -6483,6 +6492,15 @@
             ],
             "title": "Current Status",
             "type": "string"
+          },
+          "current_trial_diagnostic_codes": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EvalTrialDiagnosticCode"
+            },
+            "maxItems": 100,
+            "title": "Current Trial Diagnostic Codes",
+            "type": "array"
           }
         },
         "required": [
@@ -6536,6 +6554,7 @@
         "description": "Stable reason that two published executions cannot be compared as one contract.",
         "enum": [
           "target_key_mismatch",
+          "external_target_revision_mismatch",
           "corpus_revision_mismatch",
           "suite_id_mismatch",
           "suite_revision_mismatch",
@@ -6752,6 +6771,15 @@
         "additionalProperties": false,
         "description": "Safe published run plus the fresh target identity used to produce it.",
         "properties": {
+          "external_trials": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ExternalTrialIdentityV1"
+            },
+            "maxItems": 100000,
+            "title": "External Trials",
+            "type": "array"
+          },
           "revision": {
             "title": "Revision",
             "type": "string"
@@ -11735,6 +11763,12 @@
           "terminal_evidence_unavailable",
           "interrupted_evidence_unavailable",
           "child_evidence_unavailable",
+          "external_target_unavailable",
+          "external_target_cancelled",
+          "external_target_unknown",
+          "external_target_incomplete",
+          "external_target_identity_mismatch",
+          "external_target_failed",
           "execution_failed",
           "session_failed",
           "terminal_evidence_failed",
@@ -12263,6 +12297,16 @@
             "title": "Application Release Id",
             "type": "string"
           },
+          "external_process": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExternalProcessTargetIdentityV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "schema_version": {
             "const": 1,
             "default": 1,
@@ -12579,6 +12623,180 @@
           }
         },
         "title": "ExecutionRequirements",
+        "type": "object"
+      },
+      "ExternalBodyReleaseV1": {
+        "additionalProperties": false,
+        "description": "Content identity and launch contract for one immutable packaged body.\n\n``content_revision`` commits the complete multi-file body.  The private\nruntime and launch protocol are named independently so replacing the bundled\nruntime cannot hide behind an otherwise unchanged target identity.",
+        "properties": {
+          "content_revision": {
+            "title": "Content Revision",
+            "type": "string"
+          },
+          "entrypoint": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 32,
+            "minItems": 1,
+            "title": "Entrypoint",
+            "type": "array"
+          },
+          "launch_protocol_revision": {
+            "title": "Launch Protocol Revision",
+            "type": "string"
+          },
+          "private_runtime_path": {
+            "title": "Private Runtime Path",
+            "type": "string"
+          },
+          "private_runtime_revision": {
+            "title": "Private Runtime Revision",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "content_revision",
+          "private_runtime_path",
+          "private_runtime_revision",
+          "launch_protocol_revision",
+          "entrypoint"
+        ],
+        "title": "ExternalBodyReleaseV1",
+        "type": "object"
+      },
+      "ExternalProcessTargetIdentityV1": {
+        "additionalProperties": false,
+        "description": "Independently pinned identities for one trusted external target.",
+        "properties": {
+          "body": {
+            "$ref": "#/components/schemas/ExternalBodyReleaseV1"
+          },
+          "environment_revision": {
+            "title": "Environment Revision",
+            "type": "string"
+          },
+          "evaluator_runtime_revision": {
+            "title": "Evaluator Runtime Revision",
+            "type": "string"
+          },
+          "evidence_policy_revision": {
+            "title": "Evidence Policy Revision",
+            "type": "string"
+          },
+          "reset_contract_revision": {
+            "title": "Reset Contract Revision",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "runner_revision": {
+            "title": "Runner Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "target_implementation_revision": {
+            "title": "Target Implementation Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision",
+          "body",
+          "evaluator_runtime_revision",
+          "target_implementation_revision",
+          "runner_revision",
+          "environment_revision",
+          "reset_contract_revision",
+          "evidence_policy_revision"
+        ],
+        "title": "ExternalProcessTargetIdentityV1",
+        "type": "object"
+      },
+      "ExternalTrialIdentityV1": {
+        "additionalProperties": false,
+        "description": "Exact native run/corpus/suite/case/trial identity fixed before dispatch.",
+        "properties": {
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "case_revision": {
+            "title": "Case Revision",
+            "type": "string"
+          },
+          "corpus_revision": {
+            "title": "Corpus Revision",
+            "type": "string"
+          },
+          "native_run_id": {
+            "title": "Native Run Id",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "suite_id": {
+            "title": "Suite Id",
+            "type": "string"
+          },
+          "suite_revision": {
+            "title": "Suite Revision",
+            "type": "string"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          },
+          "target_revision": {
+            "title": "Target Revision",
+            "type": "string"
+          },
+          "trial_number": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Trial Number",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revision",
+          "native_run_id",
+          "target_key",
+          "target_revision",
+          "corpus_revision",
+          "suite_id",
+          "suite_revision",
+          "case_id",
+          "case_revision",
+          "trial_number"
+        ],
+        "title": "ExternalTrialIdentityV1",
         "type": "object"
       },
       "FilePart": {
@@ -14174,6 +14392,32 @@
           "model"
         ],
         "title": "ModelTarget",
+        "type": "object"
+      },
+      "OpaqueExternalCaseRefV1": {
+        "additionalProperties": false,
+        "description": "Authority-free alias for case material retained by a trusted adapter.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "revision"
+        ],
+        "title": "OpaqueExternalCaseRefV1",
         "type": "object"
       },
       "OperationalSnapshotRequest": {
@@ -17133,18 +17377,25 @@
         "description": "The authority-free user input supplied after a trusted local bootstrap.",
         "properties": {
           "messages": {
+            "default": [],
             "items": {
               "$ref": "#/components/schemas/CorpusUserMessageSpec"
             },
             "maxItems": 16,
-            "minItems": 1,
             "title": "Messages",
             "type": "array"
+          },
+          "opaque_external_case_ref": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OpaqueExternalCaseRefV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
-        "required": [
-          "messages"
-        ],
         "title": "RunInputSpec",
         "type": "object"
       },

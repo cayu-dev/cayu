@@ -302,6 +302,7 @@ export function evalTrialCostSummary(
 
 const COMPARISON_REASON_TEXT: Record<CorpusComparisonReason, string> = {
   target_key_mismatch: "The runs target different attached application keys.",
+  external_target_revision_mismatch: "The external target revision changed between runs.",
   corpus_revision_mismatch: "The runs use different corpus revisions.",
   suite_id_mismatch: "The runs execute different suites.",
   suite_revision_mismatch: "The suite contract changed between runs.",

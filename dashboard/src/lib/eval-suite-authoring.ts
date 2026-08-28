@@ -166,7 +166,15 @@ export function validateEvalSuiteDraft(draft: EvalSuiteDraftV1): EvalSuiteDraftV
       requireBoundedCleanText(evalCase.name, `${label} name`, 256)
       requireOptionalCleanText(evalCase.description, `${label} description`, 2_048)
       if (evalCase.stimulus.kind === "simple_input") {
+        if (evalCase.stimulus.input.opaque_external_case_ref != null) {
+          throw new Error(
+            `${label} uses runtime-owned opaque external input, which Control Plane suite authoring cannot edit.`,
+          )
+        }
         const messages = evalCase.stimulus.input.messages
+        if (messages === undefined) {
+          throw new Error(`${label} input must contain user messages.`)
+        }
         if (messages.length < 1 || messages.length > 16) {
           throw new Error(`${label} input must contain between 1 and 16 user messages.`)
         }

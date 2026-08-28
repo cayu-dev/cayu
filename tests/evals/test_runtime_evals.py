@@ -1574,6 +1574,24 @@ def test_max_concurrency_semaphore_caps_in_flight_cases():
     assert result.status == EvalStatus.PASSED
 
 
+def test_max_concurrency_fills_slots_with_trials_from_one_case():
+    provider = _OverlapProbeProvider(expected=3)
+    suite = EvalSuite(id="parallel-trials", cases=[_case("repeated")])
+
+    result = asyncio.run(
+        run_eval_suite(
+            _app_with_provider(provider),
+            suite,
+            max_concurrency=3,
+            trials=3,
+        )
+    )
+
+    assert provider.max_active == 3
+    assert [trial.trial_number for trial in result.cases[0].trials] == [1, 2, 3]
+    assert result.status == EvalStatus.PASSED
+
+
 def test_run_eval_suite_rejects_invalid_concurrency_and_timeout():
     app = _app_with_provider(_FailingProvider())
     suite = _failing_suite("invalid", [])

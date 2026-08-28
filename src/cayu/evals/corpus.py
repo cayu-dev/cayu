@@ -38,6 +38,7 @@ from cayu._validation import (
     require_durable_nonblank,
     require_durable_text,
 )
+from cayu.evals.external import OpaqueExternalCaseRefV1
 from cayu.evals.models import EvalCaseContractV1, EvalRunContractV1
 from cayu.runtime.costs import PriceBook
 
@@ -332,8 +333,12 @@ class RunInputSpec(_PortableModel):
     """The authority-free user input supplied after a trusted local bootstrap."""
 
     messages: tuple[CorpusUserMessageSpec, ...] = Field(
-        min_length=1,
+        default=(),
         max_length=EVAL_CORPUS_MAX_MESSAGES_PER_CASE,
+    )
+    opaque_external_case_ref: OpaqueExternalCaseRefV1 | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
     )
 
     @field_validator("messages", mode="before")
@@ -341,8 +346,17 @@ class RunInputSpec(_PortableModel):
     def validate_messages_are_ordered(cls, value: object, info) -> object:
         return _ordered_sequence_input(value, info.field_name)
 
+    @field_validator("opaque_external_case_ref", mode="before")
+    @classmethod
+    def copy_opaque_external_case_ref(cls, value: object) -> object:
+        if type(value) is OpaqueExternalCaseRefV1:
+            return value.model_dump(mode="json")
+        return value
+
     @model_validator(mode="after")
     def validate_total_text(self) -> RunInputSpec:
+        if not self.messages and self.opaque_external_case_ref is None:
+            raise ValueError("Run input requires messages or one opaque external case reference.")
         total = sum(len(message.text) for message in self.messages)
         if total > EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS:
             raise ValueError(

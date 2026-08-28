@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
+from pydantic import BaseModel, Field
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
@@ -72,6 +73,23 @@ def test_json_utf8_size_counter_distinguishes_overflow_from_unsupported_values()
     assert unsupported.value(object()) is False
     assert unsupported.exceeded_limit is False
     assert unsupported.encountered_unsupported_value is True
+
+
+def test_json_utf8_size_counter_honors_pydantic_serialization_exclusions() -> None:
+    class Projection(BaseModel):
+        retained: str
+        excluded: str = Field(exclude=True)
+        conditional: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    value = Projection(retained="visible", excluded="private")
+    encoded = json.dumps(
+        value.model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    assert json_utf8_size_within_limit(value, len(encoded))
+    assert not json_utf8_size_within_limit(value, len(encoded) - 1)
 
 
 @settings(max_examples=250, deadline=None)

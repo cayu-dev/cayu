@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 from pydantic import (
     BaseModel,
@@ -45,6 +46,12 @@ from cayu.evals.corpus import (
     _sha256_revision,
     eval_run_contract_for_corpus,
     pricing_profile_identity,
+)
+from cayu.evals.external import (
+    ExternalProcessTargetIdentityV1,
+    ExternalTrialEnvelopeV1,
+    ExternalTrialIdentityV1,
+    with_external_trial_envelope,
 )
 from cayu.evals.models import EvalRun, EvalRunContractV1, _model_instance_python_input
 from cayu.evals.portable_assertions import (
@@ -144,6 +151,10 @@ class EvaluationTargetIdentity(BaseModel):
     target_key: StrictStr
     application_release_id: StrictStr
     app_manifest: AppManifest
+    external_process: ExternalProcessTargetIdentityV1 | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -177,6 +188,13 @@ class EvaluationTargetIdentity(BaseModel):
             )
         if isinstance(value, BaseModel):
             raise TypeError("app_manifest must be an exact AppManifest or JSON object.")
+        return value
+
+    @field_validator("external_process", mode="before")
+    @classmethod
+    def copy_external_process(cls, value: object) -> object:
+        if type(value) is ExternalProcessTargetIdentityV1:
+            return value.model_dump(mode="json")
         return value
 
     @model_validator(mode="after")
@@ -628,6 +646,10 @@ class CorpusTarget(BaseModel):
         max_length=CORPUS_EXECUTION_MAX_MODEL_JUDGES,
     )
     limits: CorpusExecutionLimits = Field(default_factory=CorpusExecutionLimits)
+    external_process: ExternalProcessTargetIdentityV1 | None = Field(
+        default=None,
+        exclude=True,
+    )
 
     @field_validator("key")
     @classmethod
@@ -739,6 +761,18 @@ class CorpusTarget(BaseModel):
             raise TypeError("CorpusTarget limits must be exact CorpusExecutionLimits.")
         return CorpusExecutionLimits.model_validate(value.model_dump(mode="python"))
 
+    @field_validator("external_process", mode="before")
+    @classmethod
+    def copy_external_process(cls, value: object) -> ExternalProcessTargetIdentityV1 | None:
+        if value is None:
+            return None
+        if type(value) is not ExternalProcessTargetIdentityV1:
+            raise TypeError(
+                "CorpusTarget external_process must be an exact "
+                "ExternalProcessTargetIdentityV1 or None."
+            )
+        return ExternalProcessTargetIdentityV1.model_validate(value.model_dump(mode="json"))
+
     @model_validator(mode="after")
     def validate_authority_boundary(self) -> CorpusTarget:
         _require_public_target_text(self.app, self.key, "key")
@@ -788,6 +822,13 @@ class CorpusTarget(BaseModel):
             raise ValueError("CorpusTarget bootstrap text exceeds its configured input limit.")
         if bootstrap_chars > self.limits.max_compiled_input_chars:
             raise ValueError("CorpusTarget bootstrap text exceeds its compiled-suite input limit.")
+        if (
+            self.external_process is not None
+            and self.external_process.evidence_policy_revision != self.evidence_policy.revision
+        ):
+            raise ValueError(
+                "External process target evidence policy does not match its CorpusTarget."
+            )
         return self
 
 
@@ -821,6 +862,7 @@ def _copy_corpus_target(target: CorpusTarget) -> CorpusTarget:
         price_book=target.price_book,
         model_judges=target.model_judges,
         limits=target.limits,
+        external_process=target.external_process,
     )
 
 
@@ -858,6 +900,7 @@ def _evaluation_target_identity_from_validated_target(
         target_key=target.key,
         application_release_id=target.application_release_id,
         app_manifest=manifest,
+        external_process=target.external_process,
     )
 
 
@@ -973,6 +1016,11 @@ def _compile_prepared_corpus_suite(
         case_input = case_spec.input
         if case_input is None:  # Narrowed by the suite-level admission check above.
             raise RuntimeError("Captured-only eval input passed fresh-execution admission.")
+        if (
+            case_input.opaque_external_case_ref is not None
+            and validated_target.external_process is None
+        ):
+            raise ValueError("Opaque external case references require an external process target.")
         corpus_messages = tuple(
             Message.text(MessageRole.USER, message.text) for message in case_input.messages
         )
@@ -1076,6 +1124,11 @@ class CorpusExecutionResult(BaseModel):
     revision: StrictStr
     target: EvaluationTargetIdentity
     run: PublishedEvalRun
+    external_trials: tuple[ExternalTrialIdentityV1, ...] = Field(
+        default=(),
+        max_length=EVAL_CORPUS_MAX_CASES * EVAL_CORPUS_MAX_TRIALS,
+        exclude_if=lambda value: not value,
+    )
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -1097,6 +1150,7 @@ class CorpusExecutionResult(BaseModel):
                 target_key=value.target_key,
                 application_release_id=value.application_release_id,
                 app_manifest=value.app_manifest,
+                external_process=value.external_process,
             )
         if isinstance(value, BaseModel):
             raise TypeError("target must be an exact EvaluationTargetIdentity or JSON object.")
@@ -1113,10 +1167,61 @@ class CorpusExecutionResult(BaseModel):
             raise TypeError("run must be an exact PublishedEvalRun or JSON object.")
         return value
 
+    @field_validator("external_trials", mode="before")
+    @classmethod
+    def copy_external_trials(cls, value: object) -> object:
+        if not isinstance(value, list | tuple):
+            raise ValueError("external_trials must be an ordered array.")
+        return [
+            item.model_dump(mode="json") if type(item) is ExternalTrialIdentityV1 else item
+            for item in value
+        ]
+
     @model_validator(mode="after")
     def validate_contract(self) -> CorpusExecutionResult:
         if self.target.target_key != self.run.target_key:
             raise ValueError("Execution target key does not match the published eval run.")
+        if self.target.external_process is None:
+            if self.external_trials:
+                raise ValueError("Ordinary corpus results cannot carry external trial identities.")
+        else:
+            if (
+                self.target.external_process.evidence_policy_revision
+                != self.run.evidence_policy_revision
+            ):
+                raise ValueError(
+                    "External target evidence policy does not match the published run."
+                )
+            expected = tuple(
+                (
+                    case.case_id,
+                    case.case_revision,
+                    trial.trial_number,
+                )
+                for case in self.run.cases
+                for trial in case.trials
+            )
+            observed = tuple(
+                (trial.case_id, trial.case_revision, trial.trial_number)
+                for trial in self.external_trials
+            )
+            if observed != expected:
+                raise ValueError(
+                    "External trial identities do not match the published case/trial order."
+                )
+            if any(
+                trial.target_key != self.target.target_key
+                or trial.target_revision != self.target.external_process.revision
+                or trial.corpus_revision != self.run.corpus_revision
+                or trial.suite_id != self.run.suite_id
+                or trial.suite_revision != self.run.suite_revision
+                for trial in self.external_trials
+            ):
+                raise ValueError(
+                    "External trial identities do not match the published execution contract."
+                )
+            if len({trial.native_run_id for trial in self.external_trials}) != 1:
+                raise ValueError("External trial identities require one exact native run ID.")
         if any(
             trial.status in {"passed", "failed"} and trial.output.evidence_state == "unavailable"
             for case in self.run.cases
@@ -1140,20 +1245,30 @@ class CorpusExecutionResult(BaseModel):
         *,
         target: EvaluationTargetIdentity,
         run: PublishedEvalRun,
+        external_trials: tuple[ExternalTrialIdentityV1, ...] = (),
     ) -> CorpusExecutionResult:
         if type(target) is not EvaluationTargetIdentity:
             raise TypeError("target must be an exact EvaluationTargetIdentity.")
         if type(run) is not PublishedEvalRun:
             raise TypeError("run must be an exact PublishedEvalRun.")
+        if type(external_trials) is not tuple or any(
+            type(trial) is not ExternalTrialIdentityV1 for trial in external_trials
+        ):
+            raise TypeError("external_trials must be a tuple of ExternalTrialIdentityV1 values.")
         document = {
             "schema_version": CORPUS_EXECUTION_RESULT_SCHEMA_VERSION,
             "target": target.model_dump(mode="json"),
             "run": run.model_dump(mode="json"),
         }
+        if external_trials:
+            document["external_trials"] = [
+                trial.model_dump(mode="json") for trial in external_trials
+            ]
         return cls(
             revision=_content_revision(document, "corpus execution result"),
             target=target,
             run=run,
+            external_trials=external_trials,
         )
 
 
@@ -1187,6 +1302,7 @@ async def _run_compiled_corpus_suite(
     manifest_project_root: Path | None = None,
     expected_app_manifest_fingerprint: str | None = None,
     expected_execution_profile: ExecutionProfileIdentity | None = None,
+    native_run_id: str | None = None,
 ) -> CorpusExecutionResult:
     """Execute one internally compiled suite without repeating corpus compilation."""
 
@@ -1238,6 +1354,55 @@ async def _run_compiled_corpus_suite(
             expected_execution_profile=expected_execution_profile,
         )
 
+    selected_run_id = str(uuid4()) if native_run_id is None else native_run_id
+    case_revisions = {case.id: case.revision for case in compiled.corpus.cases}
+    external_case_refs = {
+        case.id: None if case.input is None else case.input.opaque_external_case_ref
+        for case in compiled.corpus.cases
+    }
+    external_trials: tuple[ExternalTrialIdentityV1, ...] = ()
+    trial_request_transform = None
+    if validated_target.external_process is not None:
+        external_process = validated_target.external_process
+        external_trials = tuple(
+            ExternalTrialIdentityV1.create(
+                native_run_id=selected_run_id,
+                target_key=validated_target.key,
+                target_revision=external_process.revision,
+                corpus_revision=compiled.corpus.revision,
+                suite_id=compiled.suite.id,
+                suite_revision=compiled.run_contract.suite_revision,
+                case_id=case.id,
+                case_revision=case_revisions[case.id],
+                trial_number=trial_number,
+            )
+            for case in compiled.suite.cases
+            for trial_number in range(1, compiled.trials + 1)
+        )
+        external_trial_by_slot = {
+            (trial.case_id, trial.trial_number): trial for trial in external_trials
+        }
+
+        def external_trial_request(
+            suite_id: str,
+            case_id: str,
+            trial_number: int,
+            request: RunRequest,
+        ) -> RunRequest:
+            if suite_id != compiled.suite.id:
+                raise ValueError("External trial suite identity changed before dispatch.")
+            trial = external_trial_by_slot[(case_id, trial_number)]
+            messages = with_external_trial_envelope(
+                request.messages,
+                ExternalTrialEnvelopeV1(
+                    trial=trial,
+                    opaque_case_ref=external_case_refs[case_id],
+                ),
+            )
+            return request.model_copy(update={"messages": messages})
+
+        trial_request_transform = external_trial_request
+
     internal_run, trial_public_data_by_case = await _run_eval_suite_with_public_projection(
         validated_target.app,
         compiled.suite,
@@ -1251,6 +1416,8 @@ async def _run_compiled_corpus_suite(
             or expected_execution_profile is not None
             else None
         ),
+        run_id=selected_run_id,
+        trial_request_transform=trial_request_transform,
     )
     return await asyncio.to_thread(
         _finalize_compiled_corpus_result,
@@ -1260,6 +1427,7 @@ async def _run_compiled_corpus_suite(
         internal_run,
         trial_public_data_by_case,
         manifest_project_root,
+        external_trials,
     )
 
 
@@ -1270,6 +1438,7 @@ def _finalize_compiled_corpus_result(
     internal_run: EvalRun,
     trial_public_data_by_case: dict[str, tuple[_EvalTrialPublicData, ...]],
     manifest_project_root: Path | None,
+    external_trials: tuple[ExternalTrialIdentityV1, ...] = (),
 ) -> CorpusExecutionResult:
     """Construct and validate the complete published result off the event loop."""
 
@@ -1281,9 +1450,11 @@ def _finalize_compiled_corpus_result(
         target_after.target_key != target_before.target_key
         or target_after.application_release_id != target_before.application_release_id
         or target_after.app_manifest_fingerprint != target_before.app_manifest_fingerprint
+        or target_after.external_process != target_before.external_process
     ):
         raise EvalExecutionProfileChangedError(
-            "CorpusTarget application manifest changed during eval execution."
+            "CorpusTarget application manifest changed or external process identity changed "
+            "during eval execution."
         )
     run_document: dict[str, Any] = _model_instance_python_input(internal_run)
     run_document["run_contract"] = compiled.run_contract
@@ -1295,6 +1466,7 @@ def _finalize_compiled_corpus_result(
             bound_run,
             trial_public_data_by_case=trial_public_data_by_case,
         ),
+        external_trials=external_trials,
     )
 
 

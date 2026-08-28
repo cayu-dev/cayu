@@ -131,6 +131,12 @@ test("suite validation mirrors Python Unicode whitespace and immutable scenario 
     scenario_revision: "pending",
   }
   assert.match(validateEvalSuiteDraft(scenario).error, /saved immutable scenario revision/)
+
+  const opaque = newEvalSuiteDraft("external.candidate")
+  opaque.cases[0].stimulus.input = {
+    opaque_external_case_ref: { id: "private-case", revision: revision("d") },
+  }
+  assert.match(validateEvalSuiteDraft(opaque).error, /runtime-owned opaque external input/)
 })
 
 test("suite validation enforces the server's 1,000-case ceiling", () => {

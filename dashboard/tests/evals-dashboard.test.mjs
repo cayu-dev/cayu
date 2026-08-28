@@ -421,6 +421,10 @@ test("eval trial cost summary distinguishes observed, unavailable, and absent pr
 
 test("eval comparison reasons remain specific and operator-readable", () => {
   assert.equal(
+    evalComparisonReasonText("external_target_revision_mismatch"),
+    "The external target revision changed between runs.",
+  )
+  assert.equal(
     evalComparisonReasonText("pricing_profile_fingerprint_mismatch"),
     "The applicable pricing contract changed between runs.",
   )

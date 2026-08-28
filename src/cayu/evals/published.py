@@ -122,6 +122,20 @@ _TRIAL_MESSAGE = {
     EvalTrialDiagnosticCode.CHILD_EVIDENCE_UNAVAILABLE: (
         "Complete child-session evidence was unavailable."
     ),
+    EvalTrialDiagnosticCode.EXTERNAL_TARGET_UNAVAILABLE: ("The external target was unavailable."),
+    EvalTrialDiagnosticCode.EXTERNAL_TARGET_CANCELLED: (
+        "The external target execution was cancelled."
+    ),
+    EvalTrialDiagnosticCode.EXTERNAL_TARGET_UNKNOWN: (
+        "The external target outcome could not be reconciled."
+    ),
+    EvalTrialDiagnosticCode.EXTERNAL_TARGET_INCOMPLETE: (
+        "The external target evidence was incomplete."
+    ),
+    EvalTrialDiagnosticCode.EXTERNAL_TARGET_IDENTITY_MISMATCH: (
+        "The external target execution identity could not be proven."
+    ),
+    EvalTrialDiagnosticCode.EXTERNAL_TARGET_FAILED: "The external target execution failed.",
     EvalTrialDiagnosticCode.EXECUTION_FAILED: "Trial execution failed.",
     EvalTrialDiagnosticCode.SESSION_FAILED: "The trial session failed.",
     EvalTrialDiagnosticCode.TERMINAL_EVIDENCE_FAILED: "Terminal evidence capture failed.",
@@ -145,8 +159,14 @@ _TRIAL_CODES_BY_STATUS = {
         EvalTrialDiagnosticCode.TERMINAL_EVIDENCE_UNAVAILABLE,
         EvalTrialDiagnosticCode.INTERRUPTED_EVIDENCE_UNAVAILABLE,
         EvalTrialDiagnosticCode.CHILD_EVIDENCE_UNAVAILABLE,
+        EvalTrialDiagnosticCode.EXTERNAL_TARGET_UNAVAILABLE,
+        EvalTrialDiagnosticCode.EXTERNAL_TARGET_CANCELLED,
+        EvalTrialDiagnosticCode.EXTERNAL_TARGET_UNKNOWN,
+        EvalTrialDiagnosticCode.EXTERNAL_TARGET_INCOMPLETE,
+        EvalTrialDiagnosticCode.EXTERNAL_TARGET_IDENTITY_MISMATCH,
     },
     "error": {
+        EvalTrialDiagnosticCode.EXTERNAL_TARGET_FAILED,
         EvalTrialDiagnosticCode.EXECUTION_FAILED,
         EvalTrialDiagnosticCode.SESSION_FAILED,
         EvalTrialDiagnosticCode.TERMINAL_EVIDENCE_FAILED,

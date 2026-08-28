@@ -468,6 +468,7 @@ class EvalRunCoordinator:
                     registration.catalog_entry.app_manifest_fingerprint
                 ),
                 expected_execution_profile=prepared.execution_profile,
+                native_run_id=lease.run.id,
             )
         else:
             if prepared.scenario_binding is None:

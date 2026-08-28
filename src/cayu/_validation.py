@@ -679,13 +679,20 @@ class JsonUtf8SizeCounter:
             fields = type(value).model_fields
             if not self._consume(2):
                 return False
-            for index, (name, field) in enumerate(fields.items()):
+            retained_fields: list[tuple[str, Any, Any]] = []
+            for name, field in fields.items():
+                field_value = getattr(value, name)
+                exclude_if = getattr(field, "exclude_if", None)
+                if field.exclude is True or (exclude_if is not None and exclude_if(field_value)):
+                    continue
+                retained_fields.append((name, field, field_value))
+            for index, (name, field, field_value) in enumerate(retained_fields):
                 if index and not self._consume(1):
                     return False
                 key = field.serialization_alias or field.alias or name
                 if not self._string(key) or not self._consume(1):
                     return False
-                if not self.value(getattr(value, name)):
+                if not self.value(field_value):
                     return False
             return True
         if isinstance(value, Mapping):

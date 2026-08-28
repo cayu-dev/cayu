@@ -404,6 +404,11 @@ def _eval_execution_target_material_identity(
         # Keep the entire object in the commitment as a forward-safety fence.
         # Individual current ceilings are also published for operator decisions.
         "execution_limits": target.limits.model_dump(mode="json"),
+        "external_process": (
+            None
+            if target.external_process is None
+            else target.external_process.model_dump(mode="json")
+        ),
     }
     canonical = canonical_durable_json_bytes(material, "eval execution target material")
     try:

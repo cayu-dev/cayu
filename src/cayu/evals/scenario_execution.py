@@ -36,6 +36,10 @@ from cayu.evals.execution import (
     _finalize_compiled_corpus_result,
     evaluation_target_identity,
 )
+from cayu.evals.external import (
+    ExternalTrialEnvelopeV1,
+    ExternalTrialIdentityV1,
+)
 from cayu.evals.memory_attribution import (
     eval_memory_attribution_bounds_for_trial_count,
     eval_memory_attribution_max_bytes_for_trial_count,
@@ -233,7 +237,7 @@ def _scenario_messages(
                 content.append(
                     TextPart(
                         text=json.dumps(
-                            part.value,
+                            part.model_dump(mode="json")["value"],
                             ensure_ascii=False,
                             sort_keys=True,
                             separators=(",", ":"),
@@ -356,6 +360,7 @@ class _ScenarioTrialDriver:
         manifest_project_root: Path | None,
         expected_app_manifest_fingerprint: str | None,
         expected_execution_profile: ExecutionProfileIdentity | None,
+        external_envelope: ExternalTrialEnvelopeV1 | None,
     ) -> None:
         self.target = target
         self.scenario = scenario
@@ -367,6 +372,7 @@ class _ScenarioTrialDriver:
         self.manifest_project_root = manifest_project_root
         self.expected_app_manifest_fingerprint = expected_app_manifest_fingerprint
         self.expected_execution_profile = expected_execution_profile
+        self.external_envelope = external_envelope
         self.initial_progress = initial_progress.model_copy(deep=True)
         session_id = (
             initial_progress.session_id
@@ -716,7 +722,15 @@ class _ScenarioTrialDriver:
                 request = self.target.request_base.model_copy(
                     update={
                         "session_id": self.session_id,
-                        "messages": [*self.target.bootstrap_messages, *initial_messages],
+                        "messages": [
+                            *(
+                                ()
+                                if self.external_envelope is None
+                                else (self.external_envelope.message(),)
+                            ),
+                            *self.target.bootstrap_messages,
+                            *initial_messages,
+                        ],
                     },
                     deep=True,
                 )
@@ -849,6 +863,24 @@ async def run_compiled_eval_scenario(
     memory_attribution_read_lifecycle = _FreshMemoryAttributionReadLifecycle(
         max_operations=max_concurrency
     )
+    external_trials: tuple[ExternalTrialIdentityV1, ...] = ()
+    if target.external_process is not None:
+        external_process = target.external_process
+        case_revision = compiled.corpus.cases[0].revision
+        external_trials = tuple(
+            ExternalTrialIdentityV1.create(
+                native_run_id=claim.run_id,
+                target_key=target.key,
+                target_revision=external_process.revision,
+                corpus_revision=compiled.corpus.revision,
+                suite_id=compiled.suite.id,
+                suite_revision=compiled.run_contract.suite_revision,
+                case_id=case.id,
+                case_revision=case_revision,
+                trial_number=trial_number,
+            )
+            for trial_number in range(1, binding.trials + 1)
+        )
 
     async def execute_trial(trial_number: int) -> None:
         driver = _ScenarioTrialDriver(
@@ -863,6 +895,11 @@ async def run_compiled_eval_scenario(
             manifest_project_root=manifest_project_root,
             expected_app_manifest_fingerprint=expected_app_manifest_fingerprint,
             expected_execution_profile=expected_execution_profile,
+            external_envelope=(
+                None
+                if not external_trials
+                else ExternalTrialEnvelopeV1(trial=external_trials[trial_number - 1])
+            ),
         )
         async with semaphore:
             execution = await _run_case_once_with_public_projection(
@@ -918,6 +955,7 @@ async def run_compiled_eval_scenario(
         internal_run,
         {case.id: public_data},
         manifest_project_root,
+        external_trials,
     )
 
 

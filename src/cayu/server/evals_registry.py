@@ -207,6 +207,7 @@ def target_for_eval_invocation(
         price_book=target.price_book,
         model_judges=target.model_judges,
         limits=target.limits,
+        external_process=target.external_process,
     )
 
 
@@ -305,6 +306,7 @@ class EvalTargetRegistration:
             price_book=self.target.price_book,
             model_judges=self.target.model_judges,
             limits=limits,
+            external_process=self.target.external_process,
         )
 
 
@@ -467,6 +469,7 @@ class EvalTargetRegistry:
                     "max_concurrency": registration.execution_profile_policy.max_concurrency,
                 }
             ),
+            external_process=target.external_process,
         )
         identity = evaluation_target_identity(
             target,
