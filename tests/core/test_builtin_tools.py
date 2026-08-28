@@ -10,6 +10,7 @@ import threading
 import tracemalloc
 from collections.abc import AsyncIterator
 from importlib import import_module
+from pathlib import PurePosixPath
 
 import pytest
 from pydantic import SecretStr
@@ -30,6 +31,7 @@ from cayu import (
     SecretRedactor,
     file_attachment,
 )
+from cayu._validation import thaw_json_value
 from cayu.artifacts import ArtifactStoreUnavailableError, LocalArtifactStore
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.tools import (
@@ -601,6 +603,8 @@ def test_builtin_tool_limits_are_model_context_sized():
     assert WriteFileTool().schema["properties"]["max_bytes"]["maximum"] == 4 * 1024 * 1024
     assert ListFilesTool().schema["properties"]["limit"]["default"] == 500
     assert ListFilesTool().schema["properties"]["limit"]["maximum"] == 10_000
+    assert ListFilesTool().schema["properties"]["offset"]["default"] == 0
+    assert ListFilesTool().schema["properties"]["max_result_bytes"]["default"] == 50_000
     assert ListArtifactsTool().schema["properties"]["limit"]["default"] == 500
     assert ListArtifactsTool().schema["properties"]["limit"]["maximum"] == 10_000
     assert ExecCommandTool().schema["properties"]["max_output_bytes"]["default"] == 50_000
@@ -656,9 +660,15 @@ def test_workspace_tools_read_write_and_list_files(tmp_path):
     assert list_result.structured == {
         "pattern": "**/*.txt",
         "files": ["notes/result.txt"],
+        "offset": 0,
+        "next_offset": None,
         "total_files": 1,
         "truncated": False,
+        "truncation_reasons": [],
+        "projected_response_bytes": list_result.structured["projected_response_bytes"],
+        "max_result_bytes": 50_000,
     }
+    assert list_result.structured["projected_response_bytes"] <= 50_000
 
 
 def test_read_file_exposes_complete_revision_to_the_model(tmp_path):
@@ -3860,12 +3870,139 @@ def test_builtin_tools_truncate_model_facing_large_outputs(tmp_path):
     assert read_result.content.endswith("[/read_file metadata]\nabc")
     assert read_result.structured["truncated"] is True
     assert read_result.structured["total_bytes"] == 6
-    assert list_result.content.endswith("[file list truncated]")
+    assert list_result.content.endswith("[file list truncated; continue with offset=1]")
     assert list_result.structured["total_files"] is None
     assert list_result.structured["truncated"] is True
+    assert list_result.structured["next_offset"] == 1
     assert command_result.structured["stdout"] == "abc"
     assert command_result.structured["stdout_truncated"] is True
     assert "[output truncated]" in command_result.content
+
+
+def test_list_files_pages_large_source_tree_and_excludes_generated_stores(tmp_path):
+    for index in range(1_205):
+        path = tmp_path / "src" / f"module-{index:04d}.py"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"VALUE = {index}\n")
+    for relative in (
+        ".git/objects/aa/object",
+        ".venv/lib/site.py",
+        "node_modules/pkg/index.js",
+        ".cache/result.json",
+        "dist/generated.py",
+    ):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("generated\n")
+
+    tool = ListFilesTool(exclude_directories=(".git", ".venv", "node_modules", ".cache", "dist"))
+    context = ToolContext(
+        session_id="sess-list-pagination",
+        workspace=LocalWorkspace(tmp_path, workspace_id="large-tree"),
+    )
+    first = asyncio.run(
+        tool.run(
+            context,
+            {"pattern": "**/*", "limit": 500, "max_result_bytes": 12_000},
+        )
+    )
+    assert first.is_error is False
+    assert first.structured["truncated"] is True
+    assert first.structured["next_offset"] is not None
+    assert first.structured["projected_response_bytes"] <= 12_000
+    assert all(
+        not any(
+            part in {".git", ".venv", "node_modules", ".cache", "dist"}
+            for part in PurePosixPath(path).parts
+        )
+        for path in first.structured["files"]
+    )
+
+    pages = [first]
+    while pages[-1].structured["next_offset"] is not None:
+        pages.append(
+            asyncio.run(
+                tool.run(
+                    context,
+                    {
+                        "pattern": "**/*",
+                        "limit": 500,
+                        "offset": pages[-1].structured["next_offset"],
+                        "max_result_bytes": 12_000,
+                    },
+                )
+            )
+        )
+    files = [path for page in pages for path in page.structured["files"]]
+    assert len(files) == 1_205
+    assert len(files) == len(set(files))
+    assert files == sorted(files)
+    assert all(page.structured["projected_response_bytes"] <= 12_000 for page in pages)
+    assert all(
+        page.structured["projected_response_bytes"]
+        == len(
+            json.dumps(
+                {
+                    "content": page.content,
+                    "structured": thaw_json_value(page.structured),
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        )
+        for page in pages
+    )
+
+
+def test_list_files_stops_at_scan_ceiling_without_invalid_continuation(tmp_path):
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (tmp_path / name).write_text(name)
+
+    result = asyncio.run(
+        ListFilesTool(max_scan_entries=2).run(
+            ToolContext(
+                session_id="sess-list-scan-ceiling",
+                workspace=LocalWorkspace(tmp_path, workspace_id="scan-ceiling"),
+            ),
+            {"pattern": "*.txt", "limit": 2, "max_result_bytes": 4_096},
+        )
+    )
+
+    assert result.structured["files"] == ["a.txt", "b.txt"]
+    assert result.structured["truncated"] is True
+    assert "scan_limit" in result.structured["truncation_reasons"]
+    assert result.structured["next_offset"] is None
+    assert result.content.endswith("continuation unavailable: scan limit reached]")
+    assert result.structured["projected_response_bytes"] <= 4_096
+
+
+def test_list_files_rejects_pattern_that_cannot_fit_result_bound(tmp_path):
+    result = asyncio.run(
+        ListFilesTool().run(
+            ToolContext(
+                session_id="sess-list-pattern-bound",
+                workspace=LocalWorkspace(tmp_path, workspace_id="pattern-bound"),
+            ),
+            {"pattern": "a" * 4_096, "max_result_bytes": 4_096},
+        )
+    )
+
+    assert result.is_error is True
+    assert result.structured == {"error": "invalid_arguments"}
+    assert result.content == "Tool argument `pattern` is too large for `max_result_bytes`."
+
+
+def test_list_files_configuration_is_execution_profile_material():
+    configured = ListFilesTool(
+        exclude_directories=("node_modules", ".git", "node_modules"),
+        max_scan_entries=12_345,
+    )
+
+    assert configured._execution_profile_material() == {
+        "exclude_directories": [".git", "node_modules"],
+        "max_scan_entries": 12_345,
+    }
+    assert configured._execution_profile_material() != ListFilesTool()._execution_profile_material()
 
 
 def test_write_file_tool_refuses_oversized_content(tmp_path):

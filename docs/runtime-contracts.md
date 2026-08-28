@@ -7274,7 +7274,9 @@ The first built-in tools are:
 - `write_file`: create a missing UTF-8 file or conditionally overwrite an existing revision, capped by `max_bytes`
 - `edit_file`: apply one or more exact, non-overlapping replacements against one complete UTF-8 snapshot as a conditional mutation
 - `delete_file`: delete one existing file through an opaque revision precondition
-- `list_files`: list files in the active workspace, capped by `limit`
+- `list_files`: list files in the active workspace with deterministic `offset`
+  continuation, capped by `limit` and `max_result_bytes`; applications may configure
+  directory-name exclusions and a bounded scan window on the registered tool instance
 - `search_text`: search file contents through the active runner in bounded `files`, `content`, or `count` mode
 - `git_changes`: inspect pageable status, filename-safe numstat summaries, or bounded unified diffs through the active runner; `diff_offset` continues a truncated single-file diff
 - `list_artifacts`: list session- or environment-scoped artifact metadata, capped by `limit`
@@ -7302,7 +7304,10 @@ Default built-in tool caps are intentionally large enough for normal coding work
 - Runtime file attachment resolution: 8 MB maximum per attachment, 32 MB maximum total per provider request, and 20 attachments maximum per provider request by default. Applications may override those runtime caps with `CayuApp(max_file_attachment_bytes=..., max_total_file_attachment_bytes=..., max_file_attachments_per_request=...)`.
 - `write_file`: 256 KB by default, 4 MB maximum per call
 - `edit_file` and `delete_file`: 256 KB complete-file precondition by default, 4 MB maximum per call; edit diff previews are 32 KB by default and 200 KB maximum
-- `list_files`: 500 paths by default, 10,000 maximum per call
+- `list_files`: 500 paths by default, 10,000 maximum per call; 50 KB projected
+  model-facing result by default, 200 KB maximum; deterministic continuation up to a
+  1,000,000-entry offset; registered tool instances scan at most 100,000 source entries
+  by default and may configure a ceiling up to 1,000,000
 - `search_text`: 100 entries by default, 500 maximum per call; 500 bytes of preview text per content match by default, 4 KB maximum per match; 20 KB of rendered model-facing text by default, 128 KB maximum per call; 1 MB of runner output captured by default, 4 MB maximum; files larger than 2 MB skipped by default, with a 64 MB maximum; 30 seconds by default, 120 seconds maximum
 - `git_changes`: 50 changes by default, 200 maximum per page; 32 KB model-facing output by default, 200 KB maximum; deterministic diff continuation up to a 4 MB byte offset; 1 MB status capture; 30-second command timeout
 - `list_artifacts`: 500 artifacts by default, 10,000 maximum per call
@@ -7315,7 +7320,12 @@ Default built-in tool caps are intentionally large enough for normal coding work
 ### Workspace search progression
 
 `ListFilesTool`, `SearchTextTool`, and `GitChangesTool` answer different questions. `list_files`
-applies a filename glob without reading file contents. `search_text` searches
+applies a filename glob without reading file contents. Its result includes `next_offset`,
+truncation reasons, and projected response size; exact continuation repeats the same glob
+with that offset. Applications can configure excluded directory names on the registered
+tool so VCS objects, caches, virtual environments, generated trees, and dependency stores
+never enter normal discovery. The scan ceiling is explicit: reaching it returns typed
+truncation without inventing a continuation beyond observed source authority. `search_text` searches
 contents and defaults to filename-only results so an agent can narrow its scope
 before asking for previews. `read_file` then expands one selected file with an
 explicit byte limit and returns a revision when the snapshot is complete.

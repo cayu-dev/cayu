@@ -9,7 +9,7 @@ import mimetypes
 import ntpath
 import posixpath
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from importlib import import_module
 from itertools import pairwise
@@ -68,6 +68,11 @@ MAX_EDIT_OPERATIONS = 100
 MAX_FILE_REVISION_CHARS = 4096
 DEFAULT_LIST_LIMIT = 500
 MAX_LIST_LIMIT = 10_000
+DEFAULT_LIST_RESULT_LIMIT_BYTES = 50_000
+MAX_LIST_RESULT_LIMIT_BYTES = 200_000
+MAX_LIST_OFFSET = 1_000_000
+DEFAULT_LIST_SCAN_LIMIT = 100_000
+MAX_LIST_SCAN_LIMIT = 1_000_000
 _READ_FILE_TRUNCATION_MARKER = "\n\n[file truncated]"
 
 _READ_FILE_ARGUMENTS = frozenset(
@@ -78,7 +83,7 @@ _EDIT_FILE_ARGUMENTS = frozenset(
 )
 _DELETE_FILE_ARGUMENTS = frozenset({"path", "expected_revision", "max_bytes"})
 _WRITE_FILE_ARGUMENTS = frozenset({"path", "content", "mode", "expected_revision", "max_bytes"})
-_LIST_FILES_ARGUMENTS = frozenset({"pattern", "limit"})
+_LIST_FILES_ARGUMENTS = frozenset({"pattern", "limit", "offset", "max_result_bytes"})
 _LIST_ARTIFACTS_ARGUMENTS = frozenset({"scope", "limit"})
 
 IMAGE_CONTENT_TYPES = FILE_ATTACHMENT_IMAGE_CONTENT_TYPES
@@ -2071,13 +2076,41 @@ class ListFilesTool(Tool):
                     "maximum": MAX_LIST_LIMIT,
                     "default": DEFAULT_LIST_LIMIT,
                 },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_LIST_OFFSET,
+                    "default": 0,
+                    "description": "File offset for deterministic continuation.",
+                },
+                "max_result_bytes": {
+                    "type": "integer",
+                    "minimum": 4_096,
+                    "maximum": MAX_LIST_RESULT_LIMIT_BYTES,
+                    "default": DEFAULT_LIST_RESULT_LIMIT_BYTES,
+                    "description": "Maximum projected model-facing result size in bytes.",
+                },
             },
             "additionalProperties": False,
         },
     )
 
+    def __init__(
+        self,
+        *,
+        exclude_directories: Iterable[str] = (),
+        max_scan_entries: int = DEFAULT_LIST_SCAN_LIMIT,
+    ) -> None:
+        self.exclude_directories = _validate_list_exclude_directories(exclude_directories)
+        if type(max_scan_entries) is not int or not 1 <= max_scan_entries <= MAX_LIST_SCAN_LIMIT:
+            raise ValueError(f"max_scan_entries must be from 1 through {MAX_LIST_SCAN_LIMIT}.")
+        self.max_scan_entries = max_scan_entries
+
     def _execution_profile_material(self) -> dict[str, object]:
-        return {}
+        return {
+            "exclude_directories": list(self.exclude_directories),
+            "max_scan_entries": self.max_scan_entries,
+        }
 
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
@@ -2100,19 +2133,207 @@ class ListFilesTool(Tool):
                 default=DEFAULT_LIST_LIMIT,
                 maximum=MAX_LIST_LIMIT,
             )
-        result = await workspace.list(pattern, limit=limit)
-        result_content = "\n".join(result.paths) if result.paths else "No files matched."
-        if result.truncated:
-            result_content = f"{result_content}\n\n[file list truncated]"
-        return ToolResult(
-            content=result_content,
-            structured={
-                "pattern": pattern,
-                "files": list(result.paths),
-                "total_files": result.total_count,
-                "truncated": result.truncated,
-            },
+            offset = _optional_nonnegative_int(args, "offset", default=0)
+            if offset > MAX_LIST_OFFSET:
+                raise ValueError(f"Tool argument `offset` must be at most {MAX_LIST_OFFSET}.")
+            max_result_bytes = _optional_int(
+                args,
+                "max_result_bytes",
+                default=DEFAULT_LIST_RESULT_LIMIT_BYTES,
+                maximum=MAX_LIST_RESULT_LIMIT_BYTES,
+            )
+            if max_result_bytes < 4_096:
+                raise ValueError("Tool argument `max_result_bytes` must be at least 4096.")
+            if offset >= self.max_scan_entries:
+                raise ValueError(
+                    "Tool argument `offset` must be smaller than the configured scan limit."
+                )
+            if (
+                _minimum_list_file_result_bytes(
+                    pattern=pattern,
+                    offset=offset,
+                    max_result_bytes=max_result_bytes,
+                )
+                > max_result_bytes
+            ):
+                raise ValueError("Tool argument `pattern` is too large for `max_result_bytes`.")
+        requested_end = min(self.max_scan_entries, offset + limit)
+        scan_limit = max(1, requested_end)
+        while True:
+            result = await workspace.list(pattern, limit=scan_limit)
+            visible = tuple(
+                path
+                for path in result.paths
+                if not _path_has_list_excluded_directory(path, self.exclude_directories)
+            )
+            if (
+                len(visible) >= requested_end
+                or not result.truncated
+                or scan_limit >= self.max_scan_entries
+            ):
+                break
+            scan_limit = min(self.max_scan_entries, max(scan_limit * 2, requested_end))
+
+        candidates = visible[offset:requested_end]
+        total_files = len(visible) if not result.truncated else None
+        source_has_more = result.truncated or requested_end < len(visible)
+        selected = _fit_list_file_result(
+            pattern=pattern,
+            candidates=candidates,
+            offset=offset,
+            total_files=total_files,
+            source_has_more=source_has_more,
+            max_result_bytes=max_result_bytes,
         )
+        next_offset = offset + len(selected)
+        truncated_by_limit = len(candidates) == limit and source_has_more
+        truncated_by_bytes = len(selected) < len(candidates)
+        scan_limit_exhausted = (
+            result.truncated and scan_limit >= self.max_scan_entries and next_offset >= len(visible)
+        )
+        reasons = tuple(
+            name
+            for name, active in (
+                ("limit", truncated_by_limit),
+                ("response_bytes", truncated_by_bytes),
+                ("scan_limit", scan_limit_exhausted),
+            )
+            if active
+        )
+        truncated = bool(reasons)
+        continuation = (
+            next_offset
+            if truncated and not scan_limit_exhausted and (selected or not truncated_by_bytes)
+            else None
+        )
+        result_content = "\n".join(selected) if selected else "No files matched."
+        if truncated:
+            suffix = (
+                "continuation unavailable: scan limit reached"
+                if scan_limit_exhausted
+                else (
+                    "continuation unavailable: response byte limit reached"
+                    if continuation is None
+                    else f"continue with offset={continuation}"
+                )
+            )
+            result_content = f"{result_content}\n\n[file list truncated; {suffix}]"
+        structured = {
+            "pattern": pattern,
+            "files": list(selected),
+            "offset": offset,
+            "next_offset": continuation,
+            "total_files": total_files,
+            "truncated": truncated,
+            "truncation_reasons": list(reasons),
+            "projected_response_bytes": 0,
+            "max_result_bytes": max_result_bytes,
+        }
+        while True:
+            projected_response_bytes = _projected_list_result_bytes(result_content, structured)
+            if projected_response_bytes == structured["projected_response_bytes"]:
+                break
+            structured["projected_response_bytes"] = projected_response_bytes
+        return ToolResult(content=result_content, structured=structured)
+
+
+def _validate_list_exclude_directories(values: Iterable[str]) -> tuple[str, ...]:
+    if isinstance(values, str | bytes):
+        raise TypeError("exclude_directories must be an iterable of directory names.")
+    copied = tuple(values)
+    validated: list[str] = []
+    seen: set[str] = set()
+    for value in copied:
+        if type(value) is not str:
+            raise TypeError("exclude_directories entries must be strings.")
+        name = require_unicode_scalar_text(
+            require_nonblank(value, "exclude directory"), "exclude directory"
+        )
+        if name in {".", ".."} or "/" in name or "\\" in name or "\0" in name:
+            raise ValueError("exclude_directories entries must be plain directory names.")
+        if name not in seen:
+            seen.add(name)
+            validated.append(name)
+    return tuple(sorted(validated))
+
+
+def _path_has_list_excluded_directory(path: str, excluded: tuple[str, ...]) -> bool:
+    return bool(excluded) and any(part in excluded for part in PurePosixPath(path).parts[:-1])
+
+
+def _fit_list_file_result(
+    *,
+    pattern: str,
+    candidates: tuple[str, ...],
+    offset: int,
+    total_files: int | None,
+    source_has_more: bool,
+    max_result_bytes: int,
+) -> tuple[str, ...]:
+    selected: list[str] = []
+    for path in candidates:
+        proposed = (*selected, path)
+        has_more = source_has_more or len(proposed) < len(candidates)
+        worst_case = {
+            "pattern": pattern,
+            "files": list(proposed),
+            "offset": offset,
+            "next_offset": offset + len(proposed) if has_more else None,
+            "total_files": total_files,
+            "truncated": has_more,
+            "truncation_reasons": ["limit", "response_bytes", "scan_limit"],
+            "projected_response_bytes": MAX_LIST_RESULT_LIMIT_BYTES,
+            "max_result_bytes": max_result_bytes,
+        }
+        content = "\n".join(proposed) or "No files matched."
+        if has_more:
+            # Reserve the longest terminal suffix so switching from a normal
+            # continuation to an exhausted scan ceiling cannot exceed the
+            # caller's result-byte bound after selection.
+            content += (
+                "\n\n[file list truncated; continuation unavailable: response byte limit reached]"
+            )
+        projected = _projected_list_result_bytes(content, worst_case)
+        if projected > max_result_bytes:
+            break
+        selected.append(path)
+    return tuple(selected)
+
+
+def _minimum_list_file_result_bytes(
+    *,
+    pattern: str,
+    offset: int,
+    max_result_bytes: int,
+) -> int:
+    """Return a conservative projection floor before entering the workspace."""
+
+    structured = {
+        "pattern": pattern,
+        "files": [],
+        "offset": offset,
+        "next_offset": None,
+        "total_files": None,
+        "truncated": True,
+        "truncation_reasons": ["limit", "response_bytes", "scan_limit"],
+        "projected_response_bytes": MAX_LIST_RESULT_LIMIT_BYTES,
+        "max_result_bytes": max_result_bytes,
+    }
+    return _projected_list_result_bytes(
+        "No files matched.\n\n[file list truncated; "
+        "continuation unavailable: response byte limit reached]",
+        structured,
+    )
+
+
+def _projected_list_result_bytes(content: str, structured: Mapping[str, object]) -> int:
+    return len(
+        json.dumps(
+            {"content": content, "structured": structured},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
 
 
 class ListArtifactsTool(Tool):

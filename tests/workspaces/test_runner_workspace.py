@@ -1526,6 +1526,11 @@ def test_builtin_file_tools_use_runner_workspace(tmp_path) -> None:
     assert list_result.structured == {
         "pattern": "**/*.txt",
         "files": ["notes/result.txt"],
+        "offset": 0,
+        "next_offset": None,
         "total_files": 1,
         "truncated": False,
+        "truncation_reasons": [],
+        "projected_response_bytes": list_result.structured["projected_response_bytes"],
+        "max_result_bytes": 50_000,
     }
