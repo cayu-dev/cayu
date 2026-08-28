@@ -7991,6 +7991,10 @@ export type ExecutionRequirements = {
      * Real Secret Visibility
      */
     real_secret_visibility?: 'allowed' | 'non_possession';
+    /**
+     * Required Executables
+     */
+    required_executables?: Array<string>;
 };
 
 /**

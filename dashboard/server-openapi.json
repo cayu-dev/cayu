@@ -16024,6 +16024,14 @@
             ],
             "title": "Real Secret Visibility",
             "type": "string"
+          },
+          "required_executables": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 64,
+            "title": "Required Executables",
+            "type": "array"
           }
         },
         "title": "ExecutionRequirements",

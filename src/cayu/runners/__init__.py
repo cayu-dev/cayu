@@ -33,7 +33,14 @@ from cayu.runners.docker import (
     DEFAULT_DOCKER_CWD,
     DEFAULT_DOCKER_IMAGE,
     DockerCloseAction,
+    DockerContainerOwnershipError,
     DockerRunner,
+    DockerRuntimeConfigurationError,
+)
+from cayu.runners.docker_workload import (
+    DockerImageIdentity,
+    DockerTmpfsMount,
+    DockerWorkloadRestrictions,
 )
 from cayu.runners.e2b import (
     DEFAULT_E2B_CWD,
@@ -99,7 +106,12 @@ __all__ = [
     "PINNED_BROWSER_SESSION_IMAGE",
     "PINNED_BROWSER_SESSION_WORKLOAD",
     "DockerCloseAction",
+    "DockerContainerOwnershipError",
+    "DockerImageIdentity",
     "DockerRunner",
+    "DockerRuntimeConfigurationError",
+    "DockerTmpfsMount",
+    "DockerWorkloadRestrictions",
     "E2BCloseAction",
     "E2BGuestHandoffError",
     "E2BGuestHandoffPhase",

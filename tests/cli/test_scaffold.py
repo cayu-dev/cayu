@@ -17,6 +17,8 @@ import pytest
 from cayu import (
     CayuApp,
     ChatCompletionsProvider,
+    DockerCodingEnvironmentFactory,
+    DockerImageIdentity,
     EvalStatus,
     InMemorySessionStore,
     InMemoryTaskStore,
@@ -341,6 +343,180 @@ def test_cayu_new_coding_emits_explicit_composition_and_clean_git_baseline(
     output = capsys.readouterr().out
     assert "pytest -q tests/test_coding_composition.py" in output
     assert '--agent coder --message "YOUR REQUEST"' in output
+
+
+def test_cayu_new_docker_coding_emits_explicit_checks_and_immutable_image_contract(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _bypass_coding_dependency_preflight(monkeypatch)
+    assert (
+        main(
+            [
+                "new",
+                "docker-coder",
+                "--composition",
+                "coding",
+                "--coding-execution",
+                "docker",
+                "--dir",
+                str(tmp_path),
+            ]
+        )
+        == 0
+    )
+    project = tmp_path / "docker-coder"
+    expected_support = {
+        ".dockerignore",
+        "Dockerfile.coding",
+        "build_coding_image.py",
+        "docker-coding-build.json",
+        "docker-coding-image.json",
+        "tests/test_project.py",
+    }
+    assert all((project / path).is_file() for path in expected_support)
+    assert (
+        subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=project,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        == ""
+    )
+
+    composition_source = (project / "composition.py").read_text(encoding="utf-8")
+    primary_source = (project / "agents" / "agent.py").read_text(encoding="utf-8")
+    dockerfile = (project / "Dockerfile.coding").read_text(encoding="utf-8")
+    builder = (project / "build_coding_image.py").read_text(encoding="utf-8")
+    readme = (project / "README.md").read_text(encoding="utf-8")
+    assert "DockerCodingEnvironmentFactory" in composition_source
+    assert "DockerWorkspaceTransferLimits" in composition_source
+    assert "RunCheckTool" in composition_source
+    assert "NamedCheck" in composition_source
+    assert "_ExactCheckCommandPolicy" in composition_source
+    assert "values=list(_CHECK_NAMES)" in composition_source
+    assert 'code_trust="untrusted"' not in composition_source
+    assert "ExecutionRequirements.untrusted" not in composition_source
+    assert "ExecCommandTool" not in composition_source
+    assert "LocalRunner" not in composition_source
+    assert r"(?:\.cayu|\.git|\.runtime)" in composition_source
+    assert "PRIMARY_EXECUTION_PROFILE_IDENTITY" in primary_source
+    assert "ARG CAYU_BASE_IMAGE" in dockerfile
+    assert "ARG CAYU_DEBIAN_SNAPSHOT" in dockerfile
+    assert "snapshot.debian.org/archive/debian" in dockerfile
+    assert "uv sync --frozen --extra dev --no-install-project" in dockerfile
+    assert "from=cayu-wheel" in dockerfile
+    assert "pip install" in dockerfile
+    assert "cayu_wheel_sha256" in builder
+    assert '"--build-context"' in builder
+    assert "Docker is the P1 bounded path" in readme
+    assert "#1191" in readme
+    assert "does not claim exact" in readme
+    assert json.loads((project / "docker-coding-image.json").read_text())["content_digest"] is None
+    build_configuration = json.loads((project / "docker-coding-build.json").read_text())
+    assert build_configuration["cayu_wheel"] is None
+    assert build_configuration["cayu_wheel_sha256"] is None
+    assert build_configuration["debian_snapshot"] is None
+    assert build_configuration["debian_suite"] is None
+    scaffold_output = capsys.readouterr().out
+    assert "Build and record image" in scaffold_output
+    assert "trusted-repository Docker named checks" in scaffold_output
+
+    check_cli = importlib.import_module("cayu.cli.check")
+
+    def build_app_without_host_dependency_probe(
+        target: str,
+        *,
+        command: str = "Project",
+    ) -> CayuApp:
+        del command
+        assert target == "app:build_app"
+        composition = importlib.import_module("composition")
+        monkeypatch.setattr(composition, "_verify_coding_dependencies", lambda root: None)
+        app_module = importlib.import_module("app")
+        return app_module.build_app()
+
+    # This assertion owns the immutable-image diagnostic, not the host runner's
+    # optional ripgrep installation. The ordinary dependency preflight has
+    # dedicated semantic tests below.
+    monkeypatch.setattr(
+        check_cli,
+        "build_project_app",
+        build_app_without_host_dependency_probe,
+    )
+    monkeypatch.chdir(project)
+    assert main(["check", "--json"]) == 2
+    diagnostic = json.loads(capsys.readouterr().out)
+    assert diagnostic["error"]["code"] == "PROJECT_CHECK_FAILED"
+    assert "no immutable image ID" in diagnostic["error"]["message"]
+    assert "environment" not in diagnostic["error"]
+
+    spec = importlib.util.spec_from_file_location(
+        "docker_coding_scaffolded_app", project / "app.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    image_id = "sha256:" + ("a" * 64)
+    with project_context(project):
+        spec.loader.exec_module(module)
+        globals_ = module.build_coding_app.__globals__
+        monkeypatch.setitem(globals_, "_verify_coding_dependencies", lambda root: None)
+        monkeypatch.setitem(
+            globals_,
+            "_configured_docker_authority",
+            lambda root: (
+                DockerImageIdentity(
+                    reference="docker-coder:test",
+                    content_digest=image_id,
+                ),
+                "/usr/bin/docker",
+            ),
+        )
+        app = module.build_app(
+            provider=ScriptedModelProvider([]),
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+        )
+
+    environment = app._environments["coding"]
+    assert environment.factory_backed is True
+    assert isinstance(environment.factory, DockerCodingEnvironmentFactory)
+    primary = app._agents["docker-coder"]
+    reviewer = app._agents["docker-coder-reviewer"]
+    assert set(reviewer.tools) == set()
+    assert "run_check" in primary.tools
+    assert "exec_command" not in primary.tools
+    assert primary.execution_requirements.code_trust == "trusted"
+    assert primary.execution_requirements.network_access == "deny_by_default"
+    assert primary.tools["run_check"].tool.schema["properties"]["check"]["enum"] == [
+        "format",
+        "lint",
+        "test",
+    ]
+
+
+def test_coding_execution_requires_the_coding_composition(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert (
+        main(
+            [
+                "new",
+                "invalid-docker",
+                "--coding-execution",
+                "docker",
+                "--dir",
+                str(tmp_path),
+            ]
+        )
+        == 1
+    )
+    assert not (tmp_path / "invalid-docker").exists()
+    assert "requires --composition coding" in capsys.readouterr().err
 
 
 def test_cayu_new_coding_rejects_unsupported_local_workspace_before_creation(

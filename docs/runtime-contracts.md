@@ -7421,7 +7421,8 @@ keyword, validate before side effects, and apply the same scalar rules and order
 whether one explicitly selected execution candidate is suitable. It represents
 code trust, real-secret visibility, network access, guest privilege, host
 filesystem exposure, cancellation, cleanup, durability, and the minimum
-acceptable default evidence level. Typed `ExecutionEvidenceOverride` entries
+acceptable default evidence level. `required_executables` adds bounded tool
+dependencies to the same admission decision. Typed `ExecutionEvidenceOverride` entries
 can raise or lower that minimum for individual required capabilities without
 changing the workload's provider-neutral security requirements.
 `ExecutionRequirements.untrusted()` requires
@@ -7498,6 +7499,15 @@ bounded, secret-shaped-value-rejecting primitives as
 `EgressCapabilityEvidence`; execution admission does not maintain a second
 unconstrained evidence vocabulary.
 
+Executable evidence uses the separately versioned
+`cayu.execution_tool_requirements.v1` envelope. Every entry is sorted and
+unique, and the envelope repeats the exact environment and immutable-image
+fingerprints from its enclosing capability evidence. Configured integrations
+may declare an executable before allocation; a final coding runner must probe
+it in the exact container and report time-bounded `live_verified` evidence.
+Missing, unavailable, stale, malformed, or fingerprint-mismatched executable
+evidence refuses admission.
+
 Cayu applies admission at its common environment boundary. The `pre_create`
 gate runs before any registered factory's `create()` method. Before creation,
 integrations report positive support only as `declared`; resource/process
@@ -7520,6 +7530,37 @@ Successful results publish `execution_requirements` and
 `execution_capabilities` in both factory-result metadata and the concrete
 environment spec. Arbitrary caller assertions cannot replace integration
 evidence.
+
+`DockerCodingEnvironmentFactory` is the built-in bounded Docker path for
+explicitly trusted repository code. It is not an untrusted-code sandbox and
+rejects `ExecutionRequirements.untrusted()` before invoking Docker. Its explicit
+`LocalWorkspace` source and image are trusted application configuration. Image
+selection is immutable (`DockerImageIdentity`), and its typed
+`DockerWorkloadRestrictions` has no raw Docker-argument escape hatch. The
+created container is non-root, read-only-root, no-new-privileges, capability
+drop-all, resource-limited, and writable only through bounded tmpfs mounts. It
+uses `--network none`, receives no bind mounts, host Docker socket, raw
+workload credential, setup command, or environment overlay, and is owned and
+cleaned only by the full container ID returned from creation. Docker inspection
+and executable probes bind the final evidence to that exact container and
+image; drift or ambiguous ownership fails closed. The configured and live
+`guest_privilege_containment` and `unprivileged_guest` claims require
+read-only-root, no-new-privileges, and an empty capability add-back set. A
+weakened restriction value reports both capabilities as unsupported so matching
+admission requirements fail closed.
+
+Repository input reaches the container only through
+`DockerCodingWorkspaceBinding`. The host `.git`, `.cayu`, and `.runtime`
+directories are excluded before traversal and never enter copy limits or the
+guest. The guest initializes its own ephemeral Git baseline after bounded
+copy-in. Copy-back stages bounded output, preflights the original host file
+revisions, and publishes with conditional create/replace/delete operations.
+A pre-existing host conflict performs no writes. A race during publication is
+reported as `SyncBindingSourceConflictError` with the exact already-applied
+paths; no successful final snapshot is emitted. Cancellation and other
+supervisory process-control exceptions propagate after the dispatched mutation
+is fenced and are never reclassified as source conflicts. Guest Git metadata
+and the other protected directories are never copied back.
 
 An isolation boundary separates guest execution from the host or control
 plane. Network denial restricts reachable destinations but does not itself

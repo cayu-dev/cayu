@@ -100,6 +100,7 @@ class SyncBindingContext:
 class _SyncBindingState:
     source_paths: tuple[str, ...]
     target_baseline_paths: tuple[str, ...]
+    source_revisions: tuple[tuple[str, str], ...]
     source_resource_key: tuple[object, ...]
     target_id: str
     target_resource_key: tuple[object, ...]
@@ -153,6 +154,22 @@ SyncTargetWorkspacePlanFactory = Callable[
 ]
 SyncTargetCleanPolicy = Literal["always", "never"]
 SyncBackPolicy = Literal["always", "on_success", "never"]
+SyncSourceConflictPolicy = Literal["overwrite", "require_revision"]
+
+
+class SyncBindingSourceConflictError(RuntimeError):
+    """Copy-back refused because the durable source changed concurrently."""
+
+    def __init__(self, path: str, *, applied_paths: tuple[str, ...] = ()) -> None:
+        self.path = require_clean_nonblank(path, "path")
+        self.applied_paths = tuple(applied_paths)
+        detail = (
+            "before any copy-back mutation"
+            if not applied_paths
+            else f"after {len(applied_paths)} copy-back mutations"
+        )
+        super().__init__(f"SyncBinding source revision conflict for {path!r} {detail}.")
+
 
 GIT_REPOSITORY_METADATA_KEY = "git_repository"
 _GIT_OBSERVATION_ENV_REMOVE = (
@@ -1218,6 +1235,7 @@ class SyncBinding(WorkspaceBinding):
         clean_target: SyncTargetCleanPolicy = "always",
         sync_back: SyncBackPolicy = "always",
         delete_missing: bool = True,
+        source_conflict_policy: SyncSourceConflictPolicy = "overwrite",
     ) -> None:
         if target_workspace is not None and not isinstance(target_workspace, Workspace):
             raise TypeError("SyncBinding target_workspace must be a Workspace or None.")
@@ -1259,6 +1277,14 @@ class SyncBinding(WorkspaceBinding):
         if type(delete_missing) is not bool:
             raise TypeError("SyncBinding delete_missing must be a bool.")
         self.delete_missing = delete_missing
+        self.source_conflict_policy = _validate_source_conflict_policy(source_conflict_policy)
+        if self.source_conflict_policy == "require_revision" and (
+            self.max_file_bytes is None or self.max_total_bytes is None
+        ):
+            raise ValueError(
+                "SyncBinding revision-aware copy-back requires finite max_file_bytes "
+                "and max_total_bytes."
+            )
         self._state_lock = threading.Lock()
         self._states: dict[str, _SyncBindingState] = {}
         # Retained as a target-oriented compatibility diagnostic for existing callers. The
@@ -1499,6 +1525,14 @@ class SyncBinding(WorkspaceBinding):
                 limit=self.max_files,
                 role="source",
             )
+            source_revisions: tuple[tuple[str, str], ...] = ()
+            if self.source_conflict_policy == "require_revision":
+                source_revisions = await _capture_sync_source_revisions(
+                    workspace,
+                    source_paths,
+                    max_file_bytes=cast("int", self.max_file_bytes),
+                    max_total_bytes=cast("int", self.max_total_bytes),
+                )
             cleaned_paths: tuple[str, ...] = ()
             if self.clean_target == "always":
                 cleaned_paths = await _clear_workspace(target, max_files=self.max_files)
@@ -1518,6 +1552,13 @@ class SyncBinding(WorkspaceBinding):
                 max_total_bytes=self.max_total_bytes,
                 max_archive_bytes=self.max_archive_bytes,
             )
+            if self.source_conflict_policy == "require_revision":
+                await _verify_sync_source_revisions(
+                    workspace,
+                    source_revisions,
+                    max_file_bytes=cast("int", self.max_file_bytes),
+                    max_total_bytes=cast("int", self.max_total_bytes),
+                )
             bind_metadata = {
                 **request_metadata,
                 "sync_binding": {
@@ -1531,6 +1572,7 @@ class SyncBinding(WorkspaceBinding):
                     "clean_target": self.clean_target,
                     "sync_back": self.sync_back,
                     "delete_missing": self.delete_missing,
+                    "source_conflict_policy": self.source_conflict_policy,
                     "copied_files": len(source_paths),
                     "copied_bytes": copied_bytes,
                     "cleaned_target_files": len(cleaned_paths),
@@ -1559,6 +1601,7 @@ class SyncBinding(WorkspaceBinding):
                 _SyncBindingState(
                     source_paths=source_paths,
                     target_baseline_paths=target_baseline_paths,
+                    source_revisions=source_revisions,
                     source_resource_key=source_resource_key,
                     target_id=target.id,
                     target_resource_key=target_resource_key,
@@ -1671,6 +1714,7 @@ class SyncBinding(WorkspaceBinding):
                 state_key,
                 source_paths=state.source_paths,
                 target_baseline_paths=state.target_baseline_paths,
+                source_revisions=state.source_revisions,
             )
             return None
         if bound.source_workspace is None:
@@ -1691,22 +1735,33 @@ class SyncBinding(WorkspaceBinding):
                 target_baseline_paths=state.target_baseline_paths,
                 target_paths=target_paths,
             )
-            copied_bytes = await _copy_paths(
-                source=bound.workspace,
-                target=source_workspace,
-                paths=copy_back_paths,
-                max_file_bytes=self.max_file_bytes,
-                max_total_bytes=self.max_total_bytes,
-                max_archive_bytes=self.max_archive_bytes,
-            )
             deleted_paths: tuple[str, ...] = ()
             if self.delete_missing:
                 deleted_paths = tuple(sorted(set(state.source_paths) - set(target_paths)))
+            if self.source_conflict_policy == "require_revision":
+                copied_bytes, source_revisions = await self._copy_back_with_revisions(
+                    state_key=state_key,
+                    source=source_workspace,
+                    target=bound.workspace,
+                    copy_back_paths=copy_back_paths,
+                    deleted_paths=deleted_paths,
+                    revisions=state.source_revisions,
+                )
+            else:
+                copied_bytes = await _copy_paths(
+                    source=bound.workspace,
+                    target=source_workspace,
+                    paths=copy_back_paths,
+                    max_file_bytes=self.max_file_bytes,
+                    max_total_bytes=self.max_total_bytes,
+                    max_archive_bytes=self.max_archive_bytes,
+                )
                 for path in deleted_paths:
                     await _await_sync_mutation(
                         lambda path=path: source_workspace.delete(path),
                         operation=f"SyncBinding source delete for {path!r}",
                     )
+                source_revisions = state.source_revisions
             synced_source_paths = tuple(
                 sorted((set(state.source_paths) - set(deleted_paths)).union(copy_back_paths))
             )
@@ -1730,8 +1785,81 @@ class SyncBinding(WorkspaceBinding):
             state_key,
             source_paths=synced_source_paths,
             target_baseline_paths=target_paths,
+            source_revisions=source_revisions,
         )
         return final_snapshot
+
+    async def _copy_back_with_revisions(
+        self,
+        *,
+        state_key: str,
+        source: Workspace,
+        target: Workspace,
+        copy_back_paths: tuple[str, ...],
+        deleted_paths: tuple[str, ...],
+        revisions: tuple[tuple[str, str], ...],
+    ) -> tuple[int, tuple[tuple[str, str], ...]]:
+        max_file_bytes = cast("int", self.max_file_bytes)
+        max_total_bytes = cast("int", self.max_total_bytes)
+        staged, copied_bytes = await _stage_sync_files(
+            target,
+            copy_back_paths,
+            max_file_bytes=max_file_bytes,
+            max_total_bytes=max_total_bytes,
+        )
+        revision_map = dict(revisions)
+        await _verify_sync_source_revisions(
+            source,
+            revisions,
+            max_file_bytes=max_file_bytes,
+            max_total_bytes=max_total_bytes,
+        )
+        applied: list[str] = []
+        operations = tuple(sorted(set(copy_back_paths).union(deleted_paths)))
+        for path in operations:
+            try:
+
+                async def mutate_and_record(path: str = path) -> None:
+                    if path in staged:
+                        content = staged[path]
+                        expected_revision = revision_map.get(path)
+                        if expected_revision is None:
+                            result = await source.create_bytes(path, content)
+                        else:
+                            result = await source.replace_bytes(
+                                path,
+                                content,
+                                expected_revision=expected_revision,
+                            )
+                        if result.after_revision is None:
+                            raise RuntimeError(
+                                "SyncBinding conditional write returned no resulting revision."
+                            )
+                        revision_map[path] = result.after_revision
+                    else:
+                        expected_revision = revision_map[path]
+                        await source.delete_if_revision(
+                            path,
+                            expected_revision=expected_revision,
+                        )
+                        del revision_map[path]
+                    applied.append(path)
+                    self._update_conflict_state(
+                        state_key,
+                        source_paths=tuple(sorted(revision_map)),
+                        source_revisions=tuple(sorted(revision_map.items())),
+                    )
+
+                await _await_sync_mutation(
+                    mutate_and_record,
+                    operation=f"SyncBinding conditional source mutation for {path!r}",
+                )
+            except Exception as exc:
+                raise SyncBindingSourceConflictError(
+                    path,
+                    applied_paths=tuple(applied),
+                ) from exc
+        return copied_bytes, tuple(sorted(revision_map.items()))
 
     async def _target_workspace(
         self,
@@ -1841,12 +1969,30 @@ class SyncBinding(WorkspaceBinding):
             if state is not None and state.phase == "finalizing":
                 self._states[state_key] = replace(state, phase="active")
 
+    def _update_conflict_state(
+        self,
+        state_key: str,
+        *,
+        source_paths: tuple[str, ...],
+        source_revisions: tuple[tuple[str, str], ...],
+    ) -> None:
+        with self._state_lock:
+            state = self._states.get(state_key)
+            if state is None or state.phase != "finalizing":
+                raise RuntimeError("SyncBinding copy-back lost its ownership state.")
+            self._states[state_key] = replace(
+                state,
+                source_paths=source_paths,
+                source_revisions=source_revisions,
+            )
+
     def _complete_sync_finalize(
         self,
         state_key: str,
         *,
         source_paths: tuple[str, ...],
         target_baseline_paths: tuple[str, ...],
+        source_revisions: tuple[tuple[str, str], ...],
     ) -> None:
         with self._state_lock:
             state = self._states.get(state_key)
@@ -1861,6 +2007,7 @@ class SyncBinding(WorkspaceBinding):
                     state,
                     source_paths=source_paths,
                     target_baseline_paths=target_baseline_paths,
+                    source_revisions=source_revisions,
                     phase="active",
                 )
             else:
@@ -2036,6 +2183,90 @@ def _validate_sync_back_policy(value: object) -> SyncBackPolicy:
     if value not in {"always", "on_success", "never"}:
         raise ValueError("SyncBinding sync_back must be 'always', 'on_success', or 'never'.")
     return cast("SyncBackPolicy", value)
+
+
+def _validate_source_conflict_policy(value: object) -> SyncSourceConflictPolicy:
+    if value not in {"overwrite", "require_revision"}:
+        raise ValueError(
+            "SyncBinding source_conflict_policy must be 'overwrite' or 'require_revision'."
+        )
+    return cast("SyncSourceConflictPolicy", value)
+
+
+async def _capture_sync_source_revisions(
+    workspace: Workspace,
+    paths: tuple[str, ...],
+    *,
+    max_file_bytes: int,
+    max_total_bytes: int,
+) -> tuple[tuple[str, str], ...]:
+    revisions: list[tuple[str, str]] = []
+    observed_bytes = 0
+    for path in paths:
+        result = await workspace.read_bytes(
+            path,
+            max_bytes=workspace.bounded_read_limit(max_file_bytes),
+        )
+        if result.truncated:
+            raise RuntimeError(
+                f"SyncBinding source file exceeds max_file_bytes={max_file_bytes}: {path}"
+            )
+        observed_bytes += result.total_bytes
+        if observed_bytes > max_total_bytes:
+            raise RuntimeError(
+                f"SyncBinding source files exceed max_total_bytes={max_total_bytes}."
+            )
+        if result.revision is None:
+            raise RuntimeError(
+                f"SyncBinding revision-aware copy-back requires source revision support: {path}"
+            )
+        revisions.append((path, result.revision))
+    return tuple(revisions)
+
+
+async def _verify_sync_source_revisions(
+    workspace: Workspace,
+    revisions: tuple[tuple[str, str], ...],
+    *,
+    max_file_bytes: int,
+    max_total_bytes: int,
+) -> None:
+    try:
+        current = await _capture_sync_source_revisions(
+            workspace,
+            tuple(path for path, _ in revisions),
+            max_file_bytes=max_file_bytes,
+            max_total_bytes=max_total_bytes,
+        )
+    except Exception as exc:
+        path = revisions[0][0] if revisions else "source-workspace"
+        raise SyncBindingSourceConflictError(path) from exc
+    expected = dict(revisions)
+    for path, revision in current:
+        if expected[path] != revision:
+            raise SyncBindingSourceConflictError(path)
+
+
+async def _stage_sync_files(
+    workspace: Workspace,
+    paths: tuple[str, ...],
+    *,
+    max_file_bytes: int,
+    max_total_bytes: int,
+) -> tuple[dict[str, bytes], int]:
+    staged: dict[str, bytes] = {}
+    total_bytes = 0
+    for path in paths:
+        content = await _read_sync_file(
+            workspace,
+            path,
+            max_file_bytes=max_file_bytes,
+            max_total_bytes=max_total_bytes,
+            copied_bytes=total_bytes,
+        )
+        staged[path] = content
+        total_bytes += len(content)
+    return staged, total_bytes
 
 
 async def _list_workspace_paths(

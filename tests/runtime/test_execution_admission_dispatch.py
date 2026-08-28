@@ -1032,6 +1032,7 @@ def test_missing_final_runner_evidence_returns_structured_refusal() -> None:
         {
             "code": "missing_capability",
             "capability": "confirmed_cleanup",
+            "executable": None,
             "required_state": "available",
             "observed_state": "missing",
             "reason_code": None,

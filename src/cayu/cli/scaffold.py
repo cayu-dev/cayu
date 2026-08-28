@@ -3398,6 +3398,15 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
             "The coding composition requires git and rg."
         ),
     )
+    parser.add_argument(
+        "--coding-execution",
+        choices=("docker",),
+        help=(
+            "Explicit execution backend for --composition coding. Omit to keep "
+            "the bounded no-command composition; docker adds trusted-repository "
+            "named checks in an admitted Docker environment."
+        ),
+    )
 
 
 def _installed_cayu_version() -> str:
@@ -3411,6 +3420,7 @@ def project_files(
     provider: str | None = None,
     template: str = "agent",
     composition: str | None = None,
+    coding_execution: str | None = None,
 ) -> dict[str, str]:
     resolved_agent_name = name if agent_name is None else agent_name
     reviewer_name = f"{resolved_agent_name}-reviewer"
@@ -3446,6 +3456,8 @@ def project_files(
         "AGENTS.md": render(_AGENTS_MD),
         ".gitignore": _GITIGNORE,
     }
+    if coding_execution is not None and composition != "coding":
+        raise ValueError("coding_execution requires composition='coding'.")
     if composition is not None:
         if composition != "coding":
             raise ValueError("composition must be 'coding'.")
@@ -3453,7 +3465,13 @@ def project_files(
             raise ValueError("the coding composition cannot be combined with a service template.")
         from cayu.cli.coding_composition import coding_project_files
 
-        files.update(coding_project_files(files=files, render=render))
+        files.update(
+            coding_project_files(
+                files=files,
+                render=render,
+                execution=coding_execution,
+            )
+        )
         return files
     if template == "agent":
         return files
@@ -3505,6 +3523,13 @@ def run_new(args: argparse.Namespace) -> int:
         )
         return 1
     composition = getattr(args, "composition", None)
+    coding_execution = getattr(args, "coding_execution", None)
+    if coding_execution is not None and composition != "coding":
+        print(
+            "error: --coding-execution requires --composition coding.",
+            file=sys.stderr,
+        )
+        return 1
     if composition is not None and args.template != "agent":
         print(
             "error: --composition coding cannot be combined with --template service.",
@@ -3548,6 +3573,7 @@ def run_new(args: argparse.Namespace) -> int:
         provider=args.provider,
         template=args.template,
         composition=composition,
+        coding_execution=coding_execution,
     )
     if composition == "coding":
         assert coding_git is not None
@@ -3678,6 +3704,9 @@ def run_new(args: argparse.Namespace) -> int:
     elif composition == "coding":
         print("  uv run cayu check --json")
         print("  uv run pytest -q tests/test_coding_composition.py")
+        if coding_execution == "docker":
+            print("  Configure pinned inputs: docker-coding-build.json")
+            print("  Build and record image: uv run python build_coding_image.py")
     else:
         print("  uv run cayu check --json")
         print("  uv run pytest")
@@ -3687,6 +3716,8 @@ def run_new(args: argparse.Namespace) -> int:
         print("  Product API: http://127.0.0.1:8000/api/operations")
         print("  Operator control plane: http://127.0.0.1:8000/cayu/")
     elif composition == "coding":
+        if coding_execution == "docker":
+            print("  Execution: trusted-repository Docker named checks (network disabled)")
         print(f'  Live run: uv run python run.py --agent {agent_name} --message "YOUR REQUEST"')
         print("  Local control plane: uv run cayu serve --dev")
         print("  Open: http://127.0.0.1:8000/cayu/")

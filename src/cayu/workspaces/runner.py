@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import posixpath
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 from cayu._validation import (
@@ -185,7 +185,14 @@ def delete_operation(root_fd):
         close_fd(parent_fd)
 
 
-def collect_files(dir_fd, prefix, pattern_regex, matches, ancestor_directories):
+def collect_files(
+    dir_fd,
+    prefix,
+    pattern_regex,
+    matches,
+    ancestor_directories,
+    excluded_directory_names,
+):
     if os.listdir not in getattr(os, "supports_fd", ()):
         raise GuardPathError("unsupported")
     directory_info = os.fstat(dir_fd)
@@ -197,6 +204,8 @@ def collect_files(dir_fd, prefix, pattern_regex, matches, ancestor_directories):
     try:
         for name in os.listdir(dir_fd):
             rel_path = name if not prefix else prefix + "/" + name
+            if name.casefold() in excluded_directory_names:
+                continue
             try:
                 entry = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
             except OSError as exc:
@@ -219,6 +228,7 @@ def collect_files(dir_fd, prefix, pattern_regex, matches, ancestor_directories):
                         pattern_regex,
                         matches,
                         ancestor_directories,
+                        excluded_directory_names,
                     )
                 finally:
                     close_fd(child_fd)
@@ -238,8 +248,16 @@ def list_operation(root_fd):
     pattern_regex = re.compile(sys.argv[2])
     limit = int(sys.argv[3])
     payload_limit = int(sys.argv[4])
+    excluded_directory_names = frozenset(json.loads(sys.argv[5]))
     matches = []
-    collect_files(root_fd, "", pattern_regex, matches, set())
+    collect_files(
+        root_fd,
+        "",
+        pattern_regex,
+        matches,
+        set(),
+        excluded_directory_names,
+    )
     sorted_matches = sorted(matches)
     paths = sorted_matches[:limit]
     total_count = len(matches)
@@ -390,11 +408,20 @@ def preflight_tar_destination(root_fd, rel_path):
 def write_tar_operation(root_fd):
     payload = json.loads(sys.stdin.read())
     data = base64.b64decode(payload["tar_base64"], validate=True)
+    excluded_directory_names = frozenset(json.loads(sys.argv[2]))
     member_paths = set()
     member_parent_paths = set()
     with tarfile.open(fileobj=io.BytesIO(data), mode="r") as archive:
         for member in archive:
             validate_tar_member(member, member_paths, member_parent_paths)
+            if any(
+                part.casefold() in excluded_directory_names
+                for part in member.name.split("/")
+            ):
+                fail(
+                    "invalid_path",
+                    f"Workspace tar member is inside an excluded directory: {member.name}",
+                )
             extracted = archive.extractfile(member)
             if extracted is None:
                 fail(
@@ -490,6 +517,7 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
         python_executable: str = "python3",
         default_read_limit_bytes: int = DEFAULT_RUNNER_WORKSPACE_READ_LIMIT_BYTES,
         default_list_limit: int = DEFAULT_RUNNER_WORKSPACE_LIST_LIMIT,
+        excluded_directory_names: Iterable[str] = (),
         enable_workspace_branches: bool = False,
         branch_operation_timeout_s: int = 300,
         branch_authority_resolver: WorkspaceBranchBindingAuthorityProvider | None = None,
@@ -504,6 +532,14 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
             "default_read_limit_bytes",
         )
         self.default_list_limit = _validate_required_limit(default_list_limit, "default_list_limit")
+        self.excluded_directory_names = _validate_excluded_directory_names(excluded_directory_names)
+        self._excluded_directory_keys = frozenset(
+            value.casefold() for value in self.excluded_directory_names
+        )
+        if self.excluded_directory_names and enable_workspace_branches:
+            raise ValueError(
+                "RunnerWorkspace excluded directories cannot be combined with workspace branches."
+            )
         if type(enable_workspace_branches) is not bool:
             raise TypeError("RunnerWorkspace enable_workspace_branches must be a bool.")
         self.branch_operation_timeout_s = _validate_required_limit(
@@ -652,6 +688,7 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
         max_bytes: int | None = None,
     ) -> WorkspaceReadResult:
         path = _validate_relative_path(path)
+        self._require_path_allowed(path)
         offset = _validate_workspace_offset(offset, owner="RunnerWorkspace")
         limit = (
             self.default_read_limit_bytes
@@ -679,6 +716,7 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
 
     async def write_bytes(self, path: str, content: bytes) -> None:
         path = _validate_relative_path(path)
+        self._require_path_allowed(path)
         if type(content) is not bytes:
             raise TypeError("Workspace write content must be bytes.")
         payload = {
@@ -693,6 +731,7 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
 
     async def delete(self, path: str) -> None:
         path = _validate_relative_path(path)
+        self._require_path_allowed(path)
         await self._run_json_operation(
             "delete",
             path,
@@ -701,6 +740,7 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
 
     async def create_bytes(self, path: str, content: bytes) -> WorkspaceMutationResult:
         path = _validate_relative_path(path)
+        self._require_path_allowed(path)
         if type(content) is not bytes:
             raise TypeError("Workspace create content must be bytes.")
         return await guard_create(
@@ -721,6 +761,7 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
         expected_revision: str,
     ) -> WorkspaceMutationResult:
         path = _validate_relative_path(path)
+        self._require_path_allowed(path)
         if type(content) is not bytes:
             raise TypeError("Workspace replace content must be bytes.")
         return await guard_replace(
@@ -743,6 +784,7 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
         expected_revision: str,
     ) -> WorkspaceMutationResult:
         path = _validate_relative_path(path)
+        self._require_path_allowed(path)
         return await guard_delete_if_revision(
             self._runner,
             root=self._runner.resolve_cwd(self.cwd),
@@ -770,17 +812,23 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
             translate_list_pattern(pattern),
             str(effective_limit),
             str(RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES),
+            json.dumps(tuple(sorted(self._excluded_directory_keys))),
             output_limit_bytes=_json_list_output_limit(),
         )
         validated = _validate_workspace_list_result(
             result,
             pattern=pattern,
             effective_limit=effective_limit,
+            excluded_directory_keys=self._excluded_directory_keys,
         )
         del result
         if isinstance(validated, Exception):
             raise validated from None
         return validated
+
+    def _require_path_allowed(self, path: str) -> None:
+        if _path_has_excluded_directory(path, self._excluded_directory_keys):
+            raise ValueError("Workspace path is inside an excluded directory.")
 
     async def read_tar_bytes(
         self,
@@ -803,6 +851,8 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
         """
 
         validated_paths = _validate_tar_paths(paths)
+        for path in validated_paths:
+            self._require_path_allowed(path)
         per_file_limit = (
             self.default_read_limit_bytes
             if max_file_bytes is None
@@ -849,6 +899,7 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
         payload = {"tar_base64": base64.b64encode(data).decode("ascii")}
         await self._run_json_operation(
             "write_tar",
+            json.dumps(tuple(sorted(self._excluded_directory_keys))),
             stdin=json.dumps(payload),
             output_limit_bytes=RUNNER_WORKSPACE_SCRIPT_OUTPUT_OVERHEAD_BYTES,
         )
@@ -916,6 +967,7 @@ def _validate_workspace_list_result(
     *,
     pattern: str,
     effective_limit: int,
+    excluded_directory_keys: frozenset[str],
 ) -> WorkspaceListResult | TypeError | ValueError:
     paths = result.get("paths")
     total_count = result.get("total_count")
@@ -935,6 +987,8 @@ def _validate_workspace_list_result(
             return ValueError("Runner workspace list returned an invalid path.")
         if path != normalized:
             return ValueError("Runner workspace list returned a non-normalized path.")
+        if _path_has_excluded_directory(path, excluded_directory_keys):
+            return ValueError("Runner workspace list returned an excluded path.")
         validated_paths.append(path)
 
     if len(set(validated_paths)) != len(validated_paths):
@@ -967,6 +1021,35 @@ def _validate_optional_limit(value: int | None, field_name: str) -> int | None:
     if value is None:
         return None
     return _validate_required_limit(value, field_name)
+
+
+def _validate_excluded_directory_names(values: Iterable[str]) -> tuple[str, ...]:
+    if isinstance(values, str | bytes):
+        raise TypeError("RunnerWorkspace excluded_directory_names must be an iterable of strings.")
+    try:
+        names = tuple(values)
+    except TypeError as exc:
+        raise TypeError(
+            "RunnerWorkspace excluded_directory_names must be an iterable of strings."
+        ) from exc
+    normalized: dict[str, str] = {}
+    for index, name in enumerate(names):
+        value = require_clean_nonblank(name, f"excluded_directory_names[{index}]")
+        if value in {".", ".."} or "/" in value or "\\" in value:
+            raise ValueError(
+                "RunnerWorkspace excluded directory names must be single path segments."
+            )
+        key = value.casefold()
+        if key in normalized:
+            raise ValueError(
+                "RunnerWorkspace excluded directory names must be case-insensitively unique."
+            )
+        normalized[key] = value
+    return tuple(normalized[key] for key in sorted(normalized))
+
+
+def _path_has_excluded_directory(path: str, excluded_directory_keys: frozenset[str]) -> bool:
+    return any(part.casefold() in excluded_directory_keys for part in path.split("/"))
 
 
 def _validate_tar_paths(paths: Sequence[str]) -> tuple[str, ...]:

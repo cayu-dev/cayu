@@ -26,6 +26,7 @@ from cayu.capabilities import (
 )
 
 EXECUTION_CAPABILITY_EVIDENCE_SCHEMA = "cayu.execution_capabilities.v1"
+EXECUTION_TOOL_REQUIREMENT_EVIDENCE_SCHEMA = "cayu.execution_tool_requirements.v1"
 EXECUTION_LIVE_EVIDENCE_MAX_TTL_SECONDS = 300
 
 ExecutionCodeTrust = Literal["trusted", "untrusted"]
@@ -51,6 +52,12 @@ ExecutionAdmissionRefusalCode = Literal[
     "future_evidence",
     "overlong_evidence",
     "contradictory_evidence",
+]
+ExecutionExecutableEvidenceState = Literal[
+    "declared",
+    "live_verified",
+    "unverified",
+    "unavailable",
 ]
 ExecutionObservedCapabilityState = (
     CapabilityState
@@ -159,6 +166,90 @@ class ExecutionCapabilityClaim(CapabilityClaim):
         )
 
 
+class ExecutionExecutableEvidence(BaseModel):
+    """One bounded executable-availability fact for the exact final environment."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    executable: str = Field(max_length=4096)
+    state: ExecutionExecutableEvidenceState
+    observed_at: datetime | None = None
+    valid_until: datetime | None = None
+    reason_code: str | None = Field(default=None, max_length=96)
+    remediation_code: str | None = Field(default=None, max_length=96)
+
+    @field_validator("executable")
+    @classmethod
+    def validate_executable(cls, value: str) -> str:
+        executable = require_durable_clean_nonblank(value, "executable")
+        if len(executable.encode("utf-8")) > 4096:
+            raise ValueError("Executable evidence names must not exceed 4096 bytes.")
+        return executable
+
+    @field_validator("reason_code", "remediation_code")
+    @classmethod
+    def validate_optional_code(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_state_fields(self) -> Self:
+        if self.state == "live_verified":
+            if self.observed_at is None or self.valid_until is None:
+                raise ValueError("Live executable evidence requires observed_at and valid_until.")
+            if self.observed_at.tzinfo is None or self.valid_until.tzinfo is None:
+                raise ValueError("Executable evidence timestamps must include a timezone.")
+            if self.valid_until <= self.observed_at:
+                raise ValueError("Executable evidence valid_until must follow observed_at.")
+            if self.reason_code is not None or self.remediation_code is not None:
+                raise ValueError("Live executable evidence cannot carry refusal codes.")
+        elif self.state == "declared":
+            if self.observed_at is not None or self.valid_until is not None:
+                raise ValueError("Declared executable evidence cannot carry timestamps.")
+            if self.reason_code is not None or self.remediation_code is not None:
+                raise ValueError("Declared executable evidence cannot carry refusal codes.")
+        else:
+            if self.observed_at is not None or self.valid_until is not None:
+                raise ValueError("Negative executable evidence cannot carry timestamps.")
+            if self.reason_code is None or self.remediation_code is None:
+                raise ValueError("Negative executable evidence requires refusal codes.")
+        return self
+
+
+class ExecutionToolRequirementEvidence(BaseModel):
+    """Versioned evidence for tool dependencies in one exact environment."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    schema_version: Literal["cayu.execution_tool_requirements.v1"] = Field(
+        default=EXECUTION_TOOL_REQUIREMENT_EVIDENCE_SCHEMA,
+        alias="schema",
+    )
+    environment_fingerprint: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    image_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+    )
+    executables: tuple[ExecutionExecutableEvidence, ...] = Field(
+        default_factory=tuple,
+        max_length=64,
+    )
+
+    @model_validator(mode="after")
+    def validate_unique_executables(self) -> Self:
+        names = [claim.executable for claim in self.executables]
+        if names != sorted(names) or len(names) != len(set(names)):
+            raise ValueError("Executable evidence must be unique and sorted by name.")
+        return self
+
+    def executable_for(self, executable: str) -> ExecutionExecutableEvidence | None:
+        return next(
+            (claim for claim in self.executables if claim.executable == executable),
+            None,
+        )
+
+
 class ExecutionCapabilityEvidence(CapabilityEvidence):
     """Versioned evidence for one explicitly selected execution candidate."""
 
@@ -170,12 +261,48 @@ class ExecutionCapabilityEvidence(CapabilityEvidence):
         default_factory=tuple,
         max_length=64,
     )
+    environment_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+    )
+    image_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+    )
+    tool_requirements: ExecutionToolRequirementEvidence | None = None
+
+    @model_validator(mode="after")
+    def validate_tool_requirement_identity(self) -> Self:
+        evidence = self.tool_requirements
+        if evidence is None:
+            return self
+        if self.environment_fingerprint != evidence.environment_fingerprint:
+            raise ValueError("Tool-requirement evidence must match the environment fingerprint.")
+        if self.image_fingerprint != evidence.image_fingerprint:
+            raise ValueError("Tool-requirement evidence must match the image fingerprint.")
+        return self
 
     def claim_for(self, capability: str) -> ExecutionCapabilityClaim | None:
         return next(
             (claim for claim in self.claims if claim.capability == capability),
             None,
         )
+
+    def to_metadata(self) -> dict[str, object]:
+        """Return complete bounded execution evidence for durable diagnostics."""
+
+        metadata = super().to_metadata()
+        if self.environment_fingerprint is not None:
+            metadata["environment_fingerprint"] = self.environment_fingerprint
+        if self.image_fingerprint is not None:
+            metadata["image_fingerprint"] = self.image_fingerprint
+        if self.tool_requirements is not None:
+            metadata["tool_requirements"] = self.tool_requirements.model_dump(
+                mode="json",
+                by_alias=True,
+                exclude_none=True,
+            )
+        return metadata
 
 
 class ExecutionAdmissionCandidate(BaseModel):
@@ -243,6 +370,20 @@ class ExecutionRequirements(BaseModel):
         default_factory=tuple,
         max_length=64,
     )
+    required_executables: tuple[str, ...] = Field(default_factory=tuple, max_length=64)
+
+    @field_validator("required_executables")
+    @classmethod
+    def validate_required_executables(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        owned: list[str] = []
+        for executable in value:
+            item = require_durable_clean_nonblank(executable, "required_executables item")
+            if len(item.encode("utf-8")) > 4096:
+                raise ValueError("required_executables entries must not exceed 4096 bytes.")
+            owned.append(item)
+        if owned != sorted(owned) or len(owned) != len(set(owned)):
+            raise ValueError("required_executables must be unique and sorted.")
+        return tuple(owned)
 
     @model_validator(mode="after")
     def validate_evidence_overrides(self) -> Self:
@@ -330,10 +471,18 @@ class ExecutionAdmissionRefusal(BaseModel):
 
     code: ExecutionAdmissionRefusalCode
     capability: CapabilityIdentity | None = None
+    executable: str | None = Field(default=None, max_length=4096)
     required_state: MinimumExecutionEvidence | None = None
     observed_state: ExecutionObservedCapabilityState | None = None
     reason_code: CapabilityIdentity | None = None
     remediation_code: CapabilityIdentity | None = None
+
+    @field_validator("executable")
+    @classmethod
+    def validate_optional_executable(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, "executable")
 
 
 class ExecutionAdmissionDecision(BaseModel):
@@ -370,10 +519,16 @@ class ExecutionAdmissionError(RuntimeError):
 
     def __init__(self, decision: ExecutionAdmissionDecision) -> None:
         self.decision = decision
-        capabilities = ", ".join(
-            refusal.capability for refusal in decision.refusals if refusal.capability is not None
+        requirements = ", ".join(
+            (
+                refusal.capability
+                if refusal.capability is not None
+                else f"executable:{refusal.executable}"
+            )
+            for refusal in decision.refusals
+            if refusal.capability is not None or refusal.executable is not None
         )
-        detail = f": {capabilities}" if capabilities else ""
+        detail = f": {requirements}" if requirements else ""
         super().__init__(
             f"Execution candidate {decision.candidate!r} was refused during "
             f"{decision.stage}{detail}."
@@ -397,7 +552,7 @@ def evaluate_execution_admission(
         raise ValueError("stage must be 'pre_create' or 'pre_exposure'.")
     required_capabilities = requirements.required_capabilities()
     if evidence is None:
-        if not required_capabilities:
+        if not required_capabilities and not requirements.required_executables:
             return ExecutionAdmissionDecision(
                 status="admitted",
                 stage=stage,
@@ -441,7 +596,7 @@ def evaluate_execution_admission(
             evidence=validated_evidence,
         )
 
-    if not required_capabilities:
+    if not required_capabilities and not requirements.required_executables:
         return ExecutionAdmissionDecision(
             status="admitted",
             stage=stage,
@@ -573,6 +728,91 @@ def evaluate_execution_admission(
                 )
             )
 
+    tool_evidence = validated_evidence.tool_requirements
+    for executable in requirements.required_executables:
+        executable_claim = (
+            None if tool_evidence is None else tool_evidence.executable_for(executable)
+        )
+        required_state: MinimumExecutionEvidence = (
+            "declared" if stage == "pre_create" else "live_verified"
+        )
+        if executable_claim is None:
+            refusals.append(
+                ExecutionAdmissionRefusal(
+                    code="missing_capability",
+                    executable=executable,
+                    required_state=required_state,
+                    observed_state="missing",
+                )
+            )
+            continue
+        if executable_claim.state == "unverified":
+            refusals.append(
+                ExecutionAdmissionRefusal(
+                    code="unverified_capability",
+                    executable=executable,
+                    required_state=required_state,
+                    observed_state="unverified",
+                    reason_code=executable_claim.reason_code,
+                    remediation_code=executable_claim.remediation_code,
+                )
+            )
+            continue
+        if executable_claim.state == "unavailable":
+            refusals.append(
+                ExecutionAdmissionRefusal(
+                    code="unsupported_capability",
+                    executable=executable,
+                    required_state=required_state,
+                    observed_state="unsupported",
+                    reason_code=executable_claim.reason_code,
+                    remediation_code=executable_claim.remediation_code,
+                )
+            )
+            continue
+        if stage == "pre_exposure" and executable_claim.state != "live_verified":
+            refusals.append(
+                ExecutionAdmissionRefusal(
+                    code="insufficient_evidence",
+                    executable=executable,
+                    required_state="live_verified",
+                    observed_state="declared",
+                )
+            )
+            continue
+        if executable_claim.state == "live_verified":
+            assert executable_claim.observed_at is not None
+            assert executable_claim.valid_until is not None
+            if executable_claim.observed_at > checked_at + _MAX_EVIDENCE_CLOCK_SKEW:
+                refusals.append(
+                    ExecutionAdmissionRefusal(
+                        code="future_evidence",
+                        executable=executable,
+                        required_state=required_state,
+                        observed_state="live_verified",
+                    )
+                )
+                continue
+            if executable_claim.valid_until <= checked_at:
+                refusals.append(
+                    ExecutionAdmissionRefusal(
+                        code="stale_evidence",
+                        executable=executable,
+                        required_state=required_state,
+                        observed_state="stale",
+                    )
+                )
+                continue
+            if executable_claim.valid_until - executable_claim.observed_at > _MAX_LIVE_EVIDENCE_TTL:
+                refusals.append(
+                    ExecutionAdmissionRefusal(
+                        code="overlong_evidence",
+                        executable=executable,
+                        required_state=required_state,
+                        observed_state="live_verified",
+                    )
+                )
+
     return ExecutionAdmissionDecision(
         status="refused" if refusals else "admitted",
         stage=stage,
@@ -611,7 +851,7 @@ def _refused_for_each_requirement(
     evidence_schema: str | None = None,
     evidence: ExecutionCapabilityEvidence | None = None,
 ) -> ExecutionAdmissionDecision:
-    refusals = tuple(
+    capability_refusals = tuple(
         ExecutionAdmissionRefusal(
             code=code,
             capability=capability,
@@ -624,6 +864,16 @@ def _refused_for_each_requirement(
         )
         for capability in requirements.required_capabilities()
     )
+    executable_refusals = tuple(
+        ExecutionAdmissionRefusal(
+            code=code,
+            executable=executable,
+            required_state=("declared" if stage == "pre_create" else "live_verified"),
+            observed_state=observed_state,
+        )
+        for executable in requirements.required_executables
+    )
+    refusals = (*capability_refusals, *executable_refusals)
     if not refusals:
         refusals = (ExecutionAdmissionRefusal(code=code, observed_state=observed_state),)
     return ExecutionAdmissionDecision(

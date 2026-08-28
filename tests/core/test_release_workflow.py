@@ -258,6 +258,7 @@ def test_selected_high_value_jobs_preserve_premerge_and_main_contracts() -> None
 
     for preserved_check in (
         "Verify the installed-wheel dashboard-to-local eval journey",
+        "Check built-wheel generated Docker coding contract",
         "Check built-wheel secure public-service contract",
     ):
         check_offset = package.index(preserved_check)

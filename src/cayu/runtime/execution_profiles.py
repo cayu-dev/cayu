@@ -1084,6 +1084,7 @@ def build_execution_profile_identity(
                         "durability": "ephemeral",
                         "minimum_evidence": "declared",
                         "evidence_overrides": [],
+                        "required_executables": [],
                     },
                 }
                 if execution_environment is None

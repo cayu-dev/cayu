@@ -1,15 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import posixpath
+import re
 import shlex
 import shutil
 from collections.abc import Mapping, Sequence
-from typing import Literal
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
+from typing import Literal, cast
 from uuid import uuid4
 
-from cayu._validation import require_clean_nonblank, require_durable_clean_nonblank
+from cayu._validation import (
+    canonical_durable_json_bytes,
+    require_clean_nonblank,
+    require_durable_clean_nonblank,
+)
+from cayu.capabilities import CapabilityDetail
 from cayu.credentials import CredentialMode, CredentialModeInput, normalize_credential_mode
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
@@ -51,6 +61,7 @@ from cayu.runners.base import (
     attach_cancellation_artifacts,
     copy_exec_command,
 )
+from cayu.runners.docker_workload import DockerImageIdentity, DockerWorkloadRestrictions
 from cayu.runners.workloads import (
     BROWSER_FETCH_WORKLOAD_NAME,
     BROWSER_SESSION_WORKLOAD_NAME,
@@ -69,6 +80,8 @@ DEFAULT_DOCKER_IMAGE = "debian:stable-slim"
 DEFAULT_DOCKER_CWD = "/workspace"
 DOCKER_COMMAND_STATE_DIR = "/tmp/cayu-docker-commands"
 _DOCKER_LIFECYCLE_DIAGNOSTIC_MAX_BYTES = 300
+_DOCKER_CONTAINER_ID_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_DOCKER_IMAGE_ID_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _DOCKER_EGRESS_CUTOVER_FENCE_SCRIPT = r"""
 import os
 import signal
@@ -127,6 +140,57 @@ raise SystemExit(70)
 """.strip()
 
 DockerCloseAction = Literal["remove", "stop", "none"]
+
+
+@dataclass(frozen=True, slots=True)
+class _DockerRuntimeEvidence:
+    container_id: str
+    image_id: str
+    image_reference: str
+    network_mode: str
+    default_cwd: str
+    runtime: str | None
+    seccomp_profile_sha256: str | None
+    restrictions: DockerWorkloadRestrictions
+    image_identity: DockerImageIdentity
+    required_executables: tuple[str, ...]
+    executable_availability: tuple[tuple[str, bool], ...]
+    observed_at: datetime
+    valid_until: datetime
+
+    @property
+    def environment_fingerprint(self) -> str:
+        material = {
+            "container_id": self.container_id,
+            "image_id": self.image_id,
+            "image_reference": self.image_reference,
+            "network_mode": self.network_mode,
+            "default_cwd": self.default_cwd,
+            "runtime": self.runtime,
+            "seccomp_profile_sha256": self.seccomp_profile_sha256,
+            "restrictions": self.restrictions.model_dump(mode="json"),
+            "required_executables": list(self.required_executables),
+        }
+        return (
+            "sha256:"
+            + sha256(canonical_durable_json_bytes(material, "docker_runtime_evidence")).hexdigest()
+        )
+
+    @property
+    def image_fingerprint(self) -> str:
+        return self.image_identity.fingerprint
+
+
+class DockerContainerOwnershipError(RuntimeError):
+    """Docker allocation did not yield an exact owned container identity."""
+
+
+class DockerRuntimeConfigurationError(RuntimeError):
+    """The exact created container does not match its declared restrictions."""
+
+    def __init__(self, code: str) -> None:
+        self.code = require_durable_clean_nonblank(code, "code")
+        super().__init__(f"Docker runtime configuration verification failed: {self.code}.")
 
 
 def _require_docker(docker_path: str | None) -> str:
@@ -222,6 +286,216 @@ def validate_docker_seccomp_profile(path: str | None) -> str | None:
     if os.path.getsize(value) > 1024 * 1024:
         raise ValueError("DockerRunner seccomp_profile must not exceed 1 MiB.")
     return value
+
+
+def _normalize_required_executables(values: Sequence[str]) -> tuple[str, ...]:
+    if isinstance(values, str | bytes):
+        raise TypeError("required_executables must be a sequence of strings.")
+    if len(values) > 64:
+        raise ValueError("required_executables must contain at most 64 entries.")
+    executables = tuple(
+        sorted(
+            {require_durable_clean_nonblank(value, "required_executables item") for value in values}
+        )
+    )
+    if any(len(value.encode("utf-8")) > 4096 for value in executables):
+        raise ValueError("required_executables entries must not exceed 4096 bytes.")
+    return executables
+
+
+def _seccomp_profile_fingerprint(path: str | None) -> str | None:
+    if path is None:
+        return None
+    digest = sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(64 * 1024), b""):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+def _strict_tmpfs_options(
+    restrictions: DockerWorkloadRestrictions,
+) -> dict[str, frozenset[str]]:
+    options: dict[str, frozenset[str]] = {}
+    args = restrictions.run_args()
+    for index, value in enumerate(args):
+        if value != "--tmpfs":
+            continue
+        target, separator, raw_options = args[index + 1].partition(":")
+        if not separator:
+            raise AssertionError("Docker tmpfs projection omitted its options.")
+        options[target] = frozenset(raw_options.split(","))
+    return options
+
+
+def _require_mapping(value: object, code: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise DockerRuntimeConfigurationError(code)
+    return cast("Mapping[str, object]", value)
+
+
+def _require_sequence(value: object, code: str) -> Sequence[object]:
+    if value is None:
+        return ()
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes):
+        raise DockerRuntimeConfigurationError(code)
+    return value
+
+
+def _verify_strict_container_inspection(
+    inspection: Mapping[str, object],
+    *,
+    container_id: str,
+    image_identity: DockerImageIdentity,
+    restrictions: DockerWorkloadRestrictions,
+    network_mode: str,
+    runtime: str | None,
+    seccomp_profile: str | None,
+) -> tuple[str, str]:
+    if inspection.get("Id") != container_id:
+        raise DockerRuntimeConfigurationError("container_identity_drift")
+    image_id = inspection.get("Image")
+    if type(image_id) is not str or _DOCKER_IMAGE_ID_PATTERN.fullmatch(image_id) is None:
+        raise DockerRuntimeConfigurationError("image_identity_missing")
+    if image_identity.content_digest is not None and image_id != image_identity.content_digest:
+        raise DockerRuntimeConfigurationError("image_content_digest_mismatch")
+
+    config = _require_mapping(inspection.get("Config"), "container_config_missing")
+    image_reference = config.get("Image")
+    if type(image_reference) is not str or image_reference != image_identity.reference:
+        raise DockerRuntimeConfigurationError("image_reference_mismatch")
+    if config.get("User") != restrictions.user:
+        raise DockerRuntimeConfigurationError("nonroot_user_drift")
+
+    host = _require_mapping(inspection.get("HostConfig"), "host_config_missing")
+    if host.get("NetworkMode") != network_mode:
+        raise DockerRuntimeConfigurationError("network_mode_drift")
+    if host.get("Privileged") is not False:
+        raise DockerRuntimeConfigurationError("privileged_mode_enabled")
+    if host.get("ReadonlyRootfs") is not restrictions.read_only_root:
+        raise DockerRuntimeConfigurationError("read_only_root_drift")
+    if runtime is not None and host.get("Runtime") != runtime:
+        raise DockerRuntimeConfigurationError("runtime_drift")
+    if host.get("PidsLimit") != restrictions.pids_limit:
+        raise DockerRuntimeConfigurationError("pids_limit_drift")
+    if host.get("Memory") != restrictions.memory_bytes:
+        raise DockerRuntimeConfigurationError("memory_limit_drift")
+    if host.get("MemorySwap") != restrictions.memory_swap_bytes:
+        raise DockerRuntimeConfigurationError("memory_swap_limit_drift")
+    if host.get("CpuPeriod") != restrictions.cpu_period_us:
+        raise DockerRuntimeConfigurationError("cpu_period_drift")
+    if host.get("CpuQuota") != restrictions.cpu_quota_us:
+        raise DockerRuntimeConfigurationError("cpu_quota_drift")
+    if host.get("ShmSize") != restrictions.shm_size_bytes:
+        raise DockerRuntimeConfigurationError("shm_size_drift")
+
+    security_options = {
+        value
+        for value in _require_sequence(host.get("SecurityOpt"), "security_options_malformed")
+        if type(value) is str
+    }
+    if restrictions.no_new_privileges and not security_options.intersection(
+        {"no-new-privileges", "no-new-privileges=true"}
+    ):
+        raise DockerRuntimeConfigurationError("no_new_privileges_drift")
+    if seccomp_profile is not None and f"seccomp={seccomp_profile}" not in security_options:
+        raise DockerRuntimeConfigurationError("seccomp_profile_drift")
+
+    cap_drop = {
+        str(value).upper()
+        for value in _require_sequence(host.get("CapDrop"), "capability_drop_malformed")
+    }
+    if cap_drop != {"ALL"}:
+        raise DockerRuntimeConfigurationError("capability_drop_drift")
+    cap_add = tuple(
+        sorted(
+            str(value).upper()
+            for value in _require_sequence(host.get("CapAdd"), "capability_add_malformed")
+        )
+    )
+    if cap_add != restrictions.capability_add:
+        raise DockerRuntimeConfigurationError("capability_add_drift")
+
+    expected_tmpfs = _strict_tmpfs_options(restrictions)
+    raw_tmpfs = _require_mapping(host.get("Tmpfs"), "tmpfs_configuration_missing")
+    if set(raw_tmpfs) != set(expected_tmpfs):
+        raise DockerRuntimeConfigurationError("tmpfs_target_drift")
+    for target, expected_options in expected_tmpfs.items():
+        raw_options = raw_tmpfs.get(target)
+        if type(raw_options) is not str:
+            raise DockerRuntimeConfigurationError("tmpfs_options_malformed")
+        if frozenset(raw_options.split(",")) != expected_options:
+            raise DockerRuntimeConfigurationError("tmpfs_options_drift")
+
+    if _require_sequence(host.get("Binds"), "bind_configuration_malformed"):
+        raise DockerRuntimeConfigurationError("host_bind_mount_present")
+    if _require_sequence(host.get("Devices"), "device_configuration_malformed"):
+        raise DockerRuntimeConfigurationError("host_device_present")
+    if _require_sequence(host.get("DeviceRequests"), "device_request_malformed"):
+        raise DockerRuntimeConfigurationError("host_device_request_present")
+    for mount in _require_sequence(inspection.get("Mounts"), "mounts_malformed"):
+        mounted = _require_mapping(mount, "mount_entry_malformed")
+        if mounted.get("Type") not in {None, "tmpfs"}:
+            raise DockerRuntimeConfigurationError("host_mount_present")
+        destination = mounted.get("Destination")
+        if destination not in expected_tmpfs:
+            raise DockerRuntimeConfigurationError("unexpected_mount_present")
+    return image_id, image_reference
+
+
+async def _inspect_strict_container(
+    docker_path: str,
+    container_id: str,
+    *,
+    docker_cli_env_allowlist: Sequence[str],
+) -> Mapping[str, object]:
+    result = await _run_docker(
+        docker_path,
+        ["inspect", "--format", "{{json .}}", container_id],
+        docker_cli_env_allowlist=docker_cli_env_allowlist,
+        timeout_s=30,
+    )
+    if result.exit_code != 0 or result.timed_out:
+        raise DockerRuntimeConfigurationError("container_inspection_unavailable")
+    try:
+        decoded = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        raise DockerRuntimeConfigurationError("container_inspection_malformed") from None
+    return _require_mapping(decoded, "container_inspection_malformed")
+
+
+async def _probe_strict_container(
+    docker_path: str,
+    container_id: str,
+    *,
+    restrictions: DockerWorkloadRestrictions,
+    required_executables: tuple[str, ...],
+    docker_cli_env_allowlist: Sequence[str],
+) -> tuple[tuple[str, bool], ...]:
+    identity = await _run_docker(
+        docker_path,
+        ["exec", container_id, "sh", "-c", 'printf \'%s:%s\' "$(id -u)" "$(id -g)"'],
+        docker_cli_env_allowlist=docker_cli_env_allowlist,
+        timeout_s=30,
+    )
+    if identity.exit_code != 0 or identity.timed_out or identity.stdout != restrictions.user:
+        raise DockerRuntimeConfigurationError("nonroot_runtime_identity_drift")
+    availability: list[tuple[str, bool]] = []
+    for executable in required_executables:
+        result = await _run_docker(
+            docker_path,
+            [
+                "exec",
+                container_id,
+                "sh",
+                "-c",
+                f"command -v {shlex.quote(executable)} >/dev/null 2>&1",
+            ],
+            docker_cli_env_allowlist=docker_cli_env_allowlist,
+            timeout_s=30,
+        )
+        availability.append((executable, result.exit_code == 0 and not result.timed_out))
+    return tuple(availability)
 
 
 def _build_docker_exec_argv(
@@ -396,7 +670,13 @@ class DockerRunner(Runner):
 
     @property
     def resource_key(self) -> tuple[object, ...]:
-        return ("docker", self.name)
+        return ("docker", self.container_id or self.name)
+
+    @property
+    def container_reference(self) -> str:
+        """Return the exact ID when Cayu owns one, otherwise the legacy name."""
+
+        return self.container_id or self.name
 
     def _execution_profile_material(self) -> dict[str, object] | None:
         """Return portable configuration when no deployment-local grants are present."""
@@ -406,6 +686,23 @@ class DockerRunner(Runner):
         # durable public hash oracle.
         if self.secret_env or self.env_overlay or self.docker_cli_env_allowlist:
             return None
+        if self._runtime_evidence is not None:
+            evidence = self._runtime_evidence
+            return {
+                "image_identity": evidence.image_identity.model_dump(mode="json"),
+                "restrictions": evidence.restrictions.model_dump(mode="json"),
+                "default_cwd": self.default_cwd,
+                "close_action": self.close_action,
+                "network_mode": evidence.network_mode,
+                "runtime": evidence.runtime,
+                "seccomp_profile_sha256": evidence.seccomp_profile_sha256,
+                "credential_mode": self.credential_mode.value,
+                "allow_raw_secret_env": self._allow_raw_secret_env,
+                "cancel_timeout_s": self.cancel_timeout_s,
+                "cancellation_cleanup": self.cancellation_cleanup,
+                "timeout_cleanup": self.timeout_cleanup,
+                "required_executables": list(evidence.required_executables),
+            }
         return {
             "name": self.name,
             "image": self.image,
@@ -437,12 +734,35 @@ class DockerRunner(Runner):
         _env_overlay_secret_values_present: bool | None = None,
         docker_cli_env_allowlist: Sequence[str] = (),
         image: str | None = None,
+        _container_id: str | None = None,
+        _runtime_evidence: _DockerRuntimeEvidence | None = None,
     ) -> None:
         self.name = require_clean_nonblank(name, "name")
         self.default_cwd = _validate_guest_cwd(default_cwd)
         self.close_action = _validate_close_action(close_action)
         self.docker_path = _require_docker(docker_path)
         self.image = None if image is None else require_clean_nonblank(image, "image")
+        if _runtime_evidence is not None and not isinstance(
+            _runtime_evidence,
+            _DockerRuntimeEvidence,
+        ):
+            raise TypeError("_runtime_evidence must be Docker runtime evidence or None.")
+        self._runtime_evidence = _runtime_evidence
+        if _container_id is not None and (
+            type(_container_id) is not str
+            or _DOCKER_CONTAINER_ID_PATTERN.fullmatch(_container_id) is None
+        ):
+            raise ValueError("_container_id must be a full lowercase Docker container ID.")
+        evidence_container_id = (
+            None if _runtime_evidence is None else _runtime_evidence.container_id
+        )
+        if (
+            _container_id is not None
+            and evidence_container_id is not None
+            and _container_id != evidence_container_id
+        ):
+            raise ValueError("Docker runtime evidence belongs to another container ID.")
+        self.container_id = _container_id or evidence_container_id
         self.credential_mode = normalize_credential_mode(credential_mode)
         self._allow_raw_secret_env = allow_raw_secret_env
         self.secret_env, self.secret_resolver = normalize_runner_secret_env(
@@ -498,6 +818,9 @@ class DockerRunner(Runner):
         ca_mount: tuple[str, str] | None = None,
         seccomp_profile: str | None = None,
         docker_cli_env_allowlist: Sequence[str] = (),
+        image_identity: DockerImageIdentity | None = None,
+        workload_restrictions: DockerWorkloadRestrictions | None = None,
+        required_executables: Sequence[str] = (),
     ) -> DockerRunner:
         """Start a long-lived container and return a runner bound to it.
 
@@ -520,14 +843,48 @@ class DockerRunner(Runner):
         registry or daemon authentication only and never enters the guest.
         Managed containers always use Docker's minimal init as PID 1 so cleanup
         descendants orphaned by a worker exit are reaped after they finish.
+
+        ``image_identity`` plus ``workload_restrictions`` selects the strict,
+        evidence-bearing path. It requires an exact no-network, no-mount,
+        credential-free container and ``replace=False``; the resulting runner
+        retains the full container ID and verifies the live Docker inspection
+        before it can be exposed.
         """
         docker = _require_docker(docker_path)
         name = require_clean_nonblank(name, "name")
         image = require_clean_nonblank(image, "image")
+        if (image_identity is None) != (workload_restrictions is None):
+            raise ValueError(
+                "image_identity and workload_restrictions must be configured together."
+            )
+        strict_mode = image_identity is not None
+        owned_image_identity = (
+            None
+            if image_identity is None
+            else DockerImageIdentity.model_validate(image_identity.model_dump(mode="python"))
+        )
+        owned_restrictions = (
+            None
+            if workload_restrictions is None
+            else DockerWorkloadRestrictions.model_validate(
+                workload_restrictions.model_dump(mode="python")
+            )
+        )
+        executable_requirements = _normalize_required_executables(required_executables)
+        if executable_requirements and not strict_mode:
+            raise ValueError(
+                "required_executables require image_identity and workload_restrictions."
+            )
+        if owned_image_identity is not None:
+            if image not in {DEFAULT_DOCKER_IMAGE, owned_image_identity.reference}:
+                raise ValueError("image must match image_identity.reference.")
+            image = owned_image_identity.reference
         runtime = _validate_runtime(runtime)
         if mount_path is not None:
             mount_path = _validate_mount_path(mount_path)
         _validate_close_action(close_action)
+        if type(replace) is not bool:
+            raise TypeError("replace must be a bool.")
         cancel_timeout = validate_cancel_timeout(cancel_timeout_s)
         cancellation_policy = validate_runner_cleanup_policy(
             cancellation_cleanup, "cancellation_cleanup"
@@ -545,6 +902,46 @@ class DockerRunner(Runner):
             credential_mode=mode,
             allow_raw_secret_env=allow_raw_secret_env,
         )
+        if strict_mode:
+            assert owned_image_identity is not None
+            assert owned_restrictions is not None
+            if replace:
+                raise ValueError("Evidence-bearing Docker creation requires replace=False.")
+            if mount_path is not None or ca_mount is not None:
+                raise ValueError("Evidence-bearing Docker creation forbids host mounts.")
+            if extra_hosts:
+                raise ValueError("Evidence-bearing Docker creation forbids extra host mappings.")
+            if network != "none":
+                raise ValueError("Evidence-bearing Docker creation requires network='none'.")
+            if setup_commands:
+                raise ValueError(
+                    "Evidence-bearing Docker creation requires tools baked into the image."
+                )
+            if validated_secret_env or env_overlay:
+                raise ValueError(
+                    "Evidence-bearing Docker creation forbids workload secret injection."
+                )
+            if mode is CredentialMode.RAW_ENV or allow_raw_secret_env:
+                raise ValueError(
+                    "Evidence-bearing Docker creation requires a non-readable credential mode."
+                )
+            if close_action != "remove":
+                raise ValueError("Evidence-bearing Docker creation requires close_action='remove'.")
+            if cancellation_policy != "sandbox" or timeout_policy != "sandbox":
+                raise ValueError(
+                    "Evidence-bearing Docker creation requires container-level cleanup."
+                )
+            if not any(
+                default_cwd == mount.target
+                or default_cwd.startswith(mount.target.rstrip("/") + "/")
+                for mount in owned_restrictions.tmpfs
+            ):
+                raise ValueError(
+                    "Evidence-bearing Docker default_cwd must be inside bounded tmpfs."
+                )
+        seccomp_profile_sha256 = _seccomp_profile_fingerprint(seccomp_profile)
+        owned_container_id: str | None = None
+        runtime_evidence: _DockerRuntimeEvidence | None = None
         try:
             if replace:
                 await _run_docker(
@@ -557,6 +954,8 @@ class DockerRunner(Runner):
             # Docker's minimal init as PID 1 so those orphaned owners are reaped
             # after they finish; plain `sleep infinity` cannot reap zombies.
             run_argv = ["run", "-d", "--init"]
+            if owned_restrictions is not None:
+                run_argv.extend(owned_restrictions.run_args())
             if runtime:
                 run_argv += ["--runtime", runtime]
             if seccomp_profile is not None:
@@ -586,6 +985,15 @@ class DockerRunner(Runner):
                     _docker_lifecycle_redactor(env_overlay, docker_cli_allowlist),
                 )
                 raise RuntimeError(f"docker run failed (exit {started.exit_code}): {detail}")
+            candidate_container_id = started.stdout.strip()
+            if _DOCKER_CONTAINER_ID_PATTERN.fullmatch(candidate_container_id) is not None:
+                owned_container_id = candidate_container_id
+            elif strict_mode:
+                raise DockerContainerOwnershipError(
+                    "Docker did not return a full exact container ID; cleanup ownership is "
+                    "ambiguous and no name-based cleanup was attempted."
+                )
+            container_reference = owned_container_id or name
             # Isolated mode: create the in-container workspace root (runs as root;
             # plain docker's default exec user is root, so no chmod needed). Bind
             # mode reuses the existing host dir, so skip (and never chmod the host).
@@ -596,7 +1004,7 @@ class DockerRunner(Runner):
                         "exec",
                         "-u",
                         "root",
-                        name,
+                        container_reference,
                         "sh",
                         "-c",
                         f"mkdir -p {shlex.quote(default_cwd)}",
@@ -619,7 +1027,7 @@ class DockerRunner(Runner):
                     setup_argv = ["exec", "-u", "root"]
                     if setup_env_file is not None:
                         setup_argv += ["--env-file", setup_env_file]
-                    setup_argv += [name, "sh", "-c", cmd]
+                    setup_argv += [container_reference, "sh", "-c", cmd]
                     res = await _run_docker(
                         docker,
                         setup_argv,
@@ -632,12 +1040,63 @@ class DockerRunner(Runner):
                         _docker_lifecycle_redactor(env_overlay, docker_cli_allowlist),
                     )
                     raise RuntimeError(f"docker setup command failed: {detail}")
-        except BaseException:
-            await _run_docker(
-                docker,
-                ["rm", "-f", name],
-                docker_cli_env_allowlist=docker_cli_allowlist,
-            )
+            if strict_mode:
+                assert owned_container_id is not None
+                assert owned_image_identity is not None
+                assert owned_restrictions is not None
+                inspection = await _inspect_strict_container(
+                    docker,
+                    owned_container_id,
+                    docker_cli_env_allowlist=docker_cli_allowlist,
+                )
+                image_id, image_reference = _verify_strict_container_inspection(
+                    inspection,
+                    container_id=owned_container_id,
+                    image_identity=owned_image_identity,
+                    restrictions=owned_restrictions,
+                    network_mode="none",
+                    runtime=runtime,
+                    seccomp_profile=seccomp_profile,
+                )
+                executable_availability = await _probe_strict_container(
+                    docker,
+                    owned_container_id,
+                    restrictions=owned_restrictions,
+                    required_executables=executable_requirements,
+                    docker_cli_env_allowlist=docker_cli_allowlist,
+                )
+                observed_at = datetime.now(UTC)
+                runtime_evidence = _DockerRuntimeEvidence(
+                    container_id=owned_container_id,
+                    image_id=image_id,
+                    image_reference=image_reference,
+                    network_mode="none",
+                    default_cwd=default_cwd,
+                    runtime=runtime,
+                    seccomp_profile_sha256=seccomp_profile_sha256,
+                    restrictions=owned_restrictions,
+                    image_identity=owned_image_identity,
+                    required_executables=executable_requirements,
+                    executable_availability=executable_availability,
+                    observed_at=observed_at,
+                    valid_until=observed_at + timedelta(seconds=300),
+                )
+        except BaseException as create_error:
+            cleanup_reference = owned_container_id or (None if strict_mode else name)
+            if cleanup_reference is not None:
+                cleanup = await _run_docker(
+                    docker,
+                    ["rm", "-f", cleanup_reference],
+                    docker_cli_env_allowlist=docker_cli_allowlist,
+                )
+                if cleanup.exit_code != 0 or cleanup.timed_out:
+                    cleanup_error = DockerContainerOwnershipError(
+                        "Docker creation failed and exact-container cleanup was not confirmed."
+                    )
+                    raise BaseExceptionGroup(
+                        "Docker creation and exact-container cleanup both failed.",
+                        [create_error, cleanup_error],
+                    ) from None
             raise
         return cls(
             name,
@@ -655,6 +1114,220 @@ class DockerRunner(Runner):
             env_overlay=env_overlay,
             _env_overlay_secret_values_present=_env_overlay_secret_values_present,
             docker_cli_env_allowlist=docker_cli_allowlist,
+            _container_id=owned_container_id,
+            _runtime_evidence=runtime_evidence,
+        )
+
+    def execution_capability_evidence(self):
+        """Describe Docker honestly and bind strict evidence to the exact container."""
+
+        from cayu.environments.admission import (
+            ExecutionCapabilityClaim,
+            ExecutionCapabilityEvidence,
+            ExecutionExecutableEvidence,
+            ExecutionToolRequirementEvidence,
+        )
+
+        evidence = self._runtime_evidence
+        if evidence is None:
+            unsupported = {
+                "untrusted_code_isolation": "docker_untrusted_isolation_unsupported",
+                "real_credential_non_possession": "docker_credential_boundary_unverified",
+                "deny_by_default_network": "docker_network_boundary_unverified",
+                "brokered_egress": "docker_brokered_egress_unverified",
+                "guest_privilege_containment": "docker_privilege_boundary_unverified",
+                "unprivileged_guest": "docker_privilege_boundary_unverified",
+                "host_filesystem_isolation": "docker_host_filesystem_unverified",
+                "read_only_host_inputs": "docker_host_filesystem_unverified",
+                "reconnect": "docker_reconnect_unsupported",
+            }
+            return ExecutionCapabilityEvidence(
+                subject="docker",
+                claims=(
+                    ExecutionCapabilityClaim.available("confirmed_cancellation"),
+                    ExecutionCapabilityClaim.available("confirmed_cleanup"),
+                    *(
+                        ExecutionCapabilityClaim.unsupported(
+                            capability,
+                            reason_code=reason_code,
+                            remediation_code=(
+                                "select_reconnectable_execution"
+                                if capability == "reconnect"
+                                else "use_verified_docker_restrictions"
+                            ),
+                        )
+                        for capability, reason_code in unsupported.items()
+                    ),
+                ),
+            )
+
+        def live_claim(
+            capability: str,
+            *,
+            observation: Literal["denied", "supported"],
+            details: tuple[CapabilityDetail, ...] = (),
+        ) -> ExecutionCapabilityClaim:
+            return ExecutionCapabilityClaim(
+                capability=capability,
+                state="live_verified",
+                proof_source="runtime_preflight",
+                observation=observation,
+                observed_at=evidence.observed_at,
+                valid_until=evidence.valid_until,
+                adapter_details=details,
+            )
+
+        restrictions = evidence.restrictions
+        privilege_details = (
+            CapabilityDetail(name="nonroot", value=True),
+            CapabilityDetail(name="uid", value=restrictions.uid),
+            CapabilityDetail(name="gid", value=restrictions.gid),
+            CapabilityDetail(
+                name="read_only_root",
+                value=restrictions.read_only_root,
+            ),
+            CapabilityDetail(
+                name="no_new_privileges",
+                value=restrictions.no_new_privileges,
+            ),
+            CapabilityDetail(name="cap_drop_all", value=True),
+            CapabilityDetail(
+                name="capability_add_empty",
+                value=not restrictions.capability_add,
+            ),
+            CapabilityDetail(name="pids_limit", value=restrictions.pids_limit),
+            CapabilityDetail(name="memory_bytes", value=restrictions.memory_bytes),
+            CapabilityDetail(
+                name="memory_swap_bytes",
+                value=restrictions.memory_swap_bytes,
+            ),
+            CapabilityDetail(name="cpu_period_us", value=restrictions.cpu_period_us),
+            CapabilityDetail(name="cpu_quota_us", value=restrictions.cpu_quota_us),
+            CapabilityDetail(name="shm_size_bytes", value=restrictions.shm_size_bytes),
+        )
+        if restrictions.supports_strict_privilege_evidence:
+            privilege_claims = (
+                live_claim(
+                    "guest_privilege_containment",
+                    observation="supported",
+                    details=privilege_details,
+                ),
+                live_claim(
+                    "unprivileged_guest",
+                    observation="supported",
+                    details=privilege_details,
+                ),
+            )
+        else:
+            privilege_claims = (
+                ExecutionCapabilityClaim.unsupported(
+                    "guest_privilege_containment",
+                    reason_code="docker_privilege_restrictions_weakened",
+                    remediation_code="use_verified_docker_restrictions",
+                ),
+                ExecutionCapabilityClaim.unsupported(
+                    "unprivileged_guest",
+                    reason_code="docker_privilege_restrictions_weakened",
+                    remediation_code="use_verified_docker_restrictions",
+                ),
+            )
+        unsupported = (
+            ExecutionCapabilityClaim.unsupported(
+                "untrusted_code_isolation",
+                reason_code="docker_untrusted_isolation_unsupported",
+                remediation_code="select_untrusted_isolation",
+            ),
+            ExecutionCapabilityClaim.unsupported(
+                "brokered_egress",
+                reason_code="docker_network_disabled",
+                remediation_code="select_brokered_egress",
+            ),
+            ExecutionCapabilityClaim.unsupported(
+                "read_only_host_inputs",
+                reason_code="docker_host_inputs_not_mounted",
+                remediation_code="use_workspace_sync",
+            ),
+            ExecutionCapabilityClaim.unsupported(
+                "reconnect",
+                reason_code="docker_reconnect_unsupported",
+                remediation_code="select_reconnectable_execution",
+            ),
+        )
+        executable_availability = dict(evidence.executable_availability)
+        tool_requirements = ExecutionToolRequirementEvidence(
+            environment_fingerprint=evidence.environment_fingerprint,
+            image_fingerprint=evidence.image_fingerprint,
+            executables=tuple(
+                ExecutionExecutableEvidence(
+                    executable=executable,
+                    state=(
+                        "live_verified" if executable_availability[executable] else "unavailable"
+                    ),
+                    observed_at=(
+                        evidence.observed_at if executable_availability[executable] else None
+                    ),
+                    valid_until=(
+                        evidence.valid_until if executable_availability[executable] else None
+                    ),
+                    reason_code=(
+                        None if executable_availability[executable] else "executable_unavailable"
+                    ),
+                    remediation_code=(
+                        None if executable_availability[executable] else "rebuild_trusted_image"
+                    ),
+                )
+                for executable in evidence.required_executables
+            ),
+        )
+        return ExecutionCapabilityEvidence(
+            subject="docker",
+            environment_fingerprint=evidence.environment_fingerprint,
+            image_fingerprint=evidence.image_fingerprint,
+            claims=(
+                live_claim("real_credential_non_possession", observation="supported"),
+                live_claim(
+                    "deny_by_default_network",
+                    observation="denied",
+                    details=(CapabilityDetail(name="network_none", value=True),),
+                ),
+                *privilege_claims,
+                live_claim(
+                    "host_filesystem_isolation",
+                    observation="supported",
+                    details=(
+                        CapabilityDetail(name="host_mount_count", value=0),
+                        CapabilityDetail(name="cwd_bounded_tmpfs", value=True),
+                    ),
+                ),
+                live_claim(
+                    "confirmed_cancellation",
+                    observation="supported",
+                    details=(
+                        CapabilityDetail(name="container_cleanup", value=True),
+                        CapabilityDetail(name="exact_container_owner", value=True),
+                    ),
+                ),
+                live_claim(
+                    "confirmed_cleanup",
+                    observation="supported",
+                    details=(
+                        CapabilityDetail(name="close_remove", value=True),
+                        CapabilityDetail(name="exact_container_owner", value=True),
+                    ),
+                ),
+                *unsupported,
+            ),
+            tool_requirements=tool_requirements,
+        )
+
+    def execution_admission_candidate(self):
+        """Return capability evidence for this exact Docker execution target."""
+
+        from cayu.environments.admission import ExecutionAdmissionCandidate
+
+        return ExecutionAdmissionCandidate(
+            candidate="docker",
+            evidence=self.execution_capability_evidence(),
         )
 
     def workload_authority(self, name: str):
@@ -881,7 +1554,7 @@ class DockerRunner(Runner):
         pid_file = f"{DOCKER_COMMAND_STATE_DIR}/{command_id}.pid"
         handle = _DockerCommandHandle(
             docker_path=self.docker_path,
-            name=self.name,
+            name=self.container_reference,
             pid_file=pid_file,
             docker_cli_env_allowlist=self.docker_cli_env_allowlist,
         )
@@ -889,7 +1562,7 @@ class DockerRunner(Runner):
             environment = {}
             argv = _build_docker_exec_argv(
                 self.docker_path,
-                self.name,
+                self.container_reference,
                 owned_command,
                 cwd=working_dir,
                 env_file=env_file,
@@ -952,7 +1625,7 @@ class DockerRunner(Runner):
                 "exec",
                 "-u",
                 "root",
-                self.name,
+                self.container_reference,
                 "python3",
                 "-c",
                 _DOCKER_EGRESS_CUTOVER_FENCE_SCRIPT,
@@ -975,7 +1648,7 @@ class DockerRunner(Runner):
     async def _remove_container(self) -> None:
         result = await _run_docker(
             self.docker_path,
-            ["rm", "-f", self.name],
+            ["rm", "-f", self.container_reference],
             docker_cli_env_allowlist=self.docker_cli_env_allowlist,
         )
         if result.exit_code != 0:
@@ -987,13 +1660,13 @@ class DockerRunner(Runner):
                 ),
             )
             raise RuntimeError(
-                f"docker rm failed for container '{self.name}' (exit {result.exit_code}): {detail}"
+                f"docker rm failed for the owned container (exit {result.exit_code}): {detail}"
             )
 
     async def _stop_container(self) -> None:
         result = await _run_docker(
             self.docker_path,
-            ["stop", self.name],
+            ["stop", self.container_reference],
             docker_cli_env_allowlist=self.docker_cli_env_allowlist,
         )
         if result.exit_code != 0:
@@ -1005,6 +1678,5 @@ class DockerRunner(Runner):
                 ),
             )
             raise RuntimeError(
-                f"docker stop failed for container '{self.name}' "
-                f"(exit {result.exit_code}): {detail}"
+                f"docker stop failed for the owned container (exit {result.exit_code}): {detail}"
             )

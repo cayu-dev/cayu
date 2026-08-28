@@ -11,7 +11,9 @@ from cayu import (
     ExecutionCapabilityClaim,
     ExecutionCapabilityEvidence,
     ExecutionEvidenceOverride,
+    ExecutionExecutableEvidence,
     ExecutionRequirements,
+    ExecutionToolRequirementEvidence,
     LocalRunner,
     evaluate_execution_admission,
 )
@@ -31,6 +33,7 @@ def test_untrusted_requirements_cover_every_execution_security_dimension() -> No
         "durability": "ephemeral",
         "minimum_evidence": "available",
         "evidence_overrides": [],
+        "required_executables": [],
     }
 
 
@@ -382,3 +385,60 @@ def test_unusable_evidence_names_every_affected_hard_requirement() -> None:
     assert {item.capability for item in mismatch.refusals} == expected
     assert {item.code for item in malformed.refusals} == {"malformed_evidence"}
     assert {item.code for item in mismatch.refusals} == {"evidence_candidate_mismatch"}
+
+
+def test_required_executable_needs_fresh_exact_final_environment_evidence() -> None:
+    now = datetime(2026, 8, 28, tzinfo=UTC)
+    fingerprint = "sha256:" + ("a" * 64)
+    requirements = ExecutionRequirements.trusted(required_executables=("git",))
+    configured = ExecutionCapabilityEvidence(
+        subject="docker",
+        environment_fingerprint=fingerprint,
+        claims=(ExecutionCapabilityClaim.declared("confirmed_cleanup"),),
+        tool_requirements=ExecutionToolRequirementEvidence(
+            environment_fingerprint=fingerprint,
+            executables=(ExecutionExecutableEvidence(executable="git", state="declared"),),
+        ),
+    )
+
+    pre_create = evaluate_execution_admission(
+        candidate="docker",
+        requirements=requirements,
+        evidence=configured,
+        stage="pre_create",
+        now=now,
+    )
+    pre_exposure = evaluate_execution_admission(
+        candidate="docker",
+        requirements=requirements,
+        evidence=configured,
+        stage="pre_exposure",
+        now=now,
+    )
+    stale = evaluate_execution_admission(
+        candidate="docker",
+        requirements=requirements,
+        evidence=ExecutionCapabilityEvidence(
+            subject="docker",
+            environment_fingerprint=fingerprint,
+            claims=(ExecutionCapabilityClaim.declared("confirmed_cleanup"),),
+            tool_requirements=ExecutionToolRequirementEvidence(
+                environment_fingerprint=fingerprint,
+                executables=(
+                    ExecutionExecutableEvidence(
+                        executable="git",
+                        state="live_verified",
+                        observed_at=now - timedelta(minutes=5),
+                        valid_until=now - timedelta(seconds=1),
+                    ),
+                ),
+            ),
+        ),
+        stage="pre_exposure",
+        now=now,
+    )
+
+    assert pre_create.status == "admitted"
+    assert pre_exposure.refusals[0].code == "insufficient_evidence"
+    assert pre_exposure.refusals[0].executable == "git"
+    assert stale.refusals[0].code == "stale_evidence"

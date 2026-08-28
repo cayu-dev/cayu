@@ -490,6 +490,20 @@ jobs:
           PY
           "$GITHUB_WORKSPACE/.release-venv/bin/python" \
             -m pytest -q tests/test_coding_composition.py
+          docker_coding_root="$(mktemp -d)"
+          "$GITHUB_WORKSPACE/.release-venv/bin/cayu" new proof-docker-coding \
+            --composition coding --coding-execution docker \
+            --dir "$docker_coding_root"
+          cd "$docker_coding_root/proof-docker-coding"
+          unset CAYU_PROVIDER CAYU_MODEL OPENAI_API_KEY ANTHROPIC_API_KEY \
+            OPENROUTER_API_KEY
+          test -z "$(git status --porcelain)"
+          test "$(git log -1 --format=%s)" = 'Initial Cayu coding composition'
+          test -f Dockerfile.coding
+          test -f docker-coding-build.json
+          test -f docker-coding-image.json
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" \
+            -m pytest -q tests/test_coding_composition.py
           openrouter_root="$(mktemp -d)"
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" new proof-openrouter \
             --provider openrouter --dir "$openrouter_root"
@@ -499,6 +513,18 @@ jobs:
             OPENROUTER_ROUTER_METADATA
           "$GITHUB_WORKSPACE/.release-venv/bin/python" -m pytest -q
           "$GITHUB_WORKSPACE/.release-venv/bin/cayu" eval run >/dev/null
+      - name: Check built-wheel generated Docker coding contract
+        run: |
+          wheel="$(realpath dist/first/*.whl)"
+          live_test_root="$(mktemp -d)"
+          cp tests/cli/test_scaffold_docker_live.py "$live_test_root/"
+          cd "$live_test_root"
+          unset PYTHONPATH CAYU_PROVIDER OPENAI_API_KEY ANTHROPIC_API_KEY \
+            OPENROUTER_API_KEY
+          CAYU_DOCKER_GENERATED_CODING_WHEEL="$wheel" \
+          CAYU_REQUIRE_GENERATED_DOCKER_CODING=1 \
+            "$GITHUB_WORKSPACE/.release-venv/bin/python" \
+            -m pytest -q test_scaffold_docker_live.py
       - name: Check built-wheel secure public-service contract
         run: |
           uv pip install --python .release-server-venv/bin/python pytest 'ruff>=0.15.15,<0.16'
