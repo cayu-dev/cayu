@@ -90,6 +90,28 @@ def test_runtime_evidence_request_requires_explicit_scope_bounds() -> None:
         RuntimeEvidenceRequest.model_validate({"root_session_id": "root"})
 
 
+def test_runtime_evidence_can_project_only_the_selected_root_session() -> None:
+    async def scenario():
+        store = InMemorySessionStore()
+        await _create_session(store, "root")
+        await _create_session(store, "child", parent_session_id="root")
+        return await runtime_evidence(
+            CayuApp(session_store=store, enable_logging=False),
+            RuntimeEvidenceRequest(
+                root_session_id="root",
+                max_sessions=10,
+                max_events=20,
+                include_descendants=False,
+            ),
+        )
+
+    report = asyncio.run(scenario())
+
+    assert tuple(session.session_id for session in report.sessions) == ("root",)
+    assert report.scope.descendant_session_ids == ("root",)
+    assert report.scope.causal_budget_session_ids is None
+
+
 def test_runtime_evidence_fails_with_a_typed_error_when_scopes_exceed_report_capacity() -> None:
     async def scenario() -> None:
         store = InMemorySessionStore()

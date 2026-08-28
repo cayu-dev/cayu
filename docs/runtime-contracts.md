@@ -5039,6 +5039,13 @@ and its durable descendants only. `include_causal_budget=True` opts into a
 separate `max_causal_budget_sessions` expansion; it never turns an omitted
 scope into a whole-store scan.
 
+Set `include_descendants=False` to project only the selected root session. This
+is useful for applications that persist one immutable report per logical turn
+and compose a longer workflow from those report fingerprints instead of
+rematerializing an ever-growing descendant tree. Causal-budget expansion remains
+independent: callers that require a strictly root-only report must also leave
+`include_causal_budget=False`.
+
 ```python
 from cayu import MemoryAttributionBounds, RuntimeEvidenceRequest, runtime_evidence
 

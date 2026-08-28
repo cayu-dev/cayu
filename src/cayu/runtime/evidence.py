@@ -306,6 +306,7 @@ class RuntimeEvidenceRequest(BaseModel):
     root_session_id: str = Field(max_length=_MAX_IDENTITY_CHARS)
     max_sessions: StrictInt = Field(ge=1, le=_HARD_MAX_SESSIONS)
     max_events: StrictInt = Field(ge=1, le=_HARD_MAX_EVENTS)
+    include_descendants: StrictBool = True
     memory_attribution_bounds: MemoryAttributionBounds = Field(
         default_factory=MemoryAttributionBounds
     )
@@ -1150,7 +1151,8 @@ async def runtime_evidence(
     capture = _Capture(request=selected)
     capture.sessions[root.id] = root
     capture.descendant_ids.add(root.id)
-    await _capture_descendants(app, root, capture)
+    if selected.include_descendants:
+        await _capture_descendants(app, root, capture)
     if selected.include_causal_budget:
         await _capture_causal_budget(app, root, capture)
     ordered_sessions = _stable_parent_first(capture.sessions, root_session_id=root.id)
