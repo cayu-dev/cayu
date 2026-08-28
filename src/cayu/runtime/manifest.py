@@ -20,7 +20,11 @@ from pydantic import (
     model_validator,
 )
 
-from cayu._validation import collision_safe_json_object, copy_json_value
+from cayu._validation import (
+    collision_safe_json_object,
+    copy_json_value,
+    require_durable_clean_nonblank,
+)
 from cayu.core.agents import AgentAuthoringState
 from cayu.core.execution_identity import ExecutionProfileBehaviorIdentity
 from cayu.environments import ExecutionRequirements
@@ -52,7 +56,7 @@ if TYPE_CHECKING:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime.app import CayuApp
 
-APP_MANIFEST_SCHEMA_VERSION = "13"
+APP_MANIFEST_SCHEMA_VERSION = "14"
 _ABSOLUTE_PATH_PLACEHOLDER = "[ABSOLUTE_PATH]"
 _MEMORY_ADDRESS_PLACEHOLDER = "[MEMORY_ADDRESS]"
 _OBJECT_REPRESENTATION_PLACEHOLDER = "[OBJECT_REPRESENTATION]"
@@ -165,6 +169,41 @@ class CapabilityManifest(_ManifestModel):
     live_verified: Literal["not_run"] = "not_run"
 
 
+class NamedCheckManifest(_ManifestModel):
+    """Bounded non-secret descriptor for one application-owned check."""
+
+    name: str
+    description: str
+    timeout_s: int = Field(gt=0)
+    max_output_bytes: int = Field(gt=0)
+    required_executables: tuple[str, ...]
+    profile_fingerprint: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+    @field_validator("name", "description")
+    @classmethod
+    def validate_bounded_text(cls, value: str, info) -> str:
+        owned = require_durable_clean_nonblank(value, info.field_name)
+        maximum = 128 if info.field_name == "name" else 4 * 1024
+        if len(owned.encode("utf-8")) > maximum:
+            raise ValueError(f"{info.field_name} must not exceed {maximum} bytes.")
+        return owned
+
+    @field_validator("required_executables")
+    @classmethod
+    def validate_required_executables(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > 32:
+            raise ValueError("required_executables must contain at most 32 entries.")
+        owned: list[str] = []
+        for executable in value:
+            item = require_durable_clean_nonblank(executable, "required_executables item")
+            if len(item.encode("utf-8")) > 4 * 1024:
+                raise ValueError("required_executables entries must not exceed 4096 bytes.")
+            owned.append(item)
+        if tuple(sorted(set(owned))) != tuple(owned):
+            raise ValueError("required_executables must be unique and sorted.")
+        return tuple(owned)
+
+
 class ToolManifest(_ManifestModel):
     name: str
     description: str
@@ -187,6 +226,7 @@ class ToolManifest(_ManifestModel):
     input_schema: FrozenJsonObject = Field(default_factory=lambda: MappingProxyType({}))
     policy_coverage: Literal["allowed", "denied", "approval_required", "conditional", "unknown"]
     command_policy: str | None = None
+    named_checks: tuple[NamedCheckManifest, ...] = ()
     registration_provenance: RegistrationProvenance
     implementation_provenance: RegistrationProvenance
 
@@ -343,7 +383,7 @@ class RuntimeManifest(_ManifestModel):
 
 
 class AppManifest(_ManifestModel):
-    schema_version: Literal["13"] = APP_MANIFEST_SCHEMA_VERSION
+    schema_version: Literal["14"] = APP_MANIFEST_SCHEMA_VERSION
     fingerprint: str
     agents: tuple[AgentManifest, ...]
     providers: tuple[ProviderManifest, ...]
@@ -624,6 +664,7 @@ def _describe_tool(
         input_schema=app.redact_json(tool.schema),
         policy_coverage=_tool_policy_coverage(tool_policy, tool_name),
         command_policy=_command_policy_name(tool.tool),
+        named_checks=_named_check_manifests(tool.tool),
         registration_provenance=registration_provenance,
         implementation_provenance=_provenance(tool.tool, project_root),
     )
@@ -754,10 +795,29 @@ def _type_name(value: object) -> str:
 
 def _command_policy_name(value: object) -> str | None:
     from cayu.tools.commands import ExecCommandTool
+    from cayu.tools.named_checks import RunCheckTool
 
-    if not isinstance(value, ExecCommandTool):
+    if not isinstance(value, ExecCommandTool | RunCheckTool):
         return None
     return _optional_type_name(value.command_policy)
+
+
+def _named_check_manifests(value: object) -> tuple[NamedCheckManifest, ...]:
+    from cayu.tools.named_checks import RunCheckTool
+
+    if type(value) is not RunCheckTool:
+        return ()
+    return tuple(
+        NamedCheckManifest(
+            name=check.name,
+            description=check.description,
+            timeout_s=check.timeout_s,
+            max_output_bytes=check.max_output_bytes,
+            required_executables=check.required_executables,
+            profile_fingerprint=check.profile_fingerprint,
+        )
+        for check in value.checks
+    )
 
 
 def _optional_type_name(value: object | None) -> str | None:

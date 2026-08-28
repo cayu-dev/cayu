@@ -7216,6 +7216,35 @@ command policy preserves the unrestricted compatibility path: valid
 model-controlled arguments pass through to the runner subject to tool bounds
 and runner isolation.
 
+`RunCheckTool` is the bounded application-owned alternative to model-authored
+command input. Its schema contains only one required `check` selector whose enum
+is derived from immutable `NamedCheck` declarations; additional properties are
+forbidden. A declaration snapshots exact process argv plus its timeout, output
+ceiling, executable requirements, description, and application execution-profile
+identity. Shell commands and every model-controlled command, cwd, environment,
+stdin, runner, image, network, and limit field are rejected. The tool requires a
+non-null `CommandPolicy` and delegates the resolved command through the same
+runner selection, canonical cwd, preflight, command-policy, execution,
+cancellation, capture, and validated-result implementation as `ExecCommandTool`.
+Ordinary `ToolPolicy` remains the outer authorization gate, including durable
+approval; inline `REQUIRE_COMMAND_APPROVAL` remains a command-policy refusal.
+
+Named-check results identify the check and declaration fingerprint and retain
+separate status for a passing or nonzero failing exit, timeout, cancellation,
+runner unavailability, policy denial, inline command approval, typed execution
+failure, and malformed runner evidence. Nonzero exit is a completed check rather
+than a tool transport error. Runner capture and model projection have independent
+bounds and truncation flags. A projection overflow uses a session artifact when
+available and always records the captured-output digest and retention status.
+The built-in execution profile canonicalizes declarations by check name and
+includes command digests, descriptions, limits, executable requirements,
+declaration identities, result-projection behavior, and the independently
+profiled command policy. Manifest descriptors expose only the bounded names,
+descriptions, limits, executable requirements, and fingerprints. Those
+requirements are not environment evidence: availability must be admitted from
+the exact runner rather than inferred from the host `PATH`, an image name, or the
+declaration itself.
+
 `GitCommandPolicy` is the first specialization. It defines a fail-closed local
 repository matrix on top of `ProcessCommandPolicy`, including structural global
 option parsing, repeated `-C` containment, explicit staging paths, and a
@@ -7234,6 +7263,7 @@ The first built-in tools are:
 - `git_changes`: inspect pageable status, filename-safe numstat summaries, or bounded unified diffs through the active runner; `diff_offset` continues a truncated single-file diff
 - `list_artifacts`: list session- or environment-scoped artifact metadata, capped by `limit`
 - `exec_command`: execute an explicit process argv or shell script with the active runner, capped by `timeout_s` and `max_output_bytes`
+- `run_check`: select one immutable application-owned process check by a finite name; argv, cwd, environment, stdin, limits, runner, image, and network are not model input
 - `subagent`: delegate a bounded task to a configured child Cayu agent; foreground mode returns the child result, background mode returns after in-process startup, and durable mode returns after child-first task-queue publication
 - `subagent_result`: fetch one background or durable subagent result by `child_session_id`, or wait for all asynchronous subagents started by the current parent session; a configured task store adds verified durable queue status
 - `list_knowledge`: discover active knowledge entries and facets without requiring a lexical search term

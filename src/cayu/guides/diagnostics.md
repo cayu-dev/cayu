@@ -56,17 +56,19 @@ one per session.
 
 ## agent-workflow-runner-not-registered
 
-`AGENT_WORKFLOW_RUNNER_NOT_REGISTERED` means `exec_command` is registered and
-named in `workflow_tool_names`, but no runner is structurally available.
+`AGENT_WORKFLOW_RUNNER_NOT_REGISTERED` means `exec_command`, `run_check`, or
+another runner-backed workflow tool is registered and named in
+`workflow_tool_names`, but no runner is structurally available.
 Register a static environment with a runner, or an environment factory that
 supplies one per session.
 
 ## agent-workflow-command-policy-not-registered
 
 `AGENT_WORKFLOW_COMMAND_POLICY_NOT_REGISTERED` means an agent explicitly
-declares `exec_command` as part of its workflow but the registered
-`ExecCommandTool` has no `CommandPolicy`. Attach a deny-by-default policy such
-as `ProcessCommandPolicy`. Inspection reports only the policy type, never its
+declares `exec_command` or `run_check` as part of its workflow but the
+registered command tool has no `CommandPolicy`. `RunCheckTool` rejects that
+configuration during construction; attach a deny-by-default policy such as
+`ProcessCommandPolicy`. Inspection reports only the policy type, never its
 allowed executables, directories, environment values, or other policy data.
 
 ## external-tool-unguarded

@@ -17,6 +17,7 @@ authoritative only where a maintained guide points to the implementation or the
 - [Evals](evals.md)
 - [Memory foundation](memory-foundation.md)
 - [Model catalog](model-catalog.md)
+- [Named checks](named-checks.md)
 - [OpenAI subscription](openai-subscription.md)
 - [Project server](project-server.md)
 - [Project workers](project-workers.md)

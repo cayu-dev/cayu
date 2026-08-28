@@ -4448,8 +4448,8 @@
             "$ref": "#/components/schemas/RuntimeManifest"
           },
           "schema_version": {
-            "const": "13",
-            "default": "13",
+            "const": "14",
+            "default": "14",
             "title": "Schema Version",
             "type": "string"
           },
@@ -20505,6 +20505,52 @@
         "title": "ModelTarget",
         "type": "object"
       },
+      "NamedCheckManifest": {
+        "additionalProperties": false,
+        "description": "Bounded non-secret descriptor for one application-owned check.",
+        "properties": {
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "max_output_bytes": {
+            "exclusiveMinimum": 0.0,
+            "title": "Max Output Bytes",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "profile_fingerprint": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Profile Fingerprint",
+            "type": "string"
+          },
+          "required_executables": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Required Executables",
+            "type": "array"
+          },
+          "timeout_s": {
+            "exclusiveMinimum": 0.0,
+            "title": "Timeout S",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "timeout_s",
+          "max_output_bytes",
+          "required_executables",
+          "profile_fingerprint"
+        ],
+        "title": "NamedCheckManifest",
+        "type": "object"
+      },
       "OpaqueExternalCaseRefV1": {
         "additionalProperties": false,
         "description": "Authority-free alias for case material retained by a trusted adapter.",
@@ -28436,6 +28482,14 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "named_checks": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/NamedCheckManifest"
+            },
+            "title": "Named Checks",
+            "type": "array"
           },
           "parallel_safe": {
             "title": "Parallel Safe",

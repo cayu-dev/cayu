@@ -2223,7 +2223,7 @@ export type AppManifest = {
     /**
      * Schema Version
      */
-    schema_version?: '13';
+    schema_version?: '14';
     stores: StoreManifest;
 };
 
@@ -10418,6 +10418,38 @@ export type ModelTarget = {
 };
 
 /**
+ * NamedCheckManifest
+ *
+ * Bounded non-secret descriptor for one application-owned check.
+ */
+export type NamedCheckManifest = {
+    /**
+     * Description
+     */
+    description: string;
+    /**
+     * Max Output Bytes
+     */
+    max_output_bytes: number;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Profile Fingerprint
+     */
+    profile_fingerprint: string;
+    /**
+     * Required Executables
+     */
+    required_executables: Array<string>;
+    /**
+     * Timeout S
+     */
+    timeout_s: number;
+};
+
+/**
  * OpaqueExternalCaseRefV1
  *
  * Authority-free alias for case material retained by a trusted adapter.
@@ -14644,6 +14676,10 @@ export type ToolManifest = {
      * Name
      */
     name: string;
+    /**
+     * Named Checks
+     */
+    named_checks?: Array<NamedCheckManifest>;
     /**
      * Parallel Safe
      */

@@ -253,6 +253,10 @@ For a credential-free domain-tool tracer bullet, run `cayu guide
 references#domain-tool`, then use `cayu generate tool`. To add workspace tools
 and command execution, see
 [`examples/local_environment_runtime.py`](https://github.com/cayu-dev/cayu/blob/main/examples/local_environment_runtime.py).
+For a finite application-owned command surface, use
+[`NamedCheck` and `RunCheckTool`](https://github.com/cayu-tech/cayu/blob/main/docs/named-checks.md)
+instead of exposing
+model-authored shell or argv.
 
 ### Build with a coding agent
 

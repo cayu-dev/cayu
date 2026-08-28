@@ -46,11 +46,12 @@ _WORKSPACE_TOOL_NAMES = frozenset(
         "edit_file",
         "list_files",
         "read_file",
+        "run_check",
         "search_text",
         "write_file",
     }
 )
-_RUNNER_TOOL_NAMES = frozenset({"exec_command", "git_changes"})
+_RUNNER_TOOL_NAMES = frozenset({"exec_command", "git_changes", "run_check"})
 
 
 class DiagnosticSeverity(StrEnum):
@@ -319,23 +320,23 @@ def check_manifest(
                 )
             )
 
-        exec_command = next(
-            (
-                tool
-                for tool in agent.tools
-                if tool.name == "exec_command" and tool.name in registered_workflow_tools
-            ),
-            None,
+        guarded_command_tools = (
+            tool
+            for tool in agent.tools
+            if tool.name in {"exec_command", "run_check"} and tool.name in registered_workflow_tools
         )
-        if exec_command is not None and exec_command.command_policy is None:
+        for guarded_command_tool in guarded_command_tools:
+            if guarded_command_tool.command_policy is not None:
+                continue
+            tool_name = guarded_command_tool.name
             diagnostics.append(
                 ProjectDiagnostic(
                     code="AGENT_WORKFLOW_COMMAND_POLICY_NOT_REGISTERED",
                     severity=DiagnosticSeverity.ERROR,
-                    subject=f"tool:{agent.name}/exec_command",
-                    path=f"agents.{agent.name}.tools.exec_command.command_policy",
+                    subject=f"tool:{agent.name}/{tool_name}",
+                    path=f"agents.{agent.name}.tools.{tool_name}.command_policy",
                     message=(
-                        f"Agent '{agent.name}' requires exec_command in its workflow, "
+                        f"Agent '{agent.name}' requires {tool_name} in its workflow, "
                         "but the tool has no enforcing CommandPolicy."
                     ),
                     hint=(
@@ -343,7 +344,7 @@ def check_manifest(
                         "ProcessCommandPolicy or GitCommandPolicy."
                     ),
                     tags=("authoring", "deploy", "security"),
-                    parameters={"agent": agent.name, "tool": "exec_command"},
+                    parameters={"agent": agent.name, "tool": tool_name},
                     documentation_anchor=(
                         "cayu guide diagnostics#agent-workflow-command-policy-not-registered"
                     ),

@@ -60,7 +60,7 @@ class GeneratorPrecondition(BaseModel):
 class GeneratorPlan(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["13"] = GENERATOR_PLAN_SCHEMA_VERSION
+    schema_version: Literal["14"] = GENERATOR_PLAN_SCHEMA_VERSION
     status: Literal["ready", "conflict", "manual_action_required", "already_present"]
     slice_name: str
     tool_name: str
@@ -77,7 +77,7 @@ class ServiceContextMigrationPlan(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["13"] = GENERATOR_PLAN_SCHEMA_VERSION
+    schema_version: Literal["14"] = GENERATOR_PLAN_SCHEMA_VERSION
     status: Literal["ready", "conflict", "manual_action_required", "already_present"]
     migration: Literal["service_context"] = "service_context"
     edits: tuple[GeneratorEdit, ...]

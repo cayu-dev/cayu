@@ -30,6 +30,7 @@ from cayu.runners.base import (
     _clear_preflight_traceback_frames,
     _CommandValidationModel,
     runner_execution_error,
+    runner_workspace_mutation_settlement,
 )
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
 from cayu.tools._operation_boundary import (
@@ -240,6 +241,50 @@ class ExecCommandTool(Tool):
             if stdin is not None:
                 require_unicode_scalar_text(stdin, "stdin")
             canonical_cwd = runner.resolve_cwd(cwd)
+        return await self._execute_resolved_command(
+            ctx,
+            command=command,
+            cwd=cwd,
+            canonical_cwd=canonical_cwd,
+            env=env,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            max_output_bytes=max_output_bytes,
+            policy_source=self,
+            include_runner_evidence=False,
+        )
+
+    async def _execute_resolved_command(
+        self,
+        ctx: ToolContext,
+        *,
+        command: ExecCommand,
+        cwd: str | None,
+        canonical_cwd: str | None,
+        env: dict[str, str] | None,
+        timeout_s: int,
+        stdin: str | None,
+        max_output_bytes: int,
+        policy_source: object,
+        include_runner_evidence: bool,
+    ) -> ToolResult:
+        """Execute one owned request through the canonical command boundary.
+
+        Built-in tools with a narrower model-facing contract use this method
+        after resolving their application-owned command. Argument parsing stays
+        with the caller, while runner selection, canonical cwd validation,
+        preflight, command policy, execution, and result validation remain one
+        implementation.
+        """
+
+        runner = _require_runner(ctx)
+        if runner is None:
+            return ToolResult(
+                content="No runner configured for this tool call.",
+                is_error=True,
+            )
+        if canonical_cwd is None:
+            canonical_cwd = runner.resolve_cwd(cwd)
         if self._policy is not None:
             preflight_runner = _require_runner_preflight(runner)
             preflight_failure: Exception | None = None
@@ -276,7 +321,7 @@ class ExecCommandTool(Tool):
             if type(verdict) is not CommandPolicyResult:
                 raise TypeError("Command policy must return a CommandPolicyResult.")
             if verdict.decision is not CommandPolicyDecision.ALLOW:
-                return _policy_refusal_result(verdict, ctx=ctx, source=self)
+                return _policy_refusal_result(verdict, ctx=ctx, source=policy_source)
             cwd = canonical_cwd
         try:
             result = await runner.exec(
@@ -290,6 +335,7 @@ class ExecCommandTool(Tool):
         except RunnerUnavailableError as exc:
             return _runner_unavailable_result(exc)
         result = _require_exec_result(result)
+        mutation_settlement = runner_workspace_mutation_settlement(result=result, error=None)
         content = _command_content(
             stdout=result.stdout,
             stderr=result.stderr,
@@ -300,18 +346,27 @@ class ExecCommandTool(Tool):
             stdout_truncated=result.stdout_truncated,
             stderr_truncated=result.stderr_truncated,
         )
+        structured = {
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "stdout_truncated": result.stdout_truncated,
+            "stderr_truncated": result.stderr_truncated,
+            "exit_code": result.exit_code,
+            "timed_out": result.timed_out,
+            "cancelled": result.cancelled,
+            "artifacts": copy_json_value(result.artifacts, "artifacts"),
+        }
+        if include_runner_evidence:
+            structured.update(
+                {
+                    "stdout_bytes": result.stdout_bytes,
+                    "stderr_bytes": result.stderr_bytes,
+                    "workspace_mutation_settlement": mutation_settlement,
+                }
+            )
         return ToolResult(
             content=content,
-            structured={
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "stdout_truncated": result.stdout_truncated,
-                "stderr_truncated": result.stderr_truncated,
-                "exit_code": result.exit_code,
-                "timed_out": result.timed_out,
-                "cancelled": result.cancelled,
-                "artifacts": copy_json_value(result.artifacts, "artifacts"),
-            },
+            structured=structured,
             artifacts=result.artifacts,
             is_error=result.timed_out or result.cancelled,
         )

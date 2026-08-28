@@ -50,6 +50,7 @@ from cayu.tools.knowledge import (
     RememberKnowledgeTool,
     SearchKnowledgeTool,
 )
+from cayu.tools.named_checks import NamedCheck, RunCheckTool
 from cayu.tools.parallel import ParallelAIWebAdapter
 from cayu.tools.search import SearchTextTool
 from cayu.tools.subagents import (
@@ -132,6 +133,7 @@ __all__ = [
     "ListArtifactsTool",
     "ListFilesTool",
     "ListKnowledgeTool",
+    "NamedCheck",
     "ParallelAIWebAdapter",
     "PdfArtifactReader",
     "ProcessCommandPolicy",
@@ -140,6 +142,7 @@ __all__ = [
     "ReadKnowledgeTool",
     "RememberKnowledgePolicy",
     "RememberKnowledgeTool",
+    "RunCheckTool",
     "ScreenshotPageTool",
     "SearchKnowledgeTool",
     "SearchTextTool",
